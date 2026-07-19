@@ -1,0 +1,14 @@
+[package]
+name = "serial-protocol"
+description = "Versioned wire contracts shared by seriald and serialctl"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
