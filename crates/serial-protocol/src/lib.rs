@@ -96,8 +96,47 @@ pub struct SerialSettings {
     pub echo: EchoMode,
     pub shell_prompt: Option<String>,
     pub uboot_prompt: Option<String>,
+    /// Bytes written to the driver per paced chunk. The daemon defaults to a
+    /// typewriter-style one byte per chunk because slow target UARTs drop
+    /// characters when a full write is pushed at once.
+    #[serde(default = "default_write_chunk_size")]
+    pub write_chunk_size: u32,
+    /// Delay between paced write chunks. `0` disables pacing and writes at
+    /// full speed.
+    #[serde(default = "default_write_chunk_delay_ms")]
+    pub write_chunk_delay_ms: u64,
     pub auto_open: bool,
     pub probe: Option<ProbeConfig>,
+}
+
+fn default_write_chunk_size() -> u32 {
+    1
+}
+
+fn default_write_chunk_delay_ms() -> u64 {
+    1
+}
+
+/// Per-write pacing override carried by [`ClientMessage::Write`].
+///
+/// The daemon writes at most `chunk_size` bytes per driver call and sleeps
+/// `chunk_delay_ms` between chunks so slow target UARTs are not overrun. A
+/// zero delay selects the full-speed write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritePacing {
+    pub chunk_size: u32,
+    pub chunk_delay_ms: u64,
+}
+
+impl WritePacing {
+    /// Resolves the effective pacing for one write request: an explicit
+    /// per-request override wins over the Slot settings.
+    pub fn resolve(override_pacing: Option<Self>, settings: &SerialSettings) -> Self {
+        override_pacing.unwrap_or(Self {
+            chunk_size: settings.write_chunk_size,
+            chunk_delay_ms: settings.write_chunk_delay_ms,
+        })
+    }
 }
 
 impl Default for SerialSettings {
@@ -114,6 +153,8 @@ impl Default for SerialSettings {
             echo: EchoMode::On,
             shell_prompt: None,
             uboot_prompt: Some("SigmaStar #".into()),
+            write_chunk_size: default_write_chunk_size(),
+            write_chunk_delay_ms: default_write_chunk_delay_ms(),
             auto_open: true,
             probe: None,
         }
@@ -348,6 +389,10 @@ pub enum ClientMessage {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        /// Per-write pacing override. Older clients omit the field and keep
+        /// using the Slot's configured pacing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pacing: Option<WritePacing>,
     },
     StartRun {
         request_id: Uuid,
@@ -863,6 +908,83 @@ mod tests {
         assert!(!settings.rts);
         assert_eq!(settings.write_eol, "\r");
         assert_eq!(settings.uboot_prompt.as_deref(), Some("SigmaStar #"));
+        assert_eq!(settings.write_chunk_size, 1);
+        assert_eq!(settings.write_chunk_delay_ms, 1);
         assert!(settings.probe.is_none());
+    }
+
+    #[test]
+    fn write_pacing_round_trips_through_the_control_frame() {
+        let message = ClientMessage::Write {
+            request_id: Uuid::new_v4(),
+            slot_id: "slot-1".into(),
+            control_id: Uuid::new_v4(),
+            fence: 7,
+            data: b"reboot\r".to_vec(),
+            operation_id: Some(Uuid::new_v4()),
+            pacing: Some(WritePacing {
+                chunk_size: 4,
+                chunk_delay_ms: 10,
+            }),
+        };
+        let frame = encode_client_control(&message).unwrap();
+        assert_eq!(decode_client_control(&frame).unwrap(), message);
+    }
+
+    #[test]
+    fn legacy_write_message_without_pacing_still_decodes() {
+        // A pre-pacing client serializes the Write variant without the
+        // optional pacing key; the daemon must keep accepting that shape.
+        let request_id = Uuid::new_v4();
+        let control_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "type": "write",
+            "request_id": request_id,
+            "slot_id": "slot-1",
+            "control_id": control_id,
+            "fence": 3,
+            "data": BASE64.encode(b"reboot\r"),
+            "operation_id": null,
+        });
+        let header = serde_json::to_vec(&legacy).unwrap();
+        let mut frame = vec![CONTROL_FRAME_TAG];
+        frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&header);
+        assert_eq!(
+            decode_client_control(&frame).unwrap(),
+            ClientMessage::Write {
+                request_id,
+                slot_id: "slot-1".into(),
+                control_id,
+                fence: 3,
+                data: b"reboot\r".to_vec(),
+                operation_id: None,
+                pacing: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pacing_resolution_prefers_the_request_override() {
+        let settings = SerialSettings {
+            write_chunk_size: 8,
+            write_chunk_delay_ms: 5,
+            ..SerialSettings::default()
+        };
+        assert_eq!(
+            WritePacing::resolve(None, &settings),
+            WritePacing {
+                chunk_size: 8,
+                chunk_delay_ms: 5,
+            }
+        );
+        let override_pacing = WritePacing {
+            chunk_size: 2,
+            chunk_delay_ms: 0,
+        };
+        assert_eq!(
+            WritePacing::resolve(Some(override_pacing), &settings),
+            override_pacing
+        );
     }
 }

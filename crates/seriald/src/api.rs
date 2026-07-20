@@ -556,10 +556,19 @@ async fn dispatch_slot_command(
             fence,
             data,
             operation_id,
+            pacing,
             ..
         } => {
             handle
-                .write(request_id, actor, control_id, fence, data, operation_id)
+                .write(
+                    request_id,
+                    actor,
+                    control_id,
+                    fence,
+                    data,
+                    operation_id,
+                    pacing,
+                )
                 .await?
         }
         ClientMessage::StartRun {

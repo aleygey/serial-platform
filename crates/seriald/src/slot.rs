@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, Direction, EventKind,
     FlowControl, LoggingState, Parity, RunInfo, RunStatus, SerialSettings, SessionState,
-    SlotConfig, SlotSnapshot, StopBits, TargetActivity, TimelineEvent,
+    SlotConfig, SlotSnapshot, StopBits, TargetActivity, TimelineEvent, WritePacing,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -293,6 +293,7 @@ impl SlotHandle {
         fence: u64,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        pacing: Option<WritePacing>,
     ) -> Result<CommandResult, SlotError> {
         if data.len() > MAX_WRITE_BYTES {
             return Err(SlotError::WriteTooLarge);
@@ -304,6 +305,7 @@ impl SlotHandle {
             fence,
             data,
             operation_id,
+            pacing,
             reply,
         })
         .await
@@ -479,6 +481,7 @@ enum SlotCommand {
         fence: u64,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        pacing: Option<WritePacing>,
         reply: Reply,
     },
     StartRun {
@@ -572,6 +575,7 @@ impl ExecutedWriteIds {
 enum PortCommand {
     Write {
         data: Vec<u8>,
+        pacing: WritePacing,
         reply: oneshot::Sender<PortWriteOutcome>,
     },
 }
@@ -579,6 +583,7 @@ enum PortCommand {
 struct PortWriteOutcome {
     written: usize,
     error: Option<String>,
+    cancelled: bool,
 }
 
 enum PortEvent {
@@ -1048,6 +1053,7 @@ impl SlotActor {
                 fence,
                 data,
                 operation_id,
+                pacing,
                 ..
             } => {
                 if data.len() > MAX_WRITE_BYTES {
@@ -1062,10 +1068,12 @@ impl SlotActor {
                     return Err(SlotError::PortOffline);
                 };
                 let total = data.len();
+                let pacing = WritePacing::resolve(pacing, &self.config.settings);
                 let (reply, result) = oneshot::channel();
                 port.commands
                     .send(PortCommand::Write {
                         data: data.clone(),
+                        pacing,
                         reply,
                     })
                     .await
@@ -1712,6 +1720,7 @@ enum SlotRequest {
         fence: u64,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        pacing: Option<WritePacing>,
     },
     StartRun {
         actor: Actor,
@@ -1766,13 +1775,16 @@ impl SlotRequest {
     /// connection-scoped authorization data and change after reconnect.
     fn write_fingerprint(&self) -> Option<Vec<u8>> {
         let Self::Write {
-            data, operation_id, ..
+            data,
+            operation_id,
+            pacing,
+            ..
         } = self
         else {
             return None;
         };
         Some(
-            serde_json::to_vec(&(data, operation_id))
+            serde_json::to_vec(&(data, operation_id, pacing))
                 .expect("write request fields are serializable"),
         )
     }
@@ -1815,7 +1827,16 @@ impl SlotRequest {
                 fence,
                 data,
                 operation_id,
-            } => serde_json::to_vec(&("write", &actor.id, control_id, fence, data, operation_id)),
+                pacing,
+            } => serde_json::to_vec(&(
+                "write",
+                &actor.id,
+                control_id,
+                fence,
+                data,
+                operation_id,
+                pacing,
+            )),
             Self::StartRun {
                 actor,
                 control_id,
@@ -1945,6 +1966,7 @@ impl SlotCommand {
                 fence,
                 data,
                 operation_id,
+                pacing,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
                 request: SlotRequest::Write {
@@ -1953,6 +1975,7 @@ impl SlotCommand {
                     fence,
                     data,
                     operation_id,
+                    pacing,
                 },
                 reply,
             },
@@ -2225,42 +2248,19 @@ async fn run_port_writer(
             }
             command = command_rx.recv() => command,
         };
-        let Some(PortCommand::Write { data, reply }) = command else {
+        let Some(PortCommand::Write {
+            data,
+            pacing,
+            reply,
+        }) = command
+        else {
             return;
         };
-        let deadline = tokio::time::Instant::now() + WRITE_TIMEOUT;
-        let mut written = 0;
-        let mut error = None;
-        let mut cancelled = false;
-        while written < data.len() {
-            tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
-                        error = Some("serial write cancelled because the port is closing".into());
-                        cancelled = true;
-                        break;
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    error = Some("serial write timed out; port state is uncertain".into());
-                    break;
-                }
-                result = writer.write(&data[written..]) => match result {
-                    Ok(0) => {
-                        error = Some("serial driver accepted zero bytes".into());
-                        break;
-                    }
-                    Ok(count) => written += count,
-                    Err(write_error) => {
-                        error = Some(write_error.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-        let failed = error.is_some();
-        let message = error.clone();
-        let _ = reply.send(PortWriteOutcome { written, error });
+        let outcome = write_with_pacing(&mut writer, &data, pacing, &mut cancel).await;
+        let failed = outcome.error.is_some();
+        let cancelled = outcome.cancelled;
+        let message = outcome.error.clone();
+        let _ = reply.send(outcome);
         if cancelled {
             return;
         }
@@ -2274,6 +2274,104 @@ async fn run_port_writer(
             return;
         }
     }
+}
+
+/// Writes `data` to the driver in `pacing.chunk_size` byte chunks, sleeping
+/// `pacing.chunk_delay_ms` between chunks (never after the final chunk) so a
+/// slow target UART is not overrun. A zero chunk delay keeps the original
+/// full-speed path with no sleeps. A chunk size of zero is treated as one
+/// byte. The deadline is the fixed write timeout extended to twice the
+/// estimated pacing duration, so large paced writes cannot time out merely
+/// because pacing made them slower.
+async fn write_with_pacing<W>(
+    writer: &mut W,
+    data: &[u8],
+    pacing: WritePacing,
+    cancel: &mut watch::Receiver<bool>,
+) -> PortWriteOutcome
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let chunk_size = (pacing.chunk_size as usize).max(1);
+    let chunk_delay = Duration::from_millis(pacing.chunk_delay_ms);
+    let deadline =
+        tokio::time::Instant::now() + write_deadline(data.len(), chunk_size, chunk_delay);
+    let mut written = 0;
+    let mut error = None;
+    let mut cancelled = false;
+    'chunks: while written < data.len() {
+        let chunk_end = written.saturating_add(chunk_size).min(data.len());
+        // One chunk can still need several driver calls when a write is
+        // accepted only partially.
+        while written < chunk_end {
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        error = Some("serial write cancelled because the port is closing".into());
+                        cancelled = true;
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    error = Some("serial write timed out; port state is uncertain".into());
+                    break;
+                }
+                result = writer.write(&data[written..chunk_end]) => match result {
+                    Ok(0) => {
+                        error = Some("serial driver accepted zero bytes".into());
+                        break;
+                    }
+                    Ok(count) => written += count,
+                    Err(write_error) => {
+                        error = Some(write_error.to_string());
+                        break;
+                    }
+                }
+            }
+            if error.is_some() {
+                break 'chunks;
+            }
+        }
+        if written >= data.len() || chunk_delay.is_zero() {
+            continue;
+        }
+        tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    error = Some("serial write cancelled because the port is closing".into());
+                    cancelled = true;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                error = Some("serial write timed out; port state is uncertain".into());
+            }
+            _ = tokio::time::sleep(chunk_delay) => {}
+        }
+        if error.is_some() {
+            break;
+        }
+    }
+    PortWriteOutcome {
+        written,
+        error,
+        cancelled,
+    }
+}
+
+/// Deadline budget for one paced write: at least the fixed write timeout,
+/// otherwise twice the estimated inter-chunk pacing duration plus the fixed
+/// timeout as slack for driver latency.
+fn write_deadline(total_bytes: usize, chunk_size: usize, chunk_delay: Duration) -> Duration {
+    if chunk_delay.is_zero() {
+        return WRITE_TIMEOUT;
+    }
+    let chunk_count = total_bytes.div_ceil(chunk_size.max(1)) as u128;
+    let pacing_millis = chunk_count
+        .saturating_sub(1)
+        .saturating_mul(chunk_delay.as_millis())
+        .min(u64::MAX as u128) as u64;
+    let estimated = Duration::from_millis(pacing_millis);
+    WRITE_TIMEOUT.max(estimated.saturating_mul(2).saturating_add(WRITE_TIMEOUT))
 }
 
 async fn send_port_closed(
@@ -2353,6 +2451,7 @@ mod tests {
             fence: 7,
             data: b"first".to_vec(),
             operation_id: None,
+            pacing: None,
         };
         let same = SlotRequest::Write {
             actor: actor.clone(),
@@ -2360,6 +2459,7 @@ mod tests {
             fence: 7,
             data: b"first".to_vec(),
             operation_id: None,
+            pacing: None,
         };
         let different = SlotRequest::Write {
             actor,
@@ -2367,9 +2467,40 @@ mod tests {
             fence: 7,
             data: b"second".to_vec(),
             operation_id: None,
+            pacing: None,
         };
         assert_eq!(first.fingerprint(), same.fingerprint());
         assert_ne!(first.fingerprint(), different.fingerprint());
+    }
+
+    #[test]
+    fn write_fingerprint_includes_the_pacing_override() {
+        let actor = Actor {
+            id: "human:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Human,
+        };
+        let control_id = Uuid::new_v4();
+        let unpaced = SlotRequest::Write {
+            actor: actor.clone(),
+            control_id,
+            fence: 7,
+            data: b"reboot\r".to_vec(),
+            operation_id: None,
+            pacing: None,
+        };
+        let paced = SlotRequest::Write {
+            actor,
+            control_id,
+            fence: 7,
+            data: b"reboot\r".to_vec(),
+            operation_id: None,
+            pacing: Some(WritePacing {
+                chunk_size: 1,
+                chunk_delay_ms: 5,
+            }),
+        };
+        assert_ne!(unpaced.write_fingerprint(), paced.write_fingerprint());
     }
 
     #[test]
@@ -2385,6 +2516,7 @@ mod tests {
             fence: 3,
             data: b"reboot\r".to_vec(),
             operation_id,
+            pacing: None,
         };
         let reconnected = SlotRequest::Write {
             actor: Actor {
@@ -2396,6 +2528,7 @@ mod tests {
             fence: 9,
             data: b"reboot\r".to_vec(),
             operation_id,
+            pacing: None,
         };
 
         assert_ne!(original.fingerprint(), reconnected.fingerprint());
@@ -2497,5 +2630,190 @@ mod tests {
             receiver.try_recv(),
             Ok(PortEvent::Overflow { dropped_bytes: 3 })
         ));
+    }
+
+    #[test]
+    fn write_deadline_scales_with_the_estimated_pacing_duration() {
+        // The full-speed path keeps the fixed two-second timeout.
+        assert_eq!(
+            write_deadline(4_096, 1, Duration::ZERO),
+            Duration::from_secs(2)
+        );
+        // 4 KiB at 1 byte/1 ms paces for ~4.1 s, so the deadline doubles the
+        // estimate and adds the fixed timeout instead of expiring mid-write.
+        assert_eq!(
+            write_deadline(4_096, 1, Duration::from_millis(1)),
+            Duration::from_millis(4_095 * 2 + 2_000)
+        );
+        assert_eq!(
+            write_deadline(35, 1, Duration::from_millis(1)),
+            Duration::from_millis(34 * 2 + 2_000)
+        );
+        // A pacing estimate shorter than the fixed timeout never shrinks it.
+        assert_eq!(
+            write_deadline(1, 16, Duration::from_millis(1)),
+            Duration::from_secs(2)
+        );
+        // Extreme pacing settings saturate instead of overflowing.
+        let _ = write_deadline(usize::MAX, 1, Duration::from_millis(u64::MAX));
+    }
+
+    struct RecordingWriter {
+        calls: Vec<(usize, tokio::time::Instant)>,
+        max_accept: usize,
+        never_accept: bool,
+    }
+
+    impl RecordingWriter {
+        fn new(max_accept: usize) -> Self {
+            Self {
+                calls: Vec::new(),
+                max_accept,
+                never_accept: false,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.never_accept {
+                return std::task::Poll::Pending;
+            }
+            let accepted = buffer.len().min(self.max_accept);
+            self.calls.push((accepted, tokio::time::Instant::now()));
+            std::task::Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_write_chunks_bytes_and_sleeps_between_chunks() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut writer = RecordingWriter::new(usize::MAX);
+        let pacing = WritePacing {
+            chunk_size: 2,
+            chunk_delay_ms: 5,
+        };
+        let outcome = write_with_pacing(&mut writer, b"abcde", pacing, &mut cancel).await;
+        assert_eq!(outcome.written, 5);
+        assert_eq!(outcome.error, None);
+        assert!(!outcome.cancelled);
+
+        let sizes = writer
+            .calls
+            .iter()
+            .map(|(size, _)| *size)
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, vec![2, 2, 1]);
+        let first = writer.calls[0].1;
+        // Two inter-chunk sleeps of 5 ms; no sleep after the final chunk.
+        assert_eq!(writer.calls[1].1 - first, Duration::from_millis(5));
+        assert_eq!(writer.calls[2].1 - first, Duration::from_millis(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_write_accepts_partial_driver_writes_inside_one_chunk() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut writer = RecordingWriter::new(1);
+        let pacing = WritePacing {
+            chunk_size: 3,
+            chunk_delay_ms: 7,
+        };
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        assert_eq!(outcome.written, 4);
+        assert_eq!(outcome.error, None);
+        let sizes = writer
+            .calls
+            .iter()
+            .map(|(size, _)| *size)
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, vec![1, 1, 1, 1]);
+        let first = writer.calls[0].1;
+        // The first three one-byte calls form one chunk; only one 7 ms gap.
+        assert_eq!(writer.calls[1].1 - first, Duration::ZERO);
+        assert_eq!(writer.calls[2].1 - first, Duration::ZERO);
+        assert_eq!(writer.calls[3].1 - first, Duration::from_millis(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_delay_pacing_keeps_the_full_speed_path_without_sleeps() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut writer = RecordingWriter::new(usize::MAX);
+        let start = tokio::time::Instant::now();
+        let pacing = WritePacing {
+            chunk_size: 2,
+            chunk_delay_ms: 0,
+        };
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        assert_eq!(outcome.written, 4);
+        assert_eq!(outcome.error, None);
+        assert_eq!(writer.calls.len(), 2);
+        assert_eq!(tokio::time::Instant::now() - start, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_write_times_out_when_the_driver_stops_accepting() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut writer = RecordingWriter::new(usize::MAX);
+        writer.never_accept = true;
+        let start = tokio::time::Instant::now();
+        let pacing = WritePacing {
+            chunk_size: 2,
+            chunk_delay_ms: 5,
+        };
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        assert_eq!(outcome.written, 0);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("timed out"))
+        );
+        // 4 bytes in 2-byte chunks pace for 5 ms, so the deadline is
+        // max(2 s, 2 * 5 ms + 2 s).
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            Duration::from_millis(2_010)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_write_stops_when_the_port_is_closing() {
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        // A driver that never accepts leaves cancellation as the only ready
+        // branch, keeping the outcome deterministic.
+        let mut writer = RecordingWriter::new(usize::MAX);
+        writer.never_accept = true;
+        let pacing = WritePacing {
+            chunk_size: 1,
+            chunk_delay_ms: 1,
+        };
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        assert_eq!(outcome.written, 0);
+        assert!(outcome.cancelled);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled"))
+        );
     }
 }
