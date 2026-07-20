@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod display;
+mod i18n;
 mod tui;
 mod ws;
 
@@ -14,7 +15,8 @@ use serial_protocol::{Direction, EventKind, EventQuery, SerialSettings, SlotConf
 use crate::{
     api::ApiClient,
     config::LoadedConfig,
-    display::{format_event_plain, format_wall_time_local, safe_inline},
+    display::{format_event_plain, format_wall_time_local, pad_display, safe_inline},
+    i18n::{Lang, tr, trf},
 };
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:3210";
@@ -37,6 +39,10 @@ struct Cli {
     /// Override the serialctl configuration file.
     #[arg(long, global = true, env = "SERIALCTL_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Override the UI language (en or zh). The saved value is used when omitted.
+    #[arg(long, global = true, env = "SERIALCTL_LANG", value_parser = parse_lang)]
+    lang: Option<Lang>,
 
     /// Open this Slot initially in interactive mode.
     #[arg(long)]
@@ -153,8 +159,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    validate_cli_scope(&cli)?;
     let loaded = LoadedConfig::load(cli.config.clone())?;
+    i18n::set_lang(cli.lang.or(loaded.config.language).unwrap_or_default());
+    validate_cli_scope(&cli)?;
 
     if matches!(cli.command, Some(Command::Init)) {
         return run_init(loaded, cli.endpoint, cli.token_file).await;
@@ -166,9 +173,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None => {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                bail!(
-                    "interactive mode requires a terminal; use `serialctl status --json` or `serialctl logs --json`"
-                );
+                bail!(tr("m.terminal.required"));
             }
             tui::run(
                 api,
@@ -189,7 +194,7 @@ async fn run(cli: Cli) -> Result<()> {
 
 fn validate_cli_scope(cli: &Cli) -> Result<()> {
     if cli.initial_slot.is_some() && cli.command.is_some() {
-        bail!("--initial-slot applies only to the interactive `serialctl` console");
+        bail!(tr("m.scope.error"));
     }
     Ok(())
 }
@@ -202,10 +207,15 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
     }
 
     println!(
-        "seriald {}  epoch {}  {} Slot(s)",
-        status.server_id,
-        status.daemon_epoch,
-        status.slots.len()
+        "{}",
+        trf(
+            "m.status.header",
+            &[
+                &status.server_id.to_string(),
+                &status.daemon_epoch.to_string(),
+                &status.slots.len().to_string(),
+            ]
+        )
     );
     for slot in status.slots {
         let control = slot
@@ -214,16 +224,16 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
             .map(|lease| lease.owner.label.as_str())
             .unwrap_or("-");
         println!(
-            "{:<16} {:<10?} {:<8?} {:<8} {:>7} baud  control: {}",
-            safe_inline(&slot.config.display_name),
+            "{} {:<10?} {:<8?} {} {:>7} baud  {}",
+            pad_display(&safe_inline(&slot.config.display_name), 16),
             slot.session_state,
             slot.target_activity,
-            safe_inline(&slot.config.port),
+            pad_display(&safe_inline(&slot.config.port), 8),
             slot.config.settings.baud_rate,
-            safe_inline(control)
+            trf("m.status.control", &[&safe_inline(control)])
         );
         if let Some(reason) = slot.state_reason {
-            println!("  reason: {}", safe_inline(&reason));
+            println!("{}", trf("m.status.reason", &[&safe_inline(&reason)]));
         }
     }
     Ok(())
@@ -270,23 +280,52 @@ async fn run_doctor(
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("config       {}", report.config_path);
-        println!("endpoint     {}", report.endpoint);
         println!(
-            "token        {}",
+            "{} {}",
+            pad_display(tr("m.doctor.config"), 12),
+            report.config_path
+        );
+        println!(
+            "{} {}",
+            pad_display(tr("m.doctor.endpoint"), 12),
+            report.endpoint
+        );
+        println!(
+            "{} {}",
+            pad_display(tr("m.doctor.token"), 12),
             if report.token_configured {
-                "configured"
+                tr("m.token.configured")
             } else {
-                "not configured"
+                tr("m.token.missing")
             }
         );
-        println!("daemon       {}", report.daemon_status);
-        println!("server       {}", report.server_id);
-        println!("epoch        {}", report.daemon_epoch);
-        println!("uptime       {} ms", report.uptime_ms);
         println!(
-            "slots        {} total, {} online",
-            report.slots, report.online_slots
+            "{} {}",
+            pad_display(tr("m.doctor.daemon"), 12),
+            report.daemon_status
+        );
+        println!(
+            "{} {}",
+            pad_display(tr("m.doctor.server"), 12),
+            report.server_id
+        );
+        println!(
+            "{} {}",
+            pad_display(tr("m.doctor.epoch"), 12),
+            report.daemon_epoch
+        );
+        println!(
+            "{} {}",
+            pad_display(tr("m.doctor.uptime"), 12),
+            trf("m.uptime.ms", &[&report.uptime_ms.to_string()])
+        );
+        println!(
+            "{} {}",
+            pad_display(tr("m.doctor.slots"), 12),
+            trf(
+                "m.doctor.slots.value",
+                &[&report.slots.to_string(), &report.online_slots.to_string()]
+            )
         );
     }
     Ok(())
@@ -300,30 +339,33 @@ async fn run_archives(api: &ApiClient, args: ArchivesArgs) -> Result<()> {
     }
 
     if response.archives.is_empty() {
-        println!("No retained serial archives found.");
+        println!("{}", tr("m.archives.none"));
     }
     for archive in response.archives {
         println!(
-            "{:<16} {}  segment-open {} .. {}  seq {}..={}  {}  {} segment(s){}",
-            safe_inline(&archive.slot_id),
-            archive.epoch,
-            format_wall_time_local(archive.first_segment_wall_time_ns),
-            format_wall_time_local(archive.last_segment_wall_time_ns),
-            archive.first_seq,
-            archive.last_seq,
-            format_byte_size(archive.total_bytes),
-            archive.segment_count,
-            if archive.has_open_segment {
-                "  [open]"
-            } else {
-                ""
-            }
+            "{}",
+            trf(
+                "m.archives.line",
+                &[
+                    &pad_display(&safe_inline(&archive.slot_id), 16),
+                    &archive.epoch.to_string(),
+                    &format_wall_time_local(archive.first_segment_wall_time_ns),
+                    &format_wall_time_local(archive.last_segment_wall_time_ns),
+                    &archive.first_seq.to_string(),
+                    &archive.last_seq.to_string(),
+                    &format_byte_size(archive.total_bytes),
+                    &archive.segment_count.to_string(),
+                    if archive.has_open_segment {
+                        tr("m.archives.open")
+                    } else {
+                        ""
+                    },
+                ]
+            )
         );
     }
     if response.truncated {
-        eprintln!(
-            "archive catalog is incomplete because its bounded scan skipped unreadable entries or reached the response limit"
-        );
+        eprintln!("{}", tr("m.archives.truncated"));
     }
     Ok(())
 }
@@ -332,7 +374,7 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
     if let (Some(after), Some(before)) = (args.after_time, args.before_time)
         && after >= before
     {
-        bail!("--after-time must be earlier than --before-time");
+        bail!(tr("m.logs.time.order"));
     }
     let query_spans_epoch = args.run.is_none()
         && args.operation.is_none()
@@ -340,9 +382,7 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
         && args.after_time.is_none()
         && args.before_time.is_none();
     if query_spans_epoch && !args.json {
-        eprintln!(
-            "warning: this query spans the entire selected daemon epoch and may include older test cycles; --contains only filters that global range, so narrow it with --run, --operation, --after-seq, or --after-time/--before-time"
-        );
+        eprintln!("{}", tr("m.logs.span.warn"));
     }
     let slot_id = match args.slot.or(last_slot) {
         Some(slot) => slot,
@@ -353,7 +393,7 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
             .into_iter()
             .next()
             .map(|slot| slot.config.id)
-            .context("no Slot is configured; run `serialctl init`")?,
+            .context(tr("st.no.slot"))?,
     };
     let response = api
         .events(
@@ -386,17 +426,28 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
     if response.truncated {
         if let Some(cursor) = &response.next_cursor {
             eprintln!(
-                "results truncated; repeat the same filters with --epoch {} --after-seq {}",
-                cursor.epoch, cursor.after_seq
+                "{}",
+                trf(
+                    "m.logs.truncated",
+                    &[&cursor.epoch.to_string(), &cursor.after_seq.to_string()]
+                )
             );
         } else {
-            eprintln!("results truncated without a continuation cursor");
+            eprintln!("{}", tr("m.logs.truncated.nocursor"));
         }
     }
     for gap in response.gaps {
         eprintln!(
-            "gap {}..={} ({:?}, epoch {})",
-            gap.first_seq, gap.last_seq, gap.reason, gap.epoch
+            "{}",
+            trf(
+                "m.logs.gap",
+                &[
+                    &gap.first_seq.to_string(),
+                    &gap.last_seq.to_string(),
+                    &format!("{:?}", gap.reason),
+                    &gap.epoch.to_string(),
+                ]
+            )
         );
     }
     Ok(())
@@ -415,50 +466,45 @@ async fn run_init(
         .clone()
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
     let endpoint =
-        endpoint_override.unwrap_or(prompt_with_default("seriald endpoint", &saved_endpoint)?);
+        endpoint_override.unwrap_or(prompt_with_default(tr("i.endpoint"), &saved_endpoint)?);
 
     let token_file = token_file_override
         .or_else(|| loaded.config.token_file.clone())
         .unwrap_or_else(|| loaded.default_token_path());
     let existing_operator_token = config::read_token_if_present(&token_file)?;
     if existing_operator_token.is_some() {
-        println!(
-            "The saved token is treated as the daily operator token; setup still requires a separate admin token."
-        );
+        println!("{}", tr("i.token.notice"));
     }
-    let admin_token = rpassword::prompt_password(
-        "seriald admin bearer token (required for setup; never saved): ",
-    )?;
+    let admin_token = rpassword::prompt_password(tr("i.admin.prompt"))?;
     let admin_token = admin_token.trim().to_string();
     if admin_token.is_empty() {
-        bail!(
-            "an admin bearer token is required; seriald v1 does not support disabled authentication"
-        );
+        bail!(tr("i.admin.required"));
     }
 
     let admin_api = ApiClient::new(endpoint.clone(), Some(admin_token.clone()))?;
-    let health = admin_api.health().await.context(
-        "cannot reach seriald; start seriald on Windows and verify the host-only endpoint",
-    )?;
-    let current = admin_api
-        .status()
-        .await
-        .context("cannot read existing Slot configuration; verify the admin token")?;
+    let health = admin_api.health().await.context(tr("i.unreachable"))?;
+    let current = admin_api.status().await.context(tr("i.status.fail"))?;
     let existing_slots = current
         .slots
         .into_iter()
         .map(|slot| slot.config)
         .collect::<Vec<_>>();
     println!(
-        "Connected to seriald {} (epoch {}).",
-        health.server_id, health.daemon_epoch
+        "{}",
+        trf(
+            "i.connected",
+            &[
+                &health.server_id.to_string(),
+                &health.daemon_epoch.to_string()
+            ]
+        )
     );
 
     let ports = admin_api.ports().await?;
     if ports.is_empty() {
-        bail!("seriald found no serial ports on its host");
+        bail!(tr("i.no.ports"));
     }
-    println!("\nSerial ports discovered on the seriald host:");
+    println!("{}", tr("i.ports.header"));
     for (index, port) in ports.iter().enumerate() {
         let detail = port
             .product
@@ -466,9 +512,9 @@ async fn run_init(
             .or(port.manufacturer.as_deref())
             .unwrap_or(&port.port_type);
         println!(
-            "  {:>2}. {:<10} {}",
+            "  {:>2}. {} {}",
             index + 1,
-            safe_inline(&port.name),
+            pad_display(&safe_inline(&port.name), 10),
             safe_inline(detail)
         );
     }
@@ -490,17 +536,12 @@ async fn run_init(
     } else {
         existing_selection.join(",")
     };
-    let selection = prompt_with_default(
-        "Select ports for the complete Slot set (comma-separated numbers)",
-        &default_selection,
-    )?;
+    let selection = prompt_with_default(tr("i.select.ports"), &default_selection)?;
     let selected = parse_selection(&selection, ports.len())?;
 
-    println!(
-        "\nNew ports use: 115200 8N1, no flow control, DTR/RTS low, TX EOL \\r, echo on, U-Boot prompt `SigmaStar #`, probe disabled, auto-open."
-    );
+    println!("{}", tr("i.profile.note"));
     if !existing_slots.is_empty() {
-        println!("Previously configured ports keep their Profile and serial settings.");
+        println!("{}", tr("i.existing.keep"));
     }
     let mut slots = Vec::with_capacity(selected.len());
     for (slot_index, port_index) in selected.into_iter().enumerate() {
@@ -514,17 +555,15 @@ async fn run_init(
             .map(|slot| slot.display_name.clone())
             .unwrap_or_else(|| format!("slot-{}", slot_index + 1));
         let display_name = prompt_with_default(
-            &format!("Slot name for {}", safe_inline(&port.name)),
+            &trf("i.slot.name", &[&safe_inline(&port.name)]),
             &default_name,
         )?;
         let default_id = existing
             .as_ref()
             .map(|slot| slot.id.clone())
             .unwrap_or_else(|| normalize_slot_id(&display_name, slot_index + 1));
-        let entered_id = prompt_with_default(
-            &format!("Slot ID for {}", safe_inline(&port.name)),
-            &default_id,
-        )?;
+        let entered_id =
+            prompt_with_default(&trf("i.slot.id", &[&safe_inline(&port.name)]), &default_id)?;
         let base_id = normalize_slot_id(&entered_id, slot_index + 1);
         let mut id = base_id.clone();
         let mut suffix = 2;
@@ -539,6 +578,7 @@ async fn run_init(
             profile: "generic-115200".into(),
             enabled: true,
             settings: SerialSettings::default(),
+            device_profile: None,
         });
         slot.id = id;
         slot.display_name = display_name;
@@ -548,30 +588,36 @@ async fn run_init(
 
     let omitted_existing = unselected_existing_slots(&existing_slots, &slots);
     if !omitted_existing.is_empty() {
-        println!("\nExisting Slots not selected in this scan:");
+        println!("{}", tr("i.omitted.header"));
         for slot in &omitted_existing {
             println!(
-                "  {} → {} (kept by default, including when the COM port is temporarily absent)",
-                safe_inline(&slot.display_name),
-                safe_inline(&slot.port)
+                "{}",
+                trf(
+                    "i.omitted.note",
+                    &[&safe_inline(&slot.display_name), &safe_inline(&slot.port)]
+                )
             );
         }
-        let delete = prompt_yes_no_default_no(
-            "Explicitly delete these omitted Slots from seriald configuration?",
-        )?;
+        let delete = prompt_yes_no_default_no(tr("i.omitted.delete"))?;
         if delete {
             println!(
-                "Deleting {} explicitly omitted Slot(s).",
-                omitted_existing.len()
+                "{}",
+                trf("i.omitted.deleting", &[&omitted_existing.len().to_string()])
             );
         } else {
-            println!("Keeping {} existing Slot(s).", omitted_existing.len());
+            println!(
+                "{}",
+                trf("i.omitted.keeping", &[&omitted_existing.len().to_string()])
+            );
             slots.extend(omitted_existing);
         }
     }
 
     let configured = admin_api.configure_slots(slots).await?;
-    println!("\nConfigured {} Slot(s):", configured.slots.len());
+    println!(
+        "{}",
+        trf("i.configured", &[&configured.slots.len().to_string()])
+    );
     for slot in &configured.slots {
         println!(
             "  {} → {} ({:?})",
@@ -587,30 +633,24 @@ async fn run_init(
     drop(admin_token);
 
     let operator_prompt = if existing_operator_token.is_some() {
-        "seriald operator bearer token for daily use (leave empty to keep the saved token): "
+        tr("i.operator.keep")
     } else {
-        "seriald operator bearer token for daily use (required; saved locally): "
+        tr("i.operator.required.prompt")
     };
     let entered_operator_token = rpassword::prompt_password(operator_prompt)?;
     let entered_operator_token = entered_operator_token.trim().to_string();
     let operator_token = if entered_operator_token.is_empty() {
-        existing_operator_token.context(
-            "an operator bearer token is required for the daily console; the admin token is not saved",
-        )?
+        existing_operator_token.context(tr("i.operator.required"))?
     } else {
         entered_operator_token
     };
     let operator_api = ApiClient::new(endpoint.clone(), Some(operator_token.clone()))?;
-    operator_api.status().await.context(
-        "the operator token could not read daemon status; the token file was not changed",
-    )?;
+    operator_api.status().await.context(tr("i.operator.fail"))?;
     let daily_role = ws::probe_role(&endpoint, &operator_token)
         .await
-        .context("the daily token role could not be verified; the token file was not changed")?;
+        .context(tr("i.role.fail"))?;
     if daily_role != serial_protocol::Role::Operator {
-        bail!(
-            "the daily token has role {daily_role:?}; an operator token is required and the token file was not changed"
-        );
+        bail!(trf("i.role.wrong", &[&format!("{daily_role:?}")]));
     }
 
     config::write_token(&token_file, &operator_token)?;
@@ -618,17 +658,14 @@ async fn run_init(
     loaded.config.endpoint = Some(endpoint);
     loaded.config.last_slot = configured.slots.first().map(|slot| slot.config.id.clone());
     loaded.save()?;
-    println!(
-        "Saved serialctl configuration to {}.",
-        loaded.path.display()
-    );
-    println!("Run `serialctl` to open the multi-Slot console.");
+    println!("{}", trf("i.saved", &[&loaded.path.display().to_string()]));
+    println!("{}", tr("i.open.console"));
     Ok(())
 }
 
 fn ensure_interactive() -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        bail!("this command requires an interactive terminal");
+        bail!(tr("i.interactive"));
     }
     Ok(())
 }
@@ -658,7 +695,7 @@ fn prompt_yes_no_default_no(label: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "n" | "no" => Ok(false),
         "y" | "yes" => Ok(true),
-        _ => bail!("enter `y` to delete the omitted Slots or `n` to keep them"),
+        _ => bail!(tr("i.delete.confirm")),
     }
 }
 
@@ -683,9 +720,12 @@ fn parse_selection(value: &str, port_count: usize) -> Result<Vec<usize>> {
     {
         let number: usize = item
             .parse()
-            .with_context(|| format!("invalid port selection `{item}`"))?;
+            .with_context(|| trf("i.invalid.selection", &[item]))?;
         if number == 0 || number > port_count {
-            bail!("port selection {number} is outside 1..={port_count}");
+            bail!(trf(
+                "i.selection.range",
+                &[&number.to_string(), &port_count.to_string()]
+            ));
         }
         let index = number - 1;
         if !selected.contains(&index) {
@@ -693,7 +733,7 @@ fn parse_selection(value: &str, port_count: usize) -> Result<Vec<usize>> {
         }
     }
     if selected.is_empty() {
-        bail!("select at least one serial port");
+        bail!(tr("i.selection.empty"));
     }
     Ok(selected)
 }
@@ -741,23 +781,23 @@ fn windows_com_name(port: &str) -> Option<&str> {
 fn parse_log_limit(value: &str) -> Result<usize, String> {
     let limit = value
         .parse::<usize>()
-        .map_err(|_| "limit must be a positive integer".to_string())?;
+        .map_err(|_| tr("m.limit.int").to_string())?;
     if (1..=10_000).contains(&limit) {
         Ok(limit)
     } else {
-        Err("limit must be between 1 and 10000".into())
+        Err(tr("m.limit.range").into())
     }
+}
+
+fn parse_lang(value: &str) -> Result<Lang, String> {
+    Lang::parse(value).ok_or_else(|| format!("unknown language `{value}`; use en or zh"))
 }
 
 fn parse_rfc3339_ns(value: &str) -> Result<i64, String> {
     DateTime::parse_from_rfc3339(value)
-        .map_err(|error| {
-            format!(
-                "invalid RFC3339 timestamp `{value}`: {error}; include a timezone, for example 2026-07-19T12:30:00+08:00"
-            )
-        })?
+        .map_err(|error| trf("m.time.invalid", &[value, &error.to_string()]))?
         .timestamp_nanos_opt()
-        .ok_or_else(|| format!("RFC3339 timestamp `{value}` is outside the nanosecond range"))
+        .ok_or_else(|| trf("m.time.range", &[value]))
 }
 
 fn parse_direction(value: &str) -> Result<Direction, String> {
@@ -765,7 +805,7 @@ fn parse_direction(value: &str) -> Result<Direction, String> {
         "rx" => Ok(Direction::Rx),
         "tx" => Ok(Direction::Tx),
         "none" => Ok(Direction::None),
-        _ => Err(format!("unknown direction `{value}`; use rx, tx, or none")),
+        _ => Err(trf("m.direction.unknown", &[value])),
     }
 }
 
@@ -805,9 +845,7 @@ fn parse_event_kind(value: &str) -> Result<EventKind, String> {
         "checkpoint" => Ok(EventKind::Checkpoint),
         "logging_degraded" => Ok(EventKind::LoggingDegraded),
         "gap" => Ok(EventKind::Gap),
-        _ => Err(format!(
-            "unknown event kind `{value}`; use rx, tx, serial-opened, serial-closed, run-started, checkpoint, or another protocol event kind"
-        )),
+        _ => Err(trf("m.kind.unknown", &[value])),
     }
 }
 
@@ -823,6 +861,7 @@ mod tests {
             profile: "generic-115200".into(),
             enabled: true,
             settings: SerialSettings::default(),
+            device_profile: None,
         }
     }
 

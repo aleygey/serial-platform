@@ -1,6 +1,29 @@
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use serial_protocol::{ActorKind, Direction, EventKind, TimelineEvent};
+use unicode_width::UnicodeWidthChar;
+
+use crate::i18n::tr;
+
+/// Pads or truncates `value` to exactly `width` terminal display columns.
+/// CJK characters count as two columns; zero-width characters count as zero.
+pub fn pad_display(value: &str, width: usize) -> String {
+    let mut output = String::with_capacity(width);
+    let mut used = 0;
+    for character in value.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + char_width > width {
+            break;
+        }
+        output.push(character);
+        used += char_width;
+    }
+    while used < width {
+        output.push(' ');
+        used += 1;
+    }
+    output
+}
 
 #[derive(Debug, Clone)]
 pub struct DisplayLine {
@@ -491,7 +514,7 @@ pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
     let text = text.into();
     DisplayLine {
         seq,
-        source: "GAP".into(),
+        source: tr("d.gap").into(),
         bytes: text.len() + 20,
         source_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         marker_color: None,
@@ -612,42 +635,42 @@ fn normalize_newlines(value: &str) -> String {
 
 fn source_label(event: &TimelineEvent) -> String {
     match event.direction {
-        Direction::Rx => "DEV".into(),
+        Direction::Rx => tr("d.dev").into(),
         Direction::Tx => event
             .actor
             .as_ref()
             .map(|actor| compact_actor_label(actor, true))
-            .unwrap_or_else(|| "TX>".into()),
+            .unwrap_or_else(|| tr("d.tx").into()),
         Direction::None => event
             .actor
             .as_ref()
             .map(|actor| compact_actor_label(actor, false))
-            .unwrap_or_else(|| "SYSTEM".into()),
+            .unwrap_or_else(|| tr("d.system").into()),
     }
 }
 
 fn audit_source_label(event: &TimelineEvent) -> String {
     match event.direction {
-        Direction::Rx => "DEV".into(),
+        Direction::Rx => tr("d.dev").into(),
         Direction::Tx => event
             .actor
             .as_ref()
             .map(|actor| full_actor_label(actor, true))
-            .unwrap_or_else(|| "TX>".into()),
+            .unwrap_or_else(|| tr("d.tx").into()),
         Direction::None => event
             .actor
             .as_ref()
             .map(|actor| full_actor_label(actor, false))
-            .unwrap_or_else(|| "SYSTEM".into()),
+            .unwrap_or_else(|| tr("d.system").into()),
     }
 }
 
 fn actor_kind_label(kind: ActorKind) -> &'static str {
     match kind {
-        ActorKind::Human => "HUMAN",
-        ActorKind::Agent => "AGENT",
-        ActorKind::Script => "SCRIPT",
-        ActorKind::System => "SYSTEM",
+        ActorKind::Human => tr("d.kind.human"),
+        ActorKind::Agent => tr("d.kind.agent"),
+        ActorKind::Script => tr("d.kind.script"),
+        ActorKind::System => tr("d.kind.system"),
     }
 }
 
@@ -690,24 +713,24 @@ fn truncate_inline(value: &str, max_chars: usize) -> String {
 
 fn event_kind_label(kind: EventKind) -> &'static str {
     match kind {
-        EventKind::Rx => "rx",
-        EventKind::Tx => "tx",
-        EventKind::SerialOpening => "serial_opening",
-        EventKind::SerialOpened => "serial_opened",
-        EventKind::SerialOpenFailed => "serial_open_failed",
-        EventKind::SerialClosed => "serial_closed",
-        EventKind::SlotReconfigured => "slot_reconfigured",
-        EventKind::SlotRemoved => "slot_removed",
-        EventKind::ControlGranted => "control_granted",
-        EventKind::ControlReleased => "control_released",
-        EventKind::ControlRevoked => "control_revoked",
-        EventKind::ControlExpired => "control_expired",
-        EventKind::RunStarted => "run_started",
-        EventKind::RunEnded => "run_ended",
-        EventKind::RunAborted => "run_aborted",
-        EventKind::Checkpoint => "checkpoint",
-        EventKind::LoggingDegraded => "logging_degraded",
-        EventKind::Gap => "gap",
+        EventKind::Rx => tr("d.ev.rx"),
+        EventKind::Tx => tr("d.ev.tx"),
+        EventKind::SerialOpening => tr("d.ev.serial_opening"),
+        EventKind::SerialOpened => tr("d.ev.serial_opened"),
+        EventKind::SerialOpenFailed => tr("d.ev.serial_open_failed"),
+        EventKind::SerialClosed => tr("d.ev.serial_closed"),
+        EventKind::SlotReconfigured => tr("d.ev.slot_reconfigured"),
+        EventKind::SlotRemoved => tr("d.ev.slot_removed"),
+        EventKind::ControlGranted => tr("d.ev.control_granted"),
+        EventKind::ControlReleased => tr("d.ev.control_released"),
+        EventKind::ControlRevoked => tr("d.ev.control_revoked"),
+        EventKind::ControlExpired => tr("d.ev.control_expired"),
+        EventKind::RunStarted => tr("d.ev.run_started"),
+        EventKind::RunEnded => tr("d.ev.run_ended"),
+        EventKind::RunAborted => tr("d.ev.run_aborted"),
+        EventKind::Checkpoint => tr("d.ev.checkpoint"),
+        EventKind::LoggingDegraded => tr("d.ev.logging_degraded"),
+        EventKind::Gap => tr("d.ev.gap"),
     }
 }
 
@@ -912,6 +935,7 @@ mod tests {
 
     #[test]
     fn plain_log_output_includes_local_millisecond_time_and_event_identity() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut event = event(b"booted\r\n");
         event.seq = 42;
         event.generation = 7;
@@ -926,6 +950,7 @@ mod tests {
 
     #[test]
     fn human_readable_sources_include_safe_actor_label_and_id() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut tx = event(b"reboot\r");
         tx.direction = Direction::Tx;
         tx.kind = EventKind::Tx;
@@ -1062,6 +1087,7 @@ mod tests {
 
     #[test]
     fn source_change_commits_partial_row_and_preserves_styles() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut parser = TerminalStreamParser::new();
         let first = parser.push_event(&event_at(1, b"Sigma"));
         assert_eq!(

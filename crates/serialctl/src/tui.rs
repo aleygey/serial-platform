@@ -27,12 +27,16 @@ use serial_protocol::{
     RunInfo, ServerMessage, SessionState, SlotSnapshot, TargetActivity, TimelineEvent, WireFrame,
 };
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use crate::{
     api::ApiClient,
     config::LoadedConfig,
-    display::{DisplayLine, TerminalStreamParser, gap_line, highlight_spans, safe_inline},
+    display::{
+        DisplayLine, TerminalStreamParser, gap_line, highlight_spans, pad_display, safe_inline,
+    },
+    i18n::{self, tr, trf},
     ws::{self, NetworkCommand, NetworkEvent},
 };
 
@@ -90,14 +94,20 @@ enum SubscriptionPhase {
 impl SubscriptionPhase {
     fn label(&self) -> String {
         match self {
-            Self::Disconnected => "OFF".into(),
-            Self::Attaching => "ATTACH".into(),
+            Self::Disconnected => tr("phase.off").into(),
+            Self::Attaching => tr("phase.attach").into(),
             Self::Replaying {
                 from_seq,
                 through_seq,
-            } => format!("REPLAY#{from_seq}-#{through_seq}"),
-            Self::Ready { head_seq } => format!("LIVE#{head_seq}"),
-            Self::Lagged { from_seq, to_seq } => format!("LAGGED#{from_seq}-#{to_seq}"),
+            } => trf(
+                "phase.replay",
+                &[&from_seq.to_string(), &through_seq.to_string()],
+            ),
+            Self::Ready { head_seq } => trf("phase.live", &[&head_seq.to_string()]),
+            Self::Lagged { from_seq, to_seq } => trf(
+                "phase.lagged",
+                &[&from_seq.to_string(), &to_seq.to_string()],
+            ),
         }
     }
 
@@ -188,13 +198,7 @@ impl SlotView {
         }
         if self.last_epoch.is_some() && self.last_epoch != Some(event.daemon_epoch) {
             self.reset_stream();
-            self.push_line(
-                gap_line(
-                    event.seq,
-                    "daemon epoch changed; previous control leases and cursors are invalid",
-                ),
-                selected,
-            );
+            self.push_line(gap_line(event.seq, tr("st.epoch.changed")), selected);
         }
         self.last_epoch = Some(event.daemon_epoch);
         self.last_seq = event.seq;
@@ -261,6 +265,7 @@ struct App {
     queued_controls: HashMap<String, QueuedControl>,
     uncertain_write_outcomes: usize,
     human_idle_release: Duration,
+    config: Option<LoadedConfig>,
     should_quit: bool,
     dirty: bool,
 }
@@ -286,13 +291,14 @@ impl App {
             authenticated: false,
             connection_generation: None,
             actor: None,
-            status: "connecting…".into(),
+            status: tr("st.connecting").into(),
             pending_paste: None,
             pending_writes: HashMap::new(),
             pending_requests: HashMap::new(),
             queued_controls: HashMap::new(),
             uncertain_write_outcomes: 0,
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
+            config: None,
             should_quit: false,
             dirty: true,
         }
@@ -318,11 +324,9 @@ impl App {
         if index < self.slots.len() {
             self.selected = index;
             self.current_mut().unseen = 0;
-            self.status = format!(
-                "viewing {} ({})",
-                self.current().snapshot.config.display_name,
-                self.current().snapshot.config.port
-            );
+            let name = self.current().snapshot.config.display_name.clone();
+            let port = self.current().snapshot.config.port.clone();
+            self.status = trf("st.viewing", &[&name, &port]);
             self.dirty = true;
         }
     }
@@ -337,7 +341,7 @@ impl App {
                 for slot in &mut self.slots {
                     slot.subscription = SubscriptionPhase::Attaching;
                 }
-                self.status = "transport connected; authenticating and attaching all Slots".into();
+                self.status = tr("st.transport").into();
             }
             NetworkEvent::Disconnected { reason } => {
                 let old_actor_id = self.actor.take().map(|actor| actor.id);
@@ -371,10 +375,11 @@ impl App {
                     }
                 }
                 self.status = if newly_uncertain == 0 {
-                    format!("disconnected: {reason}; reconnecting")
+                    trf("st.disconnected", &[&reason])
                 } else {
-                    format!(
-                        "disconnected: {reason}; {newly_uncertain} sent write outcome(s) uncertain; inspect TX before retrying"
+                    trf(
+                        "st.disconnected.uncertain",
+                        &[&reason, &newly_uncertain.to_string()],
                     )
                 };
             }
@@ -410,7 +415,10 @@ impl App {
             } => {
                 self.actor = Some(actor);
                 self.authenticated = true;
-                self.status = format!("connected as {:?} (protocol v{protocol_version})", role);
+                self.status = trf(
+                    "st.welcome",
+                    &[&format!("{role:?}"), &protocol_version.to_string()],
+                );
             }
             ServerMessage::Snapshot { slot } => {
                 if let Some(index) = self
@@ -425,7 +433,7 @@ impl App {
                     if epoch_changed || generation_changed {
                         self.invalidate_slot_pending(
                             &slot.config.id,
-                            "the serial session changed before queued input was sent",
+                            tr("st.session.changed.unsent"),
                         );
                         self.slots[index].reset_stream();
                     }
@@ -434,11 +442,7 @@ impl App {
                     if epoch_changed {
                         let selected = self.selected == index;
                         let seq = self.slots[index].snapshot.head_seq;
-                        self.slots[index].push_gap(
-                            seq,
-                            "daemon restarted; old control leases were invalidated",
-                            selected,
-                        );
+                        self.slots[index].push_gap(seq, tr("st.daemon.restarted"), selected);
                         self.slots[index].last_epoch =
                             Some(self.slots[index].snapshot.daemon_epoch);
                         self.slots[index].last_seq = 0;
@@ -467,7 +471,7 @@ impl App {
                                 .map_or(0, |writes| writes.len());
                             if discarded > 0 {
                                 discarded_suffix =
-                                    format!("; {slot_id}: discarded {discarded} queued chunk(s)");
+                                    trf("st.discarded.chunks", &[&slot_id, &discarded.to_string()]);
                             }
                         }
                         _ => {}
@@ -476,7 +480,7 @@ impl App {
                 self.status = format!(
                     "{:?}: {message}{discarded_suffix}{}",
                     code,
-                    if retryable { " (retryable)" } else { "" }
+                    if retryable { tr("st.retryable") } else { "" }
                 );
             }
             ServerMessage::Gap {
@@ -489,9 +493,13 @@ impl App {
                 self.push_gap(
                     &slot_id,
                     head_seq,
-                    format!(
-                        "history gap ({reason:?}); requested after {:?}, first available {:?}",
-                        requested_after_seq, first_available_seq
+                    trf(
+                        "st.history.gap",
+                        &[
+                            &format!("{reason:?}"),
+                            &format!("{requested_after_seq:?}"),
+                            &format!("{first_available_seq:?}"),
+                        ],
                     ),
                 );
             }
@@ -506,9 +514,7 @@ impl App {
                 self.push_gap(
                     &slot_id,
                     to_seq,
-                    format!(
-                        "slow client missed live events {from_seq}..={to_seq}; reconnecting for journal replay"
-                    ),
+                    trf("st.lagged", &[&from_seq.to_string(), &to_seq.to_string()]),
                 );
             }
             ServerMessage::ReplayBegin {
@@ -522,7 +528,10 @@ impl App {
                         through_seq,
                     };
                 }
-                self.status = format!("replaying {slot_id} #{from_seq}..=#{through_seq}");
+                self.status = trf(
+                    "st.replaying",
+                    &[&slot_id, &from_seq.to_string(), &through_seq.to_string()],
+                );
             }
             ServerMessage::Ready { slot_id, head_seq } => {
                 if let Some(index) = self.slot_index(&slot_id) {
@@ -531,7 +540,7 @@ impl App {
                         self.flush_pending_writes(&slot_id, commands);
                     }
                 }
-                self.status = format!("{slot_id} live at sequence {head_seq}");
+                self.status = trf("st.live", &[&slot_id, &head_seq.to_string()]);
             }
         }
     }
@@ -548,7 +557,7 @@ impl App {
                 if let Some(PendingRequest::Acquire { slot_id }) = pending {
                     self.queued_controls.remove(&slot_id);
                     self.install_lease(&slot_id, lease);
-                    self.status = format!("write control granted for {slot_id}");
+                    self.status = trf("st.granted", &[&slot_id]);
                     self.flush_pending_writes(&slot_id, commands);
                 }
             }
@@ -564,8 +573,7 @@ impl App {
                     self.pending_requests
                         .insert(request_id, PendingRequest::Acquire { slot_id });
                 }
-                self.status =
-                    format!("write control queued at position {position}; input is held locally");
+                self.status = trf("st.queued", &[&position.to_string()]);
             }
             CommandResult::ControlRenewed { lease } => {
                 if let Some(PendingRequest::Renew { slot_id }) = pending {
@@ -578,35 +586,41 @@ impl App {
                         self.slots[index].snapshot.control = None;
                         self.slots[index].last_manual_activity = None;
                     }
-                    self.status = format!("write control released for {slot_id}");
+                    self.status = trf("st.released", &[&slot_id]);
+                }
+            }
+            CommandResult::AcquireCancelled { .. } => {
+                if let Some(PendingRequest::Acquire { slot_id }) = pending {
+                    self.queued_controls.remove(&slot_id);
+                    self.status = trf("st.acquire.cancelled", &[&slot_id]);
                 }
             }
             CommandResult::WriteAccepted { event_seq } => {
                 if let Some(PendingRequest::Write { slot_id }) = pending {
-                    self.status = format!("{slot_id}: write confirmed at sequence {event_seq}");
+                    self.status = trf("st.write.confirmed", &[&slot_id, &event_seq.to_string()]);
                     self.flush_pending_writes(&slot_id, commands);
                 }
             }
             CommandResult::HelloAccepted { actor, role } => {
                 self.actor = Some(actor);
                 self.authenticated = true;
-                self.status = format!("authenticated as {:?}", role);
+                self.status = trf("st.authenticated", &[&format!("{role:?}")]);
             }
             CommandResult::Attached { slots } => {
-                self.status = format!("watching {} Slot(s)", slots.len());
+                self.status = trf("st.watching", &[&slots.len().to_string()]);
             }
             CommandResult::Detached { slots } => {
-                self.status = format!("detached {} Slot(s)", slots.len());
+                self.status = trf("st.detached", &[&slots.len().to_string()]);
             }
             CommandResult::Pong { .. } => {}
             CommandResult::RunStarted { run } => {
-                self.status = format!("run started: {}", run.label);
+                self.status = trf("st.run.started", &[&run.label]);
             }
             CommandResult::RunEnded { run } => {
-                self.status = format!("run ended: {}", run.label);
+                self.status = trf("st.run.ended", &[&run.label]);
             }
             CommandResult::CheckpointCreated { event_seq } => {
-                self.status = format!("checkpoint created at sequence {event_seq}");
+                self.status = trf("st.checkpoint", &[&event_seq.to_string()]);
             }
         }
     }
@@ -632,10 +646,7 @@ impl App {
                     EventKind::SerialClosed | EventKind::SlotReconfigured | EventKind::SlotRemoved
                 )
             {
-                self.invalidate_slot_pending(
-                    &slot_id,
-                    "the serial session changed; queued input was discarded",
-                );
+                self.invalidate_slot_pending(&slot_id, tr("st.session.changed.discarded"));
             }
             self.apply_event_projection(index, &event);
             self.slots[index].push_event(event, selected);
@@ -769,8 +780,14 @@ impl App {
             self.pending_paste = None;
         }
         if discarded_writes > 0 || discarded_requests > 0 {
-            self.status = format!(
-                "{slot_id}: {reason} ({discarded_writes} write(s), {discarded_requests} request(s))"
+            self.status = trf(
+                "st.invalidated",
+                &[
+                    slot_id,
+                    reason,
+                    &discarded_writes.to_string(),
+                    &discarded_requests.to_string(),
+                ],
             );
         }
     }
@@ -800,16 +817,16 @@ impl App {
         pending: Option<PendingRequest>,
     ) -> bool {
         if !self.transport_connected || !self.authenticated {
-            self.status = "connection is not authenticated; input was not queued".into();
+            self.status = tr("st.not.auth.queued").into();
             return false;
         }
         let Some(generation) = self.connection_generation else {
-            self.status = "not connected; input was not queued".into();
+            self.status = tr("st.not.connected").into();
             return false;
         };
         let request_id = message.request_id();
         if pending.is_some() && self.pending_requests.len() >= MAX_OUTSTANDING_REQUESTS {
-            self.status = "too many outstanding daemon requests; input was not sent".into();
+            self.status = tr("st.too.many").into();
             return false;
         }
         match commands.try_send(NetworkCommand::Send {
@@ -818,11 +835,11 @@ impl App {
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.status = "outbound queue is full; input was not sent".into();
+                self.status = tr("st.outbound.full").into();
                 return false;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.status = "network worker stopped".into();
+                self.status = tr("st.network.stopped").into();
                 return false;
             }
         }
@@ -842,14 +859,11 @@ impl App {
             return true;
         }
         if !self.transport_connected || !self.authenticated {
-            self.status = "not authenticated; input was not queued".into();
+            self.status = tr("st.not.auth2").into();
             return false;
         }
         if !self.slot_ready(self.selected) {
-            self.status = format!(
-                "{} is not live yet; input was not queued",
-                self.selected_slot_id()
-            );
+            self.status = trf("st.not.live", &[&self.selected_slot_id()]);
             return false;
         }
         let slot_id = self.selected_slot_id();
@@ -875,7 +889,7 @@ impl App {
         if total_pending + chunks.len() > MAX_PENDING_WRITES
             || total_bytes + data.len() > MAX_PENDING_BYTES
         {
-            self.status = "local write queue is full; input was not queued".into();
+            self.status = tr("st.writeq.full").into();
             return false;
         }
         self.pending_writes
@@ -904,8 +918,7 @@ impl App {
         mode: ControlMode,
     ) -> bool {
         if !self.transport_connected || !self.authenticated || !self.slot_ready(self.selected) {
-            self.status =
-                "the selected Slot is not authenticated and live; control was not requested".into();
+            self.status = tr("st.not.auth.live").into();
             return false;
         }
         let slot_id = self.selected_slot_id();
@@ -926,8 +939,8 @@ impl App {
                 self.slots[self.selected].last_manual_activity = Some(Instant::now());
             }
             self.status = match mode {
-                ControlMode::Queue => format!("requesting write control for {slot_id}…"),
-                ControlMode::Takeover => format!("requesting explicit takeover of {slot_id}…"),
+                ControlMode::Queue => trf("st.requesting.control", &[&slot_id]),
+                ControlMode::Takeover => trf("st.requesting.takeover", &[&slot_id]),
             };
             true
         } else {
@@ -937,20 +950,20 @@ impl App {
 
     fn release_control(&mut self, commands: &mpsc::Sender<NetworkCommand>) {
         if !self.transport_connected || !self.authenticated || !self.slot_ready(self.selected) {
-            self.status = "the selected Slot is not live; control was not released".into();
+            self.status = tr("st.slot.not.live").into();
             return;
         }
         let slot_id = self.selected_slot_id();
         if !self.owns_control(self.selected) && self.has_queued_control(&slot_id) {
-            self.cancel_queued_control(commands, &slot_id, "operator cancelled queued input");
+            self.cancel_queued_control(commands, &slot_id, tr("st.cancel.reason"));
             return;
         }
         let Some(lease) = self.current().snapshot.control.clone() else {
-            self.status = "this Slot has no active write control".into();
+            self.status = tr("st.no.control").into();
             return;
         };
         if !self.owns_control(self.selected) {
-            self.status = format!("write control belongs to {}", lease.owner.label);
+            self.status = trf("st.control.belongs", &[&lease.owner.label]);
             return;
         }
         self.pending_writes.remove(&slot_id);
@@ -971,9 +984,7 @@ impl App {
         slot_id: &str,
         reason: &str,
     ) {
-        let reconnect_reason = format!(
-            "{reason} for {slot_id}; reconnecting cancels this actor's queues and releases its controls on every Slot"
-        );
+        let reconnect_reason = trf("st.reconnect.reason", &[reason, slot_id]);
         match commands.try_send(NetworkCommand::Reconnect {
             reason: reconnect_reason.clone(),
         }) {
@@ -986,10 +997,10 @@ impl App {
                 self.status = reconnect_reason;
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.status = "cannot cancel queued control: outbound queue is full".into();
+                self.status = tr("st.cancel.full").into();
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.status = "cannot cancel queued control: network worker stopped".into();
+                self.status = tr("st.cancel.stopped").into();
             }
         }
     }
@@ -1020,9 +1031,9 @@ impl App {
             }),
         );
         if automatic {
-            self.status = format!(
-                "{slot_id}: releasing idle human control after {} seconds",
-                self.human_idle_release.as_secs()
+            self.status = trf(
+                "st.idle.release",
+                &[&slot_id, &self.human_idle_release.as_secs().to_string()],
             );
         }
     }
@@ -1046,10 +1057,7 @@ impl App {
             self.cancel_queued_control(
                 commands,
                 &slot_id,
-                &format!(
-                    "queued human input expired after {} seconds of inactivity",
-                    idle_release.as_secs()
-                ),
+                &trf("st.queue.expired", &[&idle_release.as_secs().to_string()]),
             );
             return;
         }
@@ -1154,7 +1162,7 @@ impl App {
             return false;
         };
         let Some(lease) = self.slots[index].snapshot.control.clone() else {
-            self.status = "write control disappeared before send".into();
+            self.status = tr("st.write.disappeared").into();
             return false;
         };
         self.send_message(
@@ -1207,7 +1215,7 @@ impl App {
         }
         if is_prefix(key) {
             self.prefix_pending = true;
-            self.status = "command prefix: 1-9 Slot, l LINE, r RAW, PgUp/PgDn scroll, v detail, t takeover, c release/cancel, ? help".into();
+            self.status = tr("st.prefix.hint").into();
             self.dirty = true;
             return;
         }
@@ -1233,24 +1241,25 @@ impl App {
             KeyCode::Char('s' | 'S') => self.select((self.selected + 1) % self.slots.len()),
             KeyCode::Char('l' | 'L') => {
                 self.current_mut().mode = InputMode::Line;
-                self.status = "LINE mode: Enter sends the line plus Profile EOL".into();
+                self.status = tr("st.line.mode").into();
             }
             KeyCode::Char('r' | 'R') => {
                 self.current_mut().mode = InputMode::Raw;
-                self.status = "RAW mode: keystrokes are sent directly; Ctrl-] remains local".into();
+                self.status = tr("st.raw.mode").into();
             }
             KeyCode::Char('f' | 'F') | KeyCode::End => {
                 self.current_mut().follow();
-                self.status = "following live output".into();
+                self.status = tr("st.follow").into();
             }
             KeyCode::Char('v' | 'V') => {
                 self.detailed_timeline = !self.detailed_timeline;
                 self.status = if self.detailed_timeline {
-                    "detailed timeline: #seq and source columns shown".into()
+                    tr("st.detailed").into()
                 } else {
-                    "compact timeline: markers and inline highlighting".into()
+                    tr("st.compact").into()
                 };
             }
+            KeyCode::Char('g' | 'G') => self.toggle_language(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Char('t' | 'T') => {
@@ -1259,15 +1268,14 @@ impl App {
             KeyCode::Char('c' | 'C') => self.release_control(commands),
             KeyCode::Char('p' | 'P') => self.confirm_paste(commands),
             KeyCode::Char('/') => {
-                self.status =
-                    "use `serialctl logs --contains TEXT` for durable history search".into();
+                self.status = tr("st.logs.hint").into();
             }
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q' | 'Q') => self.should_quit = true,
             KeyCode::Char(']') => {
                 self.request_write(commands, vec![0x1d], None);
             }
-            _ => self.status = "unknown prefix command; Ctrl-] ? opens help".into(),
+            _ => self.status = tr("st.unknown.prefix").into(),
         }
     }
 
@@ -1349,7 +1357,7 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.current_mut().draft.clear();
                 self.current_mut().draft_cursor = 0;
-                self.status = "input cleared".into();
+                self.status = tr("st.input.cleared").into();
             }
             _ => {}
         }
@@ -1363,10 +1371,9 @@ impl App {
 
     fn handle_paste(&mut self, value: String, commands: &mpsc::Sender<NetworkCommand>) {
         if value.len() > MAX_PASTE_BYTES {
-            self.status = format!(
-                "paste rejected: {} bytes exceeds the {} byte interactive safety limit",
-                value.len(),
-                MAX_PASTE_BYTES
+            self.status = trf(
+                "st.paste.rejected",
+                &[&value.len().to_string(), &MAX_PASTE_BYTES.to_string()],
             );
             self.dirty = true;
             return;
@@ -1378,8 +1385,7 @@ impl App {
                 bytes: value.into_bytes(),
                 raw: self.current_mode() == InputMode::Raw,
             });
-            self.status =
-                "multi-line/large paste blocked; Ctrl-] p confirms for the original Slot".into();
+            self.status = tr("st.paste.blocked").into();
             self.dirty = true;
             return;
         }
@@ -1397,11 +1403,11 @@ impl App {
 
     fn confirm_paste(&mut self, commands: &mpsc::Sender<NetworkCommand>) {
         let Some(paste) = self.pending_paste.take() else {
-            self.status = "no blocked paste to confirm".into();
+            self.status = tr("st.paste.none").into();
             return;
         };
         let Some(index) = self.slot_index(&paste.slot_id) else {
-            self.status = "the paste target Slot no longer exists".into();
+            self.status = tr("st.paste.gone").into();
             return;
         };
         let previous = self.selected;
@@ -1421,7 +1427,7 @@ impl App {
         };
         self.selected = previous;
         if accepted {
-            self.status = format!("confirmed paste queued for {}", paste.slot_id);
+            self.status = trf("st.paste.queued", &[&paste.slot_id]);
         }
     }
 
@@ -1528,6 +1534,26 @@ impl App {
         }
     }
 
+    /// Ctrl-] g: switch between English and Chinese at runtime and persist
+    /// the choice to the client config on a best-effort basis.
+    fn toggle_language(&mut self) {
+        let next = i18n::lang().toggled();
+        i18n::set_lang(next);
+        if let Some(loaded) = &mut self.config {
+            loaded.config.language = Some(next);
+            if let Err(error) = loaded.save() {
+                tracing::warn!(%error, "failed to persist the language preference");
+            }
+        }
+        self.status = trf(
+            "st.language",
+            &[match next {
+                i18n::Lang::En => "English",
+                i18n::Lang::Zh => "中文",
+            }],
+        );
+    }
+
     fn complete_draft(&mut self) {
         let view = self.current_mut();
         if let Some(completion) = &mut view.completion {
@@ -1587,7 +1613,7 @@ pub async fn run(
         .await
         .context("cannot load Slot status before opening the console")?;
     if status.slots.is_empty() {
-        bail!("no Slot is configured; run `serialctl init`");
+        bail!(tr("st.no.slot"));
     }
     let slot_ids = status
         .slots
@@ -1602,6 +1628,7 @@ pub async fn run(
             .unwrap_or(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS)
             .max(1),
     );
+    app.config = Some(loaded.clone());
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
     let mut terminal = enter_terminal()?;
@@ -1654,7 +1681,7 @@ async fn run_loop(
                     for slot in &mut app.slots {
                         slot.subscription = SubscriptionPhase::Disconnected;
                     }
-                    app.status = "network worker stopped".into();
+                    app.status = tr("st.network.stopped").into();
                     app.dirty = true;
                 }
             },
@@ -1767,15 +1794,33 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
+fn session_state_label(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Disabled => tr("state.disabled"),
+        SessionState::WaitingForPort => tr("state.waiting"),
+        SessionState::Opening => tr("state.opening"),
+        SessionState::Online => tr("state.online"),
+        SessionState::Backoff => tr("state.backoff"),
+        SessionState::Stopping => tr("state.stopping"),
+    }
+}
+
+fn target_activity_label(activity: TargetActivity) -> &'static str {
+    match activity {
+        TargetActivity::Active => tr("activity.active"),
+        TargetActivity::Silent => tr("activity.silent"),
+        TargetActivity::Unknown => tr("activity.unknown"),
+    }
+}
+
 fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let titles = app
         .slots
         .iter()
         .enumerate()
         .map(|(index, slot)| {
-            let state = format!("{:?}", slot.snapshot.session_state).to_uppercase();
-            let activity =
-                format!("{:?}", displayed_target_activity(&slot.snapshot)).to_uppercase();
+            let state = session_state_label(slot.snapshot.session_state);
+            let activity = target_activity_label(displayed_target_activity(&slot.snapshot));
             let unseen = if slot.unseen > 0 {
                 format!(" +{}", slot.unseen)
             } else {
@@ -1793,13 +1838,13 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .collect::<Vec<_>>();
     let connection = if !app.transport_connected {
-        "○ reconnecting"
+        tr("conn.reconnecting")
     } else if !app.authenticated {
-        "◐ authenticating"
+        tr("conn.authenticating")
     } else if app.all_slots_ready() {
-        "● live"
+        tr("conn.live")
     } else {
-        "◐ attaching"
+        tr("conn.attaching")
     };
     let tabs = Tabs::new(titles)
         .select(app.selected)
@@ -1840,7 +1885,7 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         safe_inline(&view.snapshot.config.port),
         view.snapshot.config.settings.baud_rate,
         if view.scroll_from_bottom > 0 {
-            " · PAUSED"
+            tr("ui.paused")
         } else {
             ""
         }
@@ -1878,7 +1923,7 @@ fn timeline_line(
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::styled(
-            format!("{:<28} ", entry.source),
+            format!("{} ", pad_display(&entry.source, 28)),
             entry.source_style,
         ));
     }
@@ -1905,33 +1950,36 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .control
         .as_ref()
         .map(|lease| safe_inline(&lease.owner.label))
-        .unwrap_or_else(|| "none".into());
+        .unwrap_or_else(|| tr("ui.control.none").into());
     let mode = match app.current_mode() {
         InputMode::Line => "LINE",
         InputMode::Raw => "RAW",
     };
-    let prefix = if app.prefix_pending { " · PREFIX" } else { "" };
+    let prefix = if app.prefix_pending {
+        tr("ui.prefix")
+    } else {
+        ""
+    };
     let uncertain = if app.uncertain_write_outcomes == 0 {
         String::new()
     } else {
-        format!(
-            " · {} WRITE OUTCOME(S) UNCERTAIN: inspect TX before retrying",
-            app.uncertain_write_outcomes
-        )
+        trf("ui.uncertain", &[&app.uncertain_write_outcomes.to_string()])
     };
     let slot_id = &app.current().snapshot.config.id;
     let queue = if let Some(queued) = app.queued_controls.get(slot_id) {
         let writes = app.pending_writes.get(slot_id).map_or(0, VecDeque::len);
-        format!(
-            " · QUEUED #{} ({}s, {} chunk(s); Ctrl-] c cancels)",
-            queued.position,
-            queued.since.elapsed().as_secs(),
-            writes
+        trf(
+            "ui.queued",
+            &[
+                &queued.position.to_string(),
+                &queued.since.elapsed().as_secs().to_string(),
+                &writes.to_string(),
+            ],
         )
     } else if app.pending_requests.values().any(
         |request| matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == slot_id),
     ) {
-        " · CONTROL REQUEST PENDING (Ctrl-] c cancels)".into()
+        tr("ui.control.pending").into()
     } else {
         String::new()
     };
@@ -1943,14 +1991,15 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     .human_idle_release
                     .saturating_sub(activity.elapsed())
                     .as_secs();
-                format!(" · idle release in {remaining}s")
+                trf("ui.idle.release", &[&remaining.to_string()])
             })
     } else {
         String::new()
     };
     let content = format!(
-        " {} · {mode}{prefix} · control: {control}{idle}{queue} · {}{}",
+        " {} · {mode}{prefix} · {} {control}{idle}{queue} · {}{}",
         safe_inline(slot_id),
+        tr("ui.status.control"),
         safe_inline(&app.status),
         uncertain
     );
@@ -1973,7 +2022,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Paragraph::new(text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" history search · Enter accepts · Esc cancels "),
+                    .title(tr("ui.search.title")),
             ),
             area,
         );
@@ -1982,12 +2031,9 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (text, title) = match app.current_mode() {
         InputMode::Line => (
             safe_inline(&app.current().draft.iter().collect::<String>()),
-            " command · Enter sends Profile EOL ",
+            tr("ui.input.title.line"),
         ),
-        InputMode::Raw => (
-            "Keystrokes are sent directly. Ctrl-C sends ETX; Ctrl-] opens local commands.".into(),
-            " RAW direct transport ",
-        ),
+        InputMode::Raw => (tr("ui.input.raw.text").into(), tr("ui.input.title.raw")),
     };
     frame.render_widget(
         Paragraph::new(format!("> {text}"))
@@ -1995,7 +2041,11 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         area,
     );
     if app.current_mode() == InputMode::Line {
-        let cursor = app.current().draft_cursor as u16;
+        // The terminal cursor works in display columns, not char positions.
+        let before_cursor = app.current().draft[..app.current().draft_cursor]
+            .iter()
+            .collect::<String>();
+        let cursor = UnicodeWidthStr::width(before_cursor.as_str()) as u16;
         frame.set_cursor_position(Position::new(
             area.x.saturating_add(2).saturating_add(cursor),
             area.y.saturating_add(1),
@@ -2005,53 +2055,50 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let scroll = if app.current_mode() == InputMode::Raw {
-        "Ctrl-] PgUp/PgDn scroll"
+        tr("ui.scroll.prefix")
     } else {
-        "PgUp/PgDn scroll"
+        tr("ui.scroll.plain")
     };
     frame.render_widget(
-        Paragraph::new(format!(
-            " Ctrl-] ? help · Alt-1/2 switch · {scroll} · Ctrl-] q quit "
-        ))
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(trf("ui.helpline", &[scroll]))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
         area,
     );
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width.min(76);
-    let height = area.height.min(28);
+    let height = area.height.min(30);
     let popup = centered_rect(width, height, area);
+    let idle_seconds = app.human_idle_release.as_secs().to_string();
     let help = [
-        "All modes",
-        "  Alt-1..9 / Ctrl-] 1..9   switch Slot",
-        "  Ctrl-] s                 next Slot",
-        "  Ctrl-] l / r             LINE / RAW mode",
-        "  Ctrl-] v                 compact / detailed timeline",
-        "  Ctrl-] PgUp / PgDn       local scroll (especially in RAW)",
-        "  mouse wheel              scroll 3 lines (bottom resumes follow)",
-        "  Ctrl-] t                 explicit human takeover",
-        "  Ctrl-] c                 release control or cancel queued input",
-        "  Ctrl-] f                 follow live output",
-        "  Ctrl-] p                 confirm blocked paste",
-        "  Ctrl-] Ctrl-]            send byte 0x1d",
-        "  Ctrl-] q                 quit",
-        "",
-        "LINE: Enter sends the line plus the Profile EOL (default CR) and",
-        "returns to the live tail. Up/Down browse history; Ctrl-R starts an",
-        "incremental history search; Tab completes from history.",
-        "RAW: keys are bytes; Ctrl-C is sent to the device and does not quit.",
-        "RAW PageUp/PageDown go to the device; use the prefix for local scroll.",
-        "Large or multi-line paste is always held for explicit confirmation.",
-        &format!(
-            "Queued input expires after {}s idle; cancel reconnects and releases this terminal's controls.",
-            app.human_idle_release.as_secs()
-        ),
-        "Disconnected input is never replayed after reconnect.",
-        "Sent writes without an acknowledgement are uncertain; inspect TX before retrying.",
-        "",
-        "Press any key to close help.",
+        tr("help.all.modes").to_string(),
+        tr("help.switch").to_string(),
+        tr("help.next").to_string(),
+        tr("help.mode").to_string(),
+        tr("help.view").to_string(),
+        tr("help.lang").to_string(),
+        tr("help.scroll").to_string(),
+        tr("help.wheel").to_string(),
+        tr("help.takeover").to_string(),
+        tr("help.release").to_string(),
+        tr("help.follow").to_string(),
+        tr("help.paste").to_string(),
+        tr("help.byte").to_string(),
+        tr("help.quit").to_string(),
+        String::new(),
+        tr("help.line1").to_string(),
+        tr("help.line2").to_string(),
+        tr("help.line3").to_string(),
+        tr("help.raw1").to_string(),
+        tr("help.raw2").to_string(),
+        tr("help.paste.note").to_string(),
+        trf("help.expire", &[&idle_seconds]),
+        tr("help.replay").to_string(),
+        tr("help.uncertain").to_string(),
+        String::new(),
+        tr("help.close").to_string(),
     ];
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -2059,7 +2106,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" serialctl help "),
+                    .title(tr("help.title")),
             )
             .wrap(Wrap { trim: false }),
         popup,
@@ -2464,6 +2511,7 @@ mod tests {
 
     #[test]
     fn queued_control_can_be_cancelled_and_forces_actor_reconnect() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
         let slot_id = app.selected_slot_id();
         app.slots[0].snapshot.control = Some(ControlLease {
@@ -2724,6 +2772,7 @@ mod tests {
                 profile: "generic-115200".into(),
                 enabled: true,
                 settings: SerialSettings::default(),
+                device_profile: None,
             },
             daemon_epoch: Uuid::new_v4(),
             head_seq: 0,
@@ -2739,6 +2788,8 @@ mod tests {
             control: None,
             active_run: None,
             logging: LoggingState::Healthy,
+            effective_shell_prompt: None,
+            effective_uboot_prompt: None,
         }
     }
 

@@ -21,6 +21,8 @@ pub struct ClientConfig {
     /// Seconds of human inactivity before held write control is released.
     /// Defaults to 60 when unset.
     pub human_idle_release_seconds: Option<u64>,
+    /// UI language override ("en" or "zh"). Defaults to English when unset.
+    pub language: Option<crate::i18n::Lang>,
 }
 
 #[derive(Debug, Clone)]
