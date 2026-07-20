@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
-use serial_protocol::{EventQuery, EventQueryResponse, StatusResponse};
+use serial_protocol::{ArchiveListResponse, EventQuery, EventQueryResponse, StatusResponse};
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -45,6 +45,16 @@ impl ApiClient {
             .send()
             .await
             .context("seriald event query failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn archives(&self, slot_id: Option<&str>) -> Result<ArchiveListResponse> {
+        let query: Vec<(&str, &str)> = slot_id.map(|id| vec![("slot_id", id)]).unwrap_or_default();
+        let response = self
+            .authorize(self.client.get(self.url("/api/v1/archives")).query(&query))
+            .send()
+            .await
+            .context("seriald archive list failed")?;
         decode_response(response).await
     }
 

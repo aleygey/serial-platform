@@ -9,12 +9,16 @@ pub struct RenderedEvents {
     pub repeated_lines_collapsed: usize,
 }
 
-pub fn render_events(
-    events: &[TimelineEvent],
-    max_chars: usize,
-    include_raw: bool,
-    echo: Option<&str>,
-) -> RenderedEvents {
+pub struct RenderOptions<'a> {
+    pub max_chars: usize,
+    pub include_raw: bool,
+    pub echo: Option<&'a str>,
+    /// Collapse byte-identical adjacent lines. Disable when the exact line
+    /// stream matters more than a compact rendering.
+    pub collapse_repeats: bool,
+}
+
+pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> RenderedEvents {
     let mut rx_bytes = Vec::new();
     for event in events {
         if event.direction == Direction::Rx {
@@ -22,11 +26,15 @@ pub fn render_events(
         }
     }
     let mut text = terminal_text(&rx_bytes);
-    if let Some(echo) = echo {
+    if let Some(echo) = options.echo {
         text = remove_leading_echo(text, echo);
     }
-    let (text, repeated_lines_collapsed) = collapse_exact_repeats(&text);
-    let (text, text_truncated) = limit_tail(text, max_chars);
+    let (text, repeated_lines_collapsed) = if options.collapse_repeats {
+        collapse_exact_repeats(&text)
+    } else {
+        (text, 0)
+    };
+    let (text, text_truncated) = limit_tail(text, options.max_chars);
 
     let events = events
         .iter()
@@ -42,7 +50,7 @@ pub fn render_events(
                 "durable": event.durable,
                 "byte_count": event.data.len(),
             });
-            if include_raw && !event.data.is_empty() {
+            if options.include_raw && !event.data.is_empty() {
                 summary["data_base64"] = Value::String(BASE64.encode(&event.data));
             }
             summary
@@ -183,6 +191,28 @@ fn limit_tail(text: String, max_chars: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_protocol::EventKind;
+
+    fn rx_event(seq: u64, data: &[u8]) -> TimelineEvent {
+        TimelineEvent {
+            slot_id: "bench".into(),
+            daemon_epoch: uuid::Uuid::nil(),
+            seq,
+            generation: 1,
+            wall_time_ns: 0,
+            monotonic_time_ns: 0,
+            kind: EventKind::Rx,
+            direction: Direction::Rx,
+            actor: None,
+            run_id: None,
+            operation_id: None,
+            stream_offset_start: None,
+            stream_offset_end: None,
+            data: data.to_vec(),
+            metadata: Default::default(),
+            durable: false,
+        }
+    }
 
     #[test]
     fn terminal_rendering_removes_ansi_and_applies_controls() {
@@ -198,6 +228,33 @@ mod tests {
         assert_eq!(count, 2);
         assert!(text.contains("repeated 2 more times"));
         assert!(text.contains("[1] x\n[2] x"));
+    }
+
+    #[test]
+    fn collapse_switch_leaves_the_line_stream_untouched() {
+        let rendered = render_events(
+            &[rx_event(1, b"a\na\na\n")],
+            RenderOptions {
+                max_chars: 1024,
+                include_raw: false,
+                echo: None,
+                collapse_repeats: false,
+            },
+        );
+        assert_eq!(rendered.text, "a\na\na\n");
+        assert_eq!(rendered.repeated_lines_collapsed, 0);
+
+        let collapsed = render_events(
+            &[rx_event(1, b"a\na\na\n")],
+            RenderOptions {
+                max_chars: 1024,
+                include_raw: false,
+                echo: None,
+                collapse_repeats: true,
+            },
+        );
+        assert_eq!(collapsed.repeated_lines_collapsed, 2);
+        assert!(collapsed.text.contains("repeated 2 more times"));
     }
 
     #[test]

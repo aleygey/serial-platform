@@ -49,5 +49,11 @@ async fn run() -> Result<()> {
     let api = api::ApiClient::new(resolved.endpoint.clone(), resolved.token.clone())?;
     let session =
         session::SessionHandle::spawn(resolved.endpoint, resolved.token, actor_label.clone());
-    mcp::serve(tools::AgentTools::new(api, session, actor_label)).await
+    mcp::serve(tools::AgentTools::new(
+        api,
+        session,
+        actor_label,
+        resolved.capture,
+    ))
+    .await
 }

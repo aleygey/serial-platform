@@ -145,14 +145,19 @@ pub fn tool_definitions() -> Vec<Value> {
         "epoch": {"type":"string","format":"uuid","description":"Daemon epoch returned by a previous call; must accompany after_seq."},
         "after_seq": {"type":"integer","minimum":0,"description":"Return only events after this sequence; must accompany epoch."}
     });
+    let read_cursor = json!({
+        "epoch": {"type":"string","format":"uuid","description":"Epoch to read; defaults to the current daemon epoch. Supply an archived epoch (listed by search guidance or GET /api/v1/archives) to read history."},
+        "after_seq": {"type":"integer","minimum":0,"description":"Return only events after this sequence; requires epoch. Omit both to tail the current epoch, or pass epoch alone to read an archive from its start."}
+    });
     let bounds = json!({
         "max_chars": {"type":"integer","minimum":256,"maximum":64000,"default":16000},
-        "include_raw": {"type":"boolean","default":false,"description":"Include base64 raw bytes; use only when exact bytes matter."}
+        "include_raw": {"type":"boolean","default":false,"description":"Include base64 raw bytes; use only when exact bytes matter."},
+        "collapse_repeats": {"type":"boolean","default":true,"description":"Fold byte-identical adjacent lines into a repeat marker; false keeps the exact line stream."}
     });
     vec![
         tool(
             "devices",
-            "List authoritative serial Slots, online state, profile, prompts, control owner, active Run, and cursors. Call before selecting a device.",
+            "List authoritative serial Slots, online state, profile, effective prompts, control owner, active Run, and cursors. Call before selecting a device.",
             object(
                 json!({"slot_id":{"type":"string","description":"Optional exact Slot ID."}}),
                 &[],
@@ -161,11 +166,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "read",
-            "Read a bounded recent tail or continue from an exact epoch/after_seq cursor. Reports gaps and folds only byte-identical adjacent lines.",
+            "Read a bounded recent tail or continue from an exact epoch/after_seq cursor, including archived epochs. Reports gaps and folds only byte-identical adjacent lines. truncated marks a server-side query that reached limit_events/limit_bytes; continue from the returned after_seq.",
             object(
                 merge(&[
                     json!({"slot_id":{"type":"string"},"tail_events":{"type":"integer","minimum":1,"maximum":2000,"default":200},"limit_events":{"type":"integer","minimum":1,"maximum":2000,"default":1000},"limit_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":524288}}),
-                    cursor.clone(),
+                    json!({"direction":{"type":"string","enum":["rx","tx","none"],"description":"Filter by event direction; none matches directionless control events."},"operation_id":{"type":"string","format":"uuid","description":"Only events produced by this command operation ID."}}),
+                    read_cursor,
                     bounds.clone(),
                 ]),
                 &["slot_id"],
@@ -174,11 +180,11 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "command",
-            "Atomically attach, queue for write control (never takeover), write command+EOL, and capture until prompt/literal/quiet/timeout. Returns operation ID and interference flag.",
+            "Atomically attach, queue for write control (never takeover), write command+EOL, and capture until prompt/literal/quiet/timeout. Returns operation ID and interference flag. capture_truncated marks capture-window overflow (default 4096 events / 1 MiB; oldest events dropped), text_truncated marks rendered text cut to max_chars.",
             object(
                 merge(&[
                     json!({
-                        "slot_id":{"type":"string"},"command":{"type":"string","minLength":1,"maxLength":4096},
+                        "slot_id":{"type":"string"},"command":{"type":"string","minLength":0,"maxLength":4096,"description":"Command text; may be empty to send a bare EOL (plain Enter)."},
                         "eol":{"type":"string","description":"Override profile EOL for this call only; default profile usually uses \\r."},
                         "completion":{"type":"string","enum":["auto","prompt","contains","quiet"],"default":"auto"},
                         "until":{"type":"string","description":"Literal completion text; required for contains, optional extra prompt for prompt."},
@@ -194,7 +200,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "wait",
-            "Wait for new RX after the current head or an exact cursor. Literal contains completes on a match; without it, completes after RX followed by quiet.",
+            "Wait for new RX after the current head or an exact cursor. Literal contains completes on a match; without it, completes after RX followed by quiet. capture_truncated marks capture-window overflow (default 4096 events / 1 MiB; oldest events dropped), text_truncated marks rendered text cut to max_chars.",
             object(
                 merge(&[
                     json!({"slot_id":{"type":"string"},"contains":{"type":"string","minLength":1},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"default":10},"quiet_ms":{"type":"integer","minimum":50,"maximum":5000,"default":300}}),
@@ -207,13 +213,14 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "search",
-            "Bounded literal search. Defaults to the current Run to prevent stale logs from an earlier test being mistaken for current evidence; archive search is explicit.",
+            "Bounded literal search. Defaults to the current Run to prevent stale logs from an earlier test being mistaken for current evidence; archive search is explicit. truncated marks a server-side query that reached limit_events/limit_bytes; narrow contains or the window. Empty results include archive guidance.",
             object(
                 merge(&[
                     json!({
                         "slot_id":{"type":"string"},"contains":{"type":"string","minLength":1},
                         "scope":{"type":"string","enum":["current_run","current_cursor","archive"],"default":"current_run"},
                         "run_id":{"type":"string","format":"uuid"},"direction":{"type":"string","enum":["rx","tx","none"]},
+                        "operation_id":{"type":"string","format":"uuid","description":"Only events produced by this command operation ID."},
                         "limit_events":{"type":"integer","minimum":1,"maximum":1000,"default":200},"limit_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":524288}
                     }),
                     cursor,

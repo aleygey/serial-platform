@@ -13,9 +13,9 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 
+use crate::config::CaptureLimits;
+
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
-const MAX_CAPTURE_EVENTS: usize = 4096;
 
 pub struct Capture {
     socket: Socket,
@@ -24,6 +24,7 @@ pub struct Capture {
     retained_bytes: usize,
     truncated: bool,
     gaps: Vec<String>,
+    limits: CaptureLimits,
 }
 
 pub struct CaptureOptions {
@@ -70,6 +71,7 @@ impl Capture {
         actor_label: &str,
         slot_id: String,
         cursor: Cursor,
+        limits: CaptureLimits,
     ) -> Result<Self> {
         let mut request = ws_url(endpoint)?.into_client_request()?;
         request.headers_mut().insert(
@@ -120,6 +122,7 @@ impl Capture {
             retained_bytes: 0,
             truncated: false,
             gaps: Vec::new(),
+            limits,
         };
         loop {
             match capture.next().await? {
@@ -132,34 +135,20 @@ impl Capture {
     }
 
     pub async fn collect(mut self, options: CaptureOptions) -> CaptureResult {
-        let deadline = tokio::time::Instant::now() + options.timeout;
-        let mut last_activity = options.allow_empty_quiet.then(tokio::time::Instant::now);
+        let mut watcher = CompletionWatcher::new(options);
         let mut rolling = self.rx_text();
 
         loop {
-            if let Some(pattern) = matched_pattern(&rolling, &options.patterns) {
-                return self.finish(Completion::Pattern(pattern));
-            }
             let now = tokio::time::Instant::now();
-            if let Some(last) = last_activity
-                && options.patterns.is_empty()
-                && now.duration_since(last) >= options.quiet
-            {
-                return self.finish(Completion::Quiet);
-            }
-            if now >= deadline {
-                return self.finish(Completion::Timeout);
+            if let Some(completion) = watcher.poll(&rolling, now) {
+                return self.finish(completion);
             }
 
-            let quiet_deadline = last_activity
-                .filter(|_| options.patterns.is_empty())
-                .map(|last| last + options.quiet);
-            let wake_at = quiet_deadline.map_or(deadline, |quiet| quiet.min(deadline));
-            match tokio::time::timeout_at(wake_at, self.next()).await {
+            match tokio::time::timeout_at(watcher.wake_at(), self.next()).await {
                 Ok(Ok(Frame::Event(event))) => {
                     let event = *event;
                     if event.direction == serial_protocol::Direction::Rx {
-                        last_activity = Some(tokio::time::Instant::now());
+                        watcher.observe_rx(tokio::time::Instant::now());
                         append_rolling(&mut rolling, &String::from_utf8_lossy(&event.data));
                     }
                     self.push(event);
@@ -170,11 +159,7 @@ impl Capture {
                     return self.finish(Completion::Disconnected(error.to_string()));
                 }
                 Err(_) => {
-                    let now = tokio::time::Instant::now();
-                    if quiet_deadline.is_some_and(|quiet| now >= quiet) {
-                        return self.finish(Completion::Quiet);
-                    }
-                    return self.finish(Completion::Timeout);
+                    return self.finish(watcher.expired(tokio::time::Instant::now()));
                 }
             }
         }
@@ -240,7 +225,9 @@ impl Capture {
     fn push(&mut self, event: TimelineEvent) {
         self.retained_bytes = self.retained_bytes.saturating_add(event.data.len() + 256);
         self.events.push_back(event);
-        while self.retained_bytes > MAX_CAPTURE_BYTES || self.events.len() > MAX_CAPTURE_EVENTS {
+        while self.retained_bytes > self.limits.max_bytes
+            || self.events.len() > self.limits.max_events
+        {
             let Some(dropped) = self.events.pop_front() else {
                 break;
             };
@@ -274,6 +261,68 @@ enum Frame {
     Gap(String),
     Ready,
     Other,
+}
+
+/// Completion decision for one bounded capture. Quiet is armed independently
+/// of the prompt patterns: in auto/prompt modes a spammy device that never
+/// shows its prompt still finishes on the first RX gap of `quiet`, whichever
+/// condition is met first. Pattern matches win over quiet, quiet wins over
+/// the overall timeout.
+struct CompletionWatcher {
+    deadline: tokio::time::Instant,
+    quiet: Duration,
+    patterns: Vec<String>,
+    last_activity: Option<tokio::time::Instant>,
+}
+
+impl CompletionWatcher {
+    fn new(options: CaptureOptions) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + options.timeout,
+            quiet: options.quiet,
+            patterns: options.patterns,
+            last_activity: options.allow_empty_quiet.then(tokio::time::Instant::now),
+        }
+    }
+
+    fn observe_rx(&mut self, now: tokio::time::Instant) {
+        self.last_activity = Some(now);
+    }
+
+    fn quiet_deadline(&self) -> Option<tokio::time::Instant> {
+        self.last_activity.map(|last| last + self.quiet)
+    }
+
+    /// Next instant at which the capture could finish without new input.
+    fn wake_at(&self) -> tokio::time::Instant {
+        self.quiet_deadline()
+            .map_or(self.deadline, |quiet| quiet.min(self.deadline))
+    }
+
+    /// Decide whether the capture should finish before waiting for more input.
+    fn poll(&self, rolling: &str, now: tokio::time::Instant) -> Option<Completion> {
+        if let Some(pattern) = matched_pattern(rolling, &self.patterns) {
+            return Some(Completion::Pattern(pattern));
+        }
+        if let Some(last) = self.last_activity
+            && now.duration_since(last) >= self.quiet
+        {
+            return Some(Completion::Quiet);
+        }
+        if now >= self.deadline {
+            return Some(Completion::Timeout);
+        }
+        None
+    }
+
+    /// Decide the outcome once the scheduled wake-up elapsed.
+    fn expired(&self, now: tokio::time::Instant) -> Completion {
+        if self.quiet_deadline().is_some_and(|quiet| now >= quiet) {
+            Completion::Quiet
+        } else {
+            Completion::Timeout
+        }
+    }
 }
 
 fn matched_pattern(text: &str, patterns: &[String]) -> Option<String> {
@@ -343,5 +392,64 @@ mod tests {
             matched_pattern("boot\nSigmaStar #", &["$ ".into(), "SigmaStar #".into()]),
             Some("SigmaStar #".into())
         );
+    }
+
+    fn watcher(patterns: &[&str], allow_empty_quiet: bool) -> CompletionWatcher {
+        CompletionWatcher::new(CaptureOptions {
+            timeout: Duration::from_secs(60),
+            quiet: Duration::from_millis(300),
+            patterns: patterns.iter().map(|pattern| pattern.to_string()).collect(),
+            allow_empty_quiet,
+        })
+    }
+
+    #[test]
+    fn quiet_stays_armed_when_prompt_patterns_are_configured() {
+        // A spammy device with configured prompts must still finish on quiet:
+        // the pattern never matches, but the first RX gap of `quiet` completes.
+        let mut watcher = watcher(&["SigmaStar #"], false);
+        let rx_at = tokio::time::Instant::now();
+        watcher.observe_rx(rx_at);
+        let during_burst = rx_at + Duration::from_millis(100);
+        assert_eq!(watcher.poll("spam spam spam", during_burst), None);
+        let after_gap = rx_at + Duration::from_millis(300);
+        assert_eq!(
+            watcher.poll("spam spam spam", after_gap),
+            Some(Completion::Quiet)
+        );
+        assert_eq!(watcher.expired(after_gap), Completion::Quiet);
+    }
+
+    #[test]
+    fn pattern_match_wins_over_quiet() {
+        let mut watcher = watcher(&["SigmaStar #"], false);
+        let rx_at = tokio::time::Instant::now();
+        watcher.observe_rx(rx_at);
+        let after_gap = rx_at + Duration::from_secs(1);
+        assert_eq!(
+            watcher.poll("boot done\nSigmaStar #", after_gap),
+            Some(Completion::Pattern("SigmaStar #".into()))
+        );
+    }
+
+    #[test]
+    fn quiet_requires_rx_activity_unless_empty_quiet_is_allowed() {
+        let armed_by_rx = watcher(&[], false);
+        assert_eq!(armed_by_rx.poll("", tokio::time::Instant::now()), None);
+        let empty_quiet = watcher(&[], true);
+        let later = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(empty_quiet.poll("", later), Some(Completion::Quiet));
+    }
+
+    #[test]
+    fn timeout_fires_when_neither_pattern_nor_quiet_does() {
+        let mut options_watcher = watcher(&["never"], false);
+        options_watcher.deadline = tokio::time::Instant::now() + Duration::from_millis(1);
+        let later = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            options_watcher.poll("noise", later),
+            Some(Completion::Timeout)
+        );
+        assert_eq!(options_watcher.expired(later), Completion::Timeout);
     }
 }

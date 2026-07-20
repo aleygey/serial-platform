@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::{
     api::ApiClient,
     capture::{Capture, CaptureOptions},
-    render::render_events,
+    config::CaptureLimits,
+    render::{RenderOptions, render_events},
     session::SessionHandle,
 };
 
@@ -22,14 +23,21 @@ pub struct AgentTools {
     api: ApiClient,
     session: SessionHandle,
     actor_label: String,
+    capture_limits: CaptureLimits,
 }
 
 impl AgentTools {
-    pub fn new(api: ApiClient, session: SessionHandle, actor_label: String) -> Self {
+    pub fn new(
+        api: ApiClient,
+        session: SessionHandle,
+        actor_label: String,
+        capture_limits: CaptureLimits,
+    ) -> Self {
         Self {
             api,
             session,
             actor_label,
+            capture_limits,
         }
     }
 
@@ -49,12 +57,13 @@ impl AgentTools {
 
     async fn devices(&self, args: DevicesArgs) -> Result<Value> {
         let status = self.api.status().await?;
-        let slots: Vec<Value> = status
+        let mut slots: Vec<Value> = status
             .slots
             .iter()
             .filter(|slot| args.slot_id.as_ref().is_none_or(|id| &slot.config.id == id))
             .map(slot_summary)
             .collect();
+        disambiguate_display_names(&mut slots);
         if let Some(slot_id) = args.slot_id
             && slots.is_empty()
         {
@@ -69,28 +78,21 @@ impl AgentTools {
 
     async fn read(&self, args: ReadArgs) -> Result<Value> {
         let slot = self.slot(&args.slot_id).await?;
-        let cursor = requested_cursor(args.epoch, args.after_seq, &slot)?;
-        let after_seq = cursor
-            .as_ref()
-            .map(|value| value.after_seq)
-            .unwrap_or_else(|| {
-                slot.head_seq
-                    .saturating_sub(args.tail_events.unwrap_or(200).clamp(1, 2000) as u64)
-            });
+        let (epoch, after_seq) = read_window(args.epoch, args.after_seq, args.tail_events, &slot)?;
         let response = self
             .api
             .events(
                 &args.slot_id,
                 &EventQuery {
-                    epoch: Some(slot.daemon_epoch),
-                    after_seq: Some(after_seq),
+                    epoch: Some(epoch),
+                    after_seq,
                     before_wall_time_ns: None,
                     after_wall_time_ns: None,
-                    direction: None,
+                    direction: args.direction,
                     kind: None,
                     actor_id: None,
                     run_id: None,
-                    operation_id: None,
+                    operation_id: args.operation_id,
                     contains: None,
                     limit_events: Some(args.limit_events.unwrap_or(1000).clamp(1, 2000)),
                     limit_bytes: Some(args.limit_bytes.unwrap_or(512 * 1024).clamp(1, 1024 * 1024)),
@@ -99,10 +101,14 @@ impl AgentTools {
             .await?;
         Ok(render_response(
             &slot,
+            epoch,
             response,
-            args.max_chars,
-            args.include_raw,
-            None,
+            RenderOptions {
+                max_chars: max_chars(args.max_chars),
+                include_raw: args.include_raw,
+                echo: None,
+                collapse_repeats: args.collapse_repeats,
+            },
             "tail_or_cursor",
         ))
     }
@@ -129,12 +135,13 @@ impl AgentTools {
                     .context("scope=current_cursor requires epoch and after_seq")?;
                 (cursor.epoch, Some(cursor.after_seq), None)
             }
-            "archive" => (
-                args.epoch
-                    .context("scope=archive requires an explicit epoch")?,
-                args.after_seq,
-                args.run_id,
-            ),
+            "archive" => {
+                let epoch = match args.epoch {
+                    Some(epoch) => epoch,
+                    None => bail!("{}", self.archive_epoch_hint(&args.slot_id, &slot).await),
+                };
+                (epoch, args.after_seq, args.run_id)
+            }
             _ => bail!("scope must be current_run, current_cursor, or archive"),
         };
         let response = self
@@ -150,21 +157,68 @@ impl AgentTools {
                     kind: None,
                     actor_id: None,
                     run_id,
-                    operation_id: None,
+                    operation_id: args.operation_id,
                     contains: Some(args.contains.clone()),
                     limit_events: Some(args.limit_events.unwrap_or(200).clamp(1, 1000)),
                     limit_bytes: Some(args.limit_bytes.unwrap_or(512 * 1024).clamp(1, 1024 * 1024)),
                 },
             )
             .await?;
-        Ok(render_response(
+        let no_matches = response.events.is_empty();
+        let mut output = render_response(
             &slot,
+            epoch,
             response,
-            args.max_chars,
-            args.include_raw,
-            None,
+            RenderOptions {
+                max_chars: max_chars(args.max_chars),
+                include_raw: args.include_raw,
+                echo: None,
+                collapse_repeats: args.collapse_repeats,
+            },
             scope,
-        ))
+        );
+        if no_matches {
+            self.attach_archive_guidance(&mut output, &args.slot_id, scope)
+                .await;
+        }
+        Ok(output)
+    }
+
+    /// Error text for scope=archive without an epoch, carrying a concrete
+    /// example value the caller can retry with.
+    async fn archive_epoch_hint(&self, slot_id: &str, slot: &SlotSnapshot) -> String {
+        let example = self
+            .api
+            .archives(Some(slot_id))
+            .await
+            .ok()
+            .and_then(|list| list.archives.first().map(|archive| archive.epoch))
+            .unwrap_or(slot.daemon_epoch);
+        format!("scope=archive requires an explicit epoch, for example epoch={example}")
+    }
+
+    /// Point an empty search at wider scopes and the retained archive epochs.
+    async fn attach_archive_guidance(&self, output: &mut Value, slot_id: &str, scope: &str) {
+        match self.api.archives(Some(slot_id)).await {
+            Ok(list) => {
+                output["archive_epochs"] = json!({
+                    "archives": list.archives.iter().map(|archive| json!({
+                        "epoch": archive.epoch,
+                        "first_seq": archive.first_seq,
+                        "last_seq": archive.last_seq,
+                    })).collect::<Vec<_>>(),
+                    "truncated": list.truncated,
+                });
+                output["guidance"] = json!(format!(
+                    "No events matched in scope={scope}. Widen the window: search scope=archive with an epoch from archive_epochs, or bracket the operation with run_start/run_end and search the new Run."
+                ));
+            }
+            Err(error) => {
+                output["guidance"] = json!(format!(
+                    "No events matched in scope={scope}. Listing archives failed ({error}); retry scope=archive with a known epoch or bracket the operation with run_start/run_end and search the new Run."
+                ));
+            }
+        }
     }
 
     async fn wait(&self, args: WaitArgs) -> Result<Value> {
@@ -179,6 +233,7 @@ impl AgentTools {
             &self.actor_label,
             args.slot_id,
             cursor,
+            self.capture_limits,
         )
         .await?;
         let result = capture
@@ -191,9 +246,12 @@ impl AgentTools {
             .await;
         let rendered = render_events(
             &result.events,
-            max_chars(args.max_chars),
-            args.include_raw,
-            None,
+            RenderOptions {
+                max_chars: max_chars(args.max_chars),
+                include_raw: args.include_raw,
+                echo: None,
+                collapse_repeats: args.collapse_repeats,
+            },
         );
         let last_seq = result
             .events
@@ -210,9 +268,6 @@ impl AgentTools {
     }
 
     async fn command(&self, args: CommandArgs) -> Result<Value> {
-        if args.command.is_empty() {
-            bail!("command must not be empty");
-        }
         let slot = self.slot_online(&args.slot_id).await?;
         let operation_id = Uuid::new_v4();
         let cursor = Cursor {
@@ -225,17 +280,14 @@ impl AgentTools {
             &self.actor_label,
             args.slot_id.clone(),
             cursor,
+            self.capture_limits,
         )
         .await?;
-        let mut bytes = args.command.as_bytes().to_vec();
-        let eol = args
-            .eol
-            .clone()
-            .unwrap_or_else(|| slot.config.settings.write_eol.clone());
-        bytes.extend_from_slice(eol.as_bytes());
-        if bytes.len() > MAX_WRITE_BYTES {
-            bail!("command plus EOL exceeds {MAX_WRITE_BYTES} bytes");
-        }
+        let bytes = compose_write_bytes(
+            &args.command,
+            args.eol.as_deref(),
+            &slot.config.settings.write_eol,
+        )?;
 
         let (patterns, completion_mode) = completion_patterns(&args, &slot)?;
         let write = self
@@ -255,13 +307,16 @@ impl AgentTools {
                 allow_empty_quiet: true,
             })
             .await;
-        let echo =
-            matches!(slot.config.settings.echo, EchoMode::On).then_some(args.command.as_str());
+        let echo = (matches!(slot.config.settings.echo, EchoMode::On) && !args.command.is_empty())
+            .then_some(args.command.as_str());
         let rendered = render_events(
             &result.events,
-            max_chars(args.max_chars),
-            args.include_raw,
-            echo,
+            RenderOptions {
+                max_chars: max_chars(args.max_chars),
+                include_raw: args.include_raw,
+                echo,
+                collapse_repeats: args.collapse_repeats,
+            },
         );
         let interfered = result.events.iter().any(|event| {
             event.direction == Direction::Tx && event.operation_id != Some(operation_id)
@@ -372,20 +427,39 @@ fn requested_cursor(
     }
 }
 
+/// Resolve the epoch and window for a read. An explicit epoch is honored
+/// as-is so archived history stays reachable; only a cursor on the current
+/// daemon epoch is validated against the live head.
+fn read_window(
+    epoch: Option<Uuid>,
+    after_seq: Option<u64>,
+    tail_events: Option<usize>,
+    slot: &SlotSnapshot,
+) -> Result<(Uuid, Option<u64>)> {
+    match (epoch, after_seq) {
+        (None, None) => {
+            let tail = tail_events.unwrap_or(200).clamp(1, 2000) as u64;
+            Ok((slot.daemon_epoch, Some(slot.head_seq.saturating_sub(tail))))
+        }
+        (Some(epoch), Some(after_seq)) => {
+            if epoch == slot.daemon_epoch && after_seq > slot.head_seq {
+                bail!("cursor is ahead of Slot head_seq {}", slot.head_seq);
+            }
+            Ok((epoch, Some(after_seq)))
+        }
+        (Some(epoch), None) => Ok((epoch, None)),
+        (None, Some(_)) => bail!("after_seq requires an explicit epoch"),
+    }
+}
+
 fn render_response(
     slot: &SlotSnapshot,
+    query_epoch: Uuid,
     response: serial_protocol::EventQueryResponse,
-    requested_max: Option<usize>,
-    include_raw: bool,
-    echo: Option<&str>,
+    options: RenderOptions,
     scope: &str,
 ) -> Value {
-    let rendered = render_events(
-        &response.events,
-        max_chars(requested_max),
-        include_raw,
-        echo,
-    );
+    let rendered = render_events(&response.events, options);
     let after_seq = response
         .next_cursor
         .as_ref()
@@ -393,12 +467,32 @@ fn render_response(
         .or_else(|| response.events.last().map(|event| event.seq))
         .unwrap_or(slot.head_seq);
     json!({
-        "slot_id": slot.config.id, "scope": scope, "epoch": response.next_cursor.as_ref().map(|c| c.epoch).unwrap_or(slot.daemon_epoch),
+        "slot_id": slot.config.id, "scope": scope, "epoch": response.next_cursor.as_ref().map(|c| c.epoch).unwrap_or(query_epoch),
         "after_seq": after_seq, "head_seq": slot.head_seq, "text": rendered.text,
         "events": rendered.events, "truncated": response.truncated,
         "text_truncated": rendered.text_truncated, "repeated_lines_collapsed": rendered.repeated_lines_collapsed,
         "first_available_seq": response.first_available_seq, "gaps": response.gaps
     })
+}
+
+/// Assemble the bytes for one write. An empty command is valid as long as the
+/// effective EOL contributes bytes, which sends a bare Enter; only a fully
+/// empty payload is rejected.
+fn compose_write_bytes(
+    command: &str,
+    eol_override: Option<&str>,
+    default_eol: &str,
+) -> Result<Vec<u8>> {
+    let eol = eol_override.unwrap_or(default_eol);
+    if command.is_empty() && eol.is_empty() {
+        bail!("command and EOL are both empty; nothing would be sent");
+    }
+    let mut bytes = command.as_bytes().to_vec();
+    bytes.extend_from_slice(eol.as_bytes());
+    if bytes.len() > MAX_WRITE_BYTES {
+        bail!("command plus EOL exceeds {MAX_WRITE_BYTES} bytes");
+    }
+    Ok(bytes)
 }
 
 fn completion_patterns(args: &CommandArgs, slot: &SlotSnapshot) -> Result<(Vec<String>, String)> {
@@ -461,13 +555,41 @@ fn max_chars(value: Option<usize>) -> usize {
 fn slot_summary(slot: &SlotSnapshot) -> Value {
     json!({
         "slot_id": slot.config.id, "display_name": slot.config.display_name, "port": slot.config.port,
-        "profile": slot.config.profile, "enabled": slot.config.enabled, "session_state": slot.session_state,
+        "profile": slot.config.profile, "device_profile": slot.config.device_profile,
+        "enabled": slot.config.enabled, "session_state": slot.session_state,
         "state_reason": slot.state_reason, "target_activity": slot.target_activity, "baud_rate": slot.config.settings.baud_rate,
         "write_eol": slot.config.settings.write_eol, "echo": slot.config.settings.echo,
         "shell_prompt": slot.config.settings.shell_prompt, "uboot_prompt": slot.config.settings.uboot_prompt,
+        "effective_shell_prompt": slot.effective_shell_prompt, "effective_uboot_prompt": slot.effective_uboot_prompt,
         "epoch": slot.daemon_epoch, "head_seq": slot.head_seq, "generation": slot.generation,
         "control": slot.control, "active_run": slot.active_run, "logging": slot.logging
     })
+}
+
+/// Keep display names usable as identifiers: an empty name falls back to the
+/// port, and names shared by several Slots on one daemon gain a port suffix.
+fn disambiguate_display_names(slots: &mut [Value]) {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for slot in slots.iter() {
+        let name = slot["display_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        *counts.entry(name).or_default() += 1;
+    }
+    for slot in slots.iter_mut() {
+        let name = slot["display_name"].as_str().unwrap_or_default();
+        let port = slot["port"].as_str().unwrap_or_default();
+        if name.is_empty() {
+            slot["display_name"] = json!(format!("({port})"));
+        } else if counts.get(name).copied().unwrap_or(0) > 1 {
+            slot["display_name"] = json!(format!("{name} ({port})"));
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize, Default)]
@@ -482,11 +604,15 @@ struct ReadArgs {
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
     tail_events: Option<usize>,
+    direction: Option<Direction>,
+    operation_id: Option<Uuid>,
     limit_events: Option<usize>,
     limit_bytes: Option<usize>,
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default = "default_true")]
+    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -498,11 +624,14 @@ struct SearchArgs {
     after_seq: Option<u64>,
     run_id: Option<Uuid>,
     direction: Option<Direction>,
+    operation_id: Option<Uuid>,
     limit_events: Option<usize>,
     limit_bytes: Option<usize>,
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default = "default_true")]
+    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -516,6 +645,8 @@ struct WaitArgs {
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default = "default_true")]
+    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -531,6 +662,8 @@ struct CommandArgs {
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default = "default_true")]
+    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -553,4 +686,99 @@ struct ReleaseArgs {
     slot_id: String,
     #[serde(default)]
     abort_run: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_command_is_allowed_when_eol_contributes_bytes() {
+        assert_eq!(compose_write_bytes("", None, "\r").unwrap(), b"\r".to_vec());
+        assert_eq!(
+            compose_write_bytes("", Some("\r\n"), "\r").unwrap(),
+            b"\r\n".to_vec()
+        );
+        assert_eq!(
+            compose_write_bytes("help", Some(""), "\r").unwrap(),
+            b"help".to_vec()
+        );
+    }
+
+    #[test]
+    fn fully_empty_write_is_rejected() {
+        let error = compose_write_bytes("", Some(""), "\r").unwrap_err();
+        assert!(error.to_string().contains("nothing would be sent"));
+        let error = compose_write_bytes("", None, "").unwrap_err();
+        assert!(error.to_string().contains("nothing would be sent"));
+    }
+
+    #[test]
+    fn write_size_limit_counts_command_plus_eol() {
+        let command = "x".repeat(MAX_WRITE_BYTES);
+        assert!(compose_write_bytes(&command, Some(""), "\r").is_ok());
+        assert!(compose_write_bytes(&command, None, "\r").is_err());
+    }
+
+    #[test]
+    fn read_args_parse_direction_operation_id_and_collapse_default() {
+        let args: ReadArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "direction": "rx",
+            "operation_id": Uuid::nil(),
+        }))
+        .unwrap();
+        assert_eq!(args.direction, Some(Direction::Rx));
+        assert_eq!(args.operation_id, Some(Uuid::nil()));
+        assert!(args.collapse_repeats);
+        assert!(!args.include_raw);
+
+        let args: ReadArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "direction": "none",
+            "collapse_repeats": false,
+        }))
+        .unwrap();
+        assert_eq!(args.direction, Some(Direction::None));
+        assert!(!args.collapse_repeats);
+    }
+
+    #[test]
+    fn search_and_wait_args_parse_new_optional_fields() {
+        let search: SearchArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "contains": "ERROR",
+            "operation_id": Uuid::nil(),
+            "collapse_repeats": false,
+        }))
+        .unwrap();
+        assert_eq!(search.operation_id, Some(Uuid::nil()));
+        assert!(!search.collapse_repeats);
+
+        let wait: WaitArgs = serde_json::from_value(json!({"slot_id": "bench"})).unwrap();
+        assert!(wait.collapse_repeats);
+    }
+
+    #[test]
+    fn command_args_accept_an_empty_command() {
+        let args: CommandArgs =
+            serde_json::from_value(json!({"slot_id": "bench", "command": ""})).unwrap();
+        assert!(args.command.is_empty());
+        assert!(args.collapse_repeats);
+    }
+
+    #[test]
+    fn display_names_are_disambiguated_by_port() {
+        let mut slots = vec![
+            json!({"display_name": "hawk", "port": "COM3"}),
+            json!({"display_name": "hawk", "port": "COM7"}),
+            json!({"display_name": "", "port": "COM9"}),
+            json!({"display_name": "unique", "port": "COM11"}),
+        ];
+        disambiguate_display_names(&mut slots);
+        assert_eq!(slots[0]["display_name"], "hawk (COM3)");
+        assert_eq!(slots[1]["display_name"], "hawk (COM7)");
+        assert_eq!(slots[2]["display_name"], "(COM9)");
+        assert_eq!(slots[3]["display_name"], "unique");
+    }
 }

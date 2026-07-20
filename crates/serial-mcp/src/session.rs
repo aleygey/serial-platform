@@ -374,6 +374,7 @@ impl SessionState {
             fence: lease.fence,
             data,
             operation_id: Some(operation_id),
+            pacing: None,
         };
         match self.call(request).await {
             Ok(CommandResult::WriteAccepted { event_seq }) => Ok((event_seq, actor, request_id)),
