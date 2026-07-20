@@ -23,8 +23,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
 };
 use serial_protocol::{
-    Actor, ClientMessage, CommandResult, ControlLease, ControlMode, EventKind, LoggingState,
-    RunInfo, ServerMessage, SessionState, SlotSnapshot, TargetActivity, TimelineEvent, WireFrame,
+    Actor, ClientMessage, CommandResult, ControlLease, ControlMode, EchoMode, EventKind,
+    LoggingState, RunInfo, ServerMessage, SessionState, SlotSnapshot, TargetActivity,
+    TimelineEvent, WireFrame,
 };
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -50,6 +51,10 @@ const MAX_WRITE_BYTES: usize = 4 * 1024;
 const CONTROL_TTL_MS: u64 = 30_000;
 const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
+/// A device command echo is merged into its TX row only when it arrives
+/// within this many rows after the TX row, or within this much time.
+const ECHO_MERGE_WINDOW_ROWS: u64 = 5;
+const ECHO_MERGE_WINDOW: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -127,6 +132,14 @@ struct SlotView {
     unseen: usize,
     last_epoch: Option<Uuid>,
     last_seq: u64,
+    /// Total rows ever appended to `lines` (monotonic; indexes survive
+    /// front-eviction so the echo tracker can reference a row absolutely).
+    push_count: u64,
+    /// Most recent TX command row still waiting for its device echo.
+    echo_pending: Option<EchoTracker>,
+    /// Merge exact device command echoes into their TX rows (config
+    /// `merge_echo`, default true; only applies to echo=on Slots).
+    merge_echo: bool,
     draft: Vec<char>,
     draft_cursor: usize,
     mode: InputMode,
@@ -135,6 +148,15 @@ struct SlotView {
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
+}
+
+/// Tracks the most recently appended TX row so an exactly matching device
+/// echo row can be merged into it (echo=on Slots only).
+#[derive(Debug, Clone, Copy)]
+struct EchoTracker {
+    /// Absolute push index of the TX row (`SlotView::push_count` at push).
+    abs_index: u64,
+    at: Instant,
 }
 
 /// Ctrl-R incremental history search state (LINE mode).
@@ -167,6 +189,9 @@ impl SlotView {
             buffered_bytes: 0,
             scroll_from_bottom: 0,
             unseen: 0,
+            push_count: 0,
+            echo_pending: None,
+            merge_echo: true,
             draft: Vec::new(),
             draft_cursor: 0,
             mode: InputMode::Line,
@@ -179,17 +204,77 @@ impl SlotView {
     }
 
     fn push_line(&mut self, line: DisplayLine, selected: bool) {
+        if self.try_merge_echo(&line) {
+            // Exact device echo of the tracked TX row: mark the TX row and
+            // drop the duplicate RX row instead of appending it.
+            return;
+        }
+        let is_tx = line.direction == serial_protocol::Direction::Tx;
         self.buffered_bytes += line.bytes;
         self.lines.push_back(line);
+        let abs_index = self.push_count;
+        self.push_count += 1;
+        if is_tx {
+            self.echo_pending = Some(EchoTracker {
+                abs_index,
+                at: Instant::now(),
+            });
+        }
+        let mut evicted = 0usize;
         while self.lines.len() > MAX_LINES_PER_SLOT || self.buffered_bytes > MAX_BYTES_PER_SLOT {
             let Some(removed) = self.lines.pop_front() else {
                 break;
             };
             self.buffered_bytes = self.buffered_bytes.saturating_sub(removed.bytes);
+            evicted += 1;
         }
-        if !selected || self.scroll_from_bottom > 0 {
+        if self.scroll_from_bottom > 0 {
+            // Paused viewport: keep the same rows in view by pushing the
+            // bottom-offset up with each appended row, and pulling it back
+            // down for rows evicted from the front. When no eviction happens
+            // this keeps `total - scroll_from_bottom` (the anchor index)
+            // constant; when rows are evicted the anchor slides towards the
+            // oldest remaining rows instead of jumping or panicking.
+            self.scroll_from_bottom = (self.scroll_from_bottom + 1).saturating_sub(evicted);
+            self.unseen = self.unseen.saturating_add(1);
+        } else if !selected {
             self.unseen = self.unseen.saturating_add(1);
         }
+    }
+
+    /// Returns true when `line` is the exact device echo of the most recent TX
+    /// command row and was merged into it. Only applies to echo=on Slots with
+    /// `merge_echo` enabled, outside RAW mode, within a small row/time window
+    /// after the TX row. Anything else is appended untouched.
+    fn try_merge_echo(&mut self, line: &DisplayLine) -> bool {
+        if !self.merge_echo
+            || self.snapshot.config.settings.echo != EchoMode::On
+            || self.mode == InputMode::Raw
+            || line.direction != serial_protocol::Direction::Rx
+        {
+            return false;
+        }
+        let Some(tracker) = self.echo_pending else {
+            return false;
+        };
+        let first_abs = self.push_count - self.lines.len() as u64;
+        if tracker.abs_index < first_abs {
+            // The TX row fell out of the bounded buffer; nothing to mark.
+            self.echo_pending = None;
+            return false;
+        }
+        let rows_since_tx = self.push_count - 1 - tracker.abs_index;
+        if rows_since_tx > ECHO_MERGE_WINDOW_ROWS && tracker.at.elapsed() > ECHO_MERGE_WINDOW {
+            return false;
+        }
+        let index = (tracker.abs_index - first_abs) as usize;
+        let tx = &self.lines[index];
+        if tx.echoed || echo_normalized(&tx.text) != echo_normalized(&line.text) {
+            return false;
+        }
+        self.lines[index].echoed = true;
+        self.echo_pending = None;
+        true
     }
 
     fn push_event(&mut self, event: TimelineEvent, selected: bool) {
@@ -228,6 +313,7 @@ impl SlotView {
     fn reset_stream(&mut self) {
         self.stream.reset();
         self.pending_line = None;
+        self.echo_pending = None;
     }
 
     fn follow(&mut self) {
@@ -246,6 +332,12 @@ struct PendingPaste {
 struct QueuedControl {
     position: usize,
     since: Instant,
+}
+
+/// Normalizes a completed stream row for command-echo comparison: drop
+/// carriage returns and trailing whitespace so "root\r" matches "root".
+fn echo_normalized(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c == '\r' || c.is_whitespace())
 }
 
 struct App {
@@ -1629,6 +1721,10 @@ pub async fn run(
             .max(1),
     );
     app.config = Some(loaded.clone());
+    let merge_echo = loaded.config.merge_echo.unwrap_or(true);
+    for view in &mut app.slots {
+        view.merge_echo = merge_echo;
+    }
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
     let mut terminal = enter_terminal()?;
@@ -1867,7 +1963,11 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let view = app.current();
     let visible_height = area.height.saturating_sub(2) as usize;
     let total_lines = view.lines.len() + usize::from(view.pending_line.is_some());
-    let end = total_lines.saturating_sub(view.scroll_from_bottom);
+    // Clamp the paused offset so a vanished pending row can never produce an
+    // empty viewport; push_line already keeps the offset anchored on append
+    // and front-eviction.
+    let scroll = view.scroll_from_bottom.min(total_lines.saturating_sub(1));
+    let end = total_lines.saturating_sub(scroll);
     let start = end.saturating_sub(visible_height);
     let shell_prompt = view.snapshot.config.settings.shell_prompt.as_deref();
     let uboot_prompt = view.snapshot.config.settings.uboot_prompt.as_deref();
@@ -1900,9 +2000,11 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Renders one scrollback row. Compact mode is `{marker}{text}` where the
 /// two-column marker is a colored "●" for TX/actor-attributed rows and two
-/// spaces otherwise; detailed mode additionally shows the legacy `#seq` and
-/// source columns. Stream rows get inline keyword/prompt highlighting;
-/// system and gap rows keep their whole-line style.
+/// spaces otherwise; a TX row whose exact device echo was merged shows a
+/// softer unbolded "✓" in the same actor color instead. Detailed mode
+/// additionally shows the legacy `#seq` and source columns. Stream rows get
+/// inline keyword/prompt highlighting; system and gap rows keep their
+/// whole-line style.
 fn timeline_line(
     entry: &DisplayLine,
     detailed: bool,
@@ -1911,10 +2013,17 @@ fn timeline_line(
 ) -> Line<'static> {
     let mut spans = Vec::new();
     match entry.marker_color {
-        Some(color) => spans.push(Span::styled(
-            "● ",
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )),
+        Some(color) => {
+            let (glyph, modifier) = if entry.echoed {
+                ("✓ ", Modifier::empty())
+            } else {
+                ("● ", Modifier::BOLD)
+            };
+            spans.push(Span::styled(
+                glyph,
+                Style::default().fg(color).add_modifier(modifier),
+            ));
+        }
         None => spans.push(Span::raw("  ")),
     }
     if detailed {
@@ -2084,6 +2193,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("help.takeover").to_string(),
         tr("help.release").to_string(),
         tr("help.follow").to_string(),
+        tr("help.echo").to_string(),
         tr("help.paste").to_string(),
         tr("help.byte").to_string(),
         tr("help.quit").to_string(),
@@ -2190,7 +2300,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crossterm::event::KeyEvent;
-    use serial_protocol::{ActorKind, Direction, SerialSettings, SlotConfig};
+    use serial_protocol::{ActorKind, Direction, EchoMode, SerialSettings, SlotConfig};
 
     use super::*;
 
@@ -2854,5 +2964,122 @@ mod tests {
             metadata: BTreeMap::new(),
             durable: true,
         }
+    }
+
+    fn stream_row(seq: u64, direction: Direction, text: &str) -> DisplayLine {
+        DisplayLine {
+            seq,
+            source: if direction == Direction::Tx {
+                "HUMAN:test[abcd1234]>".into()
+            } else {
+                "DEV".into()
+            },
+            bytes: text.len() + 16,
+            source_style: Style::default(),
+            direction,
+            marker_color: (direction == Direction::Tx).then_some(Color::Green),
+            solid_style: None,
+            echoed: false,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn scrolled_viewport_stays_anchored_when_new_lines_arrive() {
+        let mut view = SlotView::new(snapshot());
+        for seq in 0..20 {
+            view.push_line(stream_row(seq, Direction::Rx, &format!("row-{seq}")), true);
+        }
+        view.scroll_from_bottom = 5;
+        view.unseen = 0;
+        // Anchor: the last visible row is index 20 - 5 - 1 = 14 ("row-14").
+        for seq in 20..23 {
+            view.push_line(stream_row(seq, Direction::Rx, &format!("row-{seq}")), true);
+        }
+        assert_eq!(view.scroll_from_bottom, 8);
+        let end = view.lines.len() - view.scroll_from_bottom;
+        assert_eq!(view.lines[end - 1].text, "row-14");
+        assert_eq!(view.unseen, 3);
+    }
+
+    #[test]
+    fn front_eviction_while_scrolled_keeps_the_offset_in_bounds() {
+        let mut view = SlotView::new(snapshot());
+        for seq in 0..MAX_LINES_PER_SLOT as u64 {
+            view.push_line(stream_row(seq, Direction::Rx, "row"), true);
+        }
+        view.scroll_from_bottom = 10;
+        for seq in 0..5u64 {
+            view.push_line(stream_row(20_000 + seq, Direction::Rx, "row"), true);
+        }
+        // Every append evicts one row, so the offset returns to 10 and the
+        // anchor index stays put instead of drifting, jumping, or panicking.
+        assert_eq!(view.scroll_from_bottom, 10);
+        assert!(view.scroll_from_bottom < view.lines.len());
+        assert_eq!(view.lines.len(), MAX_LINES_PER_SLOT);
+    }
+
+    #[test]
+    fn exact_command_echo_merges_into_the_tx_row() {
+        let mut view = SlotView::new(snapshot());
+        view.push_line(stream_row(1, Direction::Tx, "root"), true);
+        view.push_line(stream_row(2, Direction::Rx, "root\r"), true);
+        assert_eq!(view.lines.len(), 1);
+        assert!(view.lines[0].echoed);
+    }
+
+    #[test]
+    fn echo_off_slot_keeps_the_duplicate_echo_row() {
+        let mut view = SlotView::new(snapshot());
+        view.snapshot.config.settings.echo = EchoMode::Off;
+        view.push_line(stream_row(1, Direction::Tx, "root"), true);
+        view.push_line(stream_row(2, Direction::Rx, "root"), true);
+        assert_eq!(view.lines.len(), 2);
+        assert!(!view.lines[0].echoed);
+    }
+
+    #[test]
+    fn echo_merges_across_interleaved_log_rows_within_window() {
+        let mut view = SlotView::new(snapshot());
+        view.push_line(stream_row(1, Direction::Tx, "root"), true);
+        for i in 0..4u64 {
+            view.push_line(stream_row(10 + i, Direction::Rx, &format!("log {i}")), true);
+        }
+        view.push_line(stream_row(20, Direction::Rx, "root"), true);
+        assert_eq!(view.lines.len(), 5);
+        assert!(view.lines[0].echoed);
+    }
+
+    #[test]
+    fn mismatched_echo_text_keeps_both_rows() {
+        let mut view = SlotView::new(snapshot());
+        view.push_line(stream_row(1, Direction::Tx, "root"), true);
+        view.push_line(stream_row(2, Direction::Rx, "toor"), true);
+        assert_eq!(view.lines.len(), 2);
+        assert!(!view.lines[0].echoed);
+    }
+
+    #[test]
+    fn stale_echo_outside_the_window_keeps_both_rows() {
+        let mut view = SlotView::new(snapshot());
+        view.push_line(stream_row(1, Direction::Tx, "root"), true);
+        for i in 0..6u64 {
+            view.push_line(stream_row(10 + i, Direction::Rx, &format!("log {i}")), true);
+        }
+        view.echo_pending.as_mut().expect("tracked TX row").at =
+            Instant::now() - Duration::from_secs(2);
+        view.push_line(stream_row(20, Direction::Rx, "root"), true);
+        assert_eq!(view.lines.len(), 8);
+        assert!(!view.lines[0].echoed);
+    }
+
+    #[test]
+    fn raw_mode_does_not_merge_echo() {
+        let mut view = SlotView::new(snapshot());
+        view.mode = InputMode::Raw;
+        view.push_line(stream_row(1, Direction::Tx, "root"), true);
+        view.push_line(stream_row(2, Direction::Rx, "root"), true);
+        assert_eq!(view.lines.len(), 2);
+        assert!(!view.lines[0].echoed);
     }
 }

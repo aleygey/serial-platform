@@ -190,6 +190,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "  Ctrl-] f                 跟随实时输出",
     ),
     (
+        "help.echo",
+        "  ✓ marker                 device echo merged into the TX row (merge_echo=false disables)",
+        "  ✓ 标记                   设备回显已合并进 TX 行(可用 merge_echo=false 关闭)",
+    ),
+    (
         "help.paste",
         "  Ctrl-] p                 confirm blocked paste",
         "  Ctrl-] p                 确认被阻止的粘贴",

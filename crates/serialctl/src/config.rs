@@ -23,6 +23,10 @@ pub struct ClientConfig {
     pub human_idle_release_seconds: Option<u64>,
     /// UI language override ("en" or "zh"). Defaults to English when unset.
     pub language: Option<crate::i18n::Lang>,
+    /// Merge exact device command echoes into their TX rows for echo=on
+    /// Slots. Defaults to true when unset; set false to keep the raw
+    /// duplicate echo rows.
+    pub merge_echo: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

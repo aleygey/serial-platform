@@ -31,12 +31,17 @@ pub struct DisplayLine {
     pub source: String,
     pub text: String,
     pub source_style: Style,
+    /// Stream direction of the row. `None` rows are system/gap rows.
+    pub direction: Direction,
     /// Color of the leading "●" marker for TX/actor-attributed rows. `None`
     /// renders a two-space indent instead (device RX rows, system rows, gaps).
     pub marker_color: Option<Color>,
     /// Whole-line style for system/gap rows. `None` selects inline keyword and
     /// prompt highlighting (stream rows) at render time.
     pub solid_style: Option<Style>,
+    /// Set when the device echo of this TX row was received and merged: the
+    /// renderer switches the leading marker from "●" to "✓".
+    pub echoed: bool,
     pub bytes: usize,
 }
 
@@ -202,8 +207,10 @@ impl LineContext {
             source: self.source.clone(),
             bytes: text.len() + self.source.len() + 16,
             source_style: self.source_style,
+            direction: self.direction,
             marker_color: marker_color(self.direction, self.identity.actor_kind),
             solid_style: solid_style(self.direction, self.kind),
+            echoed: false,
             text,
         }
     }
@@ -503,8 +510,10 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
             source: source.clone(),
             bytes: text.len() + source.len() + 16,
             source_style,
+            direction: event.direction,
             marker_color,
             solid_style,
+            echoed: false,
             text,
         })
         .collect()
@@ -517,12 +526,14 @@ pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
         source: tr("d.gap").into(),
         bytes: text.len() + 20,
         source_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        direction: Direction::None,
         marker_color: None,
         solid_style: Some(
             Style::default()
                 .fg(Color::LightRed)
                 .add_modifier(Modifier::BOLD),
         ),
+        echoed: false,
         text,
     }
 }
