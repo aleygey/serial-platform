@@ -33,7 +33,6 @@ const MAX_LABEL_BYTES: usize = 256;
 const MAX_RUN_METADATA_BYTES: usize = 16 * 1024;
 const MAX_RUN_METADATA_KEYS: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-const JOURNAL_ACK_TIMEOUT: Duration = Duration::from_millis(100);
 const IDEMPOTENCY_ENTRIES: usize = 2_048;
 const WRITE_IDEMPOTENCY_HISTORY_ENTRIES: usize = 262_144;
 const ACTIVE_WINDOW: Duration = Duration::from_secs(5);
@@ -1442,7 +1441,7 @@ impl SlotActor {
         let mut degradation = None;
         let event = match self.journal.try_append(event.clone()) {
             Ok(pending) if self.logging == LoggingState::Healthy => {
-                match tokio::time::timeout(JOURNAL_ACK_TIMEOUT, pending.wait()).await {
+                match tokio::time::timeout(self.journal.ack_timeout(), pending.wait()).await {
                     Ok(Ok(durable)) => durable,
                     Ok(Err(error)) => {
                         if self.mark_logging_degraded(&error) {

@@ -42,6 +42,20 @@ const MAX_ARCHIVE_SUMMARIES: usize = 4_096;
 const MAX_QUERY_GAPS: usize = 1_024;
 const MAX_GAP_LEDGER_LINE_BYTES: usize = 64 * 1024;
 
+/// Production budget for one append acknowledgement before live delivery
+/// continues without durability.
+#[cfg(not(test))]
+fn default_ack_timeout() -> Duration {
+    Duration::from_millis(100)
+}
+
+/// Tests share a CI disk with every other parallel test; a slow append must
+/// never surface as a spurious `LoggingDegraded` timeline event.
+#[cfg(test)]
+fn default_ack_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
 /// Runtime limits for the append-only journal.
 #[derive(Debug, Clone)]
 pub struct JournalConfig {
@@ -51,6 +65,11 @@ pub struct JournalConfig {
     pub max_segment_age: Duration,
     pub max_total_bytes: u64,
     pub cleanup_low_watermark: f64,
+    /// How long a Slot waits for one append acknowledgement before continuing
+    /// live delivery and marking logging degraded. Unit tests default to a
+    /// far larger value so a slow CI disk cannot inject a spurious
+    /// `LoggingDegraded` event into exact-sequence assertions.
+    pub ack_timeout: Duration,
 }
 
 impl JournalConfig {
@@ -62,6 +81,7 @@ impl JournalConfig {
             max_segment_age: Duration::from_secs(60 * 60),
             max_total_bytes: 10 * 1024 * 1024 * 1024,
             cleanup_low_watermark: 0.90,
+            ack_timeout: default_ack_timeout(),
         }
     }
 
@@ -69,6 +89,11 @@ impl JournalConfig {
         if self.queue_capacity == 0 {
             return Err(JournalError::InvalidConfig(
                 "queue_capacity must be greater than zero".into(),
+            ));
+        }
+        if self.ack_timeout.is_zero() {
+            return Err(JournalError::InvalidConfig(
+                "ack_timeout must be greater than zero".into(),
             ));
         }
         if self.max_segment_bytes == 0 {
@@ -237,6 +262,13 @@ pub struct JournalHandle {
 }
 
 impl JournalHandle {
+    /// How long a Slot waits for one append acknowledgement before it
+    /// continues live delivery with `durable=false` and marks logging
+    /// degraded.
+    pub fn ack_timeout(&self) -> Duration {
+        self.config.ack_timeout
+    }
+
     /// Appends an event through the bounded writer queue.
     ///
     /// The returned event has `durable=true`; the input event is never reported
