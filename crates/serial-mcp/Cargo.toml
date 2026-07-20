@@ -1,0 +1,22 @@
+[package]
+name = "serial-mcp"
+description = "MCP adapter for seriald used by OpenCode, Codex, and other agents"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+directories.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serial-protocol = { path = "../serial-protocol" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+uuid.workspace = true

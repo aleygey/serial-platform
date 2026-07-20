@@ -42,14 +42,15 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
 
-      - name: Build seriald and serialctl
-        run: cargo build --release --locked -p seriald -p serialctl
+      - name: Build Windows binaries
+        run: cargo build --release --locked -p seriald -p serialctl -p serial-mcp
 
       - name: Smoke-test binaries
         shell: pwsh
         run: |
           .\target\release\seriald.exe --version
           .\target\release\serialctl.exe --version
+          .\target\release\serial-mcp.exe --version
 
       - name: Package Windows release
         shell: pwsh
@@ -59,6 +60,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item "target\release\seriald.exe" $packageDir
           Copy-Item "target\release\serialctl.exe" $packageDir
+          Copy-Item "target\release\serial-mcp.exe" $packageDir
+          Copy-Item "adapters" $packageDir -Recurse
           Copy-Item "README.md" $packageDir
           Copy-Item "DOCUMENTATION.md" $packageDir
           Copy-Item "LICENSE" $packageDir
@@ -92,25 +95,30 @@ jobs:
       - name: Test workspace natively
         run: cargo test --workspace --locked
 
-      - name: Build static Linux serialctl
-        run: cargo build --release --locked -p serialctl --target x86_64-unknown-linux-musl
+      - name: Build static Linux clients
+        run: cargo build --release --locked -p serialctl -p serial-mcp --target x86_64-unknown-linux-musl
 
       - name: Smoke-test Linux client
         run: |
           binary=./target/x86_64-unknown-linux-musl/release/serialctl
           "${binary}" --version
-          if readelf -d "${binary}" | grep -q '(NEEDED)'; then
-            echo "Linux release unexpectedly contains a dynamic dependency" >&2
-            exit 1
-          fi
+          mcp_binary=./target/x86_64-unknown-linux-musl/release/serial-mcp
+          "${mcp_binary}" --version
+          for candidate in "${binary}" "${mcp_binary}"; do
+            if readelf -d "${candidate}" | grep -q '(NEEDED)'; then
+              echo "Linux release unexpectedly contains a dynamic dependency: ${candidate}" >&2
+              exit 1
+            fi
+          done
 
       - name: Package Linux client
         run: |
-          package_name="serialctl-${GITHUB_REF_NAME}-linux-x86_64-musl"
+          package_name="serial-platform-${GITHUB_REF_NAME}-linux-x86_64-musl"
           package_dir="dist/${package_name}"
           mkdir -p "${package_dir}"
           install -m 0755 target/x86_64-unknown-linux-musl/release/serialctl "${package_dir}/serialctl"
-          cp README.md DOCUMENTATION.md LICENSE "${package_dir}/"
+          install -m 0755 target/x86_64-unknown-linux-musl/release/serial-mcp "${package_dir}/serial-mcp"
+          cp -r README.md DOCUMENTATION.md LICENSE adapters "${package_dir}/"
           tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
 
       - name: Upload Linux package

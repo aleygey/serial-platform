@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "serial": {
+      "type": "local",
+      "command": ["/usr/local/bin/serial-mcp", "--actor-label", "opencode:workstation"],
+      "enabled": true,
+      "timeout": 120000
+    }
+  },
+  "permission": {
+    "serial_devices": "allow",
+    "serial_read": "allow",
+    "serial_wait": "allow",
+    "serial_search": "allow",
+    "serial_command": "ask",
+    "serial_run_start": "ask",
+    "serial_run_end": "ask",
+    "serial_release": "allow"
+  }
+}
+

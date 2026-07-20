@@ -1979,8 +1979,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "directories",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial-protocol",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "serial-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "serde",
@@ -1991,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "serialctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2015,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "seriald"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",

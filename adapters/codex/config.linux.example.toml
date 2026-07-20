@@ -1,0 +1,8 @@
+[mcp_servers.serial]
+enabled = true
+required = true
+command = "/usr/local/bin/serial-mcp"
+args = ["--actor-label", "codex:workstation"]
+startup_timeout_sec = 10.0
+tool_timeout_sec = 130.0
+

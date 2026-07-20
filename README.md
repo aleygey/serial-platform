@@ -5,8 +5,9 @@ runs on the machine physically connected to the serial card; any number of
 `serialctl` clients can observe the same Slots, while a fenced control lease
 ensures that only one actor writes to a Slot at a time.
 
-It deliberately has no OpenCode, Agent, or OpenChamber dependency. Those are
-future adapters over the same protocol.
+It deliberately has no OpenCode or OpenChamber runtime dependency. The
+`serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
+MCP clients without making `seriald` Agent-specific.
 
 ## What v1 provides
 
@@ -29,6 +30,8 @@ future adapters over the same protocol.
 - Observer, operator, and admin Bearer credentials.
 - Windows daemon with a Windows or Linux/VM client over a trusted host-only
   network.
+- One `serial-mcp` adapter for OpenCode and Codex, with Run-scoped search,
+  cursor-safe reads, bounded command capture, and no Agent takeover/close.
 - Bounded cross-reconnect write safety within one daemon epoch: recent duplicate
   request IDs return their cached result, older executed IDs are rejected
   instead of being written again, and an unacknowledged outcome remains
@@ -48,20 +51,20 @@ untouched, or use electrical isolation/reset gating.
 
 Each release provides two x86_64 packages:
 
-- `serial-platform-<version>-windows-x86_64.zip` contains the Windows
-  `seriald.exe` backend and `serialctl.exe` client.
-- `serialctl-<version>-linux-x86_64-musl.tar.gz` contains a statically linked
-  Linux client. It does not include a Linux daemon because the Windows host
-  owns the workstation COM ports.
+- `serial-platform-<version>-windows-x86_64.zip` contains `seriald.exe`,
+  `serialctl.exe`, and `serial-mcp.exe`.
+- `serial-platform-<version>-linux-x86_64-musl.tar.gz` contains statically
+  linked `serialctl` and `serial-mcp` clients. It does not include a Linux
+  daemon because the Windows host owns the workstation COM ports.
 
 Extract the Windows package on the host connected to the serial card. Extract
 the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serialctl-v0.1.0-linux-x86_64-musl.tar.gz
-cd serialctl-v0.1.0-linux-x86_64-musl
-chmod +x serialctl
+tar -xzf serial-platform-v0.2.0-linux-x86_64-musl.tar.gz
+cd serial-platform-v0.2.0-linux-x86_64-musl
+chmod +x serialctl serial-mcp
 ```
 
 Release checksums are published in `SHA256SUMS`. The command examples below
@@ -207,6 +210,19 @@ older test cycles. `--contains` only filters that range; it does not make an old
 match current. Archive catalog times labeled `segment-open` are segment
 creation bounds, not exact first/last event timestamps.
 
+## OpenCode and Codex
+
+Install `serial-mcp` on the same Windows or Linux machine where the Agent
+platform runs. It reuses the endpoint and operator token written by
+`serialctl init`, so Agent config contains no secret. Ready-to-copy OpenCode
+JSONC and Codex TOML examples, the stable eight-tool surface, and the expected
+Run workflow are in [adapters/README.md](./adapters/README.md).
+
+The adapter connects directly to `seriald`; the Agent is not asked to compose
+shell commands around `serialctl`. OpenCode exposes the tools as
+`serial_devices`, `serial_command`, and so on. Codex exposes the same tools in
+the configured `serial` MCP namespace.
+
 ## Profile adjustments
 
 `serialctl init` creates the agreed `generic-115200` Profile snapshot and keeps
@@ -220,7 +236,7 @@ omitted Slots remain preserved unless deletion is explicitly confirmed.
 
 ## Current boundaries
 
-v1 does not include Agent adapters, device-pool Reservations, flashing recipes,
+v1 does not include device-pool Reservations, flashing recipes,
 server-side boot-interrupt triggers, a reusable Profile catalog/editor,
 automatic probes, full VT100 emulation, external `screen/minicom` handoff,
 TLS, compression, or a Windows Service installer. Slot configuration already

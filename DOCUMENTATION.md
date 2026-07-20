@@ -8,9 +8,25 @@ This directory is a standalone Rust workspace:
 - `seriald`: configuration, authentication, serial actors, control/Run state,
   journal, HTTP APIs, and WebSocket subscriptions.
 - `serialctl`: remote setup, diagnostics, log query, and the human terminal.
+- `serial-mcp`: thin Agent-facing MCP transport and bounded operation adapter.
 
-No crate imports OpenChamber or an Agent SDK. Future OpenCode, Claude Code,
-Codex, MCP, and OpenChamber integrations are consumers of this platform.
+No crate imports OpenChamber or an Agent SDK. OpenCode and Codex both consume
+`serial-mcp`; future Claude Code and OpenChamber integrations can reuse it or
+consume the same platform protocol.
+
+`serial-mcp` owns no physical-port lifecycle. It reads authoritative snapshots
+and journals over HTTP, observes realtime events over WebSocket, and keeps one
+Agent control connection with bounded lease renewal. It can queue for control
+but cannot request takeover, configure/remove a Slot, suspend/close a serial
+handle, or flash a target. Its stable tools are `devices`, `read`, `command`,
+`wait`, `search`, `run_start`, `run_end`, and `release`.
+
+Agent `search` defaults to the active Run. Cross-Run or old-epoch history is
+never inferred from a text match: current-cursor and archive scopes require an
+explicit cursor/epoch. `command` attaches before TX, creates an Operation UUID,
+captures a bounded event window, and marks any foreign TX as interference.
+Prompt/quiet matches are reported as completion evidence, not proof of command
+success. The adapter never automatically retries an uncertain write.
 
 ## Identity model
 
