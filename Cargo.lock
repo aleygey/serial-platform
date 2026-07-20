@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "serial-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "serial-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "serde",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "serialctl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "seriald"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
