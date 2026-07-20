@@ -1987,6 +1987,7 @@ dependencies = [
  "clap",
  "directories",
  "futures-util",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -2029,6 +2030,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
 ]
 
