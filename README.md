@@ -39,7 +39,7 @@ MCP clients without making `seriald` Agent-specific.
 
 The station defaults agreed for v1 are: 115200 8N1, no flow control, DTR and
 RTS low, command EOL `\r`, echo on, U-Boot prompt `SigmaStar #`, automatic
-probe disabled, and `auto_open=true`.
+probe disabled, `auto_open=true`, and writes paced at one byte per 1 ms.
 
 With hardware flow control, the driver owns RTS and `rts=true` is rejected.
 Linux drivers may transiently assert DTR during open even when the final
@@ -141,9 +141,10 @@ Opening the console only subscribes. The first write asks for Human Control.
 If another actor owns it, the request queues; only `Takeover` revokes it.
 The footer keeps the queue position, age, and held chunk count visible. Queued
 input expires after 60 seconds without human activity. `Ctrl-] c` cancels it by
-reconnecting the v1 actor connection; because the protocol has no dedicated
-cancel-acquire message yet, that reconnect also releases this terminal's
-control on every other Slot, then automatically restores all subscriptions.
+reconnecting the v1 actor connection; the protocol now carries a dedicated
+`cancel_acquire` message, but the v1 terminal still uses that reconnect, which
+also releases this terminal's control on every other Slot, then automatically
+restores all subscriptions.
 An acquired human lease is renewed only while that Slot has recent manual
 activity or an in-flight write, and is released after 60 seconds idle. LINE/RAW
 mode and command history are independent for every Slot.
@@ -226,25 +227,70 @@ the configured `serial` MCP namespace.
 ## Profile adjustments
 
 `serialctl init` creates the agreed `generic-115200` Profile snapshot and keeps
-an existing same-port snapshot on later runs. v1 has no Profile editor. To set
-a later shell prompt or a station-specific serial value, run `seriald paths`,
-stop the daemon, edit that Slot's `settings` in `seriald.toml`, validate that the
-file still contains the intended Slots, and restart `seriald`. The daemon file
-also contains bearer credentials, so do not copy it into logs or support
-messages. Running `serialctl init` again is the safer path for COM discovery;
-omitted Slots remain preserved unless deletion is explicitly confirmed.
+an existing same-port snapshot on later runs. To set a later shell prompt or a
+station-specific serial value, run `seriald paths`, stop the daemon, edit that
+Slot's `settings` in `seriald.toml`, validate that the file still contains the
+intended Slots, and restart `seriald`. The daemon file also contains bearer
+credentials, so do not copy it into logs or support messages. Running
+`serialctl init` again is the safer path for COM discovery; omitted Slots
+remain preserved unless deletion is explicitly confirmed.
+
+Device-model prompts can also live in a reusable catalog instead of being
+copied into every Slot. A `[[device_profiles]]` entry names the model and its
+prompts:
+
+```toml
+[[device_profiles]]
+name = "sigmastar-evb"
+shell_prompt = "root@sigmastar:/# "
+uboot_prompt = "SigmaStar =>"
+```
+
+A Slot references the entry with `device_profile = "sigmastar-evb"`. Prompts
+resolve in a fixed order: an explicit Slot `settings` value wins, then the
+referenced profile, then the built-in U-Boot default (`SigmaStar #`). The
+Slot-level `uboot_prompt` therefore defaults to unset so it never shadows a
+catalog entry. The catalog is validated on load — duplicate names, unknown
+Slot references, and more than 128 entries are rejected — and it can be
+replaced without a restart over HTTP: `GET /api/v1/config/device-profiles`
+lists it (observer) and `PUT /api/v1/config/device-profiles` validates,
+persists, and publishes a new catalog (admin). `serialctl` has no catalog
+editor yet.
+
+Two Slot settings protect slow UART sinks from overruns: the writer sends
+`write_chunk_size` bytes, then waits `write_chunk_delay_ms` before the next
+chunk. The defaults (1 byte, 1 ms) produce a typewriter cadence; set
+`write_chunk_delay_ms = 0` to send each write as one unthrottled burst. A
+single write request can also carry its own pacing override. Note that
+`seriald` rejects zero-byte writes, so clients must send at least the line
+ending.
+
+## Control tuning
+
+Write-control leases and queues are bounded by the optional `[control]`
+section of `seriald.toml`:
+
+```toml
+[control]
+max_ttl_ms = 60000      # lease TTL ceiling, clamped to at least 5000
+wait_timeout_ms = 60000 # lifetime of a queued acquire request
+max_waiters = 128       # per-Slot wait-queue bound
+```
+
+The defaults match the compiled-in v1 behavior, so the section can be omitted
+entirely; changes apply on the next daemon start.
 
 ## Current boundaries
 
 v1 does not include device-pool Reservations, flashing recipes,
-server-side boot-interrupt triggers, a reusable Profile catalog/editor,
-automatic probes, full VT100 emulation, external `screen/minicom` handoff,
-TLS, compression, or a Windows Service installer. Slot configuration already
-carries a complete Profile snapshot, so a catalog can be added without changing
-the physical-port or event model. `seriald serve` is the backend CLI entrypoint;
-service packaging can be added after station validation. Explicit Windows ACL
-auditing/hardening for shared service accounts is also roadmap work; current
-per-user files inherit the Windows profile directory ACL.
+server-side boot-interrupt triggers, automatic probes, full VT100 emulation,
+external `screen/minicom` handoff, TLS, compression, or a Windows Service
+installer. A daemon-level device-profile catalog exists and is managed over
+HTTP; a `serialctl` editor for it is still roadmap work. `seriald serve` is
+the backend CLI entrypoint; service packaging can be added after station
+validation. Explicit Windows ACL auditing/hardening for shared service
+accounts is also roadmap work; current per-user files inherit the Windows
+profile directory ACL.
 
 See [DOCUMENTATION.md](./DOCUMENTATION.md) for protocol, state, logging, and
 correctness invariants.

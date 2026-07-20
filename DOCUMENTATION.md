@@ -71,7 +71,12 @@ flowchart LR
 
 The serial worker owns the OS handle. Its read and write halves run independently:
 RX is coalesced for at most 4 ms or 4 KiB, while each write is limited to 4 KiB
-and a two-second deadline. A 4,096-entry RX queue absorbs ordinary storage or
+and chunked by the effective pacing — `write_chunk_size` bytes, then
+`write_chunk_delay_ms` between chunks (the default is a 1 byte/1 ms typewriter
+cadence; a zero delay disables pacing and a single request can override both).
+The write deadline is at least two seconds, extended to twice the estimated
+pacing duration plus two seconds so a slow cadence cannot expire mid-write. A
+4,096-entry RX queue absorbs ordinary storage or
 scheduler stalls; saturation drops bytes instead of blocking the OS reader and
 creates an explicit overflow event with the dropped byte count.
 
@@ -117,18 +122,23 @@ isolation/reset gating.
 Every write requires the current `control_id`, `daemon_epoch`, `generation`, and
 monotonically increasing fencing value. The server rejects a stale ID/fence
 before touching the physical port. Leases have bounded TTL and clients renew
-them while active. TTL enforcement uses a monotonic clock; wall-clock expiry is
-display-only and cannot be extended by changing the system time.
+them while active. Requested TTLs are clamped between a five-second floor and
+the `[control] max_ttl_ms` ceiling (default 60 seconds). TTL enforcement uses a
+monotonic clock; wall-clock expiry is display-only and cannot be extended by
+changing the system time.
 
 - A normal acquire queues behind the current owner.
-- A Slot accepts at most 128 distinct waiters. A queued actor expires after 60
-  seconds unless it explicitly requests control again; an expired waiter is
+- A Slot accepts at most `[control] max_waiters` distinct waiters (default
+  128). A queued actor expires after `[control] wait_timeout_ms` (default 60
+  seconds) unless it explicitly requests control again; an expired waiter is
   never promoted later into an unrelated target state.
 - An explicit takeover revokes the current owner.
-- `serialctl` keeps queued position/age/input visible. Because v1 has no
-  cancel-acquire message, cancelling a queued human command deliberately
-  reconnects that actor: all of its queues and controls are released, then its
-  Slot subscriptions attach again.
+- A client can withdraw its own queued acquire with `cancel_acquire`; the
+  daemon removes only that actor's queue entry and answers
+  `acquire_cancelled { removed }`. `serialctl` keeps queued position/age/input
+  visible and still cancels a queued human command by deliberately
+  reconnecting that actor: all of its queues and controls are released, then
+  its Slot subscriptions attach again.
 - `serialctl` renews a human lease only while that Slot has manual activity or
   an in-flight write. It releases the lease after 60 seconds idle; queued human
   input also expires after 60 seconds idle.
@@ -147,8 +157,8 @@ display-only and cannot be extended by changing the system time.
 Each request has a UUID. Non-write requests use a bounded actor-scoped cache.
 Writes use a separate result cache keyed by
 `(Slot, daemon_epoch, request_id)`; their stable fingerprint contains only bytes
-plus `operation_id`, so a recent duplicate can return the same result after a
-WebSocket reconnect issues a new actor and lease. A cache hit still has to
+plus `operation_id` and the requested pacing override, so a recent duplicate can
+return the same result after a WebSocket reconnect issues a new actor and lease. A cache hit still has to
 present the current actor's valid control ID and fence.
 
 The smaller result cache is backed by an exact, non-evicting set of up to
@@ -220,6 +230,14 @@ bounded 512-frame outbound channel; excess upgrade requests receive HTTP 429.
 Together with the per-Slot waiter bound, a faulty authenticated client cannot
 grow connection or control-queue state without limit.
 
+Writes carry base64 bytes, an optional client-chosen `operation_id`, and an
+optional per-request `pacing` override (`chunk_size`, `chunk_delay_ms`) that
+takes precedence over the Slot settings for that one write. Zero-byte writes
+are rejected, so clients send at least the line ending. A queued acquire can be
+withdrawn with `cancel_acquire`; the reply is `acquire_cancelled` with a
+`removed` flag, and the request travels through the same per-actor idempotency
+cache as the other control commands.
+
 ## HTTP API
 
 All endpoints require a role token.
@@ -230,6 +248,8 @@ All endpoints require a role token.
 | `GET /api/v1/status` | observer | Authoritative Slot snapshots |
 | `GET /api/v1/ports` | admin | Enumerate ports on the daemon host |
 | `PUT /api/v1/config/slots` | admin | Validate, persist, and replace Slots |
+| `GET /api/v1/config/device-profiles` | observer | List the device profile catalog |
+| `PUT /api/v1/config/device-profiles` | admin | Validate, persist, and replace the catalog |
 | `GET /api/v1/archives` | observer | List bounded retained Slot/epoch archives |
 | `GET /api/v1/slots/{id}/events` | observer | Bounded durable query |
 | `GET /api/v1/ws` | observer | Realtime protocol; writes require operator |
@@ -246,6 +266,15 @@ configs, and resumes the old active actors without ever publishing the rejected
 topology. Existing Slot IDs are reconfigured in place: changed/removed ports
 are fully stopped first, unchanged actors keep their sequence/ring/live
 channel, and only genuinely new Slot IDs create new actors.
+
+Device prompts resolve per Slot in a fixed order: an explicit value in the
+Slot's `settings` wins, then the referenced `device_profile` catalog entry,
+then the built-in U-Boot default (`SigmaStar #`). The Slot-level
+`uboot_prompt` defaults to unset so it never shadows a catalog entry, and the
+resolved values are published on every snapshot as `effective_shell_prompt` /
+`effective_uboot_prompt`. The catalog holds at most 128 entries, rejects
+duplicate names and dangling Slot references, and is replaced atomically; a
+catalog swap only republishes snapshots and never touches an open port.
 
 ## Journal
 
