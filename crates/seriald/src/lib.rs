@@ -36,6 +36,7 @@ pub async fn serve(
         started,
         journal.handle(),
         loaded.config.slots.clone(),
+        loaded.config.device_profiles.clone(),
     );
     let state = AppState::new(
         store,

@@ -4,9 +4,10 @@ use crate::ring::{EventRing, ReplayError, ReplayWindow};
 use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, Direction, EventKind,
-    FlowControl, LoggingState, Parity, RunInfo, RunStatus, SerialSettings, SessionState,
+    Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceProfile, Direction,
+    EventKind, FlowControl, LoggingState, Parity, RunInfo, RunStatus, SerialSettings, SessionState,
     SlotConfig, SlotSnapshot, StopBits, TargetActivity, TimelineEvent, WritePacing,
+    resolve_device_settings,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -120,32 +121,35 @@ impl From<ReplayError> for SlotError {
 impl SlotHandle {
     pub fn spawn(
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
     ) -> Self {
-        Self::spawn_inner(config, daemon_epoch, daemon_started, journal, false)
+        Self::spawn_inner(config, device_profile, daemon_epoch, daemon_started, journal, false)
     }
 
     /// Creates a candidate Slot actor that cannot open its port until the
     /// surrounding configuration transaction has been persisted and commits.
     pub(crate) fn spawn_staged(
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
     ) -> Self {
-        Self::spawn_inner(config, daemon_epoch, daemon_started, journal, true)
+        Self::spawn_inner(config, device_profile, daemon_epoch, daemon_started, journal, true)
     }
 
     fn spawn_inner(
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
         staged: bool,
     ) -> Self {
-        let initial = initial_snapshot(config.clone(), daemon_epoch, staged);
+        let initial = initial_snapshot(config.clone(), device_profile.clone(), daemon_epoch, staged);
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE);
         let (events, _) = broadcast::channel(BROADCAST_QUEUE);
         let (snapshot_tx, snapshot) = watch::channel(initial);
@@ -160,6 +164,7 @@ impl SlotHandle {
         tokio::spawn(
             SlotActor {
                 config,
+                device_profile,
                 daemon_epoch,
                 daemon_started,
                 journal,
@@ -385,18 +390,38 @@ impl SlotHandle {
     pub(crate) async fn stage_reconfiguration(
         &self,
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(SlotCommand::StageReconfiguration {
                 config,
+                device_profile,
                 resume_on_rollback,
                 reply,
             })
             .await
             .map_err(|_| SlotError::Closed)?;
         result.await.map_err(|_| SlotError::ReplyDropped)?
+    }
+
+    /// Replaces the device profile used to resolve effective prompts. The
+    /// actor only republishes its snapshot; the port is never touched. The
+    /// returned future completes once the new snapshot is published.
+    pub(crate) async fn set_device_profile(&self, device_profile: Option<DeviceProfile>) {
+        let (reply, done) = oneshot::channel();
+        if self
+            .commands
+            .send(SlotCommand::SetDeviceProfile {
+                device_profile,
+                reply,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = done.await;
+        }
     }
 
     pub(crate) async fn stage_removal(&self) -> Result<(), SlotError> {
@@ -514,8 +539,13 @@ enum SlotCommand {
     },
     StageReconfiguration {
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
+    },
+    SetDeviceProfile {
+        device_profile: Option<DeviceProfile>,
+        reply: oneshot::Sender<()>,
     },
     StageRemoval {
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -606,6 +636,7 @@ enum PendingReconfiguration {
     /// A replacement config held entirely inside the actor until commit.
     Replace {
         config: Box<SlotConfig>,
+        device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
     },
     /// An active Slot that will move to the retired map on commit.
@@ -614,6 +645,7 @@ enum PendingReconfiguration {
 
 struct SlotActor {
     config: SlotConfig,
+    device_profile: Option<DeviceProfile>,
     daemon_epoch: Uuid,
     daemon_started: Instant,
     journal: JournalHandle,
@@ -868,11 +900,23 @@ impl SlotActor {
             }
             CommandDisposition::StageReconfiguration {
                 config,
+                device_profile,
                 resume_on_rollback,
                 reply,
             } => {
-                let result = self.stage_reconfiguration(config, resume_on_rollback).await;
+                let result = self
+                    .stage_reconfiguration(config, device_profile, resume_on_rollback)
+                    .await;
                 let _ = reply.send(result);
+                return false;
+            }
+            CommandDisposition::SetDeviceProfile {
+                device_profile,
+                reply,
+            } => {
+                self.device_profile = device_profile;
+                self.publish_snapshot().await;
+                let _ = reply.send(());
                 return false;
             }
             CommandDisposition::StageRemoval { reply } => {
@@ -1424,6 +1468,7 @@ impl SlotActor {
 
     async fn publish_snapshot(&self) {
         let oldest = self.ring.lock().await.oldest_seq();
+        let resolved = resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
         self.snapshot.send_replace(SlotSnapshot {
             config: self.config.clone(),
             daemon_epoch: self.daemon_epoch,
@@ -1440,6 +1485,8 @@ impl SlotActor {
             control: self.control.current().cloned(),
             active_run: self.active_run.clone(),
             logging: self.logging,
+            effective_shell_prompt: resolved.shell_prompt,
+            effective_uboot_prompt: resolved.uboot_prompt,
         });
     }
 
@@ -1490,6 +1537,7 @@ impl SlotActor {
     async fn stage_reconfiguration(
         &mut self,
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
         if config.id != self.config.id {
@@ -1499,6 +1547,7 @@ impl SlotActor {
         self.pause_for_reconfigure().await?;
         self.pending_reconfiguration = Some(PendingReconfiguration::Replace {
             config: Box::new(config),
+            device_profile,
             resume_on_rollback,
         });
         Ok(())
@@ -1521,8 +1570,13 @@ impl SlotActor {
                 self.resume_current_config();
                 self.publish_snapshot().await;
             }
-            PendingReconfiguration::Replace { config, .. } => {
-                self.apply_committed_reconfiguration(*config).await;
+            PendingReconfiguration::Replace {
+                config,
+                device_profile,
+                ..
+            } => {
+                self.apply_committed_reconfiguration(*config, device_profile)
+                    .await;
             }
             PendingReconfiguration::Remove => {
                 self.emit(
@@ -1565,8 +1619,13 @@ impl SlotActor {
         Ok(())
     }
 
-    async fn apply_committed_reconfiguration(&mut self, config: SlotConfig) {
+    async fn apply_committed_reconfiguration(
+        &mut self,
+        config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
+    ) {
         let previous = std::mem::replace(&mut self.config, config);
+        self.device_profile = device_profile;
         self.resume_current_config();
         self.emit(
             EventKind::SlotReconfigured,
@@ -1891,8 +1950,13 @@ enum CommandDisposition {
     },
     StageReconfiguration {
         config: SlotConfig,
+        device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
+    },
+    SetDeviceProfile {
+        device_profile: Option<DeviceProfile>,
+        reply: oneshot::Sender<()>,
     },
     StageRemoval {
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -2037,11 +2101,20 @@ impl SlotCommand {
             }
             SlotCommand::StageReconfiguration {
                 config,
+                device_profile,
                 resume_on_rollback,
                 reply,
             } => CommandDisposition::StageReconfiguration {
                 config,
+                device_profile,
                 resume_on_rollback,
+                reply,
+            },
+            SlotCommand::SetDeviceProfile {
+                device_profile,
+                reply,
+            } => CommandDisposition::SetDeviceProfile {
+                device_profile,
                 reply,
             },
             SlotCommand::StageRemoval { reply } => CommandDisposition::StageRemoval { reply },
@@ -2056,7 +2129,12 @@ impl SlotCommand {
     }
 }
 
-fn initial_snapshot(config: SlotConfig, daemon_epoch: Uuid, staged: bool) -> SlotSnapshot {
+fn initial_snapshot(
+    config: SlotConfig,
+    device_profile: Option<DeviceProfile>,
+    daemon_epoch: Uuid,
+    staged: bool,
+) -> SlotSnapshot {
     let state = if staged {
         SessionState::Disabled
     } else if config.enabled && config.settings.auto_open {
@@ -2064,6 +2142,7 @@ fn initial_snapshot(config: SlotConfig, daemon_epoch: Uuid, staged: bool) -> Slo
     } else {
         SessionState::Disabled
     };
+    let resolved = resolve_device_settings(&config.settings, device_profile.as_ref());
     SlotSnapshot {
         config,
         daemon_epoch,
@@ -2080,6 +2159,8 @@ fn initial_snapshot(config: SlotConfig, daemon_epoch: Uuid, staged: bool) -> Slo
         control: None,
         active_run: None,
         logging: LoggingState::Healthy,
+        effective_shell_prompt: resolved.shell_prompt,
+        effective_uboot_prompt: resolved.uboot_prompt,
     }
 }
 

@@ -12,8 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
-    Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureSlotsRequest,
-    ConfigureSlotsResponse, ErrorCode, EventQuery, EventQueryResponse, HealthResponse,
+    Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceProfilesRequest,
+    ConfigureDeviceProfilesResponse, ConfigureSlotsRequest, ConfigureSlotsResponse,
+    DeviceProfileListResponse, ErrorCode, EventQuery, EventQueryResponse, HealthResponse,
     PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage, StatusResponse, encode_control,
     encode_event,
 };
@@ -84,7 +85,7 @@ impl AppState {
         let applied = self
             .inner
             .registry
-            .apply_replacement(staged.slots.clone())
+            .apply_replacement(staged.slots.clone(), staged.device_profiles.clone())
             .await?;
 
         match self.inner.config_store.save(&staged) {
@@ -98,6 +99,27 @@ impl AppState {
                 Err(rollback) => Err(ApiError::ConfigRollback { save, rollback }),
             },
         }
+    }
+
+    /// Validates, persists, and then publishes a device profile catalog. The
+    /// runtime effect is limited to snapshots resolving prompts from the new
+    /// profiles, so a persistence failure simply leaves every view unchanged.
+    async fn configure_device_profiles_transaction(
+        &self,
+        requested: Vec<serial_protocol::DeviceProfile>,
+    ) -> Result<Vec<serial_protocol::DeviceProfile>, ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        let staged = current
+            .staged_with_device_profiles(requested)
+            .map_err(ConfigError::from)?;
+        self.inner.config_store.save(&staged)?;
+        *self.inner.config.write().await = staged.clone();
+        self.inner
+            .registry
+            .apply_device_profiles(staged.device_profiles.clone())
+            .await;
+        Ok(staged.device_profiles)
     }
 
     async fn authenticate(
@@ -124,6 +146,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/ports", get(ports))
         .route("/api/v1/config/slots", put(configure_slots))
+        .route(
+            "/api/v1/config/device-profiles",
+            get(list_device_profiles).put(configure_device_profiles),
+        )
         .route("/api/v1/archives", get(archives))
         .route("/api/v1/slots/{slot_id}/events", get(events))
         .route("/api/v1/ws", get(websocket))
@@ -215,6 +241,36 @@ async fn configure_slots(
             .await
             .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
     Ok(Json(ConfigureSlotsResponse { slots }))
+}
+
+async fn list_device_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceProfileListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let config = state.inner.config.read().await;
+    Ok(Json(DeviceProfileListResponse {
+        profiles: config.device_profiles.clone(),
+    }))
+}
+
+async fn configure_device_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigureDeviceProfilesRequest>,
+) -> Result<Json<ConfigureDeviceProfilesResponse>, ApiError> {
+    state.authenticate(&headers, Role::Admin).await?;
+    // Mirror the Slot transaction: the spawned task completes the validate /
+    // persist / publish sequence even if the HTTP request is cancelled.
+    let transaction = state.clone();
+    let profiles = tokio::spawn(async move {
+        transaction
+            .configure_device_profiles_transaction(request.profiles)
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
+    Ok(Json(ConfigureDeviceProfilesResponse { profiles }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -896,6 +952,7 @@ mod tests {
             display_name: display_name.into(),
             port: port.into(),
             profile: "generic-115200".into(),
+            device_profile: None,
             enabled: false,
             settings: SerialSettings {
                 auto_open: false,
@@ -918,6 +975,7 @@ mod tests {
             started,
             journal.handle(),
             loaded.config.slots.clone(),
+            loaded.config.device_profiles.clone(),
         );
         let state = AppState::new(
             store.clone(),
@@ -952,7 +1010,7 @@ mod tests {
             JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
                 .unwrap();
         let registry =
-            SlotRegistry::new(loaded.daemon_epoch, started, journal.handle(), Vec::new());
+            SlotRegistry::new(loaded.daemon_epoch, started, journal.handle(), Vec::new(), Vec::new());
         let state = AppState::new(
             store.clone(),
             loaded.config,
@@ -991,7 +1049,7 @@ mod tests {
             JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
                 .unwrap();
         let registry =
-            SlotRegistry::new(loaded.daemon_epoch, started, journal.handle(), Vec::new());
+            SlotRegistry::new(loaded.daemon_epoch, started, journal.handle(), Vec::new(), Vec::new());
         let state = AppState::new(
             store.clone(),
             loaded.config,
@@ -1062,6 +1120,7 @@ mod tests {
             started,
             journal.handle(),
             old_slots.clone(),
+            Vec::new(),
         );
         let state = AppState::new(
             store.clone(),
@@ -1107,6 +1166,174 @@ mod tests {
 
         store.set_save_failure(false);
         state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    fn sigmastar_profile() -> serial_protocol::DeviceProfile {
+        serial_protocol::DeviceProfile {
+            name: "sigmastar-evb".into(),
+            shell_prompt: Some("root@sigmastar:/# ".into()),
+            uboot_prompt: Some("SigmaStar =>".into()),
+            write_eol: None,
+            echo: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn device_profile_update_commits_memory_disk_and_live_snapshots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let mut referencing = disabled_slot("slot-1", "Slot 1", "COM3");
+        referencing.device_profile = Some("sigmastar-evb".into());
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![referencing.clone()],
+            vec![sigmastar_profile()],
+        );
+        // The catalog must be present in memory for validation to pass; the
+        // registry was built with it directly above.
+        let mut config = loaded.config.clone();
+        config.slots = vec![referencing];
+        config.device_profiles = vec![sigmastar_profile()];
+        store.save(&config).unwrap();
+        let state = AppState::new(
+            store.clone(),
+            config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+
+        let snapshot = state
+            .inner
+            .registry
+            .get("slot-1")
+            .await
+            .unwrap()
+            .snapshot();
+        assert_eq!(
+            snapshot.effective_shell_prompt.as_deref(),
+            Some("root@sigmastar:/# ")
+        );
+        assert_eq!(
+            snapshot.effective_uboot_prompt.as_deref(),
+            Some("SigmaStar =>")
+        );
+
+        // Replacing the catalog validates against existing Slots, persists,
+        // and refreshes live snapshots without touching ports.
+        let mut updated = sigmastar_profile();
+        updated.uboot_prompt = Some("SigmaStar #".into());
+        let profiles = state
+            .configure_device_profiles_transaction(vec![updated.clone()])
+            .await
+            .unwrap();
+        assert_eq!(profiles, vec![updated.clone()]);
+        assert_eq!(
+            state.inner.config.read().await.device_profiles,
+            vec![updated.clone()]
+        );
+        assert_eq!(store.load().unwrap().device_profiles, vec![updated]);
+        let snapshot = state
+            .inner
+            .registry
+            .get("slot-1")
+            .await
+            .unwrap()
+            .snapshot();
+        assert_eq!(
+            snapshot.effective_uboot_prompt.as_deref(),
+            Some("SigmaStar #")
+        );
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphaned_device_profile_update_is_rejected_everywhere() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let mut referencing = disabled_slot("slot-1", "Slot 1", "COM3");
+        referencing.device_profile = Some("sigmastar-evb".into());
+        let mut config = loaded.config.clone();
+        config.slots = vec![referencing.clone()];
+        config.device_profiles = vec![sigmastar_profile()];
+        store.save(&config).unwrap();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![referencing],
+            vec![sigmastar_profile()],
+        );
+        let state = AppState::new(
+            store.clone(),
+            config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+
+        // Deleting a profile that a Slot still references fails validation.
+        let error = state
+            .configure_device_profiles_transaction(Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::Config(ConfigError::Validation(
+                crate::config::ConfigValidationError::UnknownDeviceProfile { .. }
+            ))
+        ));
+        assert_eq!(
+            state.inner.config.read().await.device_profiles,
+            vec![sigmastar_profile()]
+        );
+        assert_eq!(store.load().unwrap().device_profiles, vec![sigmastar_profile()]);
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slot_without_device_profile_keeps_builtin_prompt_defaults() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![disabled_slot("slot-1", "Slot 1", "COM3")],
+            Vec::new(),
+        );
+        let snapshot = registry.get("slot-1").await.unwrap().snapshot();
+        assert!(snapshot.effective_shell_prompt.is_none());
+        assert_eq!(
+            snapshot.effective_uboot_prompt.as_deref(),
+            Some(serial_protocol::DEFAULT_UBOOT_PROMPT)
+        );
+
+        registry.shutdown().await;
         journal.shutdown().await.unwrap();
     }
 }

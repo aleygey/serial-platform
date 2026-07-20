@@ -152,7 +152,9 @@ impl Default for SerialSettings {
             write_eol: "\r".into(),
             echo: EchoMode::On,
             shell_prompt: None,
-            uboot_prompt: Some("SigmaStar #".into()),
+            // Defaults to None so an attached device profile is not shadowed;
+            // resolution falls back to DEFAULT_UBOOT_PROMPT.
+            uboot_prompt: None,
             write_chunk_size: default_write_chunk_size(),
             write_chunk_delay_ms: default_write_chunk_delay_ms(),
             auto_open: true,
@@ -175,8 +177,73 @@ pub struct SlotConfig {
     pub display_name: String,
     pub port: String,
     pub profile: String,
+    /// Name of the device-model profile this Slot is attached to. Prompts and
+    /// similar device behavior belong to the device model; Slot settings
+    /// remain per-station overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_profile: Option<String>,
     pub enabled: bool,
     pub settings: SerialSettings,
+}
+
+/// A reusable device-model profile. Prompt and line-ending defaults describe
+/// the device connected behind any number of Slots, so they are configured
+/// once per model instead of being embedded in every Slot's settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceProfile {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uboot_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_eol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo: Option<EchoMode>,
+}
+
+/// U-Boot prompt assumed when neither the Slot settings nor the attached
+/// device profile provide one.
+pub const DEFAULT_UBOOT_PROMPT: &str = "SigmaStar #";
+
+/// Device-interaction settings after layering the Slot settings over the
+/// attached device profile and the built-in defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDeviceSettings {
+    pub shell_prompt: Option<String>,
+    pub uboot_prompt: Option<String>,
+    pub write_eol: String,
+    pub echo: EchoMode,
+}
+
+/// Resolves the effective device behavior for one Slot. Every field follows
+/// the order: explicit Slot setting, then the device profile, then the
+/// built-in default.
+///
+/// `shell_prompt`/`uboot_prompt` are optional in the Slot settings, so a
+/// profile can supply them when the Slot does not. `write_eol` and `echo`
+/// are concrete Slot fields that always materialize today, so they always
+/// override the profile; the profile values are retained for clients and for
+/// a future optional form of the Slot fields.
+pub fn resolve_device_settings(
+    settings: &SerialSettings,
+    device_profile: Option<&DeviceProfile>,
+) -> ResolvedDeviceSettings {
+    let shell_prompt = settings
+        .shell_prompt
+        .clone()
+        .or_else(|| device_profile.and_then(|profile| profile.shell_prompt.clone()));
+    let uboot_prompt = settings
+        .uboot_prompt
+        .clone()
+        .or_else(|| device_profile.and_then(|profile| profile.uboot_prompt.clone()))
+        .or_else(|| Some(DEFAULT_UBOOT_PROMPT.to_owned()));
+    ResolvedDeviceSettings {
+        shell_prompt,
+        uboot_prompt,
+        write_eol: settings.write_eol.clone(),
+        echo: settings.echo,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +329,13 @@ pub struct SlotSnapshot {
     pub control: Option<ControlLease>,
     pub active_run: Option<RunInfo>,
     pub logging: LoggingState,
+    /// Prompts after layering Slot settings over the attached device profile
+    /// and the built-in defaults. Omitted on the wire when unset so older
+    /// clients keep decoding snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_shell_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_uboot_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,6 +635,23 @@ pub struct ConfigureSlotsRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigureSlotsResponse {
     pub slots: Vec<SlotSnapshot>,
+}
+
+/// Read model for the configured device-model profile catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceProfileListResponse {
+    pub profiles: Vec<DeviceProfile>,
+}
+
+/// Full replacement of the device-model profile catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureDeviceProfilesRequest {
+    pub profiles: Vec<DeviceProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureDeviceProfilesResponse {
+    pub profiles: Vec<DeviceProfile>,
 }
 
 /// One discoverable, retained Slot/daemon-epoch journal archive.
@@ -907,10 +998,118 @@ mod tests {
         assert!(!settings.dtr);
         assert!(!settings.rts);
         assert_eq!(settings.write_eol, "\r");
-        assert_eq!(settings.uboot_prompt.as_deref(), Some("SigmaStar #"));
+        assert_eq!(settings.echo, EchoMode::On);
+        assert!(settings.shell_prompt.is_none());
+        // The built-in U-Boot prompt moved behind resolution so a device
+        // profile is not shadowed by the Slot default.
+        assert!(settings.uboot_prompt.is_none());
         assert_eq!(settings.write_chunk_size, 1);
         assert_eq!(settings.write_chunk_delay_ms, 1);
         assert!(settings.probe.is_none());
+    }
+
+    fn device_profile() -> DeviceProfile {
+        DeviceProfile {
+            name: "sigmastar-evb".into(),
+            shell_prompt: Some("root@sigmastar:/# ".into()),
+            uboot_prompt: Some("SigmaStar =>".into()),
+            write_eol: Some("\n".into()),
+            echo: Some(EchoMode::Off),
+        }
+    }
+
+    #[test]
+    fn device_settings_resolve_slot_then_profile_then_builtin() {
+        let profile = device_profile();
+        // Profile supplies everything the Slot leaves unset.
+        let resolved = resolve_device_settings(&SerialSettings::default(), Some(&profile));
+        assert_eq!(
+            resolved.shell_prompt.as_deref(),
+            Some("root@sigmastar:/# ")
+        );
+        assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
+        // write_eol/echo are concrete Slot fields: the profile never shadows
+        // them in v1.
+        assert_eq!(resolved.write_eol, "\r");
+        assert_eq!(resolved.echo, EchoMode::On);
+
+        // An explicit Slot setting always wins over the profile.
+        let settings = SerialSettings {
+            shell_prompt: Some("/ # ".into()),
+            uboot_prompt: Some("U-Boot> ".into()),
+            write_eol: "\r\n".into(),
+            echo: EchoMode::Auto,
+            ..SerialSettings::default()
+        };
+        let resolved = resolve_device_settings(&settings, Some(&profile));
+        assert_eq!(resolved.shell_prompt.as_deref(), Some("/ # "));
+        assert_eq!(resolved.uboot_prompt.as_deref(), Some("U-Boot> "));
+        assert_eq!(resolved.write_eol, "\r\n");
+        assert_eq!(resolved.echo, EchoMode::Auto);
+    }
+
+    #[test]
+    fn device_settings_without_profile_match_legacy_behavior() {
+        // Regression: a configuration without device profiles resolves to the
+        // same effective values as before profiles existed.
+        let resolved = resolve_device_settings(&SerialSettings::default(), None);
+        assert!(resolved.shell_prompt.is_none());
+        assert_eq!(resolved.uboot_prompt.as_deref(), Some(DEFAULT_UBOOT_PROMPT));
+        assert_eq!(resolved.write_eol, "\r");
+        assert_eq!(resolved.echo, EchoMode::On);
+    }
+
+    #[test]
+    fn legacy_slot_config_without_device_profile_still_decodes() {
+        let legacy = serde_json::json!({
+            "id": "slot-1",
+            "display_name": "Slot 1",
+            "port": "COM3",
+            "profile": "generic-115200",
+            "enabled": true,
+            "settings": SerialSettings::default(),
+        });
+        let slot: SlotConfig = serde_json::from_value(legacy).unwrap();
+        assert!(slot.device_profile.is_none());
+    }
+
+    #[test]
+    fn snapshot_omits_unset_effective_prompts_on_the_wire() {
+        let json = serde_json::to_value(SlotSnapshot {
+            config: SlotConfig {
+                id: "slot-1".into(),
+                display_name: "Slot 1".into(),
+                port: "COM3".into(),
+                profile: "generic-115200".into(),
+                device_profile: None,
+                enabled: true,
+                settings: SerialSettings::default(),
+            },
+            daemon_epoch: Uuid::new_v4(),
+            head_seq: 0,
+            ring_oldest_seq: None,
+            generation: 0,
+            endpoint_present: false,
+            session_state: SessionState::Disabled,
+            state_reason: None,
+            target_activity: TargetActivity::Unknown,
+            last_rx_wall_time_ns: None,
+            rx_offset: 0,
+            tx_offset: 0,
+            control: None,
+            active_run: None,
+            logging: LoggingState::Healthy,
+            effective_shell_prompt: None,
+            effective_uboot_prompt: None,
+        })
+        .unwrap();
+        let object = json.as_object().unwrap();
+        assert!(!object.contains_key("effective_shell_prompt"));
+        assert!(!object.contains_key("effective_uboot_prompt"));
+        // ...and an older daemon's snapshot without the keys still decodes.
+        let decoded: SlotSnapshot = serde_json::from_value(json).unwrap();
+        assert!(decoded.effective_shell_prompt.is_none());
+        assert!(decoded.effective_uboot_prompt.is_none());
     }
 
     #[test]

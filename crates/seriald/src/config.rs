@@ -15,7 +15,7 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serial_protocol::{FlowControl, SlotConfig};
+use serial_protocol::{DeviceProfile, FlowControl, SlotConfig};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -30,6 +30,8 @@ pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Hard bound for both one active configuration and the number of distinct
 /// Slot identities retained during one daemon epoch.
 pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
+/// Hard bound for the device-model profile catalog.
+pub const MAX_DEVICE_PROFILES: usize = 128;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SLOT_ID_BYTES: usize = 64;
@@ -114,6 +116,8 @@ pub struct DaemonConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub slots: Vec<SlotConfig>,
+    #[serde(default)]
+    pub device_profiles: Vec<DeviceProfile>,
 }
 
 impl DaemonConfig {
@@ -127,6 +131,7 @@ impl DaemonConfig {
                 logging: LoggingConfig::default(),
                 auth,
                 slots: Vec::new(),
+                device_profiles: Vec::new(),
             },
             credentials,
         )
@@ -146,7 +151,8 @@ impl DaemonConfig {
         }
         validate_logging(&self.logging)?;
         self.auth.validate()?;
-        validate_slots(&self.slots)
+        validate_device_profiles(&self.device_profiles)?;
+        validate_slots(&self.slots, &self.device_profiles)
     }
 
     /// Replaces all Slot configuration in memory after validating the complete
@@ -166,6 +172,32 @@ impl DaemonConfig {
     pub fn staged_with_slots(&self, slots: Vec<SlotConfig>) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
         staged.replace_slots(slots)?;
+        Ok(staged)
+    }
+
+    /// Replaces the device profile catalog in memory after validating the
+    /// complete resulting daemon configuration, including every Slot's
+    /// profile reference.
+    pub fn replace_device_profiles(
+        &mut self,
+        device_profiles: Vec<DeviceProfile>,
+    ) -> Result<(), ConfigValidationError> {
+        let previous = std::mem::replace(&mut self.device_profiles, device_profiles);
+        if let Err(error) = self.validate() {
+            self.device_profiles = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Builds a fully validated candidate with a replaced device profile
+    /// catalog without changing the live in-memory configuration.
+    pub fn staged_with_device_profiles(
+        &self,
+        device_profiles: Vec<DeviceProfile>,
+    ) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        staged.replace_device_profiles(device_profiles)?;
         Ok(staged)
     }
 }
@@ -303,6 +335,19 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Persists a validated device profile catalog replacement and only then
+    /// commits it to the caller's in-memory configuration.
+    pub fn update_device_profiles(
+        &self,
+        current: &mut DaemonConfig,
+        device_profiles: Vec<DeviceProfile>,
+    ) -> Result<(), ConfigError> {
+        let updated = current.staged_with_device_profiles(device_profiles)?;
+        self.save(&updated)?;
+        *current = updated;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_save_failure(&self, fail: bool) {
         self.fail_saves
@@ -373,6 +418,24 @@ pub enum ConfigValidationError {
     DuplicatePort { first: usize, second: usize },
     #[error("configuration contains {actual} Slots; the maximum is {limit}")]
     TooManySlots { actual: usize, limit: usize },
+    #[error("device profile at index {index} has invalid field {field}: {reason}")]
+    InvalidDeviceProfile {
+        index: usize,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("device profiles at indexes {first} and {second} use the same name")]
+    DuplicateDeviceProfileName { first: usize, second: usize },
+    #[error("configuration contains {actual} device profiles; the maximum is {limit}")]
+    TooManyDeviceProfiles { actual: usize, limit: usize },
+    #[error(
+        "Slot {slot_id} references unknown device profile {name:?}; available profiles: {available}"
+    )]
+    UnknownDeviceProfile {
+        slot_id: String,
+        name: String,
+        available: String,
+    },
 }
 
 fn validate_logging(logging: &LoggingConfig) -> Result<(), ConfigValidationError> {
@@ -388,7 +451,10 @@ fn validate_logging(logging: &LoggingConfig) -> Result<(), ConfigValidationError
     Ok(())
 }
 
-pub(crate) fn validate_slots(slots: &[SlotConfig]) -> Result<(), ConfigValidationError> {
+pub(crate) fn validate_slots(
+    slots: &[SlotConfig],
+    device_profiles: &[DeviceProfile],
+) -> Result<(), ConfigValidationError> {
     if slots.len() > MAX_SLOT_IDENTITIES_PER_DAEMON {
         return Err(ConfigValidationError::TooManySlots {
             actual: slots.len(),
@@ -410,6 +476,28 @@ pub(crate) fn validate_slots(slots: &[SlotConfig]) -> Result<(), ConfigValidatio
         validate_profile(index, &slot.profile)?;
         validate_serial_settings(index, slot)?;
 
+        if let Some(device_profile) = slot.device_profile.as_deref() {
+            if !device_profiles
+                .iter()
+                .any(|profile| profile.name == device_profile)
+            {
+                let available = device_profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ConfigValidationError::UnknownDeviceProfile {
+                    slot_id: slot.id.clone(),
+                    name: device_profile.to_owned(),
+                    available: if available.is_empty() {
+                        "(none configured)".to_owned()
+                    } else {
+                        available
+                    },
+                });
+            }
+        }
+
         if let Some(first) = ids.insert(&slot.id, index) {
             return Err(ConfigValidationError::DuplicateSlotId {
                 first,
@@ -423,6 +511,65 @@ pub(crate) fn validate_slots(slots: &[SlotConfig]) -> Result<(), ConfigValidatio
             return Err(ConfigValidationError::DuplicatePort {
                 first,
                 second: index,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_device_profiles(
+    profiles: &[DeviceProfile],
+) -> Result<(), ConfigValidationError> {
+    if profiles.len() > MAX_DEVICE_PROFILES {
+        return Err(ConfigValidationError::TooManyDeviceProfiles {
+            actual: profiles.len(),
+            limit: MAX_DEVICE_PROFILES,
+        });
+    }
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        if profile.name.is_empty()
+            || profile.name.len() > MAX_PROFILE_NAME_BYTES
+            || profile.name != profile.name.trim()
+            || profile.name.chars().any(char::is_control)
+        {
+            return Err(ConfigValidationError::InvalidDeviceProfile {
+                index,
+                field: "name",
+                reason: "must be a non-empty, trimmed name of at most 64 bytes",
+            });
+        }
+        if let Some(first) = names.insert(&profile.name, index) {
+            return Err(ConfigValidationError::DuplicateDeviceProfileName {
+                first,
+                second: index,
+            });
+        }
+        for (field, pattern) in [
+            ("shell_prompt", profile.shell_prompt.as_deref()),
+            ("uboot_prompt", profile.uboot_prompt.as_deref()),
+        ] {
+            if pattern.is_some_and(|pattern| {
+                pattern.is_empty()
+                    || pattern.len() > MAX_PROMPT_PATTERN_BYTES
+                    || pattern.contains('\0')
+            }) {
+                return Err(ConfigValidationError::InvalidDeviceProfile {
+                    index,
+                    field,
+                    reason: "must be non-empty, at most 4096 bytes, and contain no NUL",
+                });
+            }
+        }
+        if profile
+            .write_eol
+            .as_deref()
+            .is_some_and(|eol| !matches!(eol, "" | "\r" | "\n" | "\r\n"))
+        {
+            return Err(ConfigValidationError::InvalidDeviceProfile {
+                index,
+                field: "write_eol",
+                reason: "must be empty, CR, LF, or CRLF",
             });
         }
     }
@@ -688,8 +835,19 @@ mod tests {
             display_name: id.to_owned(),
             port: port.to_owned(),
             profile: "generic-115200".to_owned(),
+            device_profile: None,
             enabled: true,
             settings: SerialSettings::default(),
+        }
+    }
+
+    fn device_profile(name: &str) -> DeviceProfile {
+        DeviceProfile {
+            name: name.to_owned(),
+            shell_prompt: Some("root@dut:/# ".to_owned()),
+            uboot_prompt: Some("SigmaStar =>".to_owned()),
+            write_eol: None,
+            echo: None,
         }
     }
 
@@ -891,5 +1049,125 @@ mod tests {
         let debug = format!("{loaded:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains(&admin));
+    }
+
+    #[test]
+    fn device_profile_catalog_is_validated_as_a_whole() {
+        let (mut config, _) = DaemonConfig::generate();
+
+        // Duplicate names are rejected.
+        config.device_profiles = vec![device_profile("evb"), device_profile("evb")];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::DuplicateDeviceProfileName { .. })
+        ));
+
+        // Invalid names follow the same rules as Slot profile names.
+        config.device_profiles = vec![device_profile(" padded ")];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceProfile { field: "name", .. })
+        ));
+
+        // Invalid prompt patterns and line endings are rejected.
+        let mut invalid = device_profile("evb");
+        invalid.uboot_prompt = Some(String::new());
+        config.device_profiles = vec![invalid];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceProfile {
+                field: "uboot_prompt",
+                ..
+            })
+        ));
+        let mut invalid = device_profile("evb");
+        invalid.write_eol = Some("\r\r".to_owned());
+        config.device_profiles = vec![invalid];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceProfile {
+                field: "write_eol",
+                ..
+            })
+        ));
+
+        // The catalog is bounded.
+        config.device_profiles = (0..=MAX_DEVICE_PROFILES)
+            .map(|index| device_profile(&format!("profile-{index}")))
+            .collect();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::TooManyDeviceProfiles { .. })
+        ));
+    }
+
+    #[test]
+    fn slot_device_profile_references_must_exist() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.device_profiles = vec![device_profile("sigmastar-evb")];
+        let mut referencing = slot("slot-1", "COM3");
+        referencing.device_profile = Some("missing-model".to_owned());
+        config.slots = vec![referencing];
+        let error = config.validate().unwrap_err();
+        let message = error.to_string();
+        assert!(matches!(
+            error,
+            ConfigValidationError::UnknownDeviceProfile { .. }
+        ));
+        assert!(message.contains("missing-model"));
+        assert!(message.contains("sigmastar-evb"));
+
+        // A valid reference passes.
+        let mut valid = slot("slot-2", "COM4");
+        valid.device_profile = Some("sigmastar-evb".to_owned());
+        config.slots = vec![valid];
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn device_profile_replacement_rolls_back_on_validation_failure() {
+        let (mut config, _) = DaemonConfig::generate();
+        let mut referencing = slot("slot-1", "COM3");
+        referencing.device_profile = Some("sigmastar-evb".to_owned());
+        config.slots = vec![referencing];
+        config
+            .replace_device_profiles(vec![device_profile("sigmastar-evb")])
+            .unwrap();
+
+        // Removing a profile that a Slot still references is rejected and
+        // leaves the previous catalog in place.
+        let error = config.replace_device_profiles(Vec::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigValidationError::UnknownDeviceProfile { .. }
+        ));
+        assert_eq!(config.device_profiles.len(), 1);
+
+        let staged = config
+            .staged_with_device_profiles(vec![device_profile("sigmastar-evb"), device_profile("rk")])
+            .unwrap();
+        assert_eq!(config.device_profiles.len(), 1);
+        assert_eq!(staged.device_profiles.len(), 2);
+    }
+
+    #[test]
+    fn legacy_toml_without_device_profiles_loads_with_an_empty_catalog() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+
+        // Rewrite the persisted configuration without the device_profiles
+        // key, as a pre-profile daemon would have written it.
+        let persisted = fs::read_to_string(&store.paths().config_file).unwrap();
+        let without_profiles = persisted
+            .lines()
+            .filter(|line| !line.starts_with("device_profiles"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&store.paths().config_file, without_profiles).unwrap();
+
+        let reloaded = store.load().unwrap();
+        assert!(reloaded.device_profiles.is_empty());
+        assert_eq!(reloaded.server_id, loaded.config.server_id);
     }
 }
