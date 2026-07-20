@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::{
     api::ApiClient,
     config::LoadedConfig,
-    display::{DisplayLine, TerminalStreamParser, gap_line, safe_inline},
+    display::{DisplayLine, TerminalStreamParser, gap_line, highlight_spans, safe_inline},
     ws::{self, NetworkCommand, NetworkEvent},
 };
 
@@ -44,7 +44,7 @@ const MAX_PASTE_BYTES: usize = 64 * 1024;
 const MAX_OUTSTANDING_REQUESTS: usize = 512;
 const MAX_WRITE_BYTES: usize = 4 * 1024;
 const CONTROL_TTL_MS: u64 = 30_000;
-const HUMAN_CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +122,26 @@ struct SlotView {
     mode: InputMode,
     history: Vec<String>,
     history_cursor: Option<usize>,
+    history_search: Option<HistorySearch>,
+    completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
+}
+
+/// Ctrl-R incremental history search state (LINE mode).
+#[derive(Debug)]
+struct HistorySearch {
+    query: String,
+    saved_draft: Vec<char>,
+    saved_cursor: usize,
+    /// Index into `SlotView::history` of the current match.
+    match_index: Option<usize>,
+}
+
+/// Tab completion state (LINE mode): newest-first deduplicated candidates.
+#[derive(Debug)]
+struct Completion {
+    candidates: Vec<String>,
+    current: usize,
 }
 
 impl SlotView {
@@ -143,6 +162,8 @@ impl SlotView {
             mode: InputMode::Line,
             history: Vec::new(),
             history_cursor: None,
+            history_search: None,
+            completion: None,
             last_manual_activity: None,
         }
     }
@@ -177,12 +198,8 @@ impl SlotView {
         }
         self.last_epoch = Some(event.daemon_epoch);
         self.last_seq = event.seq;
-        let shell_prompt = self.snapshot.config.settings.shell_prompt.clone();
-        let uboot_prompt = self.snapshot.config.settings.uboot_prompt.clone();
         let had_pending = self.pending_line.is_some();
-        let batch =
-            self.stream
-                .push_event(&event, shell_prompt.as_deref(), uboot_prompt.as_deref());
+        let batch = self.stream.push_event(&event);
         let completed_pending = had_pending && !batch.completed.is_empty();
         for line in batch.completed {
             self.push_line(line, selected);
@@ -232,6 +249,7 @@ struct App {
     selected: usize,
     prefix_pending: bool,
     help: bool,
+    detailed_timeline: bool,
     transport_connected: bool,
     authenticated: bool,
     connection_generation: Option<u64>,
@@ -242,6 +260,7 @@ struct App {
     pending_requests: HashMap<Uuid, PendingRequest>,
     queued_controls: HashMap<String, QueuedControl>,
     uncertain_write_outcomes: usize,
+    human_idle_release: Duration,
     should_quit: bool,
     dirty: bool,
 }
@@ -262,6 +281,7 @@ impl App {
             selected,
             prefix_pending: false,
             help: false,
+            detailed_timeline: false,
             transport_connected: false,
             authenticated: false,
             connection_generation: None,
@@ -272,6 +292,7 @@ impl App {
             pending_requests: HashMap::new(),
             queued_controls: HashMap::new(),
             uncertain_write_outcomes: 0,
+            human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
             should_quit: false,
             dirty: true,
         }
@@ -1001,7 +1022,7 @@ impl App {
         if automatic {
             self.status = format!(
                 "{slot_id}: releasing idle human control after {} seconds",
-                HUMAN_CONTROL_IDLE_TIMEOUT.as_secs()
+                self.human_idle_release.as_secs()
             );
         }
     }
@@ -1011,6 +1032,7 @@ impl App {
             return;
         }
         self.dirty = true;
+        let idle_release = self.human_idle_release;
         let expired_queue = self.queued_controls.iter().find_map(|(slot_id, queued)| {
             let last_activity = self
                 .slot_index(slot_id)
@@ -1018,13 +1040,16 @@ impl App {
             let idle = last_activity
                 .map(|activity| activity.elapsed())
                 .unwrap_or_else(|| queued.since.elapsed());
-            (idle >= HUMAN_CONTROL_IDLE_TIMEOUT).then(|| slot_id.clone())
+            (idle >= idle_release).then(|| slot_id.clone())
         });
         if let Some(slot_id) = expired_queue {
             self.cancel_queued_control(
                 commands,
                 &slot_id,
-                "queued human input expired after 60 seconds of inactivity",
+                &format!(
+                    "queued human input expired after {} seconds of inactivity",
+                    idle_release.as_secs()
+                ),
             );
             return;
         }
@@ -1052,7 +1077,7 @@ impl App {
                 );
             let recently_active = self.slots[index]
                 .last_manual_activity
-                .is_some_and(|activity| activity.elapsed() < HUMAN_CONTROL_IDLE_TIMEOUT);
+                .is_some_and(|activity| activity.elapsed() < idle_release);
             if !recently_active && !operation_pending {
                 self.release_slot_control(commands, slot_id, lease, true);
                 continue;
@@ -1141,6 +1166,7 @@ impl App {
                 fence: lease.fence,
                 data,
                 operation_id,
+                pacing: None,
             },
             Some(PendingRequest::Write {
                 slot_id: slot_id.to_string(),
@@ -1154,6 +1180,14 @@ impl App {
                 self.handle_key(key, commands)
             }
             Event::Paste(value) => self.handle_paste(value, commands),
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.scroll_up(3),
+                    MouseEventKind::ScrollDown => self.scroll_down(3),
+                    _ => {}
+                }
+                self.dirty = true;
+            }
             Event::Resize(_, _) => self.dirty = true,
             _ => {}
         }
@@ -1173,7 +1207,7 @@ impl App {
         }
         if is_prefix(key) {
             self.prefix_pending = true;
-            self.status = "command prefix: 1-9 Slot, l LINE, r RAW, PgUp/PgDn scroll, t takeover, c release/cancel, ? help".into();
+            self.status = "command prefix: 1-9 Slot, l LINE, r RAW, PgUp/PgDn scroll, v detail, t takeover, c release/cancel, ? help".into();
             self.dirty = true;
             return;
         }
@@ -1209,6 +1243,14 @@ impl App {
                 self.current_mut().follow();
                 self.status = "following live output".into();
             }
+            KeyCode::Char('v' | 'V') => {
+                self.detailed_timeline = !self.detailed_timeline;
+                self.status = if self.detailed_timeline {
+                    "detailed timeline: #seq and source columns shown".into()
+                } else {
+                    "compact timeline: markers and inline highlighting".into()
+                };
+            }
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Char('t' | 'T') => {
@@ -1230,6 +1272,14 @@ impl App {
     }
 
     fn handle_line_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        if self.current().history_search.is_some() {
+            self.handle_history_search_key(key);
+            return;
+        }
+        // Any key other than Tab confirms the current completion candidate.
+        if key.code != KeyCode::Tab && self.current().completion.is_some() {
+            self.current_mut().completion = None;
+        }
         match key.code {
             KeyCode::Enter => {
                 let value = self.current().draft.iter().collect::<String>();
@@ -1250,7 +1300,13 @@ impl App {
                     view.draft_cursor = 0;
                 }
                 self.request_write(commands, bytes, Some(Uuid::new_v4()));
+                // Sending returns the view to the live tail, like Ctrl-] f.
+                self.current_mut().follow();
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_history_search();
+            }
+            KeyCode::Tab => self.complete_draft(),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -1398,6 +1454,111 @@ impl App {
         view.draft_cursor = view.draft.len();
     }
 
+    fn start_history_search(&mut self) {
+        let view = self.current_mut();
+        if view.history_search.is_some() {
+            return;
+        }
+        view.history_search = Some(HistorySearch {
+            query: String::new(),
+            saved_draft: std::mem::take(&mut view.draft),
+            saved_cursor: view.draft_cursor,
+            match_index: None,
+        });
+        view.draft_cursor = 0;
+    }
+
+    fn handle_history_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                let view = self.current_mut();
+                if let Some(search) = view.history_search.take() {
+                    if let Some(index) = search.match_index {
+                        view.draft = view.history[index].chars().collect();
+                        view.draft_cursor = view.draft.len();
+                    } else {
+                        view.draft = search.saved_draft;
+                        view.draft_cursor = search.saved_cursor;
+                    }
+                }
+            }
+            KeyCode::Esc => self.cancel_history_search(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_history_search();
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_history_search();
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Repeat: find the next older match, cycling back to newest.
+                let view = self.current_mut();
+                if let Some(search) = &mut view.history_search {
+                    search.match_index =
+                        find_history_match(&view.history, &search.query, search.match_index)
+                            .or_else(|| find_history_match(&view.history, &search.query, None));
+                }
+            }
+            KeyCode::Backspace => {
+                let view = self.current_mut();
+                if let Some(search) = &mut view.history_search {
+                    search.query.pop();
+                    search.match_index = find_history_match(&view.history, &search.query, None);
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let view = self.current_mut();
+                if let Some(search) = &mut view.history_search {
+                    search.query.push(character);
+                    search.match_index = find_history_match(&view.history, &search.query, None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cancel_history_search(&mut self) {
+        let view = self.current_mut();
+        if let Some(search) = view.history_search.take() {
+            view.draft = search.saved_draft;
+            view.draft_cursor = search.saved_cursor;
+        }
+    }
+
+    fn complete_draft(&mut self) {
+        let view = self.current_mut();
+        if let Some(completion) = &mut view.completion {
+            completion.current = (completion.current + 1) % completion.candidates.len();
+            let candidate = completion.candidates[completion.current].clone();
+            view.draft = candidate.chars().collect();
+            view.draft_cursor = view.draft.len();
+            return;
+        }
+        let prefix = view.draft.iter().collect::<String>();
+        let mut seen = std::collections::HashSet::new();
+        let candidates = view
+            .history
+            .iter()
+            .rev()
+            .filter(|entry| entry.starts_with(&prefix))
+            .filter(|entry| seen.insert((*entry).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        let first = candidates[0].clone();
+        view.completion = Some(Completion {
+            candidates,
+            current: 0,
+        });
+        view.draft = first.chars().collect();
+        view.draft_cursor = view.draft.len();
+    }
+
     fn scroll_up(&mut self, amount: usize) {
         let max = (self.current().lines.len() + usize::from(self.current().pending_line.is_some()))
             .saturating_sub(1);
@@ -1434,6 +1595,13 @@ pub async fn run(
         .map(|slot| slot.config.id.clone())
         .collect::<Vec<_>>();
     let mut app = App::new(status.slots, initial_slot.as_deref());
+    app.human_idle_release = Duration::from_secs(
+        loaded
+            .config
+            .human_idle_release_seconds
+            .unwrap_or(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS)
+            .max(1),
+    );
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
     let mut terminal = enter_terminal()?;
@@ -1513,7 +1681,12 @@ async fn run_loop(
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+    if let Err(error) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    ) {
         let _ = disable_raw_mode();
         return Err(error.into());
     }
@@ -1521,7 +1694,12 @@ fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
             Err(error.into())
         }
     }
@@ -1532,7 +1710,12 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = io::stdout().flush();
     }
 }
@@ -1580,7 +1763,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_input(frame, app, chunks[3]);
     draw_help_line(frame, app, chunks[4]);
     if app.help {
-        draw_help(frame, area);
+        draw_help(frame, app, area);
     }
 }
 
@@ -1641,22 +1824,15 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let total_lines = view.lines.len() + usize::from(view.pending_line.is_some());
     let end = total_lines.saturating_sub(view.scroll_from_bottom);
     let start = end.saturating_sub(visible_height);
+    let shell_prompt = view.snapshot.config.settings.shell_prompt.as_deref();
+    let uboot_prompt = view.snapshot.config.settings.uboot_prompt.as_deref();
     let lines = view
         .lines
         .iter()
         .chain(view.pending_line.iter())
         .skip(start)
         .take(end.saturating_sub(start))
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(
-                    format!("#{:<8} ", entry.seq),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(format!("{:<28} ", entry.source), entry.source_style),
-                Span::styled(entry.text.clone(), entry.semantic_style),
-            ])
-        })
+        .map(|entry| timeline_line(entry, app.detailed_timeline, shell_prompt, uboot_prompt))
         .collect::<Vec<_>>();
     let title = format!(
         " {} · {} · {} baud{} ",
@@ -1675,6 +1851,51 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Renders one scrollback row. Compact mode is `{marker}{text}` where the
+/// two-column marker is a colored "●" for TX/actor-attributed rows and two
+/// spaces otherwise; detailed mode additionally shows the legacy `#seq` and
+/// source columns. Stream rows get inline keyword/prompt highlighting;
+/// system and gap rows keep their whole-line style.
+fn timeline_line(
+    entry: &DisplayLine,
+    detailed: bool,
+    shell_prompt: Option<&str>,
+    uboot_prompt: Option<&str>,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    match entry.marker_color {
+        Some(color) => spans.push(Span::styled(
+            "● ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        None => spans.push(Span::raw("  ")),
+    }
+    if detailed {
+        spans.push(Span::styled(
+            format!("#{:<8} ", entry.seq),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{:<28} ", entry.source),
+            entry.source_style,
+        ));
+    }
+    if let Some(style) = entry.solid_style {
+        spans.push(Span::styled(entry.text.clone(), style));
+        return Line::from(spans);
+    }
+    let mut cursor = 0;
+    for (start, end, style) in highlight_spans(&entry.text, shell_prompt, uboot_prompt) {
+        if start > cursor {
+            spans.push(Span::raw(entry.text[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(entry.text[start..end].to_string(), style));
+        cursor = end;
+    }
+    spans.push(Span::raw(entry.text[cursor..].to_string()));
+    Line::from(spans)
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1718,7 +1939,8 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         app.current()
             .last_manual_activity
             .map_or_else(String::new, |activity| {
-                let remaining = HUMAN_CONTROL_IDLE_TIMEOUT
+                let remaining = app
+                    .human_idle_release
                     .saturating_sub(activity.elapsed())
                     .as_secs();
                 format!(" · idle release in {remaining}s")
@@ -1741,6 +1963,22 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if let Some(search) = &app.current().history_search {
+        let matched = search
+            .match_index
+            .map(|index| safe_inline(&app.current().history[index]))
+            .unwrap_or_default();
+        let text = format!("(reverse-i-search)`{}': {matched}", search.query);
+        frame.render_widget(
+            Paragraph::new(text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" history search · Enter accepts · Esc cancels "),
+            ),
+            area,
+        );
+        return;
+    }
     let (text, title) = match app.current_mode() {
         InputMode::Line => (
             safe_inline(&app.current().draft.iter().collect::<String>()),
@@ -1781,16 +2019,18 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width.min(76);
-    let height = area.height.min(24);
+    let height = area.height.min(28);
     let popup = centered_rect(width, height, area);
     let help = [
         "All modes",
         "  Alt-1..9 / Ctrl-] 1..9   switch Slot",
         "  Ctrl-] s                 next Slot",
         "  Ctrl-] l / r             LINE / RAW mode",
+        "  Ctrl-] v                 compact / detailed timeline",
         "  Ctrl-] PgUp / PgDn       local scroll (especially in RAW)",
+        "  mouse wheel              scroll 3 lines (bottom resumes follow)",
         "  Ctrl-] t                 explicit human takeover",
         "  Ctrl-] c                 release control or cancel queued input",
         "  Ctrl-] f                 follow live output",
@@ -1798,11 +2038,16 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         "  Ctrl-] Ctrl-]            send byte 0x1d",
         "  Ctrl-] q                 quit",
         "",
-        "LINE: Enter sends the line plus the Profile EOL (default CR).",
+        "LINE: Enter sends the line plus the Profile EOL (default CR) and",
+        "returns to the live tail. Up/Down browse history; Ctrl-R starts an",
+        "incremental history search; Tab completes from history.",
         "RAW: keys are bytes; Ctrl-C is sent to the device and does not quit.",
         "RAW PageUp/PageDown go to the device; use the prefix for local scroll.",
         "Large or multi-line paste is always held for explicit confirmation.",
-        "Queued input expires after 60s idle; cancel reconnects and releases this terminal's controls.",
+        &format!(
+            "Queued input expires after {}s idle; cancel reconnects and releases this terminal's controls.",
+            app.human_idle_release.as_secs()
+        ),
         "Disconnected input is never replayed after reconnect.",
         "Sent writes without an acknowledgement are uncertain; inspect TX before retrying.",
         "",
@@ -1832,6 +2077,18 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn is_prefix(key: KeyEvent) -> bool {
     key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Newest-first case-sensitive substring search over the command history.
+/// `before` bounds the search to entries older than that history index.
+fn find_history_match(history: &[String], query: &str, before: Option<usize>) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    let end = before.unwrap_or(history.len()).min(history.len());
+    history[..end]
+        .iter()
+        .rposition(|entry| entry.contains(query))
 }
 
 fn raw_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
@@ -2258,7 +2515,7 @@ mod tests {
     fn idle_human_control_is_released_instead_of_renewed_forever() {
         let mut app = ready_app_with_control();
         app.slots[0].last_manual_activity =
-            Some(Instant::now() - HUMAN_CONTROL_IDLE_TIMEOUT - Duration::from_secs(1));
+            Some(Instant::now() - app.human_idle_release - Duration::from_secs(1));
         let (commands, mut received) = mpsc::channel(4);
 
         app.maintain_controls(&commands);
@@ -2283,6 +2540,154 @@ mod tests {
             panic!("expected a renew request");
         };
         assert!(matches!(message, ClientMessage::RenewControl { .. }));
+    }
+
+    #[test]
+    fn history_search_finds_newest_match_and_cycles_to_older() {
+        let mut app = App::new(vec![snapshot()], None);
+        {
+            let view = &mut app.slots[0];
+            view.history = vec![
+                "show version".into(),
+                "reboot".into(),
+                "show interfaces".into(),
+            ];
+            view.draft = "partial".chars().collect();
+            view.draft_cursor = 7;
+        }
+
+        app.start_history_search();
+        for character in "show".chars() {
+            app.handle_history_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(
+            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            Some(Some(2))
+        );
+
+        // Ctrl-R cycles to the older match, then wraps back to the newest.
+        app.handle_history_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            Some(Some(0))
+        );
+        app.handle_history_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            Some(Some(2))
+        );
+
+        // Backspace edits the query and re-searches from newest.
+        for _ in 0..4 {
+            app.handle_history_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            Some(None)
+        );
+        for character in "int".chars() {
+            app.handle_history_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(
+            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            Some(Some(2))
+        );
+
+        // Enter accepts the current match into the draft.
+        app.handle_history_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.slots[0].history_search.is_none());
+        assert_eq!(
+            app.slots[0].draft.iter().collect::<String>(),
+            "show interfaces"
+        );
+    }
+
+    #[test]
+    fn history_search_escape_restores_the_original_draft() {
+        let mut app = App::new(vec![snapshot()], None);
+        {
+            let view = &mut app.slots[0];
+            view.history = vec!["reboot".into()];
+            view.draft = "keep me".chars().collect();
+            view.draft_cursor = 7;
+        }
+        app.start_history_search();
+        app.handle_history_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(
+            app.slots[0]
+                .history_search
+                .as_ref()
+                .is_some_and(|s| s.match_index == Some(0))
+        );
+
+        app.handle_history_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.slots[0].history_search.is_none());
+        assert_eq!(app.slots[0].draft.iter().collect::<String>(), "keep me");
+        assert_eq!(app.slots[0].draft_cursor, 7);
+    }
+
+    #[test]
+    fn tab_completion_cycles_deduplicated_newest_first_candidates() {
+        let mut app = App::new(vec![snapshot()], None);
+        {
+            let view = &mut app.slots[0];
+            view.history = vec![
+                "show version".into(),
+                "reset".into(),
+                "show interfaces".into(),
+                "show version".into(),
+            ];
+            view.draft = "sh".chars().collect();
+            view.draft_cursor = 2;
+        }
+        let (commands, _) = mpsc::channel(4);
+
+        for expected in ["show version", "show interfaces", "show version"] {
+            app.handle_line_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commands);
+            assert_eq!(app.slots[0].draft.iter().collect::<String>(), expected);
+        }
+
+        // Any other key confirms the candidate and leaves completion mode.
+        app.handle_line_key(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &commands,
+        );
+        assert!(app.slots[0].completion.is_none());
+        assert_eq!(
+            app.slots[0].draft.iter().collect::<String>(),
+            "show version "
+        );
+
+        // An empty draft completes from the full history, newest first.
+        app.slots[0].draft.clear();
+        app.slots[0].draft_cursor = 0;
+        app.handle_line_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.slots[0].draft.iter().collect::<String>(),
+            "show version"
+        );
+    }
+
+    #[test]
+    fn enter_send_returns_the_view_to_the_live_tail() {
+        let mut app = ready_app_with_control();
+        app.slots[0].scroll_from_bottom = 5;
+        app.slots[0].unseen = 3;
+        app.slots[0].draft = "version".chars().collect();
+        app.slots[0].draft_cursor = 7;
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+
+        assert_eq!(app.slots[0].scroll_from_bottom, 0);
+        assert_eq!(app.slots[0].unseen, 0);
+        assert!(received.try_recv().is_ok());
     }
 
     #[test]

@@ -2,26 +2,18 @@ use chrono::{DateTime, Local, SecondsFormat, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use serial_protocol::{ActorKind, Direction, EventKind, TimelineEvent};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticKind {
-    Normal,
-    Prompt,
-    Debug,
-    Info,
-    Success,
-    Warning,
-    Error,
-    System,
-    Gap,
-}
-
 #[derive(Debug, Clone)]
 pub struct DisplayLine {
     pub seq: u64,
     pub source: String,
     pub text: String,
     pub source_style: Style,
-    pub semantic_style: Style,
+    /// Color of the leading "●" marker for TX/actor-attributed rows. `None`
+    /// renders a two-space indent instead (device RX rows, system rows, gaps).
+    pub marker_color: Option<Color>,
+    /// Whole-line style for system/gap rows. `None` selects inline keyword and
+    /// prompt highlighting (stream rows) at render time.
+    pub solid_style: Option<Style>,
     pub bytes: usize,
 }
 
@@ -66,17 +58,12 @@ impl TerminalStreamParser {
     /// stream; control/system events form their own committed rows. Changing
     /// source, daemon epoch, or physical generation commits the old partial
     /// row so attribution never leaks across actors or serial sessions.
-    pub fn push_event(
-        &mut self,
-        event: &TimelineEvent,
-        shell_prompt: Option<&str>,
-        uboot_prompt: Option<&str>,
-    ) -> StreamDisplayBatch {
+    pub fn push_event(&mut self, event: &TimelineEvent) -> StreamDisplayBatch {
         let mut completed = Vec::new();
 
         if event.direction == Direction::None {
-            completed.extend(self.flush(shell_prompt, uboot_prompt));
-            completed.extend(event_to_lines(event, shell_prompt, uboot_prompt));
+            completed.extend(self.flush());
+            completed.extend(event_to_lines(event));
             return StreamDisplayBatch {
                 completed,
                 pending: None,
@@ -89,7 +76,7 @@ impl TerminalStreamParser {
             .as_ref()
             .is_some_and(|current| current.identity != incoming.identity)
         {
-            completed.extend(self.flush(shell_prompt, uboot_prompt));
+            completed.extend(self.flush());
         }
 
         match &mut self.context {
@@ -99,36 +86,29 @@ impl TerminalStreamParser {
 
         let rows = self.terminal.push(&event.data);
         if let Some(context) = self.context.as_ref() {
-            completed.extend(
-                rows.into_iter()
-                    .map(|text| context.display_line(text, shell_prompt, uboot_prompt)),
-            );
+            completed.extend(rows.into_iter().map(|text| context.display_line(text)));
         }
 
         StreamDisplayBatch {
             completed,
-            pending: self.pending_line(shell_prompt, uboot_prompt),
+            pending: self.pending_line(),
         }
     }
 
     /// Commits an unterminated row and resets all decoder/escape state.
     /// A truncated UTF-8 scalar is rendered as U+FFFD; an unfinished escape
     /// sequence is discarded because replaying it would be unsafe.
-    pub fn flush(
-        &mut self,
-        shell_prompt: Option<&str>,
-        uboot_prompt: Option<&str>,
-    ) -> Vec<DisplayLine> {
+    pub fn flush(&mut self) -> Vec<DisplayLine> {
         let completed_rows = self.terminal.finish_input();
         let mut lines = Vec::new();
         if let Some(context) = self.context.as_ref() {
             lines.extend(
                 completed_rows
                     .into_iter()
-                    .map(|text| context.display_line(text, shell_prompt, uboot_prompt)),
+                    .map(|text| context.display_line(text)),
             );
             if let Some(text) = self.terminal.take_pending() {
-                lines.push(context.display_line(text, shell_prompt, uboot_prompt));
+                lines.push(context.display_line(text));
             }
         }
         self.terminal.reset();
@@ -143,15 +123,11 @@ impl TerminalStreamParser {
         self.context = None;
     }
 
-    pub fn pending_line(
-        &self,
-        shell_prompt: Option<&str>,
-        uboot_prompt: Option<&str>,
-    ) -> Option<DisplayLine> {
+    pub fn pending_line(&self) -> Option<DisplayLine> {
         let context = self.context.as_ref()?;
         self.terminal
             .pending_text()
-            .map(|text| context.display_line(text, shell_prompt, uboot_prompt))
+            .map(|text| context.display_line(text))
     }
 }
 
@@ -197,19 +173,14 @@ impl LineContext {
         self.kind = event.kind;
     }
 
-    fn display_line(
-        &self,
-        text: String,
-        shell_prompt: Option<&str>,
-        uboot_prompt: Option<&str>,
-    ) -> DisplayLine {
-        let semantic = classify_parts(&text, self.direction, self.kind, shell_prompt, uboot_prompt);
+    fn display_line(&self, text: String) -> DisplayLine {
         DisplayLine {
             seq: self.seq,
             source: self.source.clone(),
             bytes: text.len() + self.source.len() + 16,
-            semantic_style: semantic_style(semantic),
             source_style: self.source_style,
+            marker_color: marker_color(self.direction, self.identity.actor_kind),
+            solid_style: solid_style(self.direction, self.kind),
             text,
         }
     }
@@ -484,13 +455,14 @@ fn csi_parameter(parameters: &[u8], index: usize, default: usize) -> usize {
     })
 }
 
-pub fn event_to_lines(
-    event: &TimelineEvent,
-    shell_prompt: Option<&str>,
-    uboot_prompt: Option<&str>,
-) -> Vec<DisplayLine> {
+pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
     let source = source_label(event);
     let source_style = source_style(event);
+    let marker_color = marker_color(
+        event.direction,
+        event.actor.as_ref().map(|actor| actor.kind),
+    );
+    let solid_style = solid_style(event.direction, event.kind);
     let text = sanitize_terminal_bytes(&event.data);
     let text = normalize_newlines(&text);
     let mut lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
@@ -503,16 +475,14 @@ pub fn event_to_lines(
 
     lines
         .into_iter()
-        .map(|text| {
-            let semantic = classify(&text, event, shell_prompt, uboot_prompt);
-            DisplayLine {
-                seq: event.seq,
-                source: source.clone(),
-                bytes: text.len() + source.len() + 16,
-                semantic_style: semantic_style(semantic),
-                source_style,
-                text,
-            }
+        .map(|text| DisplayLine {
+            seq: event.seq,
+            source: source.clone(),
+            bytes: text.len() + source.len() + 16,
+            source_style,
+            marker_color,
+            solid_style,
+            text,
         })
         .collect()
 }
@@ -524,7 +494,12 @@ pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
         source: "GAP".into(),
         bytes: text.len() + 20,
         source_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        semantic_style: semantic_style(SemanticKind::Gap),
+        marker_color: None,
+        solid_style: Some(
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
         text,
     }
 }
@@ -750,87 +725,137 @@ fn source_style(event: &TimelineEvent) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
-fn classify(
-    text: &str,
-    event: &TimelineEvent,
-    shell_prompt: Option<&str>,
-    uboot_prompt: Option<&str>,
-) -> SemanticKind {
-    classify_parts(
-        text,
-        event.direction,
-        event.kind,
-        shell_prompt,
-        uboot_prompt,
-    )
+/// Whole-line style for non-stream rows. Stream rows return `None` so the
+/// renderer applies inline keyword/prompt spans instead of one flat color.
+fn solid_style(direction: Direction, kind: EventKind) -> Option<Style> {
+    if direction != Direction::None {
+        return None;
+    }
+    Some(match kind {
+        EventKind::Gap | EventKind::LoggingDegraded | EventKind::SerialOpenFailed => {
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        }
+        _ => Style::default().fg(Color::DarkGray),
+    })
 }
 
-fn classify_parts(
+/// Leading-dot color for TX/actor-attributed rows; device RX rows and rows
+/// without an actor get no dot and are indented instead.
+fn marker_color(direction: Direction, actor_kind: Option<ActorKind>) -> Option<Color> {
+    match direction {
+        Direction::Rx => None,
+        Direction::Tx => Some(match actor_kind {
+            Some(ActorKind::Human) => Color::Green,
+            Some(ActorKind::Agent) => Color::Magenta,
+            Some(ActorKind::Script) => Color::Yellow,
+            Some(ActorKind::System) | None => Color::Blue,
+        }),
+        Direction::None => actor_kind.map(|_| Color::Blue),
+    }
+}
+
+const ERROR_KEYWORDS: &[&str] = &["error", "failed", "failure", "panic", "fatal", "assert"];
+const WARNING_KEYWORDS: &[&str] = &["warn", "timeout", "retry", "dropped"];
+const SUCCESS_KEYWORDS: &[&str] = &["success", "passed", " pass", "ready", "[ok]"];
+const INFO_KEYWORDS: &[&str] = &["info", "notice"];
+const DEBUG_KEYWORDS: &[&str] = &["debug", "trace"];
+
+/// MobaXterm-style inline highlight spans for one stream row.
+///
+/// Returns non-overlapping `(start_byte, end_byte, Style)` spans sorted by
+/// start. Only the matched keyword itself is colored; the rest of the row
+/// keeps the default foreground. Class priority is error over warning over
+/// success over info over debug; within one class the longer keyword wins
+/// overlaps. A trailing prompt (configured shell/U-Boot prompt, or the
+/// fallback ` #`, ` $`, ` >` line endings) is colored LightCyan+Bold and
+/// takes precedence over keywords.
+pub fn highlight_spans(
     text: &str,
-    direction: Direction,
-    kind: EventKind,
     shell_prompt: Option<&str>,
     uboot_prompt: Option<&str>,
-) -> SemanticKind {
-    if direction == Direction::None {
-        return match kind {
-            EventKind::Gap | EventKind::LoggingDegraded | EventKind::SerialOpenFailed => {
-                SemanticKind::Error
-            }
-            _ => SemanticKind::System,
-        };
+) -> Vec<(usize, usize, Style)> {
+    let mut spans: Vec<(usize, usize, Style)> = Vec::new();
+    if let Some((start, end)) = prompt_range(text, shell_prompt, uboot_prompt) {
+        spans.push((start, end, prompt_style()));
     }
 
-    let configured_prompt = [shell_prompt, uboot_prompt]
-        .into_iter()
-        .flatten()
-        .any(|prompt| !prompt.is_empty() && text.ends_with(prompt));
-    let trimmed = text.trim_end();
-    if configured_prompt
-        || trimmed.ends_with(" #")
-        || trimmed.ends_with(" $")
-        || trimmed.ends_with(" >")
-    {
-        return SemanticKind::Prompt;
-    }
-
+    // to_ascii_lowercase only remaps A-Z, so byte offsets stay valid for the
+    // original text.
     let lowercase = text.to_ascii_lowercase();
-    if contains_any(
-        &lowercase,
-        &["error", "failed", "failure", "panic", "fatal", "assert"],
-    ) {
-        SemanticKind::Error
-    } else if contains_any(&lowercase, &["warn", "timeout", "retry", "dropped"]) {
-        SemanticKind::Warning
-    } else if contains_any(&lowercase, &["success", "passed", " pass", "ready", "[ok]"]) {
-        SemanticKind::Success
-    } else if contains_any(&lowercase, &["debug", "trace"]) {
-        SemanticKind::Debug
-    } else if contains_any(&lowercase, &["info", "notice"]) {
-        SemanticKind::Info
-    } else {
-        SemanticKind::Normal
+    let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+    for (rank, keywords) in [
+        ERROR_KEYWORDS,
+        WARNING_KEYWORDS,
+        SUCCESS_KEYWORDS,
+        INFO_KEYWORDS,
+        DEBUG_KEYWORDS,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for keyword in keywords {
+            let mut from = 0;
+            while let Some(found) = lowercase[from..].find(keyword) {
+                let start = from + found;
+                candidates.push((start, start + keyword.len(), rank));
+                from = start + 1;
+            }
+        }
     }
+    candidates.sort_by(|left, right| {
+        left.2
+            .cmp(&right.2)
+            .then((right.1 - right.0).cmp(&(left.1 - left.0)))
+    });
+    for (start, end, rank) in candidates {
+        if spans
+            .iter()
+            .any(|(kept_start, kept_end, _)| start < *kept_end && *kept_start < end)
+        {
+            continue;
+        }
+        spans.push((start, end, keyword_style(rank)));
+    }
+    spans.sort_by_key(|(start, _, _)| *start);
+    spans
 }
 
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
+fn prompt_range(
+    text: &str,
+    shell_prompt: Option<&str>,
+    uboot_prompt: Option<&str>,
+) -> Option<(usize, usize)> {
+    for prompt in [shell_prompt, uboot_prompt].into_iter().flatten() {
+        if !prompt.is_empty() && text.ends_with(prompt) {
+            return Some((text.len() - prompt.len(), text.len()));
+        }
+    }
+    let trimmed = text.trim_end();
+    for marker in [" #", " $", " >"] {
+        if trimmed.ends_with(marker) {
+            return Some((trimmed.len() - 1, trimmed.len()));
+        }
+    }
+    None
 }
 
-fn semantic_style(kind: SemanticKind) -> Style {
-    match kind {
-        SemanticKind::Normal => Style::default(),
-        SemanticKind::Prompt => Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-        SemanticKind::Debug => Style::default().fg(Color::DarkGray),
-        SemanticKind::Info => Style::default().fg(Color::LightBlue),
-        SemanticKind::Success => Style::default().fg(Color::LightGreen),
-        SemanticKind::Warning => Style::default().fg(Color::Yellow),
-        SemanticKind::Error | SemanticKind::Gap => Style::default()
+fn prompt_style() -> Style {
+    Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn keyword_style(rank: usize) -> Style {
+    match rank {
+        0 => Style::default()
             .fg(Color::LightRed)
             .add_modifier(Modifier::BOLD),
-        SemanticKind::System => Style::default().fg(Color::DarkGray),
+        1 => Style::default().fg(Color::Yellow),
+        2 => Style::default().fg(Color::LightGreen),
+        3 => Style::default().fg(Color::LightBlue),
+        _ => Style::default().fg(Color::DarkGray),
     }
 }
 
@@ -914,8 +939,9 @@ mod tests {
         assert!(rendered.contains("AGENT:worker-a[agent:session-12345678]>"));
         assert!(!rendered.contains("\u{1b}"));
 
-        let line = event_to_lines(&tx, None, None).remove(0);
+        let line = event_to_lines(&tx).remove(0);
         assert_eq!(line.source, "AGENT:worker-a[12345678]>");
+        assert_eq!(line.marker_color, Some(Color::Magenta));
     }
 
     #[test]
@@ -926,16 +952,38 @@ mod tests {
     }
 
     #[test]
-    fn prompt_and_errors_get_semantic_styles() {
-        let prompt = event(b"SigmaStar #");
+    fn prompt_and_error_keywords_get_inline_spans() {
+        let spans = highlight_spans("SigmaStar #", None, Some("SigmaStar #"));
+        assert_eq!(spans, vec![(0, 11, prompt_style())]);
+
+        let spans = highlight_spans("FATAL: boot failed", None, None);
         assert_eq!(
-            classify("SigmaStar #", &prompt, None, Some("SigmaStar #")),
-            SemanticKind::Prompt
+            spans,
+            vec![(0, 5, keyword_style(0)), (12, 18, keyword_style(0)),]
         );
-        assert_eq!(
-            classify("FATAL: boot failed", &prompt, None, None),
-            SemanticKind::Error
-        );
+    }
+
+    #[test]
+    fn keyword_priority_prefers_error_then_the_longer_match() {
+        let spans = highlight_spans("ready pass", None, None);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], (0, 5, keyword_style(2)));
+        assert_eq!(spans[1], (5, 10, keyword_style(2)));
+
+        let spans = highlight_spans("pass passed", None, None);
+        assert_eq!(spans, vec![(5, 11, keyword_style(2))]);
+
+        let spans = highlight_spans("timeout error", None, None);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], (0, 7, keyword_style(1)));
+        assert_eq!(spans[1], (8, 13, keyword_style(0)));
+    }
+
+    #[test]
+    fn fallback_prompt_marks_only_the_trailing_symbol() {
+        let spans = highlight_spans("root@dut #", None, None);
+        assert_eq!(spans, vec![(9, 10, prompt_style())]);
+        assert!(highlight_spans("no prompt here", None, None).is_empty());
     }
 
     #[test]
@@ -943,11 +991,11 @@ mod tests {
         let mut parser = TerminalStreamParser::new();
         let encoded = "启动".as_bytes();
 
-        let first = parser.push_event(&event_at(1, &encoded[..2]), None, None);
+        let first = parser.push_event(&event_at(1, &encoded[..2]));
         assert!(first.completed.is_empty());
         assert!(first.pending.is_none());
 
-        let second = parser.push_event(&event_at(2, &encoded[2..5]), None, None);
+        let second = parser.push_event(&event_at(2, &encoded[2..5]));
         assert!(second.completed.is_empty());
         assert_eq!(
             second.pending.as_ref().map(|line| line.text.as_str()),
@@ -956,7 +1004,7 @@ mod tests {
 
         let mut final_bytes = encoded[5..].to_vec();
         final_bytes.push(b'\n');
-        let third = parser.push_event(&event_at(3, &final_bytes), None, None);
+        let third = parser.push_event(&event_at(3, &final_bytes));
         assert_eq!(
             third
                 .completed
@@ -972,24 +1020,24 @@ mod tests {
     fn stream_strips_split_csi_and_osc_sequences() {
         let mut parser = TerminalStreamParser::new();
 
-        let first = parser.push_event(&event_at(1, b"safe \x1b[3"), None, None);
+        let first = parser.push_event(&event_at(1, b"safe \x1b[3"));
         assert_eq!(
             first.pending.as_ref().map(|line| line.text.as_str()),
             Some("safe ")
         );
 
-        let second = parser.push_event(&event_at(2, b"1mred\x1b[0m \x1b]52;c;sec"), None, None);
+        let second = parser.push_event(&event_at(2, b"1mred\x1b[0m \x1b]52;c;sec"));
         assert_eq!(
             second.pending.as_ref().map(|line| line.text.as_str()),
             Some("safe red ")
         );
 
-        let third = parser.push_event(&event_at(3, b"ret\x1b"), None, None);
+        let third = parser.push_event(&event_at(3, b"ret\x1b"));
         assert_eq!(
             third.pending.as_ref().map(|line| line.text.as_str()),
             Some("safe red ")
         );
-        let fourth = parser.push_event(&event_at(4, b"\\end\n"), None, None);
+        let fourth = parser.push_event(&event_at(4, b"\\end\n"));
         assert_eq!(fourth.completed.len(), 1);
         assert_eq!(fourth.completed[0].text, "safe red end");
     }
@@ -997,36 +1045,41 @@ mod tests {
     #[test]
     fn stream_applies_cr_erase_and_backspace_across_events() {
         let mut parser = TerminalStreamParser::new();
-        let progress = parser.push_event(&event_at(1, b"download 100%\r42%\x1b[K\n"), None, None);
+        let progress = parser.push_event(&event_at(1, b"download 100%\r42%\x1b[K\n"));
         assert_eq!(progress.completed[0].text, "42%");
 
-        let first = parser.push_event(&event_at(2, b"abc\x08"), None, None);
+        let first = parser.push_event(&event_at(2, b"abc\x08"));
         assert_eq!(
             first.pending.as_ref().map(|line| line.text.as_str()),
             Some("abc")
         );
-        let second = parser.push_event(&event_at(3, b"\x08XY\n"), None, None);
+        let second = parser.push_event(&event_at(3, b"\x08XY\n"));
         assert_eq!(second.completed[0].text, "aXY");
 
-        let overwrite = parser.push_event(&event_at(4, b"abc\rXY\n"), None, None);
+        let overwrite = parser.push_event(&event_at(4, b"abc\rXY\n"));
         assert_eq!(overwrite.completed[0].text, "XYc");
     }
 
     #[test]
     fn source_change_commits_partial_row_and_preserves_styles() {
         let mut parser = TerminalStreamParser::new();
-        let first = parser.push_event(&event_at(1, b"Sigma"), None, Some("SigmaStar #"));
+        let first = parser.push_event(&event_at(1, b"Sigma"));
         assert_eq!(
             first.pending.as_ref().map(|line| line.text.as_str()),
             Some("Sigma")
         );
 
-        let prompt = parser.push_event(&event_at(2, b"Star #"), None, Some("SigmaStar #"));
+        let prompt = parser.push_event(&event_at(2, b"Star #"));
         let prompt = prompt
             .pending
             .expect("prompt should remain visible without newline");
         assert_eq!(prompt.source, "DEV");
-        assert_eq!(prompt.semantic_style, semantic_style(SemanticKind::Prompt));
+        assert_eq!(prompt.marker_color, None);
+        assert_eq!(prompt.solid_style, None);
+        assert_eq!(
+            highlight_spans(&prompt.text, None, Some("SigmaStar #")),
+            vec![(0, 11, prompt_style())]
+        );
 
         let mut tx = event_at(3, b"reboot\r");
         tx.direction = Direction::Tx;
@@ -1036,7 +1089,7 @@ mod tests {
             label: "operator".into(),
             kind: ActorKind::Human,
         });
-        let switched = parser.push_event(&tx, None, Some("SigmaStar #"));
+        let switched = parser.push_event(&tx);
         assert_eq!(switched.completed.len(), 1);
         assert_eq!(switched.completed[0].source, "DEV");
         assert_eq!(switched.completed[0].text, "SigmaStar #");
@@ -1053,6 +1106,10 @@ mod tests {
             )
         );
         assert_eq!(
+            switched.pending.as_ref().map(|line| line.marker_color),
+            Some(Some(Color::Green))
+        );
+        assert_eq!(
             switched.pending.as_ref().map(|line| line.text.as_str()),
             Some("reboot")
         );
@@ -1064,61 +1121,63 @@ mod tests {
         let shell_prompt = Some("root@dut:/tmp# ");
         let uboot_prompt = Some("SigmaStar =>");
 
-        let shell_prefix =
-            parser.push_event(&event_at(1, b"root@dut:/"), shell_prompt, uboot_prompt);
+        let shell_prefix = parser.push_event(&event_at(1, b"root@dut:/"));
         assert_eq!(
             shell_prefix.pending.as_ref().map(|line| line.text.as_str()),
             Some("root@dut:/")
         );
-        let shell = parser.push_event(&event_at(2, b"tmp# "), shell_prompt, uboot_prompt);
+        let shell = parser.push_event(&event_at(2, b"tmp# "));
+        let shell = shell.pending.expect("shell prompt row");
         assert_eq!(
-            shell.pending.as_ref().map(|line| line.semantic_style),
-            Some(semantic_style(SemanticKind::Prompt))
+            highlight_spans(&shell.text, shell_prompt, uboot_prompt),
+            vec![(0, 15, prompt_style())]
         );
 
-        let uboot_prefix = parser.push_event(&event_at(3, b"\nSigma"), shell_prompt, uboot_prompt);
+        let uboot_prefix = parser.push_event(&event_at(3, b"\nSigma"));
         assert_eq!(
-            uboot_prefix
-                .completed
-                .first()
-                .map(|line| line.semantic_style),
-            Some(semantic_style(SemanticKind::Prompt))
+            uboot_prefix.completed.first().map(|line| highlight_spans(
+                &line.text,
+                shell_prompt,
+                uboot_prompt
+            )),
+            Some(vec![(0, 15, prompt_style())])
         );
         assert_eq!(
             uboot_prefix.pending.as_ref().map(|line| line.text.as_str()),
             Some("Sigma")
         );
-        let uboot = parser.push_event(&event_at(4, b"Star =>"), shell_prompt, uboot_prompt);
+        let uboot = parser.push_event(&event_at(4, b"Star =>"));
+        let uboot = uboot.pending.expect("U-Boot prompt row");
         assert_eq!(
-            uboot.pending.as_ref().map(|line| line.semantic_style),
-            Some(semantic_style(SemanticKind::Prompt))
+            highlight_spans(&uboot.text, shell_prompt, uboot_prompt),
+            vec![(0, 12, prompt_style())]
         );
     }
 
     #[test]
-    fn semantic_classification_uses_the_complete_streamed_row() {
+    fn keyword_highlighting_uses_the_complete_streamed_row() {
         let mut parser = TerminalStreamParser::new();
-        parser.push_event(&event_at(1, b"FAT"), None, None);
-        let completed = parser.push_event(&event_at(2, b"AL: boot failed\n"), None, None);
+        parser.push_event(&event_at(1, b"FAT"));
+        let completed = parser.push_event(&event_at(2, b"AL: boot failed\n"));
 
         assert_eq!(completed.completed.len(), 1);
         assert_eq!(completed.completed[0].text, "FATAL: boot failed");
         assert_eq!(
-            completed.completed[0].semantic_style,
-            semantic_style(SemanticKind::Error)
+            highlight_spans(&completed.completed[0].text, None, None),
+            vec![(0, 5, keyword_style(0)), (12, 18, keyword_style(0))]
         );
     }
 
     #[test]
     fn flush_handles_truncated_utf8_and_drops_incomplete_escape() {
         let mut parser = TerminalStreamParser::new();
-        parser.push_event(&event_at(1, b"ok\xe5\x90"), None, None);
-        let flushed = parser.flush(None, None);
+        parser.push_event(&event_at(1, b"ok\xe5\x90"));
+        let flushed = parser.flush();
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].text, "ok\u{fffd}");
 
-        parser.push_event(&event_at(2, b"safe\x1b]52;c;secret"), None, None);
-        let flushed = parser.flush(None, None);
+        parser.push_event(&event_at(2, b"safe\x1b]52;c;secret"));
+        let flushed = parser.flush();
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].text, "safe");
     }
@@ -1127,7 +1186,7 @@ mod tests {
     fn stream_bounds_unterminated_rows() {
         let mut parser = TerminalStreamParser::new();
         let bytes = vec![b'x'; MAX_STREAM_LINE_CHARS + 1];
-        let batch = parser.push_event(&event_at(1, &bytes), None, None);
+        let batch = parser.push_event(&event_at(1, &bytes));
 
         assert_eq!(batch.completed.len(), 1);
         assert_eq!(batch.completed[0].text.len(), MAX_STREAM_LINE_CHARS);

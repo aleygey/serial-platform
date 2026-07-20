@@ -18,6 +18,9 @@ pub struct ClientConfig {
     pub endpoint: Option<String>,
     pub token_file: Option<PathBuf>,
     pub last_slot: Option<String>,
+    /// Seconds of human inactivity before held write control is released.
+    /// Defaults to 60 when unset.
+    pub human_idle_release_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
