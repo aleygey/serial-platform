@@ -31,6 +31,9 @@ pub struct CaptureOptions {
     pub timeout: Duration,
     pub quiet: Duration,
     pub patterns: Vec<String>,
+    /// Regex matched against the rolling RX window; compiled once by the
+    /// caller and reused for every poll until it completes the capture.
+    pub until_regex: Option<regex::Regex>,
     pub allow_empty_quiet: bool,
 }
 
@@ -44,6 +47,7 @@ pub struct CaptureResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completion {
     Pattern(String),
+    Regex(String),
     Quiet,
     Timeout,
     Disconnected(String),
@@ -53,6 +57,7 @@ impl Completion {
     pub fn label(&self) -> String {
         match self {
             Self::Pattern(pattern) => format!("pattern:{pattern}"),
+            Self::Regex(pattern) => format!("regex:{pattern}"),
             Self::Quiet => "quiet".into(),
             Self::Timeout => "timeout".into(),
             Self::Disconnected(reason) => format!("disconnected:{reason}"),
@@ -60,7 +65,7 @@ impl Completion {
     }
 
     pub fn is_complete(&self) -> bool {
-        matches!(self, Self::Pattern(_) | Self::Quiet)
+        matches!(self, Self::Pattern(_) | Self::Regex(_) | Self::Quiet)
     }
 }
 
@@ -272,6 +277,7 @@ struct CompletionWatcher {
     deadline: tokio::time::Instant,
     quiet: Duration,
     patterns: Vec<String>,
+    until_regex: Option<regex::Regex>,
     last_activity: Option<tokio::time::Instant>,
 }
 
@@ -281,6 +287,7 @@ impl CompletionWatcher {
             deadline: tokio::time::Instant::now() + options.timeout,
             quiet: options.quiet,
             patterns: options.patterns,
+            until_regex: options.until_regex,
             last_activity: options.allow_empty_quiet.then(tokio::time::Instant::now),
         }
     }
@@ -303,6 +310,11 @@ impl CompletionWatcher {
     fn poll(&self, rolling: &str, now: tokio::time::Instant) -> Option<Completion> {
         if let Some(pattern) = matched_pattern(rolling, &self.patterns) {
             return Some(Completion::Pattern(pattern));
+        }
+        if let Some(regex) = &self.until_regex
+            && regex.is_match(rolling)
+        {
+            return Some(Completion::Regex(regex.as_str().to_string()));
         }
         if let Some(last) = self.last_activity
             && now.duration_since(last) >= self.quiet
@@ -399,8 +411,33 @@ mod tests {
             timeout: Duration::from_secs(60),
             quiet: Duration::from_millis(300),
             patterns: patterns.iter().map(|pattern| pattern.to_string()).collect(),
+            until_regex: None,
             allow_empty_quiet,
         })
+    }
+
+    #[test]
+    fn until_regex_completes_on_the_first_window_match() {
+        let mut regex_watcher = watcher(&["never this literal"], false);
+        regex_watcher.until_regex = Some(regex::Regex::new(r"U-Boot \d+\.\d+").unwrap());
+        assert_eq!(
+            regex_watcher.poll("booting...", tokio::time::Instant::now()),
+            None
+        );
+        assert_eq!(
+            regex_watcher.poll("U-Boot 2023.10 ready", tokio::time::Instant::now()),
+            Some(Completion::Regex(r"U-Boot \d+\.\d+".into()))
+        );
+    }
+
+    #[test]
+    fn literal_pattern_is_reported_before_a_regex_match() {
+        let mut both = watcher(&["ready"], false);
+        both.until_regex = Some(regex::Regex::new(r"re\w+y").unwrap());
+        assert_eq!(
+            both.poll("ready now", tokio::time::Instant::now()),
+            Some(Completion::Pattern("ready".into()))
+        );
     }
 
     #[test]

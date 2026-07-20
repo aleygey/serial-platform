@@ -3,7 +3,9 @@ use std::{collections::BTreeMap, time::Duration};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use serial_protocol::{Cursor, Direction, EchoMode, EventQuery, SessionState, SlotSnapshot};
+use serial_protocol::{
+    Cursor, Direction, EchoMode, EventQuery, SessionState, SlotSnapshot, WritePacing,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -108,6 +110,7 @@ impl AgentTools {
                 include_raw: args.include_raw,
                 echo: None,
                 collapse_repeats: args.collapse_repeats,
+                include_events: args.include_events,
             },
             "tail_or_cursor",
         ))
@@ -174,6 +177,7 @@ impl AgentTools {
                 include_raw: args.include_raw,
                 echo: None,
                 collapse_repeats: args.collapse_repeats,
+                include_events: args.include_events,
             },
             scope,
         );
@@ -241,9 +245,11 @@ impl AgentTools {
                 timeout: seconds(args.timeout_seconds, 10, 1, 120),
                 quiet: millis(args.quiet_ms, 300, 50, 5000),
                 patterns: args.contains.into_iter().collect(),
+                until_regex: None,
                 allow_empty_quiet: false,
             })
             .await;
+        let with_events = args.include_events || args.include_raw;
         let rendered = render_events(
             &result.events,
             RenderOptions {
@@ -251,6 +257,7 @@ impl AgentTools {
                 include_raw: args.include_raw,
                 echo: None,
                 collapse_repeats: args.collapse_repeats,
+                include_events: args.include_events,
             },
         );
         let last_seq = result
@@ -258,13 +265,17 @@ impl AgentTools {
             .last()
             .map(|event| event.seq)
             .unwrap_or(slot.head_seq);
-        Ok(json!({
+        let mut output = json!({
             "slot_id": slot.config.id, "epoch": slot.daemon_epoch, "after_seq": last_seq,
             "completion": result.completion.label(), "complete": result.completion.is_complete(),
-            "text": rendered.text, "events": rendered.events,
+            "text": rendered.text,
             "capture_truncated": result.truncated, "text_truncated": rendered.text_truncated,
             "repeated_lines_collapsed": rendered.repeated_lines_collapsed, "gaps": result.gaps
-        }))
+        });
+        if with_events {
+            output["events"] = json!(rendered.events);
+        }
+        Ok(output)
     }
 
     async fn command(&self, args: CommandArgs) -> Result<Value> {
@@ -290,12 +301,20 @@ impl AgentTools {
         )?;
 
         let (patterns, completion_mode) = completion_patterns(&args, &slot)?;
+        let until_regex = args
+            .until_regex
+            .as_deref()
+            .map(regex::Regex::new)
+            .transpose()
+            .context("until_regex is not a valid regex")?;
+        let pacing = write_pacing(args.chunk_size, args.inter_char_delay_ms, &slot);
         let write = self
             .session
             .write(
                 args.slot_id.clone(),
                 bytes,
                 operation_id,
+                pacing,
                 seconds(args.control_wait_seconds, 15, 0, 60),
             )
             .await?;
@@ -304,11 +323,13 @@ impl AgentTools {
                 timeout: seconds(args.timeout_seconds, 10, 1, 120),
                 quiet: millis(args.quiet_ms, 300, 50, 5000),
                 patterns,
+                until_regex,
                 allow_empty_quiet: true,
             })
             .await;
         let echo = (matches!(slot.config.settings.echo, EchoMode::On) && !args.command.is_empty())
             .then_some(args.command.as_str());
+        let with_events = args.include_events || args.include_raw;
         let rendered = render_events(
             &result.events,
             RenderOptions {
@@ -316,6 +337,7 @@ impl AgentTools {
                 include_raw: args.include_raw,
                 echo,
                 collapse_repeats: args.collapse_repeats,
+                include_events: args.include_events,
             },
         );
         let interfered = result.events.iter().any(|event| {
@@ -326,16 +348,20 @@ impl AgentTools {
             .last()
             .map(|event| event.seq)
             .unwrap_or(write.event_seq);
-        Ok(json!({
+        let mut output = json!({
             "slot_id": slot.config.id, "epoch": slot.daemon_epoch, "after_seq": last_seq,
             "request_id": write.request_id, "operation_id": operation_id, "tx_event_seq": write.event_seq,
             "actor": write.actor, "completion_mode": completion_mode,
             "completion": result.completion.label(), "complete": result.completion.is_complete(),
-            "interfered": interfered, "text": rendered.text, "events": rendered.events,
+            "interfered": interfered, "text": rendered.text,
             "capture_truncated": result.truncated, "text_truncated": rendered.text_truncated,
             "repeated_lines_collapsed": rendered.repeated_lines_collapsed, "gaps": result.gaps,
             "guidance": if interfered { "Another actor wrote during this operation; do not treat output as isolated." } else { "Output belongs to this operation window; prompt/quiet completion is still a heuristic." }
-        }))
+        });
+        if with_events {
+            output["events"] = json!(rendered.events);
+        }
+        Ok(output)
     }
 
     async fn run_start(&self, args: RunStartArgs) -> Result<Value> {
@@ -459,6 +485,7 @@ fn render_response(
     options: RenderOptions,
     scope: &str,
 ) -> Value {
+    let with_events = options.include_events || options.include_raw;
     let rendered = render_events(&response.events, options);
     let after_seq = response
         .next_cursor
@@ -466,12 +493,34 @@ fn render_response(
         .map(|cursor| cursor.after_seq)
         .or_else(|| response.events.last().map(|event| event.seq))
         .unwrap_or(slot.head_seq);
-    json!({
+    let mut output = json!({
         "slot_id": slot.config.id, "scope": scope, "epoch": response.next_cursor.as_ref().map(|c| c.epoch).unwrap_or(query_epoch),
         "after_seq": after_seq, "head_seq": slot.head_seq, "text": rendered.text,
-        "events": rendered.events, "truncated": response.truncated,
+        "truncated": response.truncated,
         "text_truncated": rendered.text_truncated, "repeated_lines_collapsed": rendered.repeated_lines_collapsed,
         "first_available_seq": response.first_available_seq, "gaps": response.gaps
+    });
+    if with_events {
+        output["events"] = json!(rendered.events);
+    }
+    output
+}
+
+/// Per-call write pacing override. Either side falls back to the Slot's
+/// configured pacing (seriald itself defaults to one byte per chunk with a
+/// 1 ms inter-chunk delay), and both absent means no override at all.
+fn write_pacing(
+    chunk_size: Option<u32>,
+    inter_char_delay_ms: Option<u64>,
+    slot: &SlotSnapshot,
+) -> Option<WritePacing> {
+    let chunk_size = chunk_size.filter(|size| *size > 0);
+    if chunk_size.is_none() && inter_char_delay_ms.is_none() {
+        return None;
+    }
+    Some(WritePacing {
+        chunk_size: chunk_size.unwrap_or(slot.config.settings.write_chunk_size),
+        chunk_delay_ms: inter_char_delay_ms.unwrap_or(slot.config.settings.write_chunk_delay_ms),
     })
 }
 
@@ -611,6 +660,8 @@ struct ReadArgs {
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default)]
+    include_events: bool,
     #[serde(default = "default_true")]
     collapse_repeats: bool,
 }
@@ -630,6 +681,8 @@ struct SearchArgs {
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default)]
+    include_events: bool,
     #[serde(default = "default_true")]
     collapse_repeats: bool,
 }
@@ -645,6 +698,8 @@ struct WaitArgs {
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default)]
+    include_events: bool,
     #[serde(default = "default_true")]
     collapse_repeats: bool,
 }
@@ -656,12 +711,17 @@ struct CommandArgs {
     eol: Option<String>,
     completion: Option<String>,
     until: Option<String>,
+    until_regex: Option<String>,
+    inter_char_delay_ms: Option<u64>,
+    chunk_size: Option<u32>,
     timeout_seconds: Option<u64>,
     quiet_ms: Option<u64>,
     control_wait_seconds: Option<u64>,
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
+    #[serde(default)]
+    include_events: bool,
     #[serde(default = "default_true")]
     collapse_repeats: bool,
 }
@@ -780,5 +840,73 @@ mod tests {
         assert_eq!(slots[1]["display_name"], "hawk (COM7)");
         assert_eq!(slots[2]["display_name"], "(COM9)");
         assert_eq!(slots[3]["display_name"], "unique");
+    }
+
+    fn test_slot() -> SlotSnapshot {
+        let settings = serde_json::to_value(serial_protocol::SerialSettings::default()).unwrap();
+        serde_json::from_value(json!({
+            "config": {
+                "id": "bench", "display_name": "Bench", "port": "COM3", "profile": "linux",
+                "enabled": true, "settings": settings,
+            },
+            "daemon_epoch": Uuid::nil(),
+            "head_seq": 42,
+            "ring_oldest_seq": 1,
+            "generation": 1,
+            "endpoint_present": true,
+            "session_state": "online",
+            "state_reason": null,
+            "target_activity": "active",
+            "last_rx_wall_time_ns": null,
+            "rx_offset": 0,
+            "tx_offset": 0,
+            "control": null,
+            "active_run": null,
+            "logging": "healthy"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pacing_is_unset_without_overrides_and_falls_back_per_field() {
+        let slot = test_slot();
+        assert_eq!(write_pacing(None, None, &slot), None);
+        assert_eq!(
+            write_pacing(Some(8), None, &slot),
+            Some(WritePacing {
+                chunk_size: 8,
+                chunk_delay_ms: slot.config.settings.write_chunk_delay_ms,
+            })
+        );
+        assert_eq!(
+            write_pacing(None, Some(0), &slot),
+            Some(WritePacing {
+                chunk_size: slot.config.settings.write_chunk_size,
+                chunk_delay_ms: 0,
+            })
+        );
+        // A zero chunk size is meaningless, so it falls back like an unset one.
+        assert_eq!(write_pacing(Some(0), None, &slot), None);
+    }
+
+    #[test]
+    fn command_args_parse_regex_pacing_and_lean_rendering_fields() {
+        let args: CommandArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "command": "boot",
+            "until_regex": "U-Boot \\d+",
+            "inter_char_delay_ms": 5,
+            "chunk_size": 16,
+        }))
+        .unwrap();
+        assert_eq!(args.until_regex.as_deref(), Some("U-Boot \\d+"));
+        assert_eq!(args.inter_char_delay_ms, Some(5));
+        assert_eq!(args.chunk_size, Some(16));
+        assert!(!args.include_events);
+        assert!(!args.include_raw);
+
+        let args: ReadArgs =
+            serde_json::from_value(json!({"slot_id": "bench", "include_events": true})).unwrap();
+        assert!(args.include_events);
     }
 }

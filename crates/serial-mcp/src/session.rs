@@ -5,7 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use serial_protocol::{
     Actor, ActorKind, ClientMessage, CommandResult, ControlLease, ControlMode, ErrorCode,
-    PROTOCOL_VERSION, Role, RunInfo, ServerMessage, WireFrame, decode_wire_frame,
+    PROTOCOL_VERSION, Role, RunInfo, ServerMessage, WireFrame, WritePacing, decode_wire_frame,
     encode_client_control,
 };
 use tokio::net::TcpStream;
@@ -30,6 +30,7 @@ enum SessionRequest {
         slot_id: String,
         data: Vec<u8>,
         operation_id: Uuid,
+        pacing: Option<WritePacing>,
         control_wait: Duration,
         reply: Reply,
     },
@@ -78,6 +79,7 @@ impl SessionHandle {
         slot_id: String,
         data: Vec<u8>,
         operation_id: Uuid,
+        pacing: Option<WritePacing>,
         control_wait: Duration,
     ) -> Result<WriteResult> {
         let (reply, response) = oneshot::channel();
@@ -86,6 +88,7 @@ impl SessionHandle {
                 slot_id,
                 data,
                 operation_id,
+                pacing,
                 control_wait,
                 reply,
             })
@@ -216,11 +219,12 @@ impl SessionState {
                 slot_id,
                 data,
                 operation_id,
+                pacing,
                 control_wait,
                 reply,
             } => {
                 let result = self
-                    .write(slot_id, data, operation_id, control_wait)
+                    .write(slot_id, data, operation_id, pacing, control_wait)
                     .await
                     .map(|(event_seq, actor, request_id)| SessionResponse::Write {
                         event_seq,
@@ -359,6 +363,7 @@ impl SessionState {
         slot_id: String,
         data: Vec<u8>,
         operation_id: Uuid,
+        pacing: Option<WritePacing>,
         control_wait: Duration,
     ) -> Result<(u64, Actor, Uuid)> {
         let lease = self.ensure_control(&slot_id, control_wait).await?;
@@ -374,7 +379,7 @@ impl SessionState {
             fence: lease.fence,
             data,
             operation_id: Some(operation_id),
-            pacing: None,
+            pacing,
         };
         match self.call(request).await {
             Ok(CommandResult::WriteAccepted { event_seq }) => Ok((event_seq, actor, request_id)),

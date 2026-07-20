@@ -152,6 +152,7 @@ pub fn tool_definitions() -> Vec<Value> {
     let bounds = json!({
         "max_chars": {"type":"integer","minimum":256,"maximum":64000,"default":16000},
         "include_raw": {"type":"boolean","default":false,"description":"Include base64 raw bytes; use only when exact bytes matter."},
+        "include_events": {"type":"boolean","default":false,"description":"Include the full per-event array (verbose). Default false returns text plus the cursor fields (epoch/after_seq/head_seq/first_available_seq/gaps/truncated) needed to continue reading."},
         "collapse_repeats": {"type":"boolean","default":true,"description":"Fold byte-identical adjacent lines into a repeat marker; false keeps the exact line stream."}
     });
     vec![
@@ -188,6 +189,9 @@ pub fn tool_definitions() -> Vec<Value> {
                         "eol":{"type":"string","description":"Override profile EOL for this call only; default profile usually uses \\r."},
                         "completion":{"type":"string","enum":["auto","prompt","contains","quiet"],"default":"auto"},
                         "until":{"type":"string","description":"Literal completion text; required for contains, optional extra prompt for prompt."},
+                        "until_regex":{"type":"string","description":"Regex matched against the rolling RX window; completes immediately on the first match, in any completion mode."},
+                        "inter_char_delay_ms":{"type":"integer","minimum":0,"description":"Write pacing override for this call: delay between written chunks in ms; seriald already defaults to 1 ms per character. Omit to keep the Slot setting."},
+                        "chunk_size":{"type":"integer","minimum":1,"description":"Write pacing override for this call: bytes written per chunk; seriald defaults to 1 (one character). Omit to keep the Slot setting."},
                         "timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"default":10},
                         "quiet_ms":{"type":"integer","minimum":50,"maximum":5000,"default":300},
                         "control_wait_seconds":{"type":"integer","minimum":0,"maximum":60,"default":15}

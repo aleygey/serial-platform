@@ -16,6 +16,10 @@ pub struct RenderOptions<'a> {
     /// Collapse byte-identical adjacent lines. Disable when the exact line
     /// stream matters more than a compact rendering.
     pub collapse_repeats: bool,
+    /// Populate the per-event summary array. Omitted by default because the
+    /// array dominates token usage; cursor fields are always reported by the
+    /// caller regardless of this flag. Raw bytes imply the array.
+    pub include_events: bool,
 }
 
 pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> RenderedEvents {
@@ -36,7 +40,22 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
     };
     let (text, text_truncated) = limit_tail(text, options.max_chars);
 
-    let events = events
+    let events = if options.include_events || options.include_raw {
+        event_summaries(events, options.include_raw)
+    } else {
+        Vec::new()
+    };
+
+    RenderedEvents {
+        text,
+        events,
+        text_truncated,
+        repeated_lines_collapsed,
+    }
+}
+
+fn event_summaries(events: &[TimelineEvent], include_raw: bool) -> Vec<Value> {
+    events
         .iter()
         .map(|event| {
             let mut summary = json!({
@@ -50,19 +69,12 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
                 "durable": event.durable,
                 "byte_count": event.data.len(),
             });
-            if options.include_raw && !event.data.is_empty() {
+            if include_raw && !event.data.is_empty() {
                 summary["data_base64"] = Value::String(BASE64.encode(&event.data));
             }
             summary
         })
-        .collect();
-
-    RenderedEvents {
-        text,
-        events,
-        text_truncated,
-        repeated_lines_collapsed,
-    }
+        .collect()
 }
 
 fn terminal_text(bytes: &[u8]) -> String {
@@ -239,6 +251,7 @@ mod tests {
                 include_raw: false,
                 echo: None,
                 collapse_repeats: false,
+                include_events: false,
             },
         );
         assert_eq!(rendered.text, "a\na\na\n");
@@ -251,10 +264,54 @@ mod tests {
                 include_raw: false,
                 echo: None,
                 collapse_repeats: true,
+                include_events: false,
             },
         );
         assert_eq!(collapsed.repeated_lines_collapsed, 2);
         assert!(collapsed.text.contains("repeated 2 more times"));
+    }
+
+    #[test]
+    fn event_summaries_are_lean_by_default() {
+        let lean = render_events(
+            &[rx_event(1, b"hi\r\n")],
+            RenderOptions {
+                max_chars: 1024,
+                include_raw: false,
+                echo: None,
+                collapse_repeats: true,
+                include_events: false,
+            },
+        );
+        assert!(lean.events.is_empty());
+        assert_eq!(lean.text, "hi\n");
+
+        let full = render_events(
+            &[rx_event(1, b"hi\r\n")],
+            RenderOptions {
+                max_chars: 1024,
+                include_raw: false,
+                echo: None,
+                collapse_repeats: true,
+                include_events: true,
+            },
+        );
+        assert_eq!(full.events.len(), 1);
+        assert_eq!(full.events[0]["seq"], 1);
+
+        // Raw bytes need the event array even when include_events is false.
+        let raw = render_events(
+            &[rx_event(1, b"hi\r\n")],
+            RenderOptions {
+                max_chars: 1024,
+                include_raw: true,
+                echo: None,
+                collapse_repeats: true,
+                include_events: false,
+            },
+        );
+        assert_eq!(raw.events.len(), 1);
+        assert!(raw.events[0]["data_base64"].is_string());
     }
 
     #[test]
