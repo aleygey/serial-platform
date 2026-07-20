@@ -11,6 +11,7 @@ use std::{
     io::Write as _,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use directories::ProjectDirs;
@@ -20,6 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::auth::{AuthConfig, AuthError, CredentialDisplay};
+use crate::control::{ControlLimits, MAX_TTL_MS, MAX_WAITERS, MIN_TTL_MS, WAIT_TIMEOUT};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PORT: u16 = 3210;
@@ -102,6 +104,42 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Startup-time bounds for the write-control lease machinery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControlConfig {
+    /// Ceiling applied to client-requested lease TTLs.
+    pub max_ttl_ms: u64,
+    /// Lifetime of a queued acquire request before it is dropped.
+    pub wait_timeout_ms: u64,
+    /// Bound for the per-slot control wait queue.
+    pub max_waiters: usize,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            max_ttl_ms: MAX_TTL_MS,
+            wait_timeout_ms: WAIT_TIMEOUT.as_millis() as u64,
+            max_waiters: MAX_WAITERS,
+        }
+    }
+}
+
+impl ControlConfig {
+    /// Converts the persisted values into runtime limits. The TTL ceiling is
+    /// clamped to the protocol minimum so a misconfigured ceiling can never
+    /// produce leases shorter than the client-side floor.
+    #[must_use]
+    pub fn limits(&self) -> ControlLimits {
+        ControlLimits {
+            max_ttl_ms: self.max_ttl_ms.max(MIN_TTL_MS),
+            wait_timeout: Duration::from_millis(self.wait_timeout_ms),
+            max_waiters: self.max_waiters,
+        }
+    }
+}
+
 /// Values persisted in `seriald.toml`.
 ///
 /// `Debug` is safe because [`AuthConfig`] recursively redacts every token.
@@ -113,6 +151,8 @@ pub struct DaemonConfig {
     pub bind: SocketAddr,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub control: ControlConfig,
     pub auth: AuthConfig,
     #[serde(default)]
     pub slots: Vec<SlotConfig>,
@@ -129,6 +169,7 @@ impl DaemonConfig {
                 server_id: Uuid::new_v4(),
                 bind: default_bind_address(),
                 logging: LoggingConfig::default(),
+                control: ControlConfig::default(),
                 auth,
                 slots: Vec::new(),
                 device_profiles: Vec::new(),
@@ -476,26 +517,25 @@ pub(crate) fn validate_slots(
         validate_profile(index, &slot.profile)?;
         validate_serial_settings(index, slot)?;
 
-        if let Some(device_profile) = slot.device_profile.as_deref() {
-            if !device_profiles
+        if let Some(device_profile) = slot.device_profile.as_deref()
+            && !device_profiles
                 .iter()
                 .any(|profile| profile.name == device_profile)
-            {
-                let available = device_profiles
-                    .iter()
-                    .map(|profile| profile.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(ConfigValidationError::UnknownDeviceProfile {
-                    slot_id: slot.id.clone(),
-                    name: device_profile.to_owned(),
-                    available: if available.is_empty() {
-                        "(none configured)".to_owned()
-                    } else {
-                        available
-                    },
-                });
-            }
+        {
+            let available = device_profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ConfigValidationError::UnknownDeviceProfile {
+                slot_id: slot.id.clone(),
+                name: device_profile.to_owned(),
+                available: if available.is_empty() {
+                    "(none configured)".to_owned()
+                } else {
+                    available
+                },
+            });
         }
 
         if let Some(first) = ids.insert(&slot.id, index) {
@@ -1144,7 +1184,10 @@ mod tests {
         assert_eq!(config.device_profiles.len(), 1);
 
         let staged = config
-            .staged_with_device_profiles(vec![device_profile("sigmastar-evb"), device_profile("rk")])
+            .staged_with_device_profiles(vec![
+                device_profile("sigmastar-evb"),
+                device_profile("rk"),
+            ])
             .unwrap();
         assert_eq!(config.device_profiles.len(), 1);
         assert_eq!(staged.device_profiles.len(), 2);
@@ -1169,5 +1212,34 @@ mod tests {
         let reloaded = store.load().unwrap();
         assert!(reloaded.device_profiles.is_empty());
         assert_eq!(reloaded.server_id, loaded.config.server_id);
+    }
+
+    #[test]
+    fn control_config_defaults_match_the_builtin_limits() {
+        assert_eq!(ControlConfig::default().limits(), ControlLimits::default());
+
+        // A persisted configuration without a [control] section keeps the
+        // built-in bounds.
+        let empty: ControlConfig = toml::from_str("").unwrap();
+        assert_eq!(empty, ControlConfig::default());
+    }
+
+    #[test]
+    fn control_limits_clamp_the_ttl_ceiling_to_the_protocol_minimum() {
+        let config = ControlConfig {
+            max_ttl_ms: 1,
+            ..ControlConfig::default()
+        };
+        assert_eq!(config.limits().max_ttl_ms, MIN_TTL_MS);
+
+        let config = ControlConfig {
+            max_ttl_ms: 120_000,
+            wait_timeout_ms: 5_000,
+            max_waiters: 4,
+        };
+        let limits = config.limits();
+        assert_eq!(limits.max_ttl_ms, 120_000);
+        assert_eq!(limits.wait_timeout, Duration::from_millis(5_000));
+        assert_eq!(limits.max_waiters, 4);
     }
 }

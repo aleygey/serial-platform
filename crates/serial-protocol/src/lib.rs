@@ -455,6 +455,11 @@ pub enum ClientMessage {
         control_id: Uuid,
         fence: u64,
     },
+    CancelAcquire {
+        request_id: Uuid,
+        slot_id: String,
+        control_id: Uuid,
+    },
     Write {
         request_id: Uuid,
         slot_id: String,
@@ -505,6 +510,7 @@ impl ClientMessage {
             | Self::AcquireControl { request_id, .. }
             | Self::RenewControl { request_id, .. }
             | Self::ReleaseControl { request_id, .. }
+            | Self::CancelAcquire { request_id, .. }
             | Self::Write { request_id, .. }
             | Self::StartRun { request_id, .. }
             | Self::EndRun { request_id, .. }
@@ -524,6 +530,7 @@ pub enum CommandResult {
     ControlQueued { position: usize },
     ControlRenewed { lease: ControlLease },
     ControlReleased,
+    AcquireCancelled { removed: bool },
     WriteAccepted { event_seq: u64 },
     RunStarted { run: RunInfo },
     RunEnded { run: RunInfo },
@@ -1023,10 +1030,7 @@ mod tests {
         let profile = device_profile();
         // Profile supplies everything the Slot leaves unset.
         let resolved = resolve_device_settings(&SerialSettings::default(), Some(&profile));
-        assert_eq!(
-            resolved.shell_prompt.as_deref(),
-            Some("root@sigmastar:/# ")
-        );
+        assert_eq!(resolved.shell_prompt.as_deref(), Some("root@sigmastar:/# "));
         assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
         // write_eol/echo are concrete Slot fields: the profile never shadows
         // them in v1.
@@ -1184,6 +1188,31 @@ mod tests {
         assert_eq!(
             WritePacing::resolve(Some(override_pacing), &settings),
             override_pacing
+        );
+    }
+
+    #[test]
+    fn cancel_acquire_round_trips_through_the_control_frame() {
+        let request_id = Uuid::new_v4();
+        let message = ClientMessage::CancelAcquire {
+            request_id,
+            slot_id: "slot-1".into(),
+            control_id: Uuid::new_v4(),
+        };
+        assert_eq!(message.request_id(), request_id);
+        let frame = encode_client_control(&message).unwrap();
+        assert_eq!(decode_client_control(&frame).unwrap(), message);
+    }
+
+    #[test]
+    fn acquire_cancelled_result_uses_the_snake_case_wire_tag() {
+        let result = CommandResult::AcquireCancelled { removed: true };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["type"], "acquire_cancelled");
+        assert_eq!(json["removed"], true);
+        assert_eq!(
+            serde_json::from_value::<CommandResult>(json).unwrap(),
+            result
         );
     }
 }

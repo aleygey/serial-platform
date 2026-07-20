@@ -1,4 +1,4 @@
-use crate::control::{AcquireOutcome, ControlError, ControlState, ReleaseOutcome};
+use crate::control::{AcquireOutcome, ControlError, ControlLimits, ControlState, ReleaseOutcome};
 use crate::journal::{JournalError, JournalHandle};
 use crate::ring::{EventRing, ReplayError, ReplayWindow};
 use chrono::Utc;
@@ -122,11 +122,20 @@ impl SlotHandle {
     pub fn spawn(
         config: SlotConfig,
         device_profile: Option<DeviceProfile>,
+        control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
     ) -> Self {
-        Self::spawn_inner(config, device_profile, daemon_epoch, daemon_started, journal, false)
+        Self::spawn_inner(
+            config,
+            device_profile,
+            control_limits,
+            daemon_epoch,
+            daemon_started,
+            journal,
+            false,
+        )
     }
 
     /// Creates a candidate Slot actor that cannot open its port until the
@@ -134,22 +143,34 @@ impl SlotHandle {
     pub(crate) fn spawn_staged(
         config: SlotConfig,
         device_profile: Option<DeviceProfile>,
+        control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
     ) -> Self {
-        Self::spawn_inner(config, device_profile, daemon_epoch, daemon_started, journal, true)
+        Self::spawn_inner(
+            config,
+            device_profile,
+            control_limits,
+            daemon_epoch,
+            daemon_started,
+            journal,
+            true,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_inner(
         config: SlotConfig,
         device_profile: Option<DeviceProfile>,
+        control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
         staged: bool,
     ) -> Self {
-        let initial = initial_snapshot(config.clone(), device_profile.clone(), daemon_epoch, staged);
+        let initial =
+            initial_snapshot(config.clone(), device_profile.clone(), daemon_epoch, staged);
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE);
         let (events, _) = broadcast::channel(BROADCAST_QUEUE);
         let (snapshot_tx, snapshot) = watch::channel(initial);
@@ -187,7 +208,7 @@ impl SlotHandle {
                 last_rx_wall_time_ns: None,
                 last_rx_instant: None,
                 logging: LoggingState::Healthy,
-                control: ControlState::new(daemon_epoch, 0),
+                control: ControlState::new(daemon_epoch, 0, control_limits),
                 active_run: None,
                 port: None,
                 port_events: None,
@@ -284,6 +305,24 @@ impl SlotHandle {
             actor,
             control_id,
             fence,
+            reply,
+        })
+        .await
+    }
+
+    /// Cancels a queued acquire request. `control_id` is part of the wire
+    /// contract for forward compatibility; the actor matches the queued
+    /// waiter by actor identity because waiters hold no lease yet.
+    pub async fn cancel_acquire(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::CancelAcquire {
+            request_id,
+            actor,
+            control_id,
             reply,
         })
         .await
@@ -396,7 +435,7 @@ impl SlotHandle {
         let (reply, result) = oneshot::channel();
         self.commands
             .send(SlotCommand::StageReconfiguration {
-                config,
+                config: Box::new(config),
                 device_profile,
                 resume_on_rollback,
                 reply,
@@ -499,6 +538,12 @@ enum SlotCommand {
         fence: u64,
         reply: Reply,
     },
+    CancelAcquire {
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        reply: Reply,
+    },
     Write {
         request_id: Uuid,
         actor: Actor,
@@ -538,7 +583,7 @@ enum SlotCommand {
         actor_id: String,
     },
     StageReconfiguration {
-        config: SlotConfig,
+        config: Box<SlotConfig>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -905,7 +950,7 @@ impl SlotActor {
                 reply,
             } => {
                 let result = self
-                    .stage_reconfiguration(config, device_profile, resume_on_rollback)
+                    .stage_reconfiguration(*config, device_profile, resume_on_rollback)
                     .await;
                 let _ = reply.send(result);
                 return false;
@@ -1091,6 +1136,11 @@ impl SlotActor {
                     .await;
                 Ok(CommandResult::ControlReleased)
             }
+            // The wire `control_id` is ignored: a queued waiter holds no lease
+            // yet, so the request is matched by actor identity.
+            SlotRequest::CancelAcquire { actor, .. } => Ok(CommandResult::AcquireCancelled {
+                removed: self.control.cancel(&actor.id),
+            }),
             SlotRequest::Write {
                 actor,
                 control_id,
@@ -1773,6 +1823,10 @@ enum SlotRequest {
         control_id: Uuid,
         fence: u64,
     },
+    CancelAcquire {
+        actor: Actor,
+        control_id: Uuid,
+    },
     Write {
         actor: Actor,
         control_id: Uuid,
@@ -1880,6 +1934,9 @@ impl SlotRequest {
                 control_id,
                 fence,
             } => serde_json::to_vec(&("release", &actor.id, control_id, fence)),
+            Self::CancelAcquire { actor, control_id } => {
+                serde_json::to_vec(&("cancel_acquire", &actor.id, control_id))
+            }
             Self::Write {
                 actor,
                 control_id,
@@ -1949,7 +2006,7 @@ enum CommandDisposition {
         actor_id: String,
     },
     StageReconfiguration {
-        config: SlotConfig,
+        config: Box<SlotConfig>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -2020,6 +2077,16 @@ impl SlotCommand {
                     control_id,
                     fence,
                 },
+                reply,
+            },
+            SlotCommand::CancelAcquire {
+                request_id,
+                actor,
+                reply,
+                control_id,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::CancelAcquire { actor, control_id },
                 reply,
             },
             SlotCommand::Write {

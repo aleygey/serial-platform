@@ -1,4 +1,5 @@
 use crate::config::{ConfigValidationError, MAX_SLOT_IDENTITIES_PER_DAEMON, validate_slots};
+use crate::control::ControlLimits;
 use crate::journal::JournalHandle;
 use crate::slot::{SlotError, SlotHandle};
 use serial_protocol::{DeviceProfile, SlotConfig, SlotSnapshot};
@@ -17,6 +18,7 @@ struct RegistryInner {
     daemon_epoch: Uuid,
     daemon_started: Instant,
     journal: JournalHandle,
+    control_limits: ControlLimits,
     slots: RwLock<SlotMaps>,
     mutation: Arc<Mutex<RegistryMutation>>,
 }
@@ -145,6 +147,7 @@ impl SlotRegistry {
         journal: JournalHandle,
         configs: Vec<SlotConfig>,
         device_profiles: Vec<DeviceProfile>,
+        control_limits: ControlLimits,
     ) -> Self {
         validate_slots(&configs, &device_profiles)
             .expect("SlotRegistry requires validated Slot configuration");
@@ -156,6 +159,7 @@ impl SlotRegistry {
                 let handle = SlotHandle::spawn(
                     config,
                     device_profile,
+                    control_limits,
                     daemon_epoch,
                     daemon_started,
                     journal.clone(),
@@ -168,6 +172,7 @@ impl SlotRegistry {
                 daemon_epoch,
                 daemon_started,
                 journal,
+                control_limits,
                 slots: RwLock::new(SlotMaps {
                     active,
                     retired: HashMap::new(),
@@ -330,6 +335,7 @@ impl SlotRegistry {
                 let handle = SlotHandle::spawn_staged(
                     config,
                     device_profile,
+                    self.inner.control_limits,
                     self.inner.daemon_epoch,
                     self.inner.daemon_started,
                     self.inner.journal.clone(),
@@ -497,6 +503,7 @@ mod tests {
             journal.handle(),
             configs,
             Vec::new(),
+            ControlLimits::default(),
         )
     }
 
@@ -511,6 +518,7 @@ mod tests {
             journal.handle(),
             vec![disabled_slot("slot-1", "before")],
             Vec::new(),
+            ControlLimits::default(),
         );
         let original = registry.get("slot-1").await.unwrap();
         let mut live = original.attach(None, 10).await.unwrap().live;

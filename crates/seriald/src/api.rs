@@ -607,6 +607,9 @@ async fn dispatch_slot_command(
                 .release_control(request_id, actor, control_id, fence)
                 .await?
         }
+        ClientMessage::CancelAcquire { control_id, .. } => {
+            handle.cancel_acquire(request_id, actor, control_id).await?
+        }
         ClientMessage::Write {
             control_id,
             fence,
@@ -769,6 +772,7 @@ fn command_slot(message: &ClientMessage) -> Option<&str> {
         ClientMessage::AcquireControl { slot_id, .. }
         | ClientMessage::RenewControl { slot_id, .. }
         | ClientMessage::ReleaseControl { slot_id, .. }
+        | ClientMessage::CancelAcquire { slot_id, .. }
         | ClientMessage::Write { slot_id, .. }
         | ClientMessage::StartRun { slot_id, .. }
         | ClientMessage::EndRun { slot_id, .. }
@@ -943,6 +947,7 @@ fn wall_time_ns() -> i64 {
 mod tests {
     use super::*;
     use crate::config::{ConfigPaths, ConfigStore};
+    use crate::control::ControlLimits;
     use crate::journal::{JournalConfig, JournalManager};
     use serial_protocol::{SerialSettings, SlotConfig};
 
@@ -976,6 +981,7 @@ mod tests {
             journal.handle(),
             loaded.config.slots.clone(),
             loaded.config.device_profiles.clone(),
+            ControlLimits::default(),
         );
         let state = AppState::new(
             store.clone(),
@@ -1009,8 +1015,14 @@ mod tests {
         let journal =
             JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
                 .unwrap();
-        let registry =
-            SlotRegistry::new(loaded.daemon_epoch, started, journal.handle(), Vec::new(), Vec::new());
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
         let state = AppState::new(
             store.clone(),
             loaded.config,
@@ -1048,8 +1060,14 @@ mod tests {
         let journal =
             JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
                 .unwrap();
-        let registry =
-            SlotRegistry::new(loaded.daemon_epoch, started, journal.handle(), Vec::new(), Vec::new());
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
         let state = AppState::new(
             store.clone(),
             loaded.config,
@@ -1121,6 +1139,7 @@ mod tests {
             journal.handle(),
             old_slots.clone(),
             Vec::new(),
+            ControlLimits::default(),
         );
         let state = AppState::new(
             store.clone(),
@@ -1196,6 +1215,7 @@ mod tests {
             journal.handle(),
             vec![referencing.clone()],
             vec![sigmastar_profile()],
+            ControlLimits::default(),
         );
         // The catalog must be present in memory for validation to pass; the
         // registry was built with it directly above.
@@ -1212,13 +1232,7 @@ mod tests {
             started,
         );
 
-        let snapshot = state
-            .inner
-            .registry
-            .get("slot-1")
-            .await
-            .unwrap()
-            .snapshot();
+        let snapshot = state.inner.registry.get("slot-1").await.unwrap().snapshot();
         assert_eq!(
             snapshot.effective_shell_prompt.as_deref(),
             Some("root@sigmastar:/# ")
@@ -1242,13 +1256,7 @@ mod tests {
             vec![updated.clone()]
         );
         assert_eq!(store.load().unwrap().device_profiles, vec![updated]);
-        let snapshot = state
-            .inner
-            .registry
-            .get("slot-1")
-            .await
-            .unwrap()
-            .snapshot();
+        let snapshot = state.inner.registry.get("slot-1").await.unwrap().snapshot();
         assert_eq!(
             snapshot.effective_uboot_prompt.as_deref(),
             Some("SigmaStar #")
@@ -1279,6 +1287,7 @@ mod tests {
             journal.handle(),
             vec![referencing],
             vec![sigmastar_profile()],
+            ControlLimits::default(),
         );
         let state = AppState::new(
             store.clone(),
@@ -1304,7 +1313,10 @@ mod tests {
             state.inner.config.read().await.device_profiles,
             vec![sigmastar_profile()]
         );
-        assert_eq!(store.load().unwrap().device_profiles, vec![sigmastar_profile()]);
+        assert_eq!(
+            store.load().unwrap().device_profiles,
+            vec![sigmastar_profile()]
+        );
 
         state.shutdown().await;
         journal.shutdown().await.unwrap();
@@ -1325,6 +1337,7 @@ mod tests {
             journal.handle(),
             vec![disabled_slot("slot-1", "Slot 1", "COM3")],
             Vec::new(),
+            ControlLimits::default(),
         );
         let snapshot = registry.get("slot-1").await.unwrap().snapshot();
         assert!(snapshot.effective_shell_prompt.is_none());
