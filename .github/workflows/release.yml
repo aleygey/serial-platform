@@ -64,6 +64,7 @@ jobs:
           Copy-Item "adapters" $packageDir -Recurse
           Copy-Item "README.md" $packageDir
           Copy-Item "DOCUMENTATION.md" $packageDir
+          Copy-Item "ROADMAP.md" $packageDir
           Copy-Item "LICENSE" $packageDir
           Compress-Archive -Path $packageDir -DestinationPath "dist\$packageName.zip"
 
@@ -139,7 +140,7 @@ jobs:
           mkdir -p "${package_dir}"
           install -m 0755 target/release/serialctl "${package_dir}/serialctl"
           install -m 0755 target/release/serial-mcp "${package_dir}/serial-mcp"
-          cp -r README.md DOCUMENTATION.md LICENSE adapters "${package_dir}/"
+          cp -r README.md DOCUMENTATION.md ROADMAP.md LICENSE adapters "${package_dir}/"
           tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
           mkdir -p dist/smoke
           tar -C dist/smoke -xzf "dist/${package_name}.tar.gz"

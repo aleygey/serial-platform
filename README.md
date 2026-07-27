@@ -75,8 +75,8 @@ Each release provides two x86_64 packages:
   owns the workstation COM ports. It does not support 32-bit i386/i686 Ubuntu.
 
 Use `seriald`, `serialctl`, and `serial-mcp` from the same release across the
-Windows host and Linux VM. Release 0.3.1 uses WebSocket protocol v2 and is not
-wire-compatible with the protocol-v1 executables from 0.2.x. The HTTP route
+Windows host and Linux VM. The 0.3.x releases use WebSocket protocol v2 and are
+not wire-compatible with the protocol-v1 executables from 0.2.x. The HTTP route
 namespace is intentionally still `/api/v1`; the route namespace and the
 WebSocket payload protocol are versioned independently. Do not mix 0.2.x and
 0.3.x executables in one station.
@@ -86,8 +86,8 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.3.1-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.3.1-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.3.2-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.3.2-linux-x86_64-ubuntu20.04
 chmod +x serialctl serial-mcp
 ./serialctl --version
 ```

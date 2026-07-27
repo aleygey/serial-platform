@@ -26,9 +26,8 @@ primitives.
 
 ## Status
 
-- **Released**: available in v0.3.1.
-- **Implemented on main**: completed after v0.3.1 and intended for the next
-  release.
+- **Released**: available in v0.3.1 or earlier.
+- **Released in v0.3.2**: first published in the current release.
 - **Next**: the nearest useful work, not yet implemented.
 - **Later / candidate**: retained for evaluation; no delivery promise.
 
@@ -65,7 +64,7 @@ primitives.
   Trigger, and system activity.
 - Bearer-token roles for observer, operator, and administrator access.
 
-### Implemented on main
+### Released in v0.3.2
 
 - No new daemon protocol is required for the current console and MCP
   refinements. Ordinary Agent commands and Trigger Jobs use Slot transport
@@ -127,7 +126,7 @@ primitives.
 - Windows x86-64 and Ubuntu x86-64 baseline release artifacts that can connect
   to a Windows daemon.
 
-### Implemented on main
+### Released in v0.3.2
 
 - Keyword colouring uses case-insensitive token boundaries across all
   severity/status classes: embedded words such as `information` or
@@ -185,7 +184,7 @@ primitives.
 - Generic daemon-native Trigger access without built-in SigmaStar, U-Boot, or
   flashing recipes.
 
-### Implemented on main
+### Released in v0.3.2
 
 - Command and Trigger schemas no longer expose per-call chunk size or delay.
   The adapter always uses the Slot's safe write cadence.
