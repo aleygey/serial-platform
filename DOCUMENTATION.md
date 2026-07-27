@@ -140,7 +140,16 @@ flowchart LR
     Actor -->|TX audit event| Journal
 ```
 
-The serial worker owns the OS handle. Its read and write halves run independently:
+The serial worker owns the OS handle. On Unix its asynchronous read and write
+halves run independently. On Windows, `seriald` deliberately uses the native
+synchronous `COMPort` backend with one duplicated handle for the reader and one
+for the writer. The reader uses a nominal 4 ms driver-queue polling interval
+before calling `ReadFile`; the writer uses a finite communication timeout.
+Both blocking workers must finish and drop their handles before the Slot may reopen. This
+avoids a Windows `tokio-serial`/named-pipe failure mode where a timed-out
+overlapped write can outlive the Rust task, retain the exclusive COM handle,
+and make every reopen fail with access denied.
+
 RX is coalesced for at most 4 ms or 4 KiB, while each write is limited to 4 KiB
 and chunked by the effective pacing — `write_chunk_size` bytes, then
 `write_chunk_delay_ms` between chunks (the default is a 1 byte/1 ms typewriter

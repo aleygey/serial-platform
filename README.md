@@ -46,6 +46,12 @@ The station defaults agreed for v1 are: 115200 8N1, no flow control, DTR and
 RTS low, command EOL `\r`, echo on, no guessed Shell/U-Boot prompt, automatic
 probe disabled, `auto_open=true`, and writes paced at one byte per 1 ms.
 
+On Windows, the daemon uses native bounded synchronous COM reads/writes on
+dedicated blocking workers. It does not route COM writes through Tokio's
+named-pipe/overlapped backend. A Slot is not allowed to reopen until both
+reader and writer handles have finished and been released, preventing a
+timed-out write from leaving the port permanently locked with access denied.
+
 With hardware flow control, the driver owns RTS and `rts=true` is rejected.
 Linux drivers may transiently assert DTR during open even when the final
 requested level is low; DTR-reset-sensitive targets should use validated
@@ -65,7 +71,7 @@ Each release provides two x86_64 packages:
   owns the workstation COM ports. It does not support 32-bit i386/i686 Ubuntu.
 
 Use `seriald`, `serialctl`, and `serial-mcp` from the same release across the
-Windows host and Linux VM. Release 0.3.0 uses WebSocket protocol v2 and is not
+Windows host and Linux VM. Release 0.3.1 uses WebSocket protocol v2 and is not
 wire-compatible with the protocol-v1 executables from 0.2.x. The HTTP route
 namespace is intentionally still `/api/v1`; the route namespace and the
 WebSocket payload protocol are versioned independently. Do not mix 0.2.x and
@@ -76,8 +82,8 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.3.0-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.3.0-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.3.1-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.3.1-linux-x86_64-ubuntu20.04
 chmod +x serialctl serial-mcp
 ./serialctl --version
 ```

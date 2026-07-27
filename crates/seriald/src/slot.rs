@@ -13,15 +13,26 @@ use serial_protocol::{
     RunStatus, SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits, TargetActivity,
     TimelineEvent, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing, resolve_device_settings,
 };
+#[cfg(windows)]
+use serialport::COMPort;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(windows)]
+use std::io::Read as _;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(windows))]
+use tokio::io::AsyncReadExt;
+#[cfg(any(not(windows), test))]
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio_serial::{
     DataBits as TokioDataBits, FlowControl as TokioFlowControl, Parity as TokioParity, SerialPort,
-    SerialPortBuilderExt, SerialStream, StopBits as TokioStopBits,
+    StopBits as TokioStopBits,
 };
+#[cfg(not(windows))]
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use uuid::Uuid;
 
 const COMMAND_QUEUE: usize = 256;
@@ -59,6 +70,8 @@ const ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 const OPEN_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const OPEN_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const TERMINAL_TRIGGER_HISTORY: usize = 128;
+#[cfg(windows)]
+const WINDOWS_PORT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 
 #[derive(Clone)]
 pub struct SlotHandle {
@@ -1221,6 +1234,7 @@ impl SlotActor {
                     metadata([
                         ("port", json!(self.config.port)),
                         ("baud_rate", json!(self.config.settings.baud_rate)),
+                        ("backend", json!(serial_backend_name())),
                     ]),
                 )
                 .await;
@@ -4012,6 +4026,17 @@ fn initial_snapshot(
     }
 }
 
+#[cfg(windows)]
+fn serial_backend_name() -> &'static str {
+    "windows_blocking_com"
+}
+
+#[cfg(not(windows))]
+fn serial_backend_name() -> &'static str {
+    "tokio_serial"
+}
+
+#[cfg(not(windows))]
 fn open_port(port_name: &str, settings: &SerialSettings) -> Result<SerialStream, String> {
     let builder = tokio_serial::new(port_name, settings.baud_rate)
         .data_bits(match settings.data_bits {
@@ -4051,6 +4076,60 @@ fn open_port(port_name: &str, settings: &SerialSettings) -> Result<SerialStream,
     Ok(stream)
 }
 
+#[cfg(windows)]
+struct WindowsSerialPort {
+    reader: COMPort,
+    writer: COMPort,
+}
+
+#[cfg(windows)]
+fn open_port(port_name: &str, settings: &SerialSettings) -> Result<WindowsSerialPort, String> {
+    // `tokio-serial` implements Windows COM I/O through Tokio's named-pipe
+    // backend. Some serial-card drivers never complete an overlapped write;
+    // mio then deliberately keeps that write (and the exclusive COM handle)
+    // alive while dropping the stream. Use native synchronous COM handles on
+    // Windows so a bounded WriteFile has settled before either handle drops.
+    let builder = serialport::new(port_name, settings.baud_rate)
+        .data_bits(match settings.data_bits {
+            DataBits::Five => TokioDataBits::Five,
+            DataBits::Six => TokioDataBits::Six,
+            DataBits::Seven => TokioDataBits::Seven,
+            DataBits::Eight => TokioDataBits::Eight,
+        })
+        .parity(match settings.parity {
+            Parity::None => TokioParity::None,
+            Parity::Odd => TokioParity::Odd,
+            Parity::Even => TokioParity::Even,
+        })
+        .stop_bits(match settings.stop_bits {
+            StopBits::One => TokioStopBits::One,
+            StopBits::Two => TokioStopBits::Two,
+        })
+        .dtr_on_open(settings.dtr)
+        .flow_control(match settings.flow_control {
+            FlowControl::None => TokioFlowControl::None,
+            FlowControl::Software => TokioFlowControl::Software,
+            FlowControl::Hardware => TokioFlowControl::Hardware,
+        })
+        // The reader checks bytes_to_read before calling ReadFile, so this
+        // primarily bounds a synchronous WriteFile that stops making progress.
+        .timeout(WRITE_TIMEOUT);
+    let mut reader = builder.open_native().map_err(|error| error.to_string())?;
+    reader
+        .write_data_terminal_ready(settings.dtr)
+        .map_err(|error| error.to_string())?;
+    if settings.flow_control != FlowControl::Hardware {
+        reader
+            .write_request_to_send(settings.rts)
+            .map_err(|error| error.to_string())?;
+    }
+    let writer = reader
+        .try_clone_native()
+        .map_err(|error| error.to_string())?;
+    Ok(WindowsSerialPort { reader, writer })
+}
+
+#[cfg(not(windows))]
 fn spawn_port_worker(stream: SerialStream) -> (PortWorker, mpsc::Receiver<PortEvent>) {
     let (commands, command_rx) = mpsc::channel(PORT_WRITE_QUEUE);
     let (reader_commands, reader_command_rx) = mpsc::channel(PORT_READER_COMMAND_QUEUE);
@@ -4076,6 +4155,43 @@ fn spawn_port_worker(stream: SerialStream) -> (PortWorker, mpsc::Receiver<PortEv
     )
 }
 
+#[cfg(windows)]
+fn spawn_port_worker(stream: WindowsSerialPort) -> (PortWorker, mpsc::Receiver<PortEvent>) {
+    let (commands, command_rx) = mpsc::channel(PORT_WRITE_QUEUE);
+    let (reader_commands, reader_command_rx) = mpsc::channel(PORT_READER_COMMAND_QUEUE);
+    let (events, event_rx) = mpsc::channel(PORT_EVENT_QUEUE);
+    let (cancel, cancel_rx) = watch::channel(false);
+    let writer_failed = Arc::new(AtomicBool::new(false));
+    let reader = tokio::task::spawn_blocking({
+        let events = events.clone();
+        let cancel = cancel_rx.clone();
+        let writer_failed = writer_failed.clone();
+        move || {
+            run_windows_port_reader(
+                stream.reader,
+                events,
+                reader_command_rx,
+                cancel,
+                writer_failed,
+            )
+        }
+    });
+    let writer = tokio::task::spawn_blocking(move || {
+        run_windows_port_writer(stream.writer, command_rx, events, cancel_rx, writer_failed)
+    });
+    (
+        PortWorker {
+            commands,
+            reader_commands,
+            cancel,
+            reader,
+            writer,
+        },
+        event_rx,
+    )
+}
+
+#[cfg(not(windows))]
 async fn run_port_reader(
     mut reader: tokio::io::ReadHalf<SerialStream>,
     events: mpsc::Sender<PortEvent>,
@@ -4213,10 +4329,238 @@ async fn run_port_reader(
     }
 }
 
+#[cfg(windows)]
+fn run_windows_port_reader(
+    mut reader: COMPort,
+    events: mpsc::Sender<PortEvent>,
+    mut commands: mpsc::Receiver<PortReaderCommand>,
+    cancel: watch::Receiver<bool>,
+    writer_failed: Arc<AtomicBool>,
+) -> ReaderTail {
+    let mut buffer = vec![0_u8; RX_BUFFER_BYTES];
+    let mut pending = Vec::with_capacity(RX_BUFFER_BYTES);
+    let mut dropped_bytes = 0_u64;
+    let mut flush_deadline = None;
+
+    loop {
+        if write_cancelled(&cancel) || writer_failed.load(Ordering::Acquire) {
+            return ReaderTail {
+                pending,
+                dropped_bytes,
+            };
+        }
+
+        if pending.len() >= RX_BUFFER_BYTES {
+            enqueue_rx(&events, &mut pending, &mut dropped_bytes);
+            flush_deadline = None;
+        }
+        if flush_deadline.is_some_and(|deadline: Instant| Instant::now() >= deadline) {
+            enqueue_rx(&events, &mut pending, &mut dropped_bytes);
+            flush_deadline = None;
+        }
+
+        loop {
+            match commands.try_recv() {
+                Ok(PortReaderCommand::Barrier { id }) => {
+                    // Include the bytes already queued by the Windows driver
+                    // in the pre-barrier side. Without this snapshot drain, a
+                    // quiet reader could emit the marker first and let stale
+                    // boot output satisfy a newly-installed Trigger matcher.
+                    if let Err(reason) = drain_windows_rx_snapshot(
+                        &mut reader,
+                        &events,
+                        &mut buffer,
+                        &mut pending,
+                        &mut dropped_bytes,
+                    ) {
+                        return finish_windows_reader(
+                            &events,
+                            &cancel,
+                            &mut pending,
+                            dropped_bytes,
+                            reason,
+                        );
+                    }
+                    enqueue_rx(&events, &mut pending, &mut dropped_bytes);
+                    if dropped_bytes > 0 {
+                        let dropped = dropped_bytes;
+                        if !send_windows_port_event(
+                            &events,
+                            PortEvent::Overflow {
+                                dropped_bytes: dropped,
+                            },
+                            &cancel,
+                        ) {
+                            return ReaderTail {
+                                pending,
+                                dropped_bytes,
+                            };
+                        }
+                        dropped_bytes = 0;
+                    }
+                    if !send_windows_port_event(&events, PortEvent::ReaderBarrier { id }, &cancel) {
+                        return ReaderTail {
+                            pending,
+                            dropped_bytes,
+                        };
+                    }
+                    flush_deadline = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let available = match reader.bytes_to_read() {
+            Ok(available) => available as usize,
+            Err(error) => {
+                return finish_windows_reader(
+                    &events,
+                    &cancel,
+                    &mut pending,
+                    dropped_bytes,
+                    error.to_string(),
+                );
+            }
+        };
+        if available == 0 {
+            let sleep = flush_deadline
+                .map(|deadline: Instant| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(WINDOWS_PORT_POLL_INTERVAL)
+                .min(WINDOWS_PORT_POLL_INTERVAL);
+            if !sleep.is_zero() {
+                std::thread::sleep(sleep);
+            }
+            continue;
+        }
+
+        let capacity = rx_read_capacity(pending.len()).min(available);
+        match reader.read(&mut buffer[..capacity]) {
+            Ok(0) => {
+                return finish_windows_reader(
+                    &events,
+                    &cancel,
+                    &mut pending,
+                    dropped_bytes,
+                    "serial port reached EOF".into(),
+                );
+            }
+            Ok(count) => {
+                pending.extend_from_slice(&buffer[..count]);
+                flush_deadline.get_or_insert_with(|| Instant::now() + RX_COALESCE_WINDOW);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => {
+                return finish_windows_reader(
+                    &events,
+                    &cancel,
+                    &mut pending,
+                    dropped_bytes,
+                    error.to_string(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn drain_windows_rx_snapshot(
+    reader: &mut COMPort,
+    events: &mpsc::Sender<PortEvent>,
+    buffer: &mut [u8],
+    pending: &mut Vec<u8>,
+    dropped_bytes: &mut u64,
+) -> Result<(), String> {
+    let mut remaining = reader.bytes_to_read().map_err(|error| error.to_string())? as usize;
+    while remaining > 0 {
+        if pending.len() >= RX_BUFFER_BYTES {
+            enqueue_rx(events, pending, dropped_bytes);
+        }
+        let capacity = rx_read_capacity(pending.len())
+            .min(remaining)
+            .min(buffer.len());
+        match reader.read(&mut buffer[..capacity]) {
+            Ok(0) => {
+                return Err(format!(
+                    "serial driver reported {remaining} queued byte(s) but returned zero while establishing the reader barrier"
+                ));
+            }
+            Ok(count) => {
+                pending.extend_from_slice(&buffer[..count]);
+                remaining = remaining.saturating_sub(count);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(format!(
+                    "serial read timed out with {remaining} queued byte(s) while establishing the reader barrier"
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn finish_windows_reader(
+    events: &mpsc::Sender<PortEvent>,
+    cancel: &watch::Receiver<bool>,
+    pending: &mut Vec<u8>,
+    mut dropped_bytes: u64,
+    reason: String,
+) -> ReaderTail {
+    enqueue_rx(events, pending, &mut dropped_bytes);
+    if send_windows_port_event(
+        events,
+        PortEvent::Closed {
+            reason,
+            dropped_bytes,
+        },
+        cancel,
+    ) {
+        ReaderTail::default()
+    } else {
+        ReaderTail {
+            pending: std::mem::take(pending),
+            dropped_bytes,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn send_windows_port_event(
+    events: &mpsc::Sender<PortEvent>,
+    mut event: PortEvent,
+    cancel: &watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if write_cancelled(cancel) {
+            return false;
+        }
+        match events.try_send(event) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                event = returned;
+                std::thread::sleep(WINDOWS_PORT_POLL_INTERVAL);
+            }
+        }
+    }
+}
+
 fn rx_read_capacity(pending_len: usize) -> usize {
     RX_BUFFER_BYTES.saturating_sub(pending_len)
 }
 
+#[cfg(any(not(windows), test))]
 fn arm_rx_flush_deadline(
     current: Option<tokio::time::Instant>,
     now: tokio::time::Instant,
@@ -4256,6 +4600,7 @@ fn enqueue_rx(events: &mpsc::Sender<PortEvent>, pending: &mut Vec<u8>, dropped_b
     }
 }
 
+#[cfg(not(windows))]
 async fn run_port_writer(
     mut writer: tokio::io::WriteHalf<SerialStream>,
     mut command_rx: mpsc::Receiver<PortCommand>,
@@ -4302,6 +4647,157 @@ async fn run_port_writer(
     }
 }
 
+#[cfg(windows)]
+fn run_windows_port_writer<W>(
+    mut writer: W,
+    mut command_rx: mpsc::Receiver<PortCommand>,
+    events: mpsc::Sender<PortEvent>,
+    cancel: watch::Receiver<bool>,
+    writer_failed: Arc<AtomicBool>,
+) where
+    W: std::io::Write,
+{
+    loop {
+        if write_cancelled(&cancel) {
+            return;
+        }
+        let Some(PortCommand::Write {
+            data,
+            pacing,
+            deadline,
+            reply,
+        }) = command_rx.blocking_recv()
+        else {
+            return;
+        };
+        let outcome =
+            write_with_blocking_pacing(&mut writer, &data, pacing, deadline.into_std(), &cancel);
+        let failed = outcome.error.is_some();
+        let cancelled = outcome.cancelled;
+        let message = outcome.error.clone();
+        if failed && !cancelled {
+            // Stop the RX producer before reserving space for the authoritative
+            // close event. Under sustained RX this prevents a try-send loop
+            // from being starved forever by the reader refilling every slot.
+            writer_failed.store(true, Ordering::Release);
+        }
+        let _ = reply.send(outcome);
+        if cancelled {
+            return;
+        }
+        if failed {
+            let _ = send_windows_port_event(
+                &events,
+                PortEvent::Closed {
+                    reason: message.unwrap_or_else(|| "serial write failed".into()),
+                    dropped_bytes: 0,
+                },
+                &cancel,
+            );
+            return;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn write_with_blocking_pacing<W>(
+    writer: &mut W,
+    data: &[u8],
+    pacing: WritePacing,
+    deadline: Instant,
+    cancel: &watch::Receiver<bool>,
+) -> PortWriteOutcome
+where
+    W: std::io::Write,
+{
+    let chunk_size = (pacing.chunk_size as usize).max(1);
+    let chunk_delay = Duration::from_millis(pacing.chunk_delay_ms);
+    let mut written = 0;
+    let mut error = None;
+    let mut cancelled = false;
+
+    'chunks: while written < data.len() {
+        let chunk_end = written.saturating_add(chunk_size).min(data.len());
+        while written < chunk_end {
+            if write_cancelled(cancel) {
+                error = Some("serial write cancelled because the port is closing".into());
+                cancelled = true;
+                break 'chunks;
+            }
+            if Instant::now() >= deadline {
+                error = Some("serial write timed out; port state is uncertain".into());
+                break 'chunks;
+            }
+            match writer.write(&data[written..chunk_end]) {
+                Ok(0) => {
+                    error = Some("serial driver accepted zero bytes".into());
+                    break 'chunks;
+                }
+                Ok(count) => written += count,
+                Err(write_error) => {
+                    error = Some(write_error.to_string());
+                    break 'chunks;
+                }
+            }
+        }
+        if written >= data.len() || chunk_delay.is_zero() {
+            continue;
+        }
+        match wait_windows_pacing(chunk_delay, deadline, cancel) {
+            WindowsPacingWait::Elapsed => {}
+            WindowsPacingWait::Cancelled => {
+                error = Some("serial write cancelled because the port is closing".into());
+                cancelled = true;
+                break;
+            }
+            WindowsPacingWait::TimedOut => {
+                error = Some("serial write timed out; port state is uncertain".into());
+                break;
+            }
+        }
+    }
+
+    PortWriteOutcome {
+        written,
+        error,
+        cancelled,
+    }
+}
+
+#[cfg(windows)]
+enum WindowsPacingWait {
+    Elapsed,
+    Cancelled,
+    TimedOut,
+}
+
+#[cfg(windows)]
+fn wait_windows_pacing(
+    delay: Duration,
+    deadline: Instant,
+    cancel: &watch::Receiver<bool>,
+) -> WindowsPacingWait {
+    let delay_deadline = Instant::now() + delay;
+    loop {
+        if write_cancelled(cancel) {
+            return WindowsPacingWait::Cancelled;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return WindowsPacingWait::TimedOut;
+        }
+        if now >= delay_deadline {
+            return WindowsPacingWait::Elapsed;
+        }
+        std::thread::sleep(
+            delay_deadline
+                .saturating_duration_since(now)
+                .min(deadline.saturating_duration_since(now))
+                .min(WINDOWS_PORT_POLL_INTERVAL),
+        );
+    }
+}
+
 /// Writes `data` to the driver in `pacing.chunk_size` byte chunks, sleeping
 /// `pacing.chunk_delay_ms` between chunks (never after the final chunk) so a
 /// slow target UART is not overrun. A zero chunk delay keeps the original
@@ -4311,6 +4807,7 @@ async fn run_port_writer(
 /// still has the fixed no-progress timeout. The caller must reject a pacing
 /// plan that exceeds [`MAX_WRITE_TIMEOUT`] before enqueueing it and supplies
 /// the resulting absolute deadline here.
+#[cfg(any(not(windows), test))]
 async fn write_with_pacing<W>(
     writer: &mut W,
     data: &[u8],
@@ -4467,6 +4964,7 @@ fn ensure_lease_covers_write(
     Ok(())
 }
 
+#[cfg(any(not(windows), test))]
 async fn send_port_closed(
     events: &mpsc::Sender<PortEvent>,
     cancel: &mut watch::Receiver<bool>,
@@ -5387,5 +5885,214 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("timed out"))
         );
+    }
+
+    #[cfg(windows)]
+    struct BlockingRecordingWriter {
+        maximum_accept: usize,
+        calls: Vec<usize>,
+    }
+
+    #[cfg(windows)]
+    impl std::io::Write for BlockingRecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(buffer.len());
+            Ok(buffer.len().min(self.maximum_accept))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    struct BlockingCancellingWriter {
+        cancel: watch::Sender<bool>,
+        calls: usize,
+    }
+
+    #[cfg(windows)]
+    impl std::io::Write for BlockingCancellingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.cancel
+                .send(true)
+                .expect("test cancellation receiver must remain open");
+            Ok(buffer.len().min(1))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_blocking_writer_preserves_chunking_and_partial_progress() {
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut writer = BlockingRecordingWriter {
+            maximum_accept: 1,
+            calls: Vec::new(),
+        };
+        let outcome = write_with_blocking_pacing(
+            &mut writer,
+            b"abcd",
+            WritePacing {
+                chunk_size: 3,
+                chunk_delay_ms: 0,
+            },
+            Instant::now() + Duration::from_secs(1),
+            &cancel,
+        );
+
+        assert_eq!(outcome.written, 4);
+        assert_eq!(outcome.error, None);
+        assert!(!outcome.cancelled);
+        assert_eq!(writer.calls, vec![3, 2, 1, 1]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_blocking_writer_stops_after_cancellation_with_partial_progress() {
+        let (cancel_tx, cancel) = watch::channel(false);
+        let mut writer = BlockingCancellingWriter {
+            cancel: cancel_tx,
+            calls: 0,
+        };
+        let outcome = write_with_blocking_pacing(
+            &mut writer,
+            b"abcd",
+            WritePacing {
+                chunk_size: 4,
+                chunk_delay_ms: 0,
+            },
+            Instant::now() + Duration::from_secs(1),
+            &cancel,
+        );
+
+        assert_eq!(outcome.written, 1);
+        assert!(outcome.cancelled);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled"))
+        );
+        assert_eq!(writer.calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_blocking_writer_does_not_touch_driver_after_deadline() {
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut writer = BlockingRecordingWriter {
+            maximum_accept: usize::MAX,
+            calls: Vec::new(),
+        };
+        let outcome = write_with_blocking_pacing(
+            &mut writer,
+            b"abcd",
+            WritePacing {
+                chunk_size: 4,
+                chunk_delay_ms: 0,
+            },
+            Instant::now(),
+            &cancel,
+        );
+
+        assert_eq!(outcome.written, 0);
+        assert!(!outcome.cancelled);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("timed out"))
+        );
+        assert!(writer.calls.is_empty());
+    }
+
+    #[cfg(windows)]
+    struct BlockingTimedOutWriter;
+
+    #[cfg(windows)]
+    impl std::io::Write for BlockingTimedOutWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated synchronous COM timeout",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_blocking_writer_reports_failure_and_closes_worker() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        command_tx
+            .try_send(PortCommand::Write {
+                data: b"x".to_vec(),
+                pacing: WritePacing {
+                    chunk_size: 1,
+                    chunk_delay_ms: 0,
+                },
+                deadline: tokio::time::Instant::from_std(Instant::now() + Duration::from_secs(1)),
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        run_windows_port_writer(
+            BlockingTimedOutWriter,
+            command_rx,
+            event_tx,
+            cancel_rx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let outcome = reply_rx.try_recv().expect("write outcome");
+        assert_eq!(outcome.written, 0);
+        assert!(!outcome.cancelled);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("synchronous COM timeout"))
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PortEvent::Closed { reason, .. })
+                if reason.contains("synchronous COM timeout")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_blocking_writer_never_touches_driver_after_cancellation() {
+        let (cancel_tx, cancel) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let mut writer = BlockingRecordingWriter {
+            maximum_accept: usize::MAX,
+            calls: Vec::new(),
+        };
+        let outcome = write_with_blocking_pacing(
+            &mut writer,
+            b"abcd",
+            WritePacing {
+                chunk_size: 1,
+                chunk_delay_ms: 0,
+            },
+            Instant::now() + Duration::from_secs(1),
+            &cancel,
+        );
+
+        assert_eq!(outcome.written, 0);
+        assert!(outcome.cancelled);
+        assert!(writer.calls.is_empty());
     }
 }
