@@ -53,23 +53,29 @@ Each release provides two x86_64 packages:
 
 - `serial-platform-<version>-windows-x86_64.zip` contains `seriald.exe`,
   `serialctl.exe`, and `serial-mcp.exe`.
-- `serial-platform-<version>-linux-x86_64-musl.tar.gz` contains statically
-  linked `serialctl` and `serial-mcp` clients. It does not include a Linux
-  daemon because the Windows host owns the workstation COM ports.
+- `serial-platform-<version>-linux-x86_64-ubuntu20.04.tar.gz` contains native
+  `x86_64-unknown-linux-gnu`/glibc `serialctl` and `serial-mcp` clients built on
+  the Ubuntu 20.04 baseline (glibc 2.31). It is intended for 64-bit x86 Ubuntu
+  20.04 or newer and does not include a Linux daemon because the Windows host
+  owns the workstation COM ports. It does not support 32-bit i386/i686 Ubuntu.
 
 Extract the Windows package on the host connected to the serial card. Extract
 the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.2.0-linux-x86_64-musl.tar.gz
-cd serial-platform-v0.2.0-linux-x86_64-musl
+tar -xzf serial-platform-v0.2.2-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.2.2-linux-x86_64-ubuntu20.04
 chmod +x serialctl serial-mcp
+./serialctl --version
 ```
 
 Release checksums are published in `SHA256SUMS`. The command examples below
 assume the executables are on `PATH`. From an extracted package directory, use
 `.\seriald.exe` / `.\serialctl.exe` on Windows and `./serialctl` on Linux.
+Linux does not search the current directory by default, so `serialctl init`
+returns `command not found` unless the binary was installed on `PATH`; from the
+extracted directory, run `./serialctl init`.
 
 ## Build
 
