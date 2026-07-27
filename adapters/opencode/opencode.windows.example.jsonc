@@ -14,9 +14,9 @@
     "serial_wait": "allow",
     "serial_search": "allow",
     "serial_command": "ask",
+    "serial_trigger": "ask",
     "serial_run_start": "ask",
     "serial_run_end": "ask",
     "serial_release": "allow"
   }
 }
-

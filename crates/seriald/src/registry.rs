@@ -79,6 +79,15 @@ pub struct AppliedSlotReplacement {
     completed: bool,
 }
 
+/// A device-profile catalog refresh staged in every affected Slot actor while
+/// the registry mutation gate remains held. Staging is inert: the caller must
+/// persist the catalog and then commit, or explicitly roll it back.
+pub struct AppliedDeviceProfileReplacement {
+    gate: Option<OwnedMutexGuard<RegistryMutation>>,
+    staged_handles: Vec<SlotHandle>,
+    completed: bool,
+}
+
 impl AppliedSlotReplacement {
     /// Activates staged actors only after persistence succeeded, then
     /// atomically publishes the candidate active/retired maps.
@@ -128,6 +137,49 @@ impl AppliedSlotReplacement {
     }
 }
 
+impl AppliedDeviceProfileReplacement {
+    /// Publishes the already-staged effective settings after persistence has
+    /// succeeded. A staged actor stays alive under the registry lifecycle
+    /// gate, so a commit failure is an internal runtime fault and degrades the
+    /// registry just like a staged Slot replacement failure.
+    pub async fn commit(mut self) -> Result<(), RegistryError> {
+        for handle in &self.staged_handles {
+            if let Err(error) = handle.commit_staged_reconfiguration().await {
+                if let Some(gate) = self.gate.as_mut() {
+                    gate.lifecycle = RegistryLifecycle::Degraded;
+                }
+                self.completed = true;
+                self.gate.take();
+                return Err(RegistryError::Slot(error));
+            }
+        }
+        self.completed = true;
+        self.gate.take();
+        Ok(())
+    }
+
+    /// Discards every staged candidate without changing a live snapshot,
+    /// sequence, control/Run state, or physical port.
+    pub async fn rollback(mut self) -> Result<(), RegistryRollbackError> {
+        let result = rollback_actors(&self.staged_handles, Vec::new()).await;
+        if result.is_err()
+            && let Some(gate) = self.gate.as_mut()
+        {
+            gate.lifecycle = RegistryLifecycle::Degraded;
+        }
+        self.completed = true;
+        self.gate.take();
+        result
+    }
+
+    async fn fail_apply(self, apply: SlotError) -> RegistryError {
+        match self.rollback().await {
+            Ok(()) => RegistryError::Slot(apply),
+            Err(rollback) => RegistryError::ApplyRollback { apply, rollback },
+        }
+    }
+}
+
 impl Drop for AppliedSlotReplacement {
     fn drop(&mut self) {
         if !self.completed
@@ -135,6 +187,18 @@ impl Drop for AppliedSlotReplacement {
         {
             // Async rollback cannot run from Drop. Refuse later mutations
             // instead of pretending the partially changed runtime is safe.
+            gate.lifecycle = RegistryLifecycle::Degraded;
+        }
+    }
+}
+
+impl Drop for AppliedDeviceProfileReplacement {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Some(gate) = self.gate.as_mut()
+        {
+            // Async rollback cannot run from Drop. Block later mutations
+            // rather than allowing an abandoned staged catalog to commit.
             gate.lifecycle = RegistryLifecycle::Degraded;
         }
     }
@@ -371,16 +435,36 @@ impl SlotRegistry {
             .await
     }
 
-    /// Pushes a persisted device profile catalog into the live actors so
-    /// snapshots resolve prompts from the new profiles. Slots and their ports
-    /// are untouched; validation happened before persistence.
-    pub async fn apply_device_profiles(&self, device_profiles: Vec<DeviceProfile>) {
+    /// Stages a validated device-profile catalog in every affected live actor.
+    /// No snapshot/event/port state changes until the returned receipt commits,
+    /// so actor failure here can be rolled back before persistence.
+    pub async fn stage_device_profiles(
+        &self,
+        device_profiles: Vec<DeviceProfile>,
+    ) -> Result<AppliedDeviceProfileReplacement, RegistryError> {
+        let gate = self.inner.mutation.clone().lock_owned().await;
+        match gate.lifecycle {
+            RegistryLifecycle::Running => {}
+            RegistryLifecycle::Degraded => return Err(RegistryError::Degraded),
+            RegistryLifecycle::Shutdown => return Err(RegistryError::Shutdown),
+        }
+        let mut transaction = AppliedDeviceProfileReplacement {
+            gate: Some(gate),
+            staged_handles: Vec::new(),
+            completed: false,
+        };
         for handle in self.handles().await {
             let config = handle.snapshot().config;
-            handle
-                .set_device_profile(find_device_profile(&device_profiles, &config))
-                .await;
+            match handle
+                .stage_device_profile(find_device_profile(&device_profiles, &config))
+                .await
+            {
+                Ok(true) => transaction.staged_handles.push(handle),
+                Ok(false) => {}
+                Err(error) => return Err(transaction.fail_apply(error).await),
+            }
         }
+        Ok(transaction)
     }
 
     pub async fn disconnect_actor(&self, actor_id: &str) {

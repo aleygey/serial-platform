@@ -9,12 +9,18 @@ pub const MIN_TTL_MS: u64 = 5_000;
 /// Default lease TTL ceiling. Overridable through the daemon `[control]`
 /// configuration.
 pub const MAX_TTL_MS: u64 = 60_000;
+/// Hard ceiling for a configured control lease. Longer ownership is not a
+/// useful serial-console lease and makes monotonic deadline arithmetic harder
+/// to bound defensively.
+pub const MAX_CONTROL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 /// Default bound for the control wait queue. Overridable through the daemon
 /// `[control]` configuration.
 pub const MAX_WAITERS: usize = 128;
 /// Default lifetime of a queued acquire request. Overridable through the
 /// daemon `[control]` configuration.
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard ceiling for a configured queued-acquire lifetime.
+pub const MAX_CONTROL_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Runtime control limits, usually derived from the daemon configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +36,19 @@ impl Default for ControlLimits {
             max_ttl_ms: MAX_TTL_MS,
             wait_timeout: WAIT_TIMEOUT,
             max_waiters: MAX_WAITERS,
+        }
+    }
+}
+
+impl ControlLimits {
+    /// Applies the runtime safety bounds even when a caller constructs limits
+    /// directly instead of loading a validated [`crate::config::ControlConfig`].
+    #[must_use]
+    pub fn bounded(self) -> Self {
+        Self {
+            max_ttl_ms: self.max_ttl_ms.clamp(MIN_TTL_MS, MAX_CONTROL_TTL_MS),
+            wait_timeout: self.wait_timeout.min(MAX_CONTROL_WAIT_TIMEOUT),
+            max_waiters: self.max_waiters,
         }
     }
 }
@@ -96,7 +115,7 @@ impl ControlState {
             next_fence: 1,
             current: None,
             queue: VecDeque::new(),
-            limits,
+            limits: limits.bounded(),
         }
     }
 
@@ -123,7 +142,7 @@ impl ControlState {
                     .position(|waiter| waiter.actor.id == actor.id)
                 {
                     let ttl_ms = self.clamp_ttl(ttl_ms);
-                    let deadline = monotonic_now + self.limits.wait_timeout;
+                    let deadline = monotonic_deadline(monotonic_now, self.limits.wait_timeout);
                     let waiter = &mut self.queue[index];
                     waiter.ttl_ms = ttl_ms;
                     waiter.deadline = deadline;
@@ -134,7 +153,7 @@ impl ControlState {
                     }
                     self.queue.push_back(Waiter {
                         ttl_ms: self.clamp_ttl(ttl_ms),
-                        deadline: monotonic_now + self.limits.wait_timeout,
+                        deadline: monotonic_deadline(monotonic_now, self.limits.wait_timeout),
                         actor,
                     });
                     self.queue.len()
@@ -207,6 +226,25 @@ impl ControlState {
             return Err(ControlError::Expired);
         }
         Ok(&current.lease)
+    }
+
+    /// Returns the authoritative monotonic time remaining on a validated
+    /// lease. Callers that start a bounded physical operation use this to
+    /// reject work that cannot finish before the lease expires.
+    pub fn remaining_ttl(
+        &self,
+        actor_id: &str,
+        control_id: Uuid,
+        fence: u64,
+        monotonic_now: Instant,
+    ) -> Result<Duration, ControlError> {
+        self.validate(actor_id, control_id, fence, monotonic_now)?;
+        Ok(self
+            .current
+            .as_ref()
+            .expect("validated control has an active lease")
+            .deadline
+            .saturating_duration_since(monotonic_now))
     }
 
     pub fn expire(&mut self, wall_now_ns: i64, monotonic_now: Instant) -> Option<ReleaseOutcome> {
@@ -305,17 +343,28 @@ impl ControlState {
     }
 
     fn clamp_ttl(&self, ttl_ms: u64) -> u64 {
-        ttl_ms.clamp(MIN_TTL_MS, self.limits.max_ttl_ms)
+        ttl_ms
+            .max(MIN_TTL_MS)
+            .min(self.limits.max_ttl_ms.max(MIN_TTL_MS))
     }
 
     fn wall_expiry(&self, now_ns: i64, ttl_ms: u64) -> i64 {
-        now_ns.saturating_add((self.clamp_ttl(ttl_ms) as i64).saturating_mul(1_000_000))
+        let ttl_ns = self
+            .clamp_ttl(ttl_ms)
+            .saturating_mul(1_000_000)
+            .min(i64::MAX as u64) as i64;
+        now_ns.saturating_add(ttl_ns)
     }
 
     fn monotonic_expiry(&self, now: Instant, ttl_ms: u64) -> Instant {
-        now.checked_add(Duration::from_millis(self.clamp_ttl(ttl_ms)))
-            .expect("bounded control TTL must fit in Instant")
+        monotonic_deadline(now, Duration::from_millis(self.clamp_ttl(ttl_ms)))
     }
+}
+
+fn monotonic_deadline(now: Instant, duration: Duration) -> Instant {
+    // Immediate expiry is the conservative fallback on platforms whose
+    // Instant range cannot represent even a validated future duration.
+    now.checked_add(duration).unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -502,6 +551,40 @@ mod tests {
     }
 
     #[test]
+    fn minimum_lease_reports_exact_monotonic_time_remaining() {
+        let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
+        let started = Instant::now();
+        let AcquireOutcome::Granted(lease) =
+            state.acquire(actor("a"), ControlMode::Queue, MIN_TTL_MS, 0, started)
+        else {
+            panic!("expected grant");
+        };
+
+        assert_eq!(
+            state
+                .remaining_ttl("a", lease.id, lease.fence, started)
+                .unwrap(),
+            Duration::from_millis(MIN_TTL_MS)
+        );
+        let near_expiry = started + Duration::from_millis(MIN_TTL_MS - 75);
+        assert_eq!(
+            state
+                .remaining_ttl("a", lease.id, lease.fence, near_expiry)
+                .unwrap(),
+            Duration::from_millis(75)
+        );
+        assert_eq!(
+            state.remaining_ttl(
+                "a",
+                lease.id,
+                lease.fence,
+                started + Duration::from_millis(MIN_TTL_MS),
+            ),
+            Err(ControlError::Expired)
+        );
+    }
+
+    #[test]
     fn acquire_does_not_implicitly_expire_or_promote() {
         let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
         let monotonic_now = Instant::now();
@@ -639,5 +722,56 @@ mod tests {
             panic!("expected grant");
         };
         assert_eq!(lease.expires_wall_time_ns, 10_000 * 1_000_000);
+    }
+
+    #[test]
+    fn extreme_runtime_limits_are_bounded_without_deadline_or_wall_overflow() {
+        let limits = ControlLimits {
+            max_ttl_ms: u64::MAX,
+            wait_timeout: Duration::MAX,
+            max_waiters: 4,
+        };
+        let mut state = ControlState::new(Uuid::new_v4(), 1, limits);
+        assert_eq!(state.limits.max_ttl_ms, MAX_CONTROL_TTL_MS);
+        assert_eq!(state.limits.wait_timeout, MAX_CONTROL_WAIT_TIMEOUT);
+
+        let started = Instant::now();
+        let AcquireOutcome::Granted(owner) = state.acquire(
+            actor("owner"),
+            ControlMode::Queue,
+            u64::MAX,
+            i64::MAX - 1,
+            started,
+        ) else {
+            panic!("expected grant");
+        };
+        assert_eq!(owner.expires_wall_time_ns, i64::MAX);
+        assert!(matches!(
+            state.acquire(
+                actor("waiter"),
+                ControlMode::Queue,
+                u64::MAX,
+                i64::MIN,
+                started,
+            ),
+            AcquireOutcome::Queued { position: 1 }
+        ));
+
+        let after_wait_ceiling = started + MAX_CONTROL_WAIT_TIMEOUT + Duration::from_millis(1);
+        assert!(state.expire(i64::MAX, after_wait_ceiling).is_none());
+        let released = state
+            .release("owner", owner.id, owner.fence, i64::MAX, after_wait_ceiling)
+            .unwrap();
+        assert!(
+            released.promoted.is_none(),
+            "the bounded one-hour waiter must not survive until owner release"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_monotonic_deadline_fails_closed_without_panicking() {
+        let now = Instant::now();
+        assert!(now.checked_add(Duration::MAX).is_none());
+        assert_eq!(monotonic_deadline(now, Duration::MAX), now);
     }
 }

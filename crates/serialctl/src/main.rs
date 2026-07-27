@@ -15,7 +15,9 @@ use serial_protocol::{Direction, EventKind, EventQuery, SerialSettings, SlotConf
 use crate::{
     api::ApiClient,
     config::LoadedConfig,
-    display::{format_event_plain, format_wall_time_local, pad_display, safe_inline},
+    display::{
+        format_event_plain, format_wall_time_local, pad_display, safe_inline, trigger_status_label,
+    },
     i18n::{Lang, tr, trf},
 };
 
@@ -234,6 +236,19 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
         );
         if let Some(reason) = slot.state_reason {
             println!("{}", trf("m.status.reason", &[&safe_inline(&reason)]));
+        }
+        if let Some(trigger) = slot.active_trigger {
+            println!(
+                "{}",
+                trf(
+                    "m.status.trigger",
+                    &[
+                        &trigger.id.to_string(),
+                        trigger_status_label(trigger.status),
+                        &trigger.fires_confirmed.to_string(),
+                    ],
+                )
+            );
         }
     }
     Ok(())
@@ -842,6 +857,10 @@ fn parse_event_kind(value: &str) -> Result<EventKind, String> {
         "run_started" => Ok(EventKind::RunStarted),
         "run_ended" => Ok(EventKind::RunEnded),
         "run_aborted" => Ok(EventKind::RunAborted),
+        "trigger_started" => Ok(EventKind::TriggerStarted),
+        "trigger_completed" => Ok(EventKind::TriggerCompleted),
+        "trigger_cancelled" => Ok(EventKind::TriggerCancelled),
+        "trigger_failed" => Ok(EventKind::TriggerFailed),
         "checkpoint" => Ok(EventKind::Checkpoint),
         "logging_degraded" => Ok(EventKind::LoggingDegraded),
         "gap" => Ok(EventKind::Gap),
@@ -898,6 +917,22 @@ mod tests {
         assert_eq!(
             parse_event_kind("run_started").unwrap(),
             EventKind::RunStarted
+        );
+        assert_eq!(
+            parse_event_kind("trigger-started").unwrap(),
+            EventKind::TriggerStarted
+        );
+        assert_eq!(
+            parse_event_kind("trigger_completed").unwrap(),
+            EventKind::TriggerCompleted
+        );
+        assert_eq!(
+            parse_event_kind("trigger-cancelled").unwrap(),
+            EventKind::TriggerCancelled
+        );
+        assert_eq!(
+            parse_event_kind("trigger_failed").unwrap(),
+            EventKind::TriggerFailed
         );
         assert!(parse_event_kind("not-an-event").is_err());
     }

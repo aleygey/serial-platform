@@ -62,6 +62,17 @@ impl EventRing {
         self.events.back().map(|event| event.seq)
     }
 
+    /// Marks a live-delivered event durable after its asynchronous journal
+    /// acknowledgement arrives. Recent acknowledgements are normally near the
+    /// tail, so search backwards without adding a second unbounded index.
+    pub fn mark_durable(&mut self, seq: u64) -> bool {
+        let Some(event) = self.events.iter_mut().rev().find(|event| event.seq == seq) else {
+            return false;
+        };
+        event.durable = true;
+        true
+    }
+
     pub fn replay(
         &self,
         daemon_epoch: Uuid,
@@ -220,6 +231,25 @@ mod tests {
             vec![4, 5]
         );
         assert!(replay.gap.is_none());
+    }
+
+    #[test]
+    fn asynchronous_ack_marks_a_live_event_durable() {
+        let epoch = Uuid::new_v4();
+        let mut ring = EventRing::new(10, 10_000);
+        let mut pending = event(epoch, 1);
+        pending.durable = false;
+        ring.push(pending);
+
+        assert!(ring.mark_durable(1));
+        assert!(!ring.mark_durable(99));
+        assert!(
+            ring.replay(epoch, None, 1, 10)
+                .unwrap()
+                .events
+                .first()
+                .is_some_and(|event| event.durable)
+        );
     }
 
     #[test]

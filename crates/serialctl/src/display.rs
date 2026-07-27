@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
+
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use ratatui::style::{Color, Modifier, Style};
-use serial_protocol::{ActorKind, Direction, EventKind, TimelineEvent};
+use serial_protocol::{ActorKind, Direction, EventKind, TimelineEvent, TriggerStatus};
 use unicode_width::UnicodeWidthChar;
 
 use crate::i18n::tr;
@@ -31,8 +33,6 @@ pub struct DisplayLine {
     pub source: String,
     pub text: String,
     pub source_style: Style,
-    /// Stream direction of the row. `None` rows are system/gap rows.
-    pub direction: Direction,
     /// Color of the leading "●" marker for TX/actor-attributed rows. `None`
     /// renders a two-space indent instead (device RX rows, system rows, gaps).
     pub marker_color: Option<Color>,
@@ -50,6 +50,16 @@ pub struct DisplayLine {
 /// allowing a single Slot to grow without limit.
 const MAX_STREAM_LINE_CHARS: usize = 16 * 1024;
 const MAX_CSI_PARAMETER_BYTES: usize = 64;
+/// Maximum confirmed TX prefix retained while waiting for an exact device
+/// echo. This is bounded independently from the scrollback and write queues.
+const MAX_EXPECTED_ECHO_BYTES: usize = 64 * 1024;
+const MAX_EXPECTED_ECHO_SEGMENTS: usize = 1_024;
+const ERASE_ECHO: &[u8] = b"\x08 \x08";
+/// Some target TTYs insert this sequence while echoing a command that crosses
+/// their configured terminal column. It is presentation-only: the bytes were
+/// not part of the confirmed TX and may be ignored only while the surrounding
+/// RX still matches that exact TX expectation.
+const ECHO_HARD_WRAP: &[u8] = b"\r\r\n";
 
 /// The result of feeding one timeline event into [`TerminalStreamParser`].
 ///
@@ -62,6 +72,10 @@ const MAX_CSI_PARAMETER_BYTES: usize = 64;
 pub struct StreamDisplayBatch {
     pub completed: Vec<DisplayLine>,
     pub pending: Option<DisplayLine>,
+    /// True only when the previously pending terminal row was committed.
+    /// Standalone audit annotations can add a completed display row while
+    /// deliberately preserving the live device cursor.
+    pub pending_committed: bool,
 }
 
 /// Incremental, per-Slot terminal-to-text projection.
@@ -75,6 +89,28 @@ pub struct StreamDisplayBatch {
 pub struct TerminalStreamParser {
     terminal: TerminalTextState,
     context: Option<LineContext>,
+    reconcile_echo: bool,
+    expected_echoes: VecDeque<EchoExpectation>,
+    expected_echo_bytes: usize,
+    /// RX bytes that tentatively matched a TX prefix. They are discarded only
+    /// after a complete expectation (or logical line segment) matches; a
+    /// mismatch replays them so real device output can never be lost.
+    echo_candidate: Vec<u8>,
+    /// Candidate bytes abandoned when reconciliation is disabled between
+    /// events. They are replayed before the next byte-bearing event.
+    abandoned_rx: Vec<u8>,
+    /// RX attribution for speculative/abandoned echo bytes. In particular,
+    /// this keeps a partial echo separate from the locally projected TX row
+    /// when a physical-session boundary forces the stream to flush.
+    echo_candidate_context: Option<LineContext>,
+    /// A matched TX `\r` may be echoed by the target as `\r\n`. The optional
+    /// LF must not be mistaken for the start of the next pasted command.
+    swallow_optional_echo_lf: bool,
+    /// A locally projected TX line ended with CR but has not yet received the
+    /// device newline. If the target responds with text directly, commit the
+    /// visible command before drawing that text instead of overwriting it
+    /// from column zero.
+    tx_line_end_pending: bool,
 }
 
 impl TerminalStreamParser {
@@ -82,19 +118,51 @@ impl TerminalStreamParser {
         Self::default()
     }
 
-    /// Projects the next event. Byte-bearing RX/TX events participate in the
-    /// stream; control/system events form their own committed rows. Changing
-    /// source, daemon epoch, or physical generation commits the old partial
-    /// row so attribution never leaks across actors or serial sessions.
+    /// Enables terminal-style local TX projection with exact RX echo
+    /// reconciliation. TX bytes are shown immediately in the current terminal
+    /// row; a matching device echo is consumed byte-for-byte so echo-on
+    /// targets do not render the command twice.
+    pub fn set_echo_reconciliation(&mut self, enabled: bool) {
+        if self.reconcile_echo != enabled {
+            self.reconcile_echo = enabled;
+            if !enabled {
+                self.abandoned_rx.append(&mut self.echo_candidate);
+            }
+            self.expected_echoes.clear();
+            self.expected_echo_bytes = 0;
+            self.swallow_optional_echo_lf = false;
+        }
+    }
+
+    /// Projects the next event. Byte-bearing RX/TX events participate in one
+    /// terminal stream. Physical-session boundaries form committed system
+    /// rows; bookkeeping events such as control and Run changes stay in the
+    /// audit journal without moving the projected terminal cursor.
+    ///
+    /// Only daemon epoch or physical-generation changes force an
+    /// unterminated row to commit. Direction and actor changes update the row
+    /// attribution without splitting the visible terminal line.
     pub fn push_event(&mut self, event: &TimelineEvent) -> StreamDisplayBatch {
         let mut completed = Vec::new();
+        let had_pending = self.pending_line().is_some();
 
         if event.direction == Direction::None {
-            completed.extend(self.flush());
-            completed.extend(event_to_lines(event));
+            if terminal_boundary(event.kind) {
+                completed.extend(self.flush());
+                completed.extend(event_to_lines(event));
+                return StreamDisplayBatch {
+                    completed,
+                    pending: None,
+                    pending_committed: had_pending,
+                };
+            }
+            if visible_terminal_annotation(event.kind) {
+                completed.extend(event_to_lines(event));
+            }
             return StreamDisplayBatch {
                 completed,
-                pending: None,
+                pending: self.pending_line(),
+                pending_committed: false,
             };
         }
 
@@ -107,19 +175,233 @@ impl TerminalStreamParser {
             completed.extend(self.flush());
         }
 
-        match &mut self.context {
-            Some(current) => current.refresh(event),
-            None => self.context = Some(incoming),
+        if !self.abandoned_rx.is_empty() {
+            let replay = std::mem::take(&mut self.abandoned_rx);
+            self.replay_buffered_rx(replay, &incoming, &mut completed);
         }
 
-        let rows = self.terminal.push(&event.data);
-        if let Some(context) = self.context.as_ref() {
-            completed.extend(rows.into_iter().map(|text| context.display_line(text)));
+        let has_pending = self.terminal.pending_text().is_some();
+        match &mut self.context {
+            Some(current) if has_pending => {
+                current.seq = event.seq;
+                if event.direction == Direction::Tx {
+                    current.adopt_tx(&incoming);
+                }
+            }
+            _ => self.context = Some(incoming.clone()),
+        }
+
+        if event.direction == Direction::Tx && self.reconcile_echo && !event.data.is_empty() {
+            let fits_byte_budget = self.expected_echo_bytes.saturating_add(event.data.len())
+                <= MAX_EXPECTED_ECHO_BYTES;
+            let can_extend_tail = self
+                .expected_echoes
+                .back()
+                .is_some_and(|expectation| expectation.can_append(&event.data));
+            if fits_byte_budget
+                && (can_extend_tail || self.expected_echoes.len() < MAX_EXPECTED_ECHO_SEGMENTS)
+            {
+                self.expected_echo_bytes += event.data.len();
+                if can_extend_tail {
+                    self.expected_echoes
+                        .back_mut()
+                        .expect("an appendable echo tail exists")
+                        .append(&event.data);
+                } else {
+                    self.expected_echoes
+                        .push_back(EchoExpectation::new(&event.data));
+                }
+            } else {
+                // Do not retain a partial expectation: it could consume an
+                // unrelated RX prefix after a large write.
+                self.abandoned_rx.append(&mut self.echo_candidate);
+                self.expected_echoes.clear();
+                self.expected_echo_bytes = 0;
+                self.swallow_optional_echo_lf = false;
+            }
+        }
+
+        for &byte in &event.data {
+            if event.direction == Direction::Rx {
+                match self.reconcile_rx_byte(byte, &incoming) {
+                    EchoDisposition::Suppressed {
+                        expectation_complete,
+                    } => {
+                        if expectation_complete && let Some(context) = self.context.as_mut() {
+                            context.echoed = true;
+                        }
+                        continue;
+                    }
+                    EchoDisposition::Visible(bytes) => {
+                        for visible in bytes {
+                            self.feed_visible_byte(visible, &incoming, &mut completed);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if matches!(byte, 0x08 | 0x7f) {
+                // RAW input is projected optimistically. Model a local
+                // destructive backspace so both a literal DEL echo and the
+                // common Linux TTY BS-space-BS echo can be suppressed without
+                // applying the edit twice.
+                for erase_byte in ERASE_ECHO {
+                    self.feed_visible_byte(*erase_byte, &incoming, &mut completed);
+                }
+            } else {
+                self.feed_visible_byte(byte, &incoming, &mut completed);
+            }
         }
 
         StreamDisplayBatch {
+            pending_committed: had_pending && !completed.is_empty(),
             completed,
             pending: self.pending_line(),
+        }
+    }
+
+    fn reconcile_rx_byte(&mut self, byte: u8, incoming: &LineContext) -> EchoDisposition {
+        if !self.reconcile_echo {
+            return EchoDisposition::Visible(vec![byte]);
+        }
+        if self.swallow_optional_echo_lf {
+            self.swallow_optional_echo_lf = false;
+            if byte == b'\n' {
+                return EchoDisposition::Suppressed {
+                    expectation_complete: false,
+                };
+            }
+        }
+        let Some(expectation) = self.expected_echoes.front_mut() else {
+            return EchoDisposition::Visible(vec![byte]);
+        };
+
+        self.echo_candidate.push(byte);
+        self.echo_candidate_context = Some(incoming.clone());
+        expectation.search_started = true;
+        match expectation.match_candidate(&self.echo_candidate) {
+            EchoCandidateMatch::Full => {
+                let matched_cr = expectation.ends_in_cr();
+                let matched_len = expectation.bytes.len();
+                self.echo_candidate.clear();
+                self.echo_candidate_context = None;
+                self.expected_echoes.pop_front();
+                self.expected_echo_bytes = self.expected_echo_bytes.saturating_sub(matched_len);
+                let expectation_complete = self.expected_echoes.is_empty();
+                let next_expectation_starts_in_lf = self
+                    .expected_echoes
+                    .front()
+                    .is_some_and(EchoExpectation::starts_in_lf);
+                self.swallow_optional_echo_lf = matched_cr
+                    && !next_expectation_starts_in_lf
+                    && (!expectation_complete || !self.tx_line_end_pending);
+                return EchoDisposition::Suppressed {
+                    expectation_complete,
+                };
+            }
+            EchoCandidateMatch::Prefix => {
+                return EchoDisposition::Suppressed {
+                    expectation_complete: false,
+                };
+            }
+            EchoCandidateMatch::Mismatch => {}
+        }
+
+        // Echo suppression is deliberately adjacency-biased. Once the first
+        // RX bytes prove that the oldest expectation is not the immediate
+        // device echo, replay the whole speculative candidate and abandon all
+        // pending expectations. A later echo may therefore remain visible,
+        // but boot logs, password prompts, and other device data can never be
+        // searched for matching bytes and silently consumed.
+        let visible = std::mem::take(&mut self.echo_candidate);
+        self.echo_candidate_context = None;
+        self.expected_echoes.clear();
+        self.expected_echo_bytes = 0;
+        self.swallow_optional_echo_lf = false;
+        EchoDisposition::Visible(visible)
+    }
+
+    fn feed_visible_byte(
+        &mut self,
+        byte: u8,
+        incoming: &LineContext,
+        completed: &mut Vec<DisplayLine>,
+    ) {
+        if self.tx_line_end_pending && !matches!(byte, b'\r' | b'\n') {
+            self.commit_pending_row(incoming, completed);
+        }
+
+        let mut rows = Vec::new();
+        self.terminal.consume(byte, &mut rows);
+        if byte == b'\n' {
+            self.tx_line_end_pending = false;
+        } else if incoming.direction == Direction::Tx && byte == b'\r' {
+            self.tx_line_end_pending = true;
+        }
+        if rows.is_empty() {
+            return;
+        }
+
+        let context = self
+            .context
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| incoming.clone());
+        completed.extend(rows.drain(..).map(|text| context.display_line(text)));
+        // A newline ended any prior mixed RX/TX row. Remaining bytes in this
+        // event belong to the incoming event's source.
+        self.context = Some(incoming.clone());
+    }
+
+    fn commit_pending_row(&mut self, incoming: &LineContext, completed: &mut Vec<DisplayLine>) {
+        self.tx_line_end_pending = false;
+        let mut rows = Vec::new();
+        self.terminal.consume(b'\n', &mut rows);
+        let context = self
+            .context
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| incoming.clone());
+        completed.extend(rows.into_iter().map(|text| context.display_line(text)));
+        self.context = Some(incoming.clone());
+    }
+
+    fn replay_echo_candidate(&mut self, completed: &mut Vec<DisplayLine>) {
+        let mut replay = std::mem::take(&mut self.abandoned_rx);
+        replay.append(&mut self.echo_candidate);
+        if replay.is_empty() {
+            return;
+        }
+        let fallback = self.context.clone();
+        let Some(fallback) = fallback.as_ref() else {
+            debug_assert!(false, "echo candidates always have a stream context");
+            return;
+        };
+        self.replay_buffered_rx(replay, fallback, completed);
+    }
+
+    fn replay_buffered_rx(
+        &mut self,
+        replay: Vec<u8>,
+        fallback: &LineContext,
+        completed: &mut Vec<DisplayLine>,
+    ) {
+        let incoming = self
+            .echo_candidate_context
+            .take()
+            .unwrap_or_else(|| fallback.clone());
+        if self
+            .context
+            .as_ref()
+            .is_some_and(|current| current.direction == Direction::Tx)
+            && incoming.direction == Direction::Rx
+            && self.terminal.pending_text().is_some()
+        {
+            self.commit_pending_row(&incoming, completed);
+        }
+        for byte in replay {
+            self.feed_visible_byte(byte, &incoming, completed);
         }
     }
 
@@ -127,8 +409,9 @@ impl TerminalStreamParser {
     /// A truncated UTF-8 scalar is rendered as U+FFFD; an unfinished escape
     /// sequence is discarded because replaying it would be unsafe.
     pub fn flush(&mut self) -> Vec<DisplayLine> {
-        let completed_rows = self.terminal.finish_input();
         let mut lines = Vec::new();
+        self.replay_echo_candidate(&mut lines);
+        let completed_rows = self.terminal.finish_input();
         if let Some(context) = self.context.as_ref() {
             lines.extend(
                 completed_rows
@@ -141,6 +424,13 @@ impl TerminalStreamParser {
         }
         self.terminal.reset();
         self.context = None;
+        self.expected_echoes.clear();
+        self.expected_echo_bytes = 0;
+        self.echo_candidate.clear();
+        self.abandoned_rx.clear();
+        self.echo_candidate_context = None;
+        self.swallow_optional_echo_lf = false;
+        self.tx_line_end_pending = false;
         lines
     }
 
@@ -149,6 +439,13 @@ impl TerminalStreamParser {
     pub fn reset(&mut self) {
         self.terminal.reset();
         self.context = None;
+        self.expected_echoes.clear();
+        self.expected_echo_bytes = 0;
+        self.echo_candidate.clear();
+        self.abandoned_rx.clear();
+        self.echo_candidate_context = None;
+        self.swallow_optional_echo_lf = false;
+        self.tx_line_end_pending = false;
     }
 
     pub fn pending_line(&self) -> Option<DisplayLine> {
@@ -159,13 +456,129 @@ impl TerminalStreamParser {
     }
 }
 
+fn terminal_boundary(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::SerialOpening
+            | EventKind::SerialOpened
+            | EventKind::SerialOpenFailed
+            | EventKind::SerialClosed
+            | EventKind::SlotRemoved
+            | EventKind::Gap
+    )
+}
+
+fn visible_terminal_annotation(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::TriggerStarted
+            | EventKind::TriggerCompleted
+            | EventKind::TriggerCancelled
+            | EventKind::TriggerFailed
+    )
+}
+
+#[derive(Debug)]
+struct EchoExpectation {
+    bytes: Vec<u8>,
+    /// Linux TTYs commonly echo a transmitted DEL as BS-space-BS.
+    accept_erase_echo: bool,
+    /// Once RX has been compared with this expectation, later TX must form a
+    /// new expectation rather than extending the byte sequence being matched.
+    search_started: bool,
+}
+
+impl EchoExpectation {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            accept_erase_echo: bytes == [0x7f],
+            search_started: false,
+        }
+    }
+
+    fn can_append(&self, bytes: &[u8]) -> bool {
+        !self.search_started
+            && !self.accept_erase_echo
+            && !matches!(self.bytes.last(), Some(b'\r' | b'\n'))
+            && !bytes.iter().any(|byte| matches!(byte, 0x08 | 0x7f))
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        debug_assert!(self.can_append(bytes));
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn match_candidate(&self, candidate: &[u8]) -> EchoCandidateMatch {
+        if self.accept_erase_echo {
+            if candidate == self.bytes || candidate == b"\x08" || candidate == ERASE_ECHO {
+                return EchoCandidateMatch::Full;
+            }
+            if self.bytes.starts_with(candidate) || ERASE_ECHO.starts_with(candidate) {
+                return EchoCandidateMatch::Prefix;
+            }
+            return EchoCandidateMatch::Mismatch;
+        }
+
+        let mut expected = 0usize;
+        let mut actual = 0usize;
+        while actual < candidate.len() {
+            if expected < self.bytes.len() && candidate[actual] == self.bytes[expected] {
+                expected += 1;
+                actual += 1;
+                continue;
+            }
+
+            // This exact sequence was observed from the target TTY at its
+            // configured column boundary. Accept a complete or split sequence
+            // only between two expected TX bytes. It stays speculative until
+            // the rest of the exact TX matches, so a later mismatch replays
+            // every byte and cannot hide real output.
+            if expected > 0 && expected < self.bytes.len() {
+                let remaining = &candidate[actual..];
+                if ECHO_HARD_WRAP.starts_with(remaining) {
+                    return EchoCandidateMatch::Prefix;
+                }
+                if remaining.starts_with(ECHO_HARD_WRAP) {
+                    actual += ECHO_HARD_WRAP.len();
+                    continue;
+                }
+            }
+            return EchoCandidateMatch::Mismatch;
+        }
+
+        if expected == self.bytes.len() {
+            EchoCandidateMatch::Full
+        } else {
+            EchoCandidateMatch::Prefix
+        }
+    }
+
+    fn ends_in_cr(&self) -> bool {
+        self.bytes.last().copied() == Some(b'\r')
+    }
+
+    fn starts_in_lf(&self) -> bool {
+        self.bytes.first().copied() == Some(b'\n')
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoCandidateMatch {
+    Full,
+    Prefix,
+    Mismatch,
+}
+
+enum EchoDisposition {
+    Suppressed { expectation_complete: bool },
+    Visible(Vec<u8>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StreamIdentity {
     daemon_epoch: uuid::Uuid,
     generation: u64,
-    direction: Direction,
-    actor_id: Option<String>,
-    actor_kind: Option<ActorKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +589,8 @@ struct LineContext {
     source_style: Style,
     direction: Direction,
     kind: EventKind,
+    actor_kind: Option<ActorKind>,
+    echoed: bool,
 }
 
 impl LineContext {
@@ -184,21 +599,25 @@ impl LineContext {
             identity: StreamIdentity {
                 daemon_epoch: event.daemon_epoch,
                 generation: event.generation,
-                direction: event.direction,
-                actor_id: event.actor.as_ref().map(|actor| actor.id.clone()),
-                actor_kind: event.actor.as_ref().map(|actor| actor.kind),
             },
             seq: event.seq,
             source: source_label(event),
             source_style: source_style(event),
             direction: event.direction,
             kind: event.kind,
+            actor_kind: event.actor.as_ref().map(|actor| actor.kind),
+            echoed: false,
         }
     }
 
-    fn refresh(&mut self, event: &TimelineEvent) {
-        self.seq = event.seq;
-        self.kind = event.kind;
+    fn adopt_tx(&mut self, incoming: &Self) {
+        self.seq = incoming.seq;
+        self.source.clone_from(&incoming.source);
+        self.source_style = incoming.source_style;
+        self.direction = incoming.direction;
+        self.kind = incoming.kind;
+        self.actor_kind = incoming.actor_kind;
+        self.echoed = false;
     }
 
     fn display_line(&self, text: String) -> DisplayLine {
@@ -207,10 +626,9 @@ impl LineContext {
             source: self.source.clone(),
             bytes: text.len() + self.source.len() + 16,
             source_style: self.source_style,
-            direction: self.direction,
-            marker_color: marker_color(self.direction, self.identity.actor_kind),
+            marker_color: marker_color(self.direction, self.actor_kind),
             solid_style: solid_style(self.direction, self.kind),
-            echoed: false,
+            echoed: self.echoed,
             text,
         }
     }
@@ -238,14 +656,6 @@ struct TerminalTextState {
 }
 
 impl TerminalTextState {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        let mut rows = Vec::new();
-        for &byte in bytes {
-            self.consume(byte, &mut rows);
-        }
-        rows
-    }
-
     fn consume(&mut self, byte: u8, rows: &mut Vec<String>) {
         if self.escape != EscapeState::Ground {
             self.consume_escape(byte);
@@ -275,7 +685,7 @@ impl TerminalTextState {
                 self.cursor = 0;
                 self.touched |= !self.line.is_empty();
             }
-            0x08 => {
+            0x08 | 0x7f => {
                 self.cursor = self.cursor.saturating_sub(1);
                 self.touched |= !self.line.is_empty();
             }
@@ -285,7 +695,7 @@ impl TerminalTextState {
                     self.write_char(' ', rows);
                 }
             }
-            0x00..=0x1f | 0x7f => {}
+            0x00..=0x1f => {}
             0x20..=0x7e => self.write_char(char::from(byte), rows),
             _ => {
                 self.utf8.push(byte);
@@ -510,7 +920,6 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
             source: source.clone(),
             bytes: text.len() + source.len() + 16,
             source_style,
-            direction: event.direction,
             marker_color,
             solid_style,
             echoed: false,
@@ -526,7 +935,6 @@ pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
         source: tr("d.gap").into(),
         bytes: text.len() + 20,
         source_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        direction: Direction::None,
         marker_color: None,
         solid_style: Some(
             Style::default()
@@ -691,10 +1099,10 @@ fn compact_actor_label(actor: &serial_protocol::Actor, write: bool) -> String {
     let short_id = id.chars().rev().take(8).collect::<String>();
     let short_id = short_id.chars().rev().collect::<String>();
     format!(
-        "{}:{}[{}]{}",
+        "{}[{}]:{}{}",
         actor_kind_label(actor.kind),
-        label,
         short_id,
+        label,
         if write { ">" } else { "" }
     )
 }
@@ -739,9 +1147,35 @@ fn event_kind_label(kind: EventKind) -> &'static str {
         EventKind::RunStarted => tr("d.ev.run_started"),
         EventKind::RunEnded => tr("d.ev.run_ended"),
         EventKind::RunAborted => tr("d.ev.run_aborted"),
+        EventKind::TriggerStarted => tr("d.ev.trigger_started"),
+        EventKind::TriggerCompleted => tr("d.ev.trigger_completed"),
+        EventKind::TriggerCancelled => tr("d.ev.trigger_cancelled"),
+        EventKind::TriggerFailed => tr("d.ev.trigger_failed"),
         EventKind::Checkpoint => tr("d.ev.checkpoint"),
         EventKind::LoggingDegraded => tr("d.ev.logging_degraded"),
         EventKind::Gap => tr("d.ev.gap"),
+    }
+}
+
+/// Stable protocol spelling for one Trigger state in human-readable status
+/// output. Labels stay device-agnostic and intentionally do not infer a
+/// bootloader or flashing result from a matched literal.
+pub fn trigger_status_label(status: TriggerStatus) -> &'static str {
+    match status {
+        TriggerStatus::Armed => "armed",
+        TriggerStatus::WaitingForStart => "waiting_for_start",
+        TriggerStatus::Running => "running",
+        TriggerStatus::Stopping => "stopping",
+        TriggerStatus::Matched => "matched",
+        TriggerStatus::TimedOut => "timed_out",
+        TriggerStatus::MaxFiresReached => "max_fires_reached",
+        TriggerStatus::Cancelled => "cancelled",
+        TriggerStatus::ControlLost => "control_lost",
+        TriggerStatus::RunLost => "run_lost",
+        TriggerStatus::GenerationChanged => "generation_changed",
+        TriggerStatus::PortClosed => "port_closed",
+        TriggerStatus::WriteFailed => "write_failed",
+        TriggerStatus::RxGap => "rx_gap",
     }
 }
 
@@ -861,10 +1295,17 @@ fn prompt_range(
     shell_prompt: Option<&str>,
     uboot_prompt: Option<&str>,
 ) -> Option<(usize, usize)> {
-    for prompt in [shell_prompt, uboot_prompt].into_iter().flatten() {
-        if !prompt.is_empty() && text.ends_with(prompt) {
-            return Some((text.len() - prompt.len(), text.len()));
-        }
+    let configured = [shell_prompt, uboot_prompt]
+        .into_iter()
+        .flatten()
+        .filter(|prompt| !prompt.is_empty())
+        .filter_map(|prompt| {
+            text.rfind(prompt)
+                .map(|start| (start, start + prompt.len()))
+        })
+        .max_by_key(|(start, end)| (*end, end - start));
+    if configured.is_some() {
+        return configured;
     }
     let trimmed = text.trim_end();
     for marker in [" #", " $", " >"] {
@@ -901,7 +1342,25 @@ fn system_event_text(event: &TimelineEvent) -> String {
     {
         return message.to_string();
     }
-    format!("{:?}", event.kind)
+    if matches!(
+        event.kind,
+        EventKind::TriggerStarted
+            | EventKind::TriggerCompleted
+            | EventKind::TriggerCancelled
+            | EventKind::TriggerFailed
+    ) {
+        let kind = event_kind_label(event.kind);
+        event
+            .metadata
+            .get("status")
+            .and_then(|value| serde_json::from_value::<TriggerStatus>(value.clone()).ok())
+            .map_or_else(
+                || kind.to_string(),
+                |status| format!("{kind}: {}", trigger_status_label(status)),
+            )
+    } else {
+        format!("{:?}", event.kind)
+    }
 }
 
 #[cfg(test)]
@@ -976,8 +1435,114 @@ mod tests {
         assert!(!rendered.contains("\u{1b}"));
 
         let line = event_to_lines(&tx).remove(0);
-        assert_eq!(line.source, "AGENT:worker-a[12345678]>");
+        assert_eq!(line.source, "AGENT[12345678]:worker-a>");
         assert_eq!(line.marker_color, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn trigger_tx_keeps_the_ordinary_agent_tx_presentation() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut tx = event(b"slp");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        tx.actor = Some(Actor {
+            id: "agent:trigger-1".into(),
+            label: "boot-window".into(),
+            kind: ActorKind::Agent,
+        });
+        tx.metadata
+            .insert("trigger_id".into(), serde_json::json!(Uuid::new_v4()));
+        tx.metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("action"));
+        tx.metadata
+            .insert("fire_index".into(), serde_json::json!(7));
+
+        let line = event_to_lines(&tx).remove(0);
+
+        assert_eq!(line.source, "AGENT[rigger-1]:boot-window>");
+        assert_eq!(line.marker_color, Some(Color::Magenta));
+        assert!(line.solid_style.is_none());
+        assert_eq!(line.text, "slp");
+        assert!(format_event_plain(&tx).contains("tx/AGENT:boot-window[agent:trigger-1]>"));
+    }
+
+    #[test]
+    fn trigger_lifecycle_labels_are_available_in_both_languages() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut started = event(&[]);
+        started.direction = Direction::None;
+        started.kind = EventKind::TriggerStarted;
+        started
+            .metadata
+            .insert("status".into(), serde_json::json!("waiting_for_start"));
+
+        assert!(format_event_plain(&started).contains("trigger_started: waiting_for_start"));
+        assert_eq!(
+            event_to_lines(&started).remove(0).text,
+            "trigger_started: waiting_for_start"
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        assert!(format_event_plain(&started).contains("触发任务已启动"));
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+    }
+
+    #[test]
+    fn every_terminal_trigger_lifecycle_row_exposes_metadata_status() {
+        let _guard = crate::i18n::lang_test_lock();
+        for (kind, status) in [
+            (EventKind::TriggerCompleted, TriggerStatus::Matched),
+            (EventKind::TriggerCompleted, TriggerStatus::TimedOut),
+            (EventKind::TriggerCompleted, TriggerStatus::MaxFiresReached),
+            (EventKind::TriggerCancelled, TriggerStatus::Cancelled),
+            (EventKind::TriggerFailed, TriggerStatus::ControlLost),
+            (EventKind::TriggerFailed, TriggerStatus::WriteFailed),
+        ] {
+            let mut terminal = event(&[]);
+            terminal.direction = Direction::None;
+            terminal.kind = kind;
+            terminal
+                .metadata
+                .insert("status".into(), serde_json::json!(status));
+
+            let expected = trigger_status_label(status);
+            assert!(format_event_plain(&terminal).contains(expected));
+            assert!(event_to_lines(&terminal).remove(0).text.contains(expected));
+        }
+    }
+
+    #[test]
+    fn trigger_annotation_preserves_the_live_terminal_cursor() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut parser = TerminalStreamParser::new();
+        let prompt = parser.push_event(&event_at(1, b"shell# "));
+        assert_eq!(prompt.pending.unwrap().text, "shell# ");
+
+        let mut completed = event(&[]);
+        completed.seq = 2;
+        completed.direction = Direction::None;
+        completed.kind = EventKind::TriggerCompleted;
+        completed
+            .metadata
+            .insert("status".into(), serde_json::json!("matched"));
+        let annotation = parser.push_event(&completed);
+
+        assert!(!annotation.pending_committed);
+        assert_eq!(annotation.completed.len(), 1);
+        assert_eq!(annotation.completed[0].text, "trigger_completed: matched");
+        assert_eq!(annotation.pending.unwrap().text, "shell# ");
+    }
+
+    #[test]
+    fn trigger_status_uses_stable_protocol_spelling() {
+        assert_eq!(
+            trigger_status_label(TriggerStatus::WaitingForStart),
+            "waiting_for_start"
+        );
+        assert_eq!(
+            trigger_status_label(TriggerStatus::MaxFiresReached),
+            "max_fires_reached"
+        );
+        assert_eq!(trigger_status_label(TriggerStatus::RxGap), "rx_gap");
     }
 
     #[test]
@@ -1020,6 +1585,12 @@ mod tests {
         let spans = highlight_spans("root@dut #", None, None);
         assert_eq!(spans, vec![(9, 10, prompt_style())]);
         assert!(highlight_spans("no prompt here", None, None).is_empty());
+    }
+
+    #[test]
+    fn configured_prompt_prefers_the_longest_match_at_the_latest_end() {
+        let spans = highlight_spans("boot\nSigmaStar # ", Some("# "), Some("SigmaStar # "));
+        assert_eq!(spans, vec![(5, 17, prompt_style())]);
     }
 
     #[test]
@@ -1094,19 +1665,23 @@ mod tests {
 
         let overwrite = parser.push_event(&event_at(4, b"abc\rXY\n"));
         assert_eq!(overwrite.completed[0].text, "XYc");
+
+        let delete = parser.push_event(&event_at(5, b"abc\x7fX\n"));
+        assert_eq!(delete.completed[0].text, "abX");
     }
 
     #[test]
-    fn source_change_commits_partial_row_and_preserves_styles() {
+    fn prompt_tx_and_exact_rx_echo_form_one_attributed_terminal_row() {
         let _guard = crate::i18n::lang_test_lock();
         let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
         let first = parser.push_event(&event_at(1, b"Sigma"));
         assert_eq!(
             first.pending.as_ref().map(|line| line.text.as_str()),
             Some("Sigma")
         );
 
-        let prompt = parser.push_event(&event_at(2, b"Star #"));
+        let prompt = parser.push_event(&event_at(2, b"Star # "));
         let prompt = prompt
             .pending
             .expect("prompt should remain visible without newline");
@@ -1127,12 +1702,10 @@ mod tests {
             kind: ActorKind::Human,
         });
         let switched = parser.push_event(&tx);
-        assert_eq!(switched.completed.len(), 1);
-        assert_eq!(switched.completed[0].source, "DEV");
-        assert_eq!(switched.completed[0].text, "SigmaStar #");
+        assert!(switched.completed.is_empty());
         assert_eq!(
             switched.pending.as_ref().map(|line| line.source.as_str()),
-            Some("HUMAN:operator[human-1]>")
+            Some("HUMAN[human-1]:operator>")
         );
         assert_eq!(
             switched.pending.as_ref().map(|line| line.source_style),
@@ -1148,8 +1721,460 @@ mod tests {
         );
         assert_eq!(
             switched.pending.as_ref().map(|line| line.text.as_str()),
-            Some("reboot")
+            Some("SigmaStar # reboot")
         );
+
+        let mut control = event_at(4, &[]);
+        control.direction = Direction::None;
+        control.kind = EventKind::ControlGranted;
+        let unchanged = parser.push_event(&control);
+        assert!(unchanged.completed.is_empty());
+        assert_eq!(
+            unchanged.pending.as_ref().map(|line| line.text.as_str()),
+            Some("SigmaStar # reboot")
+        );
+
+        let echoed = parser.push_event(&event_at(5, b"reboot\r\n"));
+        assert_eq!(echoed.completed.len(), 1);
+        assert_eq!(echoed.completed[0].text, "SigmaStar # reboot");
+        assert_eq!(echoed.completed[0].source, "HUMAN[human-1]:operator>");
+        assert_eq!(echoed.completed[0].marker_color, Some(Color::Green));
+        assert!(echoed.completed[0].echoed);
+        assert!(echoed.pending.is_none());
+    }
+
+    #[test]
+    fn target_hard_wrap_inside_long_echo_is_reconciled_without_duplicate_rows() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"[root@luckfox tmp]# "));
+
+        let command =
+            b"printf 'abcdefghijklmnopqrstuvwxyz-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ'\r";
+        let mut tx = event_at(2, command);
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        tx.actor = Some(Actor {
+            id: "agent-1".into(),
+            label: "debugger".into(),
+            kind: ActorKind::Agent,
+        });
+        let projected = parser.push_event(&tx);
+        assert!(projected.completed.is_empty());
+
+        // Real target PTY capture: once its configured display column is
+        // crossed, the line discipline injects CR CR LF into the echo. Split
+        // it across RX events to cover arbitrary serial read boundaries.
+        let split = 42;
+        let first = parser.push_event(&event_at(3, &command[..split]));
+        assert!(first.completed.is_empty());
+        let second = parser.push_event(&event_at(4, b"\r"));
+        assert!(second.completed.is_empty());
+        let third = parser.push_event(&event_at(5, b"\r"));
+        assert!(third.completed.is_empty());
+
+        let mut tail = Vec::from(&b"\n"[..]);
+        tail.extend_from_slice(&command[split..]);
+        tail.push(b'\n');
+        let echoed = parser.push_event(&event_at(6, &tail));
+
+        assert_eq!(echoed.completed.len(), 1);
+        assert_eq!(
+            echoed.completed[0].text,
+            "[root@luckfox tmp]# printf 'abcdefghijklmnopqrstuvwxyz-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ'"
+        );
+        assert_eq!(echoed.completed[0].source, "AGENT[agent-1]:debugger>");
+        assert!(echoed.completed[0].echoed);
+        assert!(echoed.pending.is_none());
+    }
+
+    #[test]
+    fn hard_wrap_candidate_mismatch_replays_every_rx_byte() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"# "));
+
+        let mut tx = event_at(2, b"abcdefghij\r");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        parser.push_event(&tx);
+
+        let response = parser.push_event(&event_at(3, b"abcde\r\r\nXYZ\r\n"));
+        assert_eq!(
+            response
+                .completed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["# abcdefghij", "abcde", "XYZ"]
+        );
+        assert!(response.pending.is_none());
+    }
+
+    #[test]
+    fn serial_boundary_keeps_partial_rx_echo_separate_from_projected_tx() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"shell# "));
+
+        let mut tx = event_at(2, b"long-command-with-arguments\r");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        tx.actor = Some(Actor {
+            id: "agent-1".into(),
+            label: "debugger".into(),
+            kind: ActorKind::Agent,
+        });
+        parser.push_event(&tx);
+        parser.push_event(&event_at(3, b"long-command"));
+
+        let mut closed = event_at(4, &[]);
+        closed.direction = Direction::None;
+        closed.kind = EventKind::SerialClosed;
+        let boundary = parser.push_event(&closed);
+
+        assert_eq!(boundary.completed.len(), 3);
+        assert_eq!(
+            boundary.completed[0].text,
+            "shell# long-command-with-arguments"
+        );
+        assert_eq!(boundary.completed[0].source, "AGENT[agent-1]:debugger>");
+        assert_eq!(boundary.completed[1].text, "long-command");
+        assert_eq!(boundary.completed[1].source, "DEV");
+        assert_eq!(boundary.completed[2].source, "SYSTEM");
+        assert!(boundary.pending.is_none());
+
+        let mut reopened = event_at(5, &[]);
+        reopened.direction = Direction::None;
+        reopened.kind = EventKind::SerialOpened;
+        let reopened = parser.push_event(&reopened);
+        assert_eq!(reopened.completed.len(), 1);
+        assert_eq!(reopened.completed[0].source, "SYSTEM");
+        assert!(reopened.pending.is_none());
+
+        let after = parser.push_event(&event_at(6, b"fresh boot\r\n"));
+        assert_eq!(after.completed.len(), 1);
+        assert_eq!(after.completed[0].text, "fresh boot");
+        assert_eq!(after.completed[0].source, "DEV");
+    }
+
+    #[test]
+    fn raw_character_echoes_extend_the_prompt_without_duplicate_rows() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"[root@luckfox ~]# "));
+
+        for (seq, byte) in [(2, b'c'), (4, b'd')] {
+            let mut tx = event_at(seq, &[byte]);
+            tx.direction = Direction::Tx;
+            tx.kind = EventKind::Tx;
+            tx.actor = Some(Actor {
+                id: "human-1".into(),
+                label: "operator".into(),
+                kind: ActorKind::Human,
+            });
+            let projected = parser.push_event(&tx);
+            assert!(projected.completed.is_empty());
+            let echoed = parser.push_event(&event_at(seq + 1, &[byte]));
+            assert!(echoed.completed.is_empty());
+        }
+
+        assert_eq!(
+            parser
+                .pending_line()
+                .as_ref()
+                .map(|line| line.text.as_str()),
+            Some("[root@luckfox ~]# cd")
+        );
+
+        let mut enter = event_at(6, b"\r");
+        enter.direction = Direction::Tx;
+        enter.kind = EventKind::Tx;
+        parser.push_event(&enter);
+        let completed = parser.push_event(&event_at(7, b"\r\n"));
+        assert_eq!(completed.completed.len(), 1);
+        assert_eq!(completed.completed[0].text, "[root@luckfox ~]# cd");
+        assert!(completed.pending.is_none());
+    }
+
+    #[test]
+    fn raw_tx_events_can_all_precede_one_batched_rx_echo() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"[root@luckfox ~]# "));
+
+        for (offset, byte) in b"pwd\r".iter().copied().enumerate() {
+            let mut tx = event_at(2 + offset as u64, &[byte]);
+            tx.direction = Direction::Tx;
+            tx.kind = EventKind::Tx;
+            tx.actor = Some(Actor {
+                id: "human-1".into(),
+                label: "operator".into(),
+                kind: ActorKind::Human,
+            });
+            parser.push_event(&tx);
+        }
+
+        assert_eq!(
+            parser
+                .pending_line()
+                .as_ref()
+                .map(|line| line.text.as_str()),
+            Some("[root@luckfox ~]# pwd")
+        );
+
+        let received = parser.push_event(&event_at(6, b"pwd\r\n/oem\r\n[root@luckfox ~]# "));
+        assert_eq!(
+            received
+                .completed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["[root@luckfox ~]# pwd", "/oem"]
+        );
+        assert!(received.completed[0].echoed);
+        assert_eq!(
+            received.pending.as_ref().map(|line| line.text.as_str()),
+            Some("[root@luckfox ~]# ")
+        );
+    }
+
+    #[test]
+    fn echo_off_commits_the_visible_command_before_direct_device_text() {
+        let mut parser = TerminalStreamParser::new();
+        parser.push_event(&event_at(1, b"[root@luckfox tmp]# "));
+
+        let mut tx = event_at(2, b"cd\r");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        parser.push_event(&tx);
+
+        let response = parser.push_event(&event_at(3, b"/tmp\r\n"));
+        assert_eq!(
+            response
+                .completed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["[root@luckfox tmp]# cd", "/tmp"]
+        );
+        assert!(response.pending.is_none());
+    }
+
+    #[test]
+    fn echo_mismatch_replays_the_complete_candidate_prefix() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"[root@luckfox tmp]# "));
+
+        let mut tx = event_at(2, b"ready\r");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        parser.push_event(&tx);
+
+        // "re" first matches the expected echo prefix, then "s" proves this
+        // is real device output. The speculative prefix must be replayed.
+        let response = parser.push_event(&event_at(3, b"result\r\n"));
+        assert_eq!(
+            response
+                .completed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["[root@luckfox tmp]# ready", "result"]
+        );
+    }
+
+    #[test]
+    fn raw_no_echo_never_consumes_matching_bytes_from_later_boot_output() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+
+        let mut tx = event_at(1, b"c");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        parser.push_event(&tx);
+
+        let boot = b"Boot countdown c continues\r\n";
+        let received = parser.push_event(&event_at(2, boot));
+        let mut rendered = received
+            .completed
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(pending) = received.pending.as_ref() {
+            rendered.push_str(&pending.text);
+        }
+
+        assert_eq!(
+            rendered, "cBoot countdown c continues",
+            "the local TX projection may remain, but every RX byte must be visible"
+        );
+    }
+
+    #[test]
+    fn logging_degradation_does_not_break_pending_echo_reconciliation() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"SigmaStar # "));
+
+        let mut tx = event_at(2, b"reboot\r");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        parser.push_event(&tx);
+
+        let mut degraded = event_at(3, &[]);
+        degraded.direction = Direction::None;
+        degraded.kind = EventKind::LoggingDegraded;
+        let unchanged = parser.push_event(&degraded);
+        assert!(unchanged.completed.is_empty());
+        assert_eq!(
+            unchanged.pending.as_ref().map(|line| line.text.as_str()),
+            Some("SigmaStar # reboot")
+        );
+
+        let echoed = parser.push_event(&event_at(4, b"reboot\r\n"));
+        assert_eq!(echoed.completed.len(), 1);
+        assert_eq!(echoed.completed[0].text, "SigmaStar # reboot");
+        assert!(echoed.completed[0].echoed);
+    }
+
+    #[test]
+    fn crlf_tx_and_exact_echo_commit_only_one_row() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"shell# "));
+
+        let mut tx = event_at(2, b"version\r\n");
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        let projected = parser.push_event(&tx);
+        assert_eq!(projected.completed.len(), 1);
+        assert_eq!(projected.completed[0].text, "shell# version");
+
+        let echoed = parser.push_event(&event_at(3, b"version\r\n"));
+        assert!(echoed.completed.is_empty());
+        assert!(echoed.pending.is_none());
+    }
+
+    #[test]
+    fn crlf_echo_split_across_tx_events_does_not_consume_a_later_device_newline() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"shell# "));
+
+        let mut command = event_at(2, b"a\r");
+        command.direction = Direction::Tx;
+        command.kind = EventKind::Tx;
+        parser.push_event(&command);
+
+        let mut split_lf = event_at(3, b"\n");
+        split_lf.direction = Direction::Tx;
+        split_lf.kind = EventKind::Tx;
+        let projected = parser.push_event(&split_lf);
+        assert_eq!(projected.completed[0].text, "shell# a");
+
+        let echoed = parser.push_event(&event_at(4, b"a\r\n"));
+        assert!(echoed.completed.is_empty());
+        assert!(echoed.pending.is_none());
+
+        let output = parser.push_event(&event_at(5, b"ok\r\n"));
+        assert_eq!(output.completed.len(), 1);
+        assert_eq!(output.completed[0].text, "ok");
+        assert!(output.pending.is_none());
+    }
+
+    #[test]
+    fn raw_del_and_linux_erase_echo_apply_backspace_only_once() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"ab"));
+
+        let mut tx = event_at(2, &[0x7f]);
+        tx.direction = Direction::Tx;
+        tx.kind = EventKind::Tx;
+        let projected = parser.push_event(&tx);
+        assert_eq!(
+            projected.pending.as_ref().map(|line| line.text.as_str()),
+            Some("a ")
+        );
+
+        let echoed = parser.push_event(&event_at(3, ERASE_ECHO));
+        assert!(echoed.completed.is_empty());
+        assert_eq!(
+            echoed.pending.as_ref().map(|line| line.text.as_str()),
+            Some("a ")
+        );
+    }
+
+    #[test]
+    fn raw_del_with_single_bs_echo_does_not_block_later_character_echoes() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"abc"));
+
+        let mut delete = event_at(2, &[0x7f]);
+        delete.direction = Direction::Tx;
+        delete.kind = EventKind::Tx;
+        parser.push_event(&delete);
+        parser.push_event(&event_at(3, b"\x08"));
+
+        for (seq, byte) in [(4, b'd'), (6, b'e')] {
+            let mut tx = event_at(seq, &[byte]);
+            tx.direction = Direction::Tx;
+            tx.kind = EventKind::Tx;
+            parser.push_event(&tx);
+            parser.push_event(&event_at(seq + 1, &[byte]));
+        }
+
+        assert_eq!(
+            parser
+                .pending_line()
+                .as_ref()
+                .map(|line| line.text.as_str()),
+            Some("abde")
+        );
+    }
+
+    #[test]
+    fn intervening_output_abandons_delayed_echo_search_without_data_loss() {
+        let mut parser = TerminalStreamParser::new();
+        parser.set_echo_reconciliation(true);
+        parser.push_event(&event_at(1, b"# "));
+
+        let mut first = event_at(2, b"one\r");
+        first.direction = Direction::Tx;
+        first.kind = EventKind::Tx;
+        parser.push_event(&first);
+
+        let mut second = event_at(3, b"two\r");
+        second.direction = Direction::Tx;
+        second.kind = EventKind::Tx;
+        let projected = parser.push_event(&second);
+        assert_eq!(projected.completed[0].text, "# one");
+        assert_eq!(
+            projected.pending.as_ref().map(|line| line.text.as_str()),
+            Some("two")
+        );
+
+        let first_echo = parser.push_event(&event_at(4, b"one\r\n"));
+        assert!(first_echo.completed.is_empty());
+        let output = parser.push_event(&event_at(5, b"result\r\n"));
+        assert_eq!(
+            output
+                .completed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["two", "result"]
+        );
+
+        let second_echo = parser.push_event(&event_at(6, b"two\r\n"));
+        assert_eq!(second_echo.completed.len(), 1);
+        assert_eq!(second_echo.completed[0].text, "two");
+        assert_eq!(second_echo.completed[0].source, "DEV");
+        assert!(second_echo.pending.is_none());
     }
 
     #[test]

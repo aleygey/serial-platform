@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use crossterm::{
+    cursor::Show,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -24,11 +25,11 @@ use ratatui::{
 };
 use serial_protocol::{
     Actor, ClientMessage, CommandResult, ControlLease, ControlMode, EchoMode, EventKind,
-    LoggingState, RunInfo, ServerMessage, SessionState, SlotSnapshot, TargetActivity,
-    TimelineEvent, WireFrame,
+    LoggingState, ResolvedDeviceSettings, RunInfo, ServerMessage, SessionState, SlotSnapshot,
+    TargetActivity, TimelineEvent, TriggerInfo, TriggerStatus, WireFrame,
 };
 use tokio::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use crate::{
@@ -36,6 +37,7 @@ use crate::{
     config::LoadedConfig,
     display::{
         DisplayLine, TerminalStreamParser, gap_line, highlight_spans, pad_display, safe_inline,
+        trigger_status_label,
     },
     i18n::{self, tr, trf},
     ws::{self, NetworkCommand, NetworkEvent},
@@ -51,10 +53,6 @@ const MAX_WRITE_BYTES: usize = 4 * 1024;
 const CONTROL_TTL_MS: u64 = 30_000;
 const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
-/// A device command echo is merged into its TX row only when it arrives
-/// within this many rows after the TX row, or within this much time.
-const ECHO_MERGE_WINDOW_ROWS: u64 = 5;
-const ECHO_MERGE_WINDOW: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -62,10 +60,45 @@ enum InputMode {
     Raw,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingWriteKind {
+    Line,
+    Raw,
+}
+
+#[derive(Debug, Clone)]
 struct PendingWrite {
     data: Vec<u8>,
     operation_id: Option<Uuid>,
+    kind: PendingWriteKind,
+}
+
+fn append_pending_write(
+    queue: &mut VecDeque<PendingWrite>,
+    data: &[u8],
+    operation_id: Option<Uuid>,
+    kind: PendingWriteKind,
+) {
+    let mut remaining = data;
+    if kind == PendingWriteKind::Raw
+        && let Some(last) = queue.back_mut()
+        && last.kind == PendingWriteKind::Raw
+        && last.operation_id == operation_id
+        && last.data.len() < MAX_WRITE_BYTES
+    {
+        let append = remaining
+            .len()
+            .min(MAX_WRITE_BYTES.saturating_sub(last.data.len()));
+        last.data.extend_from_slice(&remaining[..append]);
+        remaining = &remaining[append..];
+    }
+    for chunk in remaining.chunks(MAX_WRITE_BYTES) {
+        queue.push_back(PendingWrite {
+            data: chunk.to_vec(),
+            operation_id,
+            kind,
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -121,24 +154,125 @@ impl SubscriptionPhase {
     }
 }
 
+#[derive(Debug)]
+struct TriggerLiveProjection {
+    trigger_id: Uuid,
+    initial_pending: bool,
+    /// `None` means a reconnect snapshot could not reveal whether a start
+    /// literal was consumed while the one-time initial write was in flight.
+    start_seen: Option<bool>,
+    start_matcher: Option<LiteralProjectionMatcher>,
+    stop_matcher: LiteralProjectionMatcher,
+    /// Only live TriggerStarted events establish a trustworthy local timeout
+    /// origin. A reconnect snapshot intentionally leaves this unset.
+    deadline: Option<Instant>,
+    status_known: bool,
+}
+
+impl TriggerLiveProjection {
+    fn new(trigger: &TriggerInfo, live_start: bool) -> Self {
+        let initial_pending =
+            trigger.status == TriggerStatus::Armed && trigger.spec.initial_write.is_some();
+        let start_seen = match trigger.status {
+            TriggerStatus::WaitingForStart => Some(false),
+            TriggerStatus::Running => Some(true),
+            TriggerStatus::Armed => {
+                if trigger.spec.start_contains.is_none() {
+                    Some(true)
+                } else if live_start {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            TriggerStatus::Stopping => None,
+            status if status.is_terminal() => None,
+            _ => None,
+        };
+        let start_matcher = trigger
+            .spec
+            .start_contains
+            .as_ref()
+            .filter(|_| start_seen != Some(true))
+            .map(|pattern| LiteralProjectionMatcher::new(std::slice::from_ref(pattern)));
+        Self {
+            trigger_id: trigger.id,
+            initial_pending,
+            start_seen,
+            start_matcher,
+            stop_matcher: LiteralProjectionMatcher::new(&trigger.spec.stop_contains),
+            deadline: live_start
+                .then(|| Instant::now() + Duration::from_millis(trigger.spec.timeout_ms)),
+            status_known: true,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LiteralProjectionMatcher {
+    patterns: Vec<Vec<u8>>,
+    tail: Vec<u8>,
+    tail_limit: usize,
+}
+
+impl LiteralProjectionMatcher {
+    fn new(patterns: &[Vec<u8>]) -> Self {
+        Self {
+            patterns: patterns.to_vec(),
+            tail: Vec::new(),
+            tail_limit: patterns
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1),
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let mut window = Vec::with_capacity(self.tail.len().saturating_add(data.len()));
+        window.extend_from_slice(&self.tail);
+        window.extend_from_slice(data);
+        let matched = self.patterns.iter().any(|pattern| {
+            !pattern.is_empty()
+                && window
+                    .windows(pattern.len())
+                    .any(|candidate| candidate == pattern)
+        });
+        let keep = self.tail_limit.min(window.len());
+        self.tail.clear();
+        self.tail
+            .extend_from_slice(&window[window.len().saturating_sub(keep)..]);
+        matched
+    }
+}
+
 struct SlotView {
     snapshot: SlotSnapshot,
+    /// Live-only projection of Trigger transitions that are not published as
+    /// replacement snapshots on an attached WebSocket. The durable lifecycle
+    /// events remain authoritative; this state only keeps the footer honest
+    /// between TriggerStarted and the terminal event.
+    trigger_projection: Option<TriggerLiveProjection>,
     subscription: SubscriptionPhase,
     lines: VecDeque<DisplayLine>,
     pending_line: Option<DisplayLine>,
     stream: TerminalStreamParser,
     buffered_bytes: usize,
+    /// The bounded in-memory presentation has evicted at least one retained
+    /// row. The durable journal remains authoritative; this bit keeps a
+    /// synthetic warning visible at the oldest local boundary.
+    local_history_truncated: bool,
     scroll_from_bottom: usize,
     unseen: usize,
     last_epoch: Option<Uuid>,
     last_seq: u64,
-    /// Total rows ever appended to `lines` (monotonic; indexes survive
-    /// front-eviction so the echo tracker can reference a row absolutely).
-    push_count: u64,
-    /// Most recent TX command row still waiting for its device echo.
-    echo_pending: Option<EchoTracker>,
-    /// Merge exact device command echoes into their TX rows (config
-    /// `merge_echo`, default true; only applies to echo=on Slots).
+    /// Reconcile confirmed TX bytes with an exact subsequent RX echo while
+    /// building the terminal projection. The durable RX/TX audit events stay
+    /// separate, and this applies equally to LINE and RAW input.
     merge_echo: bool,
     draft: Vec<char>,
     draft_cursor: usize,
@@ -148,15 +282,6 @@ struct SlotView {
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
-}
-
-/// Tracks the most recently appended TX row so an exactly matching device
-/// echo row can be merged into it (echo=on Slots only).
-#[derive(Debug, Clone, Copy)]
-struct EchoTracker {
-    /// Absolute push index of the TX row (`SlotView::push_count` at push).
-    abs_index: u64,
-    at: Instant,
 }
 
 /// Ctrl-R incremental history search state (LINE mode).
@@ -178,19 +303,19 @@ struct Completion {
 
 impl SlotView {
     fn new(snapshot: SlotSnapshot) -> Self {
-        Self {
+        let mut view = Self {
             last_epoch: Some(snapshot.daemon_epoch),
             last_seq: 0,
             snapshot,
+            trigger_projection: None,
             subscription: SubscriptionPhase::Disconnected,
             lines: VecDeque::new(),
             pending_line: None,
             stream: TerminalStreamParser::new(),
             buffered_bytes: 0,
+            local_history_truncated: false,
             scroll_from_bottom: 0,
             unseen: 0,
-            push_count: 0,
-            echo_pending: None,
             merge_echo: true,
             draft: Vec::new(),
             draft_cursor: 0,
@@ -200,26 +325,181 @@ impl SlotView {
             history_search: None,
             completion: None,
             last_manual_activity: None,
+        };
+        view.sync_trigger_projection(false);
+        view
+    }
+
+    fn sync_trigger_projection(&mut self, live_start: bool) {
+        self.trigger_projection = self
+            .snapshot
+            .active_trigger
+            .as_ref()
+            .map(|trigger| TriggerLiveProjection::new(trigger, live_start));
+    }
+
+    fn clear_trigger_projection(&mut self) {
+        self.trigger_projection = None;
+    }
+
+    fn observe_trigger_rx(&mut self, data: &[u8]) {
+        let (Some(trigger), Some(projection)) = (
+            self.snapshot.active_trigger.as_mut(),
+            self.trigger_projection.as_mut(),
+        ) else {
+            return;
+        };
+        if trigger.id != projection.trigger_id {
+            self.sync_trigger_projection(false);
+            return;
+        }
+
+        // seriald gives stop literals priority when the same RX chunk can
+        // satisfy both start and stop. Mirror that exact ordering locally.
+        if projection.stop_matcher.push(data) {
+            trigger.status = TriggerStatus::Stopping;
+            projection.status_known = true;
+            return;
+        }
+        if projection
+            .start_matcher
+            .as_mut()
+            .is_some_and(|matcher| matcher.push(data))
+        {
+            projection.start_seen = Some(true);
+            projection.start_matcher = None;
+            if !projection.initial_pending {
+                trigger.status = TriggerStatus::Running;
+                projection.status_known = true;
+            }
+        }
+    }
+
+    fn observe_trigger_tx(&mut self, event: &TimelineEvent) {
+        let (Some(trigger), Some(projection)) = (
+            self.snapshot.active_trigger.as_mut(),
+            self.trigger_projection.as_mut(),
+        ) else {
+            return;
+        };
+        let trigger_id = event
+            .metadata
+            .get("trigger_id")
+            .and_then(|value| serde_json::from_value::<Uuid>(value.clone()).ok());
+        if trigger_id != Some(trigger.id) || projection.trigger_id != trigger.id {
+            return;
+        }
+
+        trigger.last_write_seq = Some(event.seq);
+        trigger.tx_bytes_confirmed = trigger
+            .tx_bytes_confirmed
+            .saturating_add(event.data.len() as u64);
+        let full_write = !event
+            .metadata
+            .get("partial")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !full_write {
+            trigger.status = TriggerStatus::Stopping;
+            projection.status_known = true;
+            return;
+        }
+        let was_stopping = trigger.status == TriggerStatus::Stopping;
+
+        match event
+            .metadata
+            .get("trigger_write_kind")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("initial") => {
+                projection.initial_pending = false;
+                if was_stopping {
+                    return;
+                }
+                match projection.start_seen {
+                    Some(true) => {
+                        trigger.status = TriggerStatus::Running;
+                        projection.status_known = true;
+                    }
+                    Some(false) => {
+                        trigger.status = TriggerStatus::WaitingForStart;
+                        projection.status_known = true;
+                    }
+                    None => {
+                        // A reconnect snapshot can observe Armed after the
+                        // start literal was already consumed but before the
+                        // initial TX completes. Do not invent WaitingForStart
+                        // in that ambiguous window.
+                        projection.status_known = false;
+                    }
+                }
+            }
+            Some("action") => {
+                projection.status_known = true;
+                if let Some(fire_index) = event
+                    .metadata
+                    .get("fire_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                {
+                    trigger.fires_confirmed = trigger.fires_confirmed.max(fire_index);
+                    trigger.status = if was_stopping || fire_index >= trigger.spec.max_fires {
+                        TriggerStatus::Stopping
+                    } else {
+                        TriggerStatus::Running
+                    };
+                } else if !was_stopping {
+                    trigger.status = TriggerStatus::Running;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_trigger_stopping(&mut self) {
+        if let Some(trigger) = self.snapshot.active_trigger.as_mut() {
+            trigger.status = TriggerStatus::Stopping;
+        }
+        if let Some(projection) = self.trigger_projection.as_mut() {
+            projection.status_known = true;
+        }
+    }
+
+    fn update_trigger_deadline(&mut self, now: Instant) -> bool {
+        let Some(projection) = self.trigger_projection.as_mut() else {
+            return false;
+        };
+        if projection.deadline.is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        projection.deadline = None;
+        let Some(trigger) = self.snapshot.active_trigger.as_mut() else {
+            return false;
+        };
+        if trigger.status == TriggerStatus::Stopping {
+            return false;
+        }
+        trigger.status = TriggerStatus::Stopping;
+        projection.status_known = true;
+        true
+    }
+
+    fn trigger_status_text(&self) -> Option<&'static str> {
+        let trigger = self.snapshot.active_trigger.as_ref()?;
+        if self
+            .trigger_projection
+            .as_ref()
+            .is_some_and(|projection| !projection.status_known)
+        {
+            Some("active")
+        } else {
+            Some(trigger_status_label(trigger.status))
         }
     }
 
     fn push_line(&mut self, line: DisplayLine, selected: bool) {
-        if self.try_merge_echo(&line) {
-            // Exact device echo of the tracked TX row: mark the TX row and
-            // drop the duplicate RX row instead of appending it.
-            return;
-        }
-        let is_tx = line.direction == serial_protocol::Direction::Tx;
         self.buffered_bytes += line.bytes;
         self.lines.push_back(line);
-        let abs_index = self.push_count;
-        self.push_count += 1;
-        if is_tx {
-            self.echo_pending = Some(EchoTracker {
-                abs_index,
-                at: Instant::now(),
-            });
-        }
         let mut evicted = 0usize;
         while self.lines.len() > MAX_LINES_PER_SLOT || self.buffered_bytes > MAX_BYTES_PER_SLOT {
             let Some(removed) = self.lines.pop_front() else {
@@ -228,53 +508,21 @@ impl SlotView {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(removed.bytes);
             evicted += 1;
         }
+        let first_truncation = evicted > 0 && !self.local_history_truncated;
+        self.local_history_truncated |= evicted > 0;
         if self.scroll_from_bottom > 0 {
             // Paused viewport: keep the same rows in view by pushing the
             // bottom-offset up with each appended row, and pulling it back
-            // down for rows evicted from the front. When no eviction happens
-            // this keeps `total - scroll_from_bottom` (the anchor index)
-            // constant; when rows are evicted the anchor slides towards the
-            // oldest remaining rows instead of jumping or panicking.
-            self.scroll_from_bottom = (self.scroll_from_bottom + 1).saturating_sub(evicted);
+            // down for rows evicted from the front. The first eviction also
+            // creates one synthetic truncation row at the front, so include
+            // that row in the offset to keep the same retained row anchored.
+            self.scroll_from_bottom = (self.scroll_from_bottom + 1)
+                .saturating_sub(evicted)
+                .saturating_add(usize::from(first_truncation));
             self.unseen = self.unseen.saturating_add(1);
         } else if !selected {
             self.unseen = self.unseen.saturating_add(1);
         }
-    }
-
-    /// Returns true when `line` is the exact device echo of the most recent TX
-    /// command row and was merged into it. Only applies to echo=on Slots with
-    /// `merge_echo` enabled, outside RAW mode, within a small row/time window
-    /// after the TX row. Anything else is appended untouched.
-    fn try_merge_echo(&mut self, line: &DisplayLine) -> bool {
-        if !self.merge_echo
-            || self.snapshot.config.settings.echo != EchoMode::On
-            || self.mode == InputMode::Raw
-            || line.direction != serial_protocol::Direction::Rx
-        {
-            return false;
-        }
-        let Some(tracker) = self.echo_pending else {
-            return false;
-        };
-        let first_abs = self.push_count - self.lines.len() as u64;
-        if tracker.abs_index < first_abs {
-            // The TX row fell out of the bounded buffer; nothing to mark.
-            self.echo_pending = None;
-            return false;
-        }
-        let rows_since_tx = self.push_count - 1 - tracker.abs_index;
-        if rows_since_tx > ECHO_MERGE_WINDOW_ROWS && tracker.at.elapsed() > ECHO_MERGE_WINDOW {
-            return false;
-        }
-        let index = (tracker.abs_index - first_abs) as usize;
-        let tx = &self.lines[index];
-        if tx.echoed || echo_normalized(&tx.text) != echo_normalized(&line.text) {
-            return false;
-        }
-        self.lines[index].echoed = true;
-        self.echo_pending = None;
-        true
     }
 
     fn push_event(&mut self, event: TimelineEvent, selected: bool) {
@@ -287,9 +535,14 @@ impl SlotView {
         }
         self.last_epoch = Some(event.daemon_epoch);
         self.last_seq = event.seq;
+        // `Auto` is deliberately lossless: until the platform has an
+        // authoritative echo probe it behaves like local projection without
+        // suppression. Only an explicit `On` may discard an exact RX echo.
+        let reconcile_echo = self.merge_echo && self.effective_echo() == EchoMode::On;
+        self.stream.set_echo_reconciliation(reconcile_echo);
         let had_pending = self.pending_line.is_some();
         let batch = self.stream.push_event(&event);
-        let completed_pending = had_pending && !batch.completed.is_empty();
+        let completed_pending = batch.pending_committed;
         for line in batch.completed {
             self.push_line(line, selected);
         }
@@ -313,12 +566,63 @@ impl SlotView {
     fn reset_stream(&mut self) {
         self.stream.reset();
         self.pending_line = None;
-        self.echo_pending = None;
     }
 
     fn follow(&mut self) {
         self.scroll_from_bottom = 0;
         self.unseen = 0;
+    }
+
+    fn logical_line_count(&self) -> usize {
+        self.lines.len()
+            + usize::from(self.pending_line.is_some())
+            + usize::from(self.local_history_truncated)
+    }
+
+    fn local_truncation_line(&self) -> Option<DisplayLine> {
+        self.local_history_truncated.then(|| {
+            let seq = self
+                .lines
+                .front()
+                .map_or(self.last_seq, |line| line.seq.saturating_sub(1));
+            gap_line(seq, local_history_truncated_message())
+        })
+    }
+
+    fn effective_echo(&self) -> EchoMode {
+        self.snapshot
+            .effective_echo
+            .unwrap_or(self.snapshot.config.settings.echo)
+    }
+
+    fn effective_write_eol(&self) -> &str {
+        self.snapshot
+            .effective_write_eol
+            .as_deref()
+            .unwrap_or(&self.snapshot.config.settings.write_eol)
+    }
+
+    fn has_effective_device_settings(&self) -> bool {
+        self.snapshot.effective_shell_prompt.is_some()
+            || self.snapshot.effective_uboot_prompt.is_some()
+            || self.snapshot.effective_write_eol.is_some()
+            || self.snapshot.effective_echo.is_some()
+    }
+
+    fn effective_shell_prompt(&self) -> Option<&str> {
+        if self.has_effective_device_settings() {
+            self.snapshot.effective_shell_prompt.as_deref()
+        } else {
+            self.snapshot.config.settings.shell_prompt.as_deref()
+        }
+    }
+
+    fn effective_uboot_prompt(&self) -> Option<&str> {
+        if self.has_effective_device_settings() {
+            self.snapshot.effective_uboot_prompt.as_deref()
+        } else {
+            self.snapshot.config.settings.uboot_prompt.as_deref()
+        }
     }
 }
 
@@ -334,16 +638,14 @@ struct QueuedControl {
     since: Instant,
 }
 
-/// Normalizes a completed stream row for command-echo comparison: drop
-/// carriage returns and trailing whitespace so "root\r" matches "root".
-fn echo_normalized(text: &str) -> &str {
-    text.trim_end_matches(|c: char| c == '\r' || c.is_whitespace())
-}
-
 struct App {
     slots: Vec<SlotView>,
     selected: usize,
     prefix_pending: bool,
+    /// The prefix key was pressed while dismissing the help overlay. The
+    /// following `?` belongs to that same shortcut and must not enter the LINE
+    /// draft or reopen help.
+    help_dismiss_prefix: bool,
     help: bool,
     detailed_timeline: bool,
     transport_connected: bool,
@@ -357,6 +659,7 @@ struct App {
     queued_controls: HashMap<String, QueuedControl>,
     uncertain_write_outcomes: usize,
     human_idle_release: Duration,
+    mouse_capture: bool,
     config: Option<LoadedConfig>,
     should_quit: bool,
     dirty: bool,
@@ -377,6 +680,7 @@ impl App {
             slots,
             selected,
             prefix_pending: false,
+            help_dismiss_prefix: false,
             help: false,
             detailed_timeline: false,
             transport_connected: false,
@@ -390,6 +694,7 @@ impl App {
             queued_controls: HashMap::new(),
             uncertain_write_outcomes: 0,
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
+            mouse_capture: false,
             config: None,
             should_quit: false,
             dirty: true,
@@ -530,6 +835,7 @@ impl App {
                         self.slots[index].reset_stream();
                     }
                     self.slots[index].snapshot = *slot;
+                    self.slots[index].sync_trigger_projection(false);
                     self.slots[index].subscription = SubscriptionPhase::Attaching;
                     if epoch_changed {
                         let selected = self.selected == index;
@@ -693,6 +999,18 @@ impl App {
                     self.flush_pending_writes(&slot_id, commands);
                 }
             }
+            CommandResult::TriggerStarted { trigger }
+            | CommandResult::TriggerStatus { trigger }
+            | CommandResult::TriggerCancelled { trigger } => {
+                self.status = trf(
+                    "st.trigger.result",
+                    &[
+                        &trigger.id.to_string(),
+                        trigger_status_label(trigger.status),
+                        &trigger.fires_confirmed.to_string(),
+                    ],
+                );
+            }
             CommandResult::HelloAccepted { actor, role } => {
                 self.actor = Some(actor);
                 self.authenticated = true;
@@ -732,13 +1050,30 @@ impl App {
             }
 
             let generation_changed = self.slots[index].snapshot.generation != event.generation;
+            let declared_profile_only = event
+                .metadata
+                .get("profile_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let unchanged_config = event
+                .metadata
+                .get("current")
+                .and_then(|value| {
+                    serde_json::from_value::<serial_protocol::SlotConfig>(value.clone()).ok()
+                })
+                .is_some_and(|current| current == self.slots[index].snapshot.config);
+            let profile_only = event.kind == EventKind::SlotReconfigured
+                && declared_profile_only
+                && unchanged_config;
+            let physical_reconfiguration =
+                event.kind == EventKind::SlotReconfigured && !profile_only;
             if generation_changed
-                || matches!(
-                    event.kind,
-                    EventKind::SerialClosed | EventKind::SlotReconfigured | EventKind::SlotRemoved
-                )
+                || matches!(event.kind, EventKind::SerialClosed | EventKind::SlotRemoved)
+                || physical_reconfiguration
             {
                 self.invalidate_slot_pending(&slot_id, tr("st.session.changed.discarded"));
+                self.slots[index].snapshot.active_trigger = None;
+                self.slots[index].clear_trigger_projection();
             }
             self.apply_event_projection(index, &event);
             self.slots[index].push_event(event, selected);
@@ -753,14 +1088,10 @@ impl App {
     }
 
     fn apply_event_projection(&mut self, index: usize, event: &TimelineEvent) {
-        let snapshot = &mut self.slots[index].snapshot;
+        let slot = &mut self.slots[index];
+        let snapshot = &mut slot.snapshot;
         snapshot.head_seq = snapshot.head_seq.max(event.seq);
         snapshot.generation = event.generation;
-        snapshot.logging = if event.durable {
-            snapshot.logging
-        } else {
-            LoggingState::Degraded
-        };
         if let Some(end) = event.stream_offset_end {
             match event.direction {
                 serial_protocol::Direction::Rx => snapshot.rx_offset = end,
@@ -772,6 +1103,7 @@ impl App {
             EventKind::Rx => {
                 snapshot.target_activity = TargetActivity::Active;
                 snapshot.last_rx_wall_time_ns = Some(event.wall_time_ns);
+                slot.observe_trigger_rx(&event.data);
             }
             EventKind::SerialOpening => snapshot.session_state = SessionState::Opening,
             EventKind::SerialOpened => {
@@ -800,7 +1132,8 @@ impl App {
                 }
             }
             EventKind::ControlReleased | EventKind::ControlRevoked | EventKind::ControlExpired => {
-                snapshot.control = None
+                snapshot.control = None;
+                slot.mark_trigger_stopping();
             }
             EventKind::RunStarted => {
                 snapshot.active_run = event
@@ -808,10 +1141,27 @@ impl App {
                     .get("run")
                     .and_then(|value| serde_json::from_value::<RunInfo>(value.clone()).ok());
             }
-            EventKind::RunEnded | EventKind::RunAborted => snapshot.active_run = None,
-            EventKind::LoggingDegraded | EventKind::Gap => {
+            EventKind::RunEnded | EventKind::RunAborted => {
+                snapshot.active_run = None;
+                slot.mark_trigger_stopping();
+            }
+            EventKind::TriggerStarted => {
+                snapshot.active_trigger = event
+                    .metadata
+                    .get("trigger")
+                    .and_then(|value| serde_json::from_value::<TriggerInfo>(value.clone()).ok());
+                slot.sync_trigger_projection(true);
+            }
+            EventKind::TriggerCompleted
+            | EventKind::TriggerCancelled
+            | EventKind::TriggerFailed => {
+                snapshot.active_trigger = None;
+                slot.clear_trigger_projection();
+            }
+            EventKind::LoggingDegraded => {
                 snapshot.logging = LoggingState::Degraded;
             }
+            EventKind::Gap => slot.mark_trigger_stopping(),
             EventKind::SlotReconfigured => {
                 if let Some(config) = event
                     .metadata
@@ -819,6 +1169,14 @@ impl App {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
                 {
                     snapshot.config = config;
+                }
+                if let Some(effective) = event.metadata.get("effective").and_then(|value| {
+                    serde_json::from_value::<ResolvedDeviceSettings>(value.clone()).ok()
+                }) {
+                    snapshot.effective_shell_prompt = effective.shell_prompt;
+                    snapshot.effective_uboot_prompt = effective.uboot_prompt;
+                    snapshot.effective_write_eol = Some(effective.write_eol);
+                    snapshot.effective_echo = Some(effective.echo);
                 }
             }
             EventKind::SlotRemoved => {
@@ -828,8 +1186,11 @@ impl App {
                 snapshot.target_activity = TargetActivity::Unknown;
                 snapshot.control = None;
                 snapshot.active_run = None;
+                snapshot.active_trigger = None;
+                slot.clear_trigger_projection();
             }
-            EventKind::Tx | EventKind::Checkpoint => {}
+            EventKind::Tx => slot.observe_trigger_tx(event),
+            EventKind::Checkpoint => {}
         }
     }
 
@@ -947,7 +1308,39 @@ impl App {
         data: Vec<u8>,
         operation_id: Option<Uuid>,
     ) -> bool {
-        if data.is_empty() {
+        self.request_write_batch_with_kind(
+            commands,
+            vec![data],
+            operation_id,
+            PendingWriteKind::Line,
+        )
+    }
+
+    fn request_raw_write(
+        &mut self,
+        commands: &mpsc::Sender<NetworkCommand>,
+        data: Vec<u8>,
+    ) -> bool {
+        self.request_write_batch_with_kind(commands, vec![data], None, PendingWriteKind::Raw)
+    }
+
+    fn request_write_batch(
+        &mut self,
+        commands: &mpsc::Sender<NetworkCommand>,
+        writes: Vec<Vec<u8>>,
+        operation_id: Option<Uuid>,
+    ) -> bool {
+        self.request_write_batch_with_kind(commands, writes, operation_id, PendingWriteKind::Line)
+    }
+
+    fn request_write_batch_with_kind(
+        &mut self,
+        commands: &mpsc::Sender<NetworkCommand>,
+        writes: Vec<Vec<u8>>,
+        operation_id: Option<Uuid>,
+        kind: PendingWriteKind,
+    ) -> bool {
+        if writes.iter().all(Vec::is_empty) {
             return true;
         }
         if !self.transport_connected || !self.authenticated {
@@ -959,13 +1352,19 @@ impl App {
             return false;
         }
         let slot_id = self.selected_slot_id();
-        let chunks = data
-            .chunks(MAX_WRITE_BYTES)
-            .map(|chunk| PendingWrite {
-                data: chunk.to_vec(),
-                operation_id,
-            })
-            .collect::<Vec<_>>();
+        let total_new_bytes = writes
+            .iter()
+            .fold(0usize, |total, write| total.saturating_add(write.len()));
+        let previous_slot_writes = self
+            .pending_writes
+            .get(&slot_id)
+            .cloned()
+            .unwrap_or_default();
+        let previous_slot_count = previous_slot_writes.len();
+        let mut candidate_slot_writes = previous_slot_writes;
+        for write in writes.iter().filter(|write| !write.is_empty()) {
+            append_pending_write(&mut candidate_slot_writes, write, operation_id, kind);
+        }
 
         let total_pending = self
             .pending_writes
@@ -978,16 +1377,17 @@ impl App {
             .flat_map(|writes| writes.iter())
             .map(|write| write.data.len())
             .sum::<usize>();
-        if total_pending + chunks.len() > MAX_PENDING_WRITES
-            || total_bytes + data.len() > MAX_PENDING_BYTES
+        let candidate_total_pending = total_pending
+            .saturating_sub(previous_slot_count)
+            .saturating_add(candidate_slot_writes.len());
+        let candidate_total_bytes = total_bytes.saturating_add(total_new_bytes);
+        if candidate_total_pending > MAX_PENDING_WRITES || candidate_total_bytes > MAX_PENDING_BYTES
         {
             self.status = tr("st.writeq.full").into();
             return false;
         }
         self.pending_writes
-            .entry(slot_id.clone())
-            .or_default()
-            .extend(chunks);
+            .insert(slot_id.clone(), candidate_slot_writes);
         self.slots[self.selected].last_manual_activity = Some(Instant::now());
 
         if self.owns_control(self.selected) {
@@ -1214,6 +1614,7 @@ impl App {
             || !self.authenticated
             || !self.slot_ready(index)
             || !self.owns_control(index)
+            || self.slots[index].snapshot.active_trigger.is_some()
         {
             return true;
         }
@@ -1266,6 +1667,9 @@ impl App {
                 fence: lease.fence,
                 data,
                 operation_id,
+                // Human writes are governed by the fenced control lease, not
+                // by an Agent Run boundary.
+                expected_run_id: None,
                 pacing: None,
             },
             Some(PendingRequest::Write {
@@ -1280,12 +1684,12 @@ impl App {
                 self.handle_key(key, commands)
             }
             Event::Paste(value) => self.handle_paste(value, commands),
-            Event::Mouse(mouse) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => self.scroll_up(3),
-                    MouseEventKind::ScrollDown => self.scroll_down(3),
-                    _ => {}
-                }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+                self.scroll_up(3);
+                self.dirty = true;
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+                self.scroll_down(3);
                 self.dirty = true;
             }
             Event::Resize(_, _) => self.dirty = true,
@@ -1296,17 +1700,28 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         if self.help {
             self.help = false;
+            if is_prefix(key) {
+                self.prefix_pending = true;
+                self.help_dismiss_prefix = true;
+            }
             self.dirty = true;
             return;
         }
         if self.prefix_pending {
             self.prefix_pending = false;
+            if self.help_dismiss_prefix && key.code == KeyCode::Char('?') {
+                self.help_dismiss_prefix = false;
+                self.dirty = true;
+                return;
+            }
+            self.help_dismiss_prefix = false;
             self.handle_prefix_key(key, commands);
             self.dirty = true;
             return;
         }
         if is_prefix(key) {
             self.prefix_pending = true;
+            self.help_dismiss_prefix = false;
             self.status = tr("st.prefix.hint").into();
             self.dirty = true;
             return;
@@ -1365,7 +1780,7 @@ impl App {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q' | 'Q') => self.should_quit = true,
             KeyCode::Char(']') => {
-                self.request_write(commands, vec![0x1d], None);
+                self.request_raw_write(commands, vec![0x1d]);
             }
             _ => self.status = tr("st.unknown.prefix").into(),
         }
@@ -1384,9 +1799,7 @@ impl App {
             KeyCode::Enter => {
                 let value = self.current().draft.iter().collect::<String>();
                 let mut bytes = value.as_bytes().to_vec();
-                bytes.extend_from_slice(
-                    self.current().snapshot.config.settings.write_eol.as_bytes(),
-                );
+                bytes.extend_from_slice(self.current().effective_write_eol().as_bytes());
                 {
                     let view = self.current_mut();
                     if !value.is_empty() {
@@ -1457,7 +1870,7 @@ impl App {
 
     fn handle_raw_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         if let Some(bytes) = raw_key_bytes(key) {
-            self.request_write(commands, bytes, None);
+            self.request_raw_write(commands, bytes);
         }
     }
 
@@ -1482,10 +1895,14 @@ impl App {
             return;
         }
         if self.current_mode() == InputMode::Raw {
-            self.request_write(commands, value.into_bytes(), None);
+            self.request_raw_write(commands, value.into_bytes());
         } else {
             let view = self.current_mut();
-            for character in value.chars() {
+            // LINE mode is a visible command editor, so hidden terminal
+            // controls belong in RAW mode and must not desynchronize display
+            // width from the logical cursor.
+            let visible = safe_inline(&value);
+            for character in visible.chars() {
                 view.draft.insert(view.draft_cursor, character);
                 view.draft_cursor += 1;
             }
@@ -1505,17 +1922,22 @@ impl App {
         let previous = self.selected;
         self.selected = index;
         let accepted = if paste.raw {
-            self.request_write(commands, paste.bytes, None)
+            self.request_raw_write(commands, paste.bytes)
         } else {
             let text = String::from_utf8_lossy(&paste.bytes);
-            let eol = self.current().snapshot.config.settings.write_eol.clone();
+            let eol = self.current().effective_write_eol().to_string();
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            let mut data = Vec::with_capacity(normalized.len() + eol.len());
-            for line in normalized.split_inclusive('\n') {
-                data.extend_from_slice(line.trim_end_matches('\n').as_bytes());
-                data.extend_from_slice(eol.as_bytes());
-            }
-            self.request_write(commands, data, Some(Uuid::new_v4()))
+            let writes = normalized
+                .split_inclusive('\n')
+                .map(|line| {
+                    let visible = safe_inline(line.trim_end_matches('\n'));
+                    let mut command = Vec::with_capacity(visible.len() + eol.len());
+                    command.extend_from_slice(visible.as_bytes());
+                    command.extend_from_slice(eol.as_bytes());
+                    command
+                })
+                .collect::<Vec<_>>();
+            self.request_write_batch(commands, writes, Some(Uuid::new_v4()))
         };
         self.selected = previous;
         if accepted {
@@ -1678,8 +2100,7 @@ impl App {
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        let max = (self.current().lines.len() + usize::from(self.current().pending_line.is_some()))
-            .saturating_sub(1);
+        let max = self.current().logical_line_count().saturating_sub(1);
         let view = self.current_mut();
         view.scroll_from_bottom = (view.scroll_from_bottom + amount).min(max);
     }
@@ -1725,10 +2146,13 @@ pub async fn run(
     for view in &mut app.slots {
         view.merge_echo = merge_echo;
     }
+    app.mouse_capture = loaded.config.mouse_capture.unwrap_or(false);
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
-    let mut terminal = enter_terminal()?;
-    let _guard = TerminalGuard;
+    let mut terminal = enter_terminal(app.mouse_capture)?;
+    let _guard = TerminalGuard {
+        mouse_capture: app.mouse_capture,
+    };
     let result = run_loop(
         &mut terminal,
         &mut app,
@@ -1783,7 +2207,12 @@ async fn run_loop(
             },
             _ = renew_tick.tick() => app.maintain_controls(commands),
             _ = activity_tick.tick() => {
-                if app.slots.iter().any(|slot| {
+                let now = Instant::now();
+                let mut trigger_changed = false;
+                for slot in &mut app.slots {
+                    trigger_changed |= slot.update_trigger_deadline(now);
+                }
+                if trigger_changed || app.slots.iter().any(|slot| {
                     slot.snapshot.target_activity == TargetActivity::Active
                         && slot.snapshot.session_state == SessionState::Online
                 }) {
@@ -1801,46 +2230,48 @@ async fn run_loop(
     Ok(())
 }
 
-fn enter_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+fn enter_terminal(mouse_capture: bool) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    ) {
-        let _ = disable_raw_mode();
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        leave_terminal(false);
+        return Err(error.into());
+    }
+    if mouse_capture && let Err(error) = execute!(stdout, EnableMouseCapture) {
+        leave_terminal(true);
         return Err(error.into());
     }
     match Terminal::new(CrosstermBackend::new(stdout)) {
         Ok(terminal) => Ok(terminal),
         Err(error) => {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
+            leave_terminal(mouse_capture);
             Err(error.into())
         }
     }
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    mouse_capture: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
-        let _ = io::stdout().flush();
+        leave_terminal(self.mouse_capture);
     }
+}
+
+fn leave_terminal(mouse_capture: bool) {
+    if mouse_capture {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+    let _ = execute!(
+        io::stdout(),
+        Show,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+    let _ = io::stdout().flush();
 }
 
 fn displayed_target_activity(snapshot: &SlotSnapshot) -> TargetActivity {
@@ -1866,6 +2297,22 @@ fn displayed_target_activity_at(snapshot: &SlotSnapshot, now: i64) -> TargetActi
         TargetActivity::Silent
     } else {
         TargetActivity::Active
+    }
+}
+
+fn local_history_truncated_message() -> &'static str {
+    match i18n::lang() {
+        i18n::Lang::En => {
+            "Local display history was truncated; use `serialctl logs` for the complete history."
+        }
+        i18n::Lang::Zh => "本地显示历史已截断；完整历史请使用 `serialctl logs` 查询。",
+    }
+}
+
+fn local_history_truncated_title() -> &'static str {
+    match i18n::lang() {
+        i18n::Lang::En => " · LOCAL HISTORY TRUNCATED",
+        i18n::Lang::Zh => " · 本地历史已截断",
     }
 }
 
@@ -1961,26 +2408,15 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let view = app.current();
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let total_lines = view.lines.len() + usize::from(view.pending_line.is_some());
+    let truncation_line = view.local_truncation_line();
+    let total_lines = view.logical_line_count();
     // Clamp the paused offset so a vanished pending row can never produce an
     // empty viewport; push_line already keeps the offset anchored on append
     // and front-eviction.
     let scroll = view.scroll_from_bottom.min(total_lines.saturating_sub(1));
     let end = total_lines.saturating_sub(scroll);
-    let start = end.saturating_sub(visible_height);
-    let shell_prompt = view.snapshot.config.settings.shell_prompt.as_deref();
-    let uboot_prompt = view.snapshot.config.settings.uboot_prompt.as_deref();
-    let lines = view
-        .lines
-        .iter()
-        .chain(view.pending_line.iter())
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .map(|entry| timeline_line(entry, app.detailed_timeline, shell_prompt, uboot_prompt))
-        .collect::<Vec<_>>();
     let title = format!(
-        " {} · {} · {} baud{} ",
+        " {} · {} · {} baud{}{} ",
         safe_inline(&view.snapshot.config.display_name),
         safe_inline(&view.snapshot.config.port),
         view.snapshot.config.settings.baud_rate,
@@ -1988,14 +2424,116 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
             tr("ui.paused")
         } else {
             ""
+        },
+        if view.local_history_truncated {
+            local_history_truncated_title()
+        } else {
+            ""
         }
     );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    let visible_height = inner.height as usize;
+    // Every logical row occupies at least one wrapped visual row, so the last
+    // `visible_height` logical rows before the requested boundary are a
+    // sufficient suffix. Paragraph then scrolls inside that suffix by its
+    // actual wrapped-line count, keeping the newest prompt visible at 80
+    // columns without remeasuring the full 20,000-row scrollback on each draw.
+    let start = end.saturating_sub(visible_height);
+    let shell_prompt = view.effective_shell_prompt();
+    let uboot_prompt = view.effective_uboot_prompt();
+    let detailed_source_width = detailed_source_width(inner.width as usize);
+    let logical_lines = truncation_line
+        .iter()
+        .chain(view.lines.iter().chain(view.pending_line.iter()))
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|entry| {
+            timeline_line(
+                entry,
+                app.detailed_timeline,
+                detailed_source_width,
+                shell_prompt,
+                uboot_prompt,
+            )
+        })
+        .collect::<Vec<_>>();
+    // Ratatui's stable public API does not expose the rendered line count for
+    // a wrapped Paragraph. Pre-wrap this small logical suffix using terminal
+    // character widths, then retain its visual tail. This mirrors a serial
+    // terminal's character wrapping and guarantees that one long row cannot
+    // push the newest prompt below the viewport.
+    let visual_lines = logical_lines
+        .into_iter()
+        .flat_map(|line| wrap_timeline_line(line, inner.width))
+        .collect::<Vec<_>>();
+    let visual_start = visual_lines.len().saturating_sub(visible_height);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(
+            visual_lines
+                .into_iter()
+                .skip(visual_start)
+                .collect::<Vec<_>>(),
+        )
+        .block(block),
         area,
     );
+}
+
+fn wrap_timeline_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = width as usize;
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let line_style = line.style;
+    let alignment = line.alignment;
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut used = 0usize;
+
+    for span in line.spans {
+        let span_style = span.style;
+        let mut piece = String::new();
+        for character in span.content.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if character_width > 0 && used > 0 && used + character_width > width {
+                if !piece.is_empty() {
+                    row.push(Span::styled(std::mem::take(&mut piece), span_style));
+                }
+                rows.push(Line {
+                    style: line_style,
+                    alignment,
+                    spans: std::mem::take(&mut row),
+                });
+                used = 0;
+            }
+
+            piece.push(character);
+            used = used.saturating_add(character_width);
+            if used >= width {
+                row.push(Span::styled(std::mem::take(&mut piece), span_style));
+                rows.push(Line {
+                    style: line_style,
+                    alignment,
+                    spans: std::mem::take(&mut row),
+                });
+                used = 0;
+            }
+        }
+        if !piece.is_empty() {
+            row.push(Span::styled(piece, span_style));
+        }
+    }
+
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(Line {
+            style: line_style,
+            alignment,
+            spans: row,
+        });
+    }
+    rows
 }
 
 /// Renders one scrollback row. Compact mode is `{marker}{text}` where the
@@ -2008,6 +2546,7 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn timeline_line(
     entry: &DisplayLine,
     detailed: bool,
+    detailed_source_width: usize,
     shell_prompt: Option<&str>,
     uboot_prompt: Option<&str>,
 ) -> Line<'static> {
@@ -2032,7 +2571,7 @@ fn timeline_line(
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::styled(
-            format!("{} ", pad_display(&entry.source, 28)),
+            format!("{} ", pad_display(&entry.source, detailed_source_width)),
             entry.source_style,
         ));
     }
@@ -2050,6 +2589,14 @@ fn timeline_line(
     }
     spans.push(Span::raw(entry.text[cursor..].to_string()));
     Line::from(spans)
+}
+
+/// Detailed rows reserve about 48 columns for payload on an ordinary terminal
+/// and expand the actor/source column only when there is room. A fixed
+/// 28-column source used almost half of an 80-column viewport once the marker
+/// and sequence were included, hiding the useful tail of Agent commands.
+fn detailed_source_width(inner_width: usize) -> usize {
+    inner_width.saturating_sub(62).clamp(10, 28)
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2105,8 +2652,26 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         String::new()
     };
+    let trigger =
+        app.current()
+            .snapshot
+            .active_trigger
+            .as_ref()
+            .map_or_else(String::new, |trigger| {
+                let short_id = trigger.id.to_string().chars().take(8).collect::<String>();
+                trf(
+                    "ui.trigger",
+                    &[
+                        &short_id,
+                        app.current()
+                            .trigger_status_text()
+                            .unwrap_or_else(|| trigger_status_label(trigger.status)),
+                        &trigger.fires_confirmed.to_string(),
+                    ],
+                )
+            });
     let content = format!(
-        " {} · {mode}{prefix} · {} {control}{idle}{queue} · {}{}",
+        " {} · {mode}{prefix} · {} {control}{idle}{queue}{trigger} · {}{}",
         safe_inline(slot_id),
         tr("ui.status.control"),
         safe_inline(&app.status),
@@ -2137,29 +2702,74 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
-    let (text, title) = match app.current_mode() {
-        InputMode::Line => (
-            safe_inline(&app.current().draft.iter().collect::<String>()),
-            tr("ui.input.title.line"),
+    let block = Block::default();
+    let block = block.borders(Borders::ALL);
+    let inner = block.inner(area);
+    let (text, cursor_column, title) = match app.current_mode() {
+        InputMode::Line => {
+            let (text, cursor_column) = line_input_projection(
+                &app.current().draft,
+                app.current().draft_cursor,
+                inner.width,
+            );
+            (text, Some(cursor_column), tr("ui.input.title.line"))
+        }
+        InputMode::Raw => (
+            format!("> {}", tr("ui.input.raw.text")),
+            None,
+            tr("ui.input.title.raw"),
         ),
-        InputMode::Raw => (tr("ui.input.raw.text").into(), tr("ui.input.title.raw")),
     };
-    frame.render_widget(
-        Paragraph::new(format!("> {text}"))
-            .block(Block::default().borders(Borders::ALL).title(title)),
-        area,
-    );
-    if app.current_mode() == InputMode::Line {
-        // The terminal cursor works in display columns, not char positions.
-        let before_cursor = app.current().draft[..app.current().draft_cursor]
-            .iter()
-            .collect::<String>();
-        let cursor = UnicodeWidthStr::width(before_cursor.as_str()) as u16;
+    frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
+    if let Some(cursor_column) = cursor_column {
         frame.set_cursor_position(Position::new(
-            area.x.saturating_add(2).saturating_add(cursor),
-            area.y.saturating_add(1),
+            inner.x.saturating_add(cursor_column),
+            inner.y,
         ));
     }
+}
+
+/// Returns one non-wrapping LINE-mode input row and the cursor column inside
+/// the bordered input area's inner rectangle. The view follows the logical
+/// cursor horizontally and counts CJK characters by terminal display width.
+fn line_input_projection(draft: &[char], cursor: usize, inner_width: u16) -> (String, u16) {
+    const PREFIX: &str = "> ";
+    let prefix_width = UnicodeWidthStr::width(PREFIX) as u16;
+    if inner_width <= prefix_width {
+        return (PREFIX.chars().take(inner_width as usize).collect(), 0);
+    }
+
+    let cursor = cursor.min(draft.len());
+    // Reserve one terminal cell for the visible cursor, including when it is
+    // positioned just after the last character.
+    let before_budget = inner_width.saturating_sub(prefix_width).saturating_sub(1) as usize;
+    let mut start = cursor;
+    let mut before_width = 0usize;
+    while start > 0 {
+        let width = unicode_width::UnicodeWidthChar::width(draft[start - 1]).unwrap_or(0);
+        if before_width.saturating_add(width) > before_budget {
+            break;
+        }
+        start -= 1;
+        before_width += width;
+    }
+
+    let content_budget = inner_width.saturating_sub(prefix_width) as usize;
+    let mut visible = String::new();
+    let mut visible_width = 0usize;
+    for &character in &draft[start..] {
+        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if visible_width.saturating_add(width) > content_budget {
+            break;
+        }
+        visible.push(character);
+        visible_width += width;
+    }
+
+    (
+        format!("{PREFIX}{}", safe_inline(&visible)),
+        prefix_width.saturating_add(before_width as u16),
+    )
 }
 
 fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2181,6 +2791,11 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let height = area.height.min(30);
     let popup = centered_rect(width, height, area);
     let idle_seconds = app.human_idle_release.as_secs().to_string();
+    let mouse_help = if app.mouse_capture {
+        tr("help.wheel")
+    } else {
+        tr("help.selection")
+    };
     let help = [
         tr("help.all.modes").to_string(),
         tr("help.switch").to_string(),
@@ -2189,7 +2804,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("help.view").to_string(),
         tr("help.lang").to_string(),
         tr("help.scroll").to_string(),
-        tr("help.wheel").to_string(),
+        mouse_help.to_string(),
         tr("help.takeover").to_string(),
         tr("help.release").to_string(),
         tr("help.follow").to_string(),
@@ -2300,7 +2915,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crossterm::event::KeyEvent;
-    use serial_protocol::{ActorKind, Direction, EchoMode, SerialSettings, SlotConfig};
+    use ratatui::backend::TestBackend;
+    use serial_protocol::{ActorKind, Direction, SerialSettings, SlotConfig, TriggerSpec};
 
     use super::*;
 
@@ -2337,15 +2953,37 @@ mod tests {
     }
 
     #[test]
+    fn provisional_live_event_does_not_claim_logging_is_degraded() {
+        let mut app = App::new(vec![snapshot()], None);
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let (commands, _) = mpsc::channel(4);
+
+        let mut provisional = event(EventKind::Rx, Direction::Rx, 1, b"live");
+        provisional.daemon_epoch = daemon_epoch;
+        provisional.durable = false;
+        app.push_event(provisional, false, &commands);
+        assert_eq!(app.slots[0].snapshot.logging, LoggingState::Healthy);
+
+        let mut degraded = event(EventKind::LoggingDegraded, Direction::None, 2, &[]);
+        degraded.daemon_epoch = daemon_epoch;
+        degraded.durable = false;
+        app.push_event(degraded, false, &commands);
+        assert_eq!(app.slots[0].snapshot.logging, LoggingState::Degraded);
+    }
+
+    #[test]
     fn serial_close_discards_queued_control_and_input() {
         let mut app = App::new(vec![snapshot()], None);
         let slot_id = app.selected_slot_id();
+        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        app.slots[0].snapshot.active_trigger = Some(trigger);
         app.pending_writes
             .entry(slot_id.clone())
             .or_default()
             .push_back(PendingWrite {
                 data: b"version\r".to_vec(),
                 operation_id: None,
+                kind: PendingWriteKind::Line,
             });
         app.pending_requests.insert(
             Uuid::new_v4(),
@@ -2361,6 +2999,285 @@ mod tests {
 
         assert!(!app.pending_writes.contains_key(&slot_id));
         assert!(app.pending_requests.is_empty());
+        assert!(app.slots[0].snapshot.active_trigger.is_none());
+    }
+
+    #[test]
+    fn trigger_lifecycle_projects_live_state_and_confirmed_fires() {
+        let mut app = App::new(vec![snapshot()], None);
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Armed);
+        let trigger_id = trigger.id;
+        let (commands, _) = mpsc::channel(4);
+
+        let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
+        started.daemon_epoch = daemon_epoch;
+        started.actor = Some(trigger.owner.clone());
+        started
+            .metadata
+            .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
+        app.push_event(started, false, &commands);
+
+        let projected = app.slots[0]
+            .snapshot
+            .active_trigger
+            .as_ref()
+            .expect("TriggerStarted projects the authoritative Trigger");
+        assert_eq!(projected.id, trigger_id);
+        assert_eq!(projected.status, TriggerStatus::Armed);
+        assert_eq!(projected.fires_confirmed, 0);
+
+        let mut fire = event(EventKind::Tx, Direction::Tx, 2, b"slp");
+        fire.daemon_epoch = daemon_epoch;
+        fire.actor = Some(trigger.owner.clone());
+        fire.metadata
+            .insert("trigger_id".into(), serde_json::json!(trigger_id));
+        fire.metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("action"));
+        fire.metadata
+            .insert("fire_index".into(), serde_json::json!(1));
+        fire.metadata
+            .insert("partial".into(), serde_json::json!(false));
+        app.push_event(fire, false, &commands);
+
+        let projected = app.slots[0]
+            .snapshot
+            .active_trigger
+            .as_ref()
+            .expect("confirmed Trigger TX keeps the live projection");
+        assert_eq!(projected.status, TriggerStatus::Running);
+        assert_eq!(projected.fires_confirmed, 1);
+        assert_eq!(projected.tx_bytes_confirmed, 3);
+        assert_eq!(projected.last_write_seq, Some(2));
+
+        let mut completed = event(EventKind::TriggerCompleted, Direction::None, 3, &[]);
+        completed.daemon_epoch = daemon_epoch;
+        completed
+            .metadata
+            .insert("status".into(), serde_json::json!("matched"));
+        app.push_event(completed, false, &commands);
+        assert!(app.slots[0].snapshot.active_trigger.is_none());
+        assert!(
+            app.slots[0]
+                .lines
+                .iter()
+                .any(|line| line.text == "trigger_completed: matched")
+        );
+    }
+
+    #[test]
+    fn trigger_projection_matches_start_and_stop_literals_across_rx_events() {
+        let mut app = App::new(vec![snapshot()], None);
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::WaitingForStart);
+        trigger.spec.start_contains = Some(b"boot>".to_vec());
+        trigger.spec.stop_contains = vec![b"SigmaStar #".to_vec()];
+        let (commands, _) = mpsc::channel(4);
+
+        let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
+        started.daemon_epoch = daemon_epoch;
+        started
+            .metadata
+            .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
+        app.push_event(started, false, &commands);
+
+        for (seq, bytes) in [(2, b"bo".as_slice()), (3, b"ot>".as_slice())] {
+            let mut rx = event(EventKind::Rx, Direction::Rx, seq, bytes);
+            rx.daemon_epoch = daemon_epoch;
+            app.push_event(rx, false, &commands);
+        }
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Running
+        );
+
+        for (seq, bytes) in [(4, b"Sigma".as_slice()), (5, b"Star #".as_slice())] {
+            let mut rx = event(EventKind::Rx, Direction::Rx, seq, bytes);
+            rx.daemon_epoch = daemon_epoch;
+            app.push_event(rx, false, &commands);
+        }
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Stopping
+        );
+
+        // A confirmed write that was already in flight is audited before the
+        // terminal lifecycle event; it must not regress the local projection
+        // from Stopping back to Running.
+        let mut in_flight = event(EventKind::Tx, Direction::Tx, 6, b"slp");
+        in_flight.daemon_epoch = daemon_epoch;
+        in_flight
+            .metadata
+            .insert("trigger_id".into(), serde_json::json!(trigger.id));
+        in_flight
+            .metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("action"));
+        in_flight
+            .metadata
+            .insert("fire_index".into(), serde_json::json!(1));
+        app.push_event(in_flight, false, &commands);
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Stopping
+        );
+    }
+
+    #[test]
+    fn max_fire_and_local_timeout_project_stopping_before_terminal_event() {
+        let mut app = App::new(vec![snapshot()], None);
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        trigger.spec.max_fires = 1;
+        trigger.spec.timeout_ms = 1;
+        let trigger_id = trigger.id;
+        let (commands, _) = mpsc::channel(4);
+
+        let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
+        started.daemon_epoch = daemon_epoch;
+        started
+            .metadata
+            .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
+        app.push_event(started, false, &commands);
+
+        let mut fire = event(EventKind::Tx, Direction::Tx, 2, b"slp");
+        fire.daemon_epoch = daemon_epoch;
+        fire.metadata
+            .insert("trigger_id".into(), serde_json::json!(trigger_id));
+        fire.metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("action"));
+        fire.metadata
+            .insert("fire_index".into(), serde_json::json!(1));
+        app.push_event(fire, false, &commands);
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Stopping
+        );
+
+        let mut timeout_app = App::new(vec![snapshot()], None);
+        let daemon_epoch = timeout_app.slots[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&timeout_app.slots[0].snapshot, TriggerStatus::Running);
+        trigger.spec.timeout_ms = 1;
+        let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
+        started.daemon_epoch = daemon_epoch;
+        started
+            .metadata
+            .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
+        timeout_app.push_event(started, false, &commands);
+
+        assert!(
+            timeout_app.slots[0].update_trigger_deadline(Instant::now() + Duration::from_millis(2))
+        );
+        assert_eq!(
+            timeout_app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Stopping
+        );
+    }
+
+    #[test]
+    fn reconnect_ambiguity_is_labeled_active_instead_of_inventing_a_state() {
+        let mut snapshot = snapshot();
+        let mut trigger = trigger_info(&snapshot, TriggerStatus::Armed);
+        trigger.spec.initial_write = Some(b"reboot\r".to_vec());
+        trigger.spec.start_contains = Some(b"boot>".to_vec());
+        let trigger_id = trigger.id;
+        snapshot.active_trigger = Some(trigger);
+        let mut app = App::new(vec![snapshot], None);
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let (commands, _) = mpsc::channel(4);
+
+        let mut initial = event(EventKind::Tx, Direction::Tx, 1, b"reboot\r");
+        initial.daemon_epoch = daemon_epoch;
+        initial
+            .metadata
+            .insert("trigger_id".into(), serde_json::json!(trigger_id));
+        initial
+            .metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("initial"));
+        app.push_event(initial, false, &commands);
+
+        assert_eq!(app.slots[0].trigger_status_text(), Some("active"));
+        assert!(app.slots[0].snapshot.active_trigger.is_some());
+    }
+
+    #[test]
+    fn every_terminal_trigger_lifecycle_clears_live_state() {
+        for (offset, kind) in [
+            EventKind::TriggerCompleted,
+            EventKind::TriggerCancelled,
+            EventKind::TriggerFailed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut app = App::new(vec![snapshot()], None);
+            let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+            let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Stopping);
+            app.slots[0].snapshot.active_trigger = Some(trigger);
+            let (commands, _) = mpsc::channel(4);
+            let mut terminal = event(kind, Direction::None, offset as u64 + 1, &[]);
+            terminal.daemon_epoch = daemon_epoch;
+
+            app.push_event(terminal, false, &commands);
+
+            assert!(
+                app.slots[0].snapshot.active_trigger.is_none(),
+                "{kind:?} left a stale active Trigger"
+            );
+        }
+    }
+
+    #[test]
+    fn human_write_waits_for_trigger_terminal_after_takeover() {
+        let mut app = ready_app_with_control();
+        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Stopping);
+        app.slots[0].snapshot.active_trigger = Some(trigger);
+        app.pending_writes
+            .entry("slot-1".into())
+            .or_default()
+            .push_back(PendingWrite {
+                data: b"version\r".to_vec(),
+                operation_id: None,
+                kind: PendingWriteKind::Line,
+            });
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let (commands, mut received) = mpsc::channel(4);
+
+        assert!(app.flush_pending_writes("slot-1", &commands));
+        assert!(received.try_recv().is_err());
+        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+
+        let mut cancelled = event(EventKind::TriggerCancelled, Direction::None, 1, &[]);
+        cancelled.daemon_epoch = daemon_epoch;
+        app.push_event(cancelled, false, &commands);
+
+        assert!(app.slots[0].snapshot.active_trigger.is_none());
+        let (_, data, _) = take_write(&mut received);
+        assert_eq!(data, b"version\r");
     }
 
     #[test]
@@ -2401,6 +3318,62 @@ mod tests {
 
         assert!(received.try_recv().is_err());
         assert!(app.pending_writes.is_empty());
+    }
+
+    #[test]
+    fn one_hundred_queued_raw_characters_coalesce_into_one_unsent_block() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(4);
+        let expected = (0..100)
+            .map(|index| b'a' + (index % 26) as u8)
+            .collect::<Vec<_>>();
+
+        for &byte in &expected {
+            assert!(app.request_raw_write(&commands, vec![byte]));
+        }
+
+        let queued = app.pending_writes.get("slot-1").expect("queued RAW data");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].data, expected);
+        assert_eq!(queued[0].kind, PendingWriteKind::Raw);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("one queued control request")
+        else {
+            panic!("expected control request")
+        };
+        assert!(matches!(message, ClientMessage::AcquireControl { .. }));
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn raw_queue_capacity_rejects_the_whole_new_input_without_partial_append() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, _received) = mpsc::channel(4);
+
+        assert!(
+            app.request_raw_write(&commands, vec![b'x'; MAX_PENDING_BYTES]),
+            "queue rejected its documented exact capacity: {}",
+            app.status
+        );
+        let before = app
+            .pending_writes
+            .get("slot-1")
+            .expect("full bounded RAW queue")
+            .iter()
+            .map(|write| write.data.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), MAX_PENDING_WRITES);
+
+        assert!(!app.request_raw_write(&commands, vec![b'y']));
+        let after = app
+            .pending_writes
+            .get("slot-1")
+            .expect("previous accepted RAW queue remains authoritative")
+            .iter()
+            .map(|write| write.data.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert_eq!(app.status, tr("st.writeq.full"));
     }
 
     #[test]
@@ -2502,6 +3475,52 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_multiline_paste_queues_distinct_commands_in_one_operation() {
+        let mut app = ready_app_with_control();
+        let (commands, mut received) = mpsc::channel(8);
+        app.pending_paste = Some(PendingPaste {
+            slot_id: "slot-1".into(),
+            bytes: b"pwd\nversion\n".to_vec(),
+            raw: false,
+        });
+
+        app.confirm_paste(&commands);
+
+        let (first_id, first_data, operation_id) = take_write(&mut received);
+        let operation_id = operation_id.expect("line paste operation ID");
+        assert_eq!(first_data, b"pwd\r");
+        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+
+        app.handle_result(
+            first_id,
+            CommandResult::WriteAccepted { event_seq: 1 },
+            &commands,
+        );
+        let (_, second_data, second_operation) = take_write(&mut received);
+        assert_eq!(second_data, b"version\r");
+        assert_eq!(second_operation, Some(operation_id));
+        assert!(!app.pending_writes.contains_key("slot-1"));
+    }
+
+    #[test]
+    fn confirmed_raw_paste_preserves_one_unmodified_burst() {
+        let mut app = ready_app_with_control();
+        let (commands, mut received) = mpsc::channel(8);
+        app.pending_paste = Some(PendingPaste {
+            slot_id: "slot-1".into(),
+            bytes: b"pwd\nversion\n".to_vec(),
+            raw: true,
+        });
+
+        app.confirm_paste(&commands);
+
+        let (_, data, operation_id) = take_write(&mut received);
+        assert_eq!(data, b"pwd\nversion\n");
+        assert_eq!(operation_id, None);
+        assert!(!app.pending_writes.contains_key("slot-1"));
+    }
+
+    #[test]
     fn subscription_phase_tracks_attach_replay_ready_and_lag() {
         let mut app = App::new(vec![snapshot()], None);
         let (commands, _) = mpsc::channel(4);
@@ -2570,22 +3589,98 @@ mod tests {
     }
 
     #[test]
-    fn live_reconfigure_updates_the_authoritative_slot_config() {
+    fn live_profile_refresh_updates_effective_behavior_without_changing_config() {
         let mut app = App::new(vec![snapshot()], None);
         let (commands, _) = mpsc::channel(4);
-        let mut config = app.slots[0].snapshot.config.clone();
-        config.display_name = "Renamed station".into();
-        config.profile = "custom-profile".into();
-        config.settings.baud_rate = 57_600;
+        let config = app.slots[0].snapshot.config.clone();
+        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        let trigger_id = trigger.id;
+        app.slots[0].snapshot.active_trigger = Some(trigger);
+        app.pending_writes
+            .entry("slot-1".into())
+            .or_default()
+            .push_back(PendingWrite {
+                data: b"queued".to_vec(),
+                operation_id: None,
+                kind: PendingWriteKind::Line,
+            });
         let mut reconfigured = event(EventKind::SlotReconfigured, Direction::None, 1, &[]);
         reconfigured.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
         reconfigured
             .metadata
             .insert("current".into(), serde_json::to_value(&config).unwrap());
+        reconfigured.metadata.insert(
+            "effective".into(),
+            serde_json::to_value(ResolvedDeviceSettings {
+                shell_prompt: Some("]# ".into()),
+                uboot_prompt: Some("Luckfox #".into()),
+                write_eol: "\n".into(),
+                echo: EchoMode::Off,
+            })
+            .unwrap(),
+        );
+        reconfigured
+            .metadata
+            .insert("profile_only".into(), serde_json::Value::Bool(true));
 
         app.push_event(reconfigured, false, &commands);
 
         assert_eq!(app.slots[0].snapshot.config, config);
+        assert_eq!(
+            app.slots[0].snapshot.effective_shell_prompt.as_deref(),
+            Some("]# ")
+        );
+        assert_eq!(
+            app.slots[0].snapshot.effective_uboot_prompt.as_deref(),
+            Some("Luckfox #")
+        );
+        assert_eq!(
+            app.slots[0].snapshot.effective_write_eol.as_deref(),
+            Some("\n")
+        );
+        assert_eq!(app.slots[0].snapshot.effective_echo, Some(EchoMode::Off));
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .map(|trigger| trigger.id),
+            Some(trigger_id)
+        );
+        assert!(app.pending_writes.contains_key("slot-1"));
+    }
+
+    #[test]
+    fn physical_reconfigure_updates_config_even_if_metadata_claims_profile_only() {
+        let mut app = App::new(vec![snapshot()], None);
+        let (commands, _) = mpsc::channel(4);
+        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        app.slots[0].snapshot.active_trigger = Some(trigger);
+        let mut config = app.slots[0].snapshot.config.clone();
+        config.display_name = "Renamed station".into();
+        config.settings.baud_rate = 57_600;
+        app.pending_writes
+            .entry("slot-1".into())
+            .or_default()
+            .push_back(PendingWrite {
+                data: b"queued".to_vec(),
+                operation_id: None,
+                kind: PendingWriteKind::Line,
+            });
+        let mut reconfigured = event(EventKind::SlotReconfigured, Direction::None, 1, &[]);
+        reconfigured.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        reconfigured
+            .metadata
+            .insert("current".into(), serde_json::to_value(&config).unwrap());
+        reconfigured
+            .metadata
+            .insert("profile_only".into(), serde_json::Value::Bool(true));
+
+        app.push_event(reconfigured, false, &commands);
+
+        assert_eq!(app.slots[0].snapshot.config, config);
+        assert!(app.slots[0].snapshot.active_trigger.is_none());
+        assert!(!app.pending_writes.contains_key("slot-1"));
     }
 
     #[test]
@@ -2601,6 +3696,8 @@ mod tests {
             end_seq: None,
             metadata: BTreeMap::new(),
         });
+        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        app.slots[0].snapshot.active_trigger = Some(trigger);
         let (commands, _) = mpsc::channel(4);
         let mut removed = event(EventKind::SlotRemoved, Direction::None, 2, &[]);
         removed.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
@@ -2617,6 +3714,7 @@ mod tests {
         assert!(!snapshot.endpoint_present);
         assert!(snapshot.control.is_none());
         assert!(snapshot.active_run.is_none());
+        assert!(snapshot.active_trigger.is_none());
     }
 
     #[test]
@@ -2638,6 +3736,7 @@ mod tests {
             .push_back(PendingWrite {
                 data: b"reboot\r".to_vec(),
                 operation_id: None,
+                kind: PendingWriteKind::Line,
             });
         app.queued_controls.insert(
             slot_id.clone(),
@@ -2849,6 +3948,38 @@ mod tests {
     }
 
     #[test]
+    fn line_send_uses_the_device_profiles_effective_eol() {
+        let mut app = ready_app_with_control();
+        app.slots[0].snapshot.effective_write_eol = Some("\n".into());
+        app.slots[0].draft = "version".chars().collect();
+        app.slots[0].draft_cursor = 7;
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+
+        let (_, bytes, _) = take_write(&mut received);
+        assert_eq!(bytes, b"version\n");
+    }
+
+    #[test]
+    fn authoritative_promptless_profile_does_not_revive_legacy_slot_prompts() {
+        let mut current = snapshot();
+        current.config.settings.shell_prompt = Some("legacy# ".into());
+        current.config.settings.uboot_prompt = Some("legacy=> ".into());
+        let mut view = SlotView::new(current);
+
+        assert_eq!(view.effective_shell_prompt(), None);
+        assert_eq!(view.effective_uboot_prompt(), None);
+
+        // An older daemon omits the entire effective bundle, so compatibility
+        // fallback remains available only in that case.
+        view.snapshot.effective_write_eol = None;
+        view.snapshot.effective_echo = None;
+        assert_eq!(view.effective_shell_prompt(), Some("legacy# "));
+        assert_eq!(view.effective_uboot_prompt(), Some("legacy=> "));
+    }
+
+    #[test]
     fn input_mode_and_command_history_are_isolated_per_slot() {
         let first = snapshot();
         let mut second = snapshot();
@@ -2897,9 +4028,49 @@ mod tests {
             tx_offset: 0,
             control: None,
             active_run: None,
+            active_trigger: None,
             logging: LoggingState::Healthy,
             effective_shell_prompt: None,
             effective_uboot_prompt: None,
+            effective_write_eol: Some("\r".into()),
+            effective_echo: Some(EchoMode::On),
+        }
+    }
+
+    fn trigger_info(snapshot: &SlotSnapshot, status: TriggerStatus) -> TriggerInfo {
+        TriggerInfo {
+            id: Uuid::new_v4(),
+            owner: Actor {
+                id: "agent:trigger-test".into(),
+                label: "Trigger test Agent".into(),
+                kind: ActorKind::Agent,
+            },
+            daemon_epoch: snapshot.daemon_epoch,
+            generation: snapshot.generation,
+            control_id: snapshot
+                .control
+                .as_ref()
+                .map_or_else(Uuid::new_v4, |lease| lease.id),
+            fence: snapshot.control.as_ref().map_or(1, |lease| lease.fence),
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: None,
+            spec: TriggerSpec {
+                initial_write: None,
+                start_contains: None,
+                action: b"slp".to_vec(),
+                interval_ms: 20,
+                stop_contains: vec![b"ready".to_vec()],
+                timeout_ms: 1_000,
+                max_fires: 50,
+                pacing: None,
+            },
+            status,
+            start_seq: 1,
+            end_seq: status.is_terminal().then_some(2),
+            last_write_seq: None,
+            fires_confirmed: 0,
+            tx_bytes_confirmed: 0,
+            matched_pattern: None,
         }
     }
 
@@ -2925,6 +4096,21 @@ mod tests {
         app.connection_generation = Some(1);
         app.actor = Some(actor);
         app.slots[0].subscription = SubscriptionPhase::Ready { head_seq: 0 };
+        app
+    }
+
+    fn ready_app_with_foreign_control() -> App {
+        let mut app = ready_app_with_control();
+        app.slots[0]
+            .snapshot
+            .control
+            .as_mut()
+            .expect("test control")
+            .owner = Actor {
+            id: "agent:foreign".into(),
+            label: "Foreign Agent".into(),
+            kind: ActorKind::Agent,
+        };
         app
     }
 
@@ -2976,12 +4162,90 @@ mod tests {
             },
             bytes: text.len() + 16,
             source_style: Style::default(),
-            direction,
             marker_color: (direction == Direction::Tx).then_some(Color::Green),
             solid_style: None,
             echoed: false,
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn detailed_source_column_adapts_to_common_terminal_widths() {
+        // 80 outer columns -> 78 inner columns: keep 48+ payload columns
+        // instead of spending a fixed 28 columns on the source.
+        assert_eq!(detailed_source_width(78), 16);
+        assert_eq!(detailed_source_width(118), 28);
+        assert_eq!(detailed_source_width(58), 10);
+    }
+
+    #[test]
+    fn wrapped_live_output_keeps_the_latest_prompt_visible_at_eighty_columns() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.slots[0].push_line(stream_row(1, Direction::Rx, &"x".repeat(2_000)), true);
+        app.slots[0].pending_line = Some(stream_row(2, Direction::Rx, "__LATEST_PROMPT__ "));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("render TUI");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("__LATEST_PROMPT__"));
+    }
+
+    #[test]
+    fn footer_shows_the_active_trigger_state_and_confirmed_fires() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        trigger.fires_confirmed = 7;
+        let short_id = trigger.id.to_string().chars().take(8).collect::<String>();
+        app.slots[0].snapshot.active_trigger = Some(trigger);
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("render TUI");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("trigger {short_id} running")));
+        assert!(rendered.contains("7 fire(s)"));
+    }
+
+    #[test]
+    fn help_shortcut_closes_help_without_inserting_question_mark() {
+        let mut app = App::new(vec![snapshot()], None);
+        let (commands, _) = mpsc::channel(1);
+        app.help = true;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            &commands,
+        );
+        assert!(!app.help);
+        assert!(app.prefix_pending);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &commands,
+        );
+        assert!(!app.help);
+        assert!(!app.prefix_pending);
+        assert!(app.current().draft.is_empty());
     }
 
     #[test]
@@ -3012,74 +4276,251 @@ mod tests {
         for seq in 0..5u64 {
             view.push_line(stream_row(20_000 + seq, Direction::Rx, "row"), true);
         }
-        // Every append evicts one row, so the offset returns to 10 and the
-        // anchor index stays put instead of drifting, jumping, or panicking.
-        assert_eq!(view.scroll_from_bottom, 10);
-        assert!(view.scroll_from_bottom < view.lines.len());
+        // Every append evicts one retained row. The first eviction also adds
+        // the synthetic truncation boundary, so the virtual bottom offset is
+        // one larger while the same retained anchor remains in view.
+        assert_eq!(view.scroll_from_bottom, 11);
+        assert!(view.scroll_from_bottom < view.logical_line_count());
         assert_eq!(view.lines.len(), MAX_LINES_PER_SLOT);
+        assert!(view.local_history_truncated);
+        assert!(view.local_truncation_line().is_some());
     }
 
     #[test]
-    fn exact_command_echo_merges_into_the_tx_row() {
+    fn local_history_eviction_keeps_an_authoritative_truncation_boundary() {
         let mut view = SlotView::new(snapshot());
-        view.push_line(stream_row(1, Direction::Tx, "root"), true);
-        view.push_line(stream_row(2, Direction::Rx, "root\r"), true);
+        for seq in 0..=MAX_LINES_PER_SLOT as u64 {
+            view.push_line(stream_row(seq, Direction::Rx, "row"), true);
+        }
+
+        assert_eq!(view.lines.len(), MAX_LINES_PER_SLOT);
+        assert!(view.local_history_truncated);
+        assert_eq!(view.logical_line_count(), MAX_LINES_PER_SLOT + 1);
+        let boundary = view
+            .local_truncation_line()
+            .expect("synthetic local truncation boundary");
+        assert!(boundary.text.contains("serialctl logs"));
+        assert!(boundary.solid_style.is_some());
+
+        // The warning is synthetic rather than part of the bounded deque, so
+        // repeated front eviction cannot silently evict the warning itself.
+        for seq in 0..100u64 {
+            view.push_line(stream_row(30_000 + seq, Direction::Rx, "new"), true);
+        }
+        assert!(
+            view.local_truncation_line()
+                .expect("persistent truncation boundary")
+                .text
+                .contains("serialctl logs")
+        );
+    }
+
+    #[test]
+    fn slot_view_keeps_prompt_command_and_echo_on_one_row() {
+        let mut view = SlotView::new(snapshot());
+        let epoch = view.snapshot.daemon_epoch;
+
+        let mut prompt = event(EventKind::Rx, Direction::Rx, 1, b"[root@luckfox tmp]# ");
+        prompt.daemon_epoch = epoch;
+        view.push_event(prompt, true);
+
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"cd\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(Actor {
+            id: "human:test".into(),
+            label: "Test operator".into(),
+            kind: ActorKind::Human,
+        });
+        view.push_event(tx, true);
+        assert_eq!(
+            view.pending_line.as_ref().map(|line| line.text.as_str()),
+            Some("[root@luckfox tmp]# cd")
+        );
+
+        let mut echoed = event(EventKind::Rx, Direction::Rx, 3, b"cd\r\n");
+        echoed.daemon_epoch = epoch;
+        view.push_event(echoed, true);
+
         assert_eq!(view.lines.len(), 1);
+        assert_eq!(view.lines[0].text, "[root@luckfox tmp]# cd");
+        assert_eq!(view.lines[0].marker_color, Some(Color::Green));
         assert!(view.lines[0].echoed);
+        assert!(view.pending_line.is_none());
     }
 
     #[test]
-    fn echo_off_slot_keeps_the_duplicate_echo_row() {
-        let mut view = SlotView::new(snapshot());
-        view.snapshot.config.settings.echo = EchoMode::Off;
-        view.push_line(stream_row(1, Direction::Tx, "root"), true);
-        view.push_line(stream_row(2, Direction::Rx, "root"), true);
-        assert_eq!(view.lines.len(), 2);
-        assert!(!view.lines[0].echoed);
-    }
-
-    #[test]
-    fn echo_merges_across_interleaved_log_rows_within_window() {
-        let mut view = SlotView::new(snapshot());
-        view.push_line(stream_row(1, Direction::Tx, "root"), true);
-        for i in 0..4u64 {
-            view.push_line(stream_row(10 + i, Direction::Rx, &format!("log {i}")), true);
-        }
-        view.push_line(stream_row(20, Direction::Rx, "root"), true);
-        assert_eq!(view.lines.len(), 5);
-        assert!(view.lines[0].echoed);
-    }
-
-    #[test]
-    fn mismatched_echo_text_keeps_both_rows() {
-        let mut view = SlotView::new(snapshot());
-        view.push_line(stream_row(1, Direction::Tx, "root"), true);
-        view.push_line(stream_row(2, Direction::Rx, "toor"), true);
-        assert_eq!(view.lines.len(), 2);
-        assert!(!view.lines[0].echoed);
-    }
-
-    #[test]
-    fn stale_echo_outside_the_window_keeps_both_rows() {
-        let mut view = SlotView::new(snapshot());
-        view.push_line(stream_row(1, Direction::Tx, "root"), true);
-        for i in 0..6u64 {
-            view.push_line(stream_row(10 + i, Direction::Rx, &format!("log {i}")), true);
-        }
-        view.echo_pending.as_mut().expect("tracked TX row").at =
-            Instant::now() - Duration::from_secs(2);
-        view.push_line(stream_row(20, Direction::Rx, "root"), true);
-        assert_eq!(view.lines.len(), 8);
-        assert!(!view.lines[0].echoed);
-    }
-
-    #[test]
-    fn raw_mode_does_not_merge_echo() {
+    fn raw_mode_uses_the_same_inline_echo_projection() {
         let mut view = SlotView::new(snapshot());
         view.mode = InputMode::Raw;
-        view.push_line(stream_row(1, Direction::Tx, "root"), true);
-        view.push_line(stream_row(2, Direction::Rx, "root"), true);
-        assert_eq!(view.lines.len(), 2);
-        assert!(!view.lines[0].echoed);
+        let epoch = view.snapshot.daemon_epoch;
+        let mut seq = 1;
+
+        let mut prompt = event(EventKind::Rx, Direction::Rx, seq, b"[root@luckfox ~]# ");
+        prompt.daemon_epoch = epoch;
+        view.push_event(prompt, true);
+        for byte in *b"cd" {
+            seq += 1;
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, &[byte]);
+            tx.daemon_epoch = epoch;
+            view.push_event(tx, true);
+            seq += 1;
+            let mut echoed = event(EventKind::Rx, Direction::Rx, seq, &[byte]);
+            echoed.daemon_epoch = epoch;
+            view.push_event(echoed, true);
+        }
+
+        assert!(view.lines.is_empty());
+        assert_eq!(
+            view.pending_line.as_ref().map(|line| line.text.as_str()),
+            Some("[root@luckfox ~]# cd")
+        );
+    }
+
+    #[test]
+    fn stale_replay_tx_does_not_duplicate_a_later_live_raw_echo() {
+        let mut app = App::new(vec![snapshot()], None);
+        let epoch = app.slots[0].snapshot.daemon_epoch;
+        let (commands, _) = mpsc::channel(4);
+
+        app.handle_server_message(
+            ServerMessage::ReplayBegin {
+                slot_id: "slot-1".into(),
+                from_seq: 1,
+                through_seq: 3,
+            },
+            &commands,
+        );
+
+        let mut prompt = event(EventKind::Rx, Direction::Rx, 1, b"[root@luckfox ~]# ");
+        prompt.daemon_epoch = epoch;
+        app.push_event(prompt, true, &commands);
+
+        let mut stale_tx = event(EventKind::Tx, Direction::Tx, 2, b"old-unmatched\r");
+        stale_tx.daemon_epoch = epoch;
+        stale_tx.actor = Some(Actor {
+            id: "human:old".into(),
+            label: "old operator".into(),
+            kind: ActorKind::Human,
+        });
+        app.push_event(stale_tx, true, &commands);
+
+        let mut unrelated = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"unrelated\r\n[root@luckfox ~]# ",
+        );
+        unrelated.daemon_epoch = epoch;
+        app.push_event(unrelated, true, &commands);
+
+        app.handle_server_message(
+            ServerMessage::Ready {
+                slot_id: "slot-1".into(),
+                head_seq: 3,
+            },
+            &commands,
+        );
+
+        for (offset, byte) in b"pwd\r".iter().copied().enumerate() {
+            let mut tx = event(EventKind::Tx, Direction::Tx, 4 + offset as u64, &[byte]);
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(Actor {
+                id: "human:live".into(),
+                label: "live operator".into(),
+                kind: ActorKind::Human,
+            });
+            app.push_event(tx, false, &commands);
+        }
+
+        let mut response = event(
+            EventKind::Rx,
+            Direction::Rx,
+            8,
+            b"pwd\r\n/oem\r\n[root@luckfox ~]# ",
+        );
+        response.daemon_epoch = epoch;
+        app.push_event(response, false, &commands);
+
+        let pwd_rows = app.slots[0]
+            .lines
+            .iter()
+            .filter(|line| line.text.contains("pwd"))
+            .collect::<Vec<_>>();
+        assert_eq!(pwd_rows.len(), 1);
+        assert_eq!(pwd_rows[0].text, "[root@luckfox ~]# pwd");
+        assert!(pwd_rows[0].echoed);
+        assert!(app.slots[0].lines.iter().any(|line| line.text == "/oem"));
+        assert_eq!(
+            app.slots[0]
+                .pending_line
+                .as_ref()
+                .map(|line| line.text.as_str()),
+            Some("[root@luckfox ~]# ")
+        );
+    }
+
+    #[test]
+    fn ready_preserves_an_in_flight_replay_echo() {
+        let mut app = App::new(vec![snapshot()], None);
+        let epoch = app.slots[0].snapshot.daemon_epoch;
+        let (commands, _) = mpsc::channel(4);
+
+        let mut prompt = event(EventKind::Rx, Direction::Rx, 1, b"[root@luckfox ~]# ");
+        prompt.daemon_epoch = epoch;
+        app.push_event(prompt, true, &commands);
+
+        let mut replay_tx = event(EventKind::Tx, Direction::Tx, 2, b"pwd\r");
+        replay_tx.daemon_epoch = epoch;
+        replay_tx.actor = Some(Actor {
+            id: "agent:replay".into(),
+            label: "replay agent".into(),
+            kind: ActorKind::Agent,
+        });
+        app.push_event(replay_tx, true, &commands);
+
+        app.handle_server_message(
+            ServerMessage::Ready {
+                slot_id: "slot-1".into(),
+                head_seq: 2,
+            },
+            &commands,
+        );
+
+        let mut live_echo = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"pwd\r\n/oem\r\n[root@luckfox ~]# ",
+        );
+        live_echo.daemon_epoch = epoch;
+        app.push_event(live_echo, false, &commands);
+
+        let pwd_rows = app.slots[0]
+            .lines
+            .iter()
+            .filter(|line| line.text.contains("pwd"))
+            .collect::<Vec<_>>();
+        assert_eq!(pwd_rows.len(), 1);
+        assert_eq!(pwd_rows[0].text, "[root@luckfox ~]# pwd");
+        assert!(pwd_rows[0].echoed);
+        assert!(app.slots[0].lines.iter().any(|line| line.text == "/oem"));
+    }
+
+    #[test]
+    fn line_input_cursor_uses_inner_columns_and_cjk_width() {
+        let draft = "abc".chars().collect::<Vec<_>>();
+        assert_eq!(line_input_projection(&draft, 3, 20), ("> abc".into(), 5));
+        assert_eq!(line_input_projection(&draft, 1, 20), ("> abc".into(), 3));
+
+        let cjk = "中a".chars().collect::<Vec<_>>();
+        assert_eq!(line_input_projection(&cjk, 1, 20), ("> 中a".into(), 4));
+        assert_eq!(line_input_projection(&cjk, 2, 20), ("> 中a".into(), 5));
+    }
+
+    #[test]
+    fn long_line_input_scrolls_horizontally_with_the_cursor() {
+        let draft = "abcdef".chars().collect::<Vec<_>>();
+        assert_eq!(line_input_projection(&draft, 6, 6), ("> def".into(), 5));
+        assert_eq!(line_input_projection(&draft, 2, 6), ("> abcd".into(), 4));
     }
 }

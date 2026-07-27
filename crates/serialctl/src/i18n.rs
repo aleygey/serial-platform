@@ -54,7 +54,7 @@ pub fn set_lang(lang: Lang) {
 #[cfg(test)]
 pub(crate) fn lang_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let guard = LOCK.lock().expect("language test lock poisoned");
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     set_lang(Lang::En);
     guard
 }
@@ -104,6 +104,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "ui.idle.release",
         " · idle release in {}s",
         " · {} 秒后空闲释放",
+    ),
+    (
+        "ui.trigger",
+        " · trigger {} {} · {} fire(s)",
+        " · 触发任务 {} {} · 已发送 {} 次",
     ),
     ("ui.status.control", "control:", "控制:"),
     ("ui.paused", " · PAUSED", " · 已暂停"),
@@ -175,6 +180,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "  鼠标滚轮                 滚动 3 行(回到底部恢复跟随)",
     ),
     (
+        "help.selection",
+        "  mouse drag               select/copy text (mouse capture is off)",
+        "  鼠标拖动                 直接选择/复制文本(默认不捕获鼠标)",
+    ),
+    (
         "help.takeover",
         "  Ctrl-] t                 explicit human takeover",
         "  Ctrl-] t                 显式人工接管",
@@ -191,8 +201,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.echo",
-        "  ✓ marker                 device echo merged into the TX row (merge_echo=false disables)",
-        "  ✓ 标记                   设备回显已合并进 TX 行(可用 merge_echo=false 关闭)",
+        "  ✓ marker                 confirmed TX and exact device echo were reconciled",
+        "  ✓ 标记                   已确认发送，并与设备精确回显完成对账",
     ),
     (
         "help.paste",
@@ -353,6 +363,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "st.write.confirmed",
         "{}: write confirmed at sequence {}",
         "{}: 写入已在序列 {} 确认",
+    ),
+    (
+        "st.trigger.result",
+        "Trigger {} is {} after {} confirmed fire(s)",
+        "触发任务 {} 当前为 {}，已确认发送 {} 次",
     ),
     ("st.authenticated", "authenticated as {:?}", "已认证为 {:?}"),
     ("st.watching", "watching {} Slot(s)", "正在监视 {} 个 Slot"),
@@ -569,6 +584,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("d.ev.run_started", "run_started", "运行开始"),
     ("d.ev.run_ended", "run_ended", "运行结束"),
     ("d.ev.run_aborted", "run_aborted", "运行中止"),
+    ("d.ev.trigger_started", "trigger_started", "触发任务已启动"),
+    (
+        "d.ev.trigger_completed",
+        "trigger_completed",
+        "触发任务已完成",
+    ),
+    (
+        "d.ev.trigger_cancelled",
+        "trigger_cancelled",
+        "触发任务已取消",
+    ),
+    ("d.ev.trigger_failed", "trigger_failed", "触发任务失败"),
     ("d.ev.checkpoint", "checkpoint", "检查点"),
     ("d.ev.logging_degraded", "logging_degraded", "日志降级"),
     ("d.ev.gap", "gap", "空洞"),
@@ -590,6 +617,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("m.status.control", "control: {}", "控制: {}"),
     ("m.status.reason", "  reason: {}", "  原因: {}"),
+    (
+        "m.status.trigger",
+        "  trigger: {}  status: {}  fires: {}",
+        "  触发任务: {}  状态: {}  已发送: {} 次",
+    ),
     ("m.doctor.config", "config", "配置文件"),
     ("m.doctor.endpoint", "endpoint", "端点"),
     ("m.doctor.token", "token", "令牌"),
@@ -674,8 +706,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "m.kind.unknown",
-        "unknown event kind `{}`; use rx, tx, serial-opened, serial-closed, run-started, checkpoint, or another protocol event kind",
-        "未知事件类型 `{}`;请使用 rx、tx、serial-opened、serial-closed、run-started、checkpoint 或其他协议事件类型",
+        "unknown event kind `{}`; use rx, tx, serial-opened, serial-closed, run-started, trigger-started, checkpoint, or another protocol event kind",
+        "未知事件类型 `{}`;请使用 rx、tx、serial-opened、serial-closed、run-started、trigger-started、checkpoint 或其他协议事件类型",
     ),
     // ---- init wizard ----
     ("i.endpoint", "seriald endpoint", "seriald 端点"),
@@ -726,8 +758,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "i.profile.note",
-        "\nNew ports use: 115200 8N1, no flow control, DTR/RTS low, TX EOL \\r, echo on, U-Boot prompt `SigmaStar #`, probe disabled, auto-open.",
-        "\n新端口使用: 115200 8N1、无流控、DTR/RTS 低电平、TX EOL \\r、回显开、U-Boot 提示符 `SigmaStar #`、探测禁用、自动打开。",
+        "\nNew ports use: 115200 8N1, no flow control, DTR/RTS low, TX EOL \\r, echo on, no guessed device prompt, probe disabled, auto-open.",
+        "\n新端口使用: 115200 8N1、无流控、DTR/RTS 低电平、TX EOL \\r、回显开、不猜测设备提示符、探测禁用、自动打开。",
     ),
     (
         "i.existing.keep",

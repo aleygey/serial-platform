@@ -1,19 +1,23 @@
 use crate::control::{AcquireOutcome, ControlError, ControlLimits, ControlState, ReleaseOutcome};
-use crate::journal::{JournalError, JournalHandle};
+use crate::journal::{JournalError, JournalHandle, PendingAppend};
 use crate::ring::{EventRing, ReplayError, ReplayWindow};
+use base64::Engine as _;
 use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceProfile, Direction,
-    EventKind, FlowControl, LoggingState, Parity, RunInfo, RunStatus, SerialSettings, SessionState,
-    SlotConfig, SlotSnapshot, StopBits, TargetActivity, TimelineEvent, WritePacing,
-    resolve_device_settings,
+    EventKind, FlowControl, LoggingState, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
+    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
+    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
+    MAX_TRIGGER_TOTAL_BYTES, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo,
+    RunStatus, SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits, TargetActivity,
+    TimelineEvent, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing, resolve_device_settings,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio_serial::{
     DataBits as TokioDataBits, FlowControl as TokioFlowControl, Parity as TokioParity, SerialPort,
     SerialPortBuilderExt, SerialStream, StopBits as TokioStopBits,
@@ -23,21 +27,38 @@ use uuid::Uuid;
 const COMMAND_QUEUE: usize = 256;
 const PORT_EVENT_QUEUE: usize = 4_096;
 const PORT_WRITE_QUEUE: usize = 128;
+const PORT_READER_COMMAND_QUEUE: usize = 8;
+const JOURNAL_ACK_QUEUE: usize = 1_024;
 const BROADCAST_QUEUE: usize = 2_048;
 const RING_EVENTS: usize = 20_000;
 const RING_BYTES: usize = 4 * 1024 * 1024;
 const RX_BUFFER_BYTES: usize = 4 * 1024;
+const MAX_TRIGGER_BUFFERED_RX_BYTES: usize = 1024 * 1024;
 const RX_COALESCE_WINDOW: Duration = Duration::from_millis(4);
 const MAX_WRITE_BYTES: usize = 4 * 1024;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_RUN_METADATA_BYTES: usize = 16 * 1024;
 const MAX_RUN_METADATA_KEYS: usize = 64;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+// Windows commonly rounds a short pacing sleep plus the next asynchronous
+// serial write to roughly one 15.6 ms scheduler tick. Budget a little more
+// than that for every additional paced chunk instead of assuming the
+// requested sleep is the only per-chunk cost.
+const WRITE_CHUNK_OVERHEAD_ALLOWANCE: Duration = Duration::from_millis(20);
+// Leave enough monotonic lease time for the accepted request to enter the
+// port worker and report its bounded outcome without racing exact expiry.
+const WRITE_LEASE_SAFETY_MARGIN: Duration = Duration::from_millis(100);
+// Bound one physical write well below the first-party human/Agent lease
+// durations. A request whose estimated pacing budget exceeds this limit is
+// rejected before it enters the port worker, rather than starting a write that
+// is already guaranteed to hit a clamped deadline partway through.
+const MAX_WRITE_TIMEOUT: Duration = Duration::from_millis(MAX_PHYSICAL_WRITE_TIMEOUT_MS);
 const IDEMPOTENCY_ENTRIES: usize = 2_048;
 const WRITE_IDEMPOTENCY_HISTORY_ENTRIES: usize = 262_144;
 const ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 const OPEN_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const OPEN_BACKOFF_MAX: Duration = Duration::from_secs(10);
+const TERMINAL_TRIGGER_HISTORY: usize = 128;
 
 #[derive(Clone)]
 pub struct SlotHandle {
@@ -79,6 +100,21 @@ pub enum SlotError {
     NoActiveRun,
     #[error("the Run id does not match the active Run")]
     RunMismatch,
+    #[error(
+        "serial write expected active Run {expected_run_id}, but no Run is active (no bytes were written)"
+    )]
+    WriteRunMissing { expected_run_id: Uuid },
+    #[error(
+        "serial write expected active Run {expected_run_id}, but the Slot's active Run is {active_run_id} (no bytes were written)"
+    )]
+    WriteRunMismatch {
+        expected_run_id: Uuid,
+        active_run_id: Uuid,
+    },
+    #[error(
+        "serial write expected active Run {expected_run_id}, but that Run is owned by another actor (no bytes were written)"
+    )]
+    WriteRunNotOwner { expected_run_id: Uuid },
     #[error("cursor is ahead of the current timeline")]
     CursorAhead,
     #[error("slot actor stopped before replying")]
@@ -89,6 +125,18 @@ pub enum SlotError {
     WriteTooLarge,
     #[error("serial write must contain at least one byte")]
     EmptyWrite,
+    #[error(
+        "serial write pacing requires an estimated {required_ms} ms, exceeding the {maximum_ms} ms request limit; increase chunk_size, reduce chunk_delay_ms, or split the write (no bytes were written)"
+    )]
+    WriteDeadlineExceeded { required_ms: u64, maximum_ms: u64 },
+    #[error(
+        "control lease has only {remaining_ms} ms remaining, but this serial write requires {write_ms} ms plus a {margin_ms} ms scheduling margin; renew control or shorten the write and retry (no bytes were written)"
+    )]
+    WriteLeaseTooShort {
+        remaining_ms: u64,
+        write_ms: u64,
+        margin_ms: u64,
+    },
     #[error("request_id was already used with different request content")]
     RequestIdReused,
     #[error(
@@ -109,6 +157,38 @@ pub enum SlotError {
     RunMetadataTooManyKeys { actual: usize },
     #[error("Run metadata encodes to {actual} bytes; the maximum is {MAX_RUN_METADATA_BYTES}")]
     RunMetadataTooLarge { actual: usize },
+    #[error("a Trigger Job is already active on this Slot (no bytes were written)")]
+    TriggerActive,
+    #[error("Trigger Job {trigger_id} was not found")]
+    TriggerNotFound { trigger_id: Uuid },
+    #[error("Trigger Job {trigger_id} belongs to another actor")]
+    TriggerNotOwner { trigger_id: Uuid },
+    #[error("Trigger daemon epoch does not match this daemon process")]
+    TriggerEpochMismatch,
+    #[error("Trigger generation does not match the current serial session")]
+    TriggerGenerationMismatch,
+    #[error("Trigger action must contain between 1 and {MAX_TRIGGER_ACTION_BYTES} bytes")]
+    InvalidTriggerAction,
+    #[error(
+        "Trigger initial_write exceeds the {MAX_TRIGGER_INITIAL_WRITE_BYTES}-byte request limit"
+    )]
+    TriggerInitialWriteTooLarge,
+    #[error(
+        "Trigger interval_ms must be between {MIN_TRIGGER_INTERVAL_MS} and {MAX_TRIGGER_INTERVAL_MS}"
+    )]
+    InvalidTriggerInterval,
+    #[error(
+        "Trigger timeout_ms must be between {MIN_TRIGGER_TIMEOUT_MS} and {MAX_TRIGGER_TIMEOUT_MS}"
+    )]
+    InvalidTriggerTimeout,
+    #[error("Trigger max_fires must be between 1 and {MAX_TRIGGER_FIRES}")]
+    InvalidTriggerMaxFires,
+    #[error(
+        "Trigger byte patterns must be non-empty, at most {MAX_TRIGGER_PATTERN_BYTES} bytes each, and stop_contains may contain at most {MAX_TRIGGER_PATTERNS} patterns"
+    )]
+    InvalidTriggerPatterns,
+    #[error("Trigger's bounded write plan exceeds {MAX_TRIGGER_TOTAL_BYTES} total bytes")]
+    TriggerTotalBytesTooLarge,
 }
 
 impl From<ReplayError> for SlotError {
@@ -171,6 +251,8 @@ impl SlotHandle {
         let initial =
             initial_snapshot(config.clone(), device_profile.clone(), daemon_epoch, staged);
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE);
+        let (trigger_write_results, trigger_write_result_rx) = mpsc::channel(1);
+        let (journal_ack_results, journal_ack_result_rx) = mpsc::channel(JOURNAL_ACK_QUEUE);
         let (events, _) = broadcast::channel(BROADCAST_QUEUE);
         let (snapshot_tx, snapshot) = watch::channel(initial);
         let ring = Arc::new(Mutex::new(EventRing::new(RING_EVENTS, RING_BYTES)));
@@ -211,6 +293,15 @@ impl SlotHandle {
                 active_run: None,
                 port: None,
                 port_events: None,
+                active_trigger: None,
+                terminal_triggers: HashMap::new(),
+                terminal_trigger_order: VecDeque::new(),
+                trigger_write_results,
+                trigger_write_result_rx,
+                journal_ack_results,
+                journal_ack_result_rx,
+                journal_ack_permits: Arc::new(Semaphore::new(JOURNAL_ACK_QUEUE)),
+                trigger_arming: false,
                 administratively_paused: staged,
                 pending_reconfiguration: staged.then_some(PendingReconfiguration::Add),
                 retry_at: Instant::now(),
@@ -336,6 +427,7 @@ impl SlotHandle {
         fence: u64,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
     ) -> Result<CommandResult, SlotError> {
         if data.len() > MAX_WRITE_BYTES {
@@ -348,7 +440,79 @@ impl SlotHandle {
             fence,
             data,
             operation_id,
+            expected_run_id,
             pacing,
+            reply,
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_trigger(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
+        spec: TriggerSpec,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::StartTrigger {
+            request_id,
+            actor,
+            control_id,
+            fence,
+            daemon_epoch,
+            generation,
+            operation_id,
+            expected_run_id,
+            spec,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn trigger_status(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::TriggerStatus {
+            request_id,
+            actor,
+            daemon_epoch,
+            generation,
+            trigger_id,
+            reply,
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cancel_trigger(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::CancelTrigger {
+            request_id,
+            actor,
+            control_id,
+            fence,
+            daemon_epoch,
+            generation,
+            trigger_id,
             reply,
         })
         .await
@@ -444,22 +608,22 @@ impl SlotHandle {
         result.await.map_err(|_| SlotError::ReplyDropped)?
     }
 
-    /// Replaces the device profile used to resolve effective prompts. The
-    /// actor only republishes its snapshot; the port is never touched. The
-    /// returned future completes once the new snapshot is published.
-    pub(crate) async fn set_device_profile(&self, device_profile: Option<DeviceProfile>) {
+    /// Stages a device-profile refresh without changing the live snapshot,
+    /// sequence, control/Run state, or physical port. The boolean is false for
+    /// an exact no-op, in which case there is nothing to commit or roll back.
+    pub(crate) async fn stage_device_profile(
+        &self,
+        device_profile: Option<DeviceProfile>,
+    ) -> Result<bool, SlotError> {
         let (reply, done) = oneshot::channel();
-        if self
-            .commands
-            .send(SlotCommand::SetDeviceProfile {
+        self.commands
+            .send(SlotCommand::StageDeviceProfile {
                 device_profile,
                 reply,
             })
             .await
-            .is_ok()
-        {
-            let _ = done.await;
-        }
+            .map_err(|_| SlotError::Closed)?;
+        done.await.map_err(|_| SlotError::ReplyDropped)?
     }
 
     pub(crate) async fn stage_removal(&self) -> Result<(), SlotError> {
@@ -550,7 +714,38 @@ enum SlotCommand {
         fence: u64,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        reply: Reply,
+    },
+    StartTrigger {
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
+        spec: TriggerSpec,
+        reply: Reply,
+    },
+    TriggerStatus {
+        request_id: Uuid,
+        actor: Actor,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
+        reply: Reply,
+    },
+    CancelTrigger {
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
         reply: Reply,
     },
     StartRun {
@@ -587,9 +782,9 @@ enum SlotCommand {
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
-    SetDeviceProfile {
+    StageDeviceProfile {
         device_profile: Option<DeviceProfile>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<bool, SlotError>>,
     },
     StageRemoval {
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -650,6 +845,7 @@ enum PortCommand {
     Write {
         data: Vec<u8>,
         pacing: WritePacing,
+        deadline: tokio::time::Instant,
         reply: oneshot::Sender<PortWriteOutcome>,
     },
 }
@@ -660,17 +856,166 @@ struct PortWriteOutcome {
     cancelled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerWriteKind {
+    Initial,
+    Action { fire_index: u32 },
+}
+
+struct TriggerWriteResult {
+    trigger_id: Uuid,
+    kind: TriggerWriteKind,
+    data: Vec<u8>,
+    outcome: Result<PortWriteOutcome, String>,
+}
+
+enum JournalAckOutcome {
+    Durable,
+    Failed(String),
+    TimedOut,
+}
+
+struct JournalAckResult {
+    seq: u64,
+    outcome: JournalAckOutcome,
+}
+
 enum PortEvent {
     Rx(Vec<u8>),
-    Overflow { dropped_bytes: u64 },
-    Closed(String),
+    Overflow {
+        dropped_bytes: u64,
+    },
+    Closed {
+        reason: String,
+        dropped_bytes: u64,
+    },
+    /// Ordered marker emitted by the sole reader after all earlier RX has
+    /// been flushed ahead of a Trigger's live observation boundary.
+    ReaderBarrier {
+        id: Uuid,
+    },
+}
+
+#[derive(Debug)]
+struct LiteralMatcher {
+    patterns: Vec<Vec<u8>>,
+    tail: Vec<u8>,
+    maximum_pattern_len: usize,
+}
+
+impl LiteralMatcher {
+    fn new(patterns: Vec<Vec<u8>>) -> Self {
+        let maximum_pattern_len = patterns.iter().map(Vec::len).max().unwrap_or(0);
+        Self {
+            patterns,
+            tail: Vec::new(),
+            maximum_pattern_len,
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if self.patterns.is_empty() {
+            return None;
+        }
+        let mut window = Vec::with_capacity(self.tail.len().saturating_add(data.len()));
+        window.extend_from_slice(&self.tail);
+        window.extend_from_slice(data);
+        let matched = self
+            .patterns
+            .iter()
+            .find(|pattern| contains_bytes(&window, pattern))
+            .cloned();
+        let tail_len = self.maximum_pattern_len.saturating_sub(1).min(window.len());
+        self.tail.clear();
+        self.tail
+            .extend_from_slice(&window[window.len().saturating_sub(tail_len)..]);
+        matched
+    }
+}
+
+#[derive(Default)]
+struct TriggerRxAuditBuffer {
+    events: VecDeque<PortEvent>,
+    bytes: usize,
+    dropped_bytes: u64,
+}
+
+impl TriggerRxAuditBuffer {
+    fn push_rx(&mut self, data: Vec<u8>) -> bool {
+        self.push_rx_with_limit(data, MAX_TRIGGER_BUFFERED_RX_BYTES)
+    }
+
+    fn push_rx_with_limit(&mut self, data: Vec<u8>, limit: usize) -> bool {
+        if self.dropped_bytes == 0 && self.bytes.saturating_add(data.len()) <= limit {
+            self.bytes = self.bytes.saturating_add(data.len());
+            self.events.push_back(PortEvent::Rx(data));
+            false
+        } else {
+            self.dropped_bytes = self.dropped_bytes.saturating_add(data.len() as u64);
+            true
+        }
+    }
+
+    fn add_gap(&mut self, dropped_bytes: u64) {
+        self.dropped_bytes = self.dropped_bytes.saturating_add(dropped_bytes);
+    }
+
+    fn take(&mut self) -> (VecDeque<PortEvent>, u64) {
+        self.bytes = 0;
+        (
+            std::mem::take(&mut self.events),
+            std::mem::take(&mut self.dropped_bytes),
+        )
+    }
+}
+
+struct ActiveTrigger {
+    info: TriggerInfo,
+    bound_run_id: Option<Uuid>,
+    deadline: Instant,
+    next_write_at: Option<Instant>,
+    initial_pending: bool,
+    start_seen: bool,
+    start_matcher: Option<LiteralMatcher>,
+    stop_matcher: LiteralMatcher,
+    write_in_flight: Option<TriggerWriteKind>,
+    buffered_rx: TriggerRxAuditBuffer,
+    pending_terminal: Option<(TriggerStatus, Option<Vec<u8>>)>,
+}
+
+impl ActiveTrigger {
+    fn next_deadline(&self) -> Option<Instant> {
+        if self.pending_terminal.is_some() {
+            return None;
+        }
+        Some(
+            self.next_write_at
+                .filter(|_| self.write_in_flight.is_none())
+                .map_or(self.deadline, |write| write.min(self.deadline)),
+        )
+    }
+
+    fn status_snapshot(&self) -> TriggerInfo {
+        self.info.clone()
+    }
+}
+
+#[derive(Default)]
+struct ReaderTail {
+    pending: Vec<u8>,
+    dropped_bytes: u64,
 }
 
 struct PortWorker {
     commands: mpsc::Sender<PortCommand>,
+    reader_commands: mpsc::Sender<PortReaderCommand>,
     cancel: watch::Sender<bool>,
-    reader: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<ReaderTail>,
     writer: tokio::task::JoinHandle<()>,
+}
+
+enum PortReaderCommand {
+    Barrier { id: Uuid },
 }
 
 enum PendingReconfiguration {
@@ -685,6 +1030,11 @@ enum PendingReconfiguration {
     },
     /// An active Slot that will move to the retired map on commit.
     Remove,
+    /// A device-profile catalog refresh. Staging it is deliberately inert:
+    /// only commit changes the resolved behavior and publishes an event.
+    DeviceProfile {
+        device_profile: Option<DeviceProfile>,
+    },
 }
 
 struct SlotActor {
@@ -712,6 +1062,15 @@ struct SlotActor {
     active_run: Option<RunInfo>,
     port: Option<PortWorker>,
     port_events: Option<mpsc::Receiver<PortEvent>>,
+    active_trigger: Option<ActiveTrigger>,
+    terminal_triggers: HashMap<Uuid, TriggerInfo>,
+    terminal_trigger_order: VecDeque<Uuid>,
+    trigger_write_results: mpsc::Sender<TriggerWriteResult>,
+    trigger_write_result_rx: mpsc::Receiver<TriggerWriteResult>,
+    journal_ack_results: mpsc::Sender<JournalAckResult>,
+    journal_ack_result_rx: mpsc::Receiver<JournalAckResult>,
+    journal_ack_permits: Arc<Semaphore>,
+    trigger_arming: bool,
     administratively_paused: bool,
     pending_reconfiguration: Option<PendingReconfiguration>,
     retry_at: Instant,
@@ -736,9 +1095,21 @@ impl SlotActor {
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            let trigger_deadline = self
+                .active_trigger
+                .as_ref()
+                .and_then(ActiveTrigger::next_deadline);
             let port_event = async {
                 match self.port_events.as_mut() {
                     Some(events) => events.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let trigger_timer = async move {
+                match trigger_deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                    }
                     None => std::future::pending().await,
                 }
             };
@@ -754,11 +1125,29 @@ impl SlotActor {
                         self.handle_port_closed("serial worker stopped".into()).await;
                     }
                 }
+                result = self.trigger_write_result_rx.recv() => {
+                    if let Some(result) = result {
+                        self.handle_trigger_write_result(result).await;
+                    }
+                }
+                result = self.journal_ack_result_rx.recv() => {
+                    if let Some(result) = result {
+                        self.handle_journal_ack_result(result).await;
+                    }
+                }
+                _ = trigger_timer => {
+                    if self.handle_trigger_timer().await {
+                        break;
+                    }
+                }
                 _ = maintenance.tick() => self.maintain().await,
             }
         }
 
+        self.request_trigger_stop(TriggerStatus::PortClosed, None)
+            .await;
         self.stop_port().await;
+        self.settle_trigger_write_after_port_stop().await;
         self.session_state = SessionState::Disabled;
         self.publish_snapshot().await;
     }
@@ -857,40 +1246,94 @@ impl SlotActor {
     async fn handle_port_event(&mut self, event: PortEvent) {
         match event {
             PortEvent::Rx(data) => {
-                self.last_rx_wall_time_ns = Some(wall_time_ns());
-                self.last_rx_instant = Some(Instant::now());
-                self.target_activity = TargetActivity::Active;
-                self.emit(
-                    EventKind::Rx,
-                    Direction::Rx,
-                    data,
-                    Some(device_actor()),
-                    None,
-                    BTreeMap::new(),
-                )
-                .await;
+                self.handle_rx_data(data).await;
             }
             PortEvent::Overflow { dropped_bytes } => {
-                self.rx_offset = self.rx_offset.saturating_add(dropped_bytes);
-                self.emit(
-                    EventKind::Gap,
-                    Direction::None,
-                    Vec::new(),
-                    Some(system_actor()),
-                    None,
-                    metadata([
-                        ("reason", json!("serial receive queue overflow")),
-                        ("dropped_bytes", json!(dropped_bytes)),
-                    ]),
-                )
-                .await;
+                self.handle_rx_overflow(dropped_bytes).await;
             }
-            PortEvent::Closed(reason) => self.handle_port_closed(reason).await,
+            PortEvent::Closed {
+                reason,
+                dropped_bytes,
+            } => {
+                if dropped_bytes > 0 {
+                    self.handle_rx_overflow(dropped_bytes).await;
+                }
+                self.handle_port_closed(reason).await;
+            }
+            PortEvent::ReaderBarrier { .. } => {}
         }
     }
 
+    async fn handle_rx_data(&mut self, data: Vec<u8>) {
+        self.last_rx_wall_time_ns = Some(wall_time_ns());
+        self.last_rx_instant = Some(Instant::now());
+        self.target_activity = TargetActivity::Active;
+        let write_was_in_flight = self
+            .active_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.write_in_flight.is_some());
+        let matched = self.observe_trigger_rx(&data);
+        if let Some(pattern) = matched {
+            self.mark_trigger_stopping(TriggerStatus::Matched, Some(pattern));
+        }
+        if write_was_in_flight {
+            let buffer_overflowed = self
+                .active_trigger
+                .as_mut()
+                .is_some_and(|trigger| trigger.buffered_rx.push_rx(data));
+            if buffer_overflowed {
+                self.mark_trigger_stopping(TriggerStatus::RxGap, None);
+            }
+            return;
+        }
+        self.emit(
+            EventKind::Rx,
+            Direction::Rx,
+            data,
+            Some(device_actor()),
+            None,
+            BTreeMap::new(),
+        )
+        .await;
+        self.finish_stopped_trigger_if_idle().await;
+    }
+
+    async fn handle_rx_overflow(&mut self, dropped_bytes: u64) {
+        if dropped_bytes == 0 {
+            return;
+        }
+        let write_in_flight = self
+            .active_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.write_in_flight.is_some());
+        self.mark_trigger_stopping(TriggerStatus::RxGap, None);
+        if write_in_flight {
+            if let Some(trigger) = self.active_trigger.as_mut() {
+                trigger.buffered_rx.add_gap(dropped_bytes);
+            }
+            return;
+        }
+        self.rx_offset = self.rx_offset.saturating_add(dropped_bytes);
+        self.emit(
+            EventKind::Gap,
+            Direction::None,
+            Vec::new(),
+            Some(system_actor()),
+            None,
+            metadata([
+                ("reason", json!("serial receive queue overflow")),
+                ("dropped_bytes", json!(dropped_bytes)),
+            ]),
+        )
+        .await;
+        self.finish_stopped_trigger_if_idle().await;
+    }
+
     async fn handle_port_closed(&mut self, reason: String) {
+        self.mark_trigger_stopping(TriggerStatus::PortClosed, None);
         self.stop_port().await;
+        self.settle_trigger_write_after_port_stop().await;
+        self.finish_stopped_trigger_if_idle().await;
         self.session_state = SessionState::Backoff;
         self.state_reason = Some(reason.clone());
         self.target_activity = TargetActivity::Unknown;
@@ -928,6 +1371,14 @@ impl SlotActor {
                 reply,
             } => (key, request, reply),
             CommandDisposition::Disconnect { actor_id } => {
+                if self
+                    .active_trigger
+                    .as_ref()
+                    .is_some_and(|trigger| trigger.info.owner.id == actor_id)
+                {
+                    self.request_trigger_stop(TriggerStatus::ControlLost, None)
+                        .await;
+                }
                 if let Some(released) =
                     self.control
                         .disconnect(&actor_id, wall_time_ns(), Instant::now())
@@ -954,13 +1405,12 @@ impl SlotActor {
                 let _ = reply.send(result);
                 return false;
             }
-            CommandDisposition::SetDeviceProfile {
+            CommandDisposition::StageDeviceProfile {
                 device_profile,
                 reply,
             } => {
-                self.device_profile = device_profile;
-                self.publish_snapshot().await;
-                let _ = reply.send(());
+                let result = self.stage_device_profile(device_profile);
+                let _ = reply.send(result);
                 return false;
             }
             CommandDisposition::StageRemoval { reply } => {
@@ -994,7 +1444,9 @@ impl SlotActor {
             // current lease, not against the actor or fence from the original
             // connection.
             self.expire_control().await;
-            if let Err(error) = request.validate_write_control(&self.control) {
+            if let Err(error) =
+                request.validate_write_authorization(&self.control, self.active_run.as_ref())
+            {
                 let _ = reply.send(Err(error));
                 return false;
             }
@@ -1080,6 +1532,14 @@ impl SlotActor {
                     }
                     AcquireOutcome::QueueFull => Err(SlotError::ControlQueueFull),
                     AcquireOutcome::TakenOver { revoked, granted } => {
+                        if self
+                            .active_trigger
+                            .as_ref()
+                            .is_some_and(|trigger| trigger.info.owner.id == revoked.owner.id)
+                        {
+                            self.request_trigger_stop(TriggerStatus::ControlLost, None)
+                                .await;
+                        }
                         self.abort_run("human takeover", Some(revoked.owner.clone()))
                             .await;
                         self.emit(
@@ -1130,6 +1590,8 @@ impl SlotActor {
                     wall_time_ns(),
                     Instant::now(),
                 )?;
+                self.request_trigger_stop(TriggerStatus::ControlLost, None)
+                    .await;
                 self.abort_run("control released", Some(actor)).await;
                 self.emit_release(released, EventKind::ControlReleased)
                     .await;
@@ -1146,27 +1608,45 @@ impl SlotActor {
                 fence,
                 data,
                 operation_id,
+                expected_run_id,
                 pacing,
                 ..
             } => {
+                if self.active_trigger.is_some() {
+                    return Err(SlotError::TriggerActive);
+                }
+                validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
                 if data.len() > MAX_WRITE_BYTES {
                     return Err(SlotError::WriteTooLarge);
                 }
-                self.control
-                    .validate(&actor.id, control_id, fence, Instant::now())?;
                 if data.is_empty() {
                     return Err(SlotError::EmptyWrite);
                 }
+                let total = data.len();
+                let pacing = WritePacing::resolve(pacing, &self.config.settings);
+                let write_timeout = write_deadline(
+                    total,
+                    pacing.chunk_size as usize,
+                    Duration::from_millis(pacing.chunk_delay_ms),
+                )
+                .map_err(|required_ms| SlotError::WriteDeadlineExceeded {
+                    required_ms,
+                    maximum_ms: duration_millis_saturating(MAX_WRITE_TIMEOUT),
+                })?;
+                let authorization_now = Instant::now();
+                let lease_remaining =
+                    self.control
+                        .remaining_ttl(&actor.id, control_id, fence, authorization_now)?;
+                ensure_lease_covers_write(lease_remaining, write_timeout)?;
                 let Some(port) = &self.port else {
                     return Err(SlotError::PortOffline);
                 };
-                let total = data.len();
-                let pacing = WritePacing::resolve(pacing, &self.config.settings);
                 let (reply, result) = oneshot::channel();
                 port.commands
                     .send(PortCommand::Write {
                         data: data.clone(),
                         pacing,
+                        deadline: tokio::time::Instant::from_std(authorization_now + write_timeout),
                         reply,
                     })
                     .await
@@ -1213,6 +1693,158 @@ impl SlotActor {
                     event_seq: event_seq.expect("full non-empty write emits TX"),
                 })
             }
+            SlotRequest::StartTrigger {
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                operation_id,
+                expected_run_id,
+                spec,
+            } => {
+                if self.active_trigger.is_some() {
+                    return Err(SlotError::TriggerActive);
+                }
+                if daemon_epoch != self.daemon_epoch {
+                    return Err(SlotError::TriggerEpochMismatch);
+                }
+                if generation != self.generation {
+                    return Err(SlotError::TriggerGenerationMismatch);
+                }
+                if self.port.is_none() {
+                    return Err(SlotError::PortOffline);
+                }
+                validate_trigger_pacing(&spec, &self.config.settings)?;
+                self.control
+                    .validate(&actor.id, control_id, fence, Instant::now())?;
+                validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
+                self.trigger_arming = true;
+                let flush_result = self.flush_pretrigger_rx().await;
+                self.trigger_arming = false;
+                flush_result?;
+                // The ordered reader barrier can surface a port close, and a
+                // large pre-existing backlog can consume lease time. Recheck
+                // every physical-write boundary before arming the matcher.
+                if self.port.is_none() {
+                    return Err(SlotError::PortOffline);
+                }
+                if generation != self.generation {
+                    return Err(SlotError::TriggerGenerationMismatch);
+                }
+                self.control
+                    .validate(&actor.id, control_id, fence, Instant::now())?;
+                validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
+
+                let bound_run_id =
+                    expected_run_id.or_else(|| self.active_run.as_ref().map(|run| run.id));
+                let initial_pending = spec.initial_write.is_some();
+                let start_seen = spec.start_contains.is_none();
+                let status = if initial_pending {
+                    TriggerStatus::Armed
+                } else if start_seen {
+                    TriggerStatus::Running
+                } else {
+                    TriggerStatus::WaitingForStart
+                };
+                let trigger_id = Uuid::new_v4();
+                let start_seq = self.seq.saturating_add(1);
+                let now = Instant::now();
+                let info = TriggerInfo {
+                    id: trigger_id,
+                    owner: actor.clone(),
+                    daemon_epoch,
+                    generation,
+                    control_id,
+                    fence,
+                    operation_id,
+                    expected_run_id,
+                    spec: spec.clone(),
+                    status,
+                    start_seq,
+                    end_seq: None,
+                    last_write_seq: None,
+                    fires_confirmed: 0,
+                    tx_bytes_confirmed: 0,
+                    matched_pattern: None,
+                };
+                self.active_trigger = Some(ActiveTrigger {
+                    info: info.clone(),
+                    bound_run_id,
+                    deadline: now + Duration::from_millis(spec.timeout_ms),
+                    next_write_at: (initial_pending || start_seen).then_some(now),
+                    initial_pending,
+                    start_seen,
+                    start_matcher: spec
+                        .start_contains
+                        .clone()
+                        .map(|pattern| LiteralMatcher::new(vec![pattern])),
+                    stop_matcher: LiteralMatcher::new(spec.stop_contains.clone()),
+                    write_in_flight: None,
+                    buffered_rx: TriggerRxAuditBuffer::default(),
+                    pending_terminal: None,
+                });
+                self.emit_inner(
+                    EventKind::TriggerStarted,
+                    Direction::None,
+                    Vec::new(),
+                    Some(actor),
+                    operation_id,
+                    bound_run_id,
+                    trigger_event_metadata(&info),
+                )
+                .await;
+                Ok(CommandResult::TriggerStarted {
+                    trigger: Box::new(
+                        self.active_trigger
+                            .as_ref()
+                            .expect("Trigger remains active after its start event")
+                            .status_snapshot(),
+                    ),
+                })
+            }
+            SlotRequest::TriggerStatus {
+                actor: _,
+                daemon_epoch,
+                generation,
+                trigger_id,
+            } => {
+                let trigger = self.lookup_trigger(trigger_id)?;
+                validate_trigger_identity(trigger, daemon_epoch, generation)?;
+                Ok(CommandResult::TriggerStatus {
+                    trigger: Box::new(trigger.clone()),
+                })
+            }
+            SlotRequest::CancelTrigger {
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                trigger_id,
+            } => {
+                let trigger = self.lookup_trigger(trigger_id)?;
+                validate_trigger_identity(trigger, daemon_epoch, generation)?;
+                if trigger.status.is_terminal() {
+                    return Ok(CommandResult::TriggerCancelled {
+                        trigger: Box::new(trigger.clone()),
+                    });
+                }
+                if trigger.owner.id != actor.id {
+                    return Err(SlotError::TriggerNotOwner { trigger_id });
+                }
+                self.control
+                    .validate(&actor.id, control_id, fence, Instant::now())?;
+                if trigger.control_id != control_id || trigger.fence != fence {
+                    return Err(SlotError::Control(ControlError::StaleFence));
+                }
+                self.request_trigger_stop(TriggerStatus::Cancelled, None)
+                    .await;
+                let trigger = self.lookup_trigger(trigger_id)?.clone();
+                Ok(CommandResult::TriggerCancelled {
+                    trigger: Box::new(trigger),
+                })
+            }
             SlotRequest::StartRun {
                 actor,
                 control_id,
@@ -1221,6 +1853,9 @@ impl SlotActor {
                 metadata: run_metadata,
                 ..
             } => {
+                if self.active_trigger.is_some() {
+                    return Err(SlotError::TriggerActive);
+                }
                 self.control
                     .validate(&actor.id, control_id, fence, Instant::now())?;
                 if self.active_run.is_some() {
@@ -1260,6 +1895,8 @@ impl SlotActor {
                 if active.id != run_id {
                     return Err(SlotError::RunMismatch);
                 }
+                self.request_trigger_stop(TriggerStatus::RunLost, None)
+                    .await;
                 let mut ended = self.active_run.take().expect("checked above");
                 ended.status = RunStatus::Completed;
                 ended.end_seq = Some(self.seq.saturating_add(1));
@@ -1315,6 +1952,8 @@ impl SlotActor {
         let Some(released) = self.control.expire(wall_time_ns(), Instant::now()) else {
             return;
         };
+        self.request_trigger_stop(TriggerStatus::ControlLost, None)
+            .await;
         self.abort_run(
             "control lease expired",
             Some(released.released.owner.clone()),
@@ -1339,6 +1978,15 @@ impl SlotActor {
     }
 
     async fn abort_run(&mut self, reason: &str, actor: Option<Actor>) {
+        if let Some(run_id) = self.active_run.as_ref().map(|run| run.id)
+            && self
+                .active_trigger
+                .as_ref()
+                .is_some_and(|trigger| trigger.bound_run_id == Some(run_id))
+        {
+            self.request_trigger_stop(TriggerStatus::RunLost, None)
+                .await;
+        }
         let Some(mut run) = self.active_run.take() else {
             return;
         };
@@ -1354,6 +2002,615 @@ impl SlotActor {
             ]),
         )
         .await;
+    }
+
+    async fn flush_pretrigger_rx(&mut self) -> Result<(), SlotError> {
+        let barrier_id = Uuid::new_v4();
+        let reader_commands = self
+            .port
+            .as_ref()
+            .map(|port| port.reader_commands.clone())
+            .ok_or(SlotError::PortOffline)?;
+        reader_commands
+            .send(PortReaderCommand::Barrier { id: barrier_id })
+            .await
+            .map_err(|_| SlotError::PortOffline)?;
+
+        loop {
+            let event = match self.port_events.as_mut() {
+                Some(events) => events.recv().await,
+                None => return Err(SlotError::PortOffline),
+            }
+            .ok_or(SlotError::PortOffline)?;
+            match event {
+                PortEvent::ReaderBarrier { id } if id == barrier_id => return Ok(()),
+                PortEvent::ReaderBarrier { .. } => {
+                    // A Slot actor issues barriers serially. An unrelated
+                    // marker is stale and has no timeline meaning.
+                }
+                event => {
+                    self.handle_port_event(event).await;
+                    if self.port.is_none() {
+                        return Err(SlotError::PortOffline);
+                    }
+                }
+            }
+        }
+    }
+
+    fn lookup_trigger(&self, trigger_id: Uuid) -> Result<&TriggerInfo, SlotError> {
+        if let Some(trigger) = self
+            .active_trigger
+            .as_ref()
+            .filter(|trigger| trigger.info.id == trigger_id)
+        {
+            return Ok(&trigger.info);
+        }
+        self.terminal_triggers
+            .get(&trigger_id)
+            .ok_or(SlotError::TriggerNotFound { trigger_id })
+    }
+
+    fn observe_trigger_rx(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        let trigger = self.active_trigger.as_mut()?;
+        if let Some(matched) = trigger.stop_matcher.push(data) {
+            return Some(matched);
+        }
+        if !trigger.start_seen
+            && trigger
+                .start_matcher
+                .as_mut()
+                .is_some_and(|matcher| matcher.push(data).is_some())
+        {
+            trigger.start_seen = true;
+            trigger.start_matcher = None;
+            if !trigger.initial_pending && trigger.pending_terminal.is_none() {
+                trigger.info.status = TriggerStatus::Running;
+                trigger.next_write_at = Some(Instant::now());
+            }
+        }
+        None
+    }
+
+    fn trigger_write_is_due(&self) -> bool {
+        let now = Instant::now();
+        self.active_trigger.as_ref().is_some_and(|trigger| {
+            trigger_write_due_at(
+                now,
+                trigger.deadline,
+                trigger.next_write_at,
+                trigger.pending_terminal.is_some(),
+                trigger.write_in_flight.is_some(),
+            )
+        })
+    }
+
+    async fn handle_trigger_timer(&mut self) -> bool {
+        // A stop byte and a timer can become ready in the same scheduler turn.
+        // Drain already-queued RX and control requests first so a due timer
+        // cannot schedule one avoidable extra write ahead of stop/cancel.
+        let mut port_events_empty = false;
+        for _ in 0..PORT_EVENT_QUEUE {
+            let event = match self.port_events.as_mut().map(mpsc::Receiver::try_recv) {
+                Some(Ok(event)) => event,
+                Some(Err(mpsc::error::TryRecvError::Empty)) | None => {
+                    port_events_empty = true;
+                    break;
+                }
+                Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
+                    self.handle_port_closed("serial worker stopped".into())
+                        .await;
+                    return false;
+                }
+            };
+            self.handle_port_event(event).await;
+            if self.active_trigger.is_none() {
+                return false;
+            }
+        }
+        if !port_events_empty {
+            // Bound one actor turn. The next ready timer turn drains again,
+            // and no write is scheduled while unread RX might contain a stop.
+            return false;
+        }
+
+        let mut commands_empty = false;
+        for _ in 0..COMMAND_QUEUE {
+            let command = match self.commands.try_recv() {
+                Ok(command) => command,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    commands_empty = true;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.request_trigger_stop(TriggerStatus::PortClosed, None)
+                        .await;
+                    return true;
+                }
+            };
+            if self.handle_command(command).await {
+                return true;
+            }
+            if self.active_trigger.is_none() {
+                return false;
+            }
+        }
+        if !commands_empty {
+            return false;
+        }
+
+        self.expire_control().await;
+        let Some(trigger) = self.active_trigger.as_ref() else {
+            return false;
+        };
+        if trigger.pending_terminal.is_some() {
+            self.finish_stopped_trigger_if_idle().await;
+            return false;
+        }
+        if Instant::now() >= trigger.deadline {
+            self.request_trigger_stop(TriggerStatus::TimedOut, None)
+                .await;
+            return false;
+        }
+        if self.trigger_write_is_due() {
+            self.begin_trigger_write().await;
+        }
+        false
+    }
+
+    async fn begin_trigger_write(&mut self) {
+        if self
+            .active_trigger
+            .as_ref()
+            .is_some_and(|trigger| Instant::now() >= trigger.deadline)
+        {
+            self.request_trigger_stop(TriggerStatus::TimedOut, None)
+                .await;
+            return;
+        }
+        let Some(trigger) = self.active_trigger.as_ref() else {
+            return;
+        };
+        if trigger.pending_terminal.is_some()
+            || trigger.write_in_flight.is_some()
+            || !trigger
+                .next_write_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return;
+        }
+
+        let trigger_id = trigger.info.id;
+        let trigger_deadline = trigger.deadline;
+        if trigger.info.daemon_epoch != self.daemon_epoch
+            || trigger.info.generation != self.generation
+        {
+            self.request_trigger_stop(TriggerStatus::GenerationChanged, None)
+                .await;
+            return;
+        }
+        if self.port.is_none() {
+            self.request_trigger_stop(TriggerStatus::PortClosed, None)
+                .await;
+            return;
+        }
+        if self
+            .control
+            .validate(
+                &trigger.info.owner.id,
+                trigger.info.control_id,
+                trigger.info.fence,
+                Instant::now(),
+            )
+            .is_err()
+        {
+            self.request_trigger_stop(TriggerStatus::ControlLost, None)
+                .await;
+            return;
+        }
+        if validate_expected_write_run(
+            trigger.info.expected_run_id,
+            &trigger.info.owner,
+            self.active_run.as_ref(),
+        )
+        .is_err()
+        {
+            self.request_trigger_stop(TriggerStatus::RunLost, None)
+                .await;
+            return;
+        }
+
+        let (kind, data) = if trigger.initial_pending {
+            let Some(data) = trigger.info.spec.initial_write.clone() else {
+                self.request_trigger_stop(TriggerStatus::WriteFailed, None)
+                    .await;
+                return;
+            };
+            (TriggerWriteKind::Initial, data)
+        } else {
+            if !trigger.start_seen {
+                return;
+            }
+            if trigger.info.fires_confirmed >= trigger.info.spec.max_fires {
+                self.request_trigger_stop(TriggerStatus::MaxFiresReached, None)
+                    .await;
+                return;
+            }
+            (
+                TriggerWriteKind::Action {
+                    fire_index: trigger.info.fires_confirmed.saturating_add(1),
+                },
+                trigger.info.spec.action.clone(),
+            )
+        };
+        let pacing = WritePacing::resolve(trigger.info.spec.pacing, &self.config.settings);
+        let Ok(write_timeout) = write_deadline(
+            data.len(),
+            pacing.chunk_size as usize,
+            Duration::from_millis(pacing.chunk_delay_ms),
+        ) else {
+            self.request_trigger_stop(TriggerStatus::WriteFailed, None)
+                .await;
+            return;
+        };
+        let authorization_now = Instant::now();
+        let lease_remaining = match self.control.remaining_ttl(
+            &trigger.info.owner.id,
+            trigger.info.control_id,
+            trigger.info.fence,
+            authorization_now,
+        ) {
+            Ok(remaining) => remaining,
+            Err(_) => {
+                self.request_trigger_stop(TriggerStatus::ControlLost, None)
+                    .await;
+                return;
+            }
+        };
+        if ensure_lease_covers_write(lease_remaining, write_timeout).is_err() {
+            self.request_trigger_stop(TriggerStatus::ControlLost, None)
+                .await;
+            return;
+        }
+        // The validation and pacing calculations above are intentionally
+        // bounded, but the deadline is authoritative at the final enqueue
+        // boundary too: no new physical write may start after it.
+        if Instant::now() >= trigger_deadline {
+            self.request_trigger_stop(TriggerStatus::TimedOut, None)
+                .await;
+            return;
+        }
+
+        let Some(port_commands) = self.port.as_ref().map(|port| port.commands.clone()) else {
+            self.request_trigger_stop(TriggerStatus::PortClosed, None)
+                .await;
+            return;
+        };
+        let (reply, result) = oneshot::channel();
+        let command = PortCommand::Write {
+            data: data.clone(),
+            pacing,
+            deadline: tokio::time::Instant::from_std(authorization_now + write_timeout),
+            reply,
+        };
+        match port_commands.try_send(command) {
+            Ok(()) => {
+                let trigger = self
+                    .active_trigger
+                    .as_mut()
+                    .expect("Trigger is still active while scheduling its write");
+                trigger.write_in_flight = Some(kind);
+                trigger.next_write_at = None;
+                if matches!(kind, TriggerWriteKind::Action { .. }) {
+                    trigger.info.status = TriggerStatus::Running;
+                }
+                let completed = self.trigger_write_results.clone();
+                tokio::spawn(async move {
+                    let outcome = result.await.map_err(|_| {
+                        "serial writer stopped before confirming the Trigger write; the physical outcome is uncertain".to_owned()
+                    });
+                    let _ = completed
+                        .send(TriggerWriteResult {
+                            trigger_id,
+                            kind,
+                            data,
+                            outcome,
+                        })
+                        .await;
+                });
+                self.publish_snapshot().await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.request_trigger_stop(TriggerStatus::PortClosed, None)
+                    .await;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.request_trigger_stop(TriggerStatus::WriteFailed, None)
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_trigger_write_result(&mut self, result: TriggerWriteResult) {
+        let Some(trigger) = self.active_trigger.as_ref() else {
+            return;
+        };
+        if trigger.info.id != result.trigger_id || trigger.write_in_flight != Some(result.kind) {
+            return;
+        }
+
+        self.active_trigger
+            .as_mut()
+            .expect("checked above")
+            .write_in_flight = None;
+        let (written, write_error) = match result.outcome {
+            Ok(outcome) => (
+                outcome.written,
+                outcome.error.or_else(|| {
+                    outcome
+                        .cancelled
+                        .then(|| "Trigger write was cancelled while the port was closing".into())
+                }),
+            ),
+            Err(error) => (0, Some(error)),
+        };
+
+        if written > 0 {
+            let (actor, operation_id, run_id, trigger_id) = {
+                let trigger = self.active_trigger.as_ref().expect("checked above");
+                (
+                    trigger.info.owner.clone(),
+                    trigger.info.operation_id,
+                    trigger.bound_run_id,
+                    trigger.info.id,
+                )
+            };
+            let mut tx_metadata = metadata([
+                ("partial", json!(written != result.data.len())),
+                ("trigger_id", json!(trigger_id)),
+                (
+                    "trigger_write_kind",
+                    json!(match result.kind {
+                        TriggerWriteKind::Initial => "initial",
+                        TriggerWriteKind::Action { .. } => "action",
+                    }),
+                ),
+            ]);
+            if let TriggerWriteKind::Action { fire_index } = result.kind {
+                tx_metadata.insert("fire_index".into(), json!(fire_index));
+            }
+            let event_seq = self
+                .emit_inner(
+                    EventKind::Tx,
+                    Direction::Tx,
+                    result.data[..written].to_vec(),
+                    Some(actor),
+                    operation_id,
+                    run_id,
+                    tx_metadata,
+                )
+                .await;
+            let trigger = self.active_trigger.as_mut().expect("checked above");
+            trigger.info.last_write_seq = Some(event_seq);
+            trigger.info.tx_bytes_confirmed = trigger
+                .info
+                .tx_bytes_confirmed
+                .saturating_add(written as u64);
+        }
+
+        let full_write = written == result.data.len() && write_error.is_none();
+        if full_write {
+            let now = Instant::now();
+            let reached_max_fires = match result.kind {
+                TriggerWriteKind::Initial => {
+                    let trigger = self.active_trigger.as_mut().expect("checked above");
+                    trigger.initial_pending = false;
+                    if trigger.pending_terminal.is_none() {
+                        if trigger.start_seen {
+                            trigger.info.status = TriggerStatus::Running;
+                            trigger.next_write_at = Some(now);
+                        } else {
+                            trigger.info.status = TriggerStatus::WaitingForStart;
+                            trigger.next_write_at = None;
+                        }
+                    }
+                    false
+                }
+                TriggerWriteKind::Action { .. } => {
+                    let trigger = self.active_trigger.as_mut().expect("checked above");
+                    trigger.info.fires_confirmed = trigger.info.fires_confirmed.saturating_add(1);
+                    let reached_max = trigger.info.fires_confirmed >= trigger.info.spec.max_fires;
+                    if !reached_max && trigger.pending_terminal.is_none() {
+                        trigger.next_write_at =
+                            Some(now + Duration::from_millis(trigger.info.spec.interval_ms));
+                    }
+                    reached_max
+                }
+            };
+            if reached_max_fires {
+                self.mark_trigger_stopping(TriggerStatus::MaxFiresReached, None);
+            }
+        } else {
+            self.mark_trigger_stopping(TriggerStatus::WriteFailed, None);
+        }
+
+        let (buffered, buffered_dropped_bytes, buffered_run_id) = self
+            .active_trigger
+            .as_mut()
+            .map(|trigger| {
+                let (events, dropped_bytes) = trigger.buffered_rx.take();
+                (events, dropped_bytes, trigger.bound_run_id)
+            })
+            .unwrap_or_default();
+        for event in buffered {
+            match event {
+                PortEvent::Rx(data) => {
+                    self.emit_inner(
+                        EventKind::Rx,
+                        Direction::Rx,
+                        data,
+                        Some(device_actor()),
+                        None,
+                        buffered_run_id,
+                        BTreeMap::new(),
+                    )
+                    .await;
+                }
+                PortEvent::Overflow { dropped_bytes } => {
+                    self.rx_offset = self.rx_offset.saturating_add(dropped_bytes);
+                    self.emit_inner(
+                        EventKind::Gap,
+                        Direction::None,
+                        Vec::new(),
+                        Some(system_actor()),
+                        None,
+                        buffered_run_id,
+                        metadata([
+                            ("reason", json!("serial receive queue overflow")),
+                            ("dropped_bytes", json!(dropped_bytes)),
+                        ]),
+                    )
+                    .await;
+                }
+                PortEvent::Closed { .. } => {}
+                PortEvent::ReaderBarrier { .. } => {}
+            }
+        }
+        if buffered_dropped_bytes > 0 {
+            self.rx_offset = self.rx_offset.saturating_add(buffered_dropped_bytes);
+            self.emit_inner(
+                EventKind::Gap,
+                Direction::None,
+                Vec::new(),
+                Some(system_actor()),
+                None,
+                buffered_run_id,
+                metadata([
+                    (
+                        "reason",
+                        json!("Trigger RX audit buffer exceeded its bounded capacity"),
+                    ),
+                    ("dropped_bytes", json!(buffered_dropped_bytes)),
+                ]),
+            )
+            .await;
+        }
+        self.finish_stopped_trigger_if_idle().await;
+        self.publish_snapshot().await;
+    }
+
+    fn mark_trigger_stopping(&mut self, status: TriggerStatus, matched_pattern: Option<Vec<u8>>) {
+        debug_assert!(status.is_terminal());
+        let Some(trigger) = self.active_trigger.as_mut() else {
+            return;
+        };
+        let replace = trigger
+            .pending_terminal
+            .as_ref()
+            .is_none_or(|(current, _)| {
+                trigger_terminal_priority(status) > trigger_terminal_priority(*current)
+            });
+        if replace {
+            trigger.pending_terminal = Some((status, matched_pattern));
+        }
+        trigger.info.status = TriggerStatus::Stopping;
+        trigger.next_write_at = None;
+    }
+
+    async fn request_trigger_stop(
+        &mut self,
+        status: TriggerStatus,
+        matched_pattern: Option<Vec<u8>>,
+    ) {
+        self.mark_trigger_stopping(status, matched_pattern);
+        if self
+            .active_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.write_in_flight.is_some())
+        {
+            self.publish_snapshot().await;
+            return;
+        }
+        self.finish_stopped_trigger_if_idle().await;
+    }
+
+    async fn finish_stopped_trigger_if_idle(&mut self) {
+        let should_finish = self.active_trigger.as_ref().is_some_and(|trigger| {
+            trigger.write_in_flight.is_none() && trigger.pending_terminal.is_some()
+        });
+        if !should_finish {
+            return;
+        }
+        let mut trigger = self.active_trigger.take().expect("checked above");
+        let (status, matched_pattern) = trigger.pending_terminal.take().expect("checked above");
+        trigger.info.status = status;
+        trigger.info.matched_pattern = matched_pattern;
+        trigger.info.end_seq = Some(self.seq.saturating_add(1));
+        let event_kind = match status {
+            TriggerStatus::Matched | TriggerStatus::TimedOut | TriggerStatus::MaxFiresReached => {
+                EventKind::TriggerCompleted
+            }
+            TriggerStatus::Cancelled => EventKind::TriggerCancelled,
+            TriggerStatus::ControlLost
+            | TriggerStatus::RunLost
+            | TriggerStatus::GenerationChanged
+            | TriggerStatus::PortClosed
+            | TriggerStatus::WriteFailed
+            | TriggerStatus::RxGap => EventKind::TriggerFailed,
+            TriggerStatus::Armed
+            | TriggerStatus::WaitingForStart
+            | TriggerStatus::Running
+            | TriggerStatus::Stopping => {
+                debug_assert!(false, "only terminal Trigger states can be finalized");
+                EventKind::TriggerFailed
+            }
+        };
+        let event_seq = self
+            .emit_inner(
+                event_kind,
+                Direction::None,
+                Vec::new(),
+                Some(trigger.info.owner.clone()),
+                trigger.info.operation_id,
+                trigger.bound_run_id,
+                trigger_event_metadata(&trigger.info),
+            )
+            .await;
+        trigger.info.end_seq = Some(event_seq);
+        let trigger_id = trigger.info.id;
+        self.terminal_triggers
+            .insert(trigger_id, trigger.info.clone());
+        self.terminal_trigger_order.push_back(trigger_id);
+        while self.terminal_trigger_order.len() > TERMINAL_TRIGGER_HISTORY {
+            if let Some(oldest) = self.terminal_trigger_order.pop_front() {
+                self.terminal_triggers.remove(&oldest);
+            }
+        }
+        self.publish_snapshot().await;
+    }
+
+    async fn drain_trigger_write_results(&mut self) {
+        while let Ok(result) = self.trigger_write_result_rx.try_recv() {
+            self.handle_trigger_write_result(result).await;
+        }
+    }
+
+    async fn settle_trigger_write_after_port_stop(&mut self) {
+        if self
+            .active_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.write_in_flight.is_some())
+        {
+            // `stop_port` has already joined the writer, so its per-write
+            // oneshot is guaranteed to have produced a value or closed.
+            // Yield until the tiny forwarding task delivers that outcome;
+            // otherwise shutdown could drop a confirmed prefix without TX
+            // audit merely because the forwarding task had not been polled.
+            if let Some(result) = self.trigger_write_result_rx.recv().await {
+                self.handle_trigger_write_result(result).await;
+            }
+        }
+        self.drain_trigger_write_results().await;
     }
 
     async fn emit_with_run(
@@ -1438,9 +2695,10 @@ impl SlotActor {
             durable: false,
         };
 
+        let wait_for_journal = self.active_trigger.is_none() && !self.trigger_arming;
         let mut degradation = None;
         let event = match self.journal.try_append(event.clone()) {
-            Ok(pending) if self.logging == LoggingState::Healthy => {
+            Ok(pending) if self.logging == LoggingState::Healthy && wait_for_journal => {
                 match tokio::time::timeout(self.journal.ack_timeout(), pending.wait()).await {
                     Ok(Ok(durable)) => durable,
                     Ok(Err(error)) => {
@@ -1458,6 +2716,19 @@ impl SlotActor {
                     }
                 }
             }
+            Ok(pending) if self.logging == LoggingState::Healthy => {
+                // Trigger matching and scheduling are real-time paths. Enqueue
+                // the record in sequence order, deliver the live event as
+                // durable=false, and observe the acknowledgement out of band.
+                // This prevents a healthy-but-slow disk flush from stretching a
+                // 20 ms Trigger interval toward the journal's 100 ms budget.
+                if let Err(error) = self.track_journal_ack(event_seq, pending)
+                    && self.mark_logging_degraded_message(error)
+                {
+                    degradation = Some(error.into());
+                }
+                event
+            }
             Ok(_pending) => event,
             Err(error) => {
                 if self.mark_logging_degraded(&error) {
@@ -1473,6 +2744,50 @@ impl SlotActor {
             self.publish_nondurable_logging_event(error).await;
         }
         event_seq
+    }
+
+    fn track_journal_ack(&self, seq: u64, pending: PendingAppend) -> Result<(), &'static str> {
+        let permit = self
+            .journal_ack_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(
+                |_| "journal acknowledgement tracker is saturated; continuing live delivery",
+            )?;
+        let timeout = self.journal.ack_timeout();
+        let completed = self.journal_ack_results.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let outcome = match tokio::time::timeout(timeout, pending.wait()).await {
+                Ok(Ok(_durable)) => JournalAckOutcome::Durable,
+                Ok(Err(error)) => JournalAckOutcome::Failed(error.to_string()),
+                Err(_) => JournalAckOutcome::TimedOut,
+            };
+            let _ = completed.send(JournalAckResult { seq, outcome }).await;
+        });
+        Ok(())
+    }
+
+    async fn handle_journal_ack_result(&mut self, result: JournalAckResult) {
+        match result.outcome {
+            JournalAckOutcome::Durable => {
+                self.ring.lock().await.mark_durable(result.seq);
+            }
+            JournalAckOutcome::Failed(error) => {
+                if self.mark_logging_degraded_message(&error) {
+                    self.publish_nondurable_logging_event(error).await;
+                }
+            }
+            JournalAckOutcome::TimedOut => {
+                let error = format!(
+                    "journal acknowledgement for event {} timed out; continuing live delivery",
+                    result.seq
+                );
+                if self.mark_logging_degraded_message(&error) {
+                    self.publish_nondurable_logging_event(error).await;
+                }
+            }
+        }
     }
 
     fn mark_logging_degraded(&mut self, error: &JournalError) -> bool {
@@ -1533,9 +2848,15 @@ impl SlotActor {
             tx_offset: self.tx_offset,
             control: self.control.current().cloned(),
             active_run: self.active_run.clone(),
+            active_trigger: self
+                .active_trigger
+                .as_ref()
+                .map(ActiveTrigger::status_snapshot),
             logging: self.logging,
             effective_shell_prompt: resolved.shell_prompt,
             effective_uboot_prompt: resolved.uboot_prompt,
+            effective_write_eol: Some(resolved.write_eol),
+            effective_echo: Some(resolved.echo),
         });
     }
 
@@ -1550,7 +2871,10 @@ impl SlotActor {
         }
         self.administratively_paused = true;
         let was_online = self.port.is_some();
+        self.mark_trigger_stopping(TriggerStatus::GenerationChanged, None);
         self.stop_port().await;
+        self.settle_trigger_write_after_port_stop().await;
+        self.finish_stopped_trigger_if_idle().await;
         if let Some(released) =
             self.control
                 .change_generation(self.generation, wall_time_ns(), Instant::now())
@@ -1609,6 +2933,19 @@ impl SlotActor {
         Ok(())
     }
 
+    fn stage_device_profile(
+        &mut self,
+        device_profile: Option<DeviceProfile>,
+    ) -> Result<bool, SlotError> {
+        debug_assert!(self.pending_reconfiguration.is_none());
+        if self.device_profile == device_profile {
+            return Ok(false);
+        }
+        self.pending_reconfiguration =
+            Some(PendingReconfiguration::DeviceProfile { device_profile });
+        Ok(true)
+    }
+
     async fn commit_staged_reconfiguration(&mut self) -> Result<(), SlotError> {
         let Some(pending) = self.pending_reconfiguration.take() else {
             debug_assert!(false, "commit requires a staged Slot change");
@@ -1638,6 +2975,9 @@ impl SlotActor {
                 )
                 .await;
             }
+            PendingReconfiguration::DeviceProfile { device_profile } => {
+                self.apply_committed_device_profile(device_profile).await;
+            }
         }
         Ok(())
     }
@@ -1664,8 +3004,52 @@ impl SlotActor {
                 self.resume_current_config();
                 self.publish_snapshot().await;
             }
+            PendingReconfiguration::DeviceProfile { .. } => {
+                // Staging a profile is inert, so dropping the candidate fully
+                // restores the pre-transaction state without an event.
+            }
         }
         Ok(())
+    }
+
+    async fn apply_committed_device_profile(&mut self, device_profile: Option<DeviceProfile>) {
+        let previous_effective =
+            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        self.device_profile = device_profile;
+        let effective =
+            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        self.emit(
+            EventKind::SlotReconfigured,
+            Direction::None,
+            Vec::new(),
+            Some(system_actor()),
+            None,
+            metadata([
+                (
+                    "current",
+                    serde_json::to_value(&self.config).unwrap_or(Value::Null),
+                ),
+                (
+                    "device_profile",
+                    serde_json::to_value(
+                        self.device_profile
+                            .as_ref()
+                            .map(|profile| profile.name.as_str()),
+                    )
+                    .unwrap_or(Value::Null),
+                ),
+                (
+                    "previous_effective",
+                    serde_json::to_value(previous_effective).unwrap_or(Value::Null),
+                ),
+                (
+                    "effective",
+                    serde_json::to_value(effective).unwrap_or(Value::Null),
+                ),
+                ("profile_only", json!(true)),
+            ]),
+        )
+        .await;
     }
 
     async fn apply_committed_reconfiguration(
@@ -1673,9 +3057,13 @@ impl SlotActor {
         config: SlotConfig,
         device_profile: Option<DeviceProfile>,
     ) {
+        let previous_effective =
+            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
         let previous = std::mem::replace(&mut self.config, config);
         self.device_profile = device_profile;
         self.resume_current_config();
+        let effective =
+            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
         self.emit(
             EventKind::SlotReconfigured,
             Direction::None,
@@ -1691,6 +3079,24 @@ impl SlotActor {
                     "current",
                     serde_json::to_value(&self.config).unwrap_or(Value::Null),
                 ),
+                (
+                    "device_profile",
+                    serde_json::to_value(
+                        self.device_profile
+                            .as_ref()
+                            .map(|profile| profile.name.as_str()),
+                    )
+                    .unwrap_or(Value::Null),
+                ),
+                (
+                    "previous_effective",
+                    serde_json::to_value(previous_effective).unwrap_or(Value::Null),
+                ),
+                (
+                    "effective",
+                    serde_json::to_value(effective).unwrap_or(Value::Null),
+                ),
+                ("profile_only", json!(false)),
             ]),
         )
         .await;
@@ -1716,7 +3122,10 @@ impl SlotActor {
     async fn prepare_shutdown(&mut self) {
         self.administratively_paused = true;
         let was_online = self.port.is_some();
+        self.mark_trigger_stopping(TriggerStatus::PortClosed, None);
         self.stop_port().await;
+        self.settle_trigger_write_after_port_stop().await;
+        self.finish_stopped_trigger_if_idle().await;
         if let Some(released) =
             self.control
                 .change_generation(self.generation, wall_time_ns(), Instant::now())
@@ -1795,13 +3204,46 @@ impl SlotActor {
     }
 
     async fn stop_port(&mut self) {
+        let mut reader_tail = ReaderTail::default();
         if let Some(port) = self.port.take() {
             let _ = port.cancel.send(true);
             drop(port.commands);
-            let _ = port.reader.await;
+            drop(port.reader_commands);
+            if let Ok(tail) = port.reader.await {
+                reader_tail = tail;
+            }
             let _ = port.writer.await;
         }
-        self.port_events = None;
+        if let Some(mut events) = self.port_events.take() {
+            while let Ok(event) = events.try_recv() {
+                let (data, dropped_bytes) = drained_port_event_parts(event);
+                if let Some(data) = data {
+                    self.handle_rx_data(data).await;
+                }
+                if dropped_bytes > 0 {
+                    self.handle_rx_overflow(dropped_bytes).await;
+                }
+            }
+        }
+        if reader_tail.dropped_bytes > 0 {
+            self.handle_rx_overflow(reader_tail.dropped_bytes).await;
+        }
+        if !reader_tail.pending.is_empty() {
+            self.handle_rx_data(reader_tail.pending).await;
+        }
+    }
+}
+
+fn drained_port_event_parts(event: PortEvent) -> (Option<Vec<u8>>, u64) {
+    match event {
+        PortEvent::Rx(data) => (Some(data), 0),
+        PortEvent::Overflow { dropped_bytes } => (None, dropped_bytes),
+        // The caller already owns the authoritative close reason, so a
+        // duplicate worker-close notification must not recurse into
+        // `stop_port`. Its overflow accounting is still authoritative:
+        // a reader that successfully queued this event returns an empty tail.
+        PortEvent::Closed { dropped_bytes, .. } => (None, dropped_bytes),
+        PortEvent::ReaderBarrier { .. } => (None, 0),
     }
 }
 
@@ -1832,7 +3274,32 @@ enum SlotRequest {
         fence: u64,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+    },
+    StartTrigger {
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
+        spec: TriggerSpec,
+    },
+    TriggerStatus {
+        actor: Actor,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
+    },
+    CancelTrigger {
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
     },
     StartRun {
         actor: Actor,
@@ -1878,6 +3345,7 @@ impl SlotRequest {
                 Ok(())
             }
             Self::Checkpoint { label, .. } => validate_label(label),
+            Self::StartTrigger { spec, .. } => validate_trigger_spec(spec),
             _ => Ok(()),
         }
     }
@@ -1886,33 +3354,65 @@ impl SlotRequest {
     /// lease ID, and fence are deliberately excluded because those are
     /// connection-scoped authorization data and change after reconnect.
     fn write_fingerprint(&self) -> Option<Vec<u8>> {
-        let Self::Write {
-            data,
-            operation_id,
-            pacing,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        Some(
-            serde_json::to_vec(&(data, operation_id, pacing))
-                .expect("write request fields are serializable"),
-        )
+        match self {
+            Self::Write {
+                data,
+                operation_id,
+                expected_run_id,
+                pacing,
+                ..
+            } => Some(
+                serde_json::to_vec(&("write", data, operation_id, expected_run_id, pacing))
+                    .expect("write request fields are serializable"),
+            ),
+            Self::StartTrigger {
+                daemon_epoch,
+                generation,
+                operation_id,
+                expected_run_id,
+                spec,
+                ..
+            } => Some(
+                serde_json::to_vec(&(
+                    "trigger_start",
+                    daemon_epoch,
+                    generation,
+                    operation_id,
+                    expected_run_id,
+                    spec,
+                ))
+                .expect("Trigger request fields are serializable"),
+            ),
+            _ => None,
+        }
     }
 
-    fn validate_write_control(&self, control: &ControlState) -> Result<(), SlotError> {
-        let Self::Write {
-            actor,
-            control_id,
-            fence,
-            ..
-        } = self
-        else {
-            return Ok(());
-        };
-        control.validate(&actor.id, *control_id, *fence, Instant::now())?;
-        Ok(())
+    fn validate_write_authorization(
+        &self,
+        control: &ControlState,
+        active_run: Option<&RunInfo>,
+    ) -> Result<(), SlotError> {
+        match self {
+            Self::Write {
+                actor,
+                control_id,
+                fence,
+                expected_run_id,
+                ..
+            }
+            | Self::StartTrigger {
+                actor,
+                control_id,
+                fence,
+                expected_run_id,
+                ..
+            } => {
+                control.validate(&actor.id, *control_id, *fence, Instant::now())?;
+                validate_expected_write_run(*expected_run_id, actor, active_run)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn fingerprint(&self) -> Vec<u8> {
@@ -1942,6 +3442,7 @@ impl SlotRequest {
                 fence,
                 data,
                 operation_id,
+                expected_run_id,
                 pacing,
             } => serde_json::to_vec(&(
                 "write",
@@ -1950,7 +3451,56 @@ impl SlotRequest {
                 fence,
                 data,
                 operation_id,
+                expected_run_id,
                 pacing,
+            )),
+            Self::StartTrigger {
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                operation_id,
+                expected_run_id,
+                spec,
+            } => serde_json::to_vec(&(
+                "trigger_start",
+                &actor.id,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                operation_id,
+                expected_run_id,
+                spec,
+            )),
+            Self::TriggerStatus {
+                actor,
+                daemon_epoch,
+                generation,
+                trigger_id,
+            } => serde_json::to_vec(&(
+                "trigger_status",
+                &actor.id,
+                daemon_epoch,
+                generation,
+                trigger_id,
+            )),
+            Self::CancelTrigger {
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                trigger_id,
+            } => serde_json::to_vec(&(
+                "trigger_cancel",
+                &actor.id,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                trigger_id,
             )),
             Self::StartRun {
                 actor,
@@ -1976,6 +3526,27 @@ impl SlotRequest {
     }
 }
 
+fn validate_expected_write_run(
+    expected_run_id: Option<Uuid>,
+    actor: &Actor,
+    active_run: Option<&RunInfo>,
+) -> Result<(), SlotError> {
+    let Some(expected_run_id) = expected_run_id else {
+        return Ok(());
+    };
+    let active_run = active_run.ok_or(SlotError::WriteRunMissing { expected_run_id })?;
+    if active_run.id != expected_run_id {
+        return Err(SlotError::WriteRunMismatch {
+            expected_run_id,
+            active_run_id: active_run.id,
+        });
+    }
+    if active_run.owner.id != actor.id {
+        return Err(SlotError::WriteRunNotOwner { expected_run_id });
+    }
+    Ok(())
+}
+
 fn validate_label(label: &str) -> Result<(), SlotError> {
     if label.is_empty()
         || label != label.trim()
@@ -1988,13 +3559,156 @@ fn validate_label(label: &str) -> Result<(), SlotError> {
     }
 }
 
+fn validate_trigger_spec(spec: &TriggerSpec) -> Result<(), SlotError> {
+    if spec.action.is_empty() || spec.action.len() > MAX_TRIGGER_ACTION_BYTES {
+        return Err(SlotError::InvalidTriggerAction);
+    }
+    if let Some(initial) = &spec.initial_write {
+        if initial.is_empty() {
+            return Err(SlotError::EmptyWrite);
+        }
+        if initial.len() > MAX_TRIGGER_INITIAL_WRITE_BYTES {
+            return Err(SlotError::TriggerInitialWriteTooLarge);
+        }
+    }
+    if !(MIN_TRIGGER_INTERVAL_MS..=MAX_TRIGGER_INTERVAL_MS).contains(&spec.interval_ms) {
+        return Err(SlotError::InvalidTriggerInterval);
+    }
+    if !(MIN_TRIGGER_TIMEOUT_MS..=MAX_TRIGGER_TIMEOUT_MS).contains(&spec.timeout_ms) {
+        return Err(SlotError::InvalidTriggerTimeout);
+    }
+    if !(1..=MAX_TRIGGER_FIRES).contains(&spec.max_fires) {
+        return Err(SlotError::InvalidTriggerMaxFires);
+    }
+    if spec.stop_contains.len() > MAX_TRIGGER_PATTERNS
+        || spec
+            .start_contains
+            .iter()
+            .chain(spec.stop_contains.iter())
+            .any(|pattern| pattern.is_empty() || pattern.len() > MAX_TRIGGER_PATTERN_BYTES)
+    {
+        return Err(SlotError::InvalidTriggerPatterns);
+    }
+    let planned_action_bytes = spec
+        .action
+        .len()
+        .checked_mul(spec.max_fires as usize)
+        .ok_or(SlotError::TriggerTotalBytesTooLarge)?;
+    let planned_total = spec
+        .initial_write
+        .as_ref()
+        .map_or(0, Vec::len)
+        .checked_add(planned_action_bytes)
+        .ok_or(SlotError::TriggerTotalBytesTooLarge)?;
+    if planned_total > MAX_TRIGGER_TOTAL_BYTES {
+        return Err(SlotError::TriggerTotalBytesTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_trigger_pacing(spec: &TriggerSpec, settings: &SerialSettings) -> Result<(), SlotError> {
+    let pacing = WritePacing::resolve(spec.pacing, settings);
+    for length in spec
+        .initial_write
+        .iter()
+        .map(Vec::len)
+        .chain(std::iter::once(spec.action.len()))
+    {
+        write_deadline(
+            length,
+            pacing.chunk_size as usize,
+            Duration::from_millis(pacing.chunk_delay_ms),
+        )
+        .map_err(|required_ms| SlotError::WriteDeadlineExceeded {
+            required_ms,
+            maximum_ms: duration_millis_saturating(MAX_WRITE_TIMEOUT),
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_trigger_identity(
+    trigger: &TriggerInfo,
+    daemon_epoch: Uuid,
+    generation: u64,
+) -> Result<(), SlotError> {
+    if trigger.daemon_epoch != daemon_epoch {
+        return Err(SlotError::TriggerEpochMismatch);
+    }
+    if trigger.generation != generation {
+        return Err(SlotError::TriggerGenerationMismatch);
+    }
+    Ok(())
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn trigger_write_due_at(
+    now: Instant,
+    deadline: Instant,
+    next_write_at: Option<Instant>,
+    stopping: bool,
+    write_in_flight: bool,
+) -> bool {
+    !stopping
+        && !write_in_flight
+        && now < deadline
+        && next_write_at.is_some_and(|write_at| now >= write_at)
+}
+
+fn trigger_terminal_priority(status: TriggerStatus) -> u8 {
+    match status {
+        TriggerStatus::RxGap => 100,
+        TriggerStatus::WriteFailed
+        | TriggerStatus::PortClosed
+        | TriggerStatus::GenerationChanged => 90,
+        TriggerStatus::ControlLost | TriggerStatus::RunLost => 80,
+        TriggerStatus::Matched => 70,
+        TriggerStatus::Cancelled => 60,
+        TriggerStatus::TimedOut => 20,
+        TriggerStatus::MaxFiresReached => 10,
+        TriggerStatus::Armed
+        | TriggerStatus::WaitingForStart
+        | TriggerStatus::Running
+        | TriggerStatus::Stopping => 0,
+    }
+}
+
+fn trigger_event_metadata(info: &TriggerInfo) -> BTreeMap<String, Value> {
+    let mut values = metadata([
+        ("trigger_id", json!(info.id)),
+        ("status", json!(info.status)),
+        ("fires_confirmed", json!(info.fires_confirmed)),
+        ("tx_bytes_confirmed", json!(info.tx_bytes_confirmed)),
+        ("trigger", serde_json::to_value(info).unwrap_or(Value::Null)),
+    ]);
+    if let Some(pattern) = &info.matched_pattern {
+        values.insert(
+            "matched_pattern_base64".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(pattern)),
+        );
+    }
+    values
+}
+
 fn is_cacheable_write_result(result: &Result<CommandResult, SlotError>) -> bool {
     matches!(
         result,
-        Ok(CommandResult::WriteAccepted { .. }) | Err(SlotError::PartialWrite { .. })
+        Ok(CommandResult::WriteAccepted { .. })
+            | Ok(CommandResult::TriggerStarted { .. })
+            | Err(SlotError::PartialWrite { .. })
     )
 }
 
+// This enum is only a short-lived dispatch value. Boxing the common request
+// path would add one heap allocation to every Slot command without reducing
+// any retained queue.
+#[allow(clippy::large_enum_variant)]
 enum CommandDisposition {
     Request {
         key: (String, Uuid),
@@ -2010,9 +3724,9 @@ enum CommandDisposition {
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
-    SetDeviceProfile {
+    StageDeviceProfile {
         device_profile: Option<DeviceProfile>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<bool, SlotError>>,
     },
     StageRemoval {
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -2096,6 +3810,7 @@ impl SlotCommand {
                 fence,
                 data,
                 operation_id,
+                expected_run_id,
                 pacing,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
@@ -2105,7 +3820,71 @@ impl SlotCommand {
                     fence,
                     data,
                     operation_id,
+                    expected_run_id,
                     pacing,
+                },
+                reply,
+            },
+            SlotCommand::StartTrigger {
+                request_id,
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                operation_id,
+                expected_run_id,
+                spec,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::StartTrigger {
+                    actor,
+                    control_id,
+                    fence,
+                    daemon_epoch,
+                    generation,
+                    operation_id,
+                    expected_run_id,
+                    spec,
+                },
+                reply,
+            },
+            SlotCommand::TriggerStatus {
+                request_id,
+                actor,
+                daemon_epoch,
+                generation,
+                trigger_id,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::TriggerStatus {
+                    actor,
+                    daemon_epoch,
+                    generation,
+                    trigger_id,
+                },
+                reply,
+            },
+            SlotCommand::CancelTrigger {
+                request_id,
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                trigger_id,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::CancelTrigger {
+                    actor,
+                    control_id,
+                    fence,
+                    daemon_epoch,
+                    generation,
+                    trigger_id,
                 },
                 reply,
             },
@@ -2176,10 +3955,10 @@ impl SlotCommand {
                 resume_on_rollback,
                 reply,
             },
-            SlotCommand::SetDeviceProfile {
+            SlotCommand::StageDeviceProfile {
                 device_profile,
                 reply,
-            } => CommandDisposition::SetDeviceProfile {
+            } => CommandDisposition::StageDeviceProfile {
                 device_profile,
                 reply,
             },
@@ -2224,9 +4003,12 @@ fn initial_snapshot(
         tx_offset: 0,
         control: None,
         active_run: None,
+        active_trigger: None,
         logging: LoggingState::Healthy,
         effective_shell_prompt: resolved.shell_prompt,
         effective_uboot_prompt: resolved.uboot_prompt,
+        effective_write_eol: Some(resolved.write_eol),
+        effective_echo: Some(resolved.echo),
     }
 }
 
@@ -2271,18 +4053,21 @@ fn open_port(port_name: &str, settings: &SerialSettings) -> Result<SerialStream,
 
 fn spawn_port_worker(stream: SerialStream) -> (PortWorker, mpsc::Receiver<PortEvent>) {
     let (commands, command_rx) = mpsc::channel(PORT_WRITE_QUEUE);
+    let (reader_commands, reader_command_rx) = mpsc::channel(PORT_READER_COMMAND_QUEUE);
     let (events, event_rx) = mpsc::channel(PORT_EVENT_QUEUE);
     let (cancel, cancel_rx) = watch::channel(false);
     let (reader_half, writer_half) = tokio::io::split(stream);
     let reader = tokio::spawn(run_port_reader(
         reader_half,
         events.clone(),
+        reader_command_rx,
         cancel_rx.clone(),
     ));
     let writer = tokio::spawn(run_port_writer(writer_half, command_rx, events, cancel_rx));
     (
         PortWorker {
             commands,
+            reader_commands,
             cancel,
             reader,
             writer,
@@ -2294,14 +4079,24 @@ fn spawn_port_worker(stream: SerialStream) -> (PortWorker, mpsc::Receiver<PortEv
 async fn run_port_reader(
     mut reader: tokio::io::ReadHalf<SerialStream>,
     events: mpsc::Sender<PortEvent>,
+    mut commands: mpsc::Receiver<PortReaderCommand>,
     mut cancel: watch::Receiver<bool>,
-) {
+) -> ReaderTail {
     let mut buffer = vec![0_u8; RX_BUFFER_BYTES];
     let mut pending = Vec::with_capacity(RX_BUFFER_BYTES);
     let mut dropped_bytes = 0_u64;
     let mut flush_deadline = None;
 
     loop {
+        if pending.len() >= RX_BUFFER_BYTES {
+            enqueue_rx(&events, &mut pending, &mut dropped_bytes);
+            flush_deadline = arm_rx_flush_deadline(
+                None,
+                tokio::time::Instant::now(),
+                !pending.is_empty() || dropped_bytes > 0,
+            );
+        }
+        let read_capacity = rx_read_capacity(pending.len());
         let deadline = flush_deadline;
         let flush = async move {
             match deadline {
@@ -2310,42 +4105,124 @@ async fn run_port_reader(
             }
         };
         tokio::select! {
+            command = commands.recv() => {
+                let Some(PortReaderCommand::Barrier { id }) = command else {
+                    return ReaderTail {
+                        pending,
+                        dropped_bytes,
+                    };
+                };
+                enqueue_rx(&events, &mut pending, &mut dropped_bytes);
+                if dropped_bytes > 0 {
+                    let dropped = dropped_bytes;
+                    let sent = tokio::select! {
+                        _ = cancel.changed() => false,
+                        result = events.send(PortEvent::Overflow { dropped_bytes: dropped }) => {
+                            result.is_ok()
+                        }
+                    };
+                    if !sent {
+                        return ReaderTail {
+                            pending,
+                            dropped_bytes,
+                        };
+                    }
+                    dropped_bytes = 0;
+                }
+                let sent = tokio::select! {
+                    _ = cancel.changed() => false,
+                    result = events.send(PortEvent::ReaderBarrier { id }) => result.is_ok(),
+                };
+                if !sent {
+                    return ReaderTail {
+                        pending,
+                        dropped_bytes,
+                    };
+                }
+                flush_deadline = None;
+            }
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
-                    return;
+                    return ReaderTail {
+                        pending,
+                        dropped_bytes,
+                    };
                 }
             }
             _ = flush => {
                 enqueue_rx(&events, &mut pending, &mut dropped_bytes);
-                flush_deadline = (!pending.is_empty() || dropped_bytes > 0)
-                    .then(|| tokio::time::Instant::now() + RX_COALESCE_WINDOW);
+                flush_deadline = arm_rx_flush_deadline(
+                    None,
+                    tokio::time::Instant::now(),
+                    !pending.is_empty() || dropped_bytes > 0,
+                );
             }
-            read = reader.read(&mut buffer) => match read {
+            read = reader.read(&mut buffer[..read_capacity]) => match read {
                 Ok(0) => {
                     enqueue_rx(&events, &mut pending, &mut dropped_bytes);
-                    send_port_closed(
+                    let sent = send_port_closed(
                         &events,
                         &mut cancel,
                         "serial port reached EOF".into(),
+                        dropped_bytes,
                     )
                     .await;
-                    return;
+                    return if sent {
+                        ReaderTail::default()
+                    } else {
+                        ReaderTail {
+                            pending,
+                            dropped_bytes,
+                        }
+                    };
                 }
                 Ok(count) => {
                     pending.extend_from_slice(&buffer[..count]);
                     if pending.len() >= RX_BUFFER_BYTES {
                         enqueue_rx(&events, &mut pending, &mut dropped_bytes);
                     }
-                    flush_deadline = Some(tokio::time::Instant::now() + RX_COALESCE_WINDOW);
+                    // The coalescing window is a hard maximum measured from
+                    // the first pending byte. A continuous stream must not
+                    // keep extending it until the 4 KiB buffer fills.
+                    flush_deadline = arm_rx_flush_deadline(
+                        flush_deadline,
+                        tokio::time::Instant::now(),
+                        !pending.is_empty() || dropped_bytes > 0,
+                    );
                 }
                 Err(error) => {
                     enqueue_rx(&events, &mut pending, &mut dropped_bytes);
-                    send_port_closed(&events, &mut cancel, error.to_string()).await;
-                    return;
+                    let sent = send_port_closed(
+                        &events,
+                        &mut cancel,
+                        error.to_string(),
+                        dropped_bytes,
+                    )
+                    .await;
+                    return if sent {
+                        ReaderTail::default()
+                    } else {
+                        ReaderTail {
+                            pending,
+                            dropped_bytes,
+                        }
+                    };
                 }
             }
         }
     }
+}
+
+fn rx_read_capacity(pending_len: usize) -> usize {
+    RX_BUFFER_BYTES.saturating_sub(pending_len)
+}
+
+fn arm_rx_flush_deadline(
+    current: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    has_pending_work: bool,
+) -> Option<tokio::time::Instant> {
+    has_pending_work.then(|| current.unwrap_or(now + RX_COALESCE_WINDOW))
 }
 
 fn enqueue_rx(events: &mpsc::Sender<PortEvent>, pending: &mut Vec<u8>, dropped_bytes: &mut u64) {
@@ -2368,7 +4245,7 @@ fn enqueue_rx(events: &mpsc::Sender<PortEvent>, pending: &mut Vec<u8>, dropped_b
     if pending.is_empty() {
         return;
     }
-    let data = std::mem::take(pending);
+    let data = std::mem::replace(pending, Vec::with_capacity(RX_BUFFER_BYTES));
     let length = data.len() as u64;
     match events.try_send(PortEvent::Rx(data)) {
         Ok(()) => {}
@@ -2398,12 +4275,13 @@ async fn run_port_writer(
         let Some(PortCommand::Write {
             data,
             pacing,
+            deadline,
             reply,
         }) = command
         else {
             return;
         };
-        let outcome = write_with_pacing(&mut writer, &data, pacing, &mut cancel).await;
+        let outcome = write_with_pacing(&mut writer, &data, pacing, deadline, &mut cancel).await;
         let failed = outcome.error.is_some();
         let cancelled = outcome.cancelled;
         let message = outcome.error.clone();
@@ -2416,6 +4294,7 @@ async fn run_port_writer(
                 &events,
                 &mut cancel,
                 message.unwrap_or_else(|| "serial write failed".into()),
+                0,
             )
             .await;
             return;
@@ -2427,13 +4306,16 @@ async fn run_port_writer(
 /// `pacing.chunk_delay_ms` between chunks (never after the final chunk) so a
 /// slow target UART is not overrun. A zero chunk delay keeps the original
 /// full-speed path with no sleeps. A chunk size of zero is treated as one
-/// byte. The deadline is the fixed write timeout extended to twice the
-/// estimated pacing duration, so large paced writes cannot time out merely
-/// because pacing made them slower.
+/// byte. The hard request deadline includes configured pacing plus a
+/// per-chunk scheduler/driver allowance, while each individual driver write
+/// still has the fixed no-progress timeout. The caller must reject a pacing
+/// plan that exceeds [`MAX_WRITE_TIMEOUT`] before enqueueing it and supplies
+/// the resulting absolute deadline here.
 async fn write_with_pacing<W>(
     writer: &mut W,
     data: &[u8],
     pacing: WritePacing,
+    deadline: tokio::time::Instant,
     cancel: &mut watch::Receiver<bool>,
 ) -> PortWriteOutcome
 where
@@ -2441,8 +4323,6 @@ where
 {
     let chunk_size = (pacing.chunk_size as usize).max(1);
     let chunk_delay = Duration::from_millis(pacing.chunk_delay_ms);
-    let deadline =
-        tokio::time::Instant::now() + write_deadline(data.len(), chunk_size, chunk_delay);
     let mut written = 0;
     let mut error = None;
     let mut cancelled = false;
@@ -2451,7 +4331,18 @@ where
         // One chunk can still need several driver calls when a write is
         // accepted only partially.
         while written < chunk_end {
+            if write_cancelled(cancel) {
+                error = Some("serial write cancelled because the port is closing".into());
+                cancelled = true;
+                break 'chunks;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                error = Some("serial write timed out; port state is uncertain".into());
+                break 'chunks;
+            }
+            let no_progress_deadline = tokio::time::Instant::now() + WRITE_TIMEOUT;
             tokio::select! {
+                biased;
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
                         error = Some("serial write cancelled because the port is closing".into());
@@ -2461,6 +4352,10 @@ where
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     error = Some("serial write timed out; port state is uncertain".into());
+                    break;
+                }
+                _ = tokio::time::sleep_until(no_progress_deadline) => {
+                    error = Some("serial driver write timed out after making no progress; port state is uncertain".into());
                     break;
                 }
                 result = writer.write(&data[written..chunk_end]) => match result {
@@ -2482,7 +4377,17 @@ where
         if written >= data.len() || chunk_delay.is_zero() {
             continue;
         }
+        if write_cancelled(cancel) {
+            error = Some("serial write cancelled because the port is closing".into());
+            cancelled = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            error = Some("serial write timed out; port state is uncertain".into());
+            break;
+        }
         tokio::select! {
+            biased;
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     error = Some("serial write cancelled because the port is closing".into());
@@ -2505,30 +4410,72 @@ where
     }
 }
 
-/// Deadline budget for one paced write: at least the fixed write timeout,
-/// otherwise twice the estimated inter-chunk pacing duration plus the fixed
-/// timeout as slack for driver latency.
-fn write_deadline(total_bytes: usize, chunk_size: usize, chunk_delay: Duration) -> Duration {
+fn write_cancelled(cancel: &watch::Receiver<bool>) -> bool {
+    *cancel.borrow() || cancel.has_changed().is_err()
+}
+
+/// Deadline budget for one paced write.
+///
+/// The fixed timeout covers the first chunk. Every later planned chunk adds
+/// twice its configured pacing delay plus a conservative allowance for timer
+/// quantization and asynchronous driver scheduling. Windows commonly turns a
+/// nominal 1 ms typewriter cadence into roughly 15 ms per byte, so counting
+/// only the requested sleeps is not a safe estimate. An over-budget plan is
+/// rejected in full before any bytes are written; it is never clamped into a
+/// deadline that guarantees a partial write. The per-driver-call no-progress
+/// timeout in [`write_with_pacing`] remains a separate, shorter bound.
+fn write_deadline(
+    total_bytes: usize,
+    chunk_size: usize,
+    chunk_delay: Duration,
+) -> Result<Duration, u64> {
     if chunk_delay.is_zero() {
-        return WRITE_TIMEOUT;
+        return Ok(WRITE_TIMEOUT);
     }
     let chunk_count = total_bytes.div_ceil(chunk_size.max(1)) as u128;
-    let pacing_millis = chunk_count
-        .saturating_sub(1)
-        .saturating_mul(chunk_delay.as_millis())
-        .min(u64::MAX as u128) as u64;
-    let estimated = Duration::from_millis(pacing_millis);
-    WRITE_TIMEOUT.max(estimated.saturating_mul(2).saturating_add(WRITE_TIMEOUT))
+    let additional_chunks = chunk_count.saturating_sub(1);
+    let pacing_millis = additional_chunks.saturating_mul(chunk_delay.as_millis());
+    let scheduling_millis =
+        additional_chunks.saturating_mul(WRITE_CHUNK_OVERHEAD_ALLOWANCE.as_millis());
+    let budget_millis = WRITE_TIMEOUT
+        .as_millis()
+        .saturating_add(pacing_millis.saturating_mul(2))
+        .saturating_add(scheduling_millis);
+    let budget_millis = budget_millis.min(u64::MAX as u128) as u64;
+    if budget_millis > duration_millis_saturating(MAX_WRITE_TIMEOUT) {
+        return Err(budget_millis);
+    }
+    Ok(Duration::from_millis(budget_millis))
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn ensure_lease_covers_write(
+    lease_remaining: Duration,
+    write_timeout: Duration,
+) -> Result<(), SlotError> {
+    let required = write_timeout.saturating_add(WRITE_LEASE_SAFETY_MARGIN);
+    if lease_remaining < required {
+        return Err(SlotError::WriteLeaseTooShort {
+            remaining_ms: duration_millis_saturating(lease_remaining),
+            write_ms: duration_millis_saturating(write_timeout),
+            margin_ms: duration_millis_saturating(WRITE_LEASE_SAFETY_MARGIN),
+        });
+    }
+    Ok(())
 }
 
 async fn send_port_closed(
     events: &mpsc::Sender<PortEvent>,
     cancel: &mut watch::Receiver<bool>,
     reason: String,
-) {
+    dropped_bytes: u64,
+) -> bool {
     tokio::select! {
-        _ = cancel.changed() => {}
-        _ = events.send(PortEvent::Closed(reason)) => {}
+        _ = cancel.changed() => false,
+        result = events.send(PortEvent::Closed { reason, dropped_bytes }) => result.is_ok(),
     }
 }
 
@@ -2584,6 +4531,109 @@ mod tests {
         assert_eq!(settings.echo, EchoMode::On);
     }
 
+    fn trigger_spec(action: &[u8]) -> TriggerSpec {
+        TriggerSpec {
+            initial_write: None,
+            start_contains: None,
+            action: action.to_vec(),
+            interval_ms: 20,
+            stop_contains: vec![b"ready>".to_vec()],
+            timeout_ms: 5_000,
+            max_fires: 250,
+            pacing: None,
+        }
+    }
+
+    #[test]
+    fn literal_matcher_matches_across_real_chunks_without_self_replaying_one_chunk() {
+        let mut single_observation = LiteralMatcher::new(vec![b"abcabc".to_vec()]);
+        assert_eq!(single_observation.push(b"abc"), None);
+
+        // Buffered RX is matched when it first reaches the actor. Flushing
+        // that exact chunk after TX audit must only emit it, never feed it to
+        // the matcher a second time: doing so would create this false match.
+        assert_eq!(single_observation.tail, b"abc");
+
+        let mut real_two_chunk_stream = LiteralMatcher::new(vec![b"abcabc".to_vec()]);
+        assert_eq!(real_two_chunk_stream.push(b"abc"), None);
+        assert_eq!(real_two_chunk_stream.push(b"abc"), Some(b"abcabc".to_vec()));
+    }
+
+    #[test]
+    fn trigger_spec_is_device_agnostic_and_strictly_bounded() {
+        let mut valid = trigger_spec(&[0x00, 0xff, b'x']);
+        valid.initial_write = Some(b"reset\r".to_vec());
+        valid.start_contains = Some(vec![0x80, b'B']);
+        valid.stop_contains = vec![vec![0x00, 0xfe], b"arbitrary prompt".to_vec()];
+        assert_eq!(validate_trigger_spec(&valid), Ok(()));
+
+        let mut too_many_bytes = trigger_spec(&vec![0; MAX_TRIGGER_ACTION_BYTES]);
+        too_many_bytes.max_fires = 257;
+        assert_eq!(
+            validate_trigger_spec(&too_many_bytes),
+            Err(SlotError::TriggerTotalBytesTooLarge)
+        );
+
+        let mut empty_pattern = trigger_spec(b"x");
+        empty_pattern.stop_contains = vec![Vec::new()];
+        assert_eq!(
+            validate_trigger_spec(&empty_pattern),
+            Err(SlotError::InvalidTriggerPatterns)
+        );
+    }
+
+    #[test]
+    fn trigger_due_predicate_excludes_the_deadline_and_blocked_states() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(20);
+        assert!(trigger_write_due_at(now, deadline, Some(now), false, false));
+        assert!(!trigger_write_due_at(
+            deadline,
+            deadline,
+            Some(now),
+            false,
+            false
+        ));
+        assert!(!trigger_write_due_at(now, deadline, Some(now), true, false));
+        assert!(!trigger_write_due_at(now, deadline, Some(now), false, true));
+    }
+
+    #[test]
+    fn trigger_rx_audit_buffer_keeps_a_gap_at_the_dropped_suffix() {
+        let mut buffer = TriggerRxAuditBuffer::default();
+        assert!(!buffer.push_rx_with_limit(vec![1, 2], 3));
+        assert!(buffer.push_rx_with_limit(vec![3, 4], 3));
+        // Once a suffix has been dropped, later smaller chunks cannot jump
+        // ahead of the eventual Gap event.
+        assert!(buffer.push_rx_with_limit(vec![5], 3));
+
+        let (events, dropped_bytes) = buffer.take();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events.front(),
+            Some(PortEvent::Rx(data)) if data == &[1, 2]
+        ));
+        assert_eq!(dropped_bytes, 3);
+        assert_eq!(buffer.bytes, 0);
+        assert_eq!(buffer.dropped_bytes, 0);
+    }
+
+    #[test]
+    fn uncertain_trigger_failures_override_success_and_timer_bounds() {
+        assert!(
+            trigger_terminal_priority(TriggerStatus::RxGap)
+                > trigger_terminal_priority(TriggerStatus::Matched)
+        );
+        assert!(
+            trigger_terminal_priority(TriggerStatus::WriteFailed)
+                > trigger_terminal_priority(TriggerStatus::Matched)
+        );
+        assert!(
+            trigger_terminal_priority(TriggerStatus::Matched)
+                > trigger_terminal_priority(TriggerStatus::TimedOut)
+        );
+    }
+
     #[test]
     fn request_fingerprint_detects_reused_id_with_different_write_bytes() {
         let actor = Actor {
@@ -2598,6 +4648,7 @@ mod tests {
             fence: 7,
             data: b"first".to_vec(),
             operation_id: None,
+            expected_run_id: None,
             pacing: None,
         };
         let same = SlotRequest::Write {
@@ -2606,6 +4657,7 @@ mod tests {
             fence: 7,
             data: b"first".to_vec(),
             operation_id: None,
+            expected_run_id: None,
             pacing: None,
         };
         let different = SlotRequest::Write {
@@ -2614,6 +4666,7 @@ mod tests {
             fence: 7,
             data: b"second".to_vec(),
             operation_id: None,
+            expected_run_id: None,
             pacing: None,
         };
         assert_eq!(first.fingerprint(), same.fingerprint());
@@ -2634,6 +4687,7 @@ mod tests {
             fence: 7,
             data: b"reboot\r".to_vec(),
             operation_id: None,
+            expected_run_id: None,
             pacing: None,
         };
         let paced = SlotRequest::Write {
@@ -2642,12 +4696,86 @@ mod tests {
             fence: 7,
             data: b"reboot\r".to_vec(),
             operation_id: None,
+            expected_run_id: None,
             pacing: Some(WritePacing {
                 chunk_size: 1,
                 chunk_delay_ms: 5,
             }),
         };
         assert_ne!(unpaced.write_fingerprint(), paced.write_fingerprint());
+    }
+
+    #[test]
+    fn agent_write_fingerprint_and_authorization_bind_the_expected_run() {
+        let actor = Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Agent,
+        };
+        let control_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let other_run_id = Uuid::new_v4();
+        let request = |expected_run_id| SlotRequest::Write {
+            actor: actor.clone(),
+            control_id,
+            fence: 7,
+            data: b"version\r".to_vec(),
+            operation_id: None,
+            expected_run_id,
+            pacing: None,
+        };
+        assert_ne!(
+            request(Some(run_id)).write_fingerprint(),
+            request(Some(other_run_id)).write_fingerprint()
+        );
+        assert_ne!(
+            request(None).write_fingerprint(),
+            request(Some(run_id)).write_fingerprint()
+        );
+
+        let active_run = RunInfo {
+            id: run_id,
+            owner: actor.clone(),
+            label: "task".into(),
+            status: RunStatus::Active,
+            start_seq: 1,
+            end_seq: None,
+            metadata: BTreeMap::new(),
+        };
+        assert!(validate_expected_write_run(None, &actor, None).is_ok());
+        assert!(validate_expected_write_run(Some(run_id), &actor, Some(&active_run)).is_ok());
+
+        let missing = validate_expected_write_run(Some(run_id), &actor, None).unwrap_err();
+        assert!(missing.to_string().contains("(no bytes were written)"));
+        assert!(matches!(
+            missing,
+            SlotError::WriteRunMissing {
+                expected_run_id
+            } if expected_run_id == run_id
+        ));
+
+        assert!(matches!(
+            validate_expected_write_run(Some(other_run_id), &actor, Some(&active_run)),
+            Err(SlotError::WriteRunMismatch {
+                expected_run_id,
+                active_run_id,
+            }) if expected_run_id == other_run_id && active_run_id == run_id
+        ));
+
+        let foreign_run = RunInfo {
+            owner: Actor {
+                id: "agent:other".into(),
+                label: "other".into(),
+                kind: ActorKind::Agent,
+            },
+            ..active_run
+        };
+        assert!(matches!(
+            validate_expected_write_run(Some(run_id), &actor, Some(&foreign_run)),
+            Err(SlotError::WriteRunNotOwner {
+                expected_run_id
+            }) if expected_run_id == run_id
+        ));
     }
 
     #[test]
@@ -2663,6 +4791,7 @@ mod tests {
             fence: 3,
             data: b"reboot\r".to_vec(),
             operation_id,
+            expected_run_id: None,
             pacing: None,
         };
         let reconnected = SlotRequest::Write {
@@ -2675,6 +4804,7 @@ mod tests {
             fence: 9,
             data: b"reboot\r".to_vec(),
             operation_id,
+            expected_run_id: None,
             pacing: None,
         };
 
@@ -2735,6 +4865,19 @@ mod tests {
     fn definite_pre_execution_write_errors_are_not_cached() {
         assert!(!is_cacheable_write_result(&Err(SlotError::EmptyWrite)));
         assert!(!is_cacheable_write_result(&Err(SlotError::PortOffline)));
+        assert!(!is_cacheable_write_result(&Err(
+            SlotError::WriteDeadlineExceeded {
+                required_ms: 15_002,
+                maximum_ms: 15_000,
+            }
+        )));
+        assert!(!is_cacheable_write_result(&Err(
+            SlotError::WriteLeaseTooShort {
+                remaining_ms: 5_000,
+                write_ms: 8_116,
+                margin_ms: 100,
+            }
+        )));
         assert!(is_cacheable_write_result(&Err(SlotError::PartialWrite {
             written: 0,
             total: 4,
@@ -2779,30 +4922,148 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn reader_close_carries_overflow_that_could_not_be_enqueued_first() {
+        let (events, mut receiver) = mpsc::channel(1);
+        assert!(events.try_send(PortEvent::Rx(vec![0])).is_ok());
+        let mut pending = vec![1, 2, 3];
+        let mut dropped = 0;
+        enqueue_rx(&events, &mut pending, &mut dropped);
+        assert_eq!(dropped, 3);
+
+        let (_cancel, cancel) = watch::channel(false);
+        let close = tokio::spawn(async move {
+            let mut cancel = cancel;
+            send_port_closed(&events, &mut cancel, "EOF".into(), dropped).await
+        });
+        assert!(matches!(receiver.recv().await, Some(PortEvent::Rx(_))));
+        assert!(close.await.unwrap());
+        assert!(matches!(
+            receiver.recv().await,
+            Some(PortEvent::Closed {
+                dropped_bytes: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn drained_reader_close_preserves_its_overflow_count() {
+        let (data, dropped_bytes) = drained_port_event_parts(PortEvent::Closed {
+            reason: "EOF".into(),
+            dropped_bytes: 17,
+        });
+
+        assert!(data.is_none());
+        assert_eq!(dropped_bytes, 17);
+    }
+
+    #[test]
+    fn drained_reader_barrier_has_no_serial_payload_or_gap() {
+        let (data, dropped_bytes) =
+            drained_port_event_parts(PortEvent::ReaderBarrier { id: Uuid::new_v4() });
+        assert!(data.is_none());
+        assert_eq!(dropped_bytes, 0);
+    }
+
+    #[test]
+    fn continuous_rx_does_not_extend_the_first_byte_flush_deadline() {
+        let first_byte_at = tokio::time::Instant::now();
+        let first_deadline = arm_rx_flush_deadline(None, first_byte_at, true).unwrap();
+        let later_read_at = first_byte_at + Duration::from_millis(3);
+
+        assert_eq!(
+            arm_rx_flush_deadline(Some(first_deadline), later_read_at, true),
+            Some(first_deadline)
+        );
+        assert_eq!(
+            first_deadline.duration_since(first_byte_at),
+            RX_COALESCE_WINDOW
+        );
+        assert_eq!(
+            arm_rx_flush_deadline(Some(first_deadline), later_read_at, false),
+            None
+        );
+    }
+
+    #[test]
+    fn rx_driver_read_is_bounded_by_the_remaining_event_capacity() {
+        assert_eq!(rx_read_capacity(0), RX_BUFFER_BYTES);
+        assert_eq!(rx_read_capacity(1), RX_BUFFER_BYTES - 1);
+        assert_eq!(rx_read_capacity(RX_BUFFER_BYTES - 17), 17);
+        assert_eq!(rx_read_capacity(RX_BUFFER_BYTES), 0);
+    }
+
     #[test]
     fn write_deadline_scales_with_the_estimated_pacing_duration() {
         // The full-speed path keeps the fixed two-second timeout.
         assert_eq!(
             write_deadline(4_096, 1, Duration::ZERO),
-            Duration::from_secs(2)
+            Ok(Duration::from_secs(2))
         );
-        // 4 KiB at 1 byte/1 ms paces for ~4.1 s, so the deadline doubles the
-        // estimate and adds the fixed timeout instead of expiring mid-write.
+        // A syntactically valid but impractically slow request is rejected in
+        // full; the daemon must not clamp it and then fail partway through.
         assert_eq!(
             write_deadline(4_096, 1, Duration::from_millis(1)),
-            Duration::from_millis(4_095 * 2 + 2_000)
+            Err(2_000 + 4_095 * (2 + 20))
         );
         assert_eq!(
             write_deadline(35, 1, Duration::from_millis(1)),
-            Duration::from_millis(34 * 2 + 2_000)
+            Ok(Duration::from_millis(2_000 + 34 * (2 + 20)))
         );
-        // A pacing estimate shorter than the fixed timeout never shrinks it.
+        // The fixed timeout entirely covers a single chunk.
         assert_eq!(
             write_deadline(1, 16, Duration::from_millis(1)),
-            Duration::from_secs(2)
+            Ok(Duration::from_secs(2))
         );
-        // Extreme pacing settings saturate instead of overflowing.
-        let _ = write_deadline(usize::MAX, 1, Duration::from_millis(u64::MAX));
+        // The boundary is inclusive, while one more planned chunk is rejected
+        // before the port worker can observe the request.
+        assert_eq!(
+            write_deadline(591, 1, Duration::from_millis(1)),
+            Ok(Duration::from_millis(14_980))
+        );
+        assert_eq!(
+            write_deadline(592, 1, Duration::from_millis(1)),
+            Err(15_002)
+        );
+        // Extreme pacing settings report a saturated required duration rather
+        // than overflowing or silently accepting a clamped budget.
+        assert_eq!(
+            write_deadline(usize::MAX, 1, Duration::from_millis(u64::MAX)),
+            Err(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn minimum_and_near_expiry_leases_reject_writes_that_cannot_finish() {
+        let fast_write = write_deadline(4_096, 4_096, Duration::ZERO).unwrap();
+        assert_eq!(fast_write, WRITE_TIMEOUT);
+        assert!(
+            ensure_lease_covers_write(Duration::from_secs(5), fast_write).is_ok(),
+            "a full five-second lease safely covers a two-second full-speed write"
+        );
+
+        let default_279_byte_write = write_deadline(279, 1, Duration::from_millis(1)).unwrap();
+        assert_eq!(default_279_byte_write, Duration::from_millis(8_116));
+        assert!(matches!(
+            ensure_lease_covers_write(Duration::from_secs(5), default_279_byte_write),
+            Err(SlotError::WriteLeaseTooShort {
+                remaining_ms: 5_000,
+                write_ms: 8_116,
+                margin_ms: 100,
+            })
+        ));
+
+        let exact_required = WRITE_TIMEOUT + WRITE_LEASE_SAFETY_MARGIN;
+        assert!(ensure_lease_covers_write(exact_required, WRITE_TIMEOUT).is_ok());
+        assert!(matches!(
+            ensure_lease_covers_write(exact_required - Duration::from_millis(1), WRITE_TIMEOUT),
+            Err(SlotError::WriteLeaseTooShort {
+                remaining_ms: 2_099,
+                write_ms: 2_000,
+                margin_ms: 100,
+            })
+        ));
     }
 
     struct RecordingWriter {
@@ -2850,6 +5111,97 @@ mod tests {
         }
     }
 
+    struct DelayedOneByteWriter {
+        delay: Duration,
+        pending: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        calls: usize,
+    }
+
+    impl DelayedOneByteWriter {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                pending: None,
+                calls: 0,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DelayedOneByteWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.pending.is_none() {
+                self.pending = Some(Box::pin(tokio::time::sleep(self.delay)));
+            }
+            let timer_ready = {
+                let timer = self.pending.as_mut().expect("timer was just installed");
+                std::future::Future::poll(timer.as_mut(), context).is_ready()
+            };
+            if !timer_ready {
+                return std::task::Poll::Pending;
+            }
+            self.pending = None;
+            self.calls += 1;
+            std::task::Poll::Ready(Ok(buffer.len().min(1)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_pacing_budget_covers_repeated_async_write_overhead() {
+        const COMMAND_BYTES: usize = 279;
+        const DRIVER_DELAY_MS: u64 = 10;
+        let old_budget = Duration::from_millis(2_000 + (COMMAND_BYTES as u64 - 1) * 2);
+        let modeled_elapsed = Duration::from_millis(
+            COMMAND_BYTES as u64 * DRIVER_DELAY_MS + (COMMAND_BYTES as u64 - 1),
+        );
+        assert!(
+            modeled_elapsed > old_budget,
+            "the regression model must exceed the previous pacing-only deadline"
+        );
+        let write_timeout = write_deadline(COMMAND_BYTES, 1, Duration::from_millis(1))
+            .expect("the real command must fit the bounded write budget");
+        assert!(write_timeout > modeled_elapsed);
+
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut writer = DelayedOneByteWriter::new(Duration::from_millis(DRIVER_DELAY_MS));
+        let data = vec![b'x'; COMMAND_BYTES];
+        let start = tokio::time::Instant::now();
+        let outcome = write_with_pacing(
+            &mut writer,
+            &data,
+            WritePacing {
+                chunk_size: 1,
+                chunk_delay_ms: 1,
+            },
+            start + write_timeout,
+            &mut cancel,
+        )
+        .await;
+
+        assert_eq!(outcome.written, COMMAND_BYTES);
+        assert_eq!(outcome.error, None);
+        assert!(!outcome.cancelled);
+        assert_eq!(writer.calls, COMMAND_BYTES);
+        assert_eq!(tokio::time::Instant::now() - start, modeled_elapsed);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn paced_write_chunks_bytes_and_sleeps_between_chunks() {
         let (_cancel_tx, mut cancel) = watch::channel(false);
@@ -2858,7 +5210,14 @@ mod tests {
             chunk_size: 2,
             chunk_delay_ms: 5,
         };
-        let outcome = write_with_pacing(&mut writer, b"abcde", pacing, &mut cancel).await;
+        let deadline = tokio::time::Instant::now()
+            + write_deadline(
+                b"abcde".len(),
+                pacing.chunk_size as usize,
+                Duration::from_millis(pacing.chunk_delay_ms),
+            )
+            .unwrap();
+        let outcome = write_with_pacing(&mut writer, b"abcde", pacing, deadline, &mut cancel).await;
         assert_eq!(outcome.written, 5);
         assert_eq!(outcome.error, None);
         assert!(!outcome.cancelled);
@@ -2883,7 +5242,14 @@ mod tests {
             chunk_size: 3,
             chunk_delay_ms: 7,
         };
-        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        let deadline = tokio::time::Instant::now()
+            + write_deadline(
+                b"abcd".len(),
+                pacing.chunk_size as usize,
+                Duration::from_millis(pacing.chunk_delay_ms),
+            )
+            .unwrap();
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, deadline, &mut cancel).await;
         assert_eq!(outcome.written, 4);
         assert_eq!(outcome.error, None);
         let sizes = writer
@@ -2908,7 +5274,14 @@ mod tests {
             chunk_size: 2,
             chunk_delay_ms: 0,
         };
-        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        let deadline = tokio::time::Instant::now()
+            + write_deadline(
+                b"abcd".len(),
+                pacing.chunk_size as usize,
+                Duration::from_millis(pacing.chunk_delay_ms),
+            )
+            .unwrap();
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, deadline, &mut cancel).await;
         assert_eq!(outcome.written, 4);
         assert_eq!(outcome.error, None);
         assert_eq!(writer.calls.len(), 2);
@@ -2925,7 +5298,20 @@ mod tests {
             chunk_size: 2,
             chunk_delay_ms: 5,
         };
-        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        let write_timeout = write_deadline(
+            b"abcd".len(),
+            pacing.chunk_size as usize,
+            Duration::from_millis(pacing.chunk_delay_ms),
+        )
+        .unwrap();
+        let outcome = write_with_pacing(
+            &mut writer,
+            b"abcd",
+            pacing,
+            start + write_timeout,
+            &mut cancel,
+        )
+        .await;
         assert_eq!(outcome.written, 0);
         assert!(
             outcome
@@ -2933,34 +5319,73 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("timed out"))
         );
-        // 4 bytes in 2-byte chunks pace for 5 ms, so the deadline is
-        // max(2 s, 2 * 5 ms + 2 s).
-        assert_eq!(
-            tokio::time::Instant::now() - start,
-            Duration::from_millis(2_010)
+        // An individual driver call that makes no progress retains the
+        // two-second bound even though the overall paced request has a larger
+        // budget. Tokio may resume the task just after the exact timer tick,
+        // so assert the semantic bounds rather than an exact wake instant.
+        let elapsed = tokio::time::Instant::now() - start;
+        assert!(elapsed >= WRITE_TIMEOUT);
+        assert!(
+            elapsed
+                < write_deadline(
+                    b"abcd".len(),
+                    pacing.chunk_size as usize,
+                    Duration::from_millis(pacing.chunk_delay_ms),
+                )
+                .unwrap()
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn paced_write_stops_when_the_port_is_closing() {
+    async fn already_cancelled_write_wins_over_a_ready_driver() {
         let (cancel_tx, mut cancel) = watch::channel(false);
         cancel_tx.send(true).unwrap();
-        // A driver that never accepts leaves cancellation as the only ready
-        // branch, keeping the outcome deterministic.
+        // The writer is immediately ready. Cancellation must still win before
+        // the first byte reaches the driver.
         let mut writer = RecordingWriter::new(usize::MAX);
-        writer.never_accept = true;
         let pacing = WritePacing {
             chunk_size: 1,
             chunk_delay_ms: 1,
         };
-        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, &mut cancel).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let outcome = write_with_pacing(&mut writer, b"abcd", pacing, deadline, &mut cancel).await;
         assert_eq!(outcome.written, 0);
+        assert!(writer.calls.is_empty());
         assert!(outcome.cancelled);
         assert!(
             outcome
                 .error
                 .as_deref()
                 .is_some_and(|message| message.contains("cancelled"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_total_deadline_wins_over_a_ready_driver() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let mut writer = RecordingWriter::new(usize::MAX);
+        let pacing = WritePacing {
+            chunk_size: 1,
+            chunk_delay_ms: 1,
+        };
+
+        let outcome = write_with_pacing(
+            &mut writer,
+            b"abcd",
+            pacing,
+            tokio::time::Instant::now(),
+            &mut cancel,
+        )
+        .await;
+
+        assert_eq!(outcome.written, 0);
+        assert!(writer.calls.is_empty());
+        assert!(!outcome.cancelled);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("timed out"))
         );
     }
 }

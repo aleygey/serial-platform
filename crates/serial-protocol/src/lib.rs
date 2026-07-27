@@ -11,13 +11,31 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
 pub const WRITE_FRAME_TAG: u8 = 0x04;
 pub const MAX_HEADER_BYTES: usize = 256 * 1024;
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_TRIGGER_INTERVAL_MS: u64 = 20;
+pub const DEFAULT_TRIGGER_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_TRIGGER_MAX_FIRES: u32 = 250;
+pub const MAX_TRIGGER_INITIAL_WRITE_BYTES: usize = 4 * 1024;
+pub const MAX_TRIGGER_ACTION_BYTES: usize = 256;
+pub const MAX_TRIGGER_PATTERN_BYTES: usize = 256;
+pub const MAX_TRIGGER_PATTERNS: usize = 8;
+pub const MIN_TRIGGER_INTERVAL_MS: u64 = 5;
+pub const MAX_TRIGGER_INTERVAL_MS: u64 = 1_000;
+pub const MIN_TRIGGER_TIMEOUT_MS: u64 = 100;
+pub const MAX_TRIGGER_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_TRIGGER_FIRES: u32 = 1_000;
+pub const MAX_TRIGGER_TOTAL_BYTES: usize = 64 * 1024;
+/// Upper bound for one physical write accepted by `seriald`.
+///
+/// A Trigger timeout stops new scheduling, but an already accepted write may
+/// need this long to settle and be audited before the Trigger becomes terminal.
+pub const MAX_PHYSICAL_WRITE_TIMEOUT_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +157,66 @@ impl WritePacing {
     }
 }
 
+/// One bounded, device-agnostic reaction to the live serial byte stream.
+///
+/// The daemon arms its literal-byte matchers before performing the optional
+/// initial write. It then sends `action` at the requested interval, stopping
+/// when a `stop_contains` pattern is observed or either hard bound is reached.
+/// Device-model meaning and higher-level workflows deliberately remain in
+/// clients; every byte field here is encoded as base64 on the JSON wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerSpec {
+    /// Optional one-time write after the live RX matchers have been armed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_bytes"
+    )]
+    pub initial_write: Option<Vec<u8>>,
+    /// Optional live RX literal that gates the first action write.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_bytes"
+    )]
+    pub start_contains: Option<Vec<u8>>,
+    /// Raw bytes sent once per fire.
+    #[serde(with = "base64_bytes")]
+    pub action: Vec<u8>,
+    /// Delay between completed action writes. The daemon validates a safe
+    /// non-zero lower bound before accepting the Job.
+    #[serde(default = "default_trigger_interval_ms")]
+    pub interval_ms: u64,
+    /// Live RX literals that terminate the Job successfully. Matching spans
+    /// serial read-chunk boundaries.
+    #[serde(default, with = "base64_byte_patterns")]
+    pub stop_contains: Vec<Vec<u8>>,
+    /// Wall-clock deadline after which the daemon schedules no new writes.
+    /// One already accepted bounded write is allowed to settle and be audited
+    /// before the Job enters its authoritative terminal state.
+    #[serde(default = "default_trigger_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Hard bound on confirmed action writes. The initial write is not a fire.
+    #[serde(default = "default_trigger_max_fires")]
+    pub max_fires: u32,
+    /// Optional pacing applied to both the initial write and every action
+    /// write. When absent, the Slot's effective write pacing is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pacing: Option<WritePacing>,
+}
+
+fn default_trigger_interval_ms() -> u64 {
+    DEFAULT_TRIGGER_INTERVAL_MS
+}
+
+fn default_trigger_timeout_ms() -> u64 {
+    DEFAULT_TRIGGER_TIMEOUT_MS
+}
+
+fn default_trigger_max_fires() -> u32 {
+    DEFAULT_TRIGGER_MAX_FIRES
+}
+
 impl Default for SerialSettings {
     fn default() -> Self {
         Self {
@@ -152,8 +230,6 @@ impl Default for SerialSettings {
             write_eol: "\r".into(),
             echo: EchoMode::On,
             shell_prompt: None,
-            // Defaults to None so an attached device profile is not shadowed;
-            // resolution falls back to DEFAULT_UBOOT_PROMPT.
             uboot_prompt: None,
             write_chunk_size: default_write_chunk_size(),
             write_chunk_delay_ms: default_write_chunk_delay_ms(),
@@ -178,8 +254,8 @@ pub struct SlotConfig {
     pub port: String,
     pub profile: String,
     /// Name of the device-model profile this Slot is attached to. Prompts and
-    /// similar device behavior belong to the device model; Slot settings
-    /// remain per-station overrides.
+    /// similar device behavior belong to the device model and override the
+    /// generic/legacy behavior baseline stored in Slot settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_profile: Option<String>,
     pub enabled: bool,
@@ -202,13 +278,10 @@ pub struct DeviceProfile {
     pub echo: Option<EchoMode>,
 }
 
-/// U-Boot prompt assumed when neither the Slot settings nor the attached
-/// device profile provide one.
-pub const DEFAULT_UBOOT_PROMPT: &str = "SigmaStar #";
-
-/// Device-interaction settings after layering the Slot settings over the
-/// attached device profile and the built-in defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Device-interaction settings after applying the attached device profile to
+/// the Slot's generic/legacy baseline. Generic transport defaults deliberately
+/// do not guess device-specific Shell or U-Boot prompts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDeviceSettings {
     pub shell_prompt: Option<String>,
     pub uboot_prompt: Option<String>,
@@ -216,33 +289,35 @@ pub struct ResolvedDeviceSettings {
     pub echo: EchoMode,
 }
 
-/// Resolves the effective device behavior for one Slot. Every field follows
-/// the order: explicit Slot setting, then the device profile, then the
-/// built-in default.
+/// Resolves the effective device behavior for one Slot. An attached
+/// device-model profile owns Shell/U-Boot prompt presence as well as any
+/// provided EOL/echo overrides. Without a profile, old Slot prompt values
+/// remain compatible.
 ///
 /// `shell_prompt`/`uboot_prompt` are optional in the Slot settings, so a
 /// profile can supply them when the Slot does not. `write_eol` and `echo`
-/// are concrete Slot fields that always materialize today, so they always
-/// override the profile; the profile values are retained for clients and for
-/// a future optional form of the Slot fields.
+/// remain concrete in the Slot for backward-compatible generic defaults.
 pub fn resolve_device_settings(
     settings: &SerialSettings,
     device_profile: Option<&DeviceProfile>,
 ) -> ResolvedDeviceSettings {
-    let shell_prompt = settings
-        .shell_prompt
-        .clone()
-        .or_else(|| device_profile.and_then(|profile| profile.shell_prompt.clone()));
-    let uboot_prompt = settings
-        .uboot_prompt
-        .clone()
-        .or_else(|| device_profile.and_then(|profile| profile.uboot_prompt.clone()))
-        .or_else(|| Some(DEFAULT_UBOOT_PROMPT.to_owned()));
+    let shell_prompt = match device_profile {
+        Some(profile) => profile.shell_prompt.clone(),
+        None => settings.shell_prompt.clone(),
+    };
+    let uboot_prompt = match device_profile {
+        Some(profile) => profile.uboot_prompt.clone(),
+        None => settings.uboot_prompt.clone(),
+    };
     ResolvedDeviceSettings {
         shell_prompt,
         uboot_prompt,
-        write_eol: settings.write_eol.clone(),
-        echo: settings.echo,
+        write_eol: device_profile
+            .and_then(|profile| profile.write_eol.clone())
+            .unwrap_or_else(|| settings.write_eol.clone()),
+        echo: device_profile
+            .and_then(|profile| profile.echo)
+            .unwrap_or(settings.echo),
     }
 }
 
@@ -312,6 +387,75 @@ pub struct RunInfo {
     pub metadata: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerStatus {
+    Armed,
+    WaitingForStart,
+    Running,
+    /// A terminal cause has been selected, but one short driver write may
+    /// still need to finish and be audited before the Job is fully stopped.
+    Stopping,
+    Matched,
+    TimedOut,
+    MaxFiresReached,
+    Cancelled,
+    ControlLost,
+    RunLost,
+    GenerationChanged,
+    PortClosed,
+    WriteFailed,
+    RxGap,
+}
+
+impl TriggerStatus {
+    pub const fn is_terminal(self) -> bool {
+        !matches!(
+            self,
+            Self::Armed | Self::WaitingForStart | Self::Running | Self::Stopping
+        )
+    }
+
+    pub const fn is_matched(self) -> bool {
+        matches!(self, Self::Matched)
+    }
+}
+
+/// Authoritative state for one daemon-owned Trigger Job.
+///
+/// `fires_confirmed` counts action writes only. `tx_bytes_confirmed` includes
+/// both the confirmed initial-write bytes and confirmed action bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerInfo {
+    pub id: Uuid,
+    pub owner: Actor,
+    pub daemon_epoch: Uuid,
+    pub generation: u64,
+    pub control_id: Uuid,
+    pub fence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<Uuid>,
+    pub spec: TriggerSpec,
+    pub status: TriggerStatus,
+    pub start_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write_seq: Option<u64>,
+    #[serde(default)]
+    pub fires_confirmed: u32,
+    #[serde(default)]
+    pub tx_bytes_confirmed: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "option_base64_bytes"
+    )]
+    pub matched_pattern: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotSnapshot {
     pub config: SlotConfig,
@@ -328,14 +472,25 @@ pub struct SlotSnapshot {
     pub tx_offset: u64,
     pub control: Option<ControlLease>,
     pub active_run: Option<RunInfo>,
+    /// Current daemon-owned Trigger Job, if any. Older snapshots omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_trigger: Option<TriggerInfo>,
     pub logging: LoggingState,
-    /// Prompts after layering Slot settings over the attached device profile
-    /// and the built-in defaults. Omitted on the wire when unset so older
-    /// clients keep decoding snapshots.
+    /// Authoritative prompts after resolving the attached device profile (or
+    /// legacy Slot values when no model is attached). Omitted on the wire when
+    /// unset; current clients use effective EOL/echo presence to distinguish
+    /// an authoritative `None` from an older daemon lacking this bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_shell_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_uboot_prompt: Option<String>,
+    /// Effective line ending and echo policy after applying the attached
+    /// device-model profile. Optional on the wire for older-daemon
+    /// compatibility; current daemons always publish both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_write_eol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_echo: Option<EchoMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +519,10 @@ pub enum EventKind {
     RunStarted,
     RunEnded,
     RunAborted,
+    TriggerStarted,
+    TriggerCompleted,
+    TriggerCancelled,
+    TriggerFailed,
     Checkpoint,
     LoggingDegraded,
     Gap,
@@ -468,10 +627,50 @@ pub enum ClientMessage {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        /// Optional optimistic Run boundary for one physical write. New Agent
+        /// adapters set this to the Run they own; human and legacy clients may
+        /// omit it and retain lease-only write authorization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<Uuid>,
         /// Per-write pacing override. Older clients omit the field and keep
         /// using the Slot's configured pacing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pacing: Option<WritePacing>,
+    },
+    TriggerStart {
+        request_id: Uuid,
+        slot_id: String,
+        control_id: Uuid,
+        fence: u64,
+        /// Explicit daemon identity prevents a delayed request from crossing a
+        /// daemon restart.
+        daemon_epoch: Uuid,
+        /// Explicit physical-session identity prevents a delayed request from
+        /// crossing a serial close/reopen boundary.
+        generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<Uuid>,
+        /// Agent adapters bind a Trigger to the Run they own. Human/script
+        /// clients may omit this and retain lease-only authorization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<Uuid>,
+        spec: TriggerSpec,
+    },
+    TriggerStatus {
+        request_id: Uuid,
+        slot_id: String,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
+    },
+    TriggerCancel {
+        request_id: Uuid,
+        slot_id: String,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        trigger_id: Uuid,
     },
     StartRun {
         request_id: Uuid,
@@ -512,6 +711,9 @@ impl ClientMessage {
             | Self::ReleaseControl { request_id, .. }
             | Self::CancelAcquire { request_id, .. }
             | Self::Write { request_id, .. }
+            | Self::TriggerStart { request_id, .. }
+            | Self::TriggerStatus { request_id, .. }
+            | Self::TriggerCancel { request_id, .. }
             | Self::StartRun { request_id, .. }
             | Self::EndRun { request_id, .. }
             | Self::Checkpoint { request_id, .. }
@@ -532,6 +734,9 @@ pub enum CommandResult {
     ControlReleased,
     AcquireCancelled { removed: bool },
     WriteAccepted { event_seq: u64 },
+    TriggerStarted { trigger: Box<TriggerInfo> },
+    TriggerStatus { trigger: Box<TriggerInfo> },
+    TriggerCancelled { trigger: Box<TriggerInfo> },
     RunStarted { run: RunInfo },
     RunEnded { run: RunInfo },
     CheckpointCreated { event_seq: u64 },
@@ -940,6 +1145,57 @@ mod base64_bytes {
     }
 }
 
+mod option_base64_bytes {
+    use super::*;
+    use serde::{Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match bytes {
+            Some(bytes) => serializer.serialize_some(&BASE64.encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = Option::<String>::deserialize(deserializer)?;
+        encoded
+            .map(|encoded| BASE64.decode(encoded).map_err(D::Error::custom))
+            .transpose()
+    }
+}
+
+mod base64_byte_patterns {
+    use super::*;
+    use serde::{Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S>(patterns: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded: Vec<String> = patterns
+            .iter()
+            .map(|pattern| BASE64.encode(pattern))
+            .collect();
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|encoded| BASE64.decode(encoded).map_err(D::Error::custom))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,18 +1282,18 @@ mod tests {
     }
 
     #[test]
-    fn device_settings_resolve_slot_then_profile_then_builtin() {
+    fn device_profile_overrides_generic_behavior_baseline() {
         let profile = device_profile();
         // Profile supplies everything the Slot leaves unset.
         let resolved = resolve_device_settings(&SerialSettings::default(), Some(&profile));
         assert_eq!(resolved.shell_prompt.as_deref(), Some("root@sigmastar:/# "));
         assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
-        // write_eol/echo are concrete Slot fields: the profile never shadows
-        // them in v1.
-        assert_eq!(resolved.write_eol, "\r");
-        assert_eq!(resolved.echo, EchoMode::On);
+        assert_eq!(resolved.write_eol, "\n");
+        assert_eq!(resolved.echo, EchoMode::Off);
 
-        // An explicit Slot setting always wins over the profile.
+        // Once attached, the model owns prompts as well as line ending and
+        // echo behavior. This prevents a stale legacy Slot prompt from
+        // surviving when the physical station changes device models.
         let settings = SerialSettings {
             shell_prompt: Some("/ # ".into()),
             uboot_prompt: Some("U-Boot> ".into()),
@@ -1046,8 +1302,24 @@ mod tests {
             ..SerialSettings::default()
         };
         let resolved = resolve_device_settings(&settings, Some(&profile));
-        assert_eq!(resolved.shell_prompt.as_deref(), Some("/ # "));
-        assert_eq!(resolved.uboot_prompt.as_deref(), Some("U-Boot> "));
+        assert_eq!(resolved.shell_prompt.as_deref(), Some("root@sigmastar:/# "));
+        assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
+        assert_eq!(resolved.write_eol, "\n");
+        assert_eq!(resolved.echo, EchoMode::Off);
+
+        // Attaching a model makes that profile authoritative for prompt
+        // presence too. An omitted prompt means "not configured", rather
+        // than inheriting a stale prompt from the previously attached model.
+        let promptless = DeviceProfile {
+            name: "promptless".into(),
+            shell_prompt: None,
+            uboot_prompt: None,
+            write_eol: None,
+            echo: None,
+        };
+        let resolved = resolve_device_settings(&settings, Some(&promptless));
+        assert!(resolved.shell_prompt.is_none());
+        assert!(resolved.uboot_prompt.is_none());
         assert_eq!(resolved.write_eol, "\r\n");
         assert_eq!(resolved.echo, EchoMode::Auto);
     }
@@ -1056,9 +1328,14 @@ mod tests {
     fn device_settings_without_profile_match_legacy_behavior() {
         // Regression: a configuration without device profiles resolves to the
         // same effective values as before profiles existed.
-        let resolved = resolve_device_settings(&SerialSettings::default(), None);
-        assert!(resolved.shell_prompt.is_none());
-        assert_eq!(resolved.uboot_prompt.as_deref(), Some(DEFAULT_UBOOT_PROMPT));
+        let settings = SerialSettings {
+            shell_prompt: Some("/ # ".into()),
+            uboot_prompt: Some("legacy=> ".into()),
+            ..SerialSettings::default()
+        };
+        let resolved = resolve_device_settings(&settings, None);
+        assert_eq!(resolved.shell_prompt.as_deref(), Some("/ # "));
+        assert_eq!(resolved.uboot_prompt.as_deref(), Some("legacy=> "));
         assert_eq!(resolved.write_eol, "\r");
         assert_eq!(resolved.echo, EchoMode::On);
     }
@@ -1102,22 +1379,30 @@ mod tests {
             tx_offset: 0,
             control: None,
             active_run: None,
+            active_trigger: None,
             logging: LoggingState::Healthy,
             effective_shell_prompt: None,
             effective_uboot_prompt: None,
+            effective_write_eol: None,
+            effective_echo: None,
         })
         .unwrap();
         let object = json.as_object().unwrap();
         assert!(!object.contains_key("effective_shell_prompt"));
         assert!(!object.contains_key("effective_uboot_prompt"));
+        assert!(!object.contains_key("effective_write_eol"));
+        assert!(!object.contains_key("effective_echo"));
         // ...and an older daemon's snapshot without the keys still decodes.
         let decoded: SlotSnapshot = serde_json::from_value(json).unwrap();
         assert!(decoded.effective_shell_prompt.is_none());
         assert!(decoded.effective_uboot_prompt.is_none());
+        assert!(decoded.effective_write_eol.is_none());
+        assert!(decoded.effective_echo.is_none());
     }
 
     #[test]
     fn write_pacing_round_trips_through_the_control_frame() {
+        let expected_run_id = Uuid::new_v4();
         let message = ClientMessage::Write {
             request_id: Uuid::new_v4(),
             slot_id: "slot-1".into(),
@@ -1125,6 +1410,7 @@ mod tests {
             fence: 7,
             data: b"reboot\r".to_vec(),
             operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(expected_run_id),
             pacing: Some(WritePacing {
                 chunk_size: 4,
                 chunk_delay_ms: 10,
@@ -1162,6 +1448,7 @@ mod tests {
                 fence: 3,
                 data: b"reboot\r".to_vec(),
                 operation_id: None,
+                expected_run_id: None,
                 pacing: None,
             }
         );
@@ -1214,5 +1501,198 @@ mod tests {
             serde_json::from_value::<CommandResult>(json).unwrap(),
             result
         );
+    }
+
+    fn trigger_spec() -> TriggerSpec {
+        TriggerSpec {
+            initial_write: Some(vec![b'r', b'e', b'b', b'o', b'o', b't', b'\r']),
+            start_contains: Some(vec![0x00, 0xff, b'B']),
+            action: vec![b's', b'l', b'p'],
+            interval_ms: 17,
+            stop_contains: vec![b"U-Boot> ".to_vec(), vec![0x00, 0x80, 0xff]],
+            timeout_ms: 4_000,
+            max_fires: 123,
+            pacing: Some(WritePacing {
+                chunk_size: 3,
+                chunk_delay_ms: 0,
+            }),
+        }
+    }
+
+    fn trigger_info(status: TriggerStatus) -> TriggerInfo {
+        TriggerInfo {
+            id: Uuid::new_v4(),
+            owner: Actor {
+                id: "agent:test".into(),
+                label: "test adapter".into(),
+                kind: ActorKind::Agent,
+            },
+            daemon_epoch: Uuid::new_v4(),
+            generation: 9,
+            control_id: Uuid::new_v4(),
+            fence: 11,
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(Uuid::new_v4()),
+            spec: trigger_spec(),
+            status,
+            start_seq: 41,
+            end_seq: status.is_terminal().then_some(73),
+            last_write_seq: Some(70),
+            fires_confirmed: 12,
+            tx_bytes_confirmed: 43,
+            matched_pattern: status.is_matched().then(|| b"U-Boot> ".to_vec()),
+        }
+    }
+
+    #[test]
+    fn protocol_v2_exposes_trigger_contracts() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn trigger_spec_uses_base64_for_every_raw_byte_field() {
+        let spec = trigger_spec();
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["initial_write"],
+            BASE64.encode(spec.initial_write.as_ref().unwrap())
+        );
+        assert_eq!(
+            json["start_contains"],
+            BASE64.encode(spec.start_contains.as_ref().unwrap())
+        );
+        assert_eq!(json["action"], BASE64.encode(&spec.action));
+        assert_eq!(
+            json["stop_contains"],
+            serde_json::json!([
+                BASE64.encode(&spec.stop_contains[0]),
+                BASE64.encode(&spec.stop_contains[1])
+            ])
+        );
+        assert_eq!(serde_json::from_value::<TriggerSpec>(json).unwrap(), spec);
+    }
+
+    #[test]
+    fn trigger_spec_defaults_are_bounded_and_backward_friendly() {
+        let decoded: TriggerSpec = serde_json::from_value(serde_json::json!({
+            "action": BASE64.encode([0x00, 0xff]),
+        }))
+        .unwrap();
+        assert!(decoded.initial_write.is_none());
+        assert!(decoded.start_contains.is_none());
+        assert_eq!(decoded.action, vec![0x00, 0xff]);
+        assert_eq!(decoded.interval_ms, DEFAULT_TRIGGER_INTERVAL_MS);
+        assert!(decoded.stop_contains.is_empty());
+        assert_eq!(decoded.timeout_ms, DEFAULT_TRIGGER_TIMEOUT_MS);
+        assert_eq!(decoded.max_fires, DEFAULT_TRIGGER_MAX_FIRES);
+        assert!(decoded.pacing.is_none());
+    }
+
+    #[test]
+    fn trigger_control_messages_round_trip() {
+        let request_id = Uuid::new_v4();
+        let daemon_epoch = Uuid::new_v4();
+        let control_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let expected_run_id = Uuid::new_v4();
+        let start = ClientMessage::TriggerStart {
+            request_id,
+            slot_id: "slot-1".into(),
+            control_id,
+            fence: 17,
+            daemon_epoch,
+            generation: 5,
+            operation_id: Some(operation_id),
+            expected_run_id: Some(expected_run_id),
+            spec: trigger_spec(),
+        };
+        assert_eq!(start.request_id(), request_id);
+        assert_eq!(
+            decode_client_control(&encode_client_control(&start).unwrap()).unwrap(),
+            start
+        );
+
+        let trigger_id = Uuid::new_v4();
+        let status = ClientMessage::TriggerStatus {
+            request_id: Uuid::new_v4(),
+            slot_id: "slot-1".into(),
+            daemon_epoch,
+            generation: 5,
+            trigger_id,
+        };
+        assert_eq!(
+            decode_client_control(&encode_client_control(&status).unwrap()).unwrap(),
+            status
+        );
+
+        let cancel = ClientMessage::TriggerCancel {
+            request_id: Uuid::new_v4(),
+            slot_id: "slot-1".into(),
+            control_id,
+            fence: 17,
+            daemon_epoch,
+            generation: 5,
+            trigger_id,
+        };
+        assert_eq!(
+            decode_client_control(&encode_client_control(&cancel).unwrap()).unwrap(),
+            cancel
+        );
+    }
+
+    #[test]
+    fn trigger_info_and_results_round_trip_with_base64_match() {
+        let trigger = trigger_info(TriggerStatus::Matched);
+        let json = serde_json::to_value(&trigger).unwrap();
+        assert_eq!(
+            json["matched_pattern"],
+            BASE64.encode(trigger.matched_pattern.as_ref().unwrap())
+        );
+        assert_eq!(
+            serde_json::from_value::<TriggerInfo>(json).unwrap(),
+            trigger
+        );
+
+        for result in [
+            CommandResult::TriggerStarted {
+                trigger: Box::new(trigger.clone()),
+            },
+            CommandResult::TriggerStatus {
+                trigger: Box::new(trigger.clone()),
+            },
+            CommandResult::TriggerCancelled {
+                trigger: Box::new(trigger.clone()),
+            },
+        ] {
+            let json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                serde_json::from_value::<CommandResult>(json).unwrap(),
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_status_and_lifecycle_event_tags_are_stable() {
+        assert!(!TriggerStatus::Armed.is_terminal());
+        assert!(!TriggerStatus::WaitingForStart.is_terminal());
+        assert!(!TriggerStatus::Running.is_terminal());
+        assert!(!TriggerStatus::Stopping.is_terminal());
+        assert!(TriggerStatus::Matched.is_terminal());
+        assert!(TriggerStatus::Matched.is_matched());
+        assert!(TriggerStatus::TimedOut.is_terminal());
+        assert!(!TriggerStatus::TimedOut.is_matched());
+
+        for (kind, expected) in [
+            (EventKind::TriggerStarted, "trigger_started"),
+            (EventKind::TriggerCompleted, "trigger_completed"),
+            (EventKind::TriggerCancelled, "trigger_cancelled"),
+            (EventKind::TriggerFailed, "trigger_failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(expected)
+            );
+        }
     }
 }

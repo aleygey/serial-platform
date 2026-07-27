@@ -101,9 +101,9 @@ impl AppState {
         }
     }
 
-    /// Validates, persists, and then publishes a device profile catalog. The
-    /// runtime effect is limited to snapshots resolving prompts from the new
-    /// profiles, so a persistence failure simply leaves every view unchanged.
+    /// Validates and stages every affected actor before persistence. Staging
+    /// is inert, so an unavailable actor or save failure can roll back without
+    /// publishing a mixed runtime catalog or changing the in-memory config.
     async fn configure_device_profiles_transaction(
         &self,
         requested: Vec<serial_protocol::DeviceProfile>,
@@ -113,13 +113,23 @@ impl AppState {
         let staged = current
             .staged_with_device_profiles(requested)
             .map_err(ConfigError::from)?;
-        self.inner.config_store.save(&staged)?;
-        *self.inner.config.write().await = staged.clone();
-        self.inner
+        let applied = self
+            .inner
             .registry
-            .apply_device_profiles(staged.device_profiles.clone())
-            .await;
-        Ok(staged.device_profiles)
+            .stage_device_profiles(staged.device_profiles.clone())
+            .await?;
+
+        match self.inner.config_store.save(&staged) {
+            Ok(()) => {
+                applied.commit().await?;
+                *self.inner.config.write().await = staged.clone();
+                Ok(staged.device_profiles)
+            }
+            Err(save) => match applied.rollback().await {
+                Ok(()) => Err(ApiError::Config(save)),
+                Err(rollback) => Err(ApiError::ConfigRollback { save, rollback }),
+            },
+        }
     }
 
     async fn authenticate(
@@ -615,6 +625,7 @@ async fn dispatch_slot_command(
             fence,
             data,
             operation_id,
+            expected_run_id,
             pacing,
             ..
         } => {
@@ -626,7 +637,62 @@ async fn dispatch_slot_command(
                     fence,
                     data,
                     operation_id,
+                    expected_run_id,
                     pacing,
+                )
+                .await?
+        }
+        ClientMessage::TriggerStart {
+            control_id,
+            fence,
+            daemon_epoch,
+            generation,
+            operation_id,
+            expected_run_id,
+            spec,
+            ..
+        } => {
+            handle
+                .start_trigger(
+                    request_id,
+                    actor,
+                    control_id,
+                    fence,
+                    daemon_epoch,
+                    generation,
+                    operation_id,
+                    expected_run_id,
+                    spec,
+                )
+                .await?
+        }
+        ClientMessage::TriggerStatus {
+            daemon_epoch,
+            generation,
+            trigger_id,
+            ..
+        } => {
+            handle
+                .trigger_status(request_id, actor, daemon_epoch, generation, trigger_id)
+                .await?
+        }
+        ClientMessage::TriggerCancel {
+            control_id,
+            fence,
+            daemon_epoch,
+            generation,
+            trigger_id,
+            ..
+        } => {
+            handle
+                .cancel_trigger(
+                    request_id,
+                    actor,
+                    control_id,
+                    fence,
+                    daemon_epoch,
+                    generation,
+                    trigger_id,
                 )
                 .await?
         }
@@ -774,6 +840,9 @@ fn command_slot(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::ReleaseControl { slot_id, .. }
         | ClientMessage::CancelAcquire { slot_id, .. }
         | ClientMessage::Write { slot_id, .. }
+        | ClientMessage::TriggerStart { slot_id, .. }
+        | ClientMessage::TriggerStatus { slot_id, .. }
+        | ClientMessage::TriggerCancel { slot_id, .. }
         | ClientMessage::StartRun { slot_id, .. }
         | ClientMessage::EndRun { slot_id, .. }
         | ClientMessage::Checkpoint { slot_id, .. } => Some(slot_id),
@@ -853,13 +922,30 @@ impl WsError {
                 SlotError::RunAlreadyActive
                 | SlotError::NoActiveRun
                 | SlotError::RunMismatch
+                | SlotError::WriteRunMissing { .. }
+                | SlotError::WriteRunMismatch { .. }
+                | SlotError::WriteRunNotOwner { .. }
                 | SlotError::PartialWrite { .. }
+                | SlotError::TriggerActive
+                | SlotError::TriggerNotOwner { .. }
+                | SlotError::TriggerEpochMismatch
+                | SlotError::TriggerGenerationMismatch
                 | SlotError::RequestIdReused => (ErrorCode::Conflict, false),
+                SlotError::WriteLeaseTooShort { .. } => (ErrorCode::Conflict, true),
                 SlotError::WriteResultExpired => (ErrorCode::IdempotencyExpired, false),
                 SlotError::WriteIdempotencyCapacity => (ErrorCode::ResourceExhausted, false),
                 SlotError::ControlQueueFull => (ErrorCode::ResourceExhausted, true),
+                SlotError::TriggerNotFound { .. } => (ErrorCode::NotFound, false),
                 SlotError::WriteTooLarge
                 | SlotError::EmptyWrite
+                | SlotError::WriteDeadlineExceeded { .. }
+                | SlotError::InvalidTriggerAction
+                | SlotError::TriggerInitialWriteTooLarge
+                | SlotError::InvalidTriggerInterval
+                | SlotError::InvalidTriggerTimeout
+                | SlotError::InvalidTriggerMaxFires
+                | SlotError::InvalidTriggerPatterns
+                | SlotError::TriggerTotalBytesTooLarge
                 | SlotError::InvalidLabel
                 | SlotError::RunMetadataTooManyKeys { .. }
                 | SlotError::RunMetadataTooLarge { .. } => (ErrorCode::BadRequest, false),
@@ -964,6 +1050,28 @@ mod tests {
                 ..SerialSettings::default()
             },
         }
+    }
+
+    #[test]
+    fn insufficient_write_lease_is_a_retryable_conflict() {
+        let error = WsError::Slot(SlotError::WriteLeaseTooShort {
+            remaining_ms: 2_099,
+            write_ms: 2_000,
+            margin_ms: 100,
+        });
+        assert_eq!(error.protocol_code(), (ErrorCode::Conflict, true));
+        assert!(error.to_string().contains("renew control"));
+    }
+
+    #[test]
+    fn expected_run_write_rejection_is_a_definite_nonretryable_conflict() {
+        let run_id = Uuid::new_v4();
+        let error = WsError::Slot(SlotError::WriteRunMissing {
+            expected_run_id: run_id,
+        });
+        assert_eq!(error.protocol_code(), (ErrorCode::Conflict, false));
+        assert!(error.to_string().contains(&run_id.to_string()));
+        assert!(error.to_string().contains("(no bytes were written)"));
     }
 
     #[tokio::test]
@@ -1193,8 +1301,8 @@ mod tests {
             name: "sigmastar-evb".into(),
             shell_prompt: Some("root@sigmastar:/# ".into()),
             uboot_prompt: Some("SigmaStar =>".into()),
-            write_eol: None,
-            echo: None,
+            write_eol: Some("\n".into()),
+            echo: Some(serial_protocol::EchoMode::Off),
         }
     }
 
@@ -1232,7 +1340,9 @@ mod tests {
             started,
         );
 
-        let snapshot = state.inner.registry.get("slot-1").await.unwrap().snapshot();
+        let handle = state.inner.registry.get("slot-1").await.unwrap();
+        let mut live = handle.attach(None, 0).await.unwrap().live;
+        let snapshot = handle.snapshot();
         assert_eq!(
             snapshot.effective_shell_prompt.as_deref(),
             Some("root@sigmastar:/# ")
@@ -1240,6 +1350,11 @@ mod tests {
         assert_eq!(
             snapshot.effective_uboot_prompt.as_deref(),
             Some("SigmaStar =>")
+        );
+        assert_eq!(snapshot.effective_write_eol.as_deref(), Some("\n"));
+        assert_eq!(
+            snapshot.effective_echo,
+            Some(serial_protocol::EchoMode::Off)
         );
 
         // Replacing the catalog validates against existing Slots, persists,
@@ -1261,6 +1376,107 @@ mod tests {
             snapshot.effective_uboot_prompt.as_deref(),
             Some("SigmaStar #")
         );
+        let event = tokio::time::timeout(Duration::from_secs(1), live.recv())
+            .await
+            .expect("attached consumer should receive the profile refresh")
+            .unwrap();
+        assert_eq!(event.kind, serial_protocol::EventKind::SlotReconfigured);
+        assert_eq!(
+            event
+                .metadata
+                .get("profile_only")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let effective: serial_protocol::ResolvedDeviceSettings = serde_json::from_value(
+            event
+                .metadata
+                .get("effective")
+                .cloned()
+                .expect("effective settings metadata"),
+        )
+        .unwrap();
+        assert_eq!(effective.uboot_prompt.as_deref(), Some("SigmaStar #"));
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_profile_stage_failure_leaves_every_committed_view_unchanged() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let mut healthy = disabled_slot("slot-a", "Healthy", "COM3");
+        healthy.device_profile = Some("sigmastar-evb".into());
+        let mut stopped = disabled_slot("slot-z", "Stopped", "COM4");
+        stopped.device_profile = Some("sigmastar-evb".into());
+        let slots = vec![healthy, stopped];
+        let old_profile = sigmastar_profile();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            slots.clone(),
+            vec![old_profile.clone()],
+            ControlLimits::default(),
+        );
+        let mut config = loaded.config.clone();
+        config.slots = slots;
+        config.device_profiles = vec![old_profile.clone()];
+        store.save(&config).unwrap();
+        let state = AppState::new(
+            store.clone(),
+            config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+
+        let healthy = state.inner.registry.get("slot-a").await.unwrap();
+        let mut live = healthy.attach(None, 0).await.unwrap().live;
+        state
+            .inner
+            .registry
+            .get("slot-z")
+            .await
+            .unwrap()
+            .shutdown()
+            .await;
+        let mut updated = old_profile.clone();
+        updated.uboot_prompt = Some("SigmaStar #".into());
+
+        let error = state
+            .configure_device_profiles_transaction(vec![updated])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::Registry(RegistryError::Slot(SlotError::Closed))
+        ));
+        assert_eq!(
+            state.inner.config.read().await.device_profiles,
+            vec![old_profile.clone()]
+        );
+        assert_eq!(
+            store.load().unwrap().device_profiles,
+            vec![old_profile.clone()]
+        );
+        let snapshot = healthy.snapshot();
+        assert_eq!(
+            snapshot.effective_uboot_prompt,
+            old_profile.uboot_prompt.clone()
+        );
+        assert_eq!(snapshot.head_seq, 0);
+        assert!(matches!(
+            live.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
 
         state.shutdown().await;
         journal.shutdown().await.unwrap();
@@ -1323,7 +1539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slot_without_device_profile_keeps_builtin_prompt_defaults() {
+    async fn slot_without_device_profile_does_not_guess_device_prompts() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
         let loaded = store.load_or_create().unwrap();
@@ -1341,10 +1557,7 @@ mod tests {
         );
         let snapshot = registry.get("slot-1").await.unwrap().snapshot();
         assert!(snapshot.effective_shell_prompt.is_none());
-        assert_eq!(
-            snapshot.effective_uboot_prompt.as_deref(),
-            Some(serial_protocol::DEFAULT_UBOOT_PROMPT)
-        );
+        assert!(snapshot.effective_uboot_prompt.is_none());
 
         registry.shutdown().await;
         journal.shutdown().await.unwrap();

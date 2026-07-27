@@ -23,10 +23,13 @@ pub struct ClientConfig {
     pub human_idle_release_seconds: Option<u64>,
     /// UI language override ("en" or "zh"). Defaults to English when unset.
     pub language: Option<crate::i18n::Lang>,
-    /// Merge exact device command echoes into their TX rows for echo=on
-    /// Slots. Defaults to true when unset; set false to keep the raw
-    /// duplicate echo rows.
+    /// Reconcile exact device echoes with confirmed TX bytes in the terminal
+    /// projection. Defaults to true. Durable RX/TX audit events are never
+    /// merged or discarded.
     pub merge_echo: Option<bool>,
+    /// Capture mouse events for wheel scrolling inside the TUI. Defaults to
+    /// false so ordinary drag selection works without holding Shift.
+    pub mouse_capture: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

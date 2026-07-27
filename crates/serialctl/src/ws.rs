@@ -18,6 +18,10 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 #[derive(Debug)]
+// `Send` is the hot-path variant and this channel is already bounded. Boxing
+// every control message would add an allocation without reducing retained
+// queue growth.
+#[allow(clippy::large_enum_variant)]
 pub enum NetworkCommand {
     Send {
         generation: u64,

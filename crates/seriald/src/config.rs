@@ -21,7 +21,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::auth::{AuthConfig, AuthError, CredentialDisplay};
-use crate::control::{ControlLimits, MAX_TTL_MS, MAX_WAITERS, MIN_TTL_MS, WAIT_TIMEOUT};
+#[cfg(test)]
+use crate::control::MIN_TTL_MS;
+use crate::control::{
+    ControlLimits, MAX_CONTROL_TTL_MS, MAX_CONTROL_WAIT_TIMEOUT, MAX_TTL_MS, MAX_WAITERS,
+    WAIT_TIMEOUT,
+};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PORT: u16 = 3210;
@@ -127,16 +132,17 @@ impl Default for ControlConfig {
 }
 
 impl ControlConfig {
-    /// Converts the persisted values into runtime limits. The TTL ceiling is
-    /// clamped to the protocol minimum so a misconfigured ceiling can never
-    /// produce leases shorter than the client-side floor.
+    /// Converts persisted values into defensively bounded runtime limits.
+    /// [`DaemonConfig::validate`] rejects values above these bounds; applying
+    /// them here as well protects direct in-process construction.
     #[must_use]
     pub fn limits(&self) -> ControlLimits {
         ControlLimits {
-            max_ttl_ms: self.max_ttl_ms.max(MIN_TTL_MS),
+            max_ttl_ms: self.max_ttl_ms,
             wait_timeout: Duration::from_millis(self.wait_timeout_ms),
             max_waiters: self.max_waiters,
         }
+        .bounded()
     }
 }
 
@@ -191,6 +197,7 @@ impl DaemonConfig {
             return Err(ConfigValidationError::InvalidBindPort);
         }
         validate_logging(&self.logging)?;
+        validate_control(&self.control)?;
         self.auth.validate()?;
         validate_device_profiles(&self.device_profiles)?;
         validate_slots(&self.slots, &self.device_profiles)
@@ -445,6 +452,12 @@ pub enum ConfigValidationError {
     InvalidRetentionTarget,
     #[error("segment_max_bytes must be non-zero and no greater than max_total_bytes")]
     InvalidSegmentSize,
+    #[error("control.max_ttl_ms is {actual}, exceeding the configured lease ceiling of {limit} ms")]
+    ControlMaxTtlTooLarge { actual: u64, limit: u64 },
+    #[error(
+        "control.wait_timeout_ms is {actual}, exceeding the queued-acquire ceiling of {limit} ms"
+    )]
+    ControlWaitTimeoutTooLarge { actual: u64, limit: u64 },
     #[error("authentication configuration is invalid: {0}")]
     Authentication(#[from] AuthError),
     #[error("Slot at index {index} has invalid field {field}: {reason}")]
@@ -488,6 +501,23 @@ fn validate_logging(logging: &LoggingConfig) -> Result<(), ConfigValidationError
     }
     if logging.segment_max_bytes == 0 || logging.segment_max_bytes > logging.max_total_bytes {
         return Err(ConfigValidationError::InvalidSegmentSize);
+    }
+    Ok(())
+}
+
+fn validate_control(control: &ControlConfig) -> Result<(), ConfigValidationError> {
+    if control.max_ttl_ms > MAX_CONTROL_TTL_MS {
+        return Err(ConfigValidationError::ControlMaxTtlTooLarge {
+            actual: control.max_ttl_ms,
+            limit: MAX_CONTROL_TTL_MS,
+        });
+    }
+    let wait_limit_ms = MAX_CONTROL_WAIT_TIMEOUT.as_millis() as u64;
+    if control.wait_timeout_ms > wait_limit_ms {
+        return Err(ConfigValidationError::ControlWaitTimeoutTooLarge {
+            actual: control.wait_timeout_ms,
+            limit: wait_limit_ms,
+        });
     }
     Ok(())
 }
@@ -1241,5 +1271,45 @@ mod tests {
         assert_eq!(limits.max_ttl_ms, 120_000);
         assert_eq!(limits.wait_timeout, Duration::from_millis(5_000));
         assert_eq!(limits.max_waiters, 4);
+    }
+
+    #[test]
+    fn control_config_rejects_unbounded_ttl_and_wait_deadlines() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.control.max_ttl_ms = MAX_CONTROL_TTL_MS + 1;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::ControlMaxTtlTooLarge {
+                actual: MAX_CONTROL_TTL_MS + 1,
+                limit: MAX_CONTROL_TTL_MS,
+            })
+        );
+
+        config.control.max_ttl_ms = MAX_CONTROL_TTL_MS;
+        config.control.wait_timeout_ms = u64::MAX;
+        let wait_limit_ms = MAX_CONTROL_WAIT_TIMEOUT.as_millis() as u64;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::ControlWaitTimeoutTooLarge {
+                actual: u64::MAX,
+                limit: wait_limit_ms,
+            })
+        );
+
+        config.control.wait_timeout_ms = wait_limit_ms;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn direct_control_limit_conversion_is_defensively_bounded() {
+        let limits = ControlConfig {
+            max_ttl_ms: u64::MAX,
+            wait_timeout_ms: u64::MAX,
+            max_waiters: 7,
+        }
+        .limits();
+        assert_eq!(limits.max_ttl_ms, MAX_CONTROL_TTL_MS);
+        assert_eq!(limits.wait_timeout, MAX_CONTROL_WAIT_TIMEOUT);
+        assert_eq!(limits.max_waiters, 7);
     }
 }
