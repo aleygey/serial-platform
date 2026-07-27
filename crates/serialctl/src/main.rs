@@ -1,4 +1,5 @@
 mod api;
+mod clipboard;
 mod config;
 mod display;
 mod i18n;

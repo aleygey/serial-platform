@@ -53,10 +53,10 @@ pub struct CaptureResult {
     pub command_boundary: Option<CommandBoundaryResult>,
 }
 
-/// The confirmed TX audit is the lower bound for one command capture. When
-/// echo is authoritative, completion remains disarmed until the complete
-/// command write is observed in RX; this also drains RX that seriald may have
-/// queued before TX but sequenced immediately after the TX audit.
+/// The confirmed TX audit is the lower bound for one command capture. RX below
+/// it is never command output. A complete configured echo is stripped and
+/// raises confidence; exact post-TX evidence may still complete when that echo
+/// is missing or incomplete, with the result explicitly downgraded.
 pub struct CommandBoundary {
     pub tx_event_seq: u64,
     pub operation_id: Uuid,
@@ -103,7 +103,7 @@ pub struct CommandBoundaryResult {
 }
 
 impl CommandBoundaryResult {
-    pub fn confidence(&self) -> &'static str {
+    pub fn confidence(&self, completion: &Completion) -> &'static str {
         if self.interfered {
             return if self.echo_observed {
                 "echo_observed_interfered"
@@ -114,6 +114,8 @@ impl CommandBoundaryResult {
         if self.echo_required {
             if self.echo_observed {
                 "echo_confirmed"
+            } else if matches!(completion, Completion::Pattern(_) | Completion::Regex(_)) {
+                "post_tx_boundary_without_echo"
             } else {
                 "echo_not_observed"
             }
@@ -308,12 +310,8 @@ impl Capture {
         boundary: Option<CommandBoundary>,
     ) -> CaptureResult {
         let mut watcher = CompletionWatcher::new(options);
-        let mut boundary = boundary.map(|boundary| {
-            if boundary.expected_echo.is_some() {
-                watcher.disarm();
-            }
-            CommandBoundaryTracker::new(boundary, self.limits)
-        });
+        let mut boundary =
+            boundary.map(|boundary| CommandBoundaryTracker::new(boundary, self.limits));
         let mut rolling = String::new();
 
         let attached_events: Vec<_> = self.events.drain(..).collect();
@@ -323,16 +321,7 @@ impl Capture {
                 Some(boundary) => boundary.accept(event),
                 None => AcceptedEvents::single(event),
             };
-            if accepted.newly_armed {
-                watcher.arm(tokio::time::Instant::now());
-            }
-            self.observe_accepted(accepted.events, &mut watcher, &mut rolling);
-        }
-
-        // A TX-sequence-only boundary is armed from the confirmed write RPC,
-        // even if its audit frame has not yet reached this independent socket.
-        if boundary.as_ref().is_none_or(CommandBoundaryTracker::armed) {
-            watcher.arm(tokio::time::Instant::now());
+            self.observe_accepted(accepted, &mut watcher, &mut rolling);
         }
 
         loop {
@@ -348,10 +337,7 @@ impl Capture {
                         Some(boundary) => boundary.accept(event),
                         None => AcceptedEvents::single(event),
                     };
-                    if accepted.newly_armed {
-                        watcher.arm(tokio::time::Instant::now());
-                    }
-                    self.observe_accepted(accepted.events, &mut watcher, &mut rolling);
+                    self.observe_accepted(accepted, &mut watcher, &mut rolling);
                 }
                 Ok(Ok(Frame::Gap(gap))) => self.gaps.push(gap),
                 Ok(Ok(Frame::Ready | Frame::Other)) => {}
@@ -367,15 +353,24 @@ impl Capture {
 
     fn observe_accepted(
         &mut self,
-        events: Vec<TimelineEvent>,
+        accepted: AcceptedEvents,
         watcher: &mut CompletionWatcher,
         rolling: &mut String,
     ) {
-        for event in events {
-            if event.direction == serial_protocol::Direction::Rx {
-                watcher.observe_rx(tokio::time::Instant::now());
-                append_rolling(rolling, &String::from_utf8_lossy(&event.data));
-            }
+        let now = tokio::time::Instant::now();
+        if accepted.reset_matching {
+            // Echo reconciliation supplies a complete replacement view. Drop
+            // the previous bytes so an echoed command or pre-echo backlog
+            // cannot masquerade as the requested boundary.
+            rolling.clear();
+        }
+        if accepted.observed_post_tx_rx {
+            watcher.observe_rx(now);
+        }
+        if !accepted.matching_rx.is_empty() {
+            append_rolling(rolling, &String::from_utf8_lossy(&accepted.matching_rx));
+        }
+        for event in accepted.events {
             self.push(event);
         }
     }
@@ -463,34 +458,96 @@ impl Capture {
         let boundary_truncated = command_boundary
             .as_ref()
             .is_some_and(|boundary| boundary.truncated);
+        let (command_boundary, pending_rx) =
+            command_boundary.map_or((None, Vec::new()), |boundary| {
+                let (result, pending_rx) = boundary.finish();
+                (Some(result), pending_rx)
+            });
+        let mut events: Vec<_> = self.events.into_iter().chain(pending_rx).collect();
+        events.sort_by_key(|event| event.seq);
+        let mut retained_bytes: usize = events
+            .iter()
+            .map(|event| event.data.len().saturating_add(256))
+            .sum();
+        let mut truncated = self.truncated || boundary_truncated;
+        while retained_bytes > self.limits.max_bytes || events.len() > self.limits.max_events {
+            let dropped = events.remove(0);
+            retained_bytes = retained_bytes.saturating_sub(dropped.data.len().saturating_add(256));
+            truncated = true;
+        }
         CaptureResult {
-            events: self.events.into_iter().collect(),
-            truncated: self.truncated || boundary_truncated,
+            events,
+            truncated,
             gaps: self.gaps,
             completion,
             through_seq,
-            command_boundary: command_boundary.map(CommandBoundaryTracker::finish),
+            command_boundary,
         }
     }
 }
 
 struct AcceptedEvents {
     events: Vec<TimelineEvent>,
-    newly_armed: bool,
+    /// RX bytes visible to the completion matcher. Echo-required captures can
+    /// expose post-TX bytes here before deciding whether a complete echo will
+    /// arrive, while still retaining those events for lossless output.
+    matching_rx: Vec<u8>,
+    observed_post_tx_rx: bool,
+    /// Replace, rather than append to, the rolling matcher view. Used both
+    /// when a complete echo is stripped and while an incomplete echo's safe
+    /// fallback view is recomputed.
+    reset_matching: bool,
 }
 
 impl AcceptedEvents {
     fn single(event: TimelineEvent) -> Self {
+        let observed_post_tx_rx = event.direction == serial_protocol::Direction::Rx;
+        let matching_rx = if observed_post_tx_rx {
+            event.data.clone()
+        } else {
+            Vec::new()
+        };
         Self {
             events: vec![event],
-            newly_armed: false,
+            matching_rx,
+            observed_post_tx_rx,
+            reset_matching: false,
         }
     }
 
     fn none() -> Self {
         Self {
             events: Vec::new(),
-            newly_armed: false,
+            matching_rx: Vec::new(),
+            observed_post_tx_rx: false,
+            reset_matching: false,
+        }
+    }
+
+    fn pending_rx(data: Vec<u8>) -> Self {
+        Self {
+            events: Vec::new(),
+            matching_rx: data,
+            observed_post_tx_rx: true,
+            // Recomputed from the entire pending RX window so a partial echo
+            // can retract bytes that must not be used as completion evidence.
+            reset_matching: true,
+        }
+    }
+
+    fn after_echo(events: Vec<TimelineEvent>) -> Self {
+        let matching_rx = events
+            .iter()
+            .filter(|event| event.direction == serial_protocol::Direction::Rx)
+            .flat_map(|event| event.data.iter().copied())
+            .collect();
+        Self {
+            events,
+            matching_rx,
+            // The echo itself is authoritative post-TX RX evidence even when
+            // it has no following output bytes.
+            observed_post_tx_rx: true,
+            reset_matching: true,
         }
     }
 }
@@ -532,10 +589,6 @@ impl CommandBoundaryTracker {
             through_seq,
             truncated: false,
         }
-    }
-
-    fn armed(&self) -> bool {
-        self.armed
     }
 
     fn accept(&mut self, event: TimelineEvent) -> AcceptedEvents {
@@ -593,16 +646,19 @@ impl CommandBoundaryTracker {
             .flat_map(|event| event.data.iter().copied())
             .collect();
         let Some(echo_end) = find_echo_end(&pending, expected) else {
-            return AcceptedEvents::none();
+            // Sequence, not echo, is the causal lower bound. Exact
+            // post-write evidence may therefore complete a command even when
+            // an echo-on target loses or omits part of the echo. The pending
+            // events stay buffered so they can either be stripped if the full
+            // echo arrives later, or returned losslessly with a low-confidence
+            // result if it never does.
+            return AcceptedEvents::pending_rx(fallback_after_incomplete_echo(&pending, expected));
         };
 
         let events = self.discard_pending_prefix(echo_end);
         self.echo_observed = true;
         self.armed = true;
-        AcceptedEvents {
-            events,
-            newly_armed: true,
-        }
+        AcceptedEvents::after_echo(events)
     }
 
     fn bound_pending(&mut self) {
@@ -659,20 +715,12 @@ impl CommandBoundaryTracker {
         accepted
     }
 
-    fn finish(mut self) -> CommandBoundaryResult {
-        // If the required echo never arrived, every buffered RX byte remains
-        // outside the primary output boundary and must still be visible in
-        // diagnostics rather than disappearing from the accounting.
-        self.discarded_rx_event_count = self
-            .discarded_rx_event_count
-            .saturating_add(self.pending_rx.len());
-        self.discarded_rx_byte_count = self.discarded_rx_byte_count.saturating_add(
-            self.pending_rx
-                .iter()
-                .map(|event| event.data.len())
-                .sum::<usize>(),
-        );
-        CommandBoundaryResult {
+    fn finish(self) -> (CommandBoundaryResult, Vec<TimelineEvent>) {
+        // Missing/incomplete echo is lower-confidence evidence, not a reason
+        // to erase the post-TX bytes. Return the bounded pending events so the
+        // caller and Agent can inspect the exact RX that led to completion.
+        let pending_rx = self.pending_rx.into_iter().collect();
+        let result = CommandBoundaryResult {
             prewrite_activity: self.prewrite_activity,
             tx_audit_observed: self.tx_audit_observed,
             echo_required: self.boundary.expected_echo.is_some(),
@@ -680,7 +728,8 @@ impl CommandBoundaryTracker {
             discarded_rx_event_count: self.discarded_rx_event_count,
             discarded_rx_byte_count: self.discarded_rx_byte_count,
             interfered: self.interfered,
-        }
+        };
+        (result, pending_rx)
     }
 }
 
@@ -738,6 +787,147 @@ fn find_echo_end(actual: &[u8], expected: &[u8]) -> Option<usize> {
     None
 }
 
+/// Build the completion-matching view while a configured echo is incomplete.
+///
+/// A logical line that is identical or close to the expected echo is withheld
+/// in full. In particular, bytes after the first damaged character on that
+/// same line are never reclassified as command output. Unrelated post-TX lines
+/// remain intact, even when they happen to contain the command's first byte.
+fn fallback_after_incomplete_echo(actual: &[u8], expected: &[u8]) -> Vec<u8> {
+    if actual.is_empty() || expected.is_empty() {
+        return actual.to_vec();
+    }
+
+    let expected = expected
+        .strip_suffix(b"\r\n")
+        .or_else(|| expected.strip_suffix(b"\r"))
+        .or_else(|| expected.strip_suffix(b"\n"))
+        .unwrap_or(expected);
+    if expected.is_empty() {
+        return actual.to_vec();
+    }
+
+    let mut line_start = 0;
+    while line_start < actual.len() {
+        let (_, line_end) = logical_echo_line(actual, line_start);
+        let mut candidates = 0;
+        for start in line_start..line_end {
+            let at_boundary =
+                start == line_start || is_echo_candidate_boundary(actual[start.saturating_sub(1)]);
+            if !at_boundary && actual[start] != expected[0] {
+                continue;
+            }
+            let (candidate, candidate_end) = logical_echo_line(actual, start);
+            if candidate.is_empty() {
+                continue;
+            }
+            candidates += 1;
+            if looks_like_damaged_echo(&candidate, expected) {
+                return actual[candidate_end..].to_vec();
+            }
+            if candidates >= 128 {
+                break;
+            }
+        }
+        if line_end >= actual.len() {
+            break;
+        }
+        line_start = line_end;
+    }
+    actual.to_vec()
+}
+
+fn logical_echo_line(actual: &[u8], start: usize) -> (Vec<u8>, usize) {
+    let mut line = Vec::new();
+    let mut index = start;
+    while index < actual.len() {
+        if actual[index..].starts_with(b"\r\r\n") {
+            index += 3;
+            continue;
+        }
+        if actual[index..].starts_with(b"\r\n") {
+            return (line, index + 2);
+        }
+        if matches!(actual[index], b'\r' | b'\n') {
+            return (line, index + 1);
+        }
+        line.push(actual[index]);
+        index += 1;
+    }
+    (line, actual.len())
+}
+
+fn is_echo_candidate_boundary(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'#' | b'$' | b'>' | b':' | b']')
+}
+
+fn looks_like_damaged_echo(candidate: &[u8], expected: &[u8]) -> bool {
+    if expected.starts_with(candidate) || candidate.starts_with(expected) {
+        return true;
+    }
+    // Fuzzy matching is too permissive for one- to four-byte bootloader
+    // commands (for example "?"). Only an exact partial/full prefix can
+    // identify their echo reliably.
+    if expected.len() <= 4 {
+        return false;
+    }
+    let max_edits = (expected.len() / 4).clamp(1, 16);
+    let candidate = if candidate.len() > expected.len() {
+        &candidate[..expected.len()]
+    } else {
+        candidate
+    };
+    edit_distance_within(candidate, expected, max_edits)
+}
+
+/// Banded Levenshtein check. Echo comparison is bounded to at most 16 edits,
+/// keeping this O(command length * edit bound) rather than quadratic.
+fn edit_distance_within(left: &[u8], right: &[u8], max_edits: usize) -> bool {
+    if left.len().abs_diff(right.len()) > max_edits {
+        return false;
+    }
+    let infinity = max_edits + 1;
+    let mut previous = vec![infinity; right.len() + 1];
+    let mut current = vec![infinity; right.len() + 1];
+    for (index, value) in previous
+        .iter_mut()
+        .enumerate()
+        .take(right.len().min(max_edits) + 1)
+    {
+        *value = index;
+    }
+
+    for left_index in 1..=left.len() {
+        let band_start = left_index.saturating_sub(max_edits);
+        let band_end = right.len().min(left_index.saturating_add(max_edits));
+        if band_start == 0 {
+            current[0] = left_index;
+        } else {
+            // `current[band_start - 1]` feeds the first insertion candidate;
+            // reset this one cell because the two row buffers are reused.
+            current[band_start - 1] = infinity;
+        }
+        for right_index in band_start.max(1)..=band_end {
+            let substitution = previous[right_index - 1]
+                + if left[left_index - 1] == right[right_index - 1] {
+                    0
+                } else {
+                    1
+                };
+            let deletion = previous[right_index].saturating_add(1);
+            let insertion = current[right_index - 1].saturating_add(1);
+            current[right_index] = substitution.min(deletion).min(insertion);
+        }
+        if band_end < right.len() {
+            // The next row can grow the band by one; keep that newly visible
+            // deletion cell authoritative instead of reusing stale data.
+            current[band_end + 1] = infinity;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()] <= max_edits
+}
+
 enum Frame {
     Event(Box<TimelineEvent>),
     Gap(String),
@@ -755,8 +945,6 @@ struct CompletionWatcher {
     patterns: Vec<String>,
     until_regex: Option<regex::Regex>,
     last_activity: Option<tokio::time::Instant>,
-    allow_empty_quiet: bool,
-    armed: bool,
 }
 
 impl CompletionWatcher {
@@ -779,26 +967,11 @@ impl CompletionWatcher {
             until_regex: options.until_regex,
             last_activity: (quiet.is_some() && options.allow_empty_quiet)
                 .then(tokio::time::Instant::now),
-            allow_empty_quiet: options.allow_empty_quiet,
-            armed: true,
         }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        self.last_activity = None;
-    }
-
-    fn arm(&mut self, now: tokio::time::Instant) {
-        if self.armed {
-            return;
-        }
-        self.armed = true;
-        self.last_activity = (self.quiet.is_some() && self.allow_empty_quiet).then_some(now);
     }
 
     fn observe_rx(&mut self, now: tokio::time::Instant) {
-        if self.armed && self.quiet.is_some() {
+        if self.quiet.is_some() {
             self.last_activity = Some(now);
         }
     }
@@ -817,9 +990,6 @@ impl CompletionWatcher {
 
     /// Decide whether the capture should finish before waiting for more input.
     fn poll(&self, rolling: &str, now: tokio::time::Instant) -> Option<Completion> {
-        if !self.armed {
-            return (now >= self.deadline).then_some(Completion::Timeout);
-        }
         if let Some(pattern) = matched_pattern(rolling, &self.patterns) {
             return Some(Completion::Pattern(pattern));
         }
@@ -842,7 +1012,7 @@ impl CompletionWatcher {
 
     /// Decide the outcome once the scheduled wake-up elapsed.
     fn expired(&self, now: tokio::time::Instant) -> Completion {
-        if self.armed && self.quiet_deadline().is_some_and(|quiet| now >= quiet) {
+        if self.quiet_deadline().is_some_and(|quiet| now >= quiet) {
             Completion::Quiet
         } else {
             Completion::Timeout
@@ -1066,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn old_prompt_cannot_complete_until_tx_and_full_echo_arm_the_capture() {
+    fn pre_tx_prompt_is_excluded_and_full_echo_keeps_high_confidence() {
         let operation_id = Uuid::new_v4();
         let mut boundary = CommandBoundaryTracker::new(
             CommandBoundary {
@@ -1077,12 +1247,12 @@ mod tests {
             CaptureLimits::default(),
         );
         let mut prompt = watcher(&["]# "], false, false);
-        prompt.disarm();
         let mut rolling = String::new();
 
         // This prompt was replayed by attach before the write.
         let accepted = boundary.accept(event(10, Direction::Rx, b"[root@luckfox ~]# ", None));
         assert!(accepted.events.is_empty());
+        assert!(accepted.matching_rx.is_empty());
         assert_eq!(prompt.poll(&rolling, tokio::time::Instant::now()), None);
 
         // The write RPC's event_seq identifies the authoritative TX audit.
@@ -1090,26 +1260,24 @@ mod tests {
         assert!(accepted.events.is_empty());
         assert!(boundary.tx_audit_observed);
 
-        // seriald can drain RX queued during the physical write after emitting
-        // TX, so sequence alone is insufficient when echo=on.
-        let accepted = boundary.accept(event(13, Direction::Rx, b"[root@luckfox ~]# ", None));
-        assert!(accepted.events.is_empty());
-        assert!(!boundary.armed());
-        assert_eq!(prompt.poll(&rolling, tokio::time::Instant::now()), None);
-
-        // The true command echo arms completion and only its following output
-        // enters the primary capture window.
+        // The true command echo resets matching and only its following output
+        // enters the high-confidence primary capture window.
         let accepted = boundary.accept(event(
-            14,
+            13,
             Direction::Rx,
             b"help\r\r\nreal output\r\n[root@luckfox ~]# ",
             None,
         ));
-        assert!(accepted.newly_armed);
-        prompt.arm(tokio::time::Instant::now());
+        assert!(accepted.reset_matching);
+        rolling.clear();
+        assert!(accepted.observed_post_tx_rx);
+        prompt.observe_rx(tokio::time::Instant::now());
+        append_rolling(
+            &mut rolling,
+            &String::from_utf8_lossy(&accepted.matching_rx),
+        );
         for event in accepted.events {
-            prompt.observe_rx(tokio::time::Instant::now());
-            append_rolling(&mut rolling, &String::from_utf8_lossy(&event.data));
+            assert!(event.seq > 12);
         }
         assert!(!rolling.starts_with("[root@luckfox ~]# "));
         assert!(rolling.contains("real output"));
@@ -1118,12 +1286,70 @@ mod tests {
             Some(Completion::Pattern("]# ".into()))
         );
 
-        let result = boundary.finish();
+        let (result, pending) = boundary.finish();
+        assert!(pending.is_empty());
         assert_eq!(result.prewrite_activity.event_count, 1);
         assert!(result.tx_audit_observed);
         assert!(result.echo_observed);
-        assert_eq!(result.confidence(), "echo_confirmed");
+        assert_eq!(
+            result.confidence(&Completion::Pattern("]# ".into())),
+            "echo_confirmed"
+        );
         assert!(!result.interfered);
+    }
+
+    #[test]
+    fn explicit_post_tx_boundary_can_complete_with_missing_echo() {
+        let operation_id = Uuid::new_v4();
+        let mut boundary = CommandBoundaryTracker::new(
+            CommandBoundary {
+                tx_event_seq: 20,
+                operation_id,
+                expected_echo: Some(b"very-long-command\r".to_vec()),
+            },
+            CaptureLimits::default(),
+        );
+        let mut prompt = watcher(&["]# "], false, false);
+        let mut rolling = String::new();
+
+        // A prompt before the confirmed TX sequence remains excluded.
+        let before = boundary.accept(event(19, Direction::Rx, b"old ]# ", None));
+        assert!(before.matching_rx.is_empty());
+
+        boundary.accept(event(
+            20,
+            Direction::Tx,
+            b"very-long-command\r",
+            Some(operation_id),
+        ));
+        // The target emitted only a partial echo before its exact prompt.
+        let accepted = boundary.accept(event(
+            21,
+            Direction::Rx,
+            b"very-long-com\r\nresult\r\n[root@luckfox ~]# ",
+            None,
+        ));
+        assert!(accepted.reset_matching);
+        assert!(accepted.observed_post_tx_rx);
+        rolling.clear();
+        prompt.observe_rx(tokio::time::Instant::now());
+        append_rolling(
+            &mut rolling,
+            &String::from_utf8_lossy(&accepted.matching_rx),
+        );
+        let completion = prompt
+            .poll(&rolling, tokio::time::Instant::now())
+            .expect("post-TX prompt should complete the bounded capture");
+        assert_eq!(completion, Completion::Pattern("]# ".into()));
+
+        let (result, pending) = boundary.finish();
+        assert!(!result.echo_observed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, 21);
+        assert_eq!(
+            result.confidence(&completion),
+            "post_tx_boundary_without_echo"
+        );
     }
 
     #[test]
@@ -1132,6 +1358,73 @@ mod tests {
         let actual = b"stale prompt\r\nprintf 1234\r\r\n567890\r\r\nresult\r\n";
         let end = find_echo_end(actual, expected).expect("wrapped echo should match");
         assert_eq!(&actual[end..], b"result\r\n");
+    }
+
+    #[test]
+    fn partial_echo_cannot_match_a_boundary_embedded_in_the_command() {
+        let expected = b"printf __DONE__\r";
+        assert!(
+            fallback_after_incomplete_echo(b"printf __DONE__", expected).is_empty(),
+            "a still-valid echo prefix must remain hidden from completion"
+        );
+        assert!(
+            fallback_after_incomplete_echo(b"[root@luckfox ~]# printf __DONE__", expected)
+                .is_empty(),
+            "a stale prompt before a partial real echo must also remain hidden"
+        );
+        assert_eq!(
+            fallback_after_incomplete_echo(
+                b"printf __DON\r\nreal __DONE__\r\n[root@luckfox ~]# ",
+                expected
+            ),
+            b"real __DONE__\r\n[root@luckfox ~]# "
+        );
+    }
+
+    #[test]
+    fn no_echo_prompt_containing_the_command_first_byte_is_preserved() {
+        assert_eq!(
+            fallback_after_incomplete_echo(b"root@dut#", b"reboot\r"),
+            b"root@dut#"
+        );
+        assert_eq!(
+            fallback_after_incomplete_echo(b"ready\r\nroot@dut#", b"reboot\r"),
+            b"ready\r\nroot@dut#"
+        );
+    }
+
+    #[test]
+    fn short_commands_disable_fuzzy_echo_classification() {
+        assert_eq!(
+            fallback_after_incomplete_echo(b"root@dut#", b"?\r"),
+            b"root@dut#"
+        );
+        assert_eq!(
+            fallback_after_incomplete_echo(b"! ready\r\nroot@dut#", b"?\r"),
+            b"! ready\r\nroot@dut#"
+        );
+        assert!(
+            fallback_after_incomplete_echo(b"?", b"?\r").is_empty(),
+            "an exact partial echo remains protected"
+        );
+    }
+
+    #[test]
+    fn banded_echo_distance_accepts_small_damage_only() {
+        assert!(edit_distance_within(b"eXcho READY", b"echo READY", 2));
+        assert!(!edit_distance_within(b"root@d", b"reboot", 1));
+    }
+
+    #[test]
+    fn damaged_echo_same_line_remainder_cannot_complete_a_boundary() {
+        assert!(fallback_after_incomplete_echo(b"eXcho READY\r", b"echo READY\r").is_empty());
+        assert_eq!(
+            fallback_after_incomplete_echo(
+                b"[root@dut]# eXcho READY\r\nreal READY\r\n",
+                b"echo READY\r"
+            ),
+            b"real READY\r\n"
+        );
     }
 
     #[test]
@@ -1154,21 +1447,24 @@ mod tests {
             b"help\r\r\n[root@luckfox ~]# ",
             None,
         ));
-        assert!(accepted.newly_armed);
+        assert!(accepted.reset_matching);
 
-        let result = boundary.finish();
+        let (result, pending) = boundary.finish();
+        assert!(pending.is_empty());
         assert!(result.interfered);
         assert_eq!(result.prewrite_activity.tx_event_count, 1);
-        assert_eq!(result.confidence(), "echo_observed_interfered");
+        assert_eq!(
+            result.confidence(&Completion::Pattern("]# ".into())),
+            "echo_observed_interfered"
+        );
     }
 
     #[test]
-    fn disarmed_quiet_capture_cannot_finish_before_echo() {
-        let mut quiet = watcher(&[], true, true);
-        quiet.disarm();
+    fn quiet_capture_requires_post_tx_rx_evidence() {
+        let mut quiet = watcher(&[], true, false);
         let after_gap = tokio::time::Instant::now() + Duration::from_secs(1);
         assert_eq!(quiet.poll("", after_gap), None);
-        quiet.arm(after_gap);
+        quiet.observe_rx(after_gap);
         assert_eq!(
             quiet.poll("", after_gap + Duration::from_secs(1)),
             Some(Completion::Quiet)

@@ -9,7 +9,8 @@ use crossterm::{
     cursor::Show,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -58,6 +59,60 @@ const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
 enum InputMode {
     Line,
     Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Output,
+    Input,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConsoleLayout {
+    output_area: Rect,
+    output_inner: Rect,
+    input_area: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    row: usize,
+    column: u16,
+}
+
+#[derive(Debug, Clone)]
+struct TextSelection {
+    rows: Vec<Line<'static>>,
+    plain_rows: Vec<String>,
+    anchor: SelectionPoint,
+    head: SelectionPoint,
+}
+
+impl TextSelection {
+    fn ordered_points(&self) -> (SelectionPoint, SelectionPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn is_dragged(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    fn selected_text(&self) -> String {
+        let (start, end) = self.ordered_points();
+        self.plain_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(row, text)| {
+                selection_columns(start, end, row)
+                    .map(|(from, through)| slice_display_columns(text, from, through))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,6 +715,9 @@ struct App {
     uncertain_write_outcomes: usize,
     human_idle_release: Duration,
     mouse_capture: bool,
+    focus: PaneFocus,
+    layout: Option<ConsoleLayout>,
+    selection: Option<TextSelection>,
     config: Option<LoadedConfig>,
     should_quit: bool,
     dirty: bool,
@@ -694,7 +752,10 @@ impl App {
             queued_controls: HashMap::new(),
             uncertain_write_outcomes: 0,
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
-            mouse_capture: false,
+            mouse_capture: true,
+            focus: PaneFocus::Input,
+            layout: None,
+            selection: None,
             config: None,
             should_quit: false,
             dirty: true,
@@ -1684,20 +1745,18 @@ impl App {
                 self.handle_key(key, commands)
             }
             Event::Paste(value) => self.handle_paste(value, commands),
-            Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
-                self.scroll_up(3);
+            Event::Mouse(mouse) => self.handle_mouse(mouse, commands),
+            Event::Resize(_, _) => {
+                self.selection = None;
                 self.dirty = true;
             }
-            Event::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
-                self.scroll_down(3);
-                self.dirty = true;
-            }
-            Event::Resize(_, _) => self.dirty = true,
             _ => {}
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        self.focus = PaneFocus::Input;
+        self.selection = None;
         if self.help {
             self.help = false;
             if is_prefix(key) {
@@ -1738,6 +1797,116 @@ impl App {
             InputMode::Raw => self.handle_raw_key(key, commands),
         }
         self.dirty = true;
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.selection = None;
+                self.scroll_up(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.selection = None;
+                self.scroll_down(3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.begin_mouse_selection(mouse),
+            MouseEventKind::Drag(MouseButton::Left) => self.update_mouse_selection(mouse),
+            MouseEventKind::Up(MouseButton::Left) => self.finish_mouse_selection(mouse),
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.handle_right_click(mouse, commands);
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn begin_mouse_selection(&mut self, mouse: MouseEvent) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let position = Position::new(mouse.column, mouse.row);
+        if rect_contains(layout.input_area, position) {
+            self.focus = PaneFocus::Input;
+            self.selection = None;
+            return;
+        }
+        if !rect_contains(layout.output_area, position) {
+            return;
+        }
+        self.focus = PaneFocus::Output;
+        if !rect_contains(layout.output_inner, position) {
+            self.selection = None;
+            return;
+        }
+        let rows = visible_output_lines(self, layout.output_inner);
+        let Some(point) = selection_point(layout.output_inner, position, rows.len()) else {
+            self.selection = None;
+            return;
+        };
+        let plain_rows = rows.iter().map(line_plain_text).collect();
+        self.selection = Some(TextSelection {
+            rows,
+            plain_rows,
+            anchor: point,
+            head: point,
+        });
+    }
+
+    fn update_mouse_selection(&mut self, mouse: MouseEvent) {
+        let (Some(layout), Some(selection)) = (self.layout, self.selection.as_mut()) else {
+            return;
+        };
+        let position = Position::new(mouse.column, mouse.row);
+        if let Some(point) =
+            selection_point_clamped(layout.output_inner, position, selection.plain_rows.len())
+        {
+            selection.head = point;
+        }
+    }
+
+    fn finish_mouse_selection(&mut self, mouse: MouseEvent) {
+        self.update_mouse_selection(mouse);
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.is_dragged())
+        {
+            self.selection = None;
+        }
+    }
+
+    fn handle_right_click(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let position = Position::new(mouse.column, mouse.row);
+        if rect_contains(layout.output_area, position) {
+            self.focus = PaneFocus::Output;
+            let Some(selection) = self.selection.take() else {
+                return;
+            };
+            let text = selection.selected_text();
+            if text.is_empty() {
+                return;
+            }
+            self.status = match crate::clipboard::copy_text(&text) {
+                Ok(()) => trf("st.clipboard.copied", &[&text.chars().count().to_string()]),
+                Err(error) => trf("st.clipboard.copy.failed", &[&error.to_string()]),
+            };
+            return;
+        }
+        if !rect_contains(layout.input_area, position) {
+            return;
+        }
+        self.focus = PaneFocus::Input;
+        self.selection = None;
+        match crate::clipboard::read_text() {
+            Ok(Some(text)) => self.handle_paste(text, commands),
+            Ok(None) => self.status = tr("st.clipboard.paste.shortcut").into(),
+            Err(error) => {
+                self.status = trf("st.clipboard.paste.failed", &[&error.to_string()]);
+            }
+        }
     }
 
     fn handle_prefix_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
@@ -2146,7 +2315,7 @@ pub async fn run(
     for view in &mut app.slots {
         view.merge_echo = merge_echo;
     }
-    app.mouse_capture = loaded.config.mouse_capture.unwrap_or(false);
+    app.mouse_capture = loaded.config.mouse_capture.unwrap_or(true);
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
@@ -2316,7 +2485,7 @@ fn local_history_truncated_title() -> &'static str {
     }
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
+fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -2326,6 +2495,13 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         Constraint::Length(1),
     ])
     .split(area);
+    let output_area = chunks[1];
+    let input_area = chunks[3];
+    app.layout = Some(ConsoleLayout {
+        output_area,
+        output_inner: inset_border(output_area),
+        input_area,
+    });
 
     draw_tabs(frame, app, chunks[0]);
     draw_output(frame, app, chunks[1]);
@@ -2408,13 +2584,6 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let view = app.current();
-    let truncation_line = view.local_truncation_line();
-    let total_lines = view.logical_line_count();
-    // Clamp the paused offset so a vanished pending row can never produce an
-    // empty viewport; push_line already keeps the offset anchored on append
-    // and front-eviction.
-    let scroll = view.scroll_from_bottom.min(total_lines.saturating_sub(1));
-    let end = total_lines.saturating_sub(scroll);
     let title = format!(
         " {} · {} · {} baud{}{} ",
         safe_inline(&view.snapshot.config.display_name),
@@ -2431,8 +2600,39 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ""
         }
     );
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(if app.focus == PaneFocus::Output {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
     let inner = block.inner(area);
+    let mut visual_lines = app.selection.as_ref().map_or_else(
+        || visible_output_lines(app, inner),
+        |selection| selection.rows.clone(),
+    );
+    if let Some(selection) = app.selection.as_ref() {
+        let (start, end) = selection.ordered_points();
+        for (row, line) in visual_lines.iter_mut().enumerate() {
+            if let Some((from, through)) = selection_columns(start, end, row) {
+                *line = line_with_selection(line.clone(), from, through);
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(visual_lines).block(block), area);
+}
+
+fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
+    let view = app.current();
+    let truncation_line = view.local_truncation_line();
+    let total_lines = view.logical_line_count();
+    // Clamp the paused offset so a vanished pending row can never produce an
+    // empty viewport; push_line already keeps the offset anchored on append
+    // and front-eviction.
+    let scroll = view.scroll_from_bottom.min(total_lines.saturating_sub(1));
+    let end = total_lines.saturating_sub(scroll);
     let visible_height = inner.height as usize;
     // Every logical row occupies at least one wrapped visual row, so the last
     // `visible_height` logical rows before the requested boundary are a
@@ -2468,16 +2668,7 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .flat_map(|line| wrap_timeline_line(line, inner.width))
         .collect::<Vec<_>>();
     let visual_start = visual_lines.len().saturating_sub(visible_height);
-    frame.render_widget(
-        Paragraph::new(
-            visual_lines
-                .into_iter()
-                .skip(visual_start)
-                .collect::<Vec<_>>(),
-        )
-        .block(block),
-        area,
-    );
+    visual_lines.into_iter().skip(visual_start).collect()
 }
 
 fn wrap_timeline_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
@@ -2534,6 +2725,123 @@ fn wrap_timeline_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         });
     }
     rows
+}
+
+fn inset_border(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn rect_contains(area: Rect, position: Position) -> bool {
+    position.x >= area.x
+        && position.x < area.x.saturating_add(area.width)
+        && position.y >= area.y
+        && position.y < area.y.saturating_add(area.height)
+}
+
+fn selection_point(
+    output_inner: Rect,
+    position: Position,
+    row_count: usize,
+) -> Option<SelectionPoint> {
+    rect_contains(output_inner, position)
+        .then(|| selection_point_clamped(output_inner, position, row_count))
+        .flatten()
+}
+
+fn selection_point_clamped(
+    output_inner: Rect,
+    position: Position,
+    row_count: usize,
+) -> Option<SelectionPoint> {
+    if output_inner.width == 0 || output_inner.height == 0 || row_count == 0 {
+        return None;
+    }
+    let last_x = output_inner
+        .x
+        .saturating_add(output_inner.width.saturating_sub(1));
+    let last_y = output_inner
+        .y
+        .saturating_add(output_inner.height.saturating_sub(1));
+    let x = position.x.clamp(output_inner.x, last_x);
+    let y = position.y.clamp(output_inner.y, last_y);
+    Some(SelectionPoint {
+        row: usize::from(y.saturating_sub(output_inner.y)).min(row_count - 1),
+        column: x.saturating_sub(output_inner.x),
+    })
+}
+
+fn selection_columns(start: SelectionPoint, end: SelectionPoint, row: usize) -> Option<(u16, u16)> {
+    if row < start.row || row > end.row {
+        return None;
+    }
+    Some((
+        if row == start.row { start.column } else { 0 },
+        if row == end.row { end.column } else { u16::MAX },
+    ))
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    let mut text = String::new();
+    for span in &line.spans {
+        text.push_str(span.content.as_ref());
+    }
+    text
+}
+
+fn slice_display_columns(text: &str, from: u16, through: u16) -> String {
+    let mut column = 0usize;
+    let from = usize::from(from);
+    let through = usize::from(through);
+    text.chars()
+        .filter(|character| {
+            let width = UnicodeWidthChar::width(*character).unwrap_or(0);
+            let start = column;
+            let end = column.saturating_add(width.max(1));
+            column = column.saturating_add(width);
+            start <= through && end > from
+        })
+        .collect()
+}
+
+fn line_with_selection(line: Line<'static>, from: u16, through: u16) -> Line<'static> {
+    let mut column = 0usize;
+    let from = usize::from(from);
+    let through = usize::from(through);
+    let spans = line
+        .spans
+        .into_iter()
+        .flat_map(|span| {
+            let base_style = span.style;
+            span.content
+                .chars()
+                .map(|character| {
+                    let width = UnicodeWidthChar::width(character).unwrap_or(0);
+                    let start = column;
+                    let end = column.saturating_add(width.max(1));
+                    column = column.saturating_add(width);
+                    let selected = start <= through && end > from;
+                    Span::styled(
+                        character.to_string(),
+                        if selected {
+                            base_style.add_modifier(Modifier::REVERSED)
+                        } else {
+                            base_style
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
 }
 
 /// Renders one scrollback row. Compact mode is `{marker}{text}` where the
@@ -2702,8 +3010,14 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
-    let block = Block::default();
-    let block = block.borders(Borders::ALL);
+    let block =
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.focus == PaneFocus::Input {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            });
     let inner = block.inner(area);
     let (text, cursor_column, title) = match app.current_mode() {
         InputMode::Line => {
@@ -2721,7 +3035,9 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
     };
     frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
-    if let Some(cursor_column) = cursor_column {
+    if let Some(cursor_column) = cursor_column
+        && app.focus == PaneFocus::Input
+    {
         frame.set_cursor_position(Position::new(
             inner.x.saturating_add(cursor_column),
             inner.y,
@@ -2788,7 +3104,7 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width.min(76);
-    let height = area.height.min(30);
+    let height = area.height.min(32);
     let popup = centered_rect(width, height, area);
     let idle_seconds = app.human_idle_release.as_secs().to_string();
     let mouse_help = if app.mouse_capture {
@@ -2805,6 +3121,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("help.lang").to_string(),
         tr("help.scroll").to_string(),
         mouse_help.to_string(),
+        tr("help.mouse.paste").to_string(),
         tr("help.takeover").to_string(),
         tr("help.release").to_string(),
         tr("help.follow").to_string(),
@@ -4187,7 +4504,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
         terminal
-            .draw(|frame| draw(frame, &app))
+            .draw(|frame| draw(frame, &mut app))
             .expect("render TUI");
 
         let rendered = terminal
@@ -4212,7 +4529,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
         terminal
-            .draw(|frame| draw(frame, &app))
+            .draw(|frame| draw(frame, &mut app))
             .expect("render TUI");
 
         let rendered = terminal
@@ -4522,5 +4839,110 @@ mod tests {
         let draft = "abcdef".chars().collect::<Vec<_>>();
         assert_eq!(line_input_projection(&draft, 6, 6), ("> def".into(), 5));
         assert_eq!(line_input_projection(&draft, 2, 6), ("> abcd".into(), 4));
+    }
+
+    #[test]
+    fn display_column_selection_handles_wrapped_rows_and_cjk() {
+        let selection = TextSelection {
+            rows: vec![Line::from("  abc"), Line::from("中def")],
+            plain_rows: vec!["  abc".into(), "中def".into()],
+            anchor: SelectionPoint { row: 0, column: 2 },
+            head: SelectionPoint { row: 1, column: 2 },
+        };
+        assert_eq!(selection.selected_text(), "abc\n中d");
+
+        let reversed = TextSelection {
+            head: selection.anchor,
+            anchor: selection.head,
+            ..selection
+        };
+        assert_eq!(reversed.selected_text(), "abc\n中d");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_output_without_browsing_command_history() {
+        let mut app = App::new(vec![snapshot()], None);
+        for seq in 0..20 {
+            app.slots[0].push_line(stream_row(seq, Direction::Rx, "row"), true);
+        }
+        app.slots[0].history = vec!["first".into(), "second".into()];
+        app.slots[0].history_cursor = None;
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+
+        assert_eq!(app.slots[0].scroll_from_bottom, 3);
+        assert_eq!(app.slots[0].history_cursor, None);
+        assert!(app.slots[0].draft.is_empty());
+    }
+
+    #[test]
+    fn mouse_click_changes_focus_and_left_drag_selects_output_without_shift() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TUI");
+        let layout = app.layout.expect("draw records console layout");
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.output_inner.x + 2,
+                row: layout.output_inner.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: layout.output_inner.x + 5,
+                row: layout.output_inner.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: layout.output_inner.x + 5,
+                row: layout.output_inner.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+
+        assert_eq!(app.focus, PaneFocus::Output);
+        assert_eq!(
+            app.selection
+                .as_ref()
+                .map(TextSelection::selected_text)
+                .as_deref(),
+            Some("abcd")
+        );
+
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.input_area.x + 1,
+                row: layout.input_area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert!(app.selection.is_none());
     }
 }

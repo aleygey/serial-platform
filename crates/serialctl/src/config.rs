@@ -27,8 +27,9 @@ pub struct ClientConfig {
     /// projection. Defaults to true. Durable RX/TX audit events are never
     /// merged or discarded.
     pub merge_echo: Option<bool>,
-    /// Capture mouse events for wheel scrolling inside the TUI. Defaults to
-    /// false so ordinary drag selection works without holding Shift.
+    /// Capture mouse events for in-app output scrolling and selection.
+    /// Defaults to true. Set false to return all mouse handling to the
+    /// terminal emulator (which also disables serialctl wheel scrolling).
     pub mouse_capture: Option<bool>,
 }
 

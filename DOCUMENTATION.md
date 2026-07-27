@@ -32,14 +32,21 @@ before TX, creates an Operation UUID, sends that Run as `expected_run_id`, then
 uses the confirmed TX audit sequence as the authoritative lower bound of its
 bounded output window. The Slot actor checks the expected ID and server-issued
 Run owner together with the current control/fence before any pacing budget or
-physical write. With authoritative `echo=on`, completion remains disarmed until the
-complete command plus EOL is observed in RX (including the target's `CR CR LF`
-hard wraps). This drains both attach replay and RX that was queued before the
-physical write but sequenced after TX, so an old prompt cannot complete the new
-command. Echo-off and empty commands use the confirmed TX sequence alone.
-Results expose prewrite activity, boundary confidence, discarded pre-boundary
-RX, and any foreign TX as interference; an interfered echo is never presented
-as isolated evidence.
+physical write. The confirmed TX sequence is the hard lower bound: earlier RX
+is excluded. With authoritative `echo=on`, a complete command plus EOL echo
+(including the target's `CR CR LF` hard wraps) is stripped and provides the
+strongest confidence. A requested literal, regex, or prompt observed after TX
+may still complete when echo is missing or incomplete, but the result is
+explicitly marked `echo_missing`, suspected input loss, and uncertain
+delivery; it is never retried automatically. Bytes that can still be part of a
+partial command echo are withheld from matching, so an `until` token inside
+the command cannot complete early. Quiet completion requires at least one
+post-TX RX event. Results expose prewrite activity, boundary confidence,
+discarded pre-boundary RX, and any foreign TX as interference; an interfered
+echo is never presented as isolated evidence. Because serial RX has no causal
+response envelope, a prompt first sequenced after TX with no recognizable echo
+can only be reported as lower-confidence evidence; use a unique sentinel when
+that ambiguity is unsafe.
 Prompt/contains modes wait for their exact boundary or timeout; a transient
 quiet gap cannot end them. An explicit `until_regex` is the sole authoritative
 completion boundary: configured prompts, literal matches, and quiet intervals
@@ -431,7 +438,13 @@ character-at-a-time input from consuming the 16-chunk limit while it waits for
 Control. The 64 KiB aggregate cap is checked before publication of the
 candidate queue, so an over-cap input is explicitly rejected without partially
 appending that input.
-Mouse capture is disabled by default so native terminal drag-selection works.
+Mouse capture is enabled by default. The wheel changes only the serial-output
+viewport, clicking output/input changes focus, output left-drag performs
+Shift-free in-app selection, and output right-click copies. Windows input
+right-click reads the native Unicode clipboard; portable paste remains
+`Ctrl+Shift+V`, including on Ubuntu. Non-Windows copy uses OSC 52 and can
+require terminal permission. `mouse_capture=false` returns all mouse handling
+to the terminal emulator and disables serialctl wheel scrolling.
 Detailed mode adapts its source-column width to preserve payload on common
 80-column terminals. The live viewport measures Paragraph wrapping over a
 bounded logical suffix and scrolls by visual rows, not logical event rows; a

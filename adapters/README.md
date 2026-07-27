@@ -53,14 +53,28 @@ the adapter never reacquires control and writes outside the old boundary.
 its ID as `expected_run_id`. `seriald` validates the exact active Run and owner
 inside the same Slot actor as the control/fence; a missing, changed, or foreign
 Run rejects the write with zero bytes. The confirmed TX is tagged with an
-Operation UUID, and its sequence is the output window's lower bound. When the
-Profile says `echo=on`, the completion matcher stays disarmed until it observes
-the complete command plus EOL echo; this rejects both replayed prompts and
-seriald RX backlog sequenced immediately after TX. The matcher accepts the
-target's observed `CR CR LF` hard wrap. Echo-off and empty commands use the TX
-sequence alone. Results expose `prewrite_activity`, boundary confidence,
-discarded pre-boundary RX, and `interfered`; any foreign TX from attach through
-completion downgrades the boundary and the RX must not be treated as isolated.
+Operation UUID, and its sequence is the output window's lower bound. RX below
+that sequence is excluded, so prompts replayed before the write cannot complete
+the command. When the Profile says `echo=on`, a complete command plus EOL echo
+is stripped and gives the strongest confidence; the matcher accepts the
+target's observed `CR CR LF` hard wrap. An exact literal, regex, or prompt
+observed after confirmed TX may still complete when that echo is missing or
+incomplete. A logical line that is identical or close to a partial/damaged echo
+is withheld in full, so neither a boundary embedded in a chunked echo nor the
+same-line remainder after a damaged byte can complete early. Unrelated post-TX
+lines are preserved even if they contain the command's first character.
+One- to four-byte commands disable fuzzy echo classification and protect only
+an exact partial/full prefix. A missing/incomplete result reports
+`echo_missing=true`,
+`suspected_input_loss=true`, and `delivery_confidence=uncertain`; it preserves
+post-TX RX and never retries automatically. Quiet completion requires at least
+one post-TX RX event. Results also expose `prewrite_activity`, discarded
+pre-boundary RX, and `interfered`; any foreign TX from attach through completion
+downgrades the boundary and the RX must not be treated as isolated.
+Serial has no causal response envelope: if an already-buffered prompt is first
+sequenced after confirmed TX and no recognizable echo prefix follows it, that
+prompt can only be reported as lower-confidence post-TX evidence. Use a unique
+literal/regex sentinel when false prompt completion would be unsafe.
 Prompt and contains modes wait for the requested evidence or timeout; they are
 not ended by a short `quiet_ms` gap. Quiet is used only when selected explicitly
 or when auto mode has no configured prompt. Supplying `until_regex` makes that
@@ -88,7 +102,10 @@ and does not increment `fires_confirmed`. This MCP v1 tool accepts explicit
 UTF-8 `text` plus `eol`; it does not expose arbitrary binary/base64 Trigger
 arguments. The lower seriald WebSocket protocol remains raw-byte capable and
 encodes Trigger payloads and literals as base64. The adapter does not read a
-Prompt or EOL from the device profile.
+Prompt or EOL from the device profile. Ordinary commands and Trigger
+kickoff/action writes do inherit the Slot transport pacing. Pacing is
+deliberately absent from the Agent schemas, so an Agent cannot bypass the
+target's safe chunk/delay settings.
 The start request returns as soon as the daemon has armed the Job, leaving the
 session task available for lease renewal while a separate subscribed capture
 waits for the terminal lifecycle event. Timeout, maximum fires, cancellation,
@@ -148,11 +165,12 @@ after restarting the adapter use an explicit cursor when an older exact
 boundary matters.
 
 One write RPC waits up to 20 seconds, covering seriald's 15-second legal write
-budget plus response margin. An explicit daemon rejection that says pacing
-exceeds that budget or the lease is too short is a definite no-byte outcome and
-is reported as safe to retry after correction. Transport loss, timeout, and
-partial writes remain outcome-uncertain; inspect TX before deciding whether to
-retry.
+budget plus response margin. `serial-mcp` leaves pacing unset in the wire
+request so `seriald` applies the Slot transport settings. An explicit
+daemon rejection that says those settings exceed the budget or the lease is too
+short is a definite no-byte outcome and is reported as safe to retry after
+configuration is corrected. Transport loss, timeout, missing echo, and partial
+writes remain outcome-uncertain; inspect TX/RX before deciding whether to retry.
 
 `search` defaults to `current_run`; it will not silently find a matching line
 from an earlier test cycle. If that bounded query is `truncated`, repeat the

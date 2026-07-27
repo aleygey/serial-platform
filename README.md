@@ -9,6 +9,10 @@ It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
+See [ROADMAP.md](ROADMAP.md) for released capabilities, the next practical
+work, and longer-term candidates separated by `seriald`, `serialctl`, and
+`serial-mcp`.
+
 ## What v1 provides
 
 - Interactive COM discovery and Slot configuration from `serialctl init`.
@@ -166,10 +170,14 @@ keys:
 In LINE mode, plain `PageUp`/`PageDown` also scroll locally; RAW keeps those
 keys for xterm byte sequences, so use the `Ctrl-]` prefix there.
 
-Mouse capture is off by default, so ordinary left-button drag selects terminal
-text without holding Shift. Set `mouse_capture = true` in `serialctl.toml` only
-if in-app wheel scrolling is more important; with capture enabled, terminal
-selection follows the terminal emulator's usual Shift-drag behavior.
+Mouse capture is on by default. The wheel scrolls only the serial-output
+viewport; clicking the output or input pane changes focus; output left-drag
+selects without `Shift`; and output right-click copies the active selection.
+On Windows, input right-click pastes from the native Unicode clipboard.
+`Ctrl+Shift+V` remains the portable paste path, including Ubuntu. Linux output
+copy uses OSC 52 and may require clipboard access to be enabled in the terminal
+emulator. Set `mouse_capture = false` in `serialctl.toml` to return mouse
+selection to the terminal emulator; that also disables in-app wheel scrolling.
 After confirmation, a LINE-mode multiline paste is queued as distinct logical
 commands that share one Operation ID and each receive the effective EOL. RAW
 paste remains one unmodified byte burst. Adjacent RAW keystrokes that have not
@@ -344,6 +352,20 @@ execution.
 
 ## Profile adjustments
 
+The current configuration has three operational layers:
+
+1. the Slot identifies the station channel (`id`, display name, and COM port);
+2. that Slot stores a complete transport baseline snapshot (115200/8N1,
+   flow-control and DTR/RTS policy, safe pacing, and auto-open);
+3. an optional reusable device profile supplies model behavior (EOL, echo,
+   Shell prompt, and U-Boot prompt).
+
+The transport baseline is deliberately still a per-Slot snapshot in schema v1;
+`generic-115200` is not a shared catalog object. This preserves exact settings
+when two fixed serial-card channels evolve differently. A reusable transport
+catalog and migration are tracked separately in the roadmap rather than being
+mixed into terminal/MCP fixes.
+
 `serialctl init` creates a `generic-115200` baseline snapshot inside each Slot
 and keeps an existing same-port snapshot on later runs. In the current schema,
 the Slot's `profile = "generic-115200"` value is a descriptive label rather
@@ -393,15 +415,17 @@ Two Slot settings protect slow UART sinks from overruns: the writer sends
 `write_chunk_size` bytes, then waits `write_chunk_delay_ms` before the next
 chunk. The defaults (1 byte, 1 ms) produce a typewriter cadence; set
 `write_chunk_delay_ms = 0` to send each write as one unthrottled burst. A
-single write request can also carry its own pacing override. Note that
-`seriald` rejects zero-byte writes, so clients must send at least the line
-ending. On Windows, timer and asynchronous-driver scheduling can make the
-conservative 1 byte/1 ms default behave closer to 15 ms per byte. Keep that
-default until the target has been validated: new `serialctl init` profiles
-still start at 1 byte/1 ms, and existing explicit settings are not migrated
-silently. For long commands on a target known to accept bursts, set the Slot
-to a chunk size of 4 or 8, or let an Agent request that per-write override;
-both improve throughput without changing the protocol.
+low-level write request can still carry an explicit protocol override for
+trusted clients, but `serialctl` and `serial-mcp` intentionally leave it unset:
+human commands, Agent commands, and Trigger Jobs all inherit the Slot transport
+cadence. Physical pacing is station configuration, not an Agent tool
+parameter. Note that `seriald` rejects zero-byte writes, so clients must send
+at least the line ending. On Windows, timer and asynchronous-driver scheduling
+can make the conservative 1 byte/1 ms default behave closer to 15 ms per byte.
+Keep that default until the target has been validated: new `serialctl init`
+profiles still start at 1 byte/1 ms, and existing explicit settings are not
+migrated silently. For long commands on a target known to accept bursts, an
+administrator can set the Slot to a validated chunk size such as 4 or 8.
 
 One physical write has a 15-second total budget and retains a separate
 two-second timeout for any driver call that makes no progress. `seriald`

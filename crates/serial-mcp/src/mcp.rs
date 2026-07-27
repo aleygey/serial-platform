@@ -192,7 +192,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "command",
-            "Require this serial-mcp process to own the Slot's active Run, atomically attach, renew that Run's existing write-control lease (never reacquire/takeover), write command+EOL with expected_run_id, and capture a bounded RX window after the confirmed TX audit. seriald rejects the write with zero bytes if the Run ended, changed, or belongs to another actor. With echo=on, completion is disarmed until the complete command echo is observed, so an old prompt or prewrite RX backlog cannot complete this command. Returns run_id, prewrite_activity, boundary confidence, and an interference flag; foreign TX means the RX is not isolated. prompt/contains wait for their exact boundary or timeout; quiet applies only when explicitly selected or auto has no configured prompt. When until_regex is supplied it is the sole completion boundary: profile prompts, literals, and quiet cannot pre-empt it, and completion_mode is regex. complete means the capture boundary was observed, never that the command succeeded; execution_status remains unknown because this generic adapter does not rewrite commands to inspect a shell exit code. When the target shell is known, emit a unique status sentinel from the command and use that sentinel as the literal or regex boundary; serial-mcp never injects shell syntax itself. RX events are Run/cursor scoped and never carry operation_id. capture_truncated marks capture-window overflow (default 4096 events / 1 MiB; oldest events dropped), text_truncated marks rendered text cut to max_chars.",
+            "Require this serial-mcp process to own the Slot's active Run, atomically attach, renew that Run's existing write-control lease (never reacquire/takeover), write command+EOL with expected_run_id, and capture a bounded RX window after the confirmed TX audit. seriald rejects the write with zero bytes if the Run ended, changed, or belongs to another actor. The confirmed TX sequence is the lower bound: pre-TX RX is excluded, while an exact post-TX literal/regex/prompt may complete even when an echo-on target does not return the full echo. A full echo gives high confidence; a missing/incomplete echo returns echo_missing, suspected_input_loss, and uncertain target delivery without retrying automatically. Quiet completion requires post-TX RX evidence and cannot complete an empty window. Returns run_id, prewrite_activity, boundary confidence, and an interference flag; foreign TX means the RX is not isolated. When until_regex is supplied it is the sole completion boundary: profile prompts, literals, and quiet cannot pre-empt it, and completion_mode is regex. Writes always inherit the Slot transport pacing; Agents cannot override it. complete means the capture boundary was observed, never that the command succeeded; execution_status remains unknown because this generic adapter does not rewrite commands to inspect a shell exit code. When the target shell is known, emit a unique status sentinel from the command and use that sentinel as the literal or regex boundary; serial-mcp never injects shell syntax itself. RX events are Run/cursor scoped and never carry operation_id. capture_truncated marks capture-window overflow (default 4096 events / 1 MiB; oldest events dropped), text_truncated marks rendered text cut to max_chars.",
             object(
                 merge(&[
                     json!({
@@ -200,9 +200,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "eol":{"type":"string","description":"Override profile EOL for this call only; default profile usually uses \\r."},
                         "completion":{"type":"string","enum":["auto","prompt","contains","quiet"],"default":"auto","description":"auto uses configured prompts, otherwise quiet. prompt/contains require exact evidence and do not finish on quiet_ms gaps. With until_regex, omit this field or leave it auto; explicit prompt/contains/quiet is rejected as ambiguous."},
                         "until":{"type":"string","description":"Literal completion text; required for contains, optional extra prompt for prompt. Cannot be combined with until_regex."},
-                        "until_regex":{"type":"string","minLength":1,"description":"Sole authoritative regex completion boundary matched against the rolling RX window. Profile prompts, literals, and quiet are disabled until this regex matches or timeout occurs; the result reports completion_mode=regex."},
-                        "inter_char_delay_ms":{"type":"integer","minimum":0,"description":"Write pacing override for this call: delay between written chunks in ms; seriald already defaults to 1 ms per character. Omit to keep the Slot setting."},
-                        "chunk_size":{"type":"integer","minimum":1,"description":"Write pacing override for this call: bytes written per chunk; seriald defaults to 1 (one character). Omit to keep the Slot setting."},
+                        "until_regex":{"type":"string","minLength":1,"description":"Sole authoritative regex completion boundary matched against post-TX RX. Profile prompts, literals, and quiet are disabled until this regex matches or timeout occurs; the result reports completion_mode=regex."},
                         "timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"default":10},
                         "quiet_ms":{"type":"integer","minimum":50,"maximum":5000,"default":300,"description":"Quiet boundary duration; used only by completion=quiet or auto when no prompt is configured."}
                     }),
@@ -214,7 +212,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "trigger",
-            "Run one bounded, generic serial reaction inside seriald while this adapter owns the Slot's active Run and write control. seriald atomically arms RX observation, optionally performs initial_write once (the one-time kickoff), then sends action after each completed interval until a caller-supplied literal stop pattern matches or a terminal limit/failure occurs. This MCP v1 surface accepts explicit UTF-8 text plus EOL; the lower seriald protocol remains raw-byte capable. No device Profile, prompt, bootloader, or flashing behavior is inferred. timeout_ms stops new scheduling; one already accepted bounded driver write may settle before the authoritative terminal result. The tool keeps the Run lease renewable, returns evidence clipped to the authoritative Trigger start/end sequence, and reports whether this MCP connection still retains the Run for a follow-up write. Only outcome=matched means a stop pattern was observed.",
+            "Run one bounded, generic serial reaction inside seriald while this adapter owns the Slot's active Run and write control. seriald atomically arms RX observation, optionally performs initial_write once (the one-time kickoff), then sends action after each completed interval until a caller-supplied literal stop pattern matches or a terminal limit/failure occurs. This MCP v1 surface accepts explicit UTF-8 text plus EOL; the lower seriald protocol remains raw-byte capable. No device Profile, prompt, bootloader, or flashing behavior is inferred, while all physical writes inherit the Slot transport pacing. timeout_ms stops new scheduling; one already accepted bounded driver write may settle before the authoritative terminal result. The tool keeps the Run lease renewable, returns evidence clipped to the authoritative Trigger start/end sequence, and reports whether this MCP connection still retains the Run for a follow-up write. Only outcome=matched means a stop pattern was observed.",
             object(
                 merge(&[
                     json!({
@@ -243,9 +241,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS,"description":"Delay after one action write is confirmed before the next is eligible. Pacing/write time is additional; missed ticks are never replayed in a burst."},
                         "stop_contains":{"type":"array","default":[],"maxItems":MAX_TRIGGER_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},"description":"Optional caller-supplied case-sensitive UTF-8 literal RX stop patterns, each limited to 256 encoded bytes at runtime. No Profile prompt is added implicitly. Omit for a bounded one-shot/repeat that intentionally ends at max_fires or timeout; when a matched outcome is required, supply at least one literal."},
                         "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS,"description":"Deadline for scheduling new writes. One already accepted bounded physical write may finish and be audited before the terminal result is returned."},
-                        "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":format!("Maximum confirmed action writes; the optional initial_write is not counted. Reaching it yields outcome=max_fires_reached and matched=false. The combined runtime plan len(initial_write) + len(action) * max_fires must not exceed {MAX_TRIGGER_TOTAL_BYTES} UTF-8 bytes.")},
-                        "inter_char_delay_ms":{"type":"integer","minimum":0,"description":"Optional pacing override shared by initial_write and every action. Omit both pacing fields to retain the Slot transport setting. If only this field is supplied, chunk_size inherits the Slot setting."},
-                        "chunk_size":{"type":"integer","minimum":1,"description":"Optional bytes-per-chunk pacing override shared by initial_write and every action. If only this field is supplied, inter_char_delay_ms inherits the Slot setting. For a target validated for bursts, action={text:'slp'}, chunk_size=3, inter_char_delay_ms=0 avoids conservative character pacing."}
+                        "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":format!("Maximum confirmed action writes; the optional initial_write is not counted. Reaching it yields outcome=max_fires_reached and matched=false. The combined runtime plan len(initial_write) + len(action) * max_fires must not exceed {MAX_TRIGGER_TOTAL_BYTES} UTF-8 bytes.")}
                     }),
                     bounds.clone(),
                 ]),
@@ -397,6 +393,16 @@ mod tests {
                 .unwrap()
                 .contains("Sole authoritative")
         );
+        assert!(
+            command["inputSchema"]["properties"]
+                .get("chunk_size")
+                .is_none()
+        );
+        assert!(
+            command["inputSchema"]["properties"]
+                .get("inter_char_delay_ms")
+                .is_none()
+        );
 
         let search = tools.iter().find(|tool| tool["name"] == "search").unwrap();
         assert!(
@@ -450,6 +456,8 @@ mod tests {
             ""
         );
         assert_eq!(schema["properties"]["stop_contains"]["default"], json!([]));
+        assert!(schema["properties"].get("chunk_size").is_none());
+        assert!(schema["properties"].get("inter_char_delay_ms").is_none());
         assert!(
             schema["properties"]["max_fires"]["description"]
                 .as_str()

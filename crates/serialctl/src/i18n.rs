@@ -176,13 +176,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.wheel",
-        "  mouse wheel              scroll 3 lines (bottom resumes follow)",
-        "  鼠标滚轮                 滚动 3 行(回到底部恢复跟随)",
+        "  wheel / left drag / right click   scroll / select / copy output",
+        "  滚轮 / 左键拖动 / 右键       滚动 / 选择 / 复制串口输出",
     ),
     (
         "help.selection",
-        "  mouse drag               select/copy text (mouse capture is off)",
-        "  鼠标拖动                 直接选择/复制文本(默认不捕获鼠标)",
+        "  mouse                    handled by terminal (serialctl wheel is off)",
+        "  鼠标                     由终端处理(serialctl 滚轮已关闭)",
+    ),
+    (
+        "help.mouse.paste",
+        "  input right click / Ctrl-Shift-V   paste (right click is Windows-native)",
+        "  输入框右键 / Ctrl-Shift-V      粘贴(右键为 Windows 原生支持)",
     ),
     (
         "help.takeover",
@@ -520,6 +525,26 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "未知前缀命令;Ctrl-] ? 打开帮助",
     ),
     ("st.input.cleared", "input cleared", "输入已清空"),
+    (
+        "st.clipboard.copied",
+        "copied {} character(s) from serial output",
+        "已从串口输出复制 {} 个字符",
+    ),
+    (
+        "st.clipboard.copy.failed",
+        "cannot copy selection: {}",
+        "无法复制所选文本: {}",
+    ),
+    (
+        "st.clipboard.paste.shortcut",
+        "right-click paste is unavailable on this platform; use Ctrl-Shift-V",
+        "此平台不支持应用内右键粘贴;请使用 Ctrl-Shift-V",
+    ),
+    (
+        "st.clipboard.paste.failed",
+        "cannot read clipboard: {}",
+        "无法读取剪贴板: {}",
+    ),
     (
         "st.paste.rejected",
         "paste rejected: {} bytes exceeds the {} byte interactive safety limit",

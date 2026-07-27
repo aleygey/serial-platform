@@ -13,7 +13,7 @@ use serial_protocol::{
     MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
     MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
     MAX_TRIGGER_TOTAL_BYTES, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, SessionState,
-    SlotSnapshot, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
+    SlotSnapshot, TriggerInfo, TriggerSpec, TriggerStatus,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -348,7 +348,6 @@ impl AgentTools {
         // completion_patterns makes an explicit regex the sole authoritative
         // boundary, so neither a configured prompt nor quiet can pre-empt it.
         let complete_on_quiet = completion_mode == "quiet";
-        let pacing = write_pacing(args.chunk_size, args.inter_char_delay_ms, &slot);
         let echo_mode = effective_echo_mode(&slot);
         let expected_echo =
             (matches!(echo_mode, EchoMode::On) && !args.command.is_empty()).then(|| bytes.clone());
@@ -359,7 +358,7 @@ impl AgentTools {
                 bytes,
                 operation_id,
                 expected_run_id,
-                pacing,
+                None,
             )
             .await?;
         let result = capture
@@ -370,7 +369,10 @@ impl AgentTools {
                     patterns,
                     until_regex,
                     complete_on_quiet,
-                    allow_empty_quiet: complete_on_quiet,
+                    // A quiet boundary needs post-TX RX evidence. In
+                    // particular, an empty command window must not return
+                    // "complete" merely because the timer elapsed.
+                    allow_empty_quiet: false,
                 },
                 CommandBoundary {
                     tx_event_seq: write.event_seq,
@@ -398,6 +400,17 @@ impl AgentTools {
             .as_ref()
             .context("command capture lost its authoritative write boundary")?;
         let interfered = boundary.interfered;
+        let echo_missing = boundary.echo_required && !boundary.echo_observed;
+        let suspected_input_loss = echo_missing;
+        let delivery_confidence = if interfered {
+            "interfered"
+        } else if echo_missing {
+            "uncertain"
+        } else if boundary.echo_observed {
+            "echo_confirmed"
+        } else {
+            "serial_write_confirmed"
+        };
         let last_seq = result.through_seq.unwrap_or(write.event_seq);
         let rx_event_count = result
             .events
@@ -425,7 +438,9 @@ impl AgentTools {
             "actor": write.actor, "completion_mode": completion_mode,
             "completion": result.completion.label(), "complete": result.completion.is_complete(),
             "completion_evidence": completion_evidence, "execution_status": "unknown",
-            "interfered": interfered, "text": rendered.text,
+            "interfered": interfered, "echo_missing": echo_missing,
+            "suspected_input_loss": suspected_input_loss,
+            "delivery_confidence": delivery_confidence, "text": rendered.text,
             "capture_window": {
                 "attached_after_seq": capture_after_seq,
                 "after_seq": write.event_seq, "through_seq": last_seq,
@@ -441,7 +456,7 @@ impl AgentTools {
                 "tx_event_count": boundary.prewrite_activity.tx_event_count
             },
             "boundary": {
-                "confidence": boundary.confidence(),
+                "confidence": boundary.confidence(&result.completion),
                 "tx_event_seq": write.event_seq,
                 "tx_audit_observed_in_capture": boundary.tx_audit_observed,
                 "echo_required": boundary.echo_required,
@@ -451,7 +466,7 @@ impl AgentTools {
             },
             "capture_truncated": result.truncated, "text_truncated": rendered.text_truncated,
             "repeated_lines_collapsed": rendered.repeated_lines_collapsed, "gaps": result.gaps,
-            "guidance": command_guidance(&result.completion, interfered)
+            "guidance": command_guidance(&result.completion, interfered, echo_missing)
         });
         if with_events {
             output["events"] = json!(rendered.events);
@@ -475,7 +490,7 @@ impl AgentTools {
             );
         }
 
-        let spec = trigger_spec(&args, &slot)?;
+        let spec = trigger_spec(&args)?;
         let operation_id = Uuid::new_v4();
         let attached_after_seq = slot.head_seq;
         let capture = Capture::attach(
@@ -1059,10 +1074,16 @@ fn completion_evidence(completion: &Completion) -> Value {
     }
 }
 
-fn command_guidance(completion: &Completion, interfered: bool) -> &'static str {
+fn command_guidance(completion: &Completion, interfered: bool, echo_missing: bool) -> &'static str {
     if interfered {
         return "Another actor wrote during this capture window; do not treat the RX as isolated. \
                 RX is window/Run scoped and never tagged with operation_id.";
+    }
+    if echo_missing {
+        return "The target's configured echo was missing or incomplete. Exact post-TX boundary \
+                evidence may still complete capture, but target delivery is uncertain and input \
+                loss is suspected. Inspect the returned RX/TX evidence before deciding whether \
+                to retry; serial-mcp did not retry automatically.";
     }
     match completion {
         Completion::Pattern(_) | Completion::Regex(_) => {
@@ -1107,24 +1128,6 @@ fn attach_search_continuation_guidance(output: &mut Value, scope: &str, run_id: 
         "Search results are incomplete. Repeat search with the same filters and the returned \
          continuation fields before concluding that a match is absent."
     });
-}
-
-/// Per-call write pacing override. Either side falls back to the Slot's
-/// configured pacing (seriald itself defaults to one byte per chunk with a
-/// 1 ms inter-chunk delay), and both absent means no override at all.
-fn write_pacing(
-    chunk_size: Option<u32>,
-    inter_char_delay_ms: Option<u64>,
-    slot: &SlotSnapshot,
-) -> Option<WritePacing> {
-    let chunk_size = chunk_size.filter(|size| *size > 0);
-    if chunk_size.is_none() && inter_char_delay_ms.is_none() {
-        return None;
-    }
-    Some(WritePacing {
-        chunk_size: chunk_size.unwrap_or(slot.config.settings.write_chunk_size),
-        chunk_delay_ms: inter_char_delay_ms.unwrap_or(slot.config.settings.write_chunk_delay_ms),
-    })
 }
 
 /// Assemble the bytes for one write. An empty command is valid as long as the
@@ -1241,7 +1244,7 @@ fn compile_until_regex(value: Option<&str>) -> Result<Option<regex::Regex>> {
         .context("until_regex is not a valid regex")
 }
 
-fn trigger_spec(args: &TriggerArgs, slot: &SlotSnapshot) -> Result<TriggerSpec> {
+fn trigger_spec(args: &TriggerArgs) -> Result<TriggerSpec> {
     let initial_write = args
         .initial_write
         .as_ref()
@@ -1300,7 +1303,10 @@ fn trigger_spec(args: &TriggerArgs, slot: &SlotSnapshot) -> Result<TriggerSpec> 
         stop_contains,
         timeout_ms,
         max_fires,
-        pacing: write_pacing(args.chunk_size, args.inter_char_delay_ms, slot),
+        // The Agent-facing Trigger intentionally cannot override physical
+        // write pacing. `None` tells seriald to apply the Slot transport
+        // settings to kickoff and action writes.
+        pacing: None,
     })
 }
 
@@ -1539,8 +1545,6 @@ struct CommandArgs {
     completion: Option<String>,
     until: Option<String>,
     until_regex: Option<String>,
-    inter_char_delay_ms: Option<u64>,
-    chunk_size: Option<u32>,
     timeout_seconds: Option<u64>,
     quiet_ms: Option<u64>,
     max_chars: Option<usize>,
@@ -1569,8 +1573,6 @@ struct TriggerArgs {
     interval_ms: Option<u64>,
     timeout_ms: Option<u64>,
     max_fires: Option<u32>,
-    inter_char_delay_ms: Option<u64>,
-    chunk_size: Option<u32>,
     max_chars: Option<usize>,
     #[serde(default)]
     include_raw: bool,
@@ -1773,6 +1775,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_writes_reject_transport_pacing_overrides() {
+        let command = serde_json::from_value::<CommandArgs>(json!({
+            "slot_id": "bench",
+            "command": "version",
+            "chunk_size": 64
+        }))
+        .err()
+        .expect("command pacing override must be rejected");
+        assert!(command.to_string().contains("unknown field"));
+
+        let trigger = serde_json::from_value::<TriggerArgs>(json!({
+            "slot_id": "bench",
+            "action": {"text": "slp"},
+            "inter_char_delay_ms": 0
+        }))
+        .err()
+        .expect("trigger pacing override must be rejected");
+        assert!(trigger.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn trigger_uses_only_explicit_call_text_and_eol() {
         let args: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
@@ -1782,12 +1805,10 @@ mod tests {
             "stop_contains": ["any caller literal"],
             "interval_ms": 20,
             "timeout_ms": 5000,
-            "max_fires": 250,
-            "chunk_size": 3,
-            "inter_char_delay_ms": 0
+            "max_fires": 250
         }))
         .unwrap();
-        let spec = trigger_spec(&args, &test_slot()).unwrap();
+        let spec = trigger_spec(&args).unwrap();
         assert_eq!(spec.initial_write.as_deref(), Some(b"reboot\r".as_slice()));
         assert_eq!(spec.start_contains.as_deref(), Some(b"Booting".as_slice()));
         assert_eq!(spec.action, b"slp");
@@ -1795,13 +1816,7 @@ mod tests {
         assert_eq!(spec.interval_ms, 20);
         assert_eq!(spec.timeout_ms, 5000);
         assert_eq!(spec.max_fires, 250);
-        assert_eq!(
-            spec.pacing,
-            Some(WritePacing {
-                chunk_size: 3,
-                chunk_delay_ms: 0,
-            })
-        );
+        assert_eq!(spec.pacing, None);
     }
 
     #[test]
@@ -1813,7 +1828,7 @@ mod tests {
             "max_fires": 1
         }))
         .unwrap();
-        let spec = trigger_spec(&args, &test_slot()).unwrap();
+        let spec = trigger_spec(&args).unwrap();
         assert!(spec.stop_contains.is_empty());
         assert_eq!(spec.max_fires, 1);
         assert_eq!(
@@ -1831,7 +1846,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            trigger_spec(&empty, &test_slot())
+            trigger_spec(&empty)
                 .unwrap_err()
                 .to_string()
                 .contains("both empty")
@@ -1845,7 +1860,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            trigger_spec(&over_total, &test_slot())
+            trigger_spec(&over_total)
                 .unwrap_err()
                 .to_string()
                 .contains("65536 bytes")
@@ -1936,10 +1951,14 @@ mod tests {
         assert_eq!(evidence["boundary_observed"], true);
         assert!(evidence.get("success").is_none());
         assert!(
-            command_guidance(&Completion::Pattern("]# ".into()), false)
+            command_guidance(&Completion::Pattern("]# ".into()), false, false)
                 .contains("execution_status remains unknown")
         );
-        assert!(command_guidance(&Completion::Quiet, false).contains("not proof"));
+        assert!(command_guidance(&Completion::Quiet, false, false).contains("not proof"));
+        assert!(
+            command_guidance(&Completion::Pattern("]# ".into()), false, true)
+                .contains("did not retry automatically")
+        );
     }
 
     #[test]
@@ -1980,28 +1999,6 @@ mod tests {
             "logging": "healthy"
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn pacing_is_unset_without_overrides_and_falls_back_per_field() {
-        let slot = test_slot();
-        assert_eq!(write_pacing(None, None, &slot), None);
-        assert_eq!(
-            write_pacing(Some(8), None, &slot),
-            Some(WritePacing {
-                chunk_size: 8,
-                chunk_delay_ms: slot.config.settings.write_chunk_delay_ms,
-            })
-        );
-        assert_eq!(
-            write_pacing(None, Some(0), &slot),
-            Some(WritePacing {
-                chunk_size: slot.config.settings.write_chunk_size,
-                chunk_delay_ms: 0,
-            })
-        );
-        // A zero chunk size is meaningless, so it falls back like an unset one.
-        assert_eq!(write_pacing(Some(0), None, &slot), None);
     }
 
     #[test]
@@ -2060,18 +2057,14 @@ mod tests {
     }
 
     #[test]
-    fn command_args_parse_regex_pacing_and_lean_rendering_fields() {
+    fn command_args_parse_regex_and_lean_rendering_fields() {
         let args: CommandArgs = serde_json::from_value(json!({
             "slot_id": "bench",
             "command": "boot",
             "until_regex": "U-Boot \\d+",
-            "inter_char_delay_ms": 5,
-            "chunk_size": 16,
         }))
         .unwrap();
         assert_eq!(args.until_regex.as_deref(), Some("U-Boot \\d+"));
-        assert_eq!(args.inter_char_delay_ms, Some(5));
-        assert_eq!(args.chunk_size, Some(16));
         assert!(!args.include_events);
         assert!(!args.include_raw);
 

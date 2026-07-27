@@ -1226,7 +1226,7 @@ fn marker_color(direction: Direction, actor_kind: Option<ActorKind>) -> Option<C
 
 const ERROR_KEYWORDS: &[&str] = &["error", "failed", "failure", "panic", "fatal", "assert"];
 const WARNING_KEYWORDS: &[&str] = &["warn", "timeout", "retry", "dropped"];
-const SUCCESS_KEYWORDS: &[&str] = &["success", "passed", " pass", "ready", "[ok]"];
+const SUCCESS_KEYWORDS: &[&str] = &["success", "passed", "pass", "ready", "[ok]"];
 const INFO_KEYWORDS: &[&str] = &["info", "notice"];
 const DEBUG_KEYWORDS: &[&str] = &["debug", "trace"];
 
@@ -1267,7 +1267,10 @@ pub fn highlight_spans(
             let mut from = 0;
             while let Some(found) = lowercase[from..].find(keyword) {
                 let start = from + found;
-                candidates.push((start, start + keyword.len(), rank));
+                let end = start + keyword.len();
+                if keyword_has_boundaries(text, start, end) {
+                    candidates.push((start, end, rank));
+                }
                 from = start + 1;
             }
         }
@@ -1288,6 +1291,21 @@ pub fn highlight_spans(
     }
     spans.sort_by_key(|(start, _, _)| *start);
     spans
+}
+
+/// Keywords are tokens, not arbitrary substrings. Underscore, hyphen,
+/// punctuation, brackets, colons and whitespace are boundaries; only a
+/// Unicode letter or digit suppresses a match on either side.
+fn keyword_has_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let left_is_alphanumeric = text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric);
+    let right_is_alphanumeric = text[end..]
+        .chars()
+        .next()
+        .is_some_and(char::is_alphanumeric);
+    !left_is_alphanumeric && !right_is_alphanumeric
 }
 
 fn prompt_range(
@@ -1569,15 +1587,35 @@ mod tests {
         let spans = highlight_spans("ready pass", None, None);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0], (0, 5, keyword_style(2)));
-        assert_eq!(spans[1], (5, 10, keyword_style(2)));
+        assert_eq!(spans[1], (6, 10, keyword_style(2)));
 
         let spans = highlight_spans("pass passed", None, None);
-        assert_eq!(spans, vec![(5, 11, keyword_style(2))]);
+        assert_eq!(
+            spans,
+            vec![(0, 4, keyword_style(2)), (5, 11, keyword_style(2))]
+        );
 
         let spans = highlight_spans("timeout error", None, None);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0], (0, 7, keyword_style(1)));
         assert_eq!(spans[1], (8, 13, keyword_style(0)));
+    }
+
+    #[test]
+    fn keyword_highlighting_requires_non_alphanumeric_boundaries() {
+        assert_eq!(
+            highlight_spans("[INFO] level=info xxx_info", None, None),
+            vec![
+                (1, 5, keyword_style(3)),
+                (13, 17, keyword_style(3)),
+                (22, 26, keyword_style(3)),
+            ]
+        );
+        assert_eq!(
+            highlight_spans("cloud_com_error_to_log", None, None),
+            vec![(10, 15, keyword_style(0))]
+        );
+        assert!(highlight_spans("xxxinfo information errorCounter", None, None).is_empty());
     }
 
     #[test]
