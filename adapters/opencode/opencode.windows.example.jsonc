@@ -3,7 +3,7 @@
   "mcp": {
     "serial": {
       "type": "local",
-      "command": ["C:\\Tools\\serial-platform\\serial-mcp.exe", "--actor-label", "opencode:workstation"],
+      "command": ["C:\\Tools\\serial-platform\\serial.exe", "mcp", "--actor-label", "opencode:workstation"],
       "enabled": true,
       "timeout": 120000
     }
@@ -14,6 +14,8 @@
     "serial_wait": "allow",
     "serial_search": "allow",
     "serial_command": "ask",
+    "serial_input": "ask",
+    "serial_signal": "ask",
     "serial_trigger": "ask",
     "serial_run_start": "ask",
     "serial_run_end": "ask",

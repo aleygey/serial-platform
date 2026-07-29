@@ -14,7 +14,7 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 
-use crate::config::CaptureLimits;
+use crate::{config::CaptureLimits, render::terminal_text, session::ensure_welcome_protocol};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -31,7 +31,7 @@ pub struct Capture {
 pub struct CaptureOptions {
     pub timeout: Duration,
     pub quiet: Duration,
-    pub patterns: Vec<String>,
+    pub patterns: Vec<CompletionPattern>,
     /// Regex matched against the rolling RX window; compiled once by the
     /// caller and reused for every poll until it completes the capture.
     pub until_regex: Option<regex::Regex>,
@@ -40,6 +40,16 @@ pub struct CaptureOptions {
     /// completion evidence.
     pub complete_on_quiet: bool,
     pub allow_empty_quiet: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionPattern {
+    /// Exact normalized terminal text anywhere in the post-TX window.
+    Literal(String),
+    /// Exact normalized terminal text only at the end of a logical line.
+    /// Device prompts use this form so a prompt-looking fragment in ordinary
+    /// output cannot finish a command.
+    Prompt(String),
 }
 
 pub struct CaptureResult {
@@ -103,6 +113,7 @@ pub struct CommandBoundaryResult {
 }
 
 impl CommandBoundaryResult {
+    #[cfg(test)]
     pub fn confidence(&self, completion: &Completion) -> &'static str {
         if self.interfered {
             return if self.echo_observed {
@@ -114,7 +125,10 @@ impl CommandBoundaryResult {
         if self.echo_required {
             if self.echo_observed {
                 "echo_confirmed"
-            } else if matches!(completion, Completion::Pattern(_) | Completion::Regex(_)) {
+            } else if matches!(
+                completion,
+                Completion::Pattern(_) | Completion::Prompt(_) | Completion::Regex(_)
+            ) {
                 "post_tx_boundary_without_echo"
             } else {
                 "echo_not_observed"
@@ -132,6 +146,7 @@ impl CommandBoundaryResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Completion {
     Pattern(String),
+    Prompt(String),
     Regex(String),
     Quiet,
     Signal(String),
@@ -140,9 +155,11 @@ pub enum Completion {
 }
 
 impl Completion {
+    #[cfg(test)]
     pub fn label(&self) -> String {
         match self {
             Self::Pattern(pattern) => format!("pattern:{pattern}"),
+            Self::Prompt(prompt) => format!("prompt:{prompt}"),
             Self::Regex(pattern) => format!("regex:{pattern}"),
             Self::Quiet => "quiet".into(),
             Self::Signal(signal) => format!("signal:{signal}"),
@@ -151,10 +168,11 @@ impl Completion {
         }
     }
 
+    #[cfg(test)]
     pub fn is_complete(&self) -> bool {
         matches!(
             self,
-            Self::Pattern(_) | Self::Regex(_) | Self::Quiet | Self::Signal(_)
+            Self::Pattern(_) | Self::Prompt(_) | Self::Regex(_) | Self::Quiet | Self::Signal(_)
         )
     }
 }
@@ -188,7 +206,12 @@ impl Capture {
         send_control(&mut socket, &hello).await?;
         loop {
             match next_frame(&mut socket).await? {
-                WireFrame::Control(ServerMessage::Welcome { .. }) => break,
+                WireFrame::Control(ServerMessage::Welcome {
+                    protocol_version, ..
+                }) => {
+                    ensure_welcome_protocol(protocol_version)?;
+                    break;
+                }
                 WireFrame::Control(ServerMessage::Error { message, .. }) => {
                     bail!("seriald rejected capture hello: {message}")
                 }
@@ -942,7 +965,7 @@ enum Frame {
 struct CompletionWatcher {
     deadline: tokio::time::Instant,
     quiet: Option<Duration>,
-    patterns: Vec<String>,
+    patterns: Vec<CompletionPattern>,
     until_regex: Option<regex::Regex>,
     last_activity: Option<tokio::time::Instant>,
 }
@@ -990,11 +1013,12 @@ impl CompletionWatcher {
 
     /// Decide whether the capture should finish before waiting for more input.
     fn poll(&self, rolling: &str, now: tokio::time::Instant) -> Option<Completion> {
-        if let Some(pattern) = matched_pattern(rolling, &self.patterns) {
-            return Some(Completion::Pattern(pattern));
+        let normalized = terminal_text(rolling.as_bytes());
+        if let Some(completion) = matched_pattern(&normalized, &self.patterns) {
+            return Some(completion);
         }
         if let Some(regex) = &self.until_regex
-            && regex.is_match(rolling)
+            && regex.is_match(&normalized)
         {
             return Some(Completion::Regex(regex.as_str().to_string()));
         }
@@ -1020,11 +1044,21 @@ impl CompletionWatcher {
     }
 }
 
-fn matched_pattern(text: &str, patterns: &[String]) -> Option<String> {
-    patterns
-        .iter()
-        .find(|pattern| !pattern.is_empty() && text.contains(pattern.as_str()))
-        .cloned()
+fn matched_pattern(text: &str, patterns: &[CompletionPattern]) -> Option<Completion> {
+    let text = terminal_text(text.as_bytes());
+    patterns.iter().find_map(|pattern| match pattern {
+        CompletionPattern::Literal(pattern) => {
+            let pattern = terminal_text(pattern.as_bytes());
+            (!pattern.is_empty() && text.contains(pattern.as_str()))
+                .then_some(Completion::Pattern(pattern))
+        }
+        CompletionPattern::Prompt(prompt) => {
+            let prompt = terminal_text(prompt.as_bytes());
+            let prompt = prompt.trim_end_matches('\n');
+            (!prompt.is_empty() && text.split('\n').any(|line| line.ends_with(prompt)))
+                .then(|| Completion::Prompt(prompt.to_string()))
+        }
+    })
 }
 
 fn append_rolling(rolling: &mut String, value: &str) {
@@ -1115,8 +1149,27 @@ mod tests {
     #[test]
     fn pattern_matching_is_literal_and_deterministic() {
         assert_eq!(
-            matched_pattern("boot\nSigmaStar #", &["$ ".into(), "SigmaStar #".into()]),
-            Some("SigmaStar #".into())
+            matched_pattern(
+                "boot\nSigmaStar #",
+                &[
+                    CompletionPattern::Literal("$ ".into()),
+                    CompletionPattern::Literal("SigmaStar #".into())
+                ]
+            ),
+            Some(Completion::Pattern("SigmaStar #".into()))
+        );
+    }
+
+    #[test]
+    fn prompt_matching_requires_a_normalized_line_end() {
+        let prompt = [CompletionPattern::Prompt("SigmaStar #".into())];
+        assert_eq!(
+            matched_pattern("boot\r\nSigmaStar #", &prompt),
+            Some(Completion::Prompt("SigmaStar #".into()))
+        );
+        assert_eq!(
+            matched_pattern("message mentions SigmaStar # but continues", &prompt),
+            None
         );
     }
 
@@ -1128,7 +1181,10 @@ mod tests {
         CompletionWatcher::new(CaptureOptions {
             timeout: Duration::from_secs(60),
             quiet: Duration::from_millis(300),
-            patterns: patterns.iter().map(|pattern| pattern.to_string()).collect(),
+            patterns: patterns
+                .iter()
+                .map(|pattern| CompletionPattern::Literal((*pattern).to_string()))
+                .collect(),
             until_regex: None,
             complete_on_quiet,
             allow_empty_quiet,
@@ -1154,7 +1210,7 @@ mod tests {
         let both = CompletionWatcher::new(CaptureOptions {
             timeout: Duration::from_secs(60),
             quiet: Duration::from_millis(300),
-            patterns: vec!["]# ".into()],
+            patterns: vec![CompletionPattern::Literal("]# ".into())],
             until_regex: Some(regex::Regex::new(r"__BACKGROUND_DONE__=\d+").unwrap()),
             complete_on_quiet: true,
             allow_empty_quiet: true,

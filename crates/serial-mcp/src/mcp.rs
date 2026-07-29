@@ -1,14 +1,20 @@
-use std::io::{BufRead, Write};
+use std::{
+    collections::HashMap,
+    io::{BufRead, Write},
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
-    DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
     MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
     MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_TRIGGER_INTERVAL_MS,
-    MIN_TRIGGER_TIMEOUT_MS,
+    MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
+};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
 };
 
 use crate::tools::AgentTools;
@@ -17,37 +23,204 @@ const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.context("failed reading MCP stdin")?;
-        if line.trim().is_empty() {
-            continue;
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+    let input_thread = std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if input_tx.send(Input::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = input_tx.send(Input::Error(error.to_string()));
+                    return;
+                }
+            }
         }
-        if let Some(response) = dispatch(&tools, &line).await {
+    });
+
+    // Only this thread owns stdout. Tool calls may finish concurrently, but
+    // their JSON-RPC frames can never interleave at the byte level.
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<Value>();
+    let output_thread = std::thread::spawn(move || -> Result<()> {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        for response in output_rx {
             serde_json::to_writer(&mut stdout, &response)?;
             stdout.write_all(b"\n")?;
             stdout.flush()?;
         }
+        Ok(())
+    });
+
+    let active_requests: ActiveRequests = Arc::new(Mutex::new(HashMap::new()));
+    let mut tasks = JoinSet::new();
+    let mut input_error = None;
+    while let Some(input) = input_rx.recv().await {
+        while tasks.try_join_next().is_some() {}
+        let line = match input {
+            Input::Line(line) => line,
+            Input::Error(error) => {
+                input_error = Some(error);
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request: RpcRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = output_tx.send(rpc_error(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: {error}"),
+                ));
+                continue;
+            }
+        };
+        if request.jsonrpc.as_deref() != Some("2.0") {
+            if let Some(id) = request.id {
+                let _ = output_tx.send(rpc_error(id, -32600, "jsonrpc must be 2.0"));
+            }
+            continue;
+        }
+        if is_cancel_notification(&request.method) {
+            if let Some(cancelled_id) = cancellation_id(&request.params) {
+                cancel_request(&active_requests, &cancelled_id);
+            }
+            continue;
+        }
+
+        // JSON-RPC notifications deliberately have no response. MCP's
+        // initialized notification is the common case; unknown notifications
+        // are ignored as required by JSON-RPC.
+        let Some(id) = request.id.clone() else {
+            continue;
+        };
+        let key = request_key(&id);
+        let (cancel_tx, cancel_rx) = if request_is_cancellable(&request) {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        {
+            let mut active = active_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if active.contains_key(&key) {
+                let _ = output_tx.send(rpc_error(
+                    id,
+                    -32600,
+                    "request id is already active; mutating calls are never cancelled or replaced",
+                ));
+                continue;
+            }
+            active.insert(key.clone(), cancel_tx);
+        }
+
+        let tools = tools.clone();
+        let output = output_tx.clone();
+        let active_requests = active_requests.clone();
+        tasks.spawn(async move {
+            let response = match cancel_rx {
+                Some(cancel_rx) => {
+                    tokio::select! {
+                        _ = cancel_rx => rpc_error(id.clone(), -32800, "request cancelled"),
+                        response = dispatch_request(&tools, request, id.clone()) => response,
+                    }
+                }
+                None => dispatch_request(&tools, request, id.clone()).await,
+            };
+            active_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+            let _ = output.send(response);
+        });
+    }
+
+    // Closing stdin cancels only read-only observations. A command, signal,
+    // Run transition, release, or Trigger may already have crossed its
+    // physical side-effect boundary, so dropping that future could hide the
+    // authoritative outcome and invite an unsafe retry. Let those calls
+    // converge before the adapter exits.
+    cancel_all_read_only(&active_requests);
+    while tasks.join_next().await.is_some() {}
+    drop(output_tx);
+    input_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("MCP stdin reader panicked"))?;
+    output_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("MCP stdout writer panicked"))??;
+    if let Some(error) = input_error {
+        anyhow::bail!("failed reading MCP stdin: {error}");
     }
     Ok(())
 }
 
-async fn dispatch(tools: &AgentTools, line: &str) -> Option<Value> {
-    let request: RpcRequest = match serde_json::from_str(line) {
-        Ok(request) => request,
-        Err(error) => {
-            return Some(rpc_error(
-                Value::Null,
-                -32700,
-                format!("parse error: {error}"),
-            ));
-        }
-    };
-    let id = request.id.clone()?;
-    if request.jsonrpc.as_deref() != Some("2.0") {
-        return Some(rpc_error(id, -32600, "jsonrpc must be 2.0"));
+enum Input {
+    Line(String),
+    Error(String),
+}
+
+type ActiveRequests = Arc<Mutex<HashMap<String, Option<oneshot::Sender<()>>>>>;
+
+fn is_cancel_notification(method: &str) -> bool {
+    matches!(method, "notifications/cancelled" | "$/cancelRequest")
+}
+
+fn cancellation_id(params: &Value) -> Option<Value> {
+    params
+        .get("requestId")
+        .or_else(|| params.get("id"))
+        .cloned()
+}
+
+fn request_key(id: &Value) -> String {
+    serde_json::to_string(id).unwrap_or_else(|_| id.to_string())
+}
+
+fn cancel_request(active_requests: &ActiveRequests, id: &Value) {
+    if let Some(cancel) = active_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(&request_key(id))
+        .and_then(Option::take)
+    {
+        let _ = cancel.send(());
     }
+}
+
+fn cancel_all_read_only(active_requests: &ActiveRequests) {
+    let mut active = active_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for cancel in active.values_mut().filter_map(Option::take) {
+        let _ = cancel.send(());
+    }
+}
+
+fn request_is_cancellable(request: &RpcRequest) -> bool {
+    if request.method != "tools/call" {
+        return false;
+    }
+    matches!(
+        request
+            .params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "devices" | "read" | "wait" | "search"
+    )
+}
+
+async fn dispatch_request(tools: &AgentTools, request: RpcRequest, id: Value) -> Value {
     match request.method.as_str() {
         "initialize" => {
             let requested = request
@@ -60,56 +233,50 @@ async fn dispatch(tools: &AgentTools, line: &str) -> Option<Value> {
             } else {
                 LATEST_PROTOCOL
             };
-            Some(rpc_result(
+            rpc_result(
                 id,
                 json!({
                     "protocolVersion": protocol,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "serial-mcp", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Inspect devices first. Start a Run for each task before command or trigger, then initialize device state explicitly. A Run isolates only the log/event interval; it does not reset or clean device state. Trigger bytes and literals are always explicit call parameters; no Profile behavior is inferred. End the Run when finished; serial-mcp stops renewal and best-effort releases control without closing the serial port. Never infer current state from archive history."
+                    "instructions": "Inspect devices, start a Run before writes, and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. End the Run when finished."
                 }),
-            ))
+            )
         }
-        "ping" => Some(rpc_result(id, json!({}))),
-        "tools/list" => Some(rpc_result(id, json!({"tools": tool_definitions()}))),
+        "ping" => rpc_result(id, json!({})),
+        "tools/list" => rpc_result(id, json!({"tools": tool_definitions()})),
         "tools/call" => {
             let params: ToolCall = match serde_json::from_value(request.params) {
                 Ok(params) => params,
                 Err(error) => {
-                    return Some(rpc_error(id, -32602, format!("invalid tool call: {error}")));
+                    return rpc_error(id, -32602, format!("invalid tool call: {error}"));
                 }
             };
             if !tool_definitions()
                 .iter()
                 .any(|tool| tool["name"] == params.name)
             {
-                return Some(rpc_error(
-                    id,
-                    -32602,
-                    format!("unknown tool {:?}", params.name),
-                ));
+                return rpc_error(id, -32602, format!("unknown tool {:?}", params.name));
             }
             match tools
                 .call(&params.name, Value::Object(params.arguments))
                 .await
             {
-                Ok(value) => Some(rpc_result(id, tool_result(value, false))),
-                Err(error) => Some(rpc_result(
-                    id,
-                    tool_result(json!({"error": error.to_string()}), true),
-                )),
+                Ok(value) => rpc_result(id, tool_result(value, false)),
+                Err(error) => {
+                    rpc_result(id, tool_result(json!({"error": error.to_string()}), true))
+                }
             }
         }
-        _ => Some(rpc_error(
-            id,
-            -32601,
-            format!("method {:?} not found", request.method),
-        )),
+        _ => rpc_error(id, -32601, format!("method {:?} not found", request.method)),
     }
 }
 
 fn tool_result(value: Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    // Keep the compatibility text for hosts that do not read
+    // structuredContent, but avoid charging the Agent for pretty-print
+    // whitespace on a duplicated representation.
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
     json!({"content": [{"type": "text", "text": text}], "structuredContent": value, "isError": is_error})
 }
 
@@ -148,147 +315,122 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
 }
 
 pub fn tool_definitions() -> Vec<Value> {
-    let cursor = json!({
-        "epoch": {"type":"string","format":"uuid","description":"Daemon epoch returned by a previous call; must accompany after_seq. A current_run continuation must use the current Slot epoch."},
-        "after_seq": {"type":"integer","minimum":0,"description":"Return only events after this sequence; must accompany epoch. For a truncated current_run search, repeat the same filters with both returned cursor values."}
-    });
-    let read_cursor = json!({
-        "epoch": {"type":"string","format":"uuid","description":"Epoch to read; defaults to the current daemon epoch. Supply an archived epoch (listed by search guidance or GET /api/v1/archives) to read history."},
-        "after_seq": {"type":"integer","minimum":0,"description":"Return only events after this sequence; requires epoch. Omit both to tail the current epoch, or pass epoch alone to read an archive from its start."}
-    });
-    let wait_cursor = json!({
-        "epoch": {"type":"string","format":"uuid","description":"Explicit daemon epoch override; must accompany after_seq. An explicit cursor always takes priority over serial-mcp's remembered live cursor."},
-        "after_seq": {"type":"integer","minimum":0,"description":"Explicit sequence override; must accompany epoch. Omit both to resume from this serial-mcp process's last live cursor for the Slot (recorded by run_start, command, or wait), falling back to the current head only when no compatible cursor exists."}
-    });
-    let bounds = json!({
-        "max_chars": {"type":"integer","minimum":256,"maximum":64000,"default":16000},
-        "include_raw": {"type":"boolean","default":false,"description":"Include base64 raw bytes; use only when exact bytes matter."},
-        "include_events": {"type":"boolean","default":false,"description":"Include the full per-event array (verbose). Default false returns text plus the cursor fields (epoch/after_seq/head_seq/first_available_seq/gaps/truncated) needed to continue reading."},
-        "collapse_repeats": {"type":"boolean","default":true,"description":"Fold byte-identical adjacent lines into a repeat marker; false keeps the exact line stream."}
-    });
     vec![
         tool(
             "devices",
-            "List authoritative serial Slots, online state, profile, effective prompts, control owner, active Run/Trigger, and cursors. Call before selecting a device. Run boundaries isolate log/event intervals only and never reset device state.",
-            object(
-                json!({"slot_id":{"type":"string","description":"Optional exact Slot ID."}}),
-                &[],
-            ),
+            "List authoritative Slots and ownership state. Inspect before writing.",
+            object(json!({"slot_id":{"type":"string"}}), &[]),
             true,
         ),
         tool(
             "read",
-            "Read a bounded recent tail or continue from an exact epoch/after_seq cursor, including archived epochs. Reports gaps and folds only byte-identical adjacent lines. operation_id can identify the confirmed TX audit only; RX output must be scoped by a Run or cursor. truncated marks a server-side query that reached limit_events/limit_bytes; continue from the returned after_seq.",
+            "Bounded serial read. Omit scope for tail; continue uses adapter cursor; archive requires epoch.",
             object(
-                merge(&[
-                    json!({"slot_id":{"type":"string"},"tail_events":{"type":"integer","minimum":1,"maximum":2000,"default":200},"limit_events":{"type":"integer","minimum":1,"maximum":2000,"default":1000},"limit_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":524288}}),
-                    json!({"direction":{"type":"string","enum":["rx","tx","none"],"description":"Filter by event direction; none matches directionless control events."},"operation_id":{"type":"string","format":"uuid","description":"Confirmed TX audit filter only; requires direction=tx. Device RX always has operation_id=null because shared serial output cannot be assigned causally. Use command capture_window, run_id, or an epoch/after_seq cursor for RX."}}),
-                    read_cursor,
-                    bounds.clone(),
-                ]),
+                json!({
+                    "slot_id":{"type":"string"},
+                    "scope":{"type":"string","enum":["tail","continue","archive"]},
+                    "epoch":{"type":"string","format":"uuid"},
+                    "after_seq":{"type":"integer","minimum":0}
+                }),
                 &["slot_id"],
             ),
             true,
         ),
         tool(
             "command",
-            "Require this serial-mcp process to own the Slot's active Run, atomically attach, renew that Run's existing write-control lease (never reacquire/takeover), write command+EOL with expected_run_id, and capture a bounded RX window after the confirmed TX audit. seriald rejects the write with zero bytes if the Run ended, changed, or belongs to another actor. The confirmed TX sequence is the lower bound: pre-TX RX is excluded, while an exact post-TX literal/regex/prompt may complete even when an echo-on target does not return the full echo. A full echo gives high confidence; a missing/incomplete echo returns echo_missing, suspected_input_loss, and uncertain target delivery without retrying automatically. Quiet completion requires post-TX RX evidence and cannot complete an empty window. Returns run_id, prewrite_activity, boundary confidence, and an interference flag; foreign TX means the RX is not isolated. When until_regex is supplied it is the sole completion boundary: profile prompts, literals, and quiet cannot pre-empt it, and completion_mode is regex. Writes always inherit the Slot transport pacing; Agents cannot override it. complete means the capture boundary was observed, never that the command succeeded; execution_status remains unknown because this generic adapter does not rewrite commands to inspect a shell exit code. When the target shell is known, emit a unique status sentinel from the command and use that sentinel as the literal or regex boundary; serial-mcp never injects shell syntax itself. RX events are Run/cursor scoped and never carry operation_id. capture_truncated marks capture-window overflow (default 4096 events / 1 MiB; oldest events dropped), text_truncated marks rendered text cut to max_chars.",
+            "Write in the active Run and capture post-TX RX. Inherits EOL/pacing/prompts; use at most one of expect/regex; execution stays unknown.",
             object(
-                merge(&[
-                    json!({
-                        "slot_id":{"type":"string"},"command":{"type":"string","minLength":0,"maxLength":4096,"description":"Command text; may be empty to send a bare EOL (plain Enter)."},
-                        "eol":{"type":"string","description":"Override profile EOL for this call only; default profile usually uses \\r."},
-                        "completion":{"type":"string","enum":["auto","prompt","contains","quiet"],"default":"auto","description":"auto uses configured prompts, otherwise quiet. prompt/contains require exact evidence and do not finish on quiet_ms gaps. With until_regex, omit this field or leave it auto; explicit prompt/contains/quiet is rejected as ambiguous."},
-                        "until":{"type":"string","description":"Literal completion text; required for contains, optional extra prompt for prompt. Cannot be combined with until_regex."},
-                        "until_regex":{"type":"string","minLength":1,"description":"Sole authoritative regex completion boundary matched against post-TX RX. Profile prompts, literals, and quiet are disabled until this regex matches or timeout occurs; the result reports completion_mode=regex."},
-                        "timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"default":10},
-                        "quiet_ms":{"type":"integer","minimum":50,"maximum":5000,"default":300,"description":"Quiet boundary duration; used only by completion=quiet or auto when no prompt is configured."}
-                    }),
-                    bounds.clone(),
-                ]),
+                json!({
+                    "slot_id":{"type":"string"},
+                    "command":{"type":"string","maxLength":4096,"description":"Empty sends Enter."},
+                    "expect":{"type":"string","minLength":1},
+                    "regex":{"type":"string","minLength":1,"maxLength":4096},
+                    "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
+                }),
                 &["slot_id", "command"],
             ),
             false,
         ),
         tool(
-            "trigger",
-            "Run one bounded, generic serial reaction inside seriald while this adapter owns the Slot's active Run and write control. seriald atomically arms RX observation, optionally performs initial_write once (the one-time kickoff), then sends action after each completed interval until a caller-supplied literal stop pattern matches or a terminal limit/failure occurs. This MCP v1 surface accepts explicit UTF-8 text plus EOL; the lower seriald protocol remains raw-byte capable. No device Profile, prompt, bootloader, or flashing behavior is inferred, while all physical writes inherit the Slot transport pacing. timeout_ms stops new scheduling; one already accepted bounded driver write may settle before the authoritative terminal result. The tool keeps the Run lease renewable, returns evidence clipped to the authoritative Trigger start/end sequence, and reports whether this MCP connection still retains the Run for a follow-up write. Only outcome=matched means a stop pattern was observed.",
+            "input",
+            "Write exact UTF-8 bytes with no EOL. Requires this MCP's active Run.",
             object(
-                merge(&[
-                    json!({
-                        "slot_id":{"type":"string"},
-                        "initial_write":{
-                            "type":"object",
-                            "description":"Optional one-time kickoff performed by the same atomic daemon Trigger after RX observation is armed. It is not counted in fires_confirmed and is never sent as a separate ordinary write. MCP v1 accepts UTF-8 text only; text plus EOL is limited by encoded byte length at runtime.",
-                            "properties":{
-                                "text":{"type":"string","maxLength":MAX_TRIGGER_INITIAL_WRITE_BYTES,"description":"UTF-8 text for the one-time initial write; text plus EOL must encode to at most 4096 bytes."},
-                                "eol":{"type":"string","maxLength":MAX_TRIGGER_INITIAL_WRITE_BYTES,"default":"","description":"Explicit UTF-8 EOL appended to text. Defaults to empty and never inherits the Slot/Profile EOL; the combined 4096-byte limit is enforced at runtime."}
-                            },
-                            "required":["text"],
-                            "additionalProperties":false
-                        },
-                        "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES,"description":"Optional case-sensitive UTF-8 literal RX text that must be observed after arming before action sends begin. Matching can span RX chunks; encoded length is limited to 256 bytes at runtime."},
-                        "action":{
-                            "type":"object",
-                            "description":"Action written once per fire. The combined UTF-8 text and explicit EOL must not be empty and must encode to at most 256 bytes.",
-                            "properties":{
-                                "text":{"type":"string","maxLength":MAX_TRIGGER_ACTION_BYTES},
-                                "eol":{"type":"string","maxLength":MAX_TRIGGER_ACTION_BYTES,"default":"","description":"Explicit UTF-8 EOL appended to each action. Defaults to empty and never inherits the Slot/Profile EOL; the combined 256-byte limit is enforced at runtime."}
-                            },
-                            "required":["text"],
-                            "additionalProperties":false
-                        },
-                        "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS,"description":"Delay after one action write is confirmed before the next is eligible. Pacing/write time is additional; missed ticks are never replayed in a burst."},
-                        "stop_contains":{"type":"array","default":[],"maxItems":MAX_TRIGGER_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},"description":"Optional caller-supplied case-sensitive UTF-8 literal RX stop patterns, each limited to 256 encoded bytes at runtime. No Profile prompt is added implicitly. Omit for a bounded one-shot/repeat that intentionally ends at max_fires or timeout; when a matched outcome is required, supply at least one literal."},
-                        "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS,"description":"Deadline for scheduling new writes. One already accepted bounded physical write may finish and be audited before the terminal result is returned."},
-                        "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":format!("Maximum confirmed action writes; the optional initial_write is not counted. Reaching it yields outcome=max_fires_reached and matched=false. The combined runtime plan len(initial_write) + len(action) * max_fires must not exceed {MAX_TRIGGER_TOTAL_BYTES} UTF-8 bytes.")}
-                    }),
-                    bounds.clone(),
-                ]),
+                json!({
+                    "slot_id":{"type":"string"},
+                    "text":{"type":"string","minLength":1,"maxLength":4096}
+                }),
+                &["slot_id", "text"],
+            ),
+            false,
+        ),
+        tool(
+            "signal",
+            "Send raw Ctrl-C/D/Z or a physical serial Break in this MCP's active Run.",
+            object(
+                json!({
+                    "slot_id":{"type":"string"},
+                    "signal":{"type":"string","enum":["ctrl_c","ctrl_d","ctrl_z","break"]},
+                    "duration_ms":{"type":"integer","minimum":1,"maximum":5000,"description":"Break only."}
+                }),
+                &["slot_id", "signal"],
+            ),
+            false,
+        ),
+        tool(
+            "trigger",
+            "Bounded daemon reaction: explicit kickoff/action/EOL/matchers; effective server pacing still applies.",
+            object(
+                json!({
+                    "slot_id":{"type":"string"},
+                    "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
+                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},
+                    "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
+                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS},
+                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
+                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS},
+                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES}
+                }),
                 &["slot_id", "action"],
             ),
             false,
         ),
         tool(
             "wait",
-            "Wait for RX after an explicit cursor, otherwise after this serial-mcp process's last live cursor for the Slot; only a missing, stale-epoch, or ahead-of-head remembered cursor falls back to the current head. This closes the command-response-to-wait attach race for delayed output. The result reports cursor_source and started_after_seq. Literal contains waits for that exact match or timeout and is never ended by a short quiet gap; without contains, capture ends after RX followed by quiet. capture_truncated marks capture-window overflow (default 4096 events / 1 MiB; oldest events dropped), text_truncated marks rendered text cut to max_chars.",
+            "Wait from adapter cursor. Use at most one of expect/regex; otherwise use effective prompt or post-RX quiet.",
             object(
-                merge(&[
-                    json!({"slot_id":{"type":"string"},"contains":{"type":"string","minLength":1},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"default":10},"quiet_ms":{"type":"integer","minimum":50,"maximum":5000,"default":300}}),
-                    wait_cursor,
-                    bounds.clone(),
-                ]),
+                json!({
+                    "slot_id":{"type":"string"},
+                    "expect":{"type":"string","minLength":1},
+                    "regex":{"type":"string","minLength":1,"maxLength":4096},
+                    "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
+                }),
                 &["slot_id"],
             ),
             true,
         ),
         tool(
             "search",
-            "Bounded literal search. Defaults to the current Run to prevent stale logs from an earlier test being mistaken for current evidence; archive search is explicit. A truncated current_run page returns continuation fields; repeat the same filters, run_id, scope, epoch, and after_seq before concluding that no match exists. Text defaults to matching lines plus five surrounding lines even when one matching RX event contains many lines; include_events/include_raw retain exact evidence. operation_id can filter confirmed TX only, never RX. A complete empty result includes wider archive guidance; an incomplete empty result prioritizes continuation guidance.",
+            "Bounded search. Omit scope for current Run; archive requires explicit epoch.",
             object(
-                merge(&[
-                    json!({
-                        "slot_id":{"type":"string"},"contains":{"type":"string","minLength":1},
-                        "scope":{"type":"string","enum":["current_run","current_cursor","archive"],"default":"current_run","description":"current_run keeps an explicit/active Run constraint and accepts the returned current-epoch cursor for pagination; current_cursor starts at an exact live cursor; archive requires an explicit epoch."},
-                        "run_id":{"type":"string","format":"uuid","description":"Run constraint. Omit only when scope=current_run can resolve the active Run; keep it unchanged across truncated-page continuations."},"direction":{"type":"string","enum":["rx","tx","none"]},
-                        "operation_id":{"type":"string","format":"uuid","description":"Confirmed TX audit filter only; requires direction=tx. Device RX has operation_id=null; scope output with run_id or current_cursor instead."},
-                        "context_lines":{"type":"integer","minimum":0,"maximum":50,"default":5,"description":"Number of lines retained before and after each literal match in rendered text. Exact returned events/raw bytes are unaffected."},
-                        "limit_events":{"type":"integer","minimum":1,"maximum":1000,"default":200},"limit_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":524288}
-                    }),
-                    cursor,
-                    bounds,
-                ]),
-                &["slot_id", "contains"],
+                json!({
+                    "slot_id":{"type":"string"},
+                    "query":{"type":"string","minLength":1,"maxLength":4096},
+                    "regex":{"type":"boolean"},
+                    "scope":{"type":"string","enum":["current_run","current_cursor","archive"]},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "epoch":{"type":"string","format":"uuid"},
+                    "after_seq":{"type":"integer","minimum":0}
+                }),
+                &["slot_id", "query"],
             ),
             true,
         ),
         tool(
             "run_start",
-            "Acquire queued Agent write control and create an adapter-owned task boundary on one Slot. A Run scopes later commands/searches and is the only lease renewed in the background, but it does not reset or initialize the device; initialize device state explicitly.",
+            "Acquire write control and start an evidence boundary. Does not reset device state.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128},
-                    "metadata":{"type":"object","additionalProperties":true,"default":{}},"control_wait_seconds":{"type":"integer","minimum":0,"maximum":15,"default":15,"description":"Maximum time to queue for Agent write control. Capped at 15 seconds so one blocked Slot cannot starve lease renewal for another Slot."}
+                    "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
                 }),
                 &["slot_id", "label"],
             ),
@@ -296,18 +438,15 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_end",
-            "End this adapter process's active Run (or its explicit run_id), stop periodic control renewal, and immediately attempt a best-effort control release. Release failure does not undo a successfully ended Run; any unreleased lease expires by TTL. The serial port remains open for shared observation.",
-            object(
-                json!({"slot_id":{"type":"string"},"run_id":{"type":"string","format":"uuid"}}),
-                &["slot_id"],
-            ),
+            "End this MCP's Run and release control; serial observation stays open.",
+            object(json!({"slot_id":{"type":"string"}}), &["slot_id"]),
             false,
         ),
         tool(
             "release",
-            "Release this adapter process's write-control lease. With no local lease it is idempotent success. It protects only a Run started by this process and refuses to abort that Run unless abort_run=true. It never closes the serial port.",
+            "Release this MCP's control lease without closing the serial port.",
             object(
-                json!({"slot_id":{"type":"string"},"abort_run":{"type":"boolean","default":false}}),
+                json!({"slot_id":{"type":"string"},"abort_run":{"type":"boolean"}}),
                 &["slot_id"],
             ),
             false,
@@ -315,14 +454,16 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-fn merge(values: &[Value]) -> Value {
-    let mut output = Map::new();
-    for value in values {
-        if let Some(map) = value.as_object() {
-            output.extend(map.clone());
-        }
-    }
-    Value::Object(output)
+fn trigger_write_schema(max_length: usize) -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "text":{"type":"string","maxLength":max_length},
+            "eol":{"type":"string","maxLength":max_length}
+        },
+        "required":["text"],
+        "additionalProperties":false
+    })
 }
 
 #[cfg(test)]
@@ -341,6 +482,8 @@ mod tests {
                 "devices",
                 "read",
                 "command",
+                "input",
+                "signal",
                 "trigger",
                 "wait",
                 "search",
@@ -359,48 +502,51 @@ mod tests {
     }
 
     #[test]
-    fn agent_control_wait_is_bounded_below_the_renewal_interval() {
+    fn common_tool_schemas_hide_adapter_owned_policy() {
         let tool = tool_definitions()
             .into_iter()
             .find(|tool| tool["name"] == "run_start")
             .unwrap();
-        assert_eq!(
-            tool["inputSchema"]["properties"]["control_wait_seconds"]["maximum"],
-            15
+        assert!(
+            tool["inputSchema"]["properties"]
+                .get("control_wait_seconds")
+                .is_none()
         );
         let command = tool_definitions()
             .into_iter()
             .find(|tool| tool["name"] == "command")
             .unwrap();
-        assert!(
-            command["inputSchema"]["properties"]
-                .get("control_wait_seconds")
-                .is_none()
+        let mut fields: Vec<_> = command["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["command", "expect", "regex", "slot_id", "timeout_seconds"]
         );
+        for hidden in ["eol", "quiet_ms", "chunk_size", "inter_char_delay_ms"] {
+            assert!(command["inputSchema"]["properties"].get(hidden).is_none());
+        }
     }
 
     #[test]
-    fn schemas_describe_regex_authority_and_run_scoped_search_continuation() {
+    fn schemas_keep_regex_and_archive_escape_hatches_without_policy_defaults() {
         let tools = tool_definitions();
         let command = tools.iter().find(|tool| tool["name"] == "command").unwrap();
         assert_eq!(
-            command["inputSchema"]["properties"]["until_regex"]["minLength"],
+            command["inputSchema"]["properties"]["regex"]["minLength"],
             1
         );
-        assert!(
-            command["inputSchema"]["properties"]["until_regex"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("Sole authoritative")
+        assert_eq!(
+            command["inputSchema"]["properties"]["regex"]["maxLength"],
+            4096
         );
         assert!(
-            command["inputSchema"]["properties"]
-                .get("chunk_size")
-                .is_none()
-        );
-        assert!(
-            command["inputSchema"]["properties"]
-                .get("inter_char_delay_ms")
+            command["inputSchema"]["properties"]["timeout_seconds"]
+                .get("default")
                 .is_none()
         );
 
@@ -409,34 +555,89 @@ mod tests {
             search["description"]
                 .as_str()
                 .unwrap()
-                .contains("truncated current_run")
+                .contains("archive requires explicit epoch")
         );
         assert!(
-            search["inputSchema"]["properties"]["after_seq"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("same filters")
+            search["inputSchema"]["properties"]["regex"]
+                .get("default")
+                .is_none()
+        );
+        assert_eq!(
+            search["inputSchema"]["properties"]["query"]["maxLength"],
+            4096
         );
 
         let wait = tools.iter().find(|tool| tool["name"] == "wait").unwrap();
-        assert!(
-            wait["description"]
-                .as_str()
-                .unwrap()
-                .contains("cursor_source")
+        assert!(wait["inputSchema"]["properties"].get("after_seq").is_none());
+        assert_eq!(
+            wait["inputSchema"]["properties"]["regex"]["maxLength"],
+            4096
+        );
+    }
+
+    #[test]
+    fn tool_result_uses_compact_compatibility_text() {
+        let value = json!({"slot_id":"bench","nested":{"ready":true}});
+        let result = tool_result(value.clone(), false);
+        assert_eq!(
+            result["content"][0]["text"],
+            r#"{"nested":{"ready":true},"slot_id":"bench"}"#
+        );
+        assert_eq!(result["structuredContent"], value);
+        assert_eq!(result["isError"], false);
+    }
+
+    #[test]
+    fn signal_schema_covers_raw_controls_and_physical_break() {
+        let signal = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "signal")
+            .unwrap();
+        assert_eq!(
+            signal["inputSchema"]["properties"]["signal"]["enum"],
+            json!(["ctrl_c", "ctrl_d", "ctrl_z", "break"])
         );
         assert!(
-            wait["inputSchema"]["properties"]["after_seq"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("last live cursor")
+            signal["inputSchema"]["properties"]["duration_ms"]
+                .get("default")
+                .is_none()
         );
-        assert!(
-            wait["inputSchema"]["properties"]["epoch"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("always takes priority")
-        );
+    }
+
+    #[test]
+    fn cancellation_notifications_accept_mcp_and_lsp_id_shapes() {
+        assert!(is_cancel_notification("notifications/cancelled"));
+        assert!(is_cancel_notification("$/cancelRequest"));
+        assert_eq!(cancellation_id(&json!({"requestId": 7})), Some(json!(7)));
+        assert_eq!(cancellation_id(&json!({"id": "abc"})), Some(json!("abc")));
+    }
+
+    #[test]
+    fn only_read_only_tool_calls_are_cancellable() {
+        for name in ["devices", "read", "wait", "search"] {
+            assert!(request_is_cancellable(&RpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: "tools/call".into(),
+                params: json!({"name": name, "arguments": {}}),
+            }));
+        }
+        for name in [
+            "command",
+            "input",
+            "signal",
+            "trigger",
+            "run_start",
+            "run_end",
+            "release",
+        ] {
+            assert!(!request_is_cancellable(&RpcRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(1)),
+                method: "tools/call".into(),
+                params: json!({"name": name, "arguments": {}}),
+            }));
+        }
     }
 
     #[test]
@@ -447,29 +648,39 @@ mod tests {
             .unwrap();
         let schema = &trigger["inputSchema"];
         assert_eq!(schema["required"], json!(["slot_id", "action"]));
-        assert_eq!(
-            schema["properties"]["action"]["properties"]["eol"]["default"],
-            ""
+        assert!(
+            schema["properties"]["action"]["properties"]["eol"]
+                .get("default")
+                .is_none()
         );
-        assert_eq!(
-            schema["properties"]["initial_write"]["properties"]["eol"]["default"],
-            ""
+        assert!(schema["properties"].get("kickoff").is_some());
+        assert!(schema["properties"].get("initial_write").is_none());
+        assert!(
+            schema["properties"]["stop_contains"]
+                .get("default")
+                .is_none()
         );
-        assert_eq!(schema["properties"]["stop_contains"]["default"], json!([]));
         assert!(schema["properties"].get("chunk_size").is_none());
         assert!(schema["properties"].get("inter_char_delay_ms").is_none());
-        assert!(
-            schema["properties"]["max_fires"]["description"]
-                .as_str()
-                .is_some_and(|description| {
-                    description.contains(&MAX_TRIGGER_TOTAL_BYTES.to_string())
-                })
-        );
         let serialized = serde_json::to_string(&trigger).unwrap().to_lowercase();
         for forbidden in ["sigmastar", "uboot"] {
             assert!(
                 !serialized.contains(forbidden),
                 "trigger schema contains device-specific term {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_tool_definition_json_size() {
+        let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
+        eprintln!("tool_definition_json_bytes={bytes}");
+        assert!(bytes <= 6_000, "tool definitions grew to {bytes} bytes");
+        for tool in tool_definitions() {
+            assert!(
+                tool["description"].as_str().unwrap().len() <= 180,
+                "{} description is too large",
+                tool["name"]
             );
         }
     }

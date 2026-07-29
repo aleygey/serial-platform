@@ -7,6 +7,8 @@ use serde::Deserialize;
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:3210";
 const DEFAULT_CAPTURE_MAX_EVENTS: usize = 4096;
 const DEFAULT_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
+const HARD_CAPTURE_MAX_EVENTS: usize = 16_384;
+const HARD_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -15,6 +17,16 @@ struct ClientConfig {
     token_file: Option<PathBuf>,
     #[allow(dead_code)]
     last_slot: Option<String>,
+    // These are serialctl-owned console preferences. serial-mcp reads the
+    // same file, so it must accept them without giving them Agent semantics.
+    #[allow(dead_code)]
+    human_idle_release_seconds: Option<u64>,
+    #[allow(dead_code)]
+    language: Option<String>,
+    #[allow(dead_code)]
+    merge_echo: Option<bool>,
+    #[allow(dead_code)]
+    mouse_capture: Option<bool>,
     capture_max_events: Option<usize>,
     capture_max_bytes: Option<usize>,
 }
@@ -84,15 +96,20 @@ pub fn resolve(
     }
 
     // A zero limit would make every capture empty, so treat it as unset.
+    // The upper bounds are deliberately not configurable: this process may
+    // run inside an Agent host and one noisy UART must not retain unbounded
+    // memory merely because the shared config contains an accidental value.
     let capture = CaptureLimits {
         max_events: config
             .capture_max_events
             .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CAPTURE_MAX_EVENTS),
+            .unwrap_or(DEFAULT_CAPTURE_MAX_EVENTS)
+            .min(HARD_CAPTURE_MAX_EVENTS),
         max_bytes: config
             .capture_max_bytes
             .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CAPTURE_MAX_BYTES),
+            .unwrap_or(DEFAULT_CAPTURE_MAX_BYTES)
+            .min(HARD_CAPTURE_MAX_BYTES),
     };
 
     Ok(ResolvedConfig {
@@ -138,5 +155,43 @@ mod tests {
             toml::from_str("capture_max_events = 8192\ncapture_max_bytes = 2097152\n").unwrap();
         assert_eq!(config.capture_max_events, Some(8192));
         assert_eq!(config.capture_max_bytes, Some(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn shared_serialctl_console_fields_are_accepted() {
+        let config: ClientConfig = toml::from_str(
+            r#"
+human_idle_release_seconds = 60
+language = "zh"
+merge_echo = true
+mouse_capture = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.human_idle_release_seconds, Some(60));
+        assert_eq!(config.language.as_deref(), Some("zh"));
+        assert_eq!(config.merge_echo, Some(true));
+        assert_eq!(config.mouse_capture, Some(false));
+    }
+
+    #[test]
+    fn capture_limits_have_non_configurable_hard_caps() {
+        let config: ClientConfig =
+            toml::from_str("capture_max_events = 999999999\ncapture_max_bytes = 999999999\n")
+                .unwrap();
+        let capture = CaptureLimits {
+            max_events: config
+                .capture_max_events
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_CAPTURE_MAX_EVENTS)
+                .min(HARD_CAPTURE_MAX_EVENTS),
+            max_bytes: config
+                .capture_max_bytes
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_CAPTURE_MAX_BYTES)
+                .min(HARD_CAPTURE_MAX_BYTES),
+        };
+        assert_eq!(capture.max_events, HARD_CAPTURE_MAX_EVENTS);
+        assert_eq!(capture.max_bytes, HARD_CAPTURE_MAX_BYTES);
     }
 }

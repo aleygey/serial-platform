@@ -1,5 +1,6 @@
 /target/
 /target-*/
+/.target-*/
 /artifacts/
 /.tmp/
 .DS_Store

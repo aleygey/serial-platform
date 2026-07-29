@@ -1,0 +1,11 @@
+[package]
+name = "serial-cli"
+description = "Unified command entrypoint for the serial-platform components"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "serial"
+path = "src/main.rs"

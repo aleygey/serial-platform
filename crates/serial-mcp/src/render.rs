@@ -1,23 +1,41 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use regex::Regex;
 use serde_json::{Value, json};
 use serial_protocol::{Direction, TimelineEvent};
 
 pub struct RenderedEvents {
     pub text: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub events: Vec<Value>,
     pub text_truncated: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub repeated_lines_collapsed: usize,
     pub match_excerpt: Option<MatchExcerptSummary>,
+    pub summary: TextSummary,
+}
+
+pub struct TextSummary {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub strategy: &'static str,
+    pub omitted_chars: usize,
+    pub omitted_lines: usize,
 }
 
 pub struct MatchExcerptSummary {
     pub matched_lines: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub omitted_lines: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub context_lines: usize,
 }
 
+pub enum MatchExcerptPattern<'a> {
+    Literal(&'a str),
+    Regex(&'a Regex),
+}
+
 pub struct MatchExcerptOptions<'a> {
-    pub literal: &'a str,
+    pub pattern: MatchExcerptPattern<'a>,
     pub context_lines: usize,
 }
 
@@ -58,8 +76,7 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
     }
     let (text, match_excerpt) = match options.match_excerpt {
         Some(excerpt) => {
-            let (text, summary) =
-                literal_match_excerpt(&text, excerpt.literal, excerpt.context_lines);
+            let (text, summary) = match_excerpt(&text, excerpt.pattern, excerpt.context_lines);
             (text, Some(summary))
         }
         None => (text, None),
@@ -69,7 +86,8 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
     } else {
         (text, 0)
     };
-    let (text, text_truncated) = limit_tail(text, options.max_chars);
+    let (text, summary) = smart_limit(text, options.max_chars);
+    let text_truncated = summary.omitted_chars > 0;
 
     let events = if options.include_events || options.include_raw {
         event_summaries(events, options.include_raw)
@@ -83,6 +101,7 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
         text_truncated,
         repeated_lines_collapsed,
         match_excerpt,
+        summary,
     }
 }
 
@@ -109,7 +128,7 @@ fn event_summaries(events: &[TimelineEvent], include_raw: bool) -> Vec<Value> {
         .collect()
 }
 
-fn terminal_text(bytes: &[u8]) -> String {
+pub(crate) fn terminal_text(bytes: &[u8]) -> String {
     let stripped = strip_ansi(bytes);
     let decoded = String::from_utf8_lossy(&stripped);
     let mut output = String::with_capacity(decoded.len());
@@ -222,14 +241,13 @@ fn remove_leading_echo(mut text: String, echo: &str) -> String {
     text
 }
 
-fn literal_match_excerpt(
+fn match_excerpt(
     text: &str,
-    literal: &str,
+    pattern: MatchExcerptPattern<'_>,
     context_lines: usize,
 ) -> (String, MatchExcerptSummary) {
-    let literal = literal.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if lines.is_empty() || literal.is_empty() {
+    if lines.is_empty() {
         return (
             text.to_string(),
             MatchExcerptSummary {
@@ -242,16 +260,27 @@ fn literal_match_excerpt(
 
     let mut matching = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        if line.contains(&literal) {
+        let is_match = match &pattern {
+            MatchExcerptPattern::Literal(literal) => line.contains(*literal),
+            MatchExcerptPattern::Regex(regex) => regex.is_match(line),
+        };
+        if is_match {
             matching.push(index);
         }
     }
 
-    // A literal may cross a journal/event or line boundary. The server has
-    // already established the raw-byte match, so anchor the excerpt at the
-    // line containing the first byte when the per-line scan cannot.
+    // A pattern may cross a journal/event or line boundary. The server has
+    // already established the match, so anchor the excerpt at the line
+    // containing its first byte when the per-line scan cannot.
+    let cross_line_match = match &pattern {
+        MatchExcerptPattern::Literal(literal) => {
+            let literal = literal.replace("\r\n", "\n").replace('\r', "\n");
+            (!literal.is_empty()).then(|| text.find(&literal)).flatten()
+        }
+        MatchExcerptPattern::Regex(regex) => regex.find(text).map(|matched| matched.start()),
+    };
     if matching.is_empty()
-        && let Some(byte_index) = text.find(&literal)
+        && let Some(byte_index) = cross_line_match
     {
         let mut consumed = 0usize;
         for (index, line) in lines.iter().enumerate() {
@@ -265,7 +294,7 @@ fn literal_match_excerpt(
 
     if matching.is_empty() {
         return (
-            "[literal matched raw bytes but is not visible after terminal normalization; use include_events=true and include_raw=true for exact evidence]\n".into(),
+            "[match is not visible after terminal normalization]\n".into(),
             MatchExcerptSummary {
                 matched_lines: 0,
                 omitted_lines: lines.len(),
@@ -348,13 +377,179 @@ fn collapse_exact_repeats(text: &str) -> (String, usize) {
     (output, collapsed)
 }
 
-fn limit_tail(text: String, max_chars: usize) -> (String, bool) {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return (text, false);
+fn smart_limit(text: String, max_chars: usize) -> (String, TextSummary) {
+    let original_chars = text.chars().count();
+    let original_lines = text.lines().count();
+    if original_chars <= max_chars {
+        return (
+            text,
+            TextSummary {
+                strategy: "complete",
+                omitted_chars: 0,
+                omitted_lines: 0,
+            },
+        );
     }
-    let tail: String = text.chars().skip(char_count - max_chars).collect();
-    (format!("[earlier output omitted]\n{tail}"), true)
+
+    // Preserve enough of the beginning to identify the operation, always
+    // preserve the newest output, and spend the remaining budget on bounded
+    // warning/error context from the omitted middle.
+    const MARKER_BUDGET: usize = 160;
+    let content_budget = max_chars.saturating_sub(MARKER_BUDGET);
+    let head_budget = content_budget / 4;
+    let tail_budget = content_budget / 2;
+    let notable_budget = content_budget.saturating_sub(head_budget + tail_budget);
+    let head = take_chars(&text, head_budget);
+    let tail = take_last_chars(&text, tail_budget);
+    let middle_chars = original_chars
+        .saturating_sub(head.chars().count())
+        .saturating_sub(tail.chars().count());
+    let middle: String = text
+        .chars()
+        .skip(head.chars().count())
+        .take(middle_chars)
+        .collect();
+    let notable = notable_context(&middle, notable_budget);
+
+    let mut output = String::new();
+    output.push_str(&head);
+    if !head.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("[... middle output omitted ...]\n");
+    if !notable.text.is_empty() {
+        output.push_str(&notable.text);
+        if !notable.text.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str("[... continuing at newest output ...]\n");
+    }
+    output.push_str(&tail);
+
+    // The fixed marker budget keeps this below max_chars for ordinary text.
+    // A single very long Unicode line can still make line accounting unusual,
+    // but the character budget remains a hard bound.
+    if output.chars().count() > max_chars {
+        output = take_last_chars(&output, max_chars);
+    }
+    let preserved_chars = head
+        .chars()
+        .count()
+        .saturating_add(tail.chars().count())
+        .saturating_add(notable.source_chars);
+    let preserved_lines = head
+        .lines()
+        .count()
+        .saturating_add(tail.lines().count())
+        .saturating_add(notable.source_lines);
+    (
+        output,
+        TextSummary {
+            strategy: "head_notable_tail",
+            omitted_chars: original_chars.saturating_sub(preserved_chars),
+            omitted_lines: original_lines.saturating_sub(preserved_lines),
+        },
+    )
+}
+
+struct NotableContext {
+    text: String,
+    source_chars: usize,
+    source_lines: usize,
+}
+
+fn notable_context(text: &str, max_chars: usize) -> NotableContext {
+    if max_chars == 0 {
+        return NotableContext {
+            text: String::new(),
+            source_chars: 0,
+            source_lines: 0,
+        };
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut keep = vec![false; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        if has_notable_token(line) {
+            let start = index.saturating_sub(1);
+            let end = (index + 2).min(lines.len());
+            keep[start..end].fill(true);
+        }
+    }
+
+    let mut output = String::new();
+    let mut source_chars = 0usize;
+    let mut source_lines = 0usize;
+    let mut omitted_between = false;
+    for (line, keep) in lines.into_iter().zip(keep) {
+        if !keep {
+            omitted_between = !output.is_empty();
+            continue;
+        }
+        if omitted_between {
+            let marker = "[... unrelated lines omitted ...]\n";
+            if output.chars().count() + marker.chars().count() <= max_chars {
+                output.push_str(marker);
+            }
+            omitted_between = false;
+        }
+        let remaining = max_chars.saturating_sub(output.chars().count());
+        if remaining == 0 {
+            break;
+        }
+        let piece = take_chars(line, remaining);
+        source_chars = source_chars.saturating_add(piece.chars().count());
+        source_lines = source_lines.saturating_add(1);
+        output.push_str(&piece);
+        if piece.chars().count() < line.chars().count() {
+            break;
+        }
+    }
+    NotableContext {
+        text: output,
+        source_chars,
+        source_lines,
+    }
+}
+
+fn has_notable_token(line: &str) -> bool {
+    const TOKENS: &[&str] = &[
+        "error",
+        "failed",
+        "failure",
+        "fatal",
+        "panic",
+        "warn",
+        "warning",
+        "timeout",
+        "denied",
+        "exception",
+        "assert",
+    ];
+    let lower = line.to_ascii_lowercase();
+    TOKENS
+        .iter()
+        .any(|token| contains_ascii_token(&lower, token))
+}
+
+fn contains_ascii_token(text: &str, token: &str) -> bool {
+    text.match_indices(token).any(|(start, matched)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + matched.len()..].chars().next();
+        before.is_none_or(|ch| !is_word_char(ch)) && after.is_none_or(|ch| !is_word_char(ch))
+    })
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn take_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+fn take_last_chars(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(limit)).collect()
 }
 
 #[cfg(test)]
@@ -456,7 +651,7 @@ mod tests {
                 collapse_repeats: false,
                 include_events: false,
                 match_excerpt: Some(MatchExcerptOptions {
-                    literal: "progress317",
+                    pattern: MatchExcerptPattern::Literal("progress317"),
                     context_lines: 5,
                 }),
             },
@@ -470,6 +665,34 @@ mod tests {
         assert_eq!(summary.matched_lines, 1);
         assert_eq!(summary.omitted_lines, 589);
         assert_eq!(summary.context_lines, 5);
+    }
+
+    #[test]
+    fn regex_search_excerpt_preserves_match_context() {
+        let rendered = render_events(
+            &[rx_event(
+                1,
+                b"before one\nbefore two\nbuild id=47 ok\nafter one\nafter two\n",
+            )],
+            RenderOptions {
+                max_chars: 1024,
+                include_raw: false,
+                echo: None,
+                collapse_repeats: false,
+                include_events: false,
+                match_excerpt: Some(MatchExcerptOptions {
+                    pattern: MatchExcerptPattern::Regex(
+                        &Regex::new(r"id=\d+\s+ok").expect("test regex"),
+                    ),
+                    context_lines: 1,
+                }),
+            },
+        );
+        assert!(rendered.text.contains("before two"));
+        assert!(rendered.text.contains("build id=47 ok"));
+        assert!(rendered.text.contains("after one"));
+        assert!(!rendered.text.contains("before one"));
+        assert!(!rendered.text.contains("after two"));
     }
 
     #[test]
@@ -558,9 +781,30 @@ mod tests {
     }
 
     #[test]
-    fn output_limit_keeps_the_most_recent_context() {
-        let (text, truncated) = limit_tail("abcdef".into(), 3);
-        assert!(truncated);
-        assert!(text.ends_with("def"));
+    fn output_limit_keeps_start_notable_context_and_recent_tail() {
+        let mut source = String::from("operation-start\n");
+        for index in 0..40 {
+            source.push_str(&format!("progress-{index}\n"));
+        }
+        source.push_str("context-before\nERROR: device failed\ncontext-after\n");
+        for index in 40..80 {
+            source.push_str(&format!("progress-{index}\n"));
+        }
+        source.push_str("operation-end");
+
+        let (text, summary) = smart_limit(source, 320);
+        assert_eq!(summary.strategy, "head_notable_tail");
+        assert!(summary.omitted_chars > 0);
+        assert!(text.contains("operation-start"));
+        assert!(text.contains("ERROR: device failed"));
+        assert!(text.ends_with("operation-end"));
+    }
+
+    #[test]
+    fn notable_keywords_require_token_boundaries() {
+        assert!(has_notable_token("service ERROR: failed"));
+        assert!(has_notable_token("[warn] retry"));
+        assert!(!has_notable_token("xxxerror is a symbol name"));
+        assert!(!has_notable_token("platform_info"));
     }
 }

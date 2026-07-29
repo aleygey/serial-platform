@@ -24,10 +24,13 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
 };
+#[cfg(test)]
+use serial_protocol::WritePacing;
 use serial_protocol::{
     Actor, ClientMessage, CommandResult, ControlLease, ControlMode, EchoMode, EventKind,
-    LoggingState, ResolvedDeviceSettings, RunInfo, ServerMessage, SessionState, SlotSnapshot,
-    TargetActivity, TimelineEvent, TriggerInfo, TriggerStatus, WireFrame,
+    LoggingState, ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo, ServerMessage,
+    SessionState, SlotSnapshot, TargetActivity, TimelineEvent, TriggerInfo, TriggerStatus,
+    WireFrame,
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -37,8 +40,8 @@ use crate::{
     api::ApiClient,
     config::LoadedConfig,
     display::{
-        DisplayLine, TerminalStreamParser, gap_line, highlight_spans, pad_display, safe_inline,
-        trigger_status_label,
+        DisplayLine, RunBoundary, TerminalStreamParser, gap_line, highlight_spans, pad_display,
+        safe_inline, trigger_status_label,
     },
     i18n::{self, tr, trf},
     ws::{self, NetworkCommand, NetworkEvent},
@@ -54,6 +57,7 @@ const MAX_WRITE_BYTES: usize = 4 * 1024;
 const CONTROL_TTL_MS: u64 = 30_000;
 const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
+const MOUSE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
@@ -86,6 +90,7 @@ struct TextSelection {
     plain_rows: Vec<String>,
     anchor: SelectionPoint,
     head: SelectionPoint,
+    last_activity: Instant,
 }
 
 impl TextSelection {
@@ -154,6 +159,40 @@ fn append_pending_write(
             kind,
         });
     }
+}
+
+fn queued_line_count(queue: &VecDeque<PendingWrite>) -> usize {
+    let mut count = 0usize;
+    let mut previous_operation = None;
+    for write in queue
+        .iter()
+        .filter(|write| write.kind == PendingWriteKind::Line)
+    {
+        if count == 0 || write.operation_id != previous_operation {
+            count = count.saturating_add(1);
+        }
+        previous_operation = write.operation_id;
+    }
+    count
+}
+
+/// Removes the newest complete LINE operation from a local, not-yet-sent
+/// queue. One long line or confirmed multiline paste may occupy several
+/// physical chunks, but it remains one editable queue entry.
+fn pop_last_queued_line(queue: &mut VecDeque<PendingWrite>) -> Option<Vec<u8>> {
+    let newest = queue.back()?;
+    if newest.kind != PendingWriteKind::Line {
+        return None;
+    }
+    let operation_id = newest.operation_id;
+    let mut chunks = Vec::new();
+    while queue.back().is_some_and(|write| {
+        write.kind == PendingWriteKind::Line && write.operation_id == operation_id
+    }) {
+        chunks.push(queue.pop_back().expect("back was just checked").data);
+    }
+    chunks.reverse();
+    Some(chunks.into_iter().flatten().collect())
 }
 
 #[derive(Debug)]
@@ -717,7 +756,11 @@ struct App {
     mouse_capture: bool,
     focus: PaneFocus,
     layout: Option<ConsoleLayout>,
+    /// Only the currently active left-button drag keeps a stable visual
+    /// snapshot. Once the drag finishes, the selected text moves to
+    /// `selection_copy` so live output resumes immediately.
     selection: Option<TextSelection>,
+    selection_copy: Option<String>,
     config: Option<LoadedConfig>,
     should_quit: bool,
     dirty: bool,
@@ -756,6 +799,7 @@ impl App {
             focus: PaneFocus::Input,
             layout: None,
             selection: None,
+            selection_copy: None,
             config: None,
             should_quit: false,
             dirty: true,
@@ -780,6 +824,7 @@ impl App {
 
     fn select(&mut self, index: usize) {
         if index < self.slots.len() {
+            self.clear_text_selection();
             self.selected = index;
             self.current_mut().unseen = 0;
             let name = self.current().snapshot.config.display_name.clone();
@@ -1060,6 +1105,9 @@ impl App {
                     self.flush_pending_writes(&slot_id, commands);
                 }
             }
+            CommandResult::BreakSent { event_seq } => {
+                self.status = trf("st.break.confirmed", &[&event_seq.to_string()]);
+            }
             CommandResult::TriggerStarted { trigger }
             | CommandResult::TriggerStatus { trigger }
             | CommandResult::TriggerCancelled { trigger } => {
@@ -1238,6 +1286,14 @@ impl App {
                     snapshot.effective_uboot_prompt = effective.uboot_prompt;
                     snapshot.effective_write_eol = Some(effective.write_eol);
                     snapshot.effective_echo = Some(effective.echo);
+                    snapshot.effective_write_pacing = Some(effective.write_pacing);
+                }
+                if let Some(effective_transport) =
+                    event.metadata.get("effective_transport").and_then(|value| {
+                        serde_json::from_value::<ResolvedTransportSettings>(value.clone()).ok()
+                    })
+                {
+                    snapshot.effective_transport = Some(effective_transport);
                 }
             }
             EventKind::SlotRemoved => {
@@ -1251,7 +1307,7 @@ impl App {
                 slot.clear_trigger_projection();
             }
             EventKind::Tx => slot.observe_trigger_tx(event),
-            EventKind::Checkpoint => {}
+            EventKind::Break | EventKind::Checkpoint => {}
         }
     }
 
@@ -1523,6 +1579,47 @@ impl App {
         self.release_slot_control(commands, slot_id, lease, false);
     }
 
+    fn remove_last_queued_line(&mut self, restore_to_editor: bool) {
+        let slot_id = self.selected_slot_id();
+        if self.owns_control(self.selected)
+            || self.pending_requests.values().any(
+                |request| matches!(request, PendingRequest::Write { slot_id: pending } if pending == &slot_id),
+            )
+        {
+            self.status = tr("st.queue.already.sending").into();
+            return;
+        }
+        let Some(queue) = self.pending_writes.get_mut(&slot_id) else {
+            self.status = tr("st.queue.none").into();
+            return;
+        };
+        let Some(mut bytes) = pop_last_queued_line(queue) else {
+            self.status = tr("st.queue.raw.only").into();
+            return;
+        };
+        if queue.is_empty() {
+            self.pending_writes.remove(&slot_id);
+        }
+        if restore_to_editor {
+            let eol = self.current().effective_write_eol().as_bytes();
+            if !eol.is_empty() && bytes.ends_with(eol) {
+                bytes.truncate(bytes.len() - eol.len());
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let view = self.current_mut();
+            view.mode = InputMode::Line;
+            view.draft = text.chars().collect();
+            view.draft_cursor = view.draft.len();
+            view.history_cursor = None;
+            view.history_search = None;
+            view.completion = None;
+            self.focus = PaneFocus::Input;
+            self.status = tr("st.queue.restored").into();
+        } else {
+            self.status = tr("st.queue.deleted").into();
+        }
+    }
+
     fn has_queued_control(&self, slot_id: &str) -> bool {
         self.queued_controls.contains_key(slot_id)
             || self.pending_writes.contains_key(slot_id)
@@ -1744,10 +1841,13 @@ impl App {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key, commands)
             }
-            Event::Paste(value) => self.handle_paste(value, commands),
+            Event::Paste(value) => {
+                self.clear_text_selection();
+                self.handle_paste(value, commands);
+            }
             Event::Mouse(mouse) => self.handle_mouse(mouse, commands),
-            Event::Resize(_, _) => {
-                self.selection = None;
+            Event::Resize(_, _) | Event::FocusLost => {
+                self.clear_text_selection();
                 self.dirty = true;
             }
             _ => {}
@@ -1756,7 +1856,7 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         self.focus = PaneFocus::Input;
-        self.selection = None;
+        self.clear_text_selection();
         if self.help {
             self.help = false;
             if is_prefix(key) {
@@ -1802,11 +1902,11 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.selection = None;
+                self.clear_text_selection();
                 self.scroll_up(3);
             }
             MouseEventKind::ScrollDown => {
-                self.selection = None;
+                self.clear_text_selection();
                 self.scroll_down(3);
             }
             MouseEventKind::Down(MouseButton::Left) => self.begin_mouse_selection(mouse),
@@ -1820,6 +1920,11 @@ impl App {
         self.dirty = true;
     }
 
+    fn clear_text_selection(&mut self) {
+        self.selection = None;
+        self.selection_copy = None;
+    }
+
     fn begin_mouse_selection(&mut self, mouse: MouseEvent) {
         let Some(layout) = self.layout else {
             return;
@@ -1827,20 +1932,19 @@ impl App {
         let position = Position::new(mouse.column, mouse.row);
         if rect_contains(layout.input_area, position) {
             self.focus = PaneFocus::Input;
-            self.selection = None;
+            self.clear_text_selection();
             return;
         }
         if !rect_contains(layout.output_area, position) {
             return;
         }
         self.focus = PaneFocus::Output;
+        self.clear_text_selection();
         if !rect_contains(layout.output_inner, position) {
-            self.selection = None;
             return;
         }
         let rows = visible_output_lines(self, layout.output_inner);
         let Some(point) = selection_point(layout.output_inner, position, rows.len()) else {
-            self.selection = None;
             return;
         };
         let plain_rows = rows.iter().map(line_plain_text).collect();
@@ -1849,6 +1953,7 @@ impl App {
             plain_rows,
             anchor: point,
             head: point,
+            last_activity: Instant::now(),
         });
     }
 
@@ -1861,18 +1966,52 @@ impl App {
             selection_point_clamped(layout.output_inner, position, selection.plain_rows.len())
         {
             selection.head = point;
+            selection.last_activity = Instant::now();
         }
     }
 
     fn finish_mouse_selection(&mut self, mouse: MouseEvent) {
         self.update_mouse_selection(mouse);
-        if self
-            .selection
-            .as_ref()
-            .is_some_and(|selection| !selection.is_dragged())
-        {
-            self.selection = None;
+        self.complete_mouse_selection();
+    }
+
+    fn complete_mouse_selection(&mut self) -> bool {
+        let Some(selection) = self.selection.take() else {
+            return false;
+        };
+        if !selection.is_dragged() {
+            self.selection_copy = None;
+            return false;
         }
+        let text = selection.selected_text();
+        if text.is_empty() {
+            self.selection_copy = None;
+            return false;
+        }
+        let characters = text.chars().count().to_string();
+        self.selection_copy = Some(text);
+        self.status = trf("st.selection.ready", &[&characters]);
+        true
+    }
+
+    fn expire_mouse_selection(&mut self, now: Instant) -> bool {
+        if self.selection.as_ref().is_some_and(|selection| {
+            now.saturating_duration_since(selection.last_activity) >= MOUSE_SELECTION_TIMEOUT
+        }) {
+            return self.complete_mouse_selection();
+        }
+        false
+    }
+
+    fn take_selection_text(&mut self) -> Option<String> {
+        let active_text = self
+            .selection
+            .take()
+            .map(|selection| selection.selected_text())
+            .filter(|text| !text.is_empty());
+        let text = active_text.or_else(|| self.selection_copy.take());
+        self.selection_copy = None;
+        text
     }
 
     fn handle_right_click(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
@@ -1882,13 +2021,9 @@ impl App {
         let position = Position::new(mouse.column, mouse.row);
         if rect_contains(layout.output_area, position) {
             self.focus = PaneFocus::Output;
-            let Some(selection) = self.selection.take() else {
+            let Some(text) = self.take_selection_text() else {
                 return;
             };
-            let text = selection.selected_text();
-            if text.is_empty() {
-                return;
-            }
             self.status = match crate::clipboard::copy_text(&text) {
                 Ok(()) => trf("st.clipboard.copied", &[&text.chars().count().to_string()]),
                 Err(error) => trf("st.clipboard.copy.failed", &[&error.to_string()]),
@@ -1899,7 +2034,7 @@ impl App {
             return;
         }
         self.focus = PaneFocus::Input;
-        self.selection = None;
+        self.clear_text_selection();
         match crate::clipboard::read_text() {
             Ok(Some(text)) => self.handle_paste(text, commands),
             Ok(None) => self.status = tr("st.clipboard.paste.shortcut").into(),
@@ -1942,6 +2077,8 @@ impl App {
                 self.acquire_control(commands, ControlMode::Takeover);
             }
             KeyCode::Char('c' | 'C') => self.release_control(commands),
+            KeyCode::Char('d' | 'D') => self.remove_last_queued_line(false),
+            KeyCode::Char('e' | 'E') => self.remove_last_queued_line(true),
             KeyCode::Char('p' | 'P') => self.confirm_paste(commands),
             KeyCode::Char('/') => {
                 self.status = tr("st.logs.hint").into();
@@ -2028,10 +2165,19 @@ impl App {
             KeyCode::Down => self.history_next(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.current_mut().draft.clear();
-                self.current_mut().draft_cursor = 0;
-                self.status = tr("st.input.cleared").into();
+            KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                {
+                    let view = self.current_mut();
+                    view.draft.clear();
+                    view.draft_cursor = 0;
+                    view.history_cursor = None;
+                    view.completion = None;
+                }
+                // Ctrl-C is an asynchronous remote TTY interrupt, not a LINE
+                // command. Send ETX immediately without the Profile EOL or
+                // any unsent local draft.
+                self.request_raw_write(commands, vec![0x03]);
+                self.current_mut().follow();
             }
             _ => {}
         }
@@ -2345,6 +2491,7 @@ async fn run_loop(
     network_events: &mut mpsc::Receiver<NetworkEvent>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
+    let mut network_events_open = true;
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renew_tick = tokio::time::interval(Duration::from_secs(10));
@@ -2360,28 +2507,18 @@ async fn run_loop(
                 Some(Err(error)) => return Err(error).context("terminal input failed"),
                 None => return Ok(()),
             },
-            event = network_events.recv() => match event {
-                Some(event) => app.handle_network(event, commands),
-                None => {
-                    app.transport_connected = false;
-                    app.authenticated = false;
-                    app.connection_generation = None;
-                    app.actor = None;
-                    for slot in &mut app.slots {
-                        slot.subscription = SubscriptionPhase::Disconnected;
-                    }
-                    app.status = tr("st.network.stopped").into();
-                    app.dirty = true;
-                }
+            event = network_events.recv(), if network_events_open => {
+                network_events_open = handle_network_channel_event(app, event, commands);
             },
             _ = renew_tick.tick() => app.maintain_controls(commands),
             _ = activity_tick.tick() => {
                 let now = Instant::now();
+                let selection_changed = app.expire_mouse_selection(now);
                 let mut trigger_changed = false;
                 for slot in &mut app.slots {
                     trigger_changed |= slot.update_trigger_deadline(now);
                 }
-                if trigger_changed || app.slots.iter().any(|slot| {
+                if selection_changed || trigger_changed || app.slots.iter().any(|slot| {
                     slot.snapshot.target_activity == TargetActivity::Active
                         && slot.snapshot.session_state == SessionState::Online
                 }) {
@@ -2397,6 +2534,34 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+fn handle_network_channel_event(
+    app: &mut App,
+    event: Option<NetworkEvent>,
+    commands: &mpsc::Sender<NetworkCommand>,
+) -> bool {
+    match event {
+        Some(event) => {
+            app.handle_network(event, commands);
+            true
+        }
+        None => {
+            app.transport_connected = false;
+            app.authenticated = false;
+            app.connection_generation = None;
+            app.actor = None;
+            for slot in &mut app.slots {
+                slot.subscription = SubscriptionPhase::Disconnected;
+            }
+            app.status = tr("st.network.stopped").into();
+            app.dirty = true;
+            // A closed Tokio receiver is permanently ready. Disable this
+            // select branch after observing closure once so terminal input and
+            // rendering remain responsive instead of busy-spinning.
+            false
+        }
+    }
 }
 
 fn enter_terminal(mouse_capture: bool) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -2584,11 +2749,16 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let view = app.current();
+    let baud_rate = view
+        .snapshot
+        .effective_transport
+        .map(|transport| transport.baud_rate)
+        .unwrap_or(view.snapshot.config.settings.baud_rate);
     let title = format!(
         " {} · {} · {} baud{}{} ",
         safe_inline(&view.snapshot.config.display_name),
         safe_inline(&view.snapshot.config.port),
-        view.snapshot.config.settings.baud_rate,
+        baud_rate,
         if view.scroll_from_bottom > 0 {
             tr("ui.paused")
         } else {
@@ -2655,6 +2825,7 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
                 detailed_source_width,
                 shell_prompt,
                 uboot_prompt,
+                inner.width as usize,
             )
         })
         .collect::<Vec<_>>();
@@ -2857,7 +3028,35 @@ fn timeline_line(
     detailed_source_width: usize,
     shell_prompt: Option<&str>,
     uboot_prompt: Option<&str>,
+    inner_width: usize,
 ) -> Line<'static> {
+    if let Some(boundary) = entry.run_boundary {
+        let style = match boundary {
+            RunBoundary::Started => Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+            RunBoundary::Ended => Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+            RunBoundary::Aborted => Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        };
+        let label = format!(" {} ", safe_inline(&entry.text));
+        let label_width = UnicodeWidthStr::width(label.as_str());
+        let text = if label_width >= inner_width {
+            pad_display(&label, inner_width)
+        } else {
+            let remaining = inner_width - label_width;
+            format!(
+                "{}{}{}",
+                "─".repeat(remaining / 2),
+                label,
+                "─".repeat(remaining - remaining / 2)
+            )
+        };
+        return Line::from(Span::styled(text, style));
+    }
     let mut spans = Vec::new();
     match entry.marker_color {
         Some(color) => {
@@ -3026,12 +3225,12 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 app.current().draft_cursor,
                 inner.width,
             );
-            (text, Some(cursor_column), tr("ui.input.title.line"))
+            (text, Some(cursor_column), input_title(app, InputMode::Line))
         }
         InputMode::Raw => (
             format!("> {}", tr("ui.input.raw.text")),
             None,
-            tr("ui.input.title.raw"),
+            input_title(app, InputMode::Raw),
         ),
     };
     frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
@@ -3043,6 +3242,58 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
             inner.y,
         ));
     }
+}
+
+fn input_title(app: &App, mode: InputMode) -> String {
+    let slot_id = &app.current().snapshot.config.id;
+    let Some(writes) = app
+        .pending_writes
+        .get(slot_id)
+        .filter(|writes| !writes.is_empty())
+    else {
+        return match mode {
+            InputMode::Line => tr("ui.input.title.line").into(),
+            InputMode::Raw => tr("ui.input.title.raw").into(),
+        };
+    };
+    match mode {
+        InputMode::Line => {
+            let preview = writes
+                .iter()
+                .find(|write| write.kind == PendingWriteKind::Line)
+                .map(|write| {
+                    let text = safe_inline(&String::from_utf8_lossy(&write.data));
+                    truncate_display(&text, 40)
+                })
+                .unwrap_or_else(|| {
+                    let bytes = writes.iter().map(|write| write.data.len()).sum::<usize>();
+                    trf("ui.input.queued.raw", &[&bytes.to_string()])
+                });
+            trf(
+                "ui.input.title.line.queued",
+                &[&queued_line_count(writes).to_string(), &preview],
+            )
+        }
+        InputMode::Raw => {
+            let bytes = writes.iter().map(|write| write.data.len()).sum::<usize>();
+            trf("ui.input.title.raw.queued", &[&bytes.to_string()])
+        }
+    }
+}
+
+fn truncate_display(value: &str, max_width: usize) -> String {
+    let mut output = String::new();
+    let mut width = 0usize;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width.saturating_add(character_width) > max_width {
+            output.push('…');
+            break;
+        }
+        output.push(character);
+        width = width.saturating_add(character_width);
+    }
+    output.trim().to_string()
 }
 
 /// Returns one non-wrapping LINE-mode input row and the cursor column inside
@@ -3104,7 +3355,7 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width.min(76);
-    let height = area.height.min(32);
+    let height = area.height.min(34);
     let popup = centered_rect(width, height, area);
     let idle_seconds = app.human_idle_release.as_secs().to_string();
     let mouse_help = if app.mouse_capture {
@@ -3124,10 +3375,13 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("help.mouse.paste").to_string(),
         tr("help.takeover").to_string(),
         tr("help.release").to_string(),
+        tr("help.queue.delete").to_string(),
+        tr("help.queue.edit").to_string(),
         tr("help.follow").to_string(),
         tr("help.echo").to_string(),
         tr("help.paste").to_string(),
         tr("help.byte").to_string(),
+        tr("help.interrupt").to_string(),
         tr("help.quit").to_string(),
         String::new(),
         tr("help.line1").to_string(),
@@ -3244,9 +3498,79 @@ mod tests {
             Some(vec![0x03])
         );
         assert_eq!(
+            raw_key_bytes(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(vec![0x04])
+        );
+        assert_eq!(
+            raw_key_bytes(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Some(vec![0x1a])
+        );
+        assert_eq!(
             raw_key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(b"\x1b[A".to_vec())
         );
+    }
+
+    #[test]
+    fn line_ctrl_c_sends_etx_to_cancel_remote_continuation() {
+        let mut app = ready_app_with_control();
+        app.slots[0].snapshot.effective_write_eol = Some("\r\n".into());
+        app.slots[0].history.push("previous command".into());
+        app.slots[0].history_cursor = Some(0);
+        app.slots[0].draft = "echo 'unterminated".chars().collect();
+        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        app.slots[0].scroll_from_bottom = 5;
+        app.slots[0].unseen = 2;
+        let control_id = app.slots[0]
+            .snapshot
+            .control
+            .as_ref()
+            .expect("test control")
+            .id;
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &commands,
+        );
+
+        let (_, data, operation_id) = take_write(&mut received);
+        assert_eq!(data, vec![0x03]);
+        assert_eq!(operation_id, None);
+        assert!(app.current().draft.is_empty());
+        assert_eq!(app.current().draft_cursor, 0);
+        assert_eq!(app.current().history_cursor, None);
+        assert_eq!(app.current().scroll_from_bottom, 0);
+        assert_eq!(app.current().unseen, 0);
+        assert_eq!(app.current_mode(), InputMode::Line);
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.current()
+                .snapshot
+                .control
+                .as_ref()
+                .expect("control remains held")
+                .id,
+            control_id
+        );
+    }
+
+    #[test]
+    fn raw_mode_ctrl_c_is_forwarded_as_etx() {
+        let mut app = ready_app_with_control();
+        app.slots[0].mode = InputMode::Raw;
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &commands,
+        );
+
+        let (_, data, operation_id) = take_write(&mut received);
+        assert_eq!(data, vec![0x03]);
+        assert_eq!(operation_id, None);
+        assert_eq!(app.current_mode(), InputMode::Raw);
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -3638,6 +3962,64 @@ mod tests {
     }
 
     #[test]
+    fn queued_line_operations_remain_one_editable_entry_across_chunks() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut queue = VecDeque::new();
+        append_pending_write(
+            &mut queue,
+            &vec![b'a'; MAX_WRITE_BYTES + 7],
+            Some(first),
+            PendingWriteKind::Line,
+        );
+        append_pending_write(
+            &mut queue,
+            b"second\r",
+            Some(second),
+            PendingWriteKind::Line,
+        );
+
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queued_line_count(&queue), 2);
+        assert_eq!(pop_last_queued_line(&mut queue), Some(b"second\r".to_vec()));
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queued_line_count(&queue), 1);
+        assert_eq!(
+            pop_last_queued_line(&mut queue),
+            Some(vec![b'a'; MAX_WRITE_BYTES + 7])
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queued_line_can_be_returned_to_the_editor_before_control_is_granted() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, _received) = mpsc::channel(4);
+        assert!(app.request_write(&commands, b"echo queued\r".to_vec(), Some(Uuid::new_v4())));
+
+        app.remove_last_queued_line(true);
+
+        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert_eq!(app.slots[0].draft.iter().collect::<String>(), "echo queued");
+        assert_eq!(app.slots[0].draft_cursor, "echo queued".chars().count());
+        assert_eq!(app.slots[0].mode, InputMode::Line);
+        assert_eq!(app.status, tr("st.queue.restored"));
+    }
+
+    #[test]
+    fn raw_queue_is_not_lossily_converted_into_a_line_draft() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, _received) = mpsc::channel(4);
+        assert!(app.request_raw_write(&commands, vec![0x03]));
+
+        app.remove_last_queued_line(true);
+
+        assert_eq!(app.pending_writes["slot-1"][0].data, vec![0x03]);
+        assert!(app.slots[0].draft.is_empty());
+        assert_eq!(app.status, tr("st.queue.raw.only"));
+    }
+
+    #[test]
     fn one_hundred_queued_raw_characters_coalesce_into_one_unsent_block() {
         let mut app = ready_app_with_foreign_control();
         let (commands, mut received) = mpsc::channel(4);
@@ -3933,6 +4315,10 @@ mod tests {
                 uboot_prompt: Some("Luckfox #".into()),
                 write_eol: "\n".into(),
                 echo: EchoMode::Off,
+                write_pacing: WritePacing {
+                    chunk_size: 1,
+                    chunk_delay_ms: 1,
+                },
             })
             .unwrap(),
         );
@@ -3956,6 +4342,13 @@ mod tests {
             Some("\n")
         );
         assert_eq!(app.slots[0].snapshot.effective_echo, Some(EchoMode::Off));
+        assert_eq!(
+            app.slots[0].snapshot.effective_write_pacing,
+            Some(WritePacing {
+                chunk_size: 1,
+                chunk_delay_ms: 1,
+            })
+        );
         assert_eq!(
             app.slots[0]
                 .snapshot
@@ -4339,10 +4732,12 @@ mod tests {
             endpoint_present: true,
             session_state: SessionState::Online,
             state_reason: None,
+            state_code: None,
             target_activity: TargetActivity::Unknown,
             last_rx_wall_time_ns: None,
             rx_offset: 0,
             tx_offset: 0,
+            rx_overflow_bytes: 0,
             control: None,
             active_run: None,
             active_trigger: None,
@@ -4351,6 +4746,11 @@ mod tests {
             effective_uboot_prompt: None,
             effective_write_eol: Some("\r".into()),
             effective_echo: Some(EchoMode::On),
+            effective_transport: None,
+            effective_write_pacing: Some(WritePacing {
+                chunk_size: 1,
+                chunk_delay_ms: 1,
+            }),
         }
     }
 
@@ -4481,6 +4881,7 @@ mod tests {
             source_style: Style::default(),
             marker_color: (direction == Direction::Tx).then_some(Color::Green),
             solid_style: None,
+            run_boundary: None,
             echoed: false,
             text: text.into(),
         }
@@ -4493,6 +4894,23 @@ mod tests {
         assert_eq!(detailed_source_width(78), 16);
         assert_eq!(detailed_source_width(118), 28);
         assert_eq!(detailed_source_width(58), 10);
+    }
+
+    #[test]
+    fn run_boundary_fills_the_terminal_width() {
+        let mut row = stream_row(1, Direction::None, "RUN START · smoke · 12345678");
+        row.run_boundary = Some(RunBoundary::Started);
+        let line = timeline_line(&row, false, 10, None, None, 64);
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 64);
+        assert!(rendered.contains("RUN START · smoke · 12345678"));
+        assert!(rendered.starts_with('─'));
+        assert!(rendered.ends_with('─'));
     }
 
     #[test]
@@ -4842,12 +5260,32 @@ mod tests {
     }
 
     #[test]
+    fn queued_line_command_is_visible_in_the_input_title() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        app.pending_writes.insert(
+            "slot-1".into(),
+            VecDeque::from([PendingWrite {
+                data: b"reboot\r".to_vec(),
+                operation_id: Some(Uuid::new_v4()),
+                kind: PendingWriteKind::Line,
+            }]),
+        );
+
+        let title = input_title(&app, InputMode::Line);
+        assert!(title.contains("QUEUED 1"));
+        assert!(title.contains("reboot"));
+        assert!(title.contains("Ctrl-] d/e/c"));
+    }
+
+    #[test]
     fn display_column_selection_handles_wrapped_rows_and_cjk() {
         let selection = TextSelection {
             rows: vec![Line::from("  abc"), Line::from("中def")],
             plain_rows: vec!["  abc".into(), "中def".into()],
             anchor: SelectionPoint { row: 0, column: 2 },
             head: SelectionPoint { row: 1, column: 2 },
+            last_activity: Instant::now(),
         };
         assert_eq!(selection.selected_text(), "abc\n中d");
 
@@ -4885,7 +5323,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_changes_focus_and_left_drag_selects_output_without_shift() {
+    fn completed_selection_resumes_live_output_and_remains_copyable() {
         let mut app = App::new(vec![snapshot()], None);
         app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
         let backend = TestBackend::new(80, 24);
@@ -4925,13 +5363,23 @@ mod tests {
         );
 
         assert_eq!(app.focus, PaneFocus::Output);
-        assert_eq!(
-            app.selection
-                .as_ref()
-                .map(TextSelection::selected_text)
-                .as_deref(),
-            Some("abcd")
-        );
+        assert!(app.selection.is_none());
+        assert_eq!(app.selection_copy.as_deref(), Some("abcd"));
+
+        app.slots[0].push_line(stream_row(2, Direction::Rx, "__AFTER_SELECTION__"), true);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render live output after selection");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("__AFTER_SELECTION__"));
+        assert_eq!(app.take_selection_text().as_deref(), Some("abcd"));
+        assert!(app.selection_copy.is_none());
 
         app.handle_terminal_event(
             Event::Mouse(MouseEvent {
@@ -4944,5 +5392,62 @@ mod tests {
         );
         assert_eq!(app.focus, PaneFocus::Input);
         assert!(app.selection.is_none());
+        assert!(app.selection_copy.is_none());
+    }
+
+    #[test]
+    fn stale_mouse_drag_finishes_without_pinning_output_forever() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TUI");
+        let layout = app.layout.expect("draw records console layout");
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.output_inner.x + 2,
+                row: layout.output_inner.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: layout.output_inner.x + 5,
+                row: layout.output_inner.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+        let last_activity = app.selection.as_ref().expect("active drag").last_activity;
+
+        assert!(app.expire_mouse_selection(last_activity + MOUSE_SELECTION_TIMEOUT));
+        assert!(app.selection.is_none());
+        assert_eq!(app.selection_copy.as_deref(), Some("abcd"));
+    }
+
+    #[test]
+    fn closed_network_event_channel_is_disabled_after_one_observation() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.transport_connected = true;
+        app.authenticated = true;
+        app.connection_generation = Some(7);
+        let (commands, _) = mpsc::channel(1);
+
+        assert!(!handle_network_channel_event(&mut app, None, &commands));
+        assert!(!app.transport_connected);
+        assert!(!app.authenticated);
+        assert!(app.connection_generation.is_none());
+        assert!(matches!(
+            app.slots[0].subscription,
+            SubscriptionPhase::Disconnected
+        ));
+        assert!(app.dirty);
     }
 }

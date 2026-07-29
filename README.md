@@ -9,13 +9,24 @@ It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
+v0.4.0 adds one user-facing launcher without collapsing those runtime
+boundaries: `serial serve` starts the backend, `serial console` opens the TUI,
+`serial setup` configures a station, `serial profile ...` manages reusable
+profiles, and `serial mcp` starts the MCP adapter. The component executables
+remain in the release package and can still be invoked directly.
+
 See [ROADMAP.md](ROADMAP.md) for released capabilities, the next practical
 work, and longer-term candidates separated by `seriald`, `serialctl`, and
 `serial-mcp`.
 
-## What v1 provides
+## What v0.4 provides
 
-- Interactive COM discovery and Slot configuration from `serialctl init`.
+- Interactive COM discovery and Slot configuration from `serial setup`.
+- Two explicit reusable configuration layers: a Transport Profile for physical
+  UART settings and an optional Device Profile for DUT behavior and safe write
+  pacing.
+- Interactive and scriptable Profile list/show/create/update/clone/import/export/
+  attach/detach commands with optimistic `config_revision` protection.
 - Long-lived serial ownership with auto-open and reconnect.
 - In-place Slot reconfiguration: an existing Slot keeps its epoch, sequence,
   replay ring, and subscribers while the old OS handle is fully stopped before
@@ -26,18 +37,23 @@ work, and longer-term candidates separated by `seriald`, `serialctl`, and
   idle release policy, TTL, and fencing.
 - LINE and RAW input modes in a full-screen terminal; switch Slot without
   leaving the current terminal.
+- Full-width Run start/end/abort boundaries, visible queued LINE commands, and
+  edit/delete controls for commands still waiting on Human Control.
 - Source-aware TX/RX timeline with daemon epoch, per-Slot sequence, physical
   generation, byte offsets, Run, and Operation fields.
 - Crash-recoverable binary journal, 64 MiB/1 hour segments, CRC validation,
   recovered gap-ledger tails, query-derived sequence-discontinuity gaps,
   bounded/concurrency-limited history queries, and a 10 GiB retention ceiling.
 - Observer, operator, and admin Bearer credentials.
+- Layered `doctor` checks for connection/authentication, a physical port, the
+  live WebSocket stream, journal storage, and full Slot state.
 - Windows daemon with a Windows or Linux/VM client over a trusted host-only
   network.
 - One `serial-mcp` adapter for OpenCode and Codex, with Run-scoped search,
   cursor-safe reads, bounded command capture, Agent writes atomically bound to
-  a Run owned by that adapter process, and no Agent takeover/close.
-- A protocol-v2, daemon-owned Trigger Job for bounded low-latency
+  a Run owned by that adapter process, raw Ctrl-C/D/Z and serial Break support,
+  and no Agent takeover/close.
+- A protocol-v3, daemon-owned Trigger Job for bounded low-latency
   `initial_write -> repeated action -> live RX stop` reactions. It is
   byte-oriented and device-agnostic; every fire uses the normal fenced,
   confirmed, audited write path.
@@ -46,9 +62,10 @@ work, and longer-term candidates separated by `seriald`, `serialctl`, and
   instead of being written again, and an unacknowledged outcome remains
   visibly marked uncertain. Input is never automatically replayed.
 
-The station defaults agreed for v1 are: 115200 8N1, no flow control, DTR and
-RTS low, command EOL `\r`, echo on, no guessed Shell/U-Boot prompt, automatic
-probe disabled, `auto_open=true`, and writes paced at one byte per 1 ms.
+The safe Transport default is 115200 8N1, no flow control, DTR and RTS low,
+and `auto_open=true`. Generic device behavior uses command EOL `\r`, echo on,
+no guessed Shell/U-Boot prompt, automatic probe disabled, and one-byte/1-ms
+write pacing. Attach a Device Profile when a DUT needs different behavior.
 
 On Windows, the daemon uses native bounded synchronous COM reads/writes on
 dedicated blocking workers. It does not route COM writes through Tokio's
@@ -66,38 +83,42 @@ untouched, or use electrical isolation/reset gating.
 
 Each release provides two x86_64 packages:
 
-- `serial-platform-<version>-windows-x86_64.zip` contains `seriald.exe`,
-  `serialctl.exe`, and `serial-mcp.exe`.
+- `serial-platform-<version>-windows-x86_64.zip` contains the unified
+  `serial.exe` plus `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe`.
 - `serial-platform-<version>-linux-x86_64-ubuntu20.04.tar.gz` contains native
-  `x86_64-unknown-linux-gnu`/glibc `serialctl` and `serial-mcp` clients built on
-  the Ubuntu 20.04 baseline (glibc 2.31). It is intended for 64-bit x86 Ubuntu
-  20.04 or newer and does not include a Linux daemon because the Windows host
-  owns the workstation COM ports. It does not support 32-bit i386/i686 Ubuntu.
+  `x86_64-unknown-linux-gnu`/glibc `serial`, `serialctl`, and `serial-mcp`
+  clients built on the Ubuntu 20.04 baseline (glibc 2.31). It is intended for
+  64-bit x86 Ubuntu 20.04 or newer. It does not contain `seriald`, because the
+  Windows host owns the workstation COM ports, and it does not support 32-bit
+  i386/i686 Ubuntu.
 
-Use `seriald`, `serialctl`, and `serial-mcp` from the same release across the
-Windows host and Linux VM. The 0.3.x releases use WebSocket protocol v2 and are
-not wire-compatible with the protocol-v1 executables from 0.2.x. The HTTP route
-namespace is intentionally still `/api/v1`; the route namespace and the
-WebSocket payload protocol are versioned independently. Do not mix 0.2.x and
-0.3.x executables in one station.
+Use every executable from the same release across the Windows host and Linux
+VM. v0.4.0 speaks WebSocket protocol v3 and must not be mixed with the
+protocol-v2 executables from 0.3.x or protocol-v1 executables from 0.2.x.
+v3 adds protocol enum variants and capabilities such as Break; a mixed client
+could fail while decoding an otherwise valid event. The HTTP route namespace
+is intentionally still `/api/v1`; the route namespace and WebSocket payload
+protocol are versioned independently.
 
 Extract the Windows package on the host connected to the serial card. Extract
 the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.3.2-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.3.2-linux-x86_64-ubuntu20.04
-chmod +x serialctl serial-mcp
-./serialctl --version
+tar -xzf serial-platform-v0.4.0-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.4.0-linux-x86_64-ubuntu20.04
+chmod +x serial serialctl serial-mcp
+./serial --version
 ```
 
 Release checksums are published in `SHA256SUMS`. The command examples below
 assume the executables are on `PATH`. From an extracted package directory, use
-`.\seriald.exe` / `.\serialctl.exe` on Windows and `./serialctl` on Linux.
-Linux does not search the current directory by default, so `serialctl init`
-returns `command not found` unless the binary was installed on `PATH`; from the
-extracted directory, run `./serialctl init`.
+`.\serial.exe` on Windows and `./serial` on Linux. Linux does not search the
+current directory by default, so `serial setup` returns `command not found`
+unless the binary was installed on `PATH`; from the extracted directory, run
+`./serial setup`. The launcher itself resolves only sibling executables from
+that same directory and never falls back to another `seriald`, `serialctl`, or
+`serial-mcp` found on `PATH`; a partial/mixed installation fails visibly.
 
 ## Build
 
@@ -110,42 +131,69 @@ cargo build --release
 cargo test --workspace
 ```
 
-Build `seriald` on the Windows host that owns the COM ports. `serialctl` can be
-built on Windows or natively inside the Linux VM.
+Build `seriald` on the Windows host that owns the COM ports. The `serial`,
+`serialctl`, and `serial-mcp` clients can be built on Windows or natively
+inside the Linux VM.
 
 ## First start
 
 On Windows:
 
 ```powershell
-seriald serve
+serial serve
 ```
 
 The first start creates the daemon configuration and prints three credentials
-once. `serialctl init` uses an admin credential only for setup and stores an
+once. `serial setup` uses an admin credential only for setup and stores an
 operator credential for normal interactive use. Use the observer credential
 for read-only monitoring. Tokens are not accepted as command-line arguments by
-`serialctl`.
+the clients.
+
+For non-interactive setup, `--admin-token-file` and
+`--operator-token-file` are read-only credential inputs, while
+`--save-operator-token-file` is the destination for the validated daily
+operator credential. Global `--token-file` is rejected by `setup`, and all
+input/output credential paths must resolve to different files; setup never
+overwrites an input credential through a relative path, symlink, or
+case-insensitive Windows alias.
 
 In another terminal:
 
 ```sh
-serialctl init
+serial setup
 ```
 
 The wizard connects to `seriald`, asks the daemon to enumerate its own COM
 ports, lets you select the usual two ports, names them `slot-1`, `slot-2`, and
-persists the selected default Profile. Existing Slots omitted from a new scan,
-including temporarily absent COM ports, are kept by default; deletion requires
-an explicit confirmation. A Slot is the stable station channel; it is not a
-device model or serial number. Replacing the sample connected to the same
-serial-card channel requires no configuration change.
+shows the available Transport and Device Profiles. Select
+`generic-115200` plus `Generic` when the DUT behavior is unknown. Existing
+Slots omitted from a new scan, including temporarily absent COM ports, are kept
+by default; deletion requires an explicit confirmation. A Slot is the stable
+station channel, not a device model or serial number. Replacing the sample
+connected to the same serial-card channel normally means attaching a different
+Device Profile, not changing the Slot.
+
+Create a reusable profile before setup, or attach it later:
+
+```sh
+serial profile transport create --interactive
+serial profile device create --interactive
+serial profile device update my-dut --interactive
+serial profile attach --slot slot-1 --transport generic-115200 --device my-dut
+```
+
+Profile mutations request the administrator credential interactively and never
+save it. For automation, use `--admin-token-file`; list/show/export remain
+read-only. Every mutation carries the revision it just read, so a second
+administrator cannot silently overwrite a newer catalog or Slot update.
 
 Start the console without naming a Slot:
 
 ```sh
-serialctl
+serial console
 ```
+
+Running plain `serial` is equivalent to `serial console`.
 
 It restores the previous Slot and keeps all configured Slots subscribed. Main
 keys:
@@ -162,17 +210,29 @@ keys:
 | `Ctrl-] g` | Switch UI language and save it |
 | `Ctrl-] t` | Explicitly take over write control |
 | `Ctrl-] c` | Release control or cancel queued input |
+| `Ctrl-] d` | Delete the newest queued LINE command |
+| `Ctrl-] e` | Return the newest queued LINE command to the editor |
 | `Ctrl-] p` | Confirm a blocked multiline/large paste |
 | `Ctrl-] ?` | Help |
 | `Ctrl-] q` | Quit |
 | `Ctrl-] Ctrl-]` | Send byte `0x1d` to the device |
+| `Ctrl-C` | Send ETX byte `0x03` immediately in LINE or RAW mode |
+| `Ctrl-D` / `Ctrl-Z` in RAW | Send `0x04` / `0x1a` exactly |
 
 In LINE mode, plain `PageUp`/`PageDown` also scroll locally; RAW keeps those
 keys for xterm byte sequences, so use the `Ctrl-]` prefix there.
+`Ctrl-C` is the asynchronous interrupt exception to LINE editing: it discards
+the unsent local draft, sends only ETX without the Profile EOL, and returns the
+view to live output. It does not quit `serialctl` or release Human Control.
+In RAW mode, Ctrl-D and Ctrl-Z are ordinary raw control bytes; they do not exit
+the local console or suspend its process.
 
 Mouse capture is on by default. The wheel scrolls only the serial-output
 viewport; clicking the output or input pane changes focus; output left-drag
-selects without `Shift`; and output right-click copies the active selection.
+selects without `Shift`; releasing the left button resumes live output while
+retaining the selected text; and output right-click copies that retained
+selection. A missing mouse-up event is finalized after five seconds, so a
+selection can never silently pin the live viewport indefinitely.
 On Windows, input right-click pastes from the native Unicode clipboard.
 `Ctrl+Shift+V` remains the portable paste path, including Ubuntu. Linux output
 copy uses OSC 52 and may require clipboard access to be enabled in the terminal
@@ -188,10 +248,13 @@ cross it is rejected as one unit and is not partially appended.
 
 Opening the console only subscribes. The first write asks for Human Control.
 If another actor owns it, the request queues; only `Takeover` revokes it.
-The footer keeps the queue position, age, and held chunk count visible. Queued
-input expires after 60 seconds without human activity. `Ctrl-] c` cancels it by
-reconnecting the v1 actor connection; the protocol now carries a dedicated
-`cancel_acquire` message, but the v1 terminal still uses that reconnect, which
+The input title and footer keep the queued command preview, queue position,
+age, and held chunk count visible. Before a queued LINE command starts sending,
+`Ctrl-] d` removes the newest command and `Ctrl-] e` returns it to the editor.
+RAW bytes are not lossily converted into editable text; cancel their queue with
+`Ctrl-] c`. Queued input expires after 60 seconds without human activity.
+`Ctrl-] c` cancels it by reconnecting the actor connection; the protocol carries a dedicated
+`cancel_acquire` message, but the current terminal still uses that reconnect, which
 also releases this terminal's control on every other Slot, then automatically
 restores all subscriptions.
 An acquired human lease is renewed only while that Slot has recent manual
@@ -213,15 +276,24 @@ may already be in flight as live RX. A serial close/reopen
 commits an unfinished TX row before any partial RX echo, so text from different
 physical sessions is never merged. Detailed timeline mode narrows its source
 column on an 80-column terminal to preserve useful command/output payload.
+The projection accepts standard 7-bit `ESC` controls but treats isolated 8-bit
+C1 values as untrusted UART data, rendering invalid UTF-8 with replacement
+characters. Unterminated escape/control strings recover on a line boundary or
+a strict size limit, so one malformed or binary RX event cannot hide all later
+replay and live output. These presentation rules never alter the exact bytes
+retained by `seriald`.
 Wrapped rows are measured before the output viewport is scrolled, so following
 live output always shows the newest prompt even when a long command or log line
 occupies several 80-column screen rows. Local presentation remains bounded to
 20,000 rows / 4 MiB per Slot. Once older local rows are evicted, the title and a
 synthetic oldest-row boundary state that local display history was truncated
-and direct the operator to `serialctl logs`; durable history is not presented
+and direct the operator to `serial logs`; durable history is not presented
 as though the retained local row were its true beginning.
-Repeated device rows remain uncollapsed in v1: live monitoring stays faithful
+Repeated device rows remain uncollapsed in v0.4: live monitoring stays faithful
 to their exact order, while bounded log/search tools handle high-volume review.
+Run lifecycle events are drawn as full-width colored start/end/abort rules, so
+an operator can see exactly which output interval belongs to an Agent task
+without confusing a Run with a board reset.
 If the connection drops after a write was sent but before its acknowledgement,
 the footer keeps an `OUTCOME UNCERTAIN` warning. Inspect the TX timeline before
 deciding whether to retry; disconnected input is never replayed automatically.
@@ -231,22 +303,22 @@ deciding whether to retry; disconnected input is never replayed automatically.
 Bind `seriald` explicitly to the Windows host-only adapter address, for example:
 
 ```powershell
-seriald serve --bind 192.168.56.1:3210
+serial serve --bind 192.168.56.1:3210
 ```
 
 `--bind` is a runtime-only override: repeat it on every launch (or stop the
-daemon, update the persisted `bind` value, and restart). Use `seriald paths` to
+daemon, update the persisted `bind` value, and restart). Use `serial paths` to
 print the exact daemon configuration, data, and journal locations.
 
 Then run inside the Linux VM:
 
 ```sh
-./serialctl --endpoint http://192.168.56.1:3210 init
-./serialctl
+./serial --endpoint http://192.168.56.1:3210 setup
+./serial console
 ```
 
-The endpoint supplied during `init` is saved in the Linux user's local
-configuration. Later launches can therefore use plain `./serialctl`; pass
+The endpoint supplied during `setup` is saved in the Linux user's local
+configuration. Later launches can therefore use plain `./serial`; pass
 `--endpoint` again only to select a different daemon.
 
 Limit the Windows firewall rule to the host-only subnet. v1 accepts plain HTTP
@@ -257,23 +329,39 @@ roadmap.
 ## Inspection and history
 
 ```sh
-serialctl status
-serialctl doctor
-serialctl archives
-serialctl archives --slot slot-1
-serialctl logs --slot slot-1 --limit 200
-serialctl logs --slot slot-1 --after-seq 1200 --epoch <epoch-uuid>
-serialctl logs --slot slot-1 --epoch <epoch-uuid> --direction rx
-serialctl logs --slot slot-1 --after-time 2026-07-19T09:00:00+08:00
-serialctl logs --slot slot-1 --contains panic
-serialctl logs --slot slot-1 --run <run-uuid> --contains panic
+serial status
+serial doctor
+serial doctor port --slot slot-1
+serial doctor stream --slot slot-1 --duration 10
+serial doctor storage
+serial doctor state --slot slot-1
+serial archives
+serial archives --slot slot-1
+serial logs --slot slot-1 --limit 200
+serial logs --slot slot-1 --after-seq 1200 --epoch <epoch-uuid>
+serial logs --slot slot-1 --epoch <epoch-uuid> --direction rx
+serial logs --slot slot-1 --after-time 2026-07-19T09:00:00+08:00
+serial logs --slot slot-1 --contains panic
+serial logs --slot slot-1 --regex "(?i)panic|watchdog"
+serial logs --slot slot-1 --run <run-uuid> --contains panic
 ```
 
-`contains` is an explicit bounded historical query. The interactive console
+The default doctor verifies saved configuration, HTTP reachability,
+authentication, and daemon identity. The subcommands then isolate port-open,
+live-delivery, storage, and authoritative Slot-state failures. `doctor stream`
+compares an independent WebSocket subscription, RX offsets, and the journal;
+it distinguishes a legitimately silent target from a delivery fault.
+
+`--contains` and `--regex` are mutually exclusive bounded historical queries.
+Regular expressions are compiled with size/automaton limits and evaluated only
+inside the query's existing event/byte/time scan budget; regex does not turn a
+bounded query into an unbounded global search. Regex queries fail closed
+against an older daemon that cannot advertise bounded server-side support;
+they never fall back to an unbounded client-side scan. The interactive console
 never silently substitutes an old global match for the current Run. Every
 response carries its next cursor, truncation state, first available sequence,
 and retention/corruption gaps. If `--epoch` is omitted, the CLI searches only
-the current daemon epoch. Run `serialctl archives` first to discover retained
+the current daemon epoch. Run `serial archives` first to discover retained
 historical epoch UUIDs, then pass one to `logs --epoch`. `archives --json` and
 `logs --json` retain exact nanosecond values and raw event fields; ordinary
 output displays RFC3339 timestamps in the client's local timezone at
@@ -281,34 +369,50 @@ millisecond precision. Time filters require RFC3339 input with an explicit
 timezone, and `--direction` accepts `rx`, `tx`, or `none`.
 Without `--run`, `--operation`, or seq/time bounds, ordinary `logs` output
 warns that the query spans the entire selected daemon epoch and may include
-older test cycles. `--contains` only filters that range; it does not make an old
-match current. Archive catalog times labeled `segment-open` are segment
-creation bounds, not exact first/last event timestamps.
+older test cycles. A text or regex filter only filters that selected range; it
+does not make an old match current. Archive catalog times labeled
+`segment-open` are segment creation bounds, not exact first/last event
+timestamps.
+
+An epoch is the UUID for one `seriald` process lifetime. It changes whenever
+the daemon restarts. A durable continuation therefore uses
+`(slot_id, epoch, after_seq)`: the same sequence number under a new epoch is a
+different timeline and must not be treated as a continuation of the old one.
 
 ## OpenCode and Codex
 
 Install `serial-mcp` on the same Windows or Linux machine where the Agent
 platform runs. It reuses the endpoint and operator token written by
-`serialctl init`, so Agent config contains no secret. Ready-to-copy OpenCode
-JSONC and Codex TOML examples, the stable nine-tool surface, and the expected
-Run workflow are in [adapters/README.md](./adapters/README.md).
+`serial setup`, so Agent config contains no secret. Configure the MCP host to
+run `serial mcp` (or the component `serial-mcp` directly). Ready-to-copy
+OpenCode JSONC and Codex TOML examples, the stable eleven-tool surface, compact
+result contract, and expected Run workflow are in
+[adapters/README.md](./adapters/README.md).
 
 The adapter connects directly to `seriald`; the Agent is not asked to compose
 shell commands around `serialctl`. OpenCode exposes the tools as
 `serial_devices`, `serial_command`, and so on. Codex exposes the same tools in
 the configured `serial` MCP namespace.
 
+The eleven tools are `devices`, `read`, `command`, `input`, `signal`,
+`trigger`, `wait`, `search`, `run_start`, `run_end`, and `release`. Ordinary
+calls expose only task-level inputs; the adapter owns request/operation IDs,
+control fences, capture cursors, prompt selection, bounded rendering, and lease
+renewal. Compact results keep the main evidence (`text`, completion/confidence,
+warnings, and one continuation cursor) while internal audit identifiers remain
+in the authoritative timeline.
+
 `serial_trigger` handles short timing windows without making the Agent or the
 Linux VM loop `serial_command`/`serial_write` calls. It requires an
 adapter-owned Run and takes explicit UTF-8 text plus EOL for an optional
-one-time `initial_write` and the repeated `action`, along with an optional start
+one-time `kickoff` and the repeated `action`, along with an optional start
 literal, stop literals, interval, timeout, and maximum-fire bounds.
-`initial_write` is the one-time kickoff after the RX matchers are armed; it does
-not increment `fires_confirmed`. The MCP v1 surface is text-oriented, while
+`kickoff` is sent once after the RX matchers are armed; it does not increment
+the action fire count. The MCP surface is text-oriented, while
 seriald's lower WebSocket protocol keeps every Trigger payload and literal as
 raw bytes encoded with base64. Neither layer infers a Prompt or byte sequence
 from the device profile. For example,
-`initial_write={"text":"reboot","eol":"\r"}`,
+`kickoff={"text":"reboot","eol":"\r"}`,
 `action={"text":"slp","eol":""}`, and
 `stop_contains=["SigmaStar #"]` form one possible caller-supplied recipe; none
 of those strings has special meaning to the platform. A matched result proves
@@ -339,10 +443,21 @@ these operations closes `seriald`'s physical port.
 Agent searches remain Run-scoped while paging: a `truncated` `current_run`
 result returns the same `run_id` plus an exact `epoch`/`after_seq` continuation,
 and an incomplete empty page is never presented as proof that no match exists.
-For delayed markers such as background-test completion, `until_regex` is the
+For delayed markers such as background-test completion, `command.regex` is the
 sole command boundary; a configured Shell prompt or quiet gap cannot finish the
-capture first. See the adapter guide for the valid parameter combinations and
-response fields.
+capture first. `search` also accepts bounded regex matching. See the adapter
+guide for valid parameter combinations and response fields.
+
+`input` writes exact UTF-8 bytes without appending EOL. `signal` sends exact
+Ctrl-C (`0x03`), Ctrl-D (`0x04`), Ctrl-Z (`0x1a`), or a physical serial Break
+with a bounded duration. Break is a UART line condition rather than an encoded
+byte and is still fenced, Run-bound, and audited.
+
+MCP requests may run concurrently, but cancellation applies only to the four
+pure observations: `devices`, `read`, `wait`, and `search`. Once a mutating
+tool may have crossed a serial/Run/Control side-effect boundary, the adapter
+waits for its authoritative result instead of hiding the outcome and inviting
+an unsafe retry.
 
 For commands where success matters, the Agent should make the target emit a
 unique result sentinel carrying the command's status and wait for that sentinel.
@@ -352,80 +467,90 @@ execution.
 
 ## Profile adjustments
 
-The current configuration has three operational layers:
+Configuration has three explicit layers:
 
-1. the Slot identifies the station channel (`id`, display name, and COM port);
-2. that Slot stores a complete transport baseline snapshot (115200/8N1,
-   flow-control and DTR/RTS policy, safe pacing, and auto-open);
-3. an optional reusable device profile supplies model behavior (EOL, echo,
-   Shell prompt, and U-Boot prompt).
+1. A Slot identifies the fixed station channel: stable ID, display name, and
+   host port such as `COM4`.
+2. Its Transport Profile defines the host-side physical UART:
+   baud rate, data bits, parity, stop bits, flow control, DTR, RTS, and
+   `auto_open`.
+3. Its optional Device Profile defines DUT-facing behavior: Shell/U-Boot prompt
+   literals, command EOL, echo policy, `write_chunk_size`, and
+   `write_chunk_delay_ms`.
 
-The transport baseline is deliberately still a per-Slot snapshot in schema v1;
-`generic-115200` is not a shared catalog object. This preserves exact settings
-when two fixed serial-card channels evolve differently. A reusable transport
-catalog and migration are tracked separately in the roadmap rather than being
-mixed into terminal/MCP fixes.
+For wire/TOML compatibility the Slot field named `profile` is the Transport
+Profile binding; `device_profile` is the optional DUT binding. `Generic` means
+no Device Profile is attached—it is a safe fallback, not a guessed model.
 
-`serialctl init` creates a `generic-115200` baseline snapshot inside each Slot
-and keeps an existing same-port snapshot on later runs. In the current schema,
-the Slot's `profile = "generic-115200"` value is a descriptive label rather
-than a second catalog reference; the actual transport baseline is the Slot's
-`settings`. Running `serialctl init` again is the safe path for COM discovery;
-omitted Slots remain preserved unless deletion is explicitly confirmed.
+Pacing belongs to the Device Profile because it compensates for how quickly a
+DUT consumes input, not for the COM endpoint. `write_chunk_size` is the maximum
+number of bytes passed to the driver in one paced step; the daemon waits
+`write_chunk_delay_ms` before the next step. The Generic fallback is one byte
+per 1 ms. A zero delay disables pacing. Existing Slot `settings` retain a full
+compatibility snapshot, but current clients consume the daemon's published
+`effective_transport` and `effective_write_pacing`.
 
-Device-specific behavior belongs in the reusable device-profile catalog rather
-than in the generic baseline. A `[[device_profiles]]` entry names the model:
+The quickest interactive path is:
 
-```toml
-[[device_profiles]]
-name = "sigmastar-evb"
-shell_prompt = "]# "
-uboot_prompt = "SigmaStar =>"
-write_eol = "\r"
-echo = "on"
+```sh
+serial profile transport list
+serial profile transport create --interactive
+serial profile transport update uart-115200 --baud-rate 921600
+serial profile device list
+serial profile device create --interactive
+serial profile device update my-dut --interactive
+serial profile attach --slot slot-1 --transport uart-115200 --device my-dut
+serial doctor state --slot slot-1
 ```
 
-A Slot references the entry with `device_profile = "sigmastar-evb"`. Once a
-model is attached, that profile is authoritative for whether Shell/U-Boot
-prompts are configured at all; an omitted prompt stays unset instead of
-falling back to stale legacy Slot data. Profile EOL and echo values, when
-present, override the generic Slot baseline. The generic platform does not
-guess a device-specific prompt. Prompt matching is a literal substring, not a
-regular expression, so configure a stable suffix such as `"]# "` rather than
-a full Shell prompt containing the current directory. Every snapshot and live
-profile-change event publishes the authoritative effective prompts, EOL, and
-echo policy, and clients use those values. The catalog is validated
-on load — duplicate names, unknown Slot references, and more than 128 entries
-are rejected — and it can be
-replaced without a restart over HTTP: `GET /api/v1/config/device-profiles`
-lists it (observer) and `PUT /api/v1/config/device-profiles` validates,
-persists, and publishes a new catalog (admin). `serialctl` has no catalog
-editor yet. As a temporary administrative path, run `seriald paths`, stop the
-daemon, edit `seriald.toml`, and restart it; the file also contains credentials,
-so never paste the whole file into logs or support messages.
+`update` changes only the fields named on the command line; `--interactive`
+walks every field while showing the existing values as defaults. Use `clone`
+for a named variant, `import`/`export` for station sharing, and
+`detach --device` to return a Slot to Generic behavior. `setup` prints the
+available catalogs and asks which Transport and Device Profile to attach to
+each selected port. It does not guess a DUT from boot text or a COM number.
+Examples:
 
-When editing the generated TOML, replace the top-level
-`device_profiles = []` with one or more `[[device_profiles]]` tables.
-Place `device_profile = "sigmastar-evb"` inside the intended `[[slots]]`
-table and before its `[slots.settings]` header; placing it after that header
-would make it an invalid serial-setting key. `serialctl status --json` then
-shows the binding and the four authoritative `effective_*` values.
+```sh
+serial profile transport clone generic-115200 --name uart-921600 --baud-rate 921600
+serial profile transport update uart-921600 --auto-open true
+serial profile device clone my-dut --name my-dut-fast --write-chunk-size 8
+serial profile device update my-dut-fast --shell-prompt "]# "
+serial profile device update my-dut-fast --clear-shell-prompt
+serial profile device update my-dut-fast --inherit-write-eol --inherit-echo
+serial profile device update my-dut-fast --inherit-write-chunk-size --inherit-write-chunk-delay
+serial profile device export my-dut --output my-dut.toml
+serial profile device import my-dut.toml
+serial profile detach --slot slot-1 --device
+```
 
-Two Slot settings protect slow UART sinks from overruns: the writer sends
-`write_chunk_size` bytes, then waits `write_chunk_delay_ms` before the next
-chunk. The defaults (1 byte, 1 ms) produce a typewriter cadence; set
-`write_chunk_delay_ms = 0` to send each write as one unthrottled burst. A
-low-level write request can still carry an explicit protocol override for
-trusted clients, but `serialctl` and `serial-mcp` intentionally leave it unset:
-human commands, Agent commands, and Trigger Jobs all inherit the Slot transport
-cadence. Physical pacing is station configuration, not an Agent tool
-parameter. Note that `seriald` rejects zero-byte writes, so clients must send
-at least the line ending. On Windows, timer and asynchronous-driver scheduling
-can make the conservative 1 byte/1 ms default behave closer to 15 ms per byte.
-Keep that default until the target has been validated: new `serialctl init`
-profiles still start at 1 byte/1 ms, and existing explicit settings are not
-migrated silently. For long commands on a target known to accept bursts, an
-administrator can set the Slot to a validated chunk size such as 4 or 8.
+Prompt fields use explicit `--clear-shell-prompt` and
+`--clear-uboot-prompt` flags because an absent prompt is an intentional Device
+Profile value, not an instruction to consult legacy Slot data. Optional EOL,
+echo, and pacing fields use `--inherit-*` to remove that Device Profile
+override and fall back to the generic/compatibility setting.
+
+Prompt matching is a literal substring, not a regular expression. Prefer a
+stable suffix such as `"]# "` over a full prompt containing the current
+directory. Omit an unknown Shell/U-Boot prompt instead of guessing. Profile
+catalogs hold at most 128 unique names and cannot be deleted while attached.
+A Transport change closes and reopens the physical port because its UART
+parameters changed. A Device change keeps the handle open, but an active Run or
+Trigger blocks the change so its evidence boundary cannot silently change
+mid-operation.
+
+Every configuration read returns `config_revision`; every write supplies the
+revision it observed. If another setup/profile client committed first,
+`seriald` returns `config_revision_mismatch` and the stale client must reload
+before retrying. Catalog and Slot mutations are staged, atomically persisted,
+then published. A validation, actor, or file-save failure leaves the previous
+authoritative state active.
+
+The low-level protocol still permits an explicit per-request pacing override
+for trusted clients, but `serialctl` and `serial-mcp` use the effective Device
+Profile pacing. Agent tool schemas intentionally omit chunk size and delay, so
+an Agent cannot accidentally bypass a station-tested safe cadence. `seriald`
+also rejects zero-byte writes; a command must contribute text or an EOL.
 
 One physical write has a 15-second total budget and retains a separate
 two-second timeout for any driver call that makes no progress. `seriald`
@@ -458,26 +583,25 @@ wait_timeout_ms = 60000 # queued acquire lifetime; configured ceiling <= 1h
 max_waiters = 128       # per-Slot wait-queue bound
 ```
 
-The defaults match the compiled-in v1 behavior, so the section can be omitted
+The defaults match the compiled-in v0.4 behavior, so the section can be omitted
 entirely; changes apply on the next daemon start. Configuration above the
 24-hour lease or one-hour wait ceilings is rejected instead of reaching
 platform `Instant` arithmetic.
 
 ## Current boundaries
 
-v1 does not include device-pool Reservations, flashing recipes,
-automatic probes, full VT100 emulation,
-external `screen/minicom` handoff, TLS, compression, or a Windows Service
-installer. A daemon-level device-profile catalog exists and is managed over
-HTTP; a `serialctl` editor for it is still roadmap work. `seriald serve` is
-the backend CLI entrypoint; service packaging can be added after station
-validation. Explicit Windows ACL auditing/hardening for shared service
-accounts is also roadmap work; current per-user files inherit the Windows
-profile directory ACL.
+v0.4 does not include device-pool Reservations, flashing recipes, automatic
+probes, full VT100 emulation, external `screen/minicom` handoff, TLS,
+compression, or a Windows Service installer. `serial serve` is the backend
+entrypoint and `serial console` is a separate client process; putting both
+behind one launcher does not merge the daemon with a terminal or prevent
+multiple consumers. Service packaging can be added after station validation.
+Explicit Windows ACL auditing/hardening for shared service accounts is also a
+candidate; current per-user files inherit the Windows profile directory ACL.
 
 The old OpenCode-only `serial_arm`/`serial_disarm` implementation was not
 copied: it could continue writing after control loss and did not create normal
-TX audit events. The protocol-v2 Trigger is Slot-owned, bound to
+TX audit events. The protocol-v3 Trigger is Slot-owned, bound to
 Control/fence/epoch/generation and an optional Run, uses bounded literal-byte
 matching and hard limits, and sends its optional kickoff and every action fire
 through the ordinary confirmed/audited write path. Device-specific recipes

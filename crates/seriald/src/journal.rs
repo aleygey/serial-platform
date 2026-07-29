@@ -9,7 +9,8 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
     ArchiveListResponse, ArchiveSummary, Cursor, DataFrameHeader, EventQuery, EventQueryResponse,
-    GapRange, GapReason, MAX_HEADER_BYTES, MAX_PAYLOAD_BYTES, TimelineEvent,
+    GapRange, GapReason, JournalDiagnostics, LoggingState, MAX_HEADER_BYTES, MAX_PAYLOAD_BYTES,
+    TimelineEvent,
 };
 use std::collections::{HashMap, hash_map::Entry};
 use std::fs::{self, File, OpenOptions};
@@ -41,6 +42,9 @@ const MAX_QUERY_SEGMENTS: usize = 16_384;
 const MAX_ARCHIVE_SUMMARIES: usize = 4_096;
 const MAX_QUERY_GAPS: usize = 1_024;
 const MAX_GAP_LEDGER_LINE_BYTES: usize = 64 * 1024;
+const MAX_REGEX_BYTES: usize = 4_096;
+const MAX_REGEX_COMPILED_BYTES: usize = 1024 * 1024;
+const MAX_REGEX_STREAM_CARRY_BYTES: usize = 64 * 1024;
 
 /// Production budget for one append acknowledgement before live delivery
 /// continues without durability.
@@ -186,6 +190,8 @@ pub enum JournalError {
     TooManyQueryGaps { maximum: usize },
     #[error("journal query has more than {maximum} segment files")]
     TooManyQuerySegments { maximum: usize },
+    #[error("journal regex is invalid: {0}")]
+    InvalidRegex(String),
     #[error("journal I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("journal JSON codec failed: {0}")]
@@ -351,6 +357,39 @@ impl JournalHandle {
         result.await.map_err(|_| JournalError::WriterClosed)?
     }
 
+    /// Collects bounded, read-only storage health. It never sends a writer
+    /// command and therefore cannot flush, rotate, prune, or otherwise mutate
+    /// the journal.
+    pub async fn diagnostics(&self) -> Result<JournalDiagnostics, JournalError> {
+        let config = Arc::clone(&self.config);
+        let queue_capacity = self.sender.max_capacity();
+        let queue_remaining = self.sender.capacity();
+        let permit = Arc::clone(&self.query_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| JournalError::WriterClosed)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let usage_bytes = journal_directory_usage(&config.root_dir)?;
+            let archives = list_archive_files(&config, None)?;
+            Ok(JournalDiagnostics {
+                usage_bytes,
+                max_bytes: config.max_total_bytes,
+                retention_target_bytes: ((config.max_total_bytes as f64)
+                    * config.cleanup_low_watermark)
+                    .floor()
+                    .min(u64::MAX as f64) as u64,
+                segment_max_bytes: config.max_segment_bytes,
+                writer_queue_capacity: queue_capacity,
+                writer_queue_remaining: queue_remaining,
+                archive_count: archives.archives.len(),
+                logging: LoggingState::Healthy,
+            })
+        })
+        .await
+        .map_err(|_| JournalError::WriterPanicked)?
+    }
+
     async fn request_shutdown(&self) -> Result<(), JournalError> {
         let (reply, result) = oneshot::channel();
         self.sender
@@ -359,6 +398,35 @@ impl JournalHandle {
             .map_err(|_| JournalError::WriterClosed)?;
         result.await.map_err(|_| JournalError::WriterClosed)?
     }
+}
+
+fn journal_directory_usage(root: &Path) -> Result<u64, JournalError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0_usize;
+    let mut usage = 0_u64;
+    while let Some(path) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > MAX_QUERY_SEGMENTS.saturating_mul(4) {
+            return Err(JournalError::TooManyQuerySegments {
+                maximum: MAX_QUERY_SEGMENTS.saturating_mul(4),
+            });
+        }
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                usage = usage.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(usage)
 }
 
 /// Completion token returned by [`JournalHandle::try_append`].
@@ -1218,6 +1286,25 @@ impl StreamSearchCarry {
         self.next_offset = event.stream_offset_end;
         matched
     }
+
+    fn regex_matches(&mut self, event: &TimelineEvent, expression: &regex::bytes::Regex) -> bool {
+        let continuous = self.generation == Some(event.generation)
+            && self.next_offset.is_some()
+            && event.stream_offset_start == self.next_offset;
+        if !continuous {
+            self.bytes.clear();
+        }
+        let mut combined = Vec::with_capacity(self.bytes.len().saturating_add(event.data.len()));
+        combined.extend_from_slice(&self.bytes);
+        combined.extend_from_slice(&event.data);
+        let matched = expression.is_match(&combined);
+        let keep_from = combined.len().saturating_sub(MAX_REGEX_STREAM_CARRY_BYTES);
+        self.bytes.clear();
+        self.bytes.extend_from_slice(&combined[keep_from..]);
+        self.generation = Some(event.generation);
+        self.next_offset = event.stream_offset_end;
+        matched
+    }
 }
 
 #[derive(Debug)]
@@ -1516,6 +1603,20 @@ fn query_files_with_limits(
             "contains must not exceed 4096 UTF-8 bytes".into(),
         ));
     }
+    if query.contains.is_some() && query.regex.is_some() {
+        return Err(JournalError::InvalidConfig(
+            "contains and regex are mutually exclusive".into(),
+        ));
+    }
+    if query
+        .regex
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_REGEX_BYTES)
+    {
+        return Err(JournalError::InvalidRegex(format!(
+            "pattern must not exceed {MAX_REGEX_BYTES} UTF-8 bytes"
+        )));
+    }
     if query.actor_id.as_ref().is_some_and(|value| {
         value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
     }) {
@@ -1538,6 +1639,17 @@ fn query_files_with_limits(
         .unwrap_or(DEFAULT_QUERY_BYTES)
         .clamp(1, MAX_QUERY_BYTES);
     let contains = query.contains.as_deref().map(str::as_bytes);
+    let expression = query
+        .regex
+        .as_deref()
+        .map(|pattern| {
+            regex::bytes::RegexBuilder::new(pattern)
+                .size_limit(MAX_REGEX_COMPILED_BYTES)
+                .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
+                .build()
+                .map_err(|error| JournalError::InvalidRegex(error.to_string()))
+        })
+        .transpose()?;
     let mut descriptors = discover_segments_for_query(&config.root_dir, slot_id, &mut budget)?;
 
     // Sequence numbers are only meaningful within one daemon epoch. An
@@ -1583,21 +1695,23 @@ fn query_files_with_limits(
         .map(|segment| segment.header.first_seq)
         .min();
     let mut last_scanned_seq = query.after_seq;
-    let seed_segment_id = contains.and_then(|_| {
-        query.after_seq.and_then(|after| {
-            descriptors
-                .iter()
-                .filter(|segment| segment.last_seq.is_some_and(|last| last <= after))
-                .max_by_key(|segment| {
-                    (
-                        segment.last_seq.unwrap_or(0),
-                        segment.header.first_seq,
-                        segment.header.segment_id,
-                    )
-                })
-                .map(|segment| segment.header.segment_id)
-        })
-    });
+    let seed_segment_id = (contains.is_some() || expression.is_some())
+        .then_some(())
+        .and_then(|_| {
+            query.after_seq.and_then(|after| {
+                descriptors
+                    .iter()
+                    .filter(|segment| segment.last_seq.is_some_and(|last| last <= after))
+                    .max_by_key(|segment| {
+                        (
+                            segment.last_seq.unwrap_or(0),
+                            segment.header.first_seq,
+                            segment.header.segment_id,
+                        )
+                    })
+                    .map(|segment| segment.header.segment_id)
+            })
+        });
     let mut rx_search_carry = StreamSearchCarry::default();
     let mut tx_search_carry = StreamSearchCarry::default();
     let mut previous_scanned_seq = None;
@@ -1743,7 +1857,7 @@ fn query_files_with_limits(
             }
 
             let scope_match = event_matches_query_scope(event.as_ref(), query);
-            let contains_match = if !scope_match {
+            let search_match = if !scope_match {
                 match event.direction {
                     serial_protocol::Direction::Rx => rx_search_carry.clear(),
                     serial_protocol::Direction::Tx => tx_search_carry.clear(),
@@ -1751,19 +1865,32 @@ fn query_files_with_limits(
                 }
                 false
             } else {
-                contains.is_none_or(|needle| match event.direction {
-                    serial_protocol::Direction::Rx => {
-                        rx_search_carry.matches(event.as_ref(), needle)
-                    }
-                    serial_protocol::Direction::Tx => {
-                        tx_search_carry.matches(event.as_ref(), needle)
-                    }
-                    serial_protocol::Direction::None => contains_bytes(&event.data, needle),
-                })
+                match (contains, expression.as_ref()) {
+                    (Some(needle), None) => match event.direction {
+                        serial_protocol::Direction::Rx => {
+                            rx_search_carry.matches(event.as_ref(), needle)
+                        }
+                        serial_protocol::Direction::Tx => {
+                            tx_search_carry.matches(event.as_ref(), needle)
+                        }
+                        serial_protocol::Direction::None => contains_bytes(&event.data, needle),
+                    },
+                    (None, Some(expression)) => match event.direction {
+                        serial_protocol::Direction::Rx => {
+                            rx_search_carry.regex_matches(event.as_ref(), expression)
+                        }
+                        serial_protocol::Direction::Tx => {
+                            tx_search_carry.regex_matches(event.as_ref(), expression)
+                        }
+                        serial_protocol::Direction::None => expression.is_match(&event.data),
+                    },
+                    (None, None) => true,
+                    (Some(_), Some(_)) => unreachable!("validated mutually exclusive filters"),
+                }
             };
             let eligible = query.after_seq.is_none_or(|after| event.seq > after)
                 && scope_match
-                && contains_match;
+                && search_match;
             if !eligible {
                 last_scanned_seq =
                     Some(last_scanned_seq.map_or(event.seq, |seq| seq.max(event.seq)));
@@ -2541,6 +2668,7 @@ mod tests {
             run_id: None,
             operation_id: None,
             contains: None,
+            regex: None,
             limit_events: Some(1_000),
             limit_bytes: Some(4 * 1024 * 1024),
         }
@@ -2769,6 +2897,73 @@ mod tests {
         assert_eq!(response.events.len(), 1);
         assert_eq!(response.events[0].seq, 2);
         assert_eq!(response.next_cursor.unwrap().after_seq, 2);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_regex_is_bounded_and_matches_across_contiguous_rx_events() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+        let mut first = event(epoch, 1, Direction::Rx, b"ERROR code=".to_vec());
+        first.stream_offset_start = Some(0);
+        first.stream_offset_end = Some(11);
+        handle.append(first).await.unwrap();
+        let mut second = event(epoch, 2, Direction::Rx, b"E42\r\n".to_vec());
+        second.stream_offset_start = Some(11);
+        second.stream_offset_end = Some(16);
+        handle.append(second).await.unwrap();
+
+        let mut filtered = query(epoch);
+        filtered.after_seq = Some(1);
+        filtered.direction = Some(Direction::Rx);
+        filtered.regex = Some(r"(?i)error\s+code=E[0-9]+".into());
+        let response = handle.query("slot-1", filtered).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|item| item.seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        let mut invalid = query(epoch);
+        invalid.regex = Some("(".into());
+        assert!(matches!(
+            handle.query("slot-1", invalid).await,
+            Err(JournalError::InvalidRegex(_))
+        ));
+
+        let mut oversized = query(epoch);
+        oversized.regex = Some("x".repeat(MAX_REGEX_BYTES + 1));
+        assert!(matches!(
+            handle.query("slot-1", oversized).await,
+            Err(JournalError::InvalidRegex(_))
+        ));
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_rejects_ambiguous_literal_and_regex_filters() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+        handle
+            .append(event(epoch, 1, Direction::Rx, b"ERROR".to_vec()))
+            .await
+            .unwrap();
+
+        let mut ambiguous = query(epoch);
+        ambiguous.contains = Some("ERROR".into());
+        ambiguous.regex = Some("ERR.*".into());
+        assert!(matches!(
+            handle.query("slot-1", ambiguous).await,
+            Err(JournalError::InvalidConfig(message))
+                if message.contains("mutually exclusive")
+        ));
         manager.shutdown().await.unwrap();
     }
 

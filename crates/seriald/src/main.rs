@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "seriald", version, about = "Shared serial-port control daemon")]
 struct Cli {
     /// Use a portable config/data root instead of the OS user directories.
-    #[arg(long, env = "SERIALD_ROOT")]
+    #[arg(long, global = true, env = "SERIALD_ROOT")]
     root: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("seriald created its first configuration.");
                 print_credentials(credentials);
                 println!(
-                    "Save the needed token in serialctl init; it will not be printed again automatically."
+                    "Save the needed token with serial setup; it will not be printed again automatically."
                 );
             }
             seriald::serve(store, loaded, bind).await
@@ -79,4 +79,21 @@ fn print_credentials(credentials: &seriald::auth::CredentialDisplay) {
     println!("observer_token={}", credentials.observer_token());
     println!("operator_token={}", credentials.operator_token());
     println!("admin_token={}", credentials.admin_token());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_root_is_a_global_daemon_option() {
+        for args in [
+            vec!["seriald", "--root", "portable", "serve"],
+            vec!["seriald", "serve", "--root", "portable"],
+        ] {
+            let parsed = Cli::try_parse_from(args).expect("--root should parse around serve");
+            assert_eq!(parsed.root, Some(PathBuf::from("portable")));
+            assert!(matches!(parsed.command, Some(Command::Serve { .. })));
+        }
+    }
 }

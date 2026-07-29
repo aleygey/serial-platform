@@ -16,7 +16,7 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serial_protocol::{DeviceProfile, FlowControl, SlotConfig};
+use serial_protocol::{DeviceProfile, FlowControl, SlotConfig, TransportProfile};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,6 +39,8 @@ pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
 /// Hard bound for the device-model profile catalog.
 pub const MAX_DEVICE_PROFILES: usize = 128;
+/// Hard bound for the physical UART profile catalog.
+pub const MAX_TRANSPORT_PROFILES: usize = 128;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SLOT_ID_BYTES: usize = 64;
@@ -153,6 +155,10 @@ impl ControlConfig {
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     pub schema_version: u32,
+    /// Monotonic persisted configuration generation used for optimistic
+    /// concurrency across multiple serialctl/admin clients.
+    #[serde(default = "default_config_revision")]
+    pub config_revision: u64,
     pub server_id: Uuid,
     pub bind: SocketAddr,
     #[serde(default)]
@@ -163,7 +169,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub slots: Vec<SlotConfig>,
     #[serde(default)]
+    pub transport_profiles: Vec<TransportProfile>,
+    #[serde(default)]
     pub device_profiles: Vec<DeviceProfile>,
+}
+
+const fn default_config_revision() -> u64 {
+    1
 }
 
 impl DaemonConfig {
@@ -172,12 +184,14 @@ impl DaemonConfig {
         (
             Self {
                 schema_version: CONFIG_SCHEMA_VERSION,
+                config_revision: default_config_revision(),
                 server_id: Uuid::new_v4(),
                 bind: default_bind_address(),
                 logging: LoggingConfig::default(),
                 control: ControlConfig::default(),
                 auth,
                 slots: Vec::new(),
+                transport_profiles: Vec::new(),
                 device_profiles: Vec::new(),
             },
             credentials,
@@ -199,8 +213,9 @@ impl DaemonConfig {
         validate_logging(&self.logging)?;
         validate_control(&self.control)?;
         self.auth.validate()?;
+        validate_transport_profiles(&self.transport_profiles)?;
         validate_device_profiles(&self.device_profiles)?;
-        validate_slots(&self.slots, &self.device_profiles)
+        validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)
     }
 
     /// Replaces all Slot configuration in memory after validating the complete
@@ -220,6 +235,29 @@ impl DaemonConfig {
     pub fn staged_with_slots(&self, slots: Vec<SlotConfig>) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
         staged.replace_slots(slots)?;
+        staged.bump_revision()?;
+        Ok(staged)
+    }
+
+    pub fn replace_transport_profiles(
+        &mut self,
+        transport_profiles: Vec<TransportProfile>,
+    ) -> Result<(), ConfigValidationError> {
+        let previous = std::mem::replace(&mut self.transport_profiles, transport_profiles);
+        if let Err(error) = self.validate() {
+            self.transport_profiles = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn staged_with_transport_profiles(
+        &self,
+        transport_profiles: Vec<TransportProfile>,
+    ) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        staged.replace_transport_profiles(transport_profiles)?;
+        staged.bump_revision()?;
         Ok(staged)
     }
 
@@ -246,7 +284,16 @@ impl DaemonConfig {
     ) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
         staged.replace_device_profiles(device_profiles)?;
+        staged.bump_revision()?;
         Ok(staged)
+    }
+
+    fn bump_revision(&mut self) -> Result<(), ConfigValidationError> {
+        self.config_revision = self
+            .config_revision
+            .checked_add(1)
+            .ok_or(ConfigValidationError::RevisionExhausted)?;
+        Ok(())
     }
 }
 
@@ -396,6 +443,17 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub fn update_transport_profiles(
+        &self,
+        current: &mut DaemonConfig,
+        transport_profiles: Vec<TransportProfile>,
+    ) -> Result<(), ConfigError> {
+        let updated = current.staged_with_transport_profiles(transport_profiles)?;
+        self.save(&updated)?;
+        *current = updated;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_save_failure(&self, fail: bool) {
         self.fail_saves
@@ -446,6 +504,8 @@ pub enum ConfigValidationError {
     NilServerId,
     #[error("bind port must be non-zero")]
     InvalidBindPort,
+    #[error("configuration revision is exhausted")]
+    RevisionExhausted,
     #[error("max_total_bytes must be non-zero")]
     InvalidLogCapacity,
     #[error("retention_target_percent must be between 1 and 99")]
@@ -482,6 +542,24 @@ pub enum ConfigValidationError {
     DuplicateDeviceProfileName { first: usize, second: usize },
     #[error("configuration contains {actual} device profiles; the maximum is {limit}")]
     TooManyDeviceProfiles { actual: usize, limit: usize },
+    #[error("transport profile at index {index} has invalid field {field}: {reason}")]
+    InvalidTransportProfile {
+        index: usize,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("transport profiles at indexes {first} and {second} use the same name")]
+    DuplicateTransportProfileName { first: usize, second: usize },
+    #[error("configuration contains {actual} transport profiles; the maximum is {limit}")]
+    TooManyTransportProfiles { actual: usize, limit: usize },
+    #[error(
+        "Slot {slot_id} references unknown transport profile {name:?}; available profiles: {available}"
+    )]
+    UnknownTransportProfile {
+        slot_id: String,
+        name: String,
+        available: String,
+    },
     #[error(
         "Slot {slot_id} references unknown device profile {name:?}; available profiles: {available}"
     )]
@@ -524,6 +602,7 @@ fn validate_control(control: &ControlConfig) -> Result<(), ConfigValidationError
 
 pub(crate) fn validate_slots(
     slots: &[SlotConfig],
+    transport_profiles: &[TransportProfile],
     device_profiles: &[DeviceProfile],
 ) -> Result<(), ConfigValidationError> {
     if slots.len() > MAX_SLOT_IDENTITIES_PER_DAEMON {
@@ -546,6 +625,26 @@ pub(crate) fn validate_slots(
         validate_text_field(index, "port", &slot.port, MAX_PORT_NAME_BYTES)?;
         validate_profile(index, &slot.profile)?;
         validate_serial_settings(index, slot)?;
+
+        // A catalog-free file is a legacy configuration: the complete Slot
+        // settings snapshot stays authoritative. Once a catalog is created,
+        // every Slot binding must resolve so a typo cannot silently fall back.
+        if !transport_profiles.is_empty()
+            && !transport_profiles
+                .iter()
+                .any(|profile| profile.name == slot.profile)
+        {
+            let available = transport_profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ConfigValidationError::UnknownTransportProfile {
+                slot_id: slot.id.clone(),
+                name: slot.profile.clone(),
+                available,
+            });
+        }
 
         if let Some(device_profile) = slot.device_profile.as_deref()
             && !device_profiles
@@ -581,6 +680,52 @@ pub(crate) fn validate_slots(
             return Err(ConfigValidationError::DuplicatePort {
                 first,
                 second: index,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_transport_profiles(
+    profiles: &[TransportProfile],
+) -> Result<(), ConfigValidationError> {
+    if profiles.len() > MAX_TRANSPORT_PROFILES {
+        return Err(ConfigValidationError::TooManyTransportProfiles {
+            actual: profiles.len(),
+            limit: MAX_TRANSPORT_PROFILES,
+        });
+    }
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        if profile.name.is_empty()
+            || profile.name.len() > MAX_PROFILE_NAME_BYTES
+            || profile.name != profile.name.trim()
+            || profile.name.chars().any(char::is_control)
+        {
+            return Err(ConfigValidationError::InvalidTransportProfile {
+                index,
+                field: "name",
+                reason: "must be a non-empty, trimmed name of at most 64 bytes",
+            });
+        }
+        if let Some(first) = names.insert(&profile.name, index) {
+            return Err(ConfigValidationError::DuplicateTransportProfileName {
+                first,
+                second: index,
+            });
+        }
+        if !(50..=12_000_000).contains(&profile.baud_rate) {
+            return Err(ConfigValidationError::InvalidTransportProfile {
+                index,
+                field: "baud_rate",
+                reason: "must be between 50 and 12000000",
+            });
+        }
+        if profile.flow_control == FlowControl::Hardware && profile.rts {
+            return Err(ConfigValidationError::InvalidTransportProfile {
+                index,
+                field: "rts",
+                reason: "must be false when hardware flow control owns RTS",
             });
         }
     }
@@ -640,6 +785,23 @@ pub(crate) fn validate_device_profiles(
                 index,
                 field: "write_eol",
                 reason: "must be empty, CR, LF, or CRLF",
+            });
+        }
+        if profile.write_chunk_size == Some(0) {
+            return Err(ConfigValidationError::InvalidDeviceProfile {
+                index,
+                field: "write_chunk_size",
+                reason: "must be greater than zero when configured",
+            });
+        }
+        if profile
+            .write_chunk_delay_ms
+            .is_some_and(|delay| delay > 10_000)
+        {
+            return Err(ConfigValidationError::InvalidDeviceProfile {
+                index,
+                field: "write_chunk_delay_ms",
+                reason: "must not exceed 10000 ms",
             });
         }
     }
@@ -723,6 +885,20 @@ fn validate_serial_settings(index: usize, slot: &SlotConfig) -> Result<(), Confi
             index,
             "settings.rts",
             "must be false when hardware flow control owns RTS",
+        ));
+    }
+    if settings.write_chunk_size == 0 {
+        return Err(invalid_slot(
+            index,
+            "settings.write_chunk_size",
+            "must be greater than zero",
+        ));
+    }
+    if settings.write_chunk_delay_ms > 10_000 {
+        return Err(invalid_slot(
+            index,
+            "settings.write_chunk_delay_ms",
+            "must not exceed 10000 ms",
         ));
     }
     for (field, pattern) in [
@@ -918,6 +1094,23 @@ mod tests {
             uboot_prompt: Some("SigmaStar =>".to_owned()),
             write_eol: None,
             echo: None,
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
+        }
+    }
+
+    fn transport_profile(name: &str) -> TransportProfile {
+        let settings = SerialSettings::default();
+        TransportProfile {
+            name: name.to_owned(),
+            baud_rate: settings.baud_rate,
+            data_bits: settings.data_bits,
+            parity: settings.parity,
+            stop_bits: settings.stop_bits,
+            flow_control: settings.flow_control,
+            dtr: settings.dtr,
+            rts: settings.rts,
+            auto_open: settings.auto_open,
         }
     }
 
@@ -1160,6 +1353,26 @@ mod tests {
                 ..
             })
         ));
+        let mut invalid = device_profile("evb");
+        invalid.write_chunk_size = Some(0);
+        config.device_profiles = vec![invalid];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceProfile {
+                field: "write_chunk_size",
+                ..
+            })
+        ));
+        let mut invalid = device_profile("evb");
+        invalid.write_chunk_delay_ms = Some(10_001);
+        config.device_profiles = vec![invalid];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceProfile {
+                field: "write_chunk_delay_ms",
+                ..
+            })
+        ));
 
         // The catalog is bounded.
         config.device_profiles = (0..=MAX_DEVICE_PROFILES)
@@ -1169,6 +1382,71 @@ mod tests {
             config.validate(),
             Err(ConfigValidationError::TooManyDeviceProfiles { .. })
         ));
+    }
+
+    #[test]
+    fn transport_profile_catalog_is_explicit_and_validated_as_a_whole() {
+        let (mut config, _) = DaemonConfig::generate();
+        let mut configured_slot = slot("slot-1", "COM3");
+
+        // A catalog-free legacy configuration keeps the Slot snapshot
+        // authoritative even though its historical profile label is not
+        // separately materialized.
+        config.slots = vec![configured_slot.clone()];
+        config.validate().unwrap();
+
+        config.transport_profiles = vec![transport_profile("station-a")];
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigValidationError::UnknownTransportProfile { .. }
+        ));
+
+        configured_slot.profile = "station-a".into();
+        config.slots = vec![configured_slot];
+        config.validate().unwrap();
+
+        config.transport_profiles = vec![
+            transport_profile("station-a"),
+            transport_profile("station-a"),
+        ];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::DuplicateTransportProfileName { .. })
+        ));
+
+        let mut invalid = transport_profile("station-a");
+        invalid.baud_rate = 0;
+        config.transport_profiles = vec![invalid];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidTransportProfile {
+                field: "baud_rate",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn every_staged_configuration_replacement_advances_revision_once() {
+        let (config, _) = DaemonConfig::generate();
+        assert_eq!(config.config_revision, 1);
+
+        let with_slots = config
+            .staged_with_slots(vec![slot("slot-1", "COM3")])
+            .unwrap();
+        assert_eq!(with_slots.config_revision, 2);
+        assert_eq!(config.config_revision, 1);
+
+        let with_transport = with_slots
+            .staged_with_transport_profiles(vec![transport_profile("generic-115200")])
+            .unwrap();
+        assert_eq!(with_transport.config_revision, 3);
+
+        let with_device = with_transport
+            .staged_with_device_profiles(vec![device_profile("dut")])
+            .unwrap();
+        assert_eq!(with_device.config_revision, 4);
     }
 
     #[test]
@@ -1224,22 +1502,28 @@ mod tests {
     }
 
     #[test]
-    fn legacy_toml_without_device_profiles_loads_with_an_empty_catalog() {
+    fn legacy_toml_without_revision_or_profile_catalogs_uses_safe_defaults() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
         let loaded = store.load_or_create().unwrap();
 
-        // Rewrite the persisted configuration without the device_profiles
-        // key, as a pre-profile daemon would have written it.
+        // Rewrite the persisted configuration without fields introduced
+        // after the initial schema, as an older daemon would have written it.
         let persisted = fs::read_to_string(&store.paths().config_file).unwrap();
         let without_profiles = persisted
             .lines()
-            .filter(|line| !line.starts_with("device_profiles"))
+            .filter(|line| {
+                !line.starts_with("config_revision")
+                    && !line.starts_with("transport_profiles")
+                    && !line.starts_with("device_profiles")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(&store.paths().config_file, without_profiles).unwrap();
 
         let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.config_revision, 1);
+        assert!(reloaded.transport_profiles.is_empty());
         assert!(reloaded.device_profiles.is_empty());
         assert_eq!(reloaded.server_id, loaded.config.server_id);
     }

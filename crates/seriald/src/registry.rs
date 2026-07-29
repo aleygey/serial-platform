@@ -2,7 +2,10 @@ use crate::config::{ConfigValidationError, MAX_SLOT_IDENTITIES_PER_DAEMON, valid
 use crate::control::ControlLimits;
 use crate::journal::JournalHandle;
 use crate::slot::{SlotError, SlotHandle};
-use serial_protocol::{DeviceProfile, SlotConfig, SlotSnapshot};
+use serial_protocol::{
+    DeviceProfile, SlotConfig, SlotSnapshot, TransportProfile, resolve_device_settings,
+    resolve_transport_settings,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -210,18 +213,21 @@ impl SlotRegistry {
         daemon_started: Instant,
         journal: JournalHandle,
         configs: Vec<SlotConfig>,
+        transport_profiles: Vec<TransportProfile>,
         device_profiles: Vec<DeviceProfile>,
         control_limits: ControlLimits,
     ) -> Self {
-        validate_slots(&configs, &device_profiles)
+        validate_slots(&configs, &transport_profiles, &device_profiles)
             .expect("SlotRegistry requires validated Slot configuration");
         let active = configs
             .into_iter()
             .map(|config| {
                 let id = config.id.clone();
+                let transport_profile = find_transport_profile(&transport_profiles, &config);
                 let device_profile = find_device_profile(&device_profiles, &config);
                 let handle = SlotHandle::spawn(
                     config,
+                    transport_profile,
                     device_profile,
                     control_limits,
                     daemon_epoch,
@@ -284,9 +290,10 @@ impl SlotRegistry {
     pub async fn apply_replacement(
         &self,
         configs: Vec<SlotConfig>,
+        transport_profiles: Vec<TransportProfile>,
         device_profiles: Vec<DeviceProfile>,
     ) -> Result<AppliedSlotReplacement, RegistryError> {
-        validate_slots(&configs, &device_profiles)?;
+        validate_slots(&configs, &transport_profiles, &device_profiles)?;
         let gate = self.inner.mutation.clone().lock_owned().await;
         match gate.lifecycle {
             RegistryLifecycle::Running => {}
@@ -327,9 +334,23 @@ impl SlotRegistry {
             .active
             .keys()
             .filter(|id| {
-                requested
-                    .get(*id)
-                    .is_none_or(|config| previous.active[*id].snapshot().config != *config)
+                requested.get(*id).is_none_or(|config| {
+                    let snapshot = previous.active[*id].snapshot();
+                    let transport = find_transport_profile(&transport_profiles, config);
+                    let device = find_device_profile(&device_profiles, config);
+                    let expected_transport =
+                        resolve_transport_settings(&config.settings, transport.as_ref());
+                    let expected_device =
+                        resolve_device_settings(&config.settings, device.as_ref());
+                    snapshot.config != *config
+                        || snapshot.effective_transport != Some(expected_transport)
+                        || snapshot.effective_shell_prompt != expected_device.shell_prompt
+                        || snapshot.effective_uboot_prompt != expected_device.uboot_prompt
+                        || snapshot.effective_write_eol.as_deref()
+                            != Some(expected_device.write_eol.as_str())
+                        || snapshot.effective_echo != Some(expected_device.echo)
+                        || snapshot.effective_write_pacing != Some(expected_device.write_pacing)
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -344,6 +365,7 @@ impl SlotRegistry {
                 handle
                     .stage_reconfiguration(
                         config.clone(),
+                        find_transport_profile(&transport_profiles, config),
                         find_device_profile(&device_profiles, config),
                         true,
                     )
@@ -375,6 +397,7 @@ impl SlotRegistry {
             if let Err(error) = handle
                 .stage_reconfiguration(
                     config.clone(),
+                    find_transport_profile(&transport_profiles, config),
                     find_device_profile(&device_profiles, config),
                     false,
                 )
@@ -395,9 +418,11 @@ impl SlotRegistry {
             } else if let Some(existing) = existing_retired {
                 existing
             } else {
+                let transport_profile = find_transport_profile(&transport_profiles, &config);
                 let device_profile = find_device_profile(&device_profiles, &config);
                 let handle = SlotHandle::spawn_staged(
                     config,
+                    transport_profile,
                     device_profile,
                     self.inner.control_limits,
                     self.inner.daemon_epoch,
@@ -427,9 +452,10 @@ impl SlotRegistry {
     pub async fn replace(
         &self,
         configs: Vec<SlotConfig>,
+        transport_profiles: Vec<TransportProfile>,
         device_profiles: Vec<DeviceProfile>,
     ) -> Result<Vec<SlotSnapshot>, RegistryError> {
-        self.apply_replacement(configs, device_profiles)
+        self.apply_replacement(configs, transport_profiles, device_profiles)
             .await?
             .commit()
             .await
@@ -541,6 +567,16 @@ fn find_device_profile(
         .cloned()
 }
 
+fn find_transport_profile(
+    transport_profiles: &[TransportProfile],
+    config: &SlotConfig,
+) -> Option<TransportProfile> {
+    transport_profiles
+        .iter()
+        .find(|profile| profile.name == config.profile)
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +623,7 @@ mod tests {
             journal.handle(),
             configs,
             Vec::new(),
+            Vec::new(),
             ControlLimits::default(),
         )
     }
@@ -602,13 +639,18 @@ mod tests {
             journal.handle(),
             vec![disabled_slot("slot-1", "before")],
             Vec::new(),
+            Vec::new(),
             ControlLimits::default(),
         );
         let original = registry.get("slot-1").await.unwrap();
         let mut live = original.attach(None, 10).await.unwrap().live;
 
         let snapshots = registry
-            .replace(vec![disabled_slot("slot-1", "after")], Vec::new())
+            .replace(
+                vec![disabled_slot("slot-1", "after")],
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert_eq!(snapshots[0].daemon_epoch, epoch);
@@ -622,7 +664,11 @@ mod tests {
         assert_eq!(event.seq, 1);
 
         let snapshots = registry
-            .replace(vec![disabled_slot("slot-1", "after-again")], Vec::new())
+            .replace(
+                vec![disabled_slot("slot-1", "after-again")],
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert_eq!(snapshots[0].head_seq, 2);
@@ -640,7 +686,10 @@ mod tests {
         let original = registry.get("slot-1").await.unwrap();
         let mut live = original.attach(None, 10).await.unwrap().live;
 
-        registry.replace(Vec::new(), Vec::new()).await.unwrap();
+        registry
+            .replace(Vec::new(), Vec::new(), Vec::new())
+            .await
+            .unwrap();
         assert!(registry.get("slot-1").await.is_none());
         assert_eq!(registry.inner.slots.read().await.retired.len(), 1);
         let removed = tokio::time::timeout(Duration::from_secs(1), live.recv())
@@ -651,7 +700,11 @@ mod tests {
         assert_eq!(removed.kind, EventKind::SlotRemoved);
 
         let snapshots = registry
-            .replace(vec![disabled_slot("slot-1", "after")], Vec::new())
+            .replace(
+                vec![disabled_slot("slot-1", "after")],
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert_eq!(snapshots[0].head_seq, 2);
@@ -676,7 +729,11 @@ mod tests {
         let mut live = original.attach(None, 10).await.unwrap().live;
 
         let applied = registry
-            .apply_replacement(vec![disabled_slot("slot-new", "New")], Vec::new())
+            .apply_replacement(
+                vec![disabled_slot("slot-new", "New")],
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert!(registry.get("slot-old").await.is_some());
@@ -695,7 +752,11 @@ mod tests {
         assert!(maps.retired.is_empty());
         drop(maps);
         let snapshots = registry
-            .replace(vec![disabled_slot("slot-new", "New")], Vec::new())
+            .replace(
+                vec![disabled_slot("slot-new", "New")],
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert_eq!(snapshots[0].head_seq, 0);
@@ -715,7 +776,7 @@ mod tests {
         let added = auto_open_slot("slot-new", "New candidate");
 
         let applied = registry
-            .apply_replacement(vec![replacement, added], Vec::new())
+            .apply_replacement(vec![replacement, added], Vec::new(), Vec::new())
             .await
             .unwrap();
         let new_candidate = applied.new_handles[0].clone();
@@ -760,8 +821,16 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let journal = JournalManager::open(JournalConfig::new(temporary.path())).unwrap();
         let registry = registry(&journal, Vec::new());
-        let first = registry.replace(vec![disabled_slot("slot-1", "first")], Vec::new());
-        let second = registry.replace(vec![disabled_slot("slot-1", "second")], Vec::new());
+        let first = registry.replace(
+            vec![disabled_slot("slot-1", "first")],
+            Vec::new(),
+            Vec::new(),
+        );
+        let second = registry.replace(
+            vec![disabled_slot("slot-1", "second")],
+            Vec::new(),
+            Vec::new(),
+        );
         let (first, second) = tokio::join!(first, second);
         first.unwrap();
         second.unwrap();
@@ -796,6 +865,7 @@ mod tests {
                     disabled_slot("slot-a", "a-after"),
                     disabled_slot("slot-z", "z-after"),
                 ],
+                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -832,13 +902,18 @@ mod tests {
                         &format!("Slot {index}"),
                     )],
                     Vec::new(),
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
         }
         let before = registry.snapshots().await;
         let error = registry
-            .replace(vec![disabled_slot("slot-over-limit", "over")], Vec::new())
+            .replace(
+                vec![disabled_slot("slot-over-limit", "over")],
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -862,7 +937,11 @@ mod tests {
         registry.shutdown().await;
         assert!(matches!(
             registry
-                .replace(vec![disabled_slot("slot-1", "after")], Vec::new())
+                .replace(
+                    vec![disabled_slot("slot-1", "after")],
+                    Vec::new(),
+                    Vec::new(),
+                )
                 .await,
             Err(RegistryError::Shutdown)
         ));

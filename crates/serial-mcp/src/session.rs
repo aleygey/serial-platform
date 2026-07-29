@@ -29,6 +29,17 @@ const WRITE_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 // the 20-second renewal cadence of leases held for other Slots.
 const MAX_CONTROL_WAIT: Duration = Duration::from_secs(15);
 
+pub(crate) fn ensure_welcome_protocol(protocol_version: u16) -> Result<()> {
+    if protocol_version != PROTOCOL_VERSION {
+        bail!(
+            "seriald WebSocket protocol version {protocol_version} is incompatible with \
+             serial-mcp protocol version {PROTOCOL_VERSION}; install seriald and serial-mcp \
+             from the same release"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct SessionHandle {
     tx: mpsc::Sender<SessionRequest>,
@@ -40,7 +51,14 @@ enum SessionRequest {
         data: Vec<u8>,
         operation_id: Uuid,
         expected_run_id: Uuid,
-        pacing: Option<WritePacing>,
+        effective_pacing: WritePacing,
+        reply: Reply,
+    },
+    SendBreak {
+        slot_id: String,
+        duration_ms: u64,
+        operation_id: Uuid,
+        expected_run_id: Uuid,
         reply: Reply,
     },
     TriggerStart {
@@ -97,19 +115,12 @@ type Reply = oneshot::Sender<std::result::Result<SessionResponse, String>>;
 // protocol values inline avoids an allocation on every session RPC.
 #[allow(clippy::large_enum_variant)]
 enum SessionResponse {
-    Write {
-        event_seq: u64,
-        actor: Actor,
-        request_id: Uuid,
-    },
+    Write { event_seq: u64 },
+    Break { event_seq: u64 },
     Trigger(TriggerInfo),
     Run(RunInfo),
-    Released {
-        had_lease: bool,
-    },
-    RunOwnership {
-        retained: bool,
-    },
+    Released { had_lease: bool },
+    RunOwnership { retained: bool },
 }
 
 impl SessionHandle {
@@ -128,7 +139,7 @@ impl SessionHandle {
         data: Vec<u8>,
         operation_id: Uuid,
         expected_run_id: Uuid,
-        pacing: Option<WritePacing>,
+        effective_pacing: WritePacing,
     ) -> Result<WriteResult> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -137,21 +148,13 @@ impl SessionHandle {
                 data,
                 operation_id,
                 expected_run_id,
-                pacing,
+                effective_pacing,
                 reply,
             })
             .await
             .context("serial session task stopped")?;
         match receive(response).await? {
-            SessionResponse::Write {
-                event_seq,
-                actor,
-                request_id,
-            } => Ok(WriteResult {
-                event_seq,
-                actor,
-                request_id,
-            }),
+            SessionResponse::Write { event_seq } => Ok(WriteResult { event_seq }),
             _ => bail!("serial session returned the wrong response type"),
         }
     }
@@ -176,6 +179,30 @@ impl SessionHandle {
             .context("serial session task stopped")?;
         match receive(response).await? {
             SessionResponse::Run(run) => Ok(run),
+            _ => bail!("serial session returned the wrong response type"),
+        }
+    }
+
+    pub async fn send_break(
+        &self,
+        slot_id: String,
+        duration_ms: u64,
+        operation_id: Uuid,
+        expected_run_id: Uuid,
+    ) -> Result<WriteResult> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::SendBreak {
+                slot_id,
+                duration_ms,
+                operation_id,
+                expected_run_id,
+                reply,
+            })
+            .await
+            .context("serial session task stopped")?;
+        match receive(response).await? {
+            SessionResponse::Break { event_seq } => Ok(WriteResult { event_seq }),
             _ => bail!("serial session returned the wrong response type"),
         }
     }
@@ -309,8 +336,6 @@ impl SessionHandle {
 
 pub struct WriteResult {
     pub event_seq: u64,
-    pub actor: Actor,
-    pub request_id: Uuid,
 }
 
 async fn receive(
@@ -327,11 +352,15 @@ async fn run_session(mut state: SessionState, mut rx: mpsc::Receiver<SessionRequ
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            // A completed long request can leave both branches ready. Always
+            // renew first so queued work for other Slots cannot consume the
+            // remaining lease lifetime.
+            biased;
+            _ = renew.tick() => state.renew_all().await,
             request = rx.recv() => {
                 let Some(request) = request else { break; };
                 state.handle(request).await;
             }
-            _ = renew.tick() => state.renew_all().await,
         }
     }
 }
@@ -368,17 +397,19 @@ impl SessionState {
                 data,
                 operation_id,
                 expected_run_id,
-                pacing,
+                effective_pacing,
                 reply,
             } => {
                 let result = self
-                    .write(slot_id, data, operation_id, expected_run_id, pacing)
+                    .write(
+                        slot_id,
+                        data,
+                        operation_id,
+                        expected_run_id,
+                        effective_pacing,
+                    )
                     .await
-                    .map(|(event_seq, actor, request_id)| SessionResponse::Write {
-                        event_seq,
-                        actor,
-                        request_id,
-                    });
+                    .map(|event_seq| SessionResponse::Write { event_seq });
                 send_reply(reply, result);
             }
             SessionRequest::StartRun {
@@ -392,6 +423,19 @@ impl SessionState {
                     .start_run(slot_id, label, metadata, control_wait)
                     .await
                     .map(SessionResponse::Run);
+                send_reply(reply, result);
+            }
+            SessionRequest::SendBreak {
+                slot_id,
+                duration_ms,
+                operation_id,
+                expected_run_id,
+                reply,
+            } => {
+                let result = self
+                    .send_break(slot_id, duration_ms, operation_id, expected_run_id)
+                    .await
+                    .map(|event_seq| SessionResponse::Break { event_seq });
                 send_reply(reply, result);
             }
             SessionRequest::TriggerStart {
@@ -514,7 +558,13 @@ impl SessionState {
         send_control(&mut socket, &hello).await?;
         loop {
             match next_frame(&mut socket).await? {
-                WireFrame::Control(ServerMessage::Welcome { actor, role, .. }) => {
+                WireFrame::Control(ServerMessage::Welcome {
+                    protocol_version,
+                    actor,
+                    role,
+                    ..
+                }) => {
+                    ensure_welcome_protocol(protocol_version)?;
                     if role < Role::Operator {
                         bail!("serial-mcp requires an operator token; daemon granted {role:?}");
                     }
@@ -569,14 +619,78 @@ impl SessionState {
                 }
                 CommandResult::ControlQueued { position } => {
                     if tokio::time::Instant::now() >= deadline {
+                        self.cancel_queued_acquire(slot_id).await.with_context(|| {
+                            format!(
+                                "timed out queued at position {position} and failed to cancel the \
+                                 pending write-control request"
+                            )
+                        })?;
                         bail!(
-                            "write control is still queued at position {position}; no takeover was attempted"
+                            "write control remained queued at position {position}; the queued \
+                             acquire was cancelled and no takeover was attempted"
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 other => bail!("unexpected acquire result: {other:?}"),
             }
+        }
+    }
+
+    async fn cancel_queued_acquire(&mut self, slot_id: &str) -> Result<()> {
+        let cancel = ClientMessage::CancelAcquire {
+            request_id: Uuid::new_v4(),
+            slot_id: slot_id.to_string(),
+            // Queued actors have no lease ID. seriald matches cancellation by
+            // actor identity and intentionally ignores this wire field.
+            control_id: Uuid::nil(),
+        };
+        let removed = match self.call(cancel).await? {
+            CommandResult::AcquireCancelled { removed } => removed,
+            other => bail!("unexpected cancel-acquire result: {other:?}"),
+        };
+        if removed {
+            return Ok(());
+        }
+
+        // The waiter can be granted between the deadline check and cancel.
+        // Resolve that race without disconnecting this actor (which may own
+        // valid Runs on other Slots): reacquire returns AlreadyHeld when the
+        // grant won, then release that exact lease; otherwise cancel the newly
+        // observed queue entry.
+        let probe = ClientMessage::AcquireControl {
+            request_id: Uuid::new_v4(),
+            slot_id: slot_id.to_string(),
+            mode: ControlMode::Queue,
+            ttl_ms: LEASE_TTL_MS,
+        };
+        match self.call(probe).await? {
+            CommandResult::ControlGranted { lease } => {
+                let release = ClientMessage::ReleaseControl {
+                    request_id: Uuid::new_v4(),
+                    slot_id: slot_id.to_string(),
+                    control_id: lease.id,
+                    fence: lease.fence,
+                };
+                match self.call(release).await? {
+                    CommandResult::ControlReleased => Ok(()),
+                    other => bail!("unexpected raced-acquire release result: {other:?}"),
+                }
+            }
+            CommandResult::ControlQueued { .. } => {
+                match self
+                    .call(ClientMessage::CancelAcquire {
+                        request_id: Uuid::new_v4(),
+                        slot_id: slot_id.to_string(),
+                        control_id: Uuid::nil(),
+                    })
+                    .await?
+                {
+                    CommandResult::AcquireCancelled { .. } => Ok(()),
+                    other => bail!("unexpected second cancel-acquire result: {other:?}"),
+                }
+            }
+            other => bail!("unexpected acquire race probe result: {other:?}"),
         }
     }
 
@@ -678,6 +792,48 @@ impl SessionState {
         }
     }
 
+    async fn send_break(
+        &mut self,
+        slot_id: String,
+        duration_ms: u64,
+        operation_id: Uuid,
+        expected_run_id: Uuid,
+    ) -> Result<u64> {
+        let lease = self
+            .renew_owned_run_control(&slot_id, expected_run_id)
+            .await?;
+        self.actor
+            .as_ref()
+            .context("serial session has no actor identity")?;
+        let request_id = Uuid::new_v4();
+        let request = ClientMessage::SendBreak {
+            request_id,
+            slot_id,
+            control_id: lease.id,
+            fence: lease.fence,
+            duration_ms,
+            operation_id: Some(operation_id),
+            expected_run_id: Some(expected_run_id),
+        };
+        let timeout = Duration::from_millis(duration_ms).saturating_add(RPC_SERVICE_MARGIN);
+        match self.call_with_timeout(request, timeout).await {
+            Ok(CommandResult::BreakSent { event_seq }) => Ok(event_seq),
+            Ok(other) => bail!("unexpected Break result: {other:?}"),
+            Err(error) if is_expected_run_rejection(&error) => {
+                self.disconnect();
+                bail!(
+                    "seriald rejected Break request {request_id} (operation {operation_id}) \
+                     because the expected Run boundary is no longer valid. Start a new Run \
+                     before retrying: {error}"
+                )
+            }
+            Err(error) => bail!(
+                "Break outcome is uncertain after request {request_id} (operation \
+                 {operation_id}); inspect the TX/control timeline before retrying: {error}"
+            ),
+        }
+    }
+
     async fn trigger_status(
         &mut self,
         slot_id: String,
@@ -770,14 +926,13 @@ impl SessionState {
         data: Vec<u8>,
         operation_id: Uuid,
         expected_run_id: Uuid,
-        pacing: Option<WritePacing>,
-    ) -> Result<(u64, Actor, Uuid)> {
+        effective_pacing: WritePacing,
+    ) -> Result<u64> {
         let lease = self
             .renew_owned_run_control(&slot_id, expected_run_id)
             .await?;
-        let actor = self
-            .actor
-            .clone()
+        self.actor
+            .as_ref()
             .context("serial session has no actor identity")?;
         let request_id = Uuid::new_v4();
         let request = ClientMessage::Write {
@@ -788,11 +943,19 @@ impl SessionState {
             data,
             operation_id: Some(operation_id),
             expected_run_id: Some(expected_run_id),
-            pacing,
+            // Agent tools never override Slot/Device pacing. The effective
+            // value is used only for the local RPC deadline below.
+            pacing: None,
         };
-        let rpc_timeout = request_timeout(&request, None);
+        let rpc_timeout = write_request_timeout(
+            match &request {
+                ClientMessage::Write { data, .. } => data.len(),
+                _ => 0,
+            },
+            effective_pacing,
+        );
         match self.call_with_timeout(request, rpc_timeout).await {
-            Ok(CommandResult::WriteAccepted { event_seq }) => Ok((event_seq, actor, request_id)),
+            Ok(CommandResult::WriteAccepted { event_seq }) => Ok(event_seq),
             Ok(other) => bail!("unexpected write result: {other:?}"),
             Err(error) if is_expected_run_rejection(&error) => {
                 self.disconnect();
@@ -1053,6 +1216,21 @@ fn request_timeout(request: &ClientMessage, control_wait: Option<Duration>) -> D
     }
 }
 
+fn write_request_timeout(data_len: usize, pacing: WritePacing) -> Duration {
+    if data_len == 0 || pacing.chunk_delay_ms == 0 {
+        return DEFAULT_RPC_TIMEOUT;
+    }
+    let chunk_size = usize::try_from(pacing.chunk_size.max(1)).unwrap_or(usize::MAX);
+    let chunks = data_len.saturating_add(chunk_size - 1) / chunk_size;
+    let delay_count = chunks.saturating_sub(1);
+    let delay_ms = u64::try_from(delay_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(pacing.chunk_delay_ms);
+    DEFAULT_RPC_TIMEOUT
+        .saturating_add(Duration::from_millis(delay_ms))
+        .min(WRITE_RPC_TIMEOUT)
+}
+
 fn retains_run_ownership(
     socket_connected: bool,
     owned_run_id: Option<Uuid>,
@@ -1199,6 +1377,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn websocket_welcome_protocol_gate_is_fail_closed() {
+        assert!(ensure_welcome_protocol(PROTOCOL_VERSION).is_ok());
+        let error = ensure_welcome_protocol(PROTOCOL_VERSION.saturating_sub(1)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("install seriald and serial-mcp from the same release")
+        );
+    }
+
+    #[test]
     fn websocket_url_is_derived_without_exposing_credentials() {
         assert_eq!(
             ws_url("http://192.168.56.1:3210").unwrap(),
@@ -1238,6 +1427,36 @@ mod tests {
             pacing: None,
         };
         assert_eq!(request_timeout(&write, None), Duration::from_secs(20));
+        assert_eq!(
+            write_request_timeout(
+                8,
+                WritePacing {
+                    chunk_size: 8,
+                    chunk_delay_ms: 1,
+                }
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            write_request_timeout(
+                4_096,
+                WritePacing {
+                    chunk_size: 1,
+                    chunk_delay_ms: 1,
+                }
+            ),
+            Duration::from_millis(9_095)
+        );
+        assert_eq!(
+            write_request_timeout(
+                4_096,
+                WritePacing {
+                    chunk_size: 1,
+                    chunk_delay_ms: 10,
+                }
+            ),
+            WRITE_RPC_TIMEOUT
+        );
 
         let release = ClientMessage::ReleaseControl {
             request_id: Uuid::nil(),
@@ -1389,8 +1608,24 @@ mod tests {
                 b"help\r".to_vec(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
-                None,
+                WritePacing {
+                    chunk_size: 1,
+                    chunk_delay_ms: 1,
+                },
             )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("call run_start"));
+        assert!(state.socket.is_none());
+        assert!(state.leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn break_without_an_owned_run_fails_before_connecting() {
+        let mut state =
+            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let error = state
+            .send_break("bench".into(), 250, Uuid::new_v4(), Uuid::new_v4())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("call run_start"));

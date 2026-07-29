@@ -36,6 +36,7 @@ pub async fn serve(
         started,
         journal.handle(),
         loaded.config.slots.clone(),
+        loaded.config.transport_profiles.clone(),
         loaded.config.device_profiles.clone(),
         loaded.config.control.limits(),
     );
@@ -56,6 +57,7 @@ pub async fn serve(
     let result = server.await.context("seriald HTTP server failed");
     state.shutdown().await;
     journal.shutdown().await.context("close serial journal")?;
+    tracing::info!("seriald shutdown complete");
     result
 }
 

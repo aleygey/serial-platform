@@ -1,229 +1,250 @@
 # serial-platform roadmap
 
-This roadmap records the product direction discussed for `seriald`,
-`serialctl`, and `serial-mcp`. It is intentionally ordered by value and
-dependency rather than by date. Items under **Later / candidate** are ideas,
-not commitments; they can be promoted, changed, or removed after station
-testing.
+This roadmap separates shipped behavior from possible future work for
+`seriald`, the human `serialctl`/`serial console`, and `serial-mcp`. Items under
+**Later / candidate** are ideas, not commitments; station feedback decides
+whether they are promoted, changed, or removed.
 
 ## Product boundary
 
 `seriald` is a device-agnostic shared serial control plane. It owns the
 physical port, fans one byte stream out to multiple observers, serializes
-writes, records authoritative events, and provides bounded low-latency
+writes, records authoritative events, and provides bounded realtime
 primitives.
 
-`serialctl` is the human console for operating and monitoring those Slots.
+`serialctl` is the human setup, diagnosis, history, and terminal client.
+`serial-mcp` is the thin Agent adapter. The `serial` executable is only a
+unified launcher for those separate roles:
 
-`serial-mcp` is the thin Agent adapter. It translates a small MCP tool set into
-the same protocol used by human clients and manages Agent-only state such as
-Run ownership and compact context.
+```text
+serial serve    -> seriald
+serial console  -> serialctl TUI
+serial setup/profile/status/doctor/logs -> serialctl management
+serial mcp      -> serial-mcp
+```
 
 Flashing recipes, board reset policy, Linux command semantics, and
 model-specific workflows do not belong in `seriald`. A human, Agent adapter,
-OpenChamber integration, or later workflow layer may compose the generic
+OpenChamber integration, or later workflow package may compose the generic
 primitives.
 
 ## Status
 
-- **Released**: available in v0.3.1 or earlier.
-- **Released in v0.3.2**: first published in the current release.
-- **Next**: the nearest useful work, not yet implemented.
-- **Later / candidate**: retained for evaluation; no delivery promise.
+- **Released before v0.4.0**: established platform behavior retained by v0.4.
+- **Released in v0.4.0**: implemented by this release.
+- **Next**: practical validation or refinement work, not yet complete.
+- **Later / candidate**: retained options with no delivery promise.
 
 ## seriald
 
-### Released
+### Released before v0.4.0
 
-- Windows-hosted daemon with remote Windows/Linux clients over the same
-  versioned HTTP and WebSocket protocol.
-- Interactive COM discovery and persistent Slot configuration through
-  `serialctl init`.
-- Long-lived auto-open serial sessions with explicit
-  online/waiting/backoff/disabled state and reconnect events.
+- Windows-hosted daemon with remote Windows/Linux clients over versioned HTTP
+  and WebSocket protocols.
+- Long-lived auto-open sessions with explicit online/waiting/backoff/disabled
+  state and reconnect events.
 - Multiple concurrent observers of exact RX, confirmed TX, state, Run,
   Operation, Control, and Trigger events.
-- Fenced write-control leases with queueing, TTL renewal, explicit operator
-  takeover, and stale-writer rejection.
-- Run and Operation boundaries for task-local evidence without pretending to
-  reset the physical board.
-- Bounded daemon-native Trigger Jobs for low-latency literal matching and
-  repeated writes, with timeout, fire-count, Control, Run, and generation
-  bounds.
-- Slot-safe physical write pacing. Slot settings are the authoritative
-  baseline, with a conservative 1-byte/1-ms default for targets that lose
-  characters on burst writes.
-- Reusable device-model profiles for EOL, echo, Shell prompt, and U-Boot
-  prompt. Attaching a model profile makes those effective values
-  authoritative without guessing device behavior.
-- Per-Slot sequence numbers, reconnect cursors, explicit gaps, bounded live
-  queues, and slow-consumer isolation.
-- Exact binary journal segments, SQLite index, corruption recovery, bounded
-  search, archive queries, and a default 10-GiB retention ceiling.
-- Actor-labelled TX audit records so a console can distinguish human, Agent,
-  Trigger, and system activity.
-- Bearer-token roles for observer, operator, and administrator access.
+- Fenced write-control leases with bounded queueing, TTL renewal, explicit
+  Human Takeover, stale-writer rejection, and cross-reconnect idempotency.
+- At most one active Run per Slot. Run/Operation boundaries scope evidence but
+  never pretend to reset or reserve a clean DUT.
+- Device-agnostic Trigger Jobs for bounded low-latency
+  kickoff/repeated-action/live-literal reactions.
+- Per-Slot sequence numbers, `(slot, epoch, seq)` cursors, explicit gaps,
+  bounded replay/live queues, and slow-consumer isolation.
+- Exact binary journal segments with CRC/torn-tail recovery, bounded scans,
+  archive discovery, a gap ledger, and a default 10-GiB retention ceiling.
+  Segment scanning is the current implementation; there is no SQLite index.
+- Actor-labelled timeline records and observer/operator/admin bearer roles.
 
-### Released in v0.3.2
+### Released in v0.4.0
 
-- No new daemon protocol is required for the current console and MCP
-  refinements. Ordinary Agent commands and Trigger Jobs use Slot transport
-  pacing instead of selecting their own burst settings.
+- WebSocket protocol v3 for the additive Break/event/error enum extensions.
+  v0.4 components intentionally reject v2/v1 peers instead of risking a
+  runtime decode failure.
+- Reusable Transport Profile catalog for baud, data/parity/stop bits, flow
+  control, DTR/RTS, and auto-open.
+- Device Profiles now also own optional chunk size/delay pacing, alongside
+  Shell/U-Boot prompt, EOL, and echo. Existing Slot settings remain a complete
+  compatibility snapshot.
+- Authoritative `effective_transport` and `effective_write_pacing` in every
+  Slot snapshot. A Transport change reopens the handle; a Device change does
+  not, and is rejected during an active Run or Trigger.
+- Optimistic `config_revision` on Slot and both Profile-catalog mutations,
+  with atomic stage/save/commit and stale-update rejection.
+- Stable error codes for missing, busy, access-denied, and general port I/O;
+  Profile-change conflicts; regex failures; and unsupported Break.
+- Read-only daemon/storage/Slot diagnostics including subscriber lag, RX
+  overflow, journal quota/usage/queue health, and configuration revision.
+- Bounded UTF-8 regular-expression history queries. Literal and regex matching
+  span adjacent same-direction serial events while retaining scan/time/byte/
+  result and compiled-automaton limits.
+- Fenced, Run-bound physical serial Break with an audited timeline event.
 
 ### Next
 
-- Add `serialctl` commands for listing, validating, creating, cloning,
-  attaching, importing, and exporting device profiles without hand-editing
-  `seriald.toml`.
-- Improve open-failure diagnostics with stable error codes and actionable
-  owner/driver/port guidance while retaining the native OS error.
-- Add administrative log-usage and retention diagnostics.
+- Run the two-Slot 115200-baud station matrix continuously: sustained RX,
+  slow subscriber, repeated unplug/replug, daemon restart, disk pressure,
+  Profile mutation conflicts, and Break support/unsupported drivers.
+- Refine native open-error classification from additional Windows adapters and
+  drivers without hiding the original OS reason.
+- Measure retention and regex-query latency near the 10-GiB ceiling before
+  choosing an index or compression format.
 
 ### Later / candidate
 
-- A reusable transport-profile catalog for physical settings such as baud,
-  8N1, flow control, DTR/RTS, pacing, and auto-open. Existing per-Slot
-  settings would remain a compatible explicit snapshot/override.
-- TLS or a trusted reverse-proxy deployment profile for networks beyond a
-  host-only or otherwise trusted station network.
+- TLS or a trusted reverse-proxy deployment profile for networks beyond
+  loopback/host-only.
 - Windows Service installation and service-account ACL guidance.
-- Optional sealed-segment compression after measuring CPU, recovery, and
-  query costs on 24/7 stations.
+- A rebuildable sparse query catalog and optional sealed-segment compression
+  after real 24/7 measurements. Raw segment bytes remain the source of truth.
 - Explicit external-exclusive handoff for rare `screen`, `minicom`, vendor
-  flasher, or diagnostic-tool use.
-- Optional hardware reset/power-control resources as separate generic
-  capabilities, only if stations standardize the hardware.
-- An explicit one-shot probe primitive that runs only while the Slot is
-  silent and has no Control owner, Run, Trigger, or recent human activity.
-  The caller would supply bounded request/response/timeout data; seriald would
-  never probe periodically or guess a device-specific heartbeat.
-- Device-pool reservations and asset identity, only if station scale grows
-  beyond a small fixed set of frequently swapped boards.
+  flasher, or diagnostics use.
+- Optional reset/power-control resources if stations standardize the hardware.
+- An explicit one-shot probe that runs only while the Slot is silent and has
+  no Control owner, Run, Trigger, or recent human activity. It would never be a
+  periodic guessed heartbeat.
+- Device-pool reservations and asset identity if station scale grows beyond a
+  small fixed set of frequently swapped boards.
 
 ### Non-goals
 
 - Built-in firmware recipes, automatic flashing, or vendor-specific boot
   sequences.
-- Automatically restoring a “clean board” state when a Run starts or ends.
-- Guessing liveness from silence, inventing heartbeat bytes, or probing a busy
-  target without an explicit policy.
-- Embedding OpenCode, Codex, OpenChamber, shell, or device-model semantics in
-  the daemon.
+- Automatically restoring a “clean board” when a Run starts or ends.
+- Guessing liveness from silence or probing a busy target.
+- Embedding OpenCode, Codex, OpenChamber, shell, or DUT semantics in the
+  daemon.
 
-## serialctl
+## serialctl / serial console
 
-### Released
+### Released before v0.4.0
 
-- One interactive console that switches between multiple live Slots without
-  restarting or naming the Slot on every command.
-- Human command mode and raw byte-entry mode.
-- Operator Control acquisition, queued writes, explicit takeover, and visible
-  Control ownership.
-- Live actor markers and distinct styling for device RX, human TX, Agent TX,
-  Trigger activity, state transitions, warnings, and errors.
-- Interactive setup, status, doctor, port discovery, log query, and JSON
-  diagnostics.
-- Windows x86-64 and Ubuntu x86-64 baseline release artifacts that can connect
-  to a Windows daemon.
+- One TUI that subscribes to and switches between multiple Slots.
+- LINE and raw byte-entry modes, Human Control queueing, explicit Takeover, and
+  visible ownership.
+- Continuous prompt/TX/echo projection with exact durable RX/TX audit events.
+- Actor-aware styling, bounded local viewport, high-rate rendering protection,
+  Shift-free selection/copy, input paste, and serial-only wheel scrolling.
+- Interactive setup, status, archive/history query, JSON output, and Windows
+  x86-64 plus Ubuntu x86-64 clients.
 
-### Released in v0.3.2
+### Released in v0.4.0
 
-- Keyword colouring uses case-insensitive token boundaries across all
-  severity/status classes: embedded words such as `information` or
-  `errorCounter` are no longer partially coloured, while `[INFO]`,
-  `level=info`, and underscore-separated log identifiers remain readable.
-- The mouse wheel scrolls only the serial-output viewport.
-- Output and input areas have explicit mouse focus. Output supports
-  Shift-free drag selection and right-click copy. Windows input supports
-  right-click paste; portable keyboard paste remains available on Linux.
+- Unified `serial` launcher in both release packages:
+  `serve`, `console`, `setup`, `profile`, `status`, `doctor`, `archives`,
+  `logs`, and `mcp`. Legacy component binaries remain available. Dispatch is
+  restricted to sibling executables from the same package; there is no `PATH`
+  fallback to a possibly different release.
+- Ubuntu client release is built natively on the Ubuntu 20.04
+  x86_64/glibc-2.31 baseline; it is not a musl or 32-bit build.
+- Setup selects a reusable Transport Profile and optional Device Profile.
+  Profile commands support list/show/create/update/clone/import/export/delete/
+  attach/detach; interactive creation/update and admin-token-file automation
+  are both supported. Partial update flags preserve omitted values, explicit
+  prompt-clear flags remove prompts, and optional EOL/echo/pacing overrides
+  can return to inherited behavior.
+  Setup separates credential input/output flags, rejects global
+  `--token-file`, and refuses aliased input/destination paths.
+- Five diagnostic levels: connection, port, stream, storage, and authoritative
+  Slot state. Stream diagnosis compares WebSocket RX with offsets and journal.
+- `logs --regex` alongside literal `--contains`, with explicit Run/epoch/cursor
+  scoping, bounded continuation, and fail-closed behavior against older
+  daemons that cannot advertise bounded server-side regex.
+- Full-width colored Run start/end/abort rules in the terminal transcript.
+- Queued LINE command preview plus `Ctrl-] d` delete and `Ctrl-] e` return to
+  editor. Bytes already entering a physical write cannot be recalled.
+- RAW Ctrl-D and Ctrl-Z transmit `0x04`/`0x1a`; Ctrl-C transmits `0x03` in both
+  modes without quitting the console.
 
 ### Next
 
-- Add the device-profile management flow described under `seriald`.
-- Refine selection, wrapped-line, wide-character, and very high-rate output
-  behavior from Windows Terminal and Ubuntu station feedback.
-- Add a compact in-console view for active Run, Operation, Trigger, and actor
-  details without obscuring raw serial text.
+- Validate selection, wrapped/wide-character rows, high-rate output, queued
+  editing, and Run boundaries in Windows Terminal and the Ubuntu station.
+- Improve Profile setup prompts from first-time user feedback while preserving
+  deterministic non-interactive flags and revision safety.
+- Add a compact in-console detail view for active Run, Operation, Trigger,
+  actor, and diagnostic counters only if it remains readable beside raw serial
+  output.
 
 ### Later / candidate
 
-- Export a selected sequence/time range as text plus authoritative event
-  metadata.
-- Saved colouring themes and user rules with safe precedence over built-in
-  token and prompt highlighting.
-- A richer native serial panel for OpenChamber that reuses the protocol and
-  state model rather than embedding `serialctl`.
-- Full terminal emulation only if real target workflows require cursor
-  addressing; the default remains a serial log console, not a general PTY.
+- Export a selected sequence/time range as text plus authoritative metadata.
+- Saved coloring themes and user rules with safe precedence over built-ins.
+- A richer native OpenChamber serial panel that reuses the protocol/state
+  model rather than embedding the TUI.
+- Full terminal emulation only if real DUT workflows require cursor
+  addressing; the default remains a serial log console, not a PTY.
 
 ### Non-goals
 
-- Giving mouse-wheel behavior to command history.
-- Hiding Agent writes or reconstructing a cleaner transcript than the bytes
-  and audit events actually observed.
-- Letting an Agent close a Slot; Agents release their Run/Control while the
-  daemon keeps the configured port available.
+- Using the mouse wheel for command history.
+- Hiding Agent writes or reconstructing a cleaner transcript than observed
+  bytes and audit events.
+- Letting an Agent close a Slot; Agents release Run/Control while `seriald`
+  keeps the configured port available.
 
 ## serial-mcp
 
-### Released
+### Released before v0.4.0
 
-- One stdio MCP adapter shared by OpenCode, Codex, and other MCP-capable Agent
-  hosts.
-- A compact tool surface for device discovery, Run lifecycle, command,
-  wait/read/search, Trigger, and release operations.
-- Adapter-owned Run and fenced-Control renewal with best-effort cleanup on
-  exit.
-- Attach-before-write capture, TX confirmation, prompt/literal/regex/quiet
-  completion modes, stale-prompt protection, interference reporting, exact
-  cursors, explicit gaps, and bounded text.
-- Current-Run search by default, with explicit cursor/archive scopes to avoid
-  treating an earlier test cycle as current evidence.
-- ANSI cleanup, bounded context, repeated-line folding, and optional raw
-  evidence.
-- Generic daemon-native Trigger access without built-in SigmaStar, U-Boot, or
-  flashing recipes.
+- One stdio adapter shared by OpenCode, Codex, and other MCP hosts.
+- Adapter-owned Run and fenced-Control renewal with best-effort cleanup.
+- Attach-before-write capture, confirmed TX lower bounds, prompt/literal/regex/
+  quiet completion, interference/gap reporting, exact cursors, and bounded
+  rendered text.
+- Current-Run search by default and explicit cursor/archive scopes.
+- Generic daemon-native Trigger access with no built-in SigmaStar, U-Boot, or
+  flashing recipe.
 
-### Released in v0.3.2
+### Released in v0.4.0
 
-- Command and Trigger schemas no longer expose per-call chunk size or delay.
-  The adapter always uses the Slot's safe write cadence.
-- Echo reconciliation no longer turns a missing echo into an automatic blind
-  timeout when a valid post-TX requested boundary is observed. Results expose
-  lower confidence, missing/incomplete echo, and suspected input loss without
-  retrying a possibly executed command.
-- Quiet completion requires post-TX evidence instead of succeeding from an
-  empty interval.
+- Stable eleven-tool surface: `devices`, `read`, `command`, `input`, `signal`,
+  `trigger`, `wait`, `search`, `run_start`, `run_end`, and `release`.
+- Smaller Agent schemas: the adapter owns fencing, UUIDs, pacing, prompt
+  selection, live cursors, capture bounds, rendering limits, and lease renewal.
+- Compact results center on text, completion/confidence, warnings, truncation/
+  gap/interference, and one continuation cursor instead of returning internal
+  IDs and duplicate boundary fields by default.
+- `input` sends exact UTF-8 bytes without EOL. `signal` exposes Ctrl-C/D/Z and
+  physical Break so Agents need not fake raw control characters.
+- `command` and `wait` accept one optional literal `expect` or regex boundary;
+  prompt/quiet fallback is selected internally. `search` accepts bounded regex
+  and remains current-Run scoped by default.
+- Concurrent MCP request dispatch and serialized stdout frames. Cancellation
+  applies only to pure read tools; a mutating call converges to its
+  authoritative result after a possible side effect. Per-Slot write
+  serialization prevents interleaved serial bytes.
+- Repeated-line folding and bounded ANSI-cleaned evidence reduce context while
+  preserving warnings, exact cursors, and durable raw events in `seriald`.
 
 ### Next
 
-- Exercise the adapter against sustained 115200-baud output, delayed prompts,
-  partial echo, target line wrapping, foreign operator writes, reconnects, and
-  Trigger-based boot interruption; keep these cases as regression fixtures.
-- Improve Agent-facing recovery guidance for gap, interference, Run loss,
-  uncertain delivery, and incomplete bounded searches while keeping tool
-  parameters small.
-- Publish copy-ready OpenCode and Codex configuration examples for both
-  Windows-local and Windows-daemon/Linux-VM layouts.
+- Keep real-device regression fixtures for sustained output, delayed prompts,
+  partial echo, target wrapping, foreign Human writes, reconnects, cancellation,
+  raw signals, Break, and Trigger-based boot interruption.
+- Tune context limits and recovery guidance from OpenCode/Codex use without
+  adding routine parameters back to the tool surface.
+- Publish tested host configuration snippets for Windows-local and
+  Windows-daemon/Linux-VM layouts as Agent hosts evolve.
 
 ### Later / candidate
 
-- Thin host-specific packaging for OpenCode permissions and Codex setup while
-  preserving one shared adapter implementation.
-- Context-budget presets for different Agent hosts, backed by the same exact
-  event interval.
-- Optional higher-level workflow packages outside the platform for repeatable
-  vendor/test procedures.
-- OpenChamber terminal integration that displays the same actor, Run,
-  Operation, Trigger, and sequence metadata.
+- Thin host-specific installers/permission helpers while preserving one shared
+  adapter.
+- Context-budget presets backed by the same exact event interval.
+- Optional workflow packages outside the platform for repeatable vendor/test
+  procedures.
+- OpenChamber integration that displays the same actor, Run, Operation,
+  Trigger, and sequence metadata.
 
 ### Non-goals
 
-- Automatic command retry after timeout, missing echo, transport loss, or
-  uncertain delivery.
+- Automatic retry after timeout, missing echo, transport loss, or uncertain
+  delivery.
 - Agent-selected physical pacing in ordinary tools.
 - Default global-history search.
-- Inferring command success from a returned prompt; callers should request an
-  explicit result marker when exit status matters.
-- Encoding flashing or device-specific recipes in MCP tool names or in
-  `seriald`.
+- Inferring command success from a returned prompt; request a unique result
+  marker when exit status matters.
+- Encoding flashing or DUT-specific recipes in MCP tool names or `seriald`.

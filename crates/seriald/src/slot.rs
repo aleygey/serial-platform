@@ -6,12 +6,14 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceProfile, Direction,
-    EventKind, FlowControl, LoggingState, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
-    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
-    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
-    MAX_TRIGGER_TOTAL_BYTES, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo,
-    RunStatus, SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits, TargetActivity,
-    TimelineEvent, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing, resolve_device_settings,
+    ErrorCode, EventKind, FlowControl, LoggingState, MAX_BREAK_DURATION_MS,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo, RunStatus, SerialSettings,
+    SessionState, SlotConfig, SlotSnapshot, StopBits, TargetActivity, TimelineEvent,
+    TransportProfile, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
+    apply_transport_profile, resolve_device_settings, resolve_transport_settings,
 };
 #[cfg(windows)]
 use serialport::COMPort;
@@ -23,9 +25,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(not(windows))]
-use tokio::io::AsyncReadExt;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 #[cfg(any(not(windows), test))]
 use tokio::io::AsyncWriteExt;
+#[cfg(not(windows))]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio_serial::{
     DataBits as TokioDataBits, FlowControl as TokioFlowControl, Parity as TokioParity, SerialPort,
@@ -80,6 +87,7 @@ pub struct SlotHandle {
     snapshot: watch::Receiver<SlotSnapshot>,
     events: broadcast::Sender<TimelineEvent>,
     ring: Arc<Mutex<EventRing>>,
+    subscriber_lag_events: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub struct AttachState {
@@ -202,6 +210,16 @@ pub enum SlotError {
     InvalidTriggerPatterns,
     #[error("Trigger's bounded write plan exceeds {MAX_TRIGGER_TOTAL_BYTES} total bytes")]
     TriggerTotalBytesTooLarge,
+    #[error(
+        "BREAK duration_ms must be between {MIN_BREAK_DURATION_MS} and {MAX_BREAK_DURATION_MS}"
+    )]
+    InvalidBreakDuration,
+    #[error("UART BREAK is not supported by this serial backend")]
+    BreakUnsupported,
+    #[error("UART BREAK failed and the physical port state is uncertain: {message}")]
+    BreakFailed { message: String },
+    #[error("device profile cannot change while a Run or Trigger Job is active")]
+    ProfileChangeBusy,
 }
 
 impl From<ReplayError> for SlotError {
@@ -213,6 +231,7 @@ impl From<ReplayError> for SlotError {
 impl SlotHandle {
     pub fn spawn(
         config: SlotConfig,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
@@ -221,6 +240,7 @@ impl SlotHandle {
     ) -> Self {
         Self::spawn_inner(
             config,
+            transport_profile,
             device_profile,
             control_limits,
             daemon_epoch,
@@ -234,6 +254,7 @@ impl SlotHandle {
     /// surrounding configuration transaction has been persisted and commits.
     pub(crate) fn spawn_staged(
         config: SlotConfig,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
@@ -242,6 +263,7 @@ impl SlotHandle {
     ) -> Self {
         Self::spawn_inner(
             config,
+            transport_profile,
             device_profile,
             control_limits,
             daemon_epoch,
@@ -254,6 +276,7 @@ impl SlotHandle {
     #[allow(clippy::too_many_arguments)]
     fn spawn_inner(
         config: SlotConfig,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
@@ -261,24 +284,32 @@ impl SlotHandle {
         journal: JournalHandle,
         staged: bool,
     ) -> Self {
-        let initial =
-            initial_snapshot(config.clone(), device_profile.clone(), daemon_epoch, staged);
+        let initial = initial_snapshot(
+            config.clone(),
+            transport_profile.clone(),
+            device_profile.clone(),
+            daemon_epoch,
+            staged,
+        );
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE);
         let (trigger_write_results, trigger_write_result_rx) = mpsc::channel(1);
         let (journal_ack_results, journal_ack_result_rx) = mpsc::channel(JOURNAL_ACK_QUEUE);
         let (events, _) = broadcast::channel(BROADCAST_QUEUE);
         let (snapshot_tx, snapshot) = watch::channel(initial);
         let ring = Arc::new(Mutex::new(EventRing::new(RING_EVENTS, RING_BYTES)));
+        let subscriber_lag_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = Self {
             slot_id: Arc::from(config.id.as_str()),
             commands,
             snapshot,
             events: events.clone(),
             ring: Arc::clone(&ring),
+            subscriber_lag_events: Arc::clone(&subscriber_lag_events),
         };
         tokio::spawn(
             SlotActor {
                 config,
+                transport_profile,
                 device_profile,
                 daemon_epoch,
                 daemon_started,
@@ -291,6 +322,7 @@ impl SlotHandle {
                 generation: 0,
                 rx_offset: 0,
                 tx_offset: 0,
+                rx_overflow_bytes: 0,
                 endpoint_present: false,
                 session_state: if staged {
                     SessionState::Disabled
@@ -298,6 +330,7 @@ impl SlotHandle {
                     SessionState::WaitingForPort
                 },
                 state_reason: staged.then(|| "slot configuration pending persistence".into()),
+                state_code: None,
                 target_activity: TargetActivity::Unknown,
                 last_rx_wall_time_ns: None,
                 last_rx_instant: None,
@@ -336,6 +369,20 @@ impl SlotHandle {
 
     pub fn snapshot(&self) -> SlotSnapshot {
         self.snapshot.borrow().clone()
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.events.receiver_count()
+    }
+
+    pub fn subscriber_lag_events(&self) -> u64 {
+        self.subscriber_lag_events
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn record_subscriber_lag(&self, skipped: u64) {
+        self.subscriber_lag_events
+            .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn attach(
@@ -455,6 +502,30 @@ impl SlotHandle {
             operation_id,
             expected_run_id,
             pacing,
+            reply,
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_break(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        duration_ms: u64,
+        operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::SendBreak {
+            request_id,
+            actor,
+            control_id,
+            fence,
+            duration_ms,
+            operation_id,
+            expected_run_id,
             reply,
         })
         .await
@@ -605,6 +676,7 @@ impl SlotHandle {
     pub(crate) async fn stage_reconfiguration(
         &self,
         config: SlotConfig,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
@@ -612,6 +684,7 @@ impl SlotHandle {
         self.commands
             .send(SlotCommand::StageReconfiguration {
                 config: Box::new(config),
+                transport_profile,
                 device_profile,
                 resume_on_rollback,
                 reply,
@@ -731,6 +804,16 @@ enum SlotCommand {
         pacing: Option<WritePacing>,
         reply: Reply,
     },
+    SendBreak {
+        request_id: Uuid,
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        duration_ms: u64,
+        operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
+        reply: Reply,
+    },
     StartTrigger {
         request_id: Uuid,
         actor: Actor,
@@ -791,6 +874,7 @@ enum SlotCommand {
     },
     StageReconfiguration {
         config: Box<SlotConfig>,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -861,12 +945,52 @@ enum PortCommand {
         deadline: tokio::time::Instant,
         reply: oneshot::Sender<PortWriteOutcome>,
     },
+    Break {
+        duration: Duration,
+        reply: oneshot::Sender<Result<(), PortBreakFailure>>,
+    },
 }
 
 struct PortWriteOutcome {
     written: usize,
     error: Option<String>,
     cancelled: bool,
+}
+
+struct PortBreakOutcome {
+    error: Option<PortBreakFailure>,
+    cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortBreakFailure {
+    Unsupported(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for PortBreakFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(message) | Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn classify_break_failure(phase: &str, error: impl std::fmt::Display) -> PortBreakFailure {
+    let message = format!("{phase}: {error}");
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("not supported")
+        || normalized.contains("unsupported")
+        || normalized.contains("not implemented")
+    {
+        PortBreakFailure::Unsupported(message)
+    } else {
+        PortBreakFailure::Failed(message)
+    }
+}
+
+fn break_failure_closes_port(error: Option<&PortBreakFailure>) -> bool {
+    matches!(error, Some(PortBreakFailure::Failed(_)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1038,8 +1162,10 @@ enum PendingReconfiguration {
     /// A replacement config held entirely inside the actor until commit.
     Replace {
         config: Box<SlotConfig>,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
+        reopened: bool,
     },
     /// An active Slot that will move to the retired map on commit.
     Remove,
@@ -1052,6 +1178,7 @@ enum PendingReconfiguration {
 
 struct SlotActor {
     config: SlotConfig,
+    transport_profile: Option<TransportProfile>,
     device_profile: Option<DeviceProfile>,
     daemon_epoch: Uuid,
     daemon_started: Instant,
@@ -1064,9 +1191,11 @@ struct SlotActor {
     generation: u64,
     rx_offset: u64,
     tx_offset: u64,
+    rx_overflow_bytes: u64,
     endpoint_present: bool,
     session_state: SessionState,
     state_reason: Option<String>,
+    state_code: Option<ErrorCode>,
     target_activity: TargetActivity,
     last_rx_wall_time_ns: Option<i64>,
     last_rx_instant: Option<Instant>,
@@ -1100,7 +1229,7 @@ struct SlotActor {
 
 impl SlotActor {
     async fn run(mut self) {
-        if !self.config.enabled || !self.config.settings.auto_open {
+        if !self.config.enabled || !self.effective_serial_settings().auto_open {
             self.session_state = SessionState::Disabled;
             self.publish_snapshot().await;
         }
@@ -1180,7 +1309,7 @@ impl SlotActor {
         if self.port.is_none()
             && !self.administratively_paused
             && self.config.enabled
-            && self.config.settings.auto_open
+            && self.effective_serial_settings().auto_open
             && Instant::now() >= self.retry_at
         {
             self.try_open().await;
@@ -1191,6 +1320,7 @@ impl SlotActor {
         self.endpoint_present = endpoint_present(&self.config.port);
         self.session_state = SessionState::Opening;
         self.state_reason = None;
+        self.state_code = None;
         self.publish_snapshot().await;
         self.emit(
             EventKind::SerialOpening,
@@ -1202,7 +1332,8 @@ impl SlotActor {
         )
         .await;
 
-        match open_port(&self.config.port, &self.config.settings) {
+        let effective_settings = self.effective_serial_settings();
+        match open_port(&self.config.port, &effective_settings) {
             Ok(stream) => {
                 self.endpoint_present = true;
                 self.generation = self.generation.saturating_add(1);
@@ -1222,6 +1353,7 @@ impl SlotActor {
                 self.port_events = Some(events);
                 self.session_state = SessionState::Online;
                 self.state_reason = None;
+                self.state_code = None;
                 self.target_activity = TargetActivity::Unknown;
                 self.retry_delay = OPEN_BACKOFF_MIN;
                 self.publish_snapshot().await;
@@ -1233,7 +1365,7 @@ impl SlotActor {
                     None,
                     metadata([
                         ("port", json!(self.config.port)),
-                        ("baud_rate", json!(self.config.settings.baud_rate)),
+                        ("baud_rate", json!(effective_settings.baud_rate)),
                         ("backend", json!(serial_backend_name())),
                     ]),
                 )
@@ -1242,6 +1374,7 @@ impl SlotActor {
             Err(error) => {
                 self.session_state = SessionState::Backoff;
                 self.state_reason = Some(error.to_string());
+                self.state_code = Some(error.code);
                 self.schedule_retry();
                 self.publish_snapshot().await;
                 self.emit(
@@ -1250,7 +1383,10 @@ impl SlotActor {
                     Vec::new(),
                     Some(system_actor()),
                     None,
-                    metadata([("error", json!(error.to_string()))]),
+                    metadata([
+                        ("error", json!(error.to_string())),
+                        ("error_code", json!(error.code)),
+                    ]),
                 )
                 .await;
             }
@@ -1316,6 +1452,7 @@ impl SlotActor {
         if dropped_bytes == 0 {
             return;
         }
+        self.rx_overflow_bytes = self.rx_overflow_bytes.saturating_add(dropped_bytes);
         let write_in_flight = self
             .active_trigger
             .as_ref()
@@ -1350,6 +1487,7 @@ impl SlotActor {
         self.finish_stopped_trigger_if_idle().await;
         self.session_state = SessionState::Backoff;
         self.state_reason = Some(reason.clone());
+        self.state_code = Some(ErrorCode::PortIo);
         self.target_activity = TargetActivity::Unknown;
         if let Some(released) =
             self.control
@@ -1409,12 +1547,18 @@ impl SlotActor {
             }
             CommandDisposition::StageReconfiguration {
                 config,
+                transport_profile,
                 device_profile,
                 resume_on_rollback,
                 reply,
             } => {
                 let result = self
-                    .stage_reconfiguration(*config, device_profile, resume_on_rollback)
+                    .stage_reconfiguration(
+                        *config,
+                        transport_profile,
+                        device_profile,
+                        resume_on_rollback,
+                    )
                     .await;
                 let _ = reply.send(result);
                 return false;
@@ -1637,7 +1781,8 @@ impl SlotActor {
                     return Err(SlotError::EmptyWrite);
                 }
                 let total = data.len();
-                let pacing = WritePacing::resolve(pacing, &self.config.settings);
+                let effective_settings = self.effective_serial_settings();
+                let pacing = WritePacing::resolve(pacing, &effective_settings);
                 let write_timeout = write_deadline(
                     total,
                     pacing.chunk_size as usize,
@@ -1707,6 +1852,60 @@ impl SlotActor {
                     event_seq: event_seq.expect("full non-empty write emits TX"),
                 })
             }
+            SlotRequest::SendBreak {
+                actor,
+                control_id,
+                fence,
+                duration_ms,
+                operation_id,
+                expected_run_id,
+            } => {
+                if self.active_trigger.is_some() {
+                    return Err(SlotError::TriggerActive);
+                }
+                validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
+                if !(MIN_BREAK_DURATION_MS..=MAX_BREAK_DURATION_MS).contains(&duration_ms) {
+                    return Err(SlotError::InvalidBreakDuration);
+                }
+                let authorization_now = Instant::now();
+                let signal_duration = Duration::from_millis(duration_ms);
+                let lease_remaining =
+                    self.control
+                        .remaining_ttl(&actor.id, control_id, fence, authorization_now)?;
+                ensure_lease_covers_write(lease_remaining, signal_duration)?;
+                let Some(port) = &self.port else {
+                    return Err(SlotError::PortOffline);
+                };
+                let (reply, result) = oneshot::channel();
+                port.commands
+                    .send(PortCommand::Break {
+                        duration: signal_duration,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| SlotError::PortOffline)?;
+                result
+                    .await
+                    .map_err(|_| SlotError::BreakFailed {
+                        message: "serial writer stopped before confirming that BREAK was cleared"
+                            .into(),
+                    })?
+                    .map_err(|error| match error {
+                        PortBreakFailure::Unsupported(_) => SlotError::BreakUnsupported,
+                        PortBreakFailure::Failed(message) => SlotError::BreakFailed { message },
+                    })?;
+                let event_seq = self
+                    .emit(
+                        EventKind::Break,
+                        Direction::None,
+                        Vec::new(),
+                        Some(actor),
+                        operation_id,
+                        metadata([("duration_ms", json!(duration_ms))]),
+                    )
+                    .await;
+                Ok(CommandResult::BreakSent { event_seq })
+            }
             SlotRequest::StartTrigger {
                 actor,
                 control_id,
@@ -1729,7 +1928,8 @@ impl SlotActor {
                 if self.port.is_none() {
                     return Err(SlotError::PortOffline);
                 }
-                validate_trigger_pacing(&spec, &self.config.settings)?;
+                let effective_settings = self.effective_serial_settings();
+                validate_trigger_pacing(&spec, &effective_settings)?;
                 self.control
                     .validate(&actor.id, control_id, fence, Instant::now())?;
                 validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
@@ -2257,7 +2457,8 @@ impl SlotActor {
                 trigger.info.spec.action.clone(),
             )
         };
-        let pacing = WritePacing::resolve(trigger.info.spec.pacing, &self.config.settings);
+        let effective_settings = self.effective_serial_settings();
+        let pacing = WritePacing::resolve(trigger.info.spec.pacing, &effective_settings);
         let Ok(write_timeout) = write_deadline(
             data.len(),
             pacing.chunk_size as usize,
@@ -2812,6 +3013,7 @@ impl SlotActor {
         let changed = self.logging != LoggingState::Degraded;
         self.logging = LoggingState::Degraded;
         self.state_reason = Some(format!("journal degraded: {error}"));
+        self.state_code = Some(ErrorCode::Internal);
         changed
     }
 
@@ -2847,6 +3049,9 @@ impl SlotActor {
     async fn publish_snapshot(&self) {
         let oldest = self.ring.lock().await.oldest_seq();
         let resolved = resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        let transport =
+            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
+        let effective_settings = self.effective_serial_settings();
         self.snapshot.send_replace(SlotSnapshot {
             config: self.config.clone(),
             daemon_epoch: self.daemon_epoch,
@@ -2856,10 +3061,12 @@ impl SlotActor {
             endpoint_present: self.endpoint_present,
             session_state: self.session_state,
             state_reason: self.state_reason.clone(),
+            state_code: self.state_code,
             target_activity: self.target_activity,
             last_rx_wall_time_ns: self.last_rx_wall_time_ns,
             rx_offset: self.rx_offset,
             tx_offset: self.tx_offset,
+            rx_overflow_bytes: self.rx_overflow_bytes,
             control: self.control.current().cloned(),
             active_run: self.active_run.clone(),
             active_trigger: self
@@ -2871,7 +3078,21 @@ impl SlotActor {
             effective_uboot_prompt: resolved.uboot_prompt,
             effective_write_eol: Some(resolved.write_eol),
             effective_echo: Some(resolved.echo),
+            effective_transport: Some(transport),
+            effective_write_pacing: Some(WritePacing {
+                chunk_size: effective_settings.write_chunk_size,
+                chunk_delay_ms: effective_settings.write_chunk_delay_ms,
+            }),
         });
+    }
+
+    fn effective_serial_settings(&self) -> SerialSettings {
+        let mut effective =
+            apply_transport_profile(&self.config.settings, self.transport_profile.as_ref());
+        let device = resolve_device_settings(&effective, self.device_profile.as_ref());
+        effective.write_chunk_size = device.write_pacing.chunk_size;
+        effective.write_chunk_delay_ms = device.write_pacing.chunk_delay_ms;
+        effective
     }
 
     fn schedule_retry(&mut self) {
@@ -2904,6 +3125,7 @@ impl SlotActor {
         }
         self.session_state = SessionState::Disabled;
         self.state_reason = Some("slot reconfiguration in progress".into());
+        self.state_code = None;
         self.target_activity = TargetActivity::Unknown;
         if was_online {
             self.emit(
@@ -2924,6 +3146,7 @@ impl SlotActor {
     async fn stage_reconfiguration(
         &mut self,
         config: SlotConfig,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
@@ -2931,11 +3154,36 @@ impl SlotActor {
             return Err(SlotError::SlotIdChanged);
         }
         debug_assert!(self.pending_reconfiguration.is_none());
-        self.pause_for_reconfigure().await?;
+        let previous_transport =
+            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
+        let next_transport =
+            resolve_transport_settings(&config.settings, transport_profile.as_ref());
+        let previous_device =
+            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        let next_device = resolve_device_settings(&config.settings, device_profile.as_ref());
+        let reopened = self.config.port != config.port
+            || self.config.enabled != config.enabled
+            || previous_transport != next_transport;
+        let device_changed = self.device_profile != device_profile
+            || self.config.device_profile != config.device_profile
+            || previous_device != next_device;
+        if profile_change_requires_idle(
+            reopened,
+            device_changed,
+            self.active_run.is_some(),
+            self.active_trigger.is_some(),
+        ) {
+            return Err(SlotError::ProfileChangeBusy);
+        }
+        if reopened {
+            self.pause_for_reconfigure().await?;
+        }
         self.pending_reconfiguration = Some(PendingReconfiguration::Replace {
             config: Box::new(config),
+            transport_profile,
             device_profile,
             resume_on_rollback,
+            reopened,
         });
         Ok(())
     }
@@ -2955,6 +3203,9 @@ impl SlotActor {
         if self.device_profile == device_profile {
             return Ok(false);
         }
+        if self.active_run.is_some() || self.active_trigger.is_some() {
+            return Err(SlotError::ProfileChangeBusy);
+        }
         self.pending_reconfiguration =
             Some(PendingReconfiguration::DeviceProfile { device_profile });
         Ok(true)
@@ -2972,11 +3223,18 @@ impl SlotActor {
             }
             PendingReconfiguration::Replace {
                 config,
+                transport_profile,
                 device_profile,
+                reopened,
                 ..
             } => {
-                self.apply_committed_reconfiguration(*config, device_profile)
-                    .await;
+                self.apply_committed_reconfiguration(
+                    *config,
+                    transport_profile,
+                    device_profile,
+                    reopened,
+                )
+                .await;
             }
             PendingReconfiguration::Remove => {
                 self.emit(
@@ -3007,9 +3265,11 @@ impl SlotActor {
                 // rollback; keep the physical port parked until then.
             }
             PendingReconfiguration::Replace {
-                resume_on_rollback, ..
+                resume_on_rollback,
+                reopened,
+                ..
             } => {
-                if resume_on_rollback {
+                if reopened && resume_on_rollback {
                     self.resume_current_config();
                     self.publish_snapshot().await;
                 }
@@ -3069,15 +3329,24 @@ impl SlotActor {
     async fn apply_committed_reconfiguration(
         &mut self,
         config: SlotConfig,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        reopened: bool,
     ) {
         let previous_effective =
             resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        let previous_transport =
+            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
         let previous = std::mem::replace(&mut self.config, config);
+        self.transport_profile = transport_profile;
         self.device_profile = device_profile;
-        self.resume_current_config();
+        if reopened {
+            self.resume_current_config();
+        }
         let effective =
             resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        let effective_transport =
+            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
         self.emit(
             EventKind::SlotReconfigured,
             Direction::None,
@@ -3110,7 +3379,16 @@ impl SlotActor {
                     "effective",
                     serde_json::to_value(effective).unwrap_or(Value::Null),
                 ),
-                ("profile_only", json!(false)),
+                (
+                    "previous_transport",
+                    serde_json::to_value(previous_transport).unwrap_or(Value::Null),
+                ),
+                (
+                    "effective_transport",
+                    serde_json::to_value(effective_transport).unwrap_or(Value::Null),
+                ),
+                ("transport_reopened", json!(reopened)),
+                ("profile_only", json!(!reopened)),
             ]),
         )
         .await;
@@ -3124,12 +3402,14 @@ impl SlotActor {
         self.retry_at = Instant::now();
         self.retry_delay = OPEN_BACKOFF_MIN;
         self.administratively_paused = false;
-        if self.config.enabled && self.config.settings.auto_open {
+        if self.config.enabled && self.effective_serial_settings().auto_open {
             self.session_state = SessionState::WaitingForPort;
             self.state_reason = None;
+            self.state_code = None;
         } else {
             self.session_state = SessionState::Disabled;
             self.state_reason = None;
+            self.state_code = None;
         }
     }
 
@@ -3152,6 +3432,7 @@ impl SlotActor {
         }
         self.session_state = SessionState::Disabled;
         self.state_reason = Some("slot stopped".into());
+        self.state_code = None;
         self.target_activity = TargetActivity::Unknown;
         if was_online {
             self.emit(
@@ -3291,6 +3572,14 @@ enum SlotRequest {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
     },
+    SendBreak {
+        actor: Actor,
+        control_id: Uuid,
+        fence: u64,
+        duration_ms: u64,
+        operation_id: Option<Uuid>,
+        expected_run_id: Option<Uuid>,
+    },
     StartTrigger {
         actor: Actor,
         control_id: Uuid,
@@ -3360,6 +3649,11 @@ impl SlotRequest {
             }
             Self::Checkpoint { label, .. } => validate_label(label),
             Self::StartTrigger { spec, .. } => validate_trigger_spec(spec),
+            Self::SendBreak { duration_ms, .. }
+                if !(MIN_BREAK_DURATION_MS..=MAX_BREAK_DURATION_MS).contains(duration_ms) =>
+            {
+                Err(SlotError::InvalidBreakDuration)
+            }
             _ => Ok(()),
         }
     }
@@ -3397,6 +3691,15 @@ impl SlotRequest {
                 ))
                 .expect("Trigger request fields are serializable"),
             ),
+            Self::SendBreak {
+                duration_ms,
+                operation_id,
+                expected_run_id,
+                ..
+            } => Some(
+                serde_json::to_vec(&("send_break", duration_ms, operation_id, expected_run_id))
+                    .expect("BREAK request fields are serializable"),
+            ),
             _ => None,
         }
     }
@@ -3415,6 +3718,13 @@ impl SlotRequest {
                 ..
             }
             | Self::StartTrigger {
+                actor,
+                control_id,
+                fence,
+                expected_run_id,
+                ..
+            }
+            | Self::SendBreak {
                 actor,
                 control_id,
                 fence,
@@ -3487,6 +3797,22 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 spec,
+            )),
+            Self::SendBreak {
+                actor,
+                control_id,
+                fence,
+                duration_ms,
+                operation_id,
+                expected_run_id,
+            } => serde_json::to_vec(&(
+                "send_break",
+                &actor.id,
+                control_id,
+                fence,
+                duration_ms,
+                operation_id,
+                expected_run_id,
             )),
             Self::TriggerStatus {
                 actor,
@@ -3571,6 +3897,15 @@ fn validate_label(label: &str) -> Result<(), SlotError> {
     } else {
         Ok(())
     }
+}
+
+fn profile_change_requires_idle(
+    transport_reopened: bool,
+    device_changed: bool,
+    run_active: bool,
+    trigger_active: bool,
+) -> bool {
+    !transport_reopened && device_changed && (run_active || trigger_active)
 }
 
 fn validate_trigger_spec(spec: &TriggerSpec) -> Result<(), SlotError> {
@@ -3714,8 +4049,10 @@ fn is_cacheable_write_result(result: &Result<CommandResult, SlotError>) -> bool 
     matches!(
         result,
         Ok(CommandResult::WriteAccepted { .. })
+            | Ok(CommandResult::BreakSent { .. })
             | Ok(CommandResult::TriggerStarted { .. })
             | Err(SlotError::PartialWrite { .. })
+            | Err(SlotError::BreakFailed { .. })
     )
 }
 
@@ -3734,6 +4071,7 @@ enum CommandDisposition {
     },
     StageReconfiguration {
         config: Box<SlotConfig>,
+        transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
@@ -3836,6 +4174,27 @@ impl SlotCommand {
                     operation_id,
                     expected_run_id,
                     pacing,
+                },
+                reply,
+            },
+            SlotCommand::SendBreak {
+                request_id,
+                actor,
+                control_id,
+                fence,
+                duration_ms,
+                operation_id,
+                expected_run_id,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::SendBreak {
+                    actor,
+                    control_id,
+                    fence,
+                    duration_ms,
+                    operation_id,
+                    expected_run_id,
                 },
                 reply,
             },
@@ -3960,11 +4319,13 @@ impl SlotCommand {
             }
             SlotCommand::StageReconfiguration {
                 config,
+                transport_profile,
                 device_profile,
                 resume_on_rollback,
                 reply,
             } => CommandDisposition::StageReconfiguration {
                 config,
+                transport_profile,
                 device_profile,
                 resume_on_rollback,
                 reply,
@@ -3990,18 +4351,22 @@ impl SlotCommand {
 
 fn initial_snapshot(
     config: SlotConfig,
+    transport_profile: Option<TransportProfile>,
     device_profile: Option<DeviceProfile>,
     daemon_epoch: Uuid,
     staged: bool,
 ) -> SlotSnapshot {
     let state = if staged {
         SessionState::Disabled
-    } else if config.enabled && config.settings.auto_open {
+    } else if config.enabled
+        && resolve_transport_settings(&config.settings, transport_profile.as_ref()).auto_open
+    {
         SessionState::WaitingForPort
     } else {
         SessionState::Disabled
     };
     let resolved = resolve_device_settings(&config.settings, device_profile.as_ref());
+    let transport = resolve_transport_settings(&config.settings, transport_profile.as_ref());
     SlotSnapshot {
         config,
         daemon_epoch,
@@ -4011,10 +4376,12 @@ fn initial_snapshot(
         endpoint_present: false,
         session_state: state,
         state_reason: staged.then(|| "slot configuration pending persistence".into()),
+        state_code: None,
         target_activity: TargetActivity::Unknown,
         last_rx_wall_time_ns: None,
         rx_offset: 0,
         tx_offset: 0,
+        rx_overflow_bytes: 0,
         control: None,
         active_run: None,
         active_trigger: None,
@@ -4023,6 +4390,8 @@ fn initial_snapshot(
         effective_uboot_prompt: resolved.uboot_prompt,
         effective_write_eol: Some(resolved.write_eol),
         effective_echo: Some(resolved.echo),
+        effective_transport: Some(transport),
+        effective_write_pacing: Some(resolved.write_pacing),
     }
 }
 
@@ -4036,8 +4405,56 @@ fn serial_backend_name() -> &'static str {
     "tokio_serial"
 }
 
+#[derive(Debug)]
+struct PortOpenError {
+    code: ErrorCode,
+    message: String,
+}
+
+impl PortOpenError {
+    fn from_serial(error: serialport::Error) -> Self {
+        use serialport::ErrorKind as SerialErrorKind;
+        let message = error.to_string();
+        let normalized = message.to_ascii_lowercase();
+        let explicitly_busy = normalized.contains("busy")
+            || normalized.contains("in use")
+            || normalized.contains("sharing violation")
+            || normalized.contains("access is denied")
+            || message.contains("拒绝访问");
+        let code = if explicitly_busy {
+            ErrorCode::PortBusy
+        } else {
+            match error.kind() {
+                SerialErrorKind::NoDevice => ErrorCode::PortNotFound,
+                SerialErrorKind::Io(std::io::ErrorKind::NotFound) => ErrorCode::PortNotFound,
+                SerialErrorKind::Io(std::io::ErrorKind::PermissionDenied) => {
+                    #[cfg(windows)]
+                    {
+                        ErrorCode::PortBusy
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        ErrorCode::PortAccessDenied
+                    }
+                }
+                SerialErrorKind::Io(std::io::ErrorKind::WouldBlock)
+                | SerialErrorKind::Io(std::io::ErrorKind::AlreadyExists) => ErrorCode::PortBusy,
+                SerialErrorKind::InvalidInput => ErrorCode::BadRequest,
+                _ => ErrorCode::PortIo,
+            }
+        };
+        Self { code, message }
+    }
+}
+
+impl std::fmt::Display for PortOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 #[cfg(not(windows))]
-fn open_port(port_name: &str, settings: &SerialSettings) -> Result<SerialStream, String> {
+fn open_port(port_name: &str, settings: &SerialSettings) -> Result<SerialStream, PortOpenError> {
     let builder = tokio_serial::new(port_name, settings.baud_rate)
         .data_bits(match settings.data_bits {
             DataBits::Five => TokioDataBits::Five,
@@ -4062,16 +4479,16 @@ fn open_port(port_name: &str, settings: &SerialSettings) -> Result<SerialStream,
         });
     let mut stream = builder
         .open_native_async()
-        .map_err(|error| error.to_string())?;
+        .map_err(PortOpenError::from_serial)?;
     stream
         .write_data_terminal_ready(settings.dtr)
-        .map_err(|error| error.to_string())?;
+        .map_err(PortOpenError::from_serial)?;
     // With hardware flow control the driver owns RTS. Manually forcing the
     // line can defeat CTS/RTS negotiation and may reset some target boards.
     if settings.flow_control != FlowControl::Hardware {
         stream
             .write_request_to_send(settings.rts)
-            .map_err(|error| error.to_string())?;
+            .map_err(PortOpenError::from_serial)?;
     }
     Ok(stream)
 }
@@ -4082,8 +4499,107 @@ struct WindowsSerialPort {
     writer: COMPort,
 }
 
+/// Tokio's generic split hides the underlying `SerialPort` methods. Keep a
+/// small shared wrapper so the writer task can assert/clear BREAK while the
+/// same nonblocking stream continues to serve RX.
+#[cfg(not(windows))]
+#[derive(Clone)]
+struct SharedSerialStream {
+    inner: Arc<std::sync::Mutex<SerialStream>>,
+}
+
+#[cfg(not(windows))]
+impl SharedSerialStream {
+    fn new(stream: SerialStream) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(stream)),
+        }
+    }
+
+    fn set_break(&self) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "serial stream lock was poisoned".to_owned())?
+            .set_break()
+            .map_err(|error| error.to_string())
+    }
+
+    fn clear_break(&self) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "serial stream lock was poisoned".to_owned())?
+            .clear_break()
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+impl AsyncRead for SharedSerialStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut stream = match self.inner.lock() {
+            Ok(stream) => stream,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "serial stream lock was poisoned",
+                )));
+            }
+        };
+        Pin::new(&mut *stream).poll_read(context, buffer)
+    }
+}
+
+#[cfg(not(windows))]
+impl AsyncWrite for SharedSerialStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut stream = match self.inner.lock() {
+            Ok(stream) => stream,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "serial stream lock was poisoned",
+                )));
+            }
+        };
+        Pin::new(&mut *stream).poll_write(context, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut stream = match self.inner.lock() {
+            Ok(stream) => stream,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "serial stream lock was poisoned",
+                )));
+            }
+        };
+        Pin::new(&mut *stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut stream = match self.inner.lock() {
+            Ok(stream) => stream,
+            Err(_) => {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "serial stream lock was poisoned",
+                )));
+            }
+        };
+        Pin::new(&mut *stream).poll_shutdown(context)
+    }
+}
+
 #[cfg(windows)]
-fn open_port(port_name: &str, settings: &SerialSettings) -> Result<WindowsSerialPort, String> {
+fn open_port(
+    port_name: &str,
+    settings: &SerialSettings,
+) -> Result<WindowsSerialPort, PortOpenError> {
     // `tokio-serial` implements Windows COM I/O through Tokio's named-pipe
     // backend. Some serial-card drivers never complete an overlapped write;
     // mio then deliberately keeps that write (and the exclusive COM handle)
@@ -4114,18 +4630,18 @@ fn open_port(port_name: &str, settings: &SerialSettings) -> Result<WindowsSerial
         // The reader checks bytes_to_read before calling ReadFile, so this
         // primarily bounds a synchronous WriteFile that stops making progress.
         .timeout(WRITE_TIMEOUT);
-    let mut reader = builder.open_native().map_err(|error| error.to_string())?;
+    let mut reader = builder.open_native().map_err(PortOpenError::from_serial)?;
     reader
         .write_data_terminal_ready(settings.dtr)
-        .map_err(|error| error.to_string())?;
+        .map_err(PortOpenError::from_serial)?;
     if settings.flow_control != FlowControl::Hardware {
         reader
             .write_request_to_send(settings.rts)
-            .map_err(|error| error.to_string())?;
+            .map_err(PortOpenError::from_serial)?;
     }
     let writer = reader
         .try_clone_native()
-        .map_err(|error| error.to_string())?;
+        .map_err(PortOpenError::from_serial)?;
     Ok(WindowsSerialPort { reader, writer })
 }
 
@@ -4135,14 +4651,22 @@ fn spawn_port_worker(stream: SerialStream) -> (PortWorker, mpsc::Receiver<PortEv
     let (reader_commands, reader_command_rx) = mpsc::channel(PORT_READER_COMMAND_QUEUE);
     let (events, event_rx) = mpsc::channel(PORT_EVENT_QUEUE);
     let (cancel, cancel_rx) = watch::channel(false);
-    let (reader_half, writer_half) = tokio::io::split(stream);
+    let shared = SharedSerialStream::new(stream);
+    let break_control = shared.clone();
+    let (reader_half, writer_half) = tokio::io::split(shared);
     let reader = tokio::spawn(run_port_reader(
         reader_half,
         events.clone(),
         reader_command_rx,
         cancel_rx.clone(),
     ));
-    let writer = tokio::spawn(run_port_writer(writer_half, command_rx, events, cancel_rx));
+    let writer = tokio::spawn(run_port_writer(
+        writer_half,
+        break_control,
+        command_rx,
+        events,
+        cancel_rx,
+    ));
     (
         PortWorker {
             commands,
@@ -4193,7 +4717,7 @@ fn spawn_port_worker(stream: WindowsSerialPort) -> (PortWorker, mpsc::Receiver<P
 
 #[cfg(not(windows))]
 async fn run_port_reader(
-    mut reader: tokio::io::ReadHalf<SerialStream>,
+    mut reader: tokio::io::ReadHalf<SharedSerialStream>,
     events: mpsc::Sender<PortEvent>,
     mut commands: mpsc::Receiver<PortReaderCommand>,
     mut cancel: watch::Receiver<bool>,
@@ -4602,7 +5126,8 @@ fn enqueue_rx(events: &mpsc::Sender<PortEvent>, pending: &mut Vec<u8>, dropped_b
 
 #[cfg(not(windows))]
 async fn run_port_writer(
-    mut writer: tokio::io::WriteHalf<SerialStream>,
+    mut writer: tokio::io::WriteHalf<SharedSerialStream>,
+    break_control: SharedSerialStream,
     mut command_rx: mpsc::Receiver<PortCommand>,
     events: mpsc::Sender<PortEvent>,
     mut cancel: watch::Receiver<bool>,
@@ -4617,20 +5142,38 @@ async fn run_port_writer(
             }
             command = command_rx.recv() => command,
         };
-        let Some(PortCommand::Write {
-            data,
-            pacing,
-            deadline,
-            reply,
-        }) = command
-        else {
+        let Some(command) = command else {
             return;
         };
-        let outcome = write_with_pacing(&mut writer, &data, pacing, deadline, &mut cancel).await;
-        let failed = outcome.error.is_some();
-        let cancelled = outcome.cancelled;
-        let message = outcome.error.clone();
-        let _ = reply.send(outcome);
+        let (failed, cancelled, message) = match command {
+            PortCommand::Write {
+                data,
+                pacing,
+                deadline,
+                reply,
+            } => {
+                let outcome =
+                    write_with_pacing(&mut writer, &data, pacing, deadline, &mut cancel).await;
+                let state = (
+                    outcome.error.is_some(),
+                    outcome.cancelled,
+                    outcome.error.clone(),
+                );
+                let _ = reply.send(outcome);
+                state
+            }
+            PortCommand::Break { duration, reply } => {
+                let outcome = send_break_async(&break_control, duration, &mut cancel).await;
+                let result = outcome.error.clone().map_or(Ok(()), Err);
+                let state = (
+                    break_failure_closes_port(outcome.error.as_ref()),
+                    outcome.cancelled,
+                    outcome.error.as_ref().map(ToString::to_string),
+                );
+                let _ = reply.send(result);
+                state
+            }
+        };
         if cancelled {
             return;
         }
@@ -4647,6 +5190,102 @@ async fn run_port_writer(
     }
 }
 
+#[cfg(not(windows))]
+async fn send_break_async(
+    port: &SharedSerialStream,
+    duration: Duration,
+    cancel: &mut watch::Receiver<bool>,
+) -> PortBreakOutcome {
+    if let Err(error) = port.set_break() {
+        return PortBreakOutcome {
+            error: Some(classify_break_failure("failed to assert BREAK", error)),
+            cancelled: false,
+        };
+    }
+    let mut cancelled = false;
+    tokio::select! {
+        changed = cancel.changed() => {
+            cancelled = changed.is_err() || *cancel.borrow();
+        }
+        _ = tokio::time::sleep(duration) => {}
+    }
+    let clear = port
+        .clear_break()
+        .map_err(|error| classify_break_failure("failed to clear BREAK", error));
+    let error = match (cancelled, clear.err()) {
+        (false, None) => None,
+        (false, Some(error)) => Some(error),
+        (true, None) => Some(PortBreakFailure::Failed(
+            "BREAK was cancelled because the port is closing".into(),
+        )),
+        (true, Some(error)) => Some(PortBreakFailure::Failed(format!(
+            "BREAK was cancelled because the port is closing; {error}"
+        ))),
+    };
+    PortBreakOutcome { error, cancelled }
+}
+
+#[cfg(windows)]
+trait BlockingBreakSignal {
+    fn assert_break(&self) -> Result<(), String>;
+    fn clear_break_signal(&self) -> Result<(), String>;
+}
+
+#[cfg(windows)]
+impl BlockingBreakSignal for COMPort {
+    fn assert_break(&self) -> Result<(), String> {
+        SerialPort::set_break(self).map_err(|error| error.to_string())
+    }
+
+    fn clear_break_signal(&self) -> Result<(), String> {
+        SerialPort::clear_break(self).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn send_break_blocking<W>(
+    port: &W,
+    duration: Duration,
+    cancel: &watch::Receiver<bool>,
+) -> PortBreakOutcome
+where
+    W: BlockingBreakSignal,
+{
+    if let Err(error) = port.assert_break() {
+        return PortBreakOutcome {
+            error: Some(classify_break_failure("failed to assert BREAK", error)),
+            cancelled: false,
+        };
+    }
+    let deadline = Instant::now() + duration;
+    let mut cancelled = false;
+    while Instant::now() < deadline {
+        if write_cancelled(cancel) {
+            cancelled = true;
+            break;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(WINDOWS_PORT_POLL_INTERVAL),
+        );
+    }
+    let clear = port
+        .clear_break_signal()
+        .map_err(|error| classify_break_failure("failed to clear BREAK", error));
+    let error = match (cancelled, clear.err()) {
+        (false, None) => None,
+        (false, Some(error)) => Some(error),
+        (true, None) => Some(PortBreakFailure::Failed(
+            "BREAK was cancelled because the port is closing".into(),
+        )),
+        (true, Some(error)) => Some(PortBreakFailure::Failed(format!(
+            "BREAK was cancelled because the port is closing; {error}"
+        ))),
+    };
+    PortBreakOutcome { error, cancelled }
+}
+
 #[cfg(windows)]
 fn run_windows_port_writer<W>(
     mut writer: W,
@@ -4655,33 +5294,55 @@ fn run_windows_port_writer<W>(
     cancel: watch::Receiver<bool>,
     writer_failed: Arc<AtomicBool>,
 ) where
-    W: std::io::Write,
+    W: std::io::Write + BlockingBreakSignal,
 {
     loop {
         if write_cancelled(&cancel) {
             return;
         }
-        let Some(PortCommand::Write {
-            data,
-            pacing,
-            deadline,
-            reply,
-        }) = command_rx.blocking_recv()
-        else {
+        let Some(command) = command_rx.blocking_recv() else {
             return;
         };
-        let outcome =
-            write_with_blocking_pacing(&mut writer, &data, pacing, deadline.into_std(), &cancel);
-        let failed = outcome.error.is_some();
-        let cancelled = outcome.cancelled;
-        let message = outcome.error.clone();
+        let (failed, cancelled, message) = match command {
+            PortCommand::Write {
+                data,
+                pacing,
+                deadline,
+                reply,
+            } => {
+                let outcome = write_with_blocking_pacing(
+                    &mut writer,
+                    &data,
+                    pacing,
+                    deadline.into_std(),
+                    &cancel,
+                );
+                let state = (
+                    outcome.error.is_some(),
+                    outcome.cancelled,
+                    outcome.error.clone(),
+                );
+                let _ = reply.send(outcome);
+                state
+            }
+            PortCommand::Break { duration, reply } => {
+                let outcome = send_break_blocking(&writer, duration, &cancel);
+                let result = outcome.error.clone().map_or(Ok(()), Err);
+                let state = (
+                    break_failure_closes_port(outcome.error.as_ref()),
+                    outcome.cancelled,
+                    outcome.error.as_ref().map(ToString::to_string),
+                );
+                let _ = reply.send(result);
+                state
+            }
+        };
         if failed && !cancelled {
             // Stop the RX producer before reserving space for the authoritative
             // close event. Under sustained RX this prevents a try-send loop
             // from being starved forever by the reader refilling every slot.
             writer_failed.store(true, Ordering::Release);
         }
-        let _ = reply.send(outcome);
         if cancelled {
             return;
         }
@@ -5029,6 +5690,30 @@ mod tests {
         assert_eq!(settings.echo, EchoMode::On);
     }
 
+    #[test]
+    fn serial_open_failures_have_stable_diagnostic_codes() {
+        let missing = PortOpenError::from_serial(serialport::Error::new(
+            serialport::ErrorKind::NoDevice,
+            "missing",
+        ));
+        assert_eq!(missing.code, ErrorCode::PortNotFound);
+
+        let busy = PortOpenError::from_serial(serialport::Error::new(
+            serialport::ErrorKind::Io(std::io::ErrorKind::WouldBlock),
+            "temporarily unavailable",
+        ));
+        assert_eq!(busy.code, ErrorCode::PortBusy);
+
+        let denied = PortOpenError::from_serial(serialport::Error::new(
+            serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied),
+            "permission denied",
+        ));
+        #[cfg(windows)]
+        assert_eq!(denied.code, ErrorCode::PortBusy);
+        #[cfg(not(windows))]
+        assert_eq!(denied.code, ErrorCode::PortAccessDenied);
+    }
+
     fn trigger_spec(action: &[u8]) -> TriggerSpec {
         TriggerSpec {
             initial_write: None,
@@ -5078,6 +5763,65 @@ mod tests {
             validate_trigger_spec(&empty_pattern),
             Err(SlotError::InvalidTriggerPatterns)
         );
+    }
+
+    #[test]
+    fn break_request_is_bounded_and_idempotency_fingerprint_covers_duration() {
+        let actor = Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Agent,
+        };
+        let request = |duration_ms| SlotRequest::SendBreak {
+            actor: actor.clone(),
+            control_id: Uuid::new_v4(),
+            fence: 7,
+            duration_ms,
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(Uuid::new_v4()),
+        };
+        assert_eq!(
+            request(MIN_BREAK_DURATION_MS).validate_business_fields(),
+            Ok(())
+        );
+        assert_eq!(
+            request(MAX_BREAK_DURATION_MS).validate_business_fields(),
+            Ok(())
+        );
+        assert_eq!(
+            request(0).validate_business_fields(),
+            Err(SlotError::InvalidBreakDuration)
+        );
+
+        let operation_id = Some(Uuid::new_v4());
+        let expected_run_id = Some(Uuid::new_v4());
+        let make = |duration_ms| SlotRequest::SendBreak {
+            actor: actor.clone(),
+            control_id: Uuid::new_v4(),
+            fence: 99,
+            duration_ms,
+            operation_id,
+            expected_run_id,
+        };
+        assert_ne!(make(100).write_fingerprint(), make(200).write_fingerprint());
+        assert!(matches!(
+            classify_break_failure("assert BREAK", "operation not supported"),
+            PortBreakFailure::Unsupported(_)
+        ));
+        assert!(!break_failure_closes_port(Some(
+            &PortBreakFailure::Unsupported("unsupported".into())
+        )));
+        assert!(break_failure_closes_port(Some(&PortBreakFailure::Failed(
+            "uncertain".into()
+        ))));
+    }
+
+    #[test]
+    fn device_profile_changes_require_idle_without_a_transport_reopen() {
+        assert!(profile_change_requires_idle(false, true, true, false));
+        assert!(profile_change_requires_idle(false, true, false, true));
+        assert!(!profile_change_requires_idle(false, false, true, true));
+        assert!(!profile_change_requires_idle(true, true, true, true));
     }
 
     #[test]
@@ -6026,6 +6770,49 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(windows)]
+    impl BlockingBreakSignal for BlockingTimedOutWriter {
+        fn assert_break(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn clear_break_signal(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    #[derive(Default)]
+    struct RecordingBreakSignal {
+        asserted: std::sync::atomic::AtomicUsize,
+        cleared: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(windows)]
+    impl BlockingBreakSignal for RecordingBreakSignal {
+        fn assert_break(&self) -> Result<(), String> {
+            self.asserted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear_break_signal(&self) -> Result<(), String> {
+            self.cleared.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_break_is_asserted_for_a_bounded_interval_and_always_cleared() {
+        let signal = RecordingBreakSignal::default();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let outcome = send_break_blocking(&signal, Duration::from_millis(1), &cancel_rx);
+        assert_eq!(outcome.error, None);
+        assert!(!outcome.cancelled);
+        assert_eq!(signal.asserted.load(Ordering::SeqCst), 1);
+        assert_eq!(signal.cleared.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(windows)]

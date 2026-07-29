@@ -11,7 +11,11 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+/// WebSocket wire generation. v3 adds physical BREAK, stable serial error
+/// codes, effective Transport/Device settings, and bounded regex queries.
+/// Those enum additions are intentionally rejected by v2 peers instead of
+/// allowing a mixed-version connection to fail later while debugging.
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -31,6 +35,8 @@ pub const MIN_TRIGGER_TIMEOUT_MS: u64 = 100;
 pub const MAX_TRIGGER_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TRIGGER_FIRES: u32 = 1_000;
 pub const MAX_TRIGGER_TOTAL_BYTES: usize = 64 * 1024;
+pub const MIN_BREAK_DURATION_MS: u64 = 1;
+pub const MAX_BREAK_DURATION_MS: u64 = 5_000;
 /// Upper bound for one physical write accepted by `seriald`.
 ///
 /// A Trigger timeout stops new scheduling, but an already accepted write may
@@ -125,6 +131,83 @@ pub struct SerialSettings {
     pub write_chunk_delay_ms: u64,
     pub auto_open: bool,
     pub probe: Option<ProbeConfig>,
+}
+
+/// Reusable physical UART configuration. `SlotConfig::settings` remains a
+/// complete compatibility snapshot, while a matching catalog entry is the
+/// authoritative source for these transport fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportProfile {
+    pub name: String,
+    pub baud_rate: u32,
+    pub data_bits: DataBits,
+    pub parity: Parity,
+    pub stop_bits: StopBits,
+    pub flow_control: FlowControl,
+    pub dtr: bool,
+    pub rts: bool,
+    pub auto_open: bool,
+}
+
+/// Physical UART settings after resolving a Slot's transport-profile binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTransportSettings {
+    pub baud_rate: u32,
+    pub data_bits: DataBits,
+    pub parity: Parity,
+    pub stop_bits: StopBits,
+    pub flow_control: FlowControl,
+    pub dtr: bool,
+    pub rts: bool,
+    pub auto_open: bool,
+}
+
+pub fn resolve_transport_settings(
+    settings: &SerialSettings,
+    transport_profile: Option<&TransportProfile>,
+) -> ResolvedTransportSettings {
+    match transport_profile {
+        Some(profile) => ResolvedTransportSettings {
+            baud_rate: profile.baud_rate,
+            data_bits: profile.data_bits,
+            parity: profile.parity,
+            stop_bits: profile.stop_bits,
+            flow_control: profile.flow_control,
+            dtr: profile.dtr,
+            rts: profile.rts,
+            auto_open: profile.auto_open,
+        },
+        None => ResolvedTransportSettings {
+            baud_rate: settings.baud_rate,
+            data_bits: settings.data_bits,
+            parity: settings.parity,
+            stop_bits: settings.stop_bits,
+            flow_control: settings.flow_control,
+            dtr: settings.dtr,
+            rts: settings.rts,
+            auto_open: settings.auto_open,
+        },
+    }
+}
+
+/// Applies only physical UART fields, preserving the Slot's legacy
+/// device-behavior and write-pacing snapshot.
+pub fn apply_transport_profile(
+    settings: &SerialSettings,
+    transport_profile: Option<&TransportProfile>,
+) -> SerialSettings {
+    let resolved = resolve_transport_settings(settings, transport_profile);
+    SerialSettings {
+        baud_rate: resolved.baud_rate,
+        data_bits: resolved.data_bits,
+        parity: resolved.parity,
+        stop_bits: resolved.stop_bits,
+        flow_control: resolved.flow_control,
+        dtr: resolved.dtr,
+        rts: resolved.rts,
+        auto_open: resolved.auto_open,
+        ..settings.clone()
+    }
 }
 
 fn default_write_chunk_size() -> u32 {
@@ -276,6 +359,13 @@ pub struct DeviceProfile {
     pub write_eol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub echo: Option<EchoMode>,
+    /// Optional target-specific UART write pacing. These fields belong to the
+    /// DUT because they compensate for how quickly that target consumes input,
+    /// not for a property of the host COM port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_chunk_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_chunk_delay_ms: Option<u64>,
 }
 
 /// Device-interaction settings after applying the attached device profile to
@@ -287,6 +377,7 @@ pub struct ResolvedDeviceSettings {
     pub uboot_prompt: Option<String>,
     pub write_eol: String,
     pub echo: EchoMode,
+    pub write_pacing: WritePacing,
 }
 
 /// Resolves the effective device behavior for one Slot. An attached
@@ -318,6 +409,14 @@ pub fn resolve_device_settings(
         echo: device_profile
             .and_then(|profile| profile.echo)
             .unwrap_or(settings.echo),
+        write_pacing: WritePacing {
+            chunk_size: device_profile
+                .and_then(|profile| profile.write_chunk_size)
+                .unwrap_or(settings.write_chunk_size),
+            chunk_delay_ms: device_profile
+                .and_then(|profile| profile.write_chunk_delay_ms)
+                .unwrap_or(settings.write_chunk_delay_ms),
+        },
     }
 }
 
@@ -466,10 +565,17 @@ pub struct SlotSnapshot {
     pub endpoint_present: bool,
     pub session_state: SessionState,
     pub state_reason: Option<String>,
+    /// Stable classification for `state_reason`. Older daemons only expose
+    /// the human-readable text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_code: Option<ErrorCode>,
     pub target_activity: TargetActivity,
     pub last_rx_wall_time_ns: Option<i64>,
     pub rx_offset: u64,
     pub tx_offset: u64,
+    /// Total reader bytes dropped during this daemon epoch for this Slot.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rx_overflow_bytes: u64,
     pub control: Option<ControlLease>,
     pub active_run: Option<RunInfo>,
     /// Current daemon-owned Trigger Job, if any. Older snapshots omit it.
@@ -491,6 +597,17 @@ pub struct SlotSnapshot {
     pub effective_write_eol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_echo: Option<EchoMode>,
+    /// Authoritative physical UART settings. Present on current daemons;
+    /// optional on the wire so old persisted/test snapshots still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_transport: Option<ResolvedTransportSettings>,
+    /// Authoritative target-aware write pacing after Device Profile overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_write_pacing: Option<WritePacing>,
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,6 +640,7 @@ pub enum EventKind {
     TriggerCompleted,
     TriggerCancelled,
     TriggerFailed,
+    Break,
     Checkpoint,
     LoggingDegraded,
     Gap,
@@ -637,6 +755,19 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pacing: Option<WritePacing>,
     },
+    /// Assert the UART BREAK condition. This is a physical line signal, not a
+    /// control byte; Ctrl-C/Ctrl-D/Ctrl-Z remain ordinary write payloads.
+    SendBreak {
+        request_id: Uuid,
+        slot_id: String,
+        control_id: Uuid,
+        fence: u64,
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<Uuid>,
+    },
     TriggerStart {
         request_id: Uuid,
         slot_id: String,
@@ -711,6 +842,7 @@ impl ClientMessage {
             | Self::ReleaseControl { request_id, .. }
             | Self::CancelAcquire { request_id, .. }
             | Self::Write { request_id, .. }
+            | Self::SendBreak { request_id, .. }
             | Self::TriggerStart { request_id, .. }
             | Self::TriggerStatus { request_id, .. }
             | Self::TriggerCancel { request_id, .. }
@@ -734,6 +866,7 @@ pub enum CommandResult {
     ControlReleased,
     AcquireCancelled { removed: bool },
     WriteAccepted { event_seq: u64 },
+    BreakSent { event_seq: u64 },
     TriggerStarted { trigger: Box<TriggerInfo> },
     TriggerStatus { trigger: Box<TriggerInfo> },
     TriggerCancelled { trigger: Box<TriggerInfo> },
@@ -807,6 +940,16 @@ pub enum ErrorCode {
     CursorAhead,
     ResourceExhausted,
     IdempotencyExpired,
+    ConfigRevisionMismatch,
+    ProfileChangeBusy,
+    PortNotFound,
+    PortBusy,
+    PortAccessDenied,
+    PortIo,
+    BreakUnsupported,
+    RegexInvalid,
+    QueryBudgetExceeded,
+    Unavailable,
     Internal,
 }
 
@@ -830,40 +973,80 @@ pub struct HealthResponse {
     pub server_id: Uuid,
     pub daemon_epoch: Uuid,
     pub uptime_ms: u64,
+    /// WebSocket wire generation served by this daemon. Missing on pre-0.4
+    /// HTTP responses and decoded as zero by current clients.
+    #[serde(default)]
+    pub protocol_version: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub server_id: Uuid,
     pub daemon_epoch: Uuid,
+    /// WebSocket wire generation served by this daemon.
+    #[serde(default)]
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub config_revision: u64,
     pub slots: Vec<SlotSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigureSlotsRequest {
     pub slots: Vec<SlotConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigureSlotsResponse {
     pub slots: Vec<SlotSnapshot>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportProfileListResponse {
+    pub profiles: Vec<TransportProfile>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureTransportProfilesRequest {
+    pub profiles: Vec<TransportProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureTransportProfilesResponse {
+    pub profiles: Vec<TransportProfile>,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 /// Read model for the configured device-model profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceProfileListResponse {
     pub profiles: Vec<DeviceProfile>,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 /// Full replacement of the device-model profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigureDeviceProfilesRequest {
     pub profiles: Vec<DeviceProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigureDeviceProfilesResponse {
     pub profiles: Vec<DeviceProfile>,
+    #[serde(default)]
+    pub config_revision: u64,
 }
 
 /// One discoverable, retained Slot/daemon-epoch journal archive.
@@ -903,8 +1086,49 @@ pub struct EventQuery {
     pub run_id: Option<Uuid>,
     pub operation_id: Option<Uuid>,
     pub contains: Option<String>,
+    /// Bounded UTF-8 regular expression. Mutually exclusive with `contains`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
     pub limit_events: Option<usize>,
     pub limit_bytes: Option<usize>,
+}
+
+/// Read-only journal health and retention metrics. Gathering this information
+/// never probes a target, opens a port, or writes serial bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalDiagnostics {
+    pub usage_bytes: u64,
+    pub max_bytes: u64,
+    pub retention_target_bytes: u64,
+    pub segment_max_bytes: u64,
+    pub writer_queue_capacity: usize,
+    pub writer_queue_remaining: usize,
+    pub archive_count: usize,
+    pub logging: LoggingState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlotDiagnostics {
+    pub snapshot: SlotSnapshot,
+    pub subscriber_count: usize,
+    pub subscriber_lag_events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonDiagnosticsResponse {
+    pub server_id: Uuid,
+    pub daemon_epoch: Uuid,
+    pub uptime_ms: u64,
+    pub config_revision: u64,
+    pub websocket_connections: usize,
+    pub websocket_limit: usize,
+    pub journal: JournalDiagnostics,
+    pub slots: Vec<SlotDiagnostics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageDiagnosticsResponse {
+    pub journal: JournalDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1278,6 +1502,8 @@ mod tests {
             uboot_prompt: Some("SigmaStar =>".into()),
             write_eol: Some("\n".into()),
             echo: Some(EchoMode::Off),
+            write_chunk_size: Some(2),
+            write_chunk_delay_ms: Some(3),
         }
     }
 
@@ -1290,6 +1516,13 @@ mod tests {
         assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
         assert_eq!(resolved.write_eol, "\n");
         assert_eq!(resolved.echo, EchoMode::Off);
+        assert_eq!(
+            resolved.write_pacing,
+            WritePacing {
+                chunk_size: 2,
+                chunk_delay_ms: 3,
+            }
+        );
 
         // Once attached, the model owns prompts as well as line ending and
         // echo behavior. This prevents a stale legacy Slot prompt from
@@ -1316,12 +1549,60 @@ mod tests {
             uboot_prompt: None,
             write_eol: None,
             echo: None,
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
         };
         let resolved = resolve_device_settings(&settings, Some(&promptless));
         assert!(resolved.shell_prompt.is_none());
         assert!(resolved.uboot_prompt.is_none());
         assert_eq!(resolved.write_eol, "\r\n");
         assert_eq!(resolved.echo, EchoMode::Auto);
+    }
+
+    #[test]
+    fn transport_profile_overrides_only_physical_uart_fields() {
+        let settings = SerialSettings {
+            baud_rate: 9_600,
+            data_bits: DataBits::Seven,
+            parity: Parity::Odd,
+            stop_bits: StopBits::Two,
+            flow_control: FlowControl::Software,
+            dtr: true,
+            rts: true,
+            write_eol: "\n".into(),
+            echo: EchoMode::Off,
+            shell_prompt: Some("/ # ".into()),
+            uboot_prompt: Some("U-Boot> ".into()),
+            write_chunk_size: 3,
+            write_chunk_delay_ms: 7,
+            auto_open: false,
+            probe: None,
+        };
+        let profile = TransportProfile {
+            name: "station-fast".into(),
+            baud_rate: 921_600,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+            dtr: false,
+            rts: false,
+            auto_open: true,
+        };
+
+        let resolved = resolve_transport_settings(&settings, Some(&profile));
+        assert_eq!(resolved.baud_rate, 921_600);
+        assert_eq!(resolved.data_bits, DataBits::Eight);
+        assert!(resolved.auto_open);
+
+        let applied = apply_transport_profile(&settings, Some(&profile));
+        assert_eq!(applied.baud_rate, 921_600);
+        assert_eq!(applied.write_eol, "\n");
+        assert_eq!(applied.echo, EchoMode::Off);
+        assert_eq!(applied.shell_prompt.as_deref(), Some("/ # "));
+        assert_eq!(applied.uboot_prompt.as_deref(), Some("U-Boot> "));
+        assert_eq!(applied.write_chunk_size, 3);
+        assert_eq!(applied.write_chunk_delay_ms, 7);
     }
 
     #[test]
@@ -1373,10 +1654,12 @@ mod tests {
             endpoint_present: false,
             session_state: SessionState::Disabled,
             state_reason: None,
+            state_code: None,
             target_activity: TargetActivity::Unknown,
             last_rx_wall_time_ns: None,
             rx_offset: 0,
             tx_offset: 0,
+            rx_overflow_bytes: 0,
             control: None,
             active_run: None,
             active_trigger: None,
@@ -1385,6 +1668,8 @@ mod tests {
             effective_uboot_prompt: None,
             effective_write_eol: None,
             effective_echo: None,
+            effective_transport: None,
+            effective_write_pacing: None,
         })
         .unwrap();
         let object = json.as_object().unwrap();
@@ -1418,6 +1703,31 @@ mod tests {
         };
         let frame = encode_client_control(&message).unwrap();
         assert_eq!(decode_client_control(&frame).unwrap(), message);
+    }
+
+    #[test]
+    fn uart_break_round_trips_with_run_and_operation_boundaries() {
+        let request_id = Uuid::new_v4();
+        let message = ClientMessage::SendBreak {
+            request_id,
+            slot_id: "slot-1".into(),
+            control_id: Uuid::new_v4(),
+            fence: 7,
+            duration_ms: 250,
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(Uuid::new_v4()),
+        };
+        assert_eq!(message.request_id(), request_id);
+        let frame = encode_client_control(&message).unwrap();
+        assert_eq!(decode_client_control(&frame).unwrap(), message);
+
+        let result = CommandResult::BreakSent { event_seq: 91 };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["type"], "break_sent");
+        assert_eq!(
+            serde_json::from_value::<CommandResult>(json).unwrap(),
+            result
+        );
     }
 
     #[test]
@@ -1545,8 +1855,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_exposes_trigger_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_v3_exposes_trigger_contracts() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

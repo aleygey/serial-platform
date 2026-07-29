@@ -16,6 +16,7 @@ crc32fast.workspace = true
 directories.workspace = true
 futures-util.workspace = true
 rand.workspace = true
+regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }

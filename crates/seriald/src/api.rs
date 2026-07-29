@@ -14,9 +14,11 @@ use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
     Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceProfilesRequest,
     ConfigureDeviceProfilesResponse, ConfigureSlotsRequest, ConfigureSlotsResponse,
-    DeviceProfileListResponse, ErrorCode, EventQuery, EventQueryResponse, HealthResponse,
-    PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage, StatusResponse, encode_control,
-    encode_event,
+    ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse,
+    DaemonDiagnosticsResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
+    EventQueryResponse, HealthResponse, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage,
+    SlotDiagnostics, StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse,
+    encode_control, encode_event,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,23 +78,39 @@ impl AppState {
     async fn configure_slots_transaction(
         &self,
         requested: Vec<serial_protocol::SlotConfig>,
-    ) -> Result<Vec<serial_protocol::SlotSnapshot>, ApiError> {
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<serial_protocol::SlotSnapshot>, u64), ApiError> {
         let _update = self.inner.config_updates.lock().await;
         let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(expected_revision, current.config_revision)?;
         let staged = current
             .staged_with_slots(requested)
             .map_err(ConfigError::from)?;
         let applied = self
             .inner
             .registry
-            .apply_replacement(staged.slots.clone(), staged.device_profiles.clone())
+            .apply_replacement(
+                staged.slots.clone(),
+                staged.transport_profiles.clone(),
+                staged.device_profiles.clone(),
+            )
             .await?;
 
         match self.inner.config_store.save(&staged) {
             Ok(()) => {
-                let snapshots = applied.commit().await?;
+                let snapshots = match applied.commit().await {
+                    Ok(snapshots) => snapshots,
+                    Err(commit) => {
+                        return Err(compensate_commit_failure(
+                            &self.inner.config_store,
+                            &current,
+                            commit,
+                        ));
+                    }
+                };
+                let revision = staged.config_revision;
                 *self.inner.config.write().await = staged;
-                Ok(snapshots)
+                Ok((snapshots, revision))
             }
             Err(save) => match applied.rollback().await {
                 Ok(()) => Err(ApiError::Config(save)),
@@ -107,9 +125,11 @@ impl AppState {
     async fn configure_device_profiles_transaction(
         &self,
         requested: Vec<serial_protocol::DeviceProfile>,
-    ) -> Result<Vec<serial_protocol::DeviceProfile>, ApiError> {
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<serial_protocol::DeviceProfile>, u64), ApiError> {
         let _update = self.inner.config_updates.lock().await;
         let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(expected_revision, current.config_revision)?;
         let staged = current
             .staged_with_device_profiles(requested)
             .map_err(ConfigError::from)?;
@@ -121,9 +141,57 @@ impl AppState {
 
         match self.inner.config_store.save(&staged) {
             Ok(()) => {
-                applied.commit().await?;
+                if let Err(commit) = applied.commit().await {
+                    return Err(compensate_commit_failure(
+                        &self.inner.config_store,
+                        &current,
+                        commit,
+                    ));
+                }
+                let revision = staged.config_revision;
                 *self.inner.config.write().await = staged.clone();
-                Ok(staged.device_profiles)
+                Ok((staged.device_profiles, revision))
+            }
+            Err(save) => match applied.rollback().await {
+                Ok(()) => Err(ApiError::Config(save)),
+                Err(rollback) => Err(ApiError::ConfigRollback { save, rollback }),
+            },
+        }
+    }
+
+    async fn configure_transport_profiles_transaction(
+        &self,
+        requested: Vec<serial_protocol::TransportProfile>,
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<serial_protocol::TransportProfile>, u64), ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(expected_revision, current.config_revision)?;
+        let staged = current
+            .staged_with_transport_profiles(requested)
+            .map_err(ConfigError::from)?;
+        let applied = self
+            .inner
+            .registry
+            .apply_replacement(
+                staged.slots.clone(),
+                staged.transport_profiles.clone(),
+                staged.device_profiles.clone(),
+            )
+            .await?;
+
+        match self.inner.config_store.save(&staged) {
+            Ok(()) => {
+                if let Err(commit) = applied.commit().await {
+                    return Err(compensate_commit_failure(
+                        &self.inner.config_store,
+                        &current,
+                        commit,
+                    ));
+                }
+                let revision = staged.config_revision;
+                *self.inner.config.write().await = staged.clone();
+                Ok((staged.transport_profiles, revision))
             }
             Err(save) => match applied.rollback().await {
                 Ok(()) => Err(ApiError::Config(save)),
@@ -150,6 +218,29 @@ impl AppState {
     }
 }
 
+fn ensure_expected_revision(expected: Option<u64>, actual: u64) -> Result<(), ApiError> {
+    if let Some(expected) = expected
+        && expected != actual
+    {
+        return Err(ApiError::ConfigRevisionMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+fn compensate_commit_failure(
+    store: &ConfigStore,
+    previous: &DaemonConfig,
+    commit: RegistryError,
+) -> ApiError {
+    match store.save(previous) {
+        Ok(()) => ApiError::Registry(commit),
+        Err(restore) => ApiError::ConfigCommitRestore {
+            commit: Box::new(commit),
+            restore,
+        },
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
@@ -157,10 +248,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ports", get(ports))
         .route("/api/v1/config/slots", put(configure_slots))
         .route(
+            "/api/v1/config/transport-profiles",
+            get(list_transport_profiles).put(configure_transport_profiles),
+        )
+        .route(
             "/api/v1/config/device-profiles",
             get(list_device_profiles).put(configure_device_profiles),
         )
         .route("/api/v1/archives", get(archives))
+        .route("/api/v1/diagnostics", get(diagnostics))
+        .route("/api/v1/diagnostics/storage", get(storage_diagnostics))
+        .route("/api/v1/slots/{slot_id}/diagnostics", get(slot_diagnostics))
         .route("/api/v1/slots/{slot_id}/events", get(events))
         .route("/api/v1/ws", get(websocket))
         .with_state(state)
@@ -182,6 +280,7 @@ async fn health(
             .elapsed()
             .as_millis()
             .min(u64::MAX as u128) as u64,
+        protocol_version: PROTOCOL_VERSION,
     }))
 }
 
@@ -194,6 +293,8 @@ async fn status(
     Ok(Json(StatusResponse {
         server_id: config.server_id,
         daemon_epoch: state.inner.daemon_epoch,
+        protocol_version: PROTOCOL_VERSION,
+        config_revision: config.config_revision,
         slots: state.inner.registry.snapshots().await,
     }))
 }
@@ -246,11 +347,49 @@ async fn configure_slots(
     // physical actors were staged. The spawned task must either commit all
     // three views or run the compensating rollback.
     let transaction = state.clone();
-    let slots =
-        tokio::spawn(async move { transaction.configure_slots_transaction(request.slots).await })
+    let (slots, config_revision) = tokio::spawn(async move {
+        transaction
+            .configure_slots_transaction(request.slots, request.expected_revision)
             .await
-            .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
-    Ok(Json(ConfigureSlotsResponse { slots }))
+    })
+    .await
+    .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
+    Ok(Json(ConfigureSlotsResponse {
+        slots,
+        config_revision,
+    }))
+}
+
+async fn list_transport_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<TransportProfileListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let config = state.inner.config.read().await;
+    Ok(Json(TransportProfileListResponse {
+        profiles: config.transport_profiles.clone(),
+        config_revision: config.config_revision,
+    }))
+}
+
+async fn configure_transport_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigureTransportProfilesRequest>,
+) -> Result<Json<ConfigureTransportProfilesResponse>, ApiError> {
+    state.authenticate(&headers, Role::Admin).await?;
+    let transaction = state.clone();
+    let (profiles, config_revision) = tokio::spawn(async move {
+        transaction
+            .configure_transport_profiles_transaction(request.profiles, request.expected_revision)
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
+    Ok(Json(ConfigureTransportProfilesResponse {
+        profiles,
+        config_revision,
+    }))
 }
 
 async fn list_device_profiles(
@@ -261,6 +400,7 @@ async fn list_device_profiles(
     let config = state.inner.config.read().await;
     Ok(Json(DeviceProfileListResponse {
         profiles: config.device_profiles.clone(),
+        config_revision: config.config_revision,
     }))
 }
 
@@ -273,14 +413,17 @@ async fn configure_device_profiles(
     // Mirror the Slot transaction: the spawned task completes the validate /
     // persist / publish sequence even if the HTTP request is cancelled.
     let transaction = state.clone();
-    let profiles = tokio::spawn(async move {
+    let (profiles, config_revision) = tokio::spawn(async move {
         transaction
-            .configure_device_profiles_transaction(request.profiles)
+            .configure_device_profiles_transaction(request.profiles, request.expected_revision)
             .await
     })
     .await
     .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
-    Ok(Json(ConfigureDeviceProfilesResponse { profiles }))
+    Ok(Json(ConfigureDeviceProfilesResponse {
+        profiles,
+        config_revision,
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -297,6 +440,84 @@ async fn archives(
     Ok(Json(
         state.inner.journal.list_archives(query.slot_id).await?,
     ))
+}
+
+async fn diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DaemonDiagnosticsResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let config = state.inner.config.read().await.clone();
+    let handles = state.inner.registry.handles().await;
+    let slots = handles
+        .into_iter()
+        .map(|handle| SlotDiagnostics {
+            snapshot: handle.snapshot(),
+            subscriber_count: handle.subscriber_count(),
+            subscriber_lag_events: handle.subscriber_lag_events(),
+        })
+        .collect::<Vec<_>>();
+    let mut journal = state.inner.journal.diagnostics().await?;
+    if slots
+        .iter()
+        .any(|slot| slot.snapshot.logging == serial_protocol::LoggingState::Degraded)
+    {
+        journal.logging = serial_protocol::LoggingState::Degraded;
+    }
+    Ok(Json(DaemonDiagnosticsResponse {
+        server_id: config.server_id,
+        daemon_epoch: state.inner.daemon_epoch,
+        uptime_ms: state
+            .inner
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+        config_revision: config.config_revision,
+        websocket_connections: MAX_WS_CONNECTIONS
+            .saturating_sub(state.inner.ws_connections.available_permits()),
+        websocket_limit: MAX_WS_CONNECTIONS,
+        journal,
+        slots,
+    }))
+}
+
+async fn storage_diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<StorageDiagnosticsResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let mut journal = state.inner.journal.diagnostics().await?;
+    if state
+        .inner
+        .registry
+        .snapshots()
+        .await
+        .iter()
+        .any(|slot| slot.logging == serial_protocol::LoggingState::Degraded)
+    {
+        journal.logging = serial_protocol::LoggingState::Degraded;
+    }
+    Ok(Json(StorageDiagnosticsResponse { journal }))
+}
+
+async fn slot_diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slot_id): Path<String>,
+) -> Result<Json<SlotDiagnostics>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let handle = state
+        .inner
+        .registry
+        .get(&slot_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id}")))?;
+    Ok(Json(SlotDiagnostics {
+        snapshot: handle.snapshot(),
+        subscriber_count: handle.subscriber_count(),
+        subscriber_lag_events: handle.subscriber_lag_events(),
+    }))
 }
 
 async fn events(
@@ -642,6 +863,26 @@ async fn dispatch_slot_command(
                 )
                 .await?
         }
+        ClientMessage::SendBreak {
+            control_id,
+            fence,
+            duration_ms,
+            operation_id,
+            expected_run_id,
+            ..
+        } => {
+            handle
+                .send_break(
+                    request_id,
+                    actor,
+                    control_id,
+                    fence,
+                    duration_ms,
+                    operation_id,
+                    expected_run_id,
+                )
+                .await?
+        }
         ClientMessage::TriggerStart {
             control_id,
             fence,
@@ -814,6 +1055,7 @@ fn spawn_live_forwarder(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    handle.record_subscriber_lag(skipped);
                     let head = handle.snapshot().head_seq;
                     let message = ServerMessage::Lagged {
                         slot_id: handle.id().into(),
@@ -840,6 +1082,7 @@ fn command_slot(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::ReleaseControl { slot_id, .. }
         | ClientMessage::CancelAcquire { slot_id, .. }
         | ClientMessage::Write { slot_id, .. }
+        | ClientMessage::SendBreak { slot_id, .. }
         | ClientMessage::TriggerStart { slot_id, .. }
         | ClientMessage::TriggerStatus { slot_id, .. }
         | ClientMessage::TriggerCancel { slot_id, .. }
@@ -931,14 +1174,18 @@ impl WsError {
                 | SlotError::TriggerEpochMismatch
                 | SlotError::TriggerGenerationMismatch
                 | SlotError::RequestIdReused => (ErrorCode::Conflict, false),
+                SlotError::ProfileChangeBusy => (ErrorCode::ProfileChangeBusy, false),
                 SlotError::WriteLeaseTooShort { .. } => (ErrorCode::Conflict, true),
                 SlotError::WriteResultExpired => (ErrorCode::IdempotencyExpired, false),
                 SlotError::WriteIdempotencyCapacity => (ErrorCode::ResourceExhausted, false),
                 SlotError::ControlQueueFull => (ErrorCode::ResourceExhausted, true),
                 SlotError::TriggerNotFound { .. } => (ErrorCode::NotFound, false),
+                SlotError::BreakUnsupported => (ErrorCode::BreakUnsupported, false),
+                SlotError::BreakFailed { .. } => (ErrorCode::PortIo, false),
                 SlotError::WriteTooLarge
                 | SlotError::EmptyWrite
                 | SlotError::WriteDeadlineExceeded { .. }
+                | SlotError::InvalidBreakDuration
                 | SlotError::InvalidTriggerAction
                 | SlotError::TriggerInitialWriteTooLarge
                 | SlotError::InvalidTriggerInterval
@@ -968,6 +1215,13 @@ pub enum ApiError {
         save: ConfigError,
         rollback: RegistryRollbackError,
     },
+    #[error(
+        "runtime commit failed ({commit}); restoring the previous persisted configuration also failed ({restore})"
+    )]
+    ConfigCommitRestore {
+        commit: Box<RegistryError>,
+        restore: ConfigError,
+    },
     #[error(transparent)]
     Journal(#[from] JournalError),
     #[error(transparent)]
@@ -976,42 +1230,53 @@ pub enum ApiError {
     NotFound(String),
     #[error("the seriald WebSocket connection limit has been reached")]
     TooManyConnections,
+    #[error("configuration revision mismatch: expected {expected}, current {actual}")]
+    ConfigRevisionMismatch { expected: u64, actual: u64 },
     #[error("{0}")]
     Internal(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self {
-            Self::Auth(AuthError::Forbidden) => StatusCode::FORBIDDEN,
-            Self::Auth(_) => StatusCode::UNAUTHORIZED,
-            Self::Config(ConfigError::Validation(_)) => StatusCode::BAD_REQUEST,
+        let (status, code) = match &self {
+            Self::Auth(AuthError::Forbidden) => (StatusCode::FORBIDDEN, ErrorCode::Forbidden),
+            Self::Auth(_) => (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized),
+            Self::Config(ConfigError::Validation(_)) => {
+                (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
+            }
             Self::Registry(
                 RegistryError::InvalidConfig(_) | RegistryError::IdentityLimit { .. },
-            ) => StatusCode::BAD_REQUEST,
+            ) => (StatusCode::BAD_REQUEST, ErrorCode::BadRequest),
+            Self::Registry(RegistryError::Slot(SlotError::ProfileChangeBusy)) => {
+                (StatusCode::CONFLICT, ErrorCode::ProfileChangeBusy)
+            }
             Self::Registry(RegistryError::Shutdown | RegistryError::Degraded) => {
-                StatusCode::SERVICE_UNAVAILABLE
+                (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable)
             }
             Self::Journal(JournalError::InvalidConfig(_) | JournalError::InvalidSlotId) => {
-                StatusCode::BAD_REQUEST
+                (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
             }
-            Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::TooManyConnections => StatusCode::TOO_MANY_REQUESTS,
+            Self::Journal(JournalError::InvalidRegex(_)) => {
+                (StatusCode::BAD_REQUEST, ErrorCode::RegexInvalid)
+            }
+            Self::Journal(JournalError::QueryBudgetExceeded { .. }) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::QueryBudgetExceeded,
+            ),
+            Self::NotFound(_) => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
+            Self::TooManyConnections => {
+                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::ResourceExhausted)
+            }
+            Self::ConfigRevisionMismatch { .. } => {
+                (StatusCode::CONFLICT, ErrorCode::ConfigRevisionMismatch)
+            }
             Self::Config(_)
             | Self::Registry(_)
             | Self::ConfigRollback { .. }
+            | Self::ConfigCommitRestore { .. }
             | Self::Journal(_)
             | Self::Slot(_)
-            | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        let code = match status {
-            StatusCode::UNAUTHORIZED => "unauthorized",
-            StatusCode::FORBIDDEN => "forbidden",
-            StatusCode::BAD_REQUEST => "bad_request",
-            StatusCode::NOT_FOUND => "not_found",
-            StatusCode::TOO_MANY_REQUESTS => "resource_exhausted",
-            StatusCode::SERVICE_UNAVAILABLE => "unavailable",
-            _ => "internal_error",
+            | Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
         };
         (
             status,
@@ -1035,7 +1300,7 @@ mod tests {
     use crate::config::{ConfigPaths, ConfigStore};
     use crate::control::ControlLimits;
     use crate::journal::{JournalConfig, JournalManager};
-    use serial_protocol::{SerialSettings, SlotConfig};
+    use serial_protocol::{SerialSettings, SlotConfig, TransportProfile};
 
     fn disabled_slot(id: &str, display_name: &str, port: &str) -> SlotConfig {
         SlotConfig {
@@ -1049,6 +1314,21 @@ mod tests {
                 auto_open: false,
                 ..SerialSettings::default()
             },
+        }
+    }
+
+    fn transport_profile(name: &str, baud_rate: u32) -> TransportProfile {
+        let settings = SerialSettings::default();
+        TransportProfile {
+            name: name.into(),
+            baud_rate,
+            data_bits: settings.data_bits,
+            parity: settings.parity,
+            stop_bits: settings.stop_bits,
+            flow_control: settings.flow_control,
+            dtr: settings.dtr,
+            rts: settings.rts,
+            auto_open: settings.auto_open,
         }
     }
 
@@ -1083,11 +1363,13 @@ mod tests {
         let journal =
             JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
                 .unwrap();
+        let initial_revision = loaded.config.config_revision;
         let registry = SlotRegistry::new(
             loaded.daemon_epoch,
             started,
             journal.handle(),
             loaded.config.slots.clone(),
+            loaded.config.transport_profiles.clone(),
             loaded.config.device_profiles.clone(),
             ControlLimits::default(),
         );
@@ -1101,14 +1383,121 @@ mod tests {
         );
         let requested = vec![disabled_slot("slot-1", "Slot 1", "COM3")];
 
-        let snapshots = state
-            .configure_slots_transaction(requested.clone())
+        let (snapshots, revision) = state
+            .configure_slots_transaction(requested.clone(), None)
             .await
             .unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].config, requested[0]);
+        assert_eq!(revision, initial_revision + 1);
         assert_eq!(state.inner.config.read().await.slots, requested);
         assert_eq!(store.load().unwrap().slots, requested);
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_configuration_revision_is_rejected_before_any_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let revision = loaded.config.config_revision;
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
+        let state = AppState::new(
+            store.clone(),
+            loaded.config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+
+        let error = state
+            .configure_slots_transaction(
+                vec![disabled_slot("slot-1", "Slot 1", "COM3")],
+                Some(revision + 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::ConfigRevisionMismatch {
+                expected,
+                actual
+            } if expected == revision + 1 && actual == revision
+        ));
+        assert!(state.inner.registry.snapshots().await.is_empty());
+        assert_eq!(state.inner.config.read().await.config_revision, revision);
+        assert_eq!(store.load().unwrap().config_revision, revision);
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_profile_update_publishes_effective_uart_settings_and_revision() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut loaded = store.load_or_create().unwrap();
+        let configured_slot = disabled_slot("slot-1", "Slot 1", "COM3");
+        store
+            .update_slots(&mut loaded.config, vec![configured_slot.clone()])
+            .unwrap();
+        let revision = loaded.config.config_revision;
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![configured_slot],
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
+        let state = AppState::new(
+            store.clone(),
+            loaded.config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+        let profile = transport_profile("generic-115200", 230_400);
+
+        let (profiles, updated_revision) = state
+            .configure_transport_profiles_transaction(vec![profile.clone()], Some(revision))
+            .await
+            .unwrap();
+        assert_eq!(profiles, vec![profile.clone()]);
+        assert_eq!(updated_revision, revision + 1);
+        assert_eq!(
+            store.load().unwrap().transport_profiles,
+            vec![profile.clone()]
+        );
+        let snapshot = state.inner.registry.get("slot-1").await.unwrap().snapshot();
+        assert_eq!(
+            snapshot.effective_transport.unwrap().baud_rate,
+            profile.baud_rate
+        );
+        // The Slot snapshot remains backward compatible; the effective bundle
+        // is authoritative when a transport catalog is attached.
+        assert_eq!(snapshot.config.settings.baud_rate, 115_200);
 
         state.shutdown().await;
         journal.shutdown().await.unwrap();
@@ -1129,6 +1518,7 @@ mod tests {
             journal.handle(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             ControlLimits::default(),
         );
         let state = AppState::new(
@@ -1141,10 +1531,13 @@ mod tests {
         );
 
         let error = state
-            .configure_slots_transaction(vec![
-                disabled_slot("slot-1", "One", "COM3"),
-                disabled_slot("slot-1", "Duplicate", "COM4"),
-            ])
+            .configure_slots_transaction(
+                vec![
+                    disabled_slot("slot-1", "One", "COM3"),
+                    disabled_slot("slot-1", "Duplicate", "COM4"),
+                ],
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1174,6 +1567,7 @@ mod tests {
             journal.handle(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             ControlLimits::default(),
         );
         let state = AppState::new(
@@ -1188,12 +1582,12 @@ mod tests {
         let second_state = state.clone();
         let first = async move {
             first_state
-                .configure_slots_transaction(vec![disabled_slot("slot-1", "First", "COM3")])
+                .configure_slots_transaction(vec![disabled_slot("slot-1", "First", "COM3")], None)
                 .await
         };
         let second = async move {
             second_state
-                .configure_slots_transaction(vec![disabled_slot("slot-1", "Second", "COM4")])
+                .configure_slots_transaction(vec![disabled_slot("slot-1", "Second", "COM4")], None)
                 .await
         };
         let (first, second) = tokio::join!(first, second);
@@ -1247,6 +1641,7 @@ mod tests {
             journal.handle(),
             old_slots.clone(),
             Vec::new(),
+            Vec::new(),
             ControlLimits::default(),
         );
         let state = AppState::new(
@@ -1262,7 +1657,7 @@ mod tests {
         store.set_save_failure(true);
 
         let error = state
-            .configure_slots_transaction(vec![disabled_slot("slot-new", "New", "COM4")])
+            .configure_slots_transaction(vec![disabled_slot("slot-new", "New", "COM4")], None)
             .await
             .unwrap_err();
         assert!(matches!(&error, ApiError::Config(ConfigError::Io { .. })));
@@ -1296,6 +1691,28 @@ mod tests {
         journal.shutdown().await.unwrap();
     }
 
+    #[test]
+    fn runtime_commit_failure_restores_previous_persisted_configuration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let previous = loaded.config;
+        let staged = previous
+            .staged_with_slots(vec![disabled_slot("slot-1", "Slot 1", "COM3")])
+            .unwrap();
+        store.save(&staged).unwrap();
+        assert_eq!(
+            store.load().unwrap().config_revision,
+            staged.config_revision
+        );
+
+        let error = compensate_commit_failure(&store, &previous, RegistryError::Shutdown);
+        assert!(matches!(error, ApiError::Registry(RegistryError::Shutdown)));
+        let restored = store.load().unwrap();
+        assert_eq!(restored.config_revision, previous.config_revision);
+        assert!(restored.slots.is_empty());
+    }
+
     fn sigmastar_profile() -> serial_protocol::DeviceProfile {
         serial_protocol::DeviceProfile {
             name: "sigmastar-evb".into(),
@@ -1303,6 +1720,8 @@ mod tests {
             uboot_prompt: Some("SigmaStar =>".into()),
             write_eol: Some("\n".into()),
             echo: Some(serial_protocol::EchoMode::Off),
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
         }
     }
 
@@ -1322,6 +1741,7 @@ mod tests {
             started,
             journal.handle(),
             vec![referencing.clone()],
+            Vec::new(),
             vec![sigmastar_profile()],
             ControlLimits::default(),
         );
@@ -1361,11 +1781,12 @@ mod tests {
         // and refreshes live snapshots without touching ports.
         let mut updated = sigmastar_profile();
         updated.uboot_prompt = Some("SigmaStar #".into());
-        let profiles = state
-            .configure_device_profiles_transaction(vec![updated.clone()])
+        let (profiles, revision) = state
+            .configure_device_profiles_transaction(vec![updated.clone()], None)
             .await
             .unwrap();
         assert_eq!(profiles, vec![updated.clone()]);
+        assert_eq!(revision, state.inner.config.read().await.config_revision);
         assert_eq!(
             state.inner.config.read().await.device_profiles,
             vec![updated.clone()]
@@ -1422,6 +1843,7 @@ mod tests {
             started,
             journal.handle(),
             slots.clone(),
+            Vec::new(),
             vec![old_profile.clone()],
             ControlLimits::default(),
         );
@@ -1452,7 +1874,7 @@ mod tests {
         updated.uboot_prompt = Some("SigmaStar #".into());
 
         let error = state
-            .configure_device_profiles_transaction(vec![updated])
+            .configure_device_profiles_transaction(vec![updated], None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1502,6 +1924,7 @@ mod tests {
             started,
             journal.handle(),
             vec![referencing],
+            Vec::new(),
             vec![sigmastar_profile()],
             ControlLimits::default(),
         );
@@ -1516,7 +1939,7 @@ mod tests {
 
         // Deleting a profile that a Slot still references fails validation.
         let error = state
-            .configure_device_profiles_transaction(Vec::new())
+            .configure_device_profiles_transaction(Vec::new(), None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1553,6 +1976,7 @@ mod tests {
             journal.handle(),
             vec![disabled_slot("slot-1", "Slot 1", "COM3")],
             Vec::new(),
+            Vec::new(),
             ControlLimits::default(),
         );
         let snapshot = registry.get("slot-1").await.unwrap().snapshot();
@@ -1560,6 +1984,74 @@ mod tests {
         assert!(snapshot.effective_uboot_prompt.is_none());
 
         registry.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_read_only_for_slots_and_journal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let admin_token = loaded
+            .initial_credentials
+            .as_ref()
+            .unwrap()
+            .admin_token()
+            .to_owned();
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![disabled_slot("slot-1", "Slot 1", "COM3")],
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
+        let state = AppState::new(
+            store,
+            loaded.config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+        let handle = state.inner.registry.get("slot-1").await.unwrap();
+        let before = handle.snapshot();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {admin_token}").parse().unwrap(),
+        );
+
+        let daemon = diagnostics(State(state.clone()), headers.clone())
+            .await
+            .unwrap()
+            .0;
+        let storage = storage_diagnostics(State(state.clone()), headers.clone())
+            .await
+            .unwrap()
+            .0;
+        let slot = slot_diagnostics(State(state.clone()), headers, Path("slot-1".to_owned()))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(daemon.slots.len(), 1);
+        assert_eq!(
+            daemon.config_revision,
+            state.inner.config.read().await.config_revision
+        );
+        assert_eq!(daemon.journal, storage.journal);
+        assert_eq!(slot.snapshot, before);
+        assert_eq!(slot.subscriber_count, 0);
+        assert_eq!(slot.subscriber_lag_events, 0);
+        assert_eq!(handle.snapshot(), before);
+
+        state.shutdown().await;
         journal.shutdown().await.unwrap();
     }
 }

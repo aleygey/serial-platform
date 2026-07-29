@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use serial_protocol::{ActorKind, Direction, EventKind, TimelineEvent, TriggerStatus};
 use unicode_width::UnicodeWidthChar;
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 
 /// Pads or truncates `value` to exactly `width` terminal display columns.
 /// CJK characters count as two columns; zero-width characters count as zero.
@@ -39,10 +39,20 @@ pub struct DisplayLine {
     /// Whole-line style for system/gap rows. `None` selects inline keyword and
     /// prompt highlighting (stream rows) at render time.
     pub solid_style: Option<Style>,
+    /// Run lifecycle rows are rendered as full-width scope boundaries while
+    /// the projected terminal cursor remains untouched.
+    pub run_boundary: Option<RunBoundary>,
     /// Set when the device echo of this TX row was received and merged: the
     /// renderer switches the leading marker from "●" to "✓".
     pub echoed: bool,
     pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunBoundary {
+    Started,
+    Ended,
+    Aborted,
 }
 
 /// The bounded amount of one unterminated terminal row retained in memory.
@@ -50,6 +60,12 @@ pub struct DisplayLine {
 /// allowing a single Slot to grow without limit.
 const MAX_STREAM_LINE_CHARS: usize = 16 * 1024;
 const MAX_CSI_PARAMETER_BYTES: usize = 64;
+/// A malformed remote control string must not hide an unbounded amount of
+/// later UART output. Legitimate OSC/DCS/SOS/PM/APC sequences are normally
+/// short and explicitly terminated; a larger one is discarded only up to
+/// this bound before ordinary text projection resumes.
+const MAX_CONTROL_STRING_BYTES: usize = 4 * 1024;
+const MAX_ESCAPE_INTERMEDIATE_BYTES: usize = 16;
 /// Maximum confirmed TX prefix retained while waiting for an exact device
 /// echo. This is bounded independently from the scrollback and write queues.
 const MAX_EXPECTED_ECHO_BYTES: usize = 64 * 1024;
@@ -471,7 +487,11 @@ fn terminal_boundary(kind: EventKind) -> bool {
 fn visible_terminal_annotation(kind: EventKind) -> bool {
     matches!(
         kind,
-        EventKind::TriggerStarted
+        EventKind::RunStarted
+            | EventKind::RunEnded
+            | EventKind::RunAborted
+            | EventKind::Break
+            | EventKind::TriggerStarted
             | EventKind::TriggerCompleted
             | EventKind::TriggerCancelled
             | EventKind::TriggerFailed
@@ -628,6 +648,7 @@ impl LineContext {
             source_style: self.source_style,
             marker_color: marker_color(self.direction, self.actor_kind),
             solid_style: solid_style(self.direction, self.kind),
+            run_boundary: None,
             echoed: self.echoed,
             text,
         }
@@ -653,12 +674,13 @@ struct TerminalTextState {
     utf8: Vec<u8>,
     escape: EscapeState,
     csi_parameters: Vec<u8>,
+    escape_payload_bytes: usize,
 }
 
 impl TerminalTextState {
     fn consume(&mut self, byte: u8, rows: &mut Vec<String>) {
         if self.escape != EscapeState::Ground {
-            self.consume_escape(byte);
+            self.consume_escape(byte, rows);
             return;
         }
 
@@ -675,11 +697,6 @@ impl TerminalTextState {
 
         match byte {
             0x1b => self.escape = EscapeState::Escape,
-            // Eight-bit C1 forms are accepted only when no UTF-8 scalar is in
-            // progress, so continuation bytes inside valid UTF-8 are safe.
-            0x9b => self.start_csi(),
-            0x90 | 0x98 | 0x9d | 0x9e | 0x9f => self.escape = EscapeState::ControlString,
-            0x9c => {}
             b'\n' => self.commit_row(rows),
             b'\r' => {
                 self.cursor = 0;
@@ -704,51 +721,117 @@ impl TerminalTextState {
         }
     }
 
-    fn consume_escape(&mut self, byte: u8) {
+    fn consume_escape(&mut self, byte: u8, rows: &mut Vec<String>) {
+        // ECMA-48 CAN/SUB cancel any in-progress escape or control string.
+        // They are safe synchronization points for a noisy UART stream.
+        if matches!(byte, 0x18 | 0x1a) {
+            self.reset_escape();
+            return;
+        }
         match self.escape {
             EscapeState::Ground => unreachable!("ground escapes are handled by consume"),
             EscapeState::Escape => match byte {
                 b'[' => self.start_csi(),
-                b']' | b'P' | b'X' | b'^' | b'_' => self.escape = EscapeState::ControlString,
-                0x20..=0x2f => self.escape = EscapeState::EscapeIntermediate,
-                0x1b => {}
-                _ => self.escape = EscapeState::Ground,
-            },
-            EscapeState::EscapeIntermediate => {
-                if byte == 0x1b {
-                    self.escape = EscapeState::Escape;
-                } else if (0x30..=0x7e).contains(&byte) {
-                    self.escape = EscapeState::Ground;
+                b']' | b'P' | b'X' | b'^' | b'_' => self.start_control_string(),
+                0x20..=0x2f => {
+                    self.escape_payload_bytes = 1;
+                    self.escape = EscapeState::EscapeIntermediate;
                 }
-            }
+                0x1b => self.escape_payload_bytes = 0,
+                _ => self.reset_escape(),
+            },
+            EscapeState::EscapeIntermediate => match byte {
+                0x1b => {
+                    self.escape_payload_bytes = 0;
+                    self.escape = EscapeState::Escape;
+                }
+                b'\r' | b'\n' => self.recover_escape_with(byte, rows),
+                0x20..=0x2f => {
+                    self.escape_payload_bytes += 1;
+                    if self.escape_payload_bytes > MAX_ESCAPE_INTERMEDIATE_BYTES {
+                        self.reset_escape();
+                    }
+                }
+                0x30..=0x7e => self.reset_escape(),
+                _ => self.recover_escape_with(byte, rows),
+            },
             EscapeState::Csi => {
                 if byte == 0x1b {
-                    self.csi_parameters.clear();
+                    self.reset_escape();
                     self.escape = EscapeState::Escape;
+                } else if matches!(byte, b'\r' | b'\n') {
+                    self.recover_escape_with(byte, rows);
                 } else if (0x40..=0x7e).contains(&byte) {
                     let parameters = std::mem::take(&mut self.csi_parameters);
-                    self.escape = EscapeState::Ground;
+                    self.reset_escape();
                     self.apply_csi(byte, &parameters);
-                } else if self.csi_parameters.len() < MAX_CSI_PARAMETER_BYTES {
+                } else if (0x20..=0x3f).contains(&byte)
+                    && self.csi_parameters.len() < MAX_CSI_PARAMETER_BYTES
+                {
                     self.csi_parameters.push(byte);
+                } else if (0x20..=0x3f).contains(&byte) {
+                    self.reset_escape();
+                } else {
+                    self.recover_escape_with(byte, rows);
                 }
             }
             EscapeState::ControlString => match byte {
-                0x07 | 0x9c => self.escape = EscapeState::Ground,
-                0x1b => self.escape = EscapeState::ControlStringEscape,
-                _ => {}
+                0x07 | 0x9c => self.reset_escape(),
+                b'\r' | b'\n' => self.recover_escape_with(byte, rows),
+                0x1b => {
+                    if self.bump_control_string() {
+                        self.escape = EscapeState::ControlStringEscape;
+                    }
+                }
+                _ => {
+                    self.bump_control_string();
+                }
             },
             EscapeState::ControlStringEscape => match byte {
-                b'\\' | 0x9c => self.escape = EscapeState::Ground,
-                0x1b => {}
-                _ => self.escape = EscapeState::ControlString,
+                b'\\' | 0x9c => self.reset_escape(),
+                b'\r' | b'\n' => self.recover_escape_with(byte, rows),
+                0x1b => {
+                    self.bump_control_string();
+                }
+                _ => {
+                    if self.bump_control_string() {
+                        self.escape = EscapeState::ControlString;
+                    }
+                }
             },
         }
     }
 
     fn start_csi(&mut self) {
         self.csi_parameters.clear();
+        self.escape_payload_bytes = 0;
         self.escape = EscapeState::Csi;
+    }
+
+    fn start_control_string(&mut self) {
+        self.escape_payload_bytes = 0;
+        self.escape = EscapeState::ControlString;
+    }
+
+    fn bump_control_string(&mut self) -> bool {
+        self.escape_payload_bytes += 1;
+        if self.escape_payload_bytes > MAX_CONTROL_STRING_BYTES {
+            self.reset_escape();
+            false
+        } else {
+            true
+        }
+    }
+
+    fn recover_escape_with(&mut self, byte: u8, rows: &mut Vec<String>) {
+        self.reset_escape();
+        self.consume(byte, rows);
+    }
+
+    fn reset_escape(&mut self) {
+        self.escape = EscapeState::Ground;
+        self.csi_parameters.clear();
+        self.escape_payload_bytes = 0;
     }
 
     fn apply_csi(&mut self, final_byte: u8, parameters: &[u8]) {
@@ -855,8 +938,7 @@ impl TerminalTextState {
     fn finish_input(&mut self) -> Vec<String> {
         let mut completed = Vec::new();
         self.drain_utf8(true, &mut completed);
-        self.escape = EscapeState::Ground;
-        self.csi_parameters.clear();
+        self.reset_escape();
         completed
     }
 
@@ -903,6 +985,12 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
         event.actor.as_ref().map(|actor| actor.kind),
     );
     let solid_style = solid_style(event.direction, event.kind);
+    let run_boundary = match event.kind {
+        EventKind::RunStarted => Some(RunBoundary::Started),
+        EventKind::RunEnded => Some(RunBoundary::Ended),
+        EventKind::RunAborted => Some(RunBoundary::Aborted),
+        _ => None,
+    };
     let text = sanitize_terminal_bytes(&event.data);
     let text = normalize_newlines(&text);
     let mut lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
@@ -922,6 +1010,7 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
             source_style,
             marker_color,
             solid_style,
+            run_boundary,
             echoed: false,
             text,
         })
@@ -941,6 +1030,7 @@ pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
                 .fg(Color::LightRed)
                 .add_modifier(Modifier::BOLD),
         ),
+        run_boundary: None,
         echoed: false,
         text,
     }
@@ -1151,6 +1241,7 @@ fn event_kind_label(kind: EventKind) -> &'static str {
         EventKind::TriggerCompleted => tr("d.ev.trigger_completed"),
         EventKind::TriggerCancelled => tr("d.ev.trigger_cancelled"),
         EventKind::TriggerFailed => tr("d.ev.trigger_failed"),
+        EventKind::Break => tr("d.ev.break"),
         EventKind::Checkpoint => tr("d.ev.checkpoint"),
         EventKind::LoggingDegraded => tr("d.ev.logging_degraded"),
         EventKind::Gap => tr("d.ev.gap"),
@@ -1358,7 +1449,49 @@ fn system_event_text(event: &TimelineEvent) -> String {
         .get("message")
         .and_then(|value| value.as_str())
     {
-        return message.to_string();
+        return safe_inline(message);
+    }
+    if matches!(
+        event.kind,
+        EventKind::RunStarted | EventKind::RunEnded | EventKind::RunAborted
+    ) {
+        let title = match event.kind {
+            EventKind::RunStarted => tr("d.run.start"),
+            EventKind::RunEnded => tr("d.run.end"),
+            EventKind::RunAborted => tr("d.run.abort"),
+            _ => unreachable!("guarded by matches"),
+        };
+        let run = event.metadata.get("run");
+        let label = run
+            .and_then(|value| value.get("label"))
+            .and_then(|value| value.as_str())
+            .map(safe_inline)
+            .filter(|value| !value.is_empty());
+        let short_id = run
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.chars().take(8).collect::<String>());
+        let reason = (event.kind == EventKind::RunAborted)
+            .then(|| event.metadata.get("reason"))
+            .flatten()
+            .and_then(|value| value.as_str())
+            .map(safe_inline)
+            .filter(|value| !value.is_empty());
+        return [Some(title.to_string()), label, short_id, reason]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
+    if event.kind == EventKind::Break {
+        return event
+            .metadata
+            .get("duration_ms")
+            .and_then(|value| value.as_u64())
+            .map_or_else(
+                || tr("d.ev.break").to_string(),
+                |duration| trf("d.break.duration", &[&duration.to_string()]),
+            );
     }
     if matches!(
         event.kind,
@@ -1551,6 +1684,35 @@ mod tests {
     }
 
     #[test]
+    fn run_lifecycle_is_a_visible_boundary_without_committing_the_prompt() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut parser = TerminalStreamParser::new();
+        let prompt = parser.push_event(&event_at(1, b"shell# "));
+        assert_eq!(prompt.pending.unwrap().text, "shell# ");
+
+        let run_id = Uuid::new_v4();
+        let mut started = event(&[]);
+        started.seq = 2;
+        started.direction = Direction::None;
+        started.kind = EventKind::RunStarted;
+        started.metadata.insert(
+            "run".into(),
+            serde_json::json!({"id": run_id, "label": "network-test"}),
+        );
+        let boundary = parser.push_event(&started);
+
+        assert!(!boundary.pending_committed);
+        assert_eq!(boundary.completed.len(), 1);
+        assert_eq!(
+            boundary.completed[0].run_boundary,
+            Some(RunBoundary::Started)
+        );
+        assert!(boundary.completed[0].text.contains("RUN START"));
+        assert!(boundary.completed[0].text.contains("network-test"));
+        assert_eq!(boundary.pending.unwrap().text, "shell# ");
+    }
+
+    #[test]
     fn trigger_status_uses_stable_protocol_spelling() {
         assert_eq!(
             trigger_status_label(TriggerStatus::WaitingForStart),
@@ -1685,6 +1847,125 @@ mod tests {
         let fourth = parser.push_event(&event_at(4, b"\\end\n"));
         assert_eq!(fourth.completed.len(), 1);
         assert_eq!(fourth.completed[0].text, "safe red end");
+    }
+
+    #[test]
+    fn field_invalid_utf8_cannot_poison_later_replay_or_live_rx() {
+        // Exact RX payload from the field incident at seq=206. The two
+        // isolated 0x98 bytes are part of an invalid UTF-8 filename. Older
+        // clients treated the first one as an unterminated C1 SOS and silently
+        // swallowed `meminfo`, the prompt, and every later replay/live event.
+        let field_payload = [
+            0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x6d, 0x3f, 0xa0, 0x3f, 0x40, 0xf8, 0x36, 0x40, 0x38,
+            0x3f, 0x40, 0x3f, 0x3f, 0x3f, 0x3f, 0x40, 0x40, 0x40, 0xd8, 0x3f, 0xd8, 0x3f, 0x3f,
+            0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x98,
+            0x3f, 0x98, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f,
+            0x3f, 0x3f, 0x1b, 0x5b, 0x6d, 0x0d, 0x0a, 0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x6d, 0x6d,
+            0x65, 0x6d, 0x69, 0x6e, 0x66, 0x6f, 0x1b, 0x5b, 0x6d, 0x0d, 0x0a, 0x5b, 0x72, 0x6f,
+            0x6f, 0x74, 0x40, 0x6c, 0x75, 0x63, 0x6b, 0x66, 0x6f, 0x78, 0x20, 0x72, 0x6f, 0x6f,
+            0x74, 0x5d, 0x23, 0x20,
+        ];
+        let mut parser = TerminalStreamParser::new();
+
+        let replay = parser.push_event(&event_at(206, &field_payload));
+        assert!(
+            replay.completed.iter().any(|line| line.text == "meminfo"),
+            "valid text after the invalid filename must remain visible"
+        );
+        assert_eq!(
+            replay.pending.as_ref().map(|line| line.text.as_str()),
+            Some("[root@luckfox root]# ")
+        );
+
+        let live = parser.push_event(&event_at(207, b"echo still-live\r\n"));
+        assert_eq!(
+            live.completed.last().map(|line| line.text.as_str()),
+            Some("[root@luckfox root]# echo still-live")
+        );
+    }
+
+    #[test]
+    fn isolated_eight_bit_c1_bytes_are_text_not_parser_state() {
+        let mut parser = TerminalStreamParser::new();
+        let batch = parser.push_event(&event_at(
+            1,
+            &[
+                0x90, 0x98, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, b'v', b'i', b's', b'i', b'b', b'l', b'e',
+                b'\n',
+            ],
+        ));
+
+        assert_eq!(batch.completed.len(), 1);
+        assert!(batch.completed[0].text.ends_with("visible"));
+        assert_eq!(
+            batch.completed[0]
+                .text
+                .chars()
+                .filter(|character| *character == '\u{fffd}')
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn unterminated_control_sequences_recover_without_hiding_later_rx() {
+        let mut parser = TerminalStreamParser::new();
+
+        let newline_recovery =
+            parser.push_event(&event_at(1, b"before\x1b]52;c;unterminated\r\nafter\n"));
+        assert_eq!(
+            newline_recovery
+                .completed
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"]
+        );
+
+        let mut oversized_osc = b"prefix\x1b]".to_vec();
+        oversized_osc.extend(std::iter::repeat_n(b'x', MAX_CONTROL_STRING_BYTES + 1));
+        oversized_osc.extend_from_slice(b"visible\n");
+        let bounded = parser.push_event(&event_at(2, &oversized_osc));
+        assert!(
+            bounded
+                .completed
+                .last()
+                .is_some_and(|line| line.text.ends_with("visible"))
+        );
+
+        let mut oversized_csi = b"left\x1b[".to_vec();
+        oversized_csi.extend(std::iter::repeat_n(b'1', MAX_CSI_PARAMETER_BYTES + 1));
+        oversized_csi.extend_from_slice(b"right\n");
+        let bounded = parser.push_event(&event_at(3, &oversized_csi));
+        assert!(
+            bounded
+                .completed
+                .last()
+                .is_some_and(|line| line.text.ends_with("right"))
+        );
+
+        for (seq, cancel) in [(4, 0x18), (5, 0x1a)] {
+            let cancelled = parser.push_event(&event_at(
+                seq,
+                &[
+                    b'b', b'e', b'f', b'o', b'r', b'e', 0x1b, b'P', b'h', b'i', b'd', b'd', b'e',
+                    b'n', cancel, b'a', b'f', b't', b'e', b'r', b'\n',
+                ],
+            ));
+            assert_eq!(
+                cancelled.completed.last().map(|line| line.text.as_str()),
+                Some("beforeafter")
+            );
+        }
+    }
+
+    #[test]
+    fn terminated_dcs_remains_safely_stripped() {
+        let mut parser = TerminalStreamParser::new();
+        let batch = parser.push_event(&event_at(1, b"left\x1bPprivate\x1b\\right\n"));
+
+        assert_eq!(batch.completed.len(), 1);
+        assert_eq!(batch.completed[0].text, "leftright");
     }
 
     #[test]

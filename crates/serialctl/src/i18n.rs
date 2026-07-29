@@ -92,8 +92,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "ui.queued",
-        " · QUEUED #{} ({}s, {} chunk(s); Ctrl-] c cancels)",
-        " · 排队中 #{}({} 秒, {} 块; Ctrl-] c 取消)",
+        " · QUEUED #{} ({}s, {} chunk(s); d/e edits LINE, c cancels)",
+        " · 排队中 #{}({} 秒, {} 块; d/e 修改 LINE, c 取消)",
     ),
     (
         "ui.control.pending",
@@ -119,11 +119,22 @@ static STRINGS: &[(&str, &str, &str)] = &[
         " 命令 · 回车发送并附加 Profile EOL ",
     ),
     (
+        "ui.input.title.line.queued",
+        " command · QUEUED {} · {} · Ctrl-] d/e/c delete/edit/cancel ",
+        " 命令 · 已排队 {} 条 · {} · Ctrl-] d/e/c 删除/编辑/取消 ",
+    ),
+    (
         "ui.input.raw.text",
         "Keystrokes are sent directly. Ctrl-C sends ETX; Ctrl-] opens local commands.",
         "按键直接发送。Ctrl-C 发送 ETX;Ctrl-] 打开本地命令。",
     ),
     ("ui.input.title.raw", " RAW direct transport ", " RAW 直传 "),
+    (
+        "ui.input.title.raw.queued",
+        " RAW direct transport · QUEUED {} byte(s) · Ctrl-] c cancels ",
+        " RAW 直传 · 已排队 {} 字节 · Ctrl-] c 取消 ",
+    ),
+    ("ui.input.queued.raw", "{} raw byte(s)", "{} 个原始字节"),
     (
         "ui.search.title",
         " history search · Enter accepts · Esc cancels ",
@@ -200,6 +211,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "  Ctrl-] c                 释放控制或取消排队输入",
     ),
     (
+        "help.queue.delete",
+        "  Ctrl-] d                 delete newest queued LINE command",
+        "  Ctrl-] d                 删除最新一条排队 LINE 命令",
+    ),
+    (
+        "help.queue.edit",
+        "  Ctrl-] e                 return newest queued LINE command to editor",
+        "  Ctrl-] e                 将最新排队 LINE 命令取回编辑框",
+    ),
+    (
         "help.follow",
         "  Ctrl-] f                 follow live output",
         "  Ctrl-] f                 跟随实时输出",
@@ -218,6 +239,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "help.byte",
         "  Ctrl-] Ctrl-]            send byte 0x1d",
         "  Ctrl-] Ctrl-]            发送字节 0x1d",
+    ),
+    (
+        "help.interrupt",
+        "  Ctrl-C                   send ETX (0x03); LINE draft is cleared",
+        "  Ctrl-C                   发送 ETX (0x03)；LINE 草稿会清空",
     ),
     (
         "help.quit",
@@ -490,8 +516,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.prefix.hint",
-        "command prefix: 1-9 Slot, l LINE, r RAW, PgUp/PgDn scroll, v detail, t takeover, c release/cancel, ? help",
-        "命令前缀: 1-9 Slot, l LINE, r RAW, PgUp/PgDn 滚动, v 详情, t 接管, c 释放/取消, ? 帮助",
+        "command prefix: 1-9 Slot, l/r mode, PgUp/PgDn scroll, t takeover, d/e queued delete/edit, c release/cancel, ? help",
+        "命令前缀: 1-9 Slot, l/r 模式, PgUp/PgDn 滚动, t 接管, d/e 删除/编辑排队命令, c 释放/取消, ? 帮助",
     ),
     (
         "st.line.mode",
@@ -524,11 +550,40 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "unknown prefix command; Ctrl-] ? opens help",
         "未知前缀命令;Ctrl-] ? 打开帮助",
     ),
-    ("st.input.cleared", "input cleared", "输入已清空"),
+    (
+        "st.queue.none",
+        "no queued LINE command to change",
+        "没有可修改的排队 LINE 命令",
+    ),
+    (
+        "st.queue.already.sending",
+        "the queued command is already being sent and can no longer be changed",
+        "排队命令已经开始发送，不能再修改",
+    ),
+    (
+        "st.queue.raw.only",
+        "the newest queued input is RAW bytes; use Ctrl-] c to cancel the queue",
+        "最新排队输入是 RAW 字节；请用 Ctrl-] c 取消队列",
+    ),
+    (
+        "st.queue.deleted",
+        "newest queued LINE command deleted",
+        "已删除最新一条排队 LINE 命令",
+    ),
+    (
+        "st.queue.restored",
+        "newest queued LINE command returned to the editor",
+        "已将最新一条排队 LINE 命令取回编辑框",
+    ),
     (
         "st.clipboard.copied",
         "copied {} character(s) from serial output",
         "已从串口输出复制 {} 个字符",
+    ),
+    (
+        "st.selection.ready",
+        "selected {} character(s); live output resumed, right-click output to copy",
+        "已选择 {} 个字符；实时输出已恢复，右键输出区即可复制",
     ),
     (
         "st.clipboard.copy.failed",
@@ -581,6 +636,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "write control disappeared before send",
         "写入控制在发送前消失",
     ),
+    (
+        "st.break.confirmed",
+        "BREAK confirmed at sequence {}",
+        "串口 BREAK 已确认，序号 {}",
+    ),
     // ---- display.rs labels ----
     ("d.dev", "DEV", "设备"),
     ("d.tx", "TX>", "发送>"),
@@ -609,6 +669,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("d.ev.run_started", "run_started", "运行开始"),
     ("d.ev.run_ended", "run_ended", "运行结束"),
     ("d.ev.run_aborted", "run_aborted", "运行中止"),
+    ("d.run.start", "RUN START", "运行开始"),
+    ("d.run.end", "RUN END", "运行结束"),
+    ("d.run.abort", "RUN ABORTED", "运行中止"),
     ("d.ev.trigger_started", "trigger_started", "触发任务已启动"),
     (
         "d.ev.trigger_completed",
@@ -621,6 +684,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "触发任务已取消",
     ),
     ("d.ev.trigger_failed", "trigger_failed", "触发任务失败"),
+    ("d.ev.break", "break", "串口 BREAK"),
+    ("d.break.duration", "BREAK · {} ms", "串口 BREAK · {} 毫秒"),
     ("d.ev.checkpoint", "checkpoint", "检查点"),
     ("d.ev.logging_degraded", "logging_degraded", "日志降级"),
     ("d.ev.gap", "gap", "空洞"),
@@ -653,6 +718,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("m.doctor.daemon", "daemon", "守护进程"),
     ("m.doctor.server", "server", "服务器"),
     ("m.doctor.epoch", "epoch", "epoch"),
+    ("m.doctor.protocol", "protocol", "协议"),
+    ("m.doctor.protocol.compatible", "compatible", "兼容"),
+    (
+        "m.doctor.protocol.mismatch",
+        "version mismatch",
+        "版本不匹配",
+    ),
     ("m.doctor.uptime", "uptime", "运行时长"),
     ("m.doctor.slots", "slots", "槽位"),
     ("m.token.configured", "configured", "已配置"),

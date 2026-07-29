@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -9,26 +9,28 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use serial_protocol::{
     Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
-    Direction, EchoMode, EventQuery, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
-    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
-    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
-    MAX_TRIGGER_TOTAL_BYTES, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, SessionState,
-    SlotSnapshot, TriggerInfo, TriggerSpec, TriggerStatus,
+    Direction, EchoMode, EventQuery, MAX_BREAK_DURATION_MS, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
+    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
+    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
+    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, PROTOCOL_VERSION, SessionState, SlotSnapshot,
+    StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
 };
 use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::{
     api::ApiClient,
-    capture::{Capture, CaptureOptions, CommandBoundary, Completion},
+    capture::{Capture, CaptureOptions, CommandBoundary, Completion, CompletionPattern},
     config::CaptureLimits,
-    render::{MatchExcerptOptions, RenderOptions, render_events},
+    render::{MatchExcerptOptions, MatchExcerptPattern, RenderOptions, render_events},
     session::SessionHandle,
 };
 
 const DEFAULT_TEXT_CHARS: usize = 16_000;
-const MAX_TEXT_CHARS: usize = 64_000;
 const MAX_WRITE_BYTES: usize = 4096;
+const MAX_REGEX_BYTES: usize = 4096;
 const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
 const TRIGGER_STATUS_MARGIN: Duration =
     Duration::from_millis(MAX_PHYSICAL_WRITE_TIMEOUT_MS + 5_000);
@@ -40,7 +42,8 @@ pub struct AgentTools {
     session: SessionHandle,
     actor_label: String,
     capture_limits: CaptureLimits,
-    live_cursors: Arc<Mutex<BTreeMap<String, Cursor>>>,
+    live_cursors: Arc<StdMutex<BTreeMap<String, Cursor>>>,
+    write_locks: Arc<StdMutex<BTreeMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl AgentTools {
@@ -55,7 +58,8 @@ impl AgentTools {
             session,
             actor_label,
             capture_limits,
-            live_cursors: Arc::new(Mutex::new(BTreeMap::new())),
+            live_cursors: Arc::new(StdMutex::new(BTreeMap::new())),
+            write_locks: Arc::new(StdMutex::new(BTreeMap::new())),
         }
     }
 
@@ -64,6 +68,8 @@ impl AgentTools {
             "devices" => self.devices(parse(arguments)?).await,
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,
+            "input" => self.input(parse(arguments)?).await,
+            "signal" => self.signal(parse(arguments)?).await,
             "trigger" => self.trigger(parse(arguments)?).await,
             "wait" => self.wait(parse(arguments)?).await,
             "search" => self.search(parse(arguments)?).await,
@@ -75,7 +81,7 @@ impl AgentTools {
     }
 
     async fn devices(&self, args: DevicesArgs) -> Result<Value> {
-        let status = self.api.status().await?;
+        let status = self.status().await?;
         let mut slots: Vec<Value> = status
             .slots
             .iter()
@@ -96,9 +102,28 @@ impl AgentTools {
     }
 
     async fn read(&self, args: ReadArgs) -> Result<Value> {
-        validate_operation_filter(args.operation_id, args.direction)?;
         let slot = self.slot(&args.slot_id).await?;
-        let (epoch, after_seq) = read_window(args.epoch, args.after_seq, args.tail_events, &slot)?;
+        let scope = args.scope.as_deref().unwrap_or("tail");
+        let (epoch, after_seq) = match scope {
+            "tail" => read_window(None, None, Some(200), &slot)?,
+            "continue" => {
+                let cursor = self.live_cursor(&slot.config.id).unwrap_or(Cursor {
+                    epoch: slot.daemon_epoch,
+                    after_seq: slot.head_seq,
+                });
+                if cursor.epoch != slot.daemon_epoch {
+                    (slot.daemon_epoch, Some(slot.head_seq))
+                } else {
+                    (cursor.epoch, Some(cursor.after_seq.min(slot.head_seq)))
+                }
+            }
+            "archive" => (
+                args.epoch
+                    .context("scope=archive requires an explicit epoch")?,
+                args.after_seq,
+            ),
+            _ => bail!("scope must be tail, continue, or archive"),
+        };
         let response = self
             .api
             .events(
@@ -108,38 +133,54 @@ impl AgentTools {
                     after_seq,
                     before_wall_time_ns: None,
                     after_wall_time_ns: None,
-                    direction: args.direction,
+                    direction: None,
                     kind: None,
                     actor_id: None,
                     run_id: None,
-                    operation_id: args.operation_id,
+                    operation_id: None,
                     contains: None,
-                    limit_events: Some(args.limit_events.unwrap_or(1000).clamp(1, 2000)),
-                    limit_bytes: Some(args.limit_bytes.unwrap_or(512 * 1024).clamp(1, 1024 * 1024)),
+                    regex: None,
+                    limit_events: Some(1000),
+                    limit_bytes: Some(512 * 1024),
                 },
             )
             .await?;
-        Ok(render_response(
+        let output = render_response(
             &slot,
             epoch,
             response,
             RenderOptions {
-                max_chars: max_chars(args.max_chars),
-                include_raw: args.include_raw,
+                max_chars: DEFAULT_TEXT_CHARS,
+                include_raw: false,
                 echo: None,
-                collapse_repeats: args.collapse_repeats,
-                include_events: args.include_events,
+                collapse_repeats: true,
+                include_events: false,
                 match_excerpt: None,
             },
-            "tail_or_cursor",
-        ))
+            scope,
+        );
+        if output["cursor"]["epoch"] == json!(slot.daemon_epoch)
+            && let Some(after_seq) = output["cursor"]["after_seq"].as_u64()
+        {
+            self.remember_live_cursor(
+                &slot.config.id,
+                Cursor {
+                    epoch: slot.daemon_epoch,
+                    after_seq,
+                },
+            );
+        }
+        Ok(output)
     }
 
     async fn search(&self, args: SearchArgs) -> Result<Value> {
-        if args.contains.trim().is_empty() {
-            bail!("contains must not be empty");
+        if args.query.trim().is_empty() {
+            bail!("query must not be empty");
         }
-        validate_operation_filter(args.operation_id, args.direction)?;
+        let compiled_regex = args
+            .regex
+            .then(|| compile_regex(&args.query, "query"))
+            .transpose()?;
         let slot = self.slot(&args.slot_id).await?;
         let scope = args.scope.as_deref().unwrap_or("current_run");
         let (epoch, after_seq, run_id) = match scope {
@@ -150,7 +191,8 @@ impl AgentTools {
             }
             "current_cursor" => {
                 let cursor = requested_cursor(args.epoch, args.after_seq, &slot)?
-                    .context("scope=current_cursor requires epoch and after_seq")?;
+                    .or_else(|| self.live_cursor(&slot.config.id))
+                    .context("scope=current_cursor has no remembered cursor; call read/run_start first or pass epoch and after_seq")?;
                 (cursor.epoch, Some(cursor.after_seq), args.run_id)
             }
             "archive" => {
@@ -162,26 +204,22 @@ impl AgentTools {
             }
             _ => bail!("scope must be current_run, current_cursor, or archive"),
         };
-        let response = self
-            .api
-            .events(
-                &args.slot_id,
-                &EventQuery {
-                    epoch: Some(epoch),
-                    after_seq,
-                    before_wall_time_ns: None,
-                    after_wall_time_ns: None,
-                    direction: args.direction,
-                    kind: None,
-                    actor_id: None,
-                    run_id,
-                    operation_id: args.operation_id,
-                    contains: Some(args.contains.clone()),
-                    limit_events: Some(args.limit_events.unwrap_or(200).clamp(1, 1000)),
-                    limit_bytes: Some(args.limit_bytes.unwrap_or(512 * 1024).clamp(1, 1024 * 1024)),
-                },
-            )
-            .await?;
+        let query = EventQuery {
+            epoch: Some(epoch),
+            after_seq,
+            before_wall_time_ns: None,
+            after_wall_time_ns: None,
+            direction: None,
+            kind: None,
+            actor_id: None,
+            run_id,
+            operation_id: None,
+            contains: (!args.regex).then(|| args.query.clone()),
+            regex: args.regex.then(|| args.query.clone()),
+            limit_events: Some(1000),
+            limit_bytes: Some(1024 * 1024),
+        };
+        let response = self.api.events(&args.slot_id, &query).await?;
         let no_matches = response.events.is_empty();
         let truncated = response.truncated;
         let mut output = render_response(
@@ -189,21 +227,26 @@ impl AgentTools {
             epoch,
             response,
             RenderOptions {
-                max_chars: max_chars(args.max_chars),
-                include_raw: args.include_raw,
+                max_chars: DEFAULT_TEXT_CHARS,
+                include_raw: false,
                 echo: None,
-                collapse_repeats: args.collapse_repeats,
-                include_events: args.include_events,
-                match_excerpt: Some(MatchExcerptOptions {
-                    literal: &args.contains,
-                    context_lines: args.context_lines.unwrap_or(5).min(50),
-                }),
+                collapse_repeats: true,
+                include_events: false,
+                match_excerpt: if args.regex {
+                    compiled_regex.as_ref().map(|regex| MatchExcerptOptions {
+                        pattern: MatchExcerptPattern::Regex(regex),
+                        context_lines: 5,
+                    })
+                } else {
+                    Some(MatchExcerptOptions {
+                        pattern: MatchExcerptPattern::Literal(&args.query),
+                        context_lines: 5,
+                    })
+                },
             },
             scope,
         );
-        if let Some(run_id) = run_id {
-            output["run_id"] = json!(run_id);
-        }
+        output["matched"] = json!(!no_matches);
         if truncated {
             attach_search_continuation_guidance(&mut output, scope, run_id);
         } else if no_matches {
@@ -252,14 +295,11 @@ impl AgentTools {
 
     async fn wait(&self, args: WaitArgs) -> Result<Value> {
         let slot = self.slot_online(&args.slot_id).await?;
-        let complete_on_quiet = args.contains.is_none();
-        let explicit_cursor = requested_cursor(args.epoch, args.after_seq, &slot)?;
-        let remembered_cursor = if explicit_cursor.is_none() {
-            self.live_cursor(&slot.config.id)
-        } else {
-            None
-        };
-        let (cursor, cursor_source) = select_wait_cursor(explicit_cursor, remembered_cursor, &slot);
+        let (patterns, until_regex, completion_mode) =
+            requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
+        let complete_on_quiet = completion_mode == "quiet";
+        let remembered_cursor = self.live_cursor(&slot.config.id);
+        let (cursor, _) = select_wait_cursor(None, remembered_cursor, &slot);
         let started_epoch = cursor.epoch;
         let started_after_seq = cursor.after_seq;
         let capture = Capture::attach(
@@ -274,22 +314,21 @@ impl AgentTools {
         let result = capture
             .collect(CaptureOptions {
                 timeout: seconds(args.timeout_seconds, 10, 1, 120),
-                quiet: millis(args.quiet_ms, 300, 50, 5000),
-                patterns: args.contains.into_iter().collect(),
-                until_regex: None,
+                quiet: Duration::from_millis(1_000),
+                patterns,
+                until_regex,
                 complete_on_quiet,
                 allow_empty_quiet: false,
             })
             .await;
-        let with_events = args.include_events || args.include_raw;
         let rendered = render_events(
             &result.events,
             RenderOptions {
-                max_chars: max_chars(args.max_chars),
-                include_raw: args.include_raw,
+                max_chars: DEFAULT_TEXT_CHARS,
+                include_raw: false,
                 echo: None,
-                collapse_repeats: args.collapse_repeats,
-                include_events: args.include_events,
+                collapse_repeats: true,
+                include_events: false,
                 match_excerpt: None,
             },
         );
@@ -301,21 +340,37 @@ impl AgentTools {
                 after_seq: last_seq,
             },
         );
+        let gap = !result.gaps.is_empty();
+        let truncated = result.truncated || rendered.text_truncated;
+        let confidence = capture_confidence(&result.completion, truncated, gap);
         let mut output = json!({
-            "slot_id": slot.config.id, "epoch": started_epoch, "after_seq": last_seq,
-            "cursor_source": cursor_source.label(), "started_after_seq": started_after_seq,
-            "completion": result.completion.label(), "complete": result.completion.is_complete(),
+            "slot_id": slot.config.id,
+            "capture": completion_kind(&result.completion),
+            "confidence": confidence,
             "text": rendered.text,
-            "capture_truncated": result.truncated, "text_truncated": rendered.text_truncated,
-            "repeated_lines_collapsed": rendered.repeated_lines_collapsed, "gaps": result.gaps
+            "truncated": truncated,
+            "gap": gap,
+            "cursor": {"epoch": started_epoch, "after_seq": last_seq}
         });
-        if with_events {
-            output["events"] = json!(rendered.events);
-        }
+        attach_capture_warnings(
+            &mut output,
+            &result.completion,
+            result.truncated,
+            rendered.text_truncated,
+            gap,
+            false,
+            false,
+            result
+                .events
+                .iter()
+                .all(|event| event.direction != Direction::Rx),
+        );
+        attach_omission(&mut output, &rendered);
         Ok(output)
     }
 
     async fn command(&self, args: CommandArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
         let expected_run_id = slot
             .active_run
@@ -337,15 +392,11 @@ impl AgentTools {
             self.capture_limits,
         )
         .await?;
-        let bytes = compose_write_bytes(
-            &args.command,
-            args.eol.as_deref(),
-            effective_write_eol(&slot),
-        )?;
+        let bytes = compose_write_bytes(&args.command, effective_write_eol(&slot))?;
 
-        let until_regex = compile_until_regex(args.until_regex.as_deref())?;
-        let (patterns, completion_mode) = completion_patterns(&args, &slot)?;
-        // completion_patterns makes an explicit regex the sole authoritative
+        let (patterns, until_regex, completion_mode) =
+            requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
+        // requested_completion makes an explicit regex the sole authoritative
         // boundary, so neither a configured prompt nor quiet can pre-empt it.
         let complete_on_quiet = completion_mode == "quiet";
         let echo_mode = effective_echo_mode(&slot);
@@ -358,14 +409,14 @@ impl AgentTools {
                 bytes,
                 operation_id,
                 expected_run_id,
-                None,
+                effective_write_pacing(&slot),
             )
             .await?;
         let result = capture
             .collect_after_write(
                 CaptureOptions {
                     timeout: seconds(args.timeout_seconds, 10, 1, 120),
-                    quiet: millis(args.quiet_ms, 300, 50, 5000),
+                    quiet: Duration::from_millis(1_000),
                     patterns,
                     until_regex,
                     complete_on_quiet,
@@ -381,17 +432,16 @@ impl AgentTools {
                 },
             )
             .await;
-        let with_events = args.include_events || args.include_raw;
         let rendered = render_events(
             &result.events,
             RenderOptions {
-                max_chars: max_chars(args.max_chars),
-                include_raw: args.include_raw,
+                max_chars: DEFAULT_TEXT_CHARS,
+                include_raw: false,
                 // collect_after_write has already consumed the complete
                 // authoritative echo while arming the completion watcher.
                 echo: None,
-                collapse_repeats: args.collapse_repeats,
-                include_events: args.include_events,
+                collapse_repeats: true,
+                include_events: false,
                 match_excerpt: None,
             },
         );
@@ -401,29 +451,22 @@ impl AgentTools {
             .context("command capture lost its authoritative write boundary")?;
         let interfered = boundary.interfered;
         let echo_missing = boundary.echo_required && !boundary.echo_observed;
-        let suspected_input_loss = echo_missing;
-        let delivery_confidence = if interfered {
-            "interfered"
-        } else if echo_missing {
-            "uncertain"
-        } else if boundary.echo_observed {
-            "echo_confirmed"
-        } else {
-            "serial_write_confirmed"
-        };
         let last_seq = result.through_seq.unwrap_or(write.event_seq);
         let rx_event_count = result
             .events
             .iter()
             .filter(|event| event.direction == Direction::Rx)
             .count();
-        let rx_byte_count: usize = result
-            .events
-            .iter()
-            .filter(|event| event.direction == Direction::Rx)
-            .map(|event| event.data.len())
-            .sum();
-        let completion_evidence = completion_evidence(&result.completion);
+        let gap = !result.gaps.is_empty();
+        let truncated = result.truncated || rendered.text_truncated;
+        let confidence = command_confidence(
+            &result.completion,
+            truncated,
+            gap,
+            interfered,
+            echo_missing,
+            rx_event_count,
+        );
         self.remember_live_cursor(
             &slot.config.id,
             Cursor {
@@ -432,49 +475,132 @@ impl AgentTools {
             },
         );
         let mut output = json!({
-            "slot_id": slot.config.id, "epoch": slot.daemon_epoch, "after_seq": last_seq,
-            "request_id": write.request_id, "run_id": expected_run_id,
-            "operation_id": operation_id, "tx_event_seq": write.event_seq,
-            "actor": write.actor, "completion_mode": completion_mode,
-            "completion": result.completion.label(), "complete": result.completion.is_complete(),
-            "completion_evidence": completion_evidence, "execution_status": "unknown",
-            "interfered": interfered, "echo_missing": echo_missing,
-            "suspected_input_loss": suspected_input_loss,
-            "delivery_confidence": delivery_confidence, "text": rendered.text,
-            "capture_window": {
-                "attached_after_seq": capture_after_seq,
-                "after_seq": write.event_seq, "through_seq": last_seq,
-                "rx_event_count": rx_event_count, "rx_byte_count": rx_byte_count
-            },
-            "prewrite_activity": {
-                "observed": boundary.prewrite_activity.event_count > 0,
-                "first_seq": boundary.prewrite_activity.first_seq,
-                "through_seq": boundary.prewrite_activity.through_seq,
-                "event_count": boundary.prewrite_activity.event_count,
-                "rx_event_count": boundary.prewrite_activity.rx_event_count,
-                "rx_byte_count": boundary.prewrite_activity.rx_byte_count,
-                "tx_event_count": boundary.prewrite_activity.tx_event_count
-            },
-            "boundary": {
-                "confidence": boundary.confidence(&result.completion),
-                "tx_event_seq": write.event_seq,
-                "tx_audit_observed_in_capture": boundary.tx_audit_observed,
-                "echo_required": boundary.echo_required,
-                "echo_observed": boundary.echo_observed,
-                "discarded_rx_event_count": boundary.discarded_rx_event_count,
-                "discarded_rx_byte_count": boundary.discarded_rx_byte_count
-            },
-            "capture_truncated": result.truncated, "text_truncated": rendered.text_truncated,
-            "repeated_lines_collapsed": rendered.repeated_lines_collapsed, "gaps": result.gaps,
-            "guidance": command_guidance(&result.completion, interfered, echo_missing)
+            "slot_id": slot.config.id,
+            "write": if echo_missing { "uncertain" } else { "confirmed" },
+            "capture": completion_kind(&result.completion),
+            "execution": "unknown",
+            "confidence": confidence,
+            "text": rendered.text,
+            "truncated": truncated,
+            "gap": gap,
+            "interfered": interfered,
+            "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
         });
-        if with_events {
-            output["events"] = json!(rendered.events);
-        }
+        attach_capture_warnings(
+            &mut output,
+            &result.completion,
+            result.truncated,
+            rendered.text_truncated,
+            gap,
+            interfered,
+            echo_missing,
+            rx_event_count == 0,
+        );
+        attach_omission(&mut output, &rendered);
         Ok(output)
     }
 
+    async fn input(&self, args: InputArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
+        let slot = self.slot_online(&args.slot_id).await?;
+        let bytes = args.text.into_bytes();
+        if bytes.is_empty() {
+            bail!("input text must not be empty");
+        }
+        if bytes.len() > MAX_WRITE_BYTES {
+            bail!("input text exceeds {MAX_WRITE_BYTES} UTF-8 bytes");
+        }
+        self.write_raw(&slot, bytes, "input").await
+    }
+
+    async fn signal(&self, args: SignalArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
+        let slot = self.slot_online(&args.slot_id).await?;
+        if args.signal == "break" {
+            let duration_ms = args.duration_ms.unwrap_or(250);
+            if !(MIN_BREAK_DURATION_MS..=MAX_BREAK_DURATION_MS).contains(&duration_ms) {
+                bail!(
+                    "duration_ms must be between {MIN_BREAK_DURATION_MS} and \
+                     {MAX_BREAK_DURATION_MS}"
+                );
+            }
+            return self.send_break(&slot, duration_ms).await;
+        }
+        if args.duration_ms.is_some() {
+            bail!("duration_ms is valid only for signal=break");
+        }
+        let byte = control_signal_byte(&args.signal)
+            .context("signal must be ctrl_c, ctrl_d, ctrl_z, or break")?;
+        self.write_raw(&slot, vec![byte], &args.signal).await
+    }
+
+    async fn send_break(&self, slot: &SlotSnapshot, duration_ms: u64) -> Result<Value> {
+        let expected_run_id = slot
+            .active_run
+            .as_ref()
+            .map(|run| run.id)
+            .context("no active Run; call run_start before signal")?;
+        let operation_id = Uuid::new_v4();
+        let sent = self
+            .session
+            .send_break(
+                slot.config.id.clone(),
+                duration_ms,
+                operation_id,
+                expected_run_id,
+            )
+            .await?;
+        self.remember_live_cursor(
+            &slot.config.id,
+            Cursor {
+                epoch: slot.daemon_epoch,
+                after_seq: sent.event_seq,
+            },
+        );
+        Ok(json!({
+            "slot_id": slot.config.id,
+            "write": "confirmed",
+            "kind": "break",
+            "cursor": {"epoch": slot.daemon_epoch, "after_seq": sent.event_seq}
+        }))
+    }
+
+    async fn write_raw(&self, slot: &SlotSnapshot, bytes: Vec<u8>, label: &str) -> Result<Value> {
+        let expected_run_id = slot
+            .active_run
+            .as_ref()
+            .map(|run| run.id)
+            .context("no active Run; call run_start before input/signal")?;
+        let operation_id = Uuid::new_v4();
+        let byte_count = bytes.len();
+        let write = self
+            .session
+            .write(
+                slot.config.id.clone(),
+                bytes,
+                operation_id,
+                expected_run_id,
+                effective_write_pacing(slot),
+            )
+            .await?;
+        self.remember_live_cursor(
+            &slot.config.id,
+            Cursor {
+                epoch: slot.daemon_epoch,
+                after_seq: write.event_seq,
+            },
+        );
+        Ok(json!({
+            "slot_id": slot.config.id,
+            "write": "confirmed",
+            "kind": label,
+            "bytes": byte_count,
+            "cursor": {"epoch": slot.daemon_epoch, "after_seq": write.event_seq}
+        }))
+    }
+
     async fn trigger(&self, args: TriggerArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
         let expected_run_id = slot
             .active_run
@@ -598,11 +724,6 @@ impl AgentTools {
             .await
             .unwrap_or(false);
 
-        let pretrigger_events: Vec<_> = capture
-            .events
-            .iter()
-            .filter(|event| event.seq < terminal.start_seq)
-            .collect();
         let trigger_events: Vec<_> = capture
             .events
             .iter()
@@ -611,19 +732,14 @@ impl AgentTools {
             })
             .cloned()
             .collect();
-        let pretrigger_rx_bytes: usize = pretrigger_events
-            .iter()
-            .filter(|event| event.direction == Direction::Rx)
-            .map(|event| event.data.len())
-            .sum();
         let rendered = render_events(
             &trigger_events,
             RenderOptions {
-                max_chars: max_chars(args.max_chars),
-                include_raw: args.include_raw,
+                max_chars: DEFAULT_TEXT_CHARS,
+                include_raw: false,
                 echo: None,
-                collapse_repeats: args.collapse_repeats,
-                include_events: args.include_events,
+                collapse_repeats: true,
+                include_events: false,
                 match_excerpt: None,
             },
         );
@@ -640,63 +756,55 @@ impl AgentTools {
             .matched_pattern
             .as_deref()
             .map(|pattern| String::from_utf8_lossy(pattern).into_owned());
-        let with_events = args.include_events || args.include_raw;
         let outcome = trigger_status_label(terminal.status);
         let capture_complete = !capture.truncated
             && capture.gaps.is_empty()
             && matches!(&capture.completion, Completion::Signal(_))
             && observed_through_seq.is_some_and(|through| through >= terminal_end_seq);
-        let guidance = if run_ownership_retained {
-            trigger_guidance(terminal.status).to_owned()
+        let gap = !capture.gaps.is_empty();
+        let truncated = capture.truncated || rendered.text_truncated;
+        let confidence = if gap {
+            "unreliable"
+        } else if truncated || !capture_complete {
+            "partial"
         } else {
-            format!(
-                "{} The MCP control connection no longer retains this Run/lease. Check devices \
-                 until the old Run is no longer active, then call run_start and initialize device \
-                 state explicitly before any further write.",
-                trigger_guidance(terminal.status)
-            )
+            "high"
         };
         let mut output = json!({
             "slot_id": slot.config.id,
-            "epoch": slot.daemon_epoch,
-            "after_seq": last_seq,
-            "trigger_id": terminal.id,
-            "operation_id": operation_id,
-            "run_id": expected_run_id,
-            "mcp_run_ownership_retained": run_ownership_retained,
             "outcome": outcome,
             "matched": terminal.status.is_matched(),
-            "matched_pattern": matched_pattern,
-            "fires_confirmed": terminal.fires_confirmed,
-            "tx_bytes_confirmed": terminal.tx_bytes_confirmed,
-            "start_seq": terminal.start_seq,
-            "end_seq": terminal_end_seq,
-            "last_write_seq": terminal.last_write_seq,
-            "capture_window": {
-                "attached_after_seq": attached_after_seq,
-                "after_seq": terminal.start_seq.saturating_sub(1),
-                "through_seq": terminal_end_seq,
-                "observed_through_seq": observed_through_seq,
-                "completion": capture.completion.label()
-            },
-            "pretrigger_activity": {
-                "observed": !pretrigger_events.is_empty(),
-                "event_count": pretrigger_events.len(),
-                "rx_byte_count": pretrigger_rx_bytes,
-                "first_seq": pretrigger_events.first().map(|event| event.seq),
-                "through_seq": pretrigger_events.last().map(|event| event.seq)
-            },
+            "fires": terminal.fires_confirmed,
+            "confidence": confidence,
             "text": rendered.text,
-            "capture_complete": capture_complete,
-            "capture_truncated": capture.truncated,
-            "text_truncated": rendered.text_truncated,
-            "repeated_lines_collapsed": rendered.repeated_lines_collapsed,
-            "gaps": capture.gaps,
-            "guidance": guidance
+            "truncated": truncated,
+            "gap": gap,
+            "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
         });
-        if with_events {
-            output["events"] = json!(rendered.events);
+        if let Some(matched_pattern) = matched_pattern {
+            output["matched_pattern"] = json!(matched_pattern);
         }
+        let mut warnings = Vec::new();
+        if gap {
+            warnings.push("RX gap; Trigger evidence is unreliable".to_string());
+        }
+        if capture.truncated {
+            warnings.push("Trigger capture hit its hard limit".to_string());
+        }
+        if !capture_complete {
+            warnings
+                .push("Trigger terminal sequence was not fully observed by capture".to_string());
+        }
+        if !run_ownership_retained {
+            warnings.push("MCP no longer owns the Run; start a new Run before writing".to_string());
+        }
+        if !terminal.status.is_matched() {
+            warnings.push(trigger_guidance(terminal.status).to_string());
+        }
+        if !warnings.is_empty() {
+            output["warnings"] = json!(warnings);
+        }
+        attach_omission(&mut output, &rendered);
         Ok(output)
     }
 
@@ -771,6 +879,7 @@ impl AgentTools {
     }
 
     async fn run_start(&self, args: RunStartArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
         if let Some(run) = slot.active_run {
             bail!("Slot already has active Run {} ({})", run.id, run.label);
@@ -778,10 +887,10 @@ impl AgentTools {
         let run = self
             .session
             .start_run(
-                args.slot_id,
+                args.slot_id.clone(),
                 args.label,
-                args.metadata,
-                seconds(args.control_wait_seconds, 15, 0, 15),
+                BTreeMap::new(),
+                Duration::from_secs(15),
             )
             .await?;
         self.remember_live_cursor(
@@ -791,26 +900,32 @@ impl AgentTools {
                 after_seq: run.start_seq,
             },
         );
-        Ok(
-            json!({"run": run, "guidance": "Initialize device state explicitly after starting the Run."}),
-        )
+        Ok(json!({
+            "slot_id": args.slot_id,
+            "run_id": run.id,
+            "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
+            "warning": "Run scopes evidence only; initialize device state explicitly"
+        }))
     }
 
     async fn run_end(&self, args: RunEndArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot(&args.slot_id).await?;
-        let run_id = args
-            .run_id
-            .or_else(|| slot.active_run.as_ref().map(|run| run.id))
-            .context("no active Run; pass run_id explicitly")?;
+        let run_id = slot
+            .active_run
+            .as_ref()
+            .map(|run| run.id)
+            .context("no active Run for this Slot")?;
+        let ended = self.session.end_run(args.slot_id.clone(), run_id).await?;
         Ok(json!({
-            "run": self.session.end_run(args.slot_id, run_id).await?,
-            "control_renewal_stopped": true,
-            "control_release": "best_effort",
-            "serial_port_closed": false
+            "slot_id": args.slot_id,
+            "ended": ended.id,
+            "control_release": "best_effort"
         }))
     }
 
     async fn release(&self, args: ReleaseArgs) -> Result<Value> {
+        let _write_guard = self.write_guard(&args.slot_id).await;
         let had_lease = self
             .session
             .release(args.slot_id.clone(), args.abort_run)
@@ -824,13 +939,18 @@ impl AgentTools {
     }
 
     async fn slot(&self, slot_id: &str) -> Result<SlotSnapshot> {
-        self.api
-            .status()
+        self.status()
             .await?
             .slots
             .into_iter()
             .find(|slot| slot.config.id == slot_id)
             .with_context(|| format!("unknown Slot {slot_id:?}"))
+    }
+
+    async fn status(&self) -> Result<StatusResponse> {
+        let status = self.api.status().await?;
+        ensure_protocol_compatible(&status)?;
+        Ok(status)
     }
 
     async fn slot_online(&self, slot_id: &str) -> Result<SlotSnapshot> {
@@ -863,6 +983,17 @@ impl AgentTools {
             cursor,
         );
     }
+
+    async fn write_guard(&self, slot_id: &str) -> OwnedMutexGuard<()> {
+        let lock = self
+            .write_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(slot_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        lock.lock_owned().await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,6 +1004,7 @@ enum CursorSource {
 }
 
 impl CursorSource {
+    #[cfg(test)]
     fn label(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
@@ -1008,7 +1140,6 @@ fn render_response(
     options: RenderOptions,
     scope: &str,
 ) -> Value {
-    let with_events = options.include_events || options.include_raw;
     let rendered = render_events(&response.events, options);
     let after_seq = response
         .next_cursor
@@ -1016,134 +1147,172 @@ fn render_response(
         .map(|cursor| cursor.after_seq)
         .or_else(|| response.events.last().map(|event| event.seq))
         .unwrap_or(slot.head_seq);
+    let epoch = response
+        .next_cursor
+        .as_ref()
+        .map(|cursor| cursor.epoch)
+        .unwrap_or(query_epoch);
+    let gap = !response.gaps.is_empty();
+    let truncated = response.truncated || rendered.text_truncated;
     let mut output = json!({
-        "slot_id": slot.config.id, "scope": scope, "epoch": response.next_cursor.as_ref().map(|c| c.epoch).unwrap_or(query_epoch),
-        "after_seq": after_seq, "head_seq": slot.head_seq, "text": rendered.text,
-        "truncated": response.truncated,
-        "text_truncated": rendered.text_truncated, "repeated_lines_collapsed": rendered.repeated_lines_collapsed,
-        "first_available_seq": response.first_available_seq, "gaps": response.gaps
+        "slot_id": slot.config.id,
+        "scope": scope,
+        "confidence": if gap { "unreliable" } else if truncated { "partial" } else { "high" },
+        "text": rendered.text,
+        "truncated": truncated,
+        "gap": gap,
+        "cursor": {"epoch": epoch, "after_seq": after_seq}
     });
-    if let Some(excerpt) = rendered.match_excerpt {
-        output["match_excerpt"] = json!({
-            "matched_lines": excerpt.matched_lines,
-            "omitted_lines": excerpt.omitted_lines,
-            "context_lines": excerpt.context_lines,
-        });
+    if let Some(ref excerpt) = rendered.match_excerpt {
+        output["matches"] = json!(excerpt.matched_lines);
     }
-    if with_events {
-        output["events"] = json!(rendered.events);
+    let mut warnings = Vec::new();
+    if gap {
+        warnings.push("journal gap; returned text is incomplete".to_string());
     }
+    if response.truncated {
+        warnings.push("event page hit its hard limit; continue from cursor".to_string());
+    }
+    if !warnings.is_empty() {
+        output["warnings"] = json!(warnings);
+    }
+    attach_omission(&mut output, &rendered);
     output
 }
 
-fn validate_operation_filter(
-    operation_id: Option<Uuid>,
-    direction: Option<Direction>,
-) -> Result<()> {
-    if operation_id.is_some() && direction != Some(Direction::Tx) {
-        bail!(
-            "operation_id identifies confirmed TX audit events only; device RX events have \
-             operation_id=null because a shared serial byte stream has no reliable causal \
-             assignment. Add direction=tx to inspect the exact write, or omit operation_id \
-             and use command's capture_window, a Run, or an epoch/after_seq cursor for output."
-        );
-    }
-    Ok(())
-}
-
-fn completion_evidence(completion: &Completion) -> Value {
+fn completion_kind(completion: &Completion) -> &'static str {
     match completion {
-        Completion::Pattern(pattern) => {
-            json!({"kind": "literal", "matched": pattern, "boundary_observed": true})
-        }
-        Completion::Regex(pattern) => {
-            json!({"kind": "regex", "matched": pattern, "boundary_observed": true})
-        }
-        Completion::Quiet => {
-            json!({"kind": "quiet", "boundary_observed": true})
-        }
-        Completion::Signal(signal) => {
-            json!({"kind": "signal", "signal": signal, "boundary_observed": true})
-        }
-        Completion::Timeout => {
-            json!({"kind": "timeout", "boundary_observed": false})
-        }
-        Completion::Disconnected(reason) => {
-            json!({"kind": "disconnected", "reason": reason, "boundary_observed": false})
-        }
+        Completion::Pattern(_) => "literal",
+        Completion::Prompt(_) => "prompt",
+        Completion::Regex(_) => "regex",
+        Completion::Quiet => "quiet",
+        Completion::Signal(_) => "signal",
+        Completion::Timeout => "timeout",
+        Completion::Disconnected(_) => "disconnected",
     }
 }
 
-fn command_guidance(completion: &Completion, interfered: bool, echo_missing: bool) -> &'static str {
+fn command_confidence(
+    completion: &Completion,
+    output_truncated: bool,
+    has_gap: bool,
+    interfered: bool,
+    echo_missing: bool,
+    rx_event_count: usize,
+) -> &'static str {
+    if has_gap || matches!(completion, Completion::Disconnected(_)) {
+        "unreliable"
+    } else if output_truncated {
+        "partial"
+    } else if interfered {
+        "interfered"
+    } else if matches!(completion, Completion::Timeout) {
+        "incomplete"
+    } else if matches!(completion, Completion::Quiet) {
+        "low"
+    } else if echo_missing {
+        "medium"
+    } else if rx_event_count == 0 {
+        "low"
+    } else {
+        "high"
+    }
+}
+
+fn capture_confidence(
+    completion: &Completion,
+    output_truncated: bool,
+    has_gap: bool,
+) -> &'static str {
+    if has_gap || matches!(completion, Completion::Disconnected(_)) {
+        "unreliable"
+    } else if output_truncated {
+        "partial"
+    } else if matches!(completion, Completion::Timeout) {
+        "incomplete"
+    } else if matches!(completion, Completion::Quiet) {
+        "low"
+    } else {
+        "high"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_capture_warnings(
+    output: &mut Value,
+    completion: &Completion,
+    capture_truncated: bool,
+    text_truncated: bool,
+    gap: bool,
+    interfered: bool,
+    echo_missing: bool,
+    no_rx: bool,
+) {
+    let mut warnings = Vec::new();
+    if gap {
+        warnings.push("RX gap; evidence is incomplete");
+    }
+    if capture_truncated {
+        warnings.push("capture hit its hard limit");
+    }
+    if text_truncated {
+        warnings.push("text was summarized");
+    }
     if interfered {
-        return "Another actor wrote during this capture window; do not treat the RX as isolated. \
-                RX is window/Run scoped and never tagged with operation_id.";
+        warnings.push("another actor wrote during capture");
     }
     if echo_missing {
-        return "The target's configured echo was missing or incomplete. Exact post-TX boundary \
-                evidence may still complete capture, but target delivery is uncertain and input \
-                loss is suspected. Inspect the returned RX/TX evidence before deciding whether \
-                to retry; serial-mcp did not retry automatically.";
+        warnings.push("configured echo missing; target delivery may be incomplete");
+    }
+    if no_rx {
+        warnings.push("no post-boundary RX observed");
     }
     match completion {
-        Completion::Pattern(_) | Completion::Regex(_) => {
-            "The requested completion boundary was observed, but serial-mcp did not inspect a \
-             shell exit code; execution_status remains unknown. RX belongs to this capture \
-             window/Run, not to operation_id."
-        }
-        Completion::Quiet => {
-            "A quiet interval ended capture; this is not proof that the command finished or \
-             succeeded. RX belongs to this capture window/Run, not to operation_id."
-        }
-        Completion::Timeout => {
-            "The requested boundary was not observed before timeout. Continue from after_seq or \
-             inspect the current Run; do not infer command success."
-        }
-        Completion::Disconnected(_) => {
-            "Capture disconnected before a completion boundary. Inspect the TX timeline and \
-             continue from the returned cursor before deciding whether to retry."
-        }
-        Completion::Signal(_) => {
-            "An external operation boundary ended capture. This completion mode is not used by \
-             ordinary serial_command calls."
-        }
+        Completion::Quiet => warnings.push("quiet is not proof of command completion"),
+        Completion::Timeout => warnings.push("completion boundary not observed before timeout"),
+        Completion::Disconnected(_) => warnings.push("capture disconnected before completion"),
+        _ => {}
+    }
+    if !warnings.is_empty() {
+        output["warnings"] = json!(warnings);
+    }
+}
+
+fn attach_omission(output: &mut Value, rendered: &crate::render::RenderedEvents) {
+    if rendered.summary.omitted_chars > 0 || rendered.summary.omitted_lines > 0 {
+        output["omitted"] = json!({
+            "chars": rendered.summary.omitted_chars,
+            "lines": rendered.summary.omitted_lines
+        });
     }
 }
 
 fn attach_search_continuation_guidance(output: &mut Value, scope: &str, run_id: Option<Uuid>) {
     let mut continuation = json!({
         "scope": scope,
-        "epoch": output["epoch"].clone(),
-        "after_seq": output["after_seq"].clone(),
+        "epoch": output["cursor"]["epoch"].clone(),
+        "after_seq": output["cursor"]["after_seq"].clone(),
     });
     if let Some(run_id) = run_id {
         continuation["run_id"] = json!(run_id);
     }
     output["continuation"] = continuation;
     output["guidance"] = json!(if scope == "current_run" {
-        "Search results are incomplete. Repeat search with the same contains/direction/operation \
-         filters and the returned continuation fields before concluding that a match is absent. \
-         Keep scope=current_run and run_id unchanged to avoid searching a different test cycle."
+        "Search is incomplete; repeat the same query with continuation and unchanged run_id."
     } else {
-        "Search results are incomplete. Repeat search with the same filters and the returned \
-         continuation fields before concluding that a match is absent."
+        "Search is incomplete; repeat the same query with continuation."
     });
 }
 
 /// Assemble the bytes for one write. An empty command is valid as long as the
 /// effective EOL contributes bytes, which sends a bare Enter; only a fully
 /// empty payload is rejected.
-fn compose_write_bytes(
-    command: &str,
-    eol_override: Option<&str>,
-    default_eol: &str,
-) -> Result<Vec<u8>> {
-    let eol = eol_override.unwrap_or(default_eol);
-    if command.is_empty() && eol.is_empty() {
+fn compose_write_bytes(command: &str, default_eol: &str) -> Result<Vec<u8>> {
+    if command.is_empty() && default_eol.is_empty() {
         bail!("command and EOL are both empty; nothing would be sent");
     }
     let mut bytes = command.as_bytes().to_vec();
-    bytes.extend_from_slice(eol.as_bytes());
+    bytes.extend_from_slice(default_eol.as_bytes());
     if bytes.len() > MAX_WRITE_BYTES {
         bail!("command plus EOL exceeds {MAX_WRITE_BYTES} bytes");
     }
@@ -1158,6 +1327,11 @@ fn effective_write_eol(slot: &SlotSnapshot) -> &str {
 
 fn effective_echo_mode(slot: &SlotSnapshot) -> EchoMode {
     slot.effective_echo.unwrap_or(slot.config.settings.echo)
+}
+
+fn effective_write_pacing(slot: &SlotSnapshot) -> WritePacing {
+    slot.effective_write_pacing
+        .unwrap_or_else(|| WritePacing::resolve(None, &slot.config.settings))
 }
 
 fn effective_prompts(slot: &SlotSnapshot) -> (Option<String>, Option<String>) {
@@ -1182,73 +1356,66 @@ fn effective_prompts(slot: &SlotSnapshot) -> (Option<String>, Option<String>) {
     }
 }
 
-fn completion_patterns(args: &CommandArgs, slot: &SlotSnapshot) -> Result<(Vec<String>, String)> {
-    if args.until_regex.is_some() {
-        match args.completion.as_deref() {
-            None | Some("auto") => {}
-            Some(mode) => bail!(
-                "until_regex is the sole completion boundary; omit completion or use \
-                 completion=auto, not completion={mode}"
-            ),
+fn requested_completion(
+    expect: Option<&str>,
+    regex: Option<&str>,
+    slot: &SlotSnapshot,
+    use_profile_prompts: bool,
+) -> Result<(Vec<CompletionPattern>, Option<regex::Regex>, String)> {
+    if expect.is_some() && regex.is_some() {
+        bail!("expect and regex are alternative completion boundaries; choose one");
+    }
+    if let Some(regex) = regex {
+        return Ok((
+            Vec::new(),
+            Some(compile_regex(regex, "regex")?),
+            "regex".into(),
+        ));
+    }
+    if let Some(expect) = expect {
+        if expect.is_empty() {
+            bail!("expect must not be empty");
         }
-        if args.until.is_some() {
-            bail!("until cannot be combined with until_regex; choose one completion boundary");
-        }
-        return Ok((Vec::new(), "regex".into()));
+        return Ok((
+            vec![CompletionPattern::Literal(expect.to_string())],
+            None,
+            "expect".into(),
+        ));
     }
 
-    let mode = args.completion.as_deref().unwrap_or("auto");
     let (shell_prompt, uboot_prompt) = effective_prompts(slot);
-    let patterns = match mode {
-        "auto" => [shell_prompt.clone(), uboot_prompt.clone()]
+    let patterns: Vec<_> = if use_profile_prompts {
+        [shell_prompt, uboot_prompt]
             .into_iter()
             .flatten()
-            .collect(),
-        "prompt" => {
-            let patterns: Vec<String> = args
-                .until
-                .clone()
-                .into_iter()
-                .chain([shell_prompt, uboot_prompt].into_iter().flatten())
-                .collect();
-            if patterns.is_empty() {
-                bail!("completion=prompt needs until or a configured Shell/U-Boot prompt");
-            }
-            patterns
-        }
-        "contains" => vec![
-            args.until
-                .clone()
-                .context("completion=contains requires until")?,
-        ],
-        "quiet" => Vec::new(),
-        _ => bail!("completion must be auto, prompt, contains, or quiet"),
+            .map(CompletionPattern::Prompt)
+            .collect()
+    } else {
+        Vec::new()
     };
-    let effective = if mode == "auto" && patterns.is_empty() {
+    let mode = if patterns.is_empty() {
         "quiet"
     } else {
-        mode
+        "prompt"
     };
-    Ok((patterns, effective.into()))
+    Ok((patterns, None, mode.into()))
 }
 
-fn compile_until_regex(value: Option<&str>) -> Result<Option<regex::Regex>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
+fn compile_regex(value: &str, field: &str) -> Result<regex::Regex> {
     if value.is_empty() {
-        bail!("until_regex must not be empty");
+        bail!("{field} must not be empty");
     }
-    regex::Regex::new(value)
-        .map(Some)
-        .context("until_regex is not a valid regex")
+    if value.len() > MAX_REGEX_BYTES {
+        bail!("{field} must not exceed {MAX_REGEX_BYTES} UTF-8 bytes");
+    }
+    regex::Regex::new(value).with_context(|| format!("{field} is not a valid regex"))
 }
 
 fn trigger_spec(args: &TriggerArgs) -> Result<TriggerSpec> {
     let initial_write = args
         .initial_write
         .as_ref()
-        .map(|write| trigger_write_bytes(write, "initial_write", MAX_TRIGGER_INITIAL_WRITE_BYTES))
+        .map(|write| trigger_write_bytes(write, "kickoff", MAX_TRIGGER_INITIAL_WRITE_BYTES))
         .transpose()?;
     let action = trigger_write_bytes(&args.action, "action", MAX_TRIGGER_ACTION_BYTES)?;
     let start_contains = args
@@ -1290,7 +1457,7 @@ fn trigger_spec(args: &TriggerArgs) -> Result<TriggerSpec> {
         .saturating_add(action.len().saturating_mul(max_fires as usize));
     if planned_bytes > MAX_TRIGGER_TOTAL_BYTES {
         bail!(
-            "initial_write plus action * max_fires plans {planned_bytes} bytes; the Trigger limit \
+            "kickoff plus action * max_fires plans {planned_bytes} bytes; the Trigger limit \
              is {MAX_TRIGGER_TOTAL_BYTES} bytes"
         );
     }
@@ -1314,7 +1481,7 @@ fn trigger_write_bytes(write: &TriggerWriteArgs, field: &str, max_bytes: usize) 
     let mut bytes = write.text.as_bytes().to_vec();
     bytes.extend_from_slice(write.eol.as_deref().unwrap_or("").as_bytes());
     if bytes.is_empty() {
-        bail!("{field} text and EOL are both empty; omit initial_write or provide bytes");
+        bail!("{field} text and EOL are both empty; omit kickoff or provide bytes");
     }
     if bytes.len() > max_bytes {
         bail!("{field} text plus EOL exceeds {max_bytes} UTF-8 bytes");
@@ -1422,29 +1589,92 @@ fn trigger_guidance(status: TriggerStatus) -> &'static str {
 fn seconds(value: Option<u64>, default: u64, min: u64, max: u64) -> Duration {
     Duration::from_secs(value.unwrap_or(default).clamp(min, max))
 }
-fn millis(value: Option<u64>, default: u64, min: u64, max: u64) -> Duration {
-    Duration::from_millis(value.unwrap_or(default).clamp(min, max))
+
+fn control_signal_byte(signal: &str) -> Option<u8> {
+    match signal {
+        "ctrl_c" => Some(0x03),
+        "ctrl_d" => Some(0x04),
+        "ctrl_z" => Some(0x1a),
+        _ => None,
+    }
 }
-fn max_chars(value: Option<usize>) -> usize {
-    value
-        .unwrap_or(DEFAULT_TEXT_CHARS)
-        .clamp(256, MAX_TEXT_CHARS)
+
+fn ensure_protocol_compatible(status: &StatusResponse) -> Result<()> {
+    if status.protocol_version != PROTOCOL_VERSION {
+        bail!(
+            "seriald protocol version {} is incompatible with serial-mcp protocol version {}; \
+             install seriald and serial-mcp from the same release",
+            status.protocol_version,
+            PROTOCOL_VERSION
+        );
+    }
+    Ok(())
 }
 
 fn slot_summary(slot: &SlotSnapshot) -> Value {
+    let effective_transport = slot.effective_transport.unwrap_or_else(|| {
+        serial_protocol::resolve_transport_settings(&slot.config.settings, None)
+    });
+    let (shell_prompt, uboot_prompt) = effective_prompts(slot);
+    let control = slot.control.as_ref().map(|lease| {
+        json!({
+            "owner": actor_summary(&lease.owner),
+            "expires_wall_time_ns": lease.expires_wall_time_ns
+        })
+    });
+    let active_run = slot.active_run.as_ref().map(|run| {
+        json!({
+            "id": run.id,
+            "label": run.label,
+            "status": run.status,
+            "start_seq": run.start_seq,
+            "owner": actor_summary(&run.owner)
+        })
+    });
+    let active_trigger = slot.active_trigger.as_ref().map(|trigger| {
+        json!({
+            "id": trigger.id,
+            "status": trigger.status,
+            "start_seq": trigger.start_seq,
+            "end_seq": trigger.end_seq,
+            "last_write_seq": trigger.last_write_seq,
+            "fires_confirmed": trigger.fires_confirmed,
+            "tx_bytes_confirmed": trigger.tx_bytes_confirmed,
+            "owner": actor_summary(&trigger.owner)
+        })
+    });
     json!({
-        "slot_id": slot.config.id, "display_name": slot.config.display_name, "port": slot.config.port,
-        "profile": slot.config.profile, "device_profile": slot.config.device_profile,
-        "enabled": slot.config.enabled, "session_state": slot.session_state,
-        "state_reason": slot.state_reason, "target_activity": slot.target_activity, "baud_rate": slot.config.settings.baud_rate,
-        "write_eol": slot.config.settings.write_eol, "echo": slot.config.settings.echo,
-        "shell_prompt": slot.config.settings.shell_prompt, "uboot_prompt": slot.config.settings.uboot_prompt,
-        "effective_shell_prompt": slot.effective_shell_prompt, "effective_uboot_prompt": slot.effective_uboot_prompt,
-        "effective_write_eol": slot.effective_write_eol, "effective_echo": slot.effective_echo,
-        "epoch": slot.daemon_epoch, "head_seq": slot.head_seq, "generation": slot.generation,
-        "control": slot.control, "active_run": slot.active_run, "active_trigger": slot.active_trigger,
-        "logging": slot.logging
+        "slot_id": slot.config.id,
+        "display_name": slot.config.display_name,
+        "port": slot.config.port,
+        "enabled": slot.config.enabled,
+        "transport_profile": slot.config.profile,
+        "device_profile": slot.config.device_profile,
+        "endpoint_present": slot.endpoint_present,
+        "session_state": slot.session_state,
+        "state_code": slot.state_code,
+        "state_reason": slot.state_reason,
+        "target_activity": slot.target_activity,
+        "effective_transport": effective_transport,
+        "effective_device": {
+            "write_eol": effective_write_eol(slot),
+            "echo": effective_echo_mode(slot),
+            "shell_prompt": shell_prompt,
+            "uboot_prompt": uboot_prompt,
+            "write_pacing": effective_write_pacing(slot)
+        },
+        "cursor": {"epoch": slot.daemon_epoch, "after_seq": slot.head_seq},
+        "generation": slot.generation,
+        "control": control,
+        "active_run": active_run,
+        "active_trigger": active_trigger,
+        "logging": slot.logging,
+        "rx_overflow_bytes": slot.rx_overflow_bytes,
     })
+}
+
+fn actor_summary(actor: &serial_protocol::Actor) -> Value {
+    json!({"id": actor.id, "label": actor.label, "kind": actor.kind})
 }
 
 /// Keep display names usable as identifiers: an empty name falls back to the
@@ -1469,10 +1699,6 @@ fn disambiguate_display_names(slots: &mut [Value]) {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct DevicesArgs {
@@ -1482,78 +1708,51 @@ struct DevicesArgs {
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
     slot_id: String,
+    scope: Option<String>,
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
-    tail_events: Option<usize>,
-    direction: Option<Direction>,
-    operation_id: Option<Uuid>,
-    limit_events: Option<usize>,
-    limit_bytes: Option<usize>,
-    max_chars: Option<usize>,
-    #[serde(default)]
-    include_raw: bool,
-    #[serde(default)]
-    include_events: bool,
-    #[serde(default = "default_true")]
-    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
     slot_id: String,
-    contains: String,
+    query: String,
+    #[serde(default)]
+    regex: bool,
     scope: Option<String>,
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
     run_id: Option<Uuid>,
-    direction: Option<Direction>,
-    operation_id: Option<Uuid>,
-    context_lines: Option<usize>,
-    limit_events: Option<usize>,
-    limit_bytes: Option<usize>,
-    max_chars: Option<usize>,
-    #[serde(default)]
-    include_raw: bool,
-    #[serde(default)]
-    include_events: bool,
-    #[serde(default = "default_true")]
-    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
     slot_id: String,
-    epoch: Option<Uuid>,
-    after_seq: Option<u64>,
-    contains: Option<String>,
+    expect: Option<String>,
+    regex: Option<String>,
     timeout_seconds: Option<u64>,
-    quiet_ms: Option<u64>,
-    max_chars: Option<usize>,
-    #[serde(default)]
-    include_raw: bool,
-    #[serde(default)]
-    include_events: bool,
-    #[serde(default = "default_true")]
-    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandArgs {
     slot_id: String,
     command: String,
-    eol: Option<String>,
-    completion: Option<String>,
-    until: Option<String>,
-    until_regex: Option<String>,
+    expect: Option<String>,
+    regex: Option<String>,
     timeout_seconds: Option<u64>,
-    quiet_ms: Option<u64>,
-    max_chars: Option<usize>,
-    #[serde(default)]
-    include_raw: bool,
-    #[serde(default)]
-    include_events: bool,
-    #[serde(default = "default_true")]
-    collapse_repeats: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputArgs {
+    slot_id: String,
+    text: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalArgs {
+    slot_id: String,
+    signal: String,
+    duration_ms: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1565,6 +1764,7 @@ struct TriggerWriteArgs {
 #[serde(deny_unknown_fields)]
 struct TriggerArgs {
     slot_id: String,
+    #[serde(rename = "kickoff")]
     initial_write: Option<TriggerWriteArgs>,
     start_contains: Option<String>,
     action: TriggerWriteArgs,
@@ -1573,28 +1773,17 @@ struct TriggerArgs {
     interval_ms: Option<u64>,
     timeout_ms: Option<u64>,
     max_fires: Option<u32>,
-    max_chars: Option<usize>,
-    #[serde(default)]
-    include_raw: bool,
-    #[serde(default)]
-    include_events: bool,
-    #[serde(default = "default_true")]
-    collapse_repeats: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunStartArgs {
     slot_id: String,
     label: String,
-    #[serde(default)]
-    metadata: BTreeMap<String, Value>,
-    control_wait_seconds: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunEndArgs {
     slot_id: String,
-    run_id: Option<Uuid>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1610,71 +1799,55 @@ mod tests {
 
     #[test]
     fn empty_command_is_allowed_when_eol_contributes_bytes() {
-        assert_eq!(compose_write_bytes("", None, "\r").unwrap(), b"\r".to_vec());
-        assert_eq!(
-            compose_write_bytes("", Some("\r\n"), "\r").unwrap(),
-            b"\r\n".to_vec()
-        );
-        assert_eq!(
-            compose_write_bytes("help", Some(""), "\r").unwrap(),
-            b"help".to_vec()
-        );
+        assert_eq!(compose_write_bytes("", "\r").unwrap(), b"\r".to_vec());
+        assert_eq!(compose_write_bytes("", "\r\n").unwrap(), b"\r\n".to_vec());
     }
 
     #[test]
     fn fully_empty_write_is_rejected() {
-        let error = compose_write_bytes("", Some(""), "\r").unwrap_err();
-        assert!(error.to_string().contains("nothing would be sent"));
-        let error = compose_write_bytes("", None, "").unwrap_err();
+        let error = compose_write_bytes("", "").unwrap_err();
         assert!(error.to_string().contains("nothing would be sent"));
     }
 
     #[test]
     fn write_size_limit_counts_command_plus_eol() {
         let command = "x".repeat(MAX_WRITE_BYTES);
-        assert!(compose_write_bytes(&command, Some(""), "\r").is_ok());
-        assert!(compose_write_bytes(&command, None, "\r").is_err());
+        assert!(compose_write_bytes(&command, "").is_ok());
+        assert!(compose_write_bytes(&command, "\r").is_err());
     }
 
     #[test]
-    fn read_args_parse_direction_operation_id_and_collapse_default() {
+    fn read_args_keep_only_scope_and_archive_cursor() {
         let args: ReadArgs = serde_json::from_value(json!({
             "slot_id": "bench",
-            "direction": "rx",
-            "operation_id": Uuid::nil(),
+            "scope": "archive",
+            "epoch": Uuid::nil(),
+            "after_seq": 42,
         }))
         .unwrap();
-        assert_eq!(args.direction, Some(Direction::Rx));
-        assert_eq!(args.operation_id, Some(Uuid::nil()));
-        assert!(args.collapse_repeats);
-        assert!(!args.include_raw);
-
-        let args: ReadArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "direction": "none",
-            "collapse_repeats": false,
-        }))
-        .unwrap();
-        assert_eq!(args.direction, Some(Direction::None));
-        assert!(!args.collapse_repeats);
+        assert_eq!(args.scope.as_deref(), Some("archive"));
+        assert_eq!(args.epoch, Some(Uuid::nil()));
+        assert_eq!(args.after_seq, Some(42));
+        assert!(
+            serde_json::from_value::<ReadArgs>(json!({"slot_id":"bench","include_raw":true}))
+                .is_err()
+        );
     }
 
     #[test]
     fn search_and_wait_args_parse_new_optional_fields() {
         let search: SearchArgs = serde_json::from_value(json!({
             "slot_id": "bench",
-            "contains": "ERROR",
-            "operation_id": Uuid::nil(),
-            "context_lines": 7,
-            "collapse_repeats": false,
+            "query": "ERROR.*1006",
+            "regex": true,
         }))
         .unwrap();
-        assert_eq!(search.operation_id, Some(Uuid::nil()));
-        assert_eq!(search.context_lines, Some(7));
-        assert!(!search.collapse_repeats);
+        assert_eq!(search.query, "ERROR.*1006");
+        assert!(search.regex);
 
-        let wait: WaitArgs = serde_json::from_value(json!({"slot_id": "bench"})).unwrap();
-        assert!(wait.collapse_repeats);
+        let wait: WaitArgs =
+            serde_json::from_value(json!({"slot_id": "bench", "expect": "ready"})).unwrap();
+        assert_eq!(wait.expect.as_deref(), Some("ready"));
     }
 
     #[test]
@@ -1771,7 +1944,14 @@ mod tests {
         let args: CommandArgs =
             serde_json::from_value(json!({"slot_id": "bench", "command": ""})).unwrap();
         assert!(args.command.is_empty());
-        assert!(args.collapse_repeats);
+    }
+
+    #[test]
+    fn control_signals_are_exact_single_bytes_without_eol() {
+        assert_eq!(control_signal_byte("ctrl_c"), Some(0x03));
+        assert_eq!(control_signal_byte("ctrl_d"), Some(0x04));
+        assert_eq!(control_signal_byte("ctrl_z"), Some(0x1a));
+        assert_eq!(control_signal_byte("break"), None);
     }
 
     #[test]
@@ -1799,7 +1979,7 @@ mod tests {
     fn trigger_uses_only_explicit_call_text_and_eol() {
         let args: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
-            "initial_write": {"text": "reboot", "eol": "\r"},
+            "kickoff": {"text": "reboot", "eol": "\r"},
             "start_contains": "Booting",
             "action": {"text": "slp"},
             "stop_contains": ["any caller literal"],
@@ -1854,7 +2034,7 @@ mod tests {
 
         let over_total: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
-            "initial_write": {"text": "x"},
+            "kickoff": {"text": "x"},
             "action": {"text": "a".repeat(256)},
             "max_fires": 256
         }))
@@ -1880,21 +2060,6 @@ mod tests {
         assert!(trigger_evidence_contains(41, 41, 73));
         assert!(trigger_evidence_contains(73, 41, 73));
         assert!(!trigger_evidence_contains(74, 41, 73));
-    }
-
-    #[test]
-    fn operation_filter_requires_an_explicit_tx_direction() {
-        let operation_id = Some(Uuid::nil());
-        let error = validate_operation_filter(operation_id, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("RX events have operation_id=null")
-        );
-        let error = validate_operation_filter(operation_id, Some(Direction::Rx)).unwrap_err();
-        assert!(error.to_string().contains("direction=tx"));
-        validate_operation_filter(operation_id, Some(Direction::Tx)).unwrap();
-        validate_operation_filter(None, Some(Direction::Rx)).unwrap();
     }
 
     #[test]
@@ -1934,7 +2099,7 @@ mod tests {
     fn truncated_current_run_search_guides_a_run_scoped_continuation() {
         let run_id = Uuid::new_v4();
         let epoch = Uuid::new_v4();
-        let mut output = json!({"epoch": epoch, "after_seq": 1234});
+        let mut output = json!({"cursor": {"epoch": epoch, "after_seq": 1234}});
         attach_search_continuation_guidance(&mut output, "current_run", Some(run_id));
 
         assert_eq!(output["continuation"]["scope"], "current_run");
@@ -1946,18 +2111,47 @@ mod tests {
     }
 
     #[test]
-    fn completion_evidence_never_claims_command_success() {
-        let evidence = completion_evidence(&Completion::Pattern("]# ".into()));
-        assert_eq!(evidence["boundary_observed"], true);
-        assert!(evidence.get("success").is_none());
-        assert!(
-            command_guidance(&Completion::Pattern("]# ".into()), false, false)
-                .contains("execution_status remains unknown")
+    fn command_assessment_never_claims_execution_success() {
+        assert_eq!(
+            completion_kind(&Completion::Pattern("]# ".into())),
+            "literal"
         );
-        assert!(command_guidance(&Completion::Quiet, false, false).contains("not proof"));
-        assert!(
-            command_guidance(&Completion::Pattern("]# ".into()), false, true)
-                .contains("did not retry automatically")
+        assert_eq!(completion_kind(&Completion::Prompt("]# ".into())), "prompt");
+        assert_eq!(
+            command_confidence(&Completion::Quiet, false, false, false, false, 1),
+            "low"
+        );
+        assert_eq!(
+            command_confidence(
+                &Completion::Pattern("]# ".into()),
+                false,
+                false,
+                false,
+                true,
+                1,
+            ),
+            "medium"
+        );
+    }
+
+    #[test]
+    fn rendered_text_truncation_reduces_command_and_wait_confidence() {
+        let rendered_text_truncated = true;
+        let output_truncated = false || rendered_text_truncated;
+        assert_eq!(
+            command_confidence(
+                &Completion::Prompt("]# ".into()),
+                output_truncated,
+                false,
+                false,
+                false,
+                1,
+            ),
+            "partial"
+        );
+        assert_eq!(
+            capture_confidence(&Completion::Prompt("]# ".into()), output_truncated, false),
+            "partial"
         );
     }
 
@@ -1974,6 +2168,114 @@ mod tests {
         assert_eq!(slots[1]["display_name"], "hawk (COM7)");
         assert_eq!(slots[2]["display_name"], "(COM9)");
         assert_eq!(slots[3]["display_name"], "unique");
+    }
+
+    #[test]
+    fn slot_summary_is_compact_but_keeps_agent_decision_state() {
+        let mut slot = test_slot();
+        let owner = serial_protocol::Actor {
+            id: "agent:one".into(),
+            label: "agent-one".into(),
+            kind: serial_protocol::ActorKind::Agent,
+        };
+        slot.config.device_profile = Some("luckfox".into());
+        slot.control = Some(serial_protocol::ControlLease {
+            id: Uuid::from_u128(1),
+            owner: owner.clone(),
+            epoch: slot.daemon_epoch,
+            generation: slot.generation,
+            fence: 7,
+            issued_wall_time_ns: 10,
+            expires_wall_time_ns: 20,
+        });
+        slot.active_run = Some(serial_protocol::RunInfo {
+            id: Uuid::from_u128(2),
+            owner: owner.clone(),
+            label: "diagnose".into(),
+            status: serial_protocol::RunStatus::Active,
+            start_seq: 40,
+            end_seq: None,
+            metadata: BTreeMap::from([("large_internal_value".into(), json!("omit me"))]),
+        });
+        slot.active_trigger = Some(TriggerInfo {
+            id: Uuid::from_u128(3),
+            owner,
+            daemon_epoch: slot.daemon_epoch,
+            generation: slot.generation,
+            control_id: Uuid::from_u128(1),
+            fence: 7,
+            operation_id: Some(Uuid::from_u128(4)),
+            expected_run_id: Some(Uuid::from_u128(2)),
+            spec: TriggerSpec {
+                initial_write: Some(b"secret kickoff bytes".to_vec()),
+                start_contains: Some(b"boot".to_vec()),
+                action: b"slp".to_vec(),
+                interval_ms: DEFAULT_TRIGGER_INTERVAL_MS,
+                stop_contains: vec![b"prompt".to_vec()],
+                timeout_ms: DEFAULT_TRIGGER_TIMEOUT_MS,
+                max_fires: DEFAULT_TRIGGER_MAX_FIRES,
+                pacing: None,
+            },
+            status: TriggerStatus::Running,
+            start_seq: 41,
+            end_seq: None,
+            last_write_seq: Some(42),
+            fires_confirmed: 2,
+            tx_bytes_confirmed: 6,
+            matched_pattern: None,
+        });
+
+        let summary = slot_summary(&slot);
+        assert_eq!(summary["slot_id"], "bench");
+        assert_eq!(summary["transport_profile"], "linux");
+        assert_eq!(summary["device_profile"], "luckfox");
+        assert_eq!(summary["session_state"], "online");
+        assert_eq!(summary["cursor"]["epoch"], json!(Uuid::nil()));
+        assert_eq!(summary["cursor"]["after_seq"], 42);
+        assert_eq!(summary["effective_transport"]["baud_rate"], 115_200);
+        assert_eq!(summary["effective_device"]["write_eol"], "\r");
+        assert_eq!(summary["control"]["owner"]["id"], "agent:one");
+        assert_eq!(summary["active_run"]["label"], "diagnose");
+        assert_eq!(summary["active_trigger"]["fires_confirmed"], 2);
+
+        for removed in [
+            "config",
+            "profile",
+            "baud_rate",
+            "write_eol",
+            "effective_write_eol",
+            "head_seq",
+            "epoch",
+        ] {
+            assert!(
+                summary.get(removed).is_none(),
+                "legacy or duplicate field {removed:?} leaked into devices"
+            );
+        }
+        assert!(summary["active_run"].get("metadata").is_none());
+        assert!(summary["active_trigger"].get("spec").is_none());
+        assert!(
+            !serde_json::to_string(&summary)
+                .unwrap()
+                .contains("secret kickoff bytes")
+        );
+    }
+
+    #[test]
+    fn http_status_protocol_mismatch_fails_closed() {
+        let mut status = StatusResponse {
+            server_id: Uuid::from_u128(10),
+            daemon_epoch: Uuid::from_u128(11),
+            protocol_version: PROTOCOL_VERSION,
+            config_revision: 1,
+            slots: vec![test_slot()],
+        };
+        ensure_protocol_compatible(&status).unwrap();
+
+        status.protocol_version = 0;
+        let error = ensure_protocol_compatible(&status).unwrap_err().to_string();
+        assert!(error.contains("protocol version 0"));
+        assert!(error.contains("same release"));
     }
 
     fn test_slot() -> SlotSnapshot {
@@ -2008,7 +2310,7 @@ mod tests {
         slot.effective_write_eol = Some("\n".into());
         assert_eq!(effective_write_eol(&slot), "\n");
         assert_eq!(
-            compose_write_bytes("version", None, effective_write_eol(&slot)).unwrap(),
+            compose_write_bytes("version", effective_write_eol(&slot)).unwrap(),
             b"version\n"
         );
     }
@@ -2028,12 +2330,16 @@ mod tests {
         slot.config.settings.shell_prompt = Some("legacy# ".into());
         slot.effective_shell_prompt = Some("]# ".into());
         slot.effective_uboot_prompt = Some("SigmaStar #".into());
-        let args: CommandArgs =
-            serde_json::from_value(json!({"slot_id": "bench", "command": "version"})).unwrap();
-
-        let (patterns, mode) = completion_patterns(&args, &slot).unwrap();
-        assert_eq!(patterns, vec!["]# ".to_string(), "SigmaStar #".to_string()]);
-        assert_eq!(mode, "auto");
+        let (patterns, regex, mode) = requested_completion(None, None, &slot, true).unwrap();
+        assert_eq!(
+            patterns,
+            vec![
+                CompletionPattern::Prompt("]# ".to_string()),
+                CompletionPattern::Prompt("SigmaStar #".to_string())
+            ]
+        );
+        assert!(regex.is_none());
+        assert_eq!(mode, "prompt");
     }
 
     #[test]
@@ -2043,17 +2349,20 @@ mod tests {
         slot.config.settings.uboot_prompt = Some("legacy=> ".into());
         slot.effective_write_eol = Some("\r".into());
         slot.effective_echo = Some(EchoMode::On);
-        let args: CommandArgs =
-            serde_json::from_value(json!({"slot_id": "bench", "command": "version"})).unwrap();
-
-        let (patterns, mode) = completion_patterns(&args, &slot).unwrap();
+        let (patterns, _, mode) = requested_completion(None, None, &slot, true).unwrap();
         assert!(patterns.is_empty());
         assert_eq!(mode, "quiet");
 
         slot.effective_write_eol = None;
         slot.effective_echo = None;
-        let (legacy_patterns, _) = completion_patterns(&args, &slot).unwrap();
-        assert_eq!(legacy_patterns, vec!["legacy# ", "legacy=> "]);
+        let (legacy_patterns, _, _) = requested_completion(None, None, &slot, true).unwrap();
+        assert_eq!(
+            legacy_patterns,
+            vec![
+                CompletionPattern::Prompt("legacy# ".into()),
+                CompletionPattern::Prompt("legacy=> ".into())
+            ]
+        );
     }
 
     #[test]
@@ -2061,16 +2370,16 @@ mod tests {
         let args: CommandArgs = serde_json::from_value(json!({
             "slot_id": "bench",
             "command": "boot",
-            "until_regex": "U-Boot \\d+",
+            "regex": "U-Boot \\d+",
         }))
         .unwrap();
-        assert_eq!(args.until_regex.as_deref(), Some("U-Boot \\d+"));
-        assert!(!args.include_events);
-        assert!(!args.include_raw);
-
-        let args: ReadArgs =
-            serde_json::from_value(json!({"slot_id": "bench", "include_events": true})).unwrap();
-        assert!(args.include_events);
+        assert_eq!(args.regex.as_deref(), Some("U-Boot \\d+"));
+        assert!(
+            serde_json::from_value::<CommandArgs>(json!({
+                "slot_id":"bench", "command":"boot", "include_events":true
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2080,20 +2389,8 @@ mod tests {
         slot.effective_uboot_prompt = Some("SigmaStar #".into());
         slot.effective_write_eol = Some("\r".into());
         slot.effective_echo = Some(EchoMode::On);
-        let args: CommandArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "command": "boot",
-            "until_regex": "U-Boot \\d+"
-        }))
-        .unwrap();
-
-        let (patterns, completion_mode) = completion_patterns(&args, &slot).unwrap();
-        let until_regex = args
-            .until_regex
-            .as_deref()
-            .map(regex::Regex::new)
-            .transpose()
-            .unwrap();
+        let (patterns, until_regex, completion_mode) =
+            requested_completion(None, Some("U-Boot \\d+"), &slot, true).unwrap();
         let complete_on_quiet = completion_mode == "quiet";
 
         assert!(patterns.is_empty());
@@ -2105,39 +2402,33 @@ mod tests {
     #[test]
     fn regex_boundary_rejects_competing_literal_completion_parameters() {
         let slot = test_slot();
-        for completion in ["prompt", "contains", "quiet"] {
-            let args: CommandArgs = serde_json::from_value(json!({
-                "slot_id": "bench",
-                "command": "boot",
-                "completion": completion,
-                "until_regex": "__DONE__"
-            }))
-            .unwrap();
-            let error = completion_patterns(&args, &slot).unwrap_err();
-            assert!(error.to_string().contains("sole completion boundary"));
-        }
-
-        let args: CommandArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "command": "boot",
-            "until": "literal",
-            "until_regex": "__DONE__"
-        }))
-        .unwrap();
-        let error = completion_patterns(&args, &slot).unwrap_err();
-        assert!(error.to_string().contains("cannot be combined"));
+        let error =
+            requested_completion(Some("literal"), Some("__DONE__"), &slot, true).unwrap_err();
+        assert!(error.to_string().contains("choose one"));
 
         assert!(
-            compile_until_regex(Some(""))
+            compile_regex("", "regex")
                 .unwrap_err()
                 .to_string()
                 .contains("must not be empty")
         );
         assert!(
-            compile_until_regex(Some("("))
+            compile_regex("(", "regex")
                 .unwrap_err()
                 .to_string()
                 .contains("not a valid regex")
         );
+        assert!(
+            compile_regex(&"界".repeat(1366), "regex")
+                .unwrap_err()
+                .to_string()
+                .contains("4096 UTF-8 bytes")
+        );
+
+        for legacy in ["completion", "until", "eol", "quiet_ms"] {
+            let mut value = json!({"slot_id":"bench","command":"boot"});
+            value[legacy] = json!("legacy");
+            assert!(serde_json::from_value::<CommandArgs>(value).is_err());
+        }
     }
 }
