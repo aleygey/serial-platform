@@ -324,13 +324,13 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "devices",
-            "List authoritative Slots and ownership state. Inspect before writing.",
+            "List authoritative Slots and ownership.",
             object(json!({"slot_id":{"type":"string"}}), &[]),
             true,
         ),
         tool(
             "read",
-            "Bounded serial read. Omit scope for tail; continue uses adapter cursor; archive requires epoch.",
+            "Read bounded serial output; archive requires epoch.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -344,7 +344,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "command",
-            "Write in the active Run and capture post-TX RX. Inherits EOL/pacing/prompts; use at most one of expect/regex; execution stays unknown.",
+            "Write in the active Run and capture RX; uses Slot EOL, pacing, and prompts.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -359,7 +359,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "input",
-            "Write exact UTF-8 bytes with no EOL. Requires this MCP's active Run.",
+            "Write exact UTF-8 bytes without EOL in the active Run.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -371,7 +371,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "signal",
-            "Send raw Ctrl-C/D/Z or a physical serial Break in this MCP's active Run.",
+            "Send Ctrl-C/D/Z or serial Break in the active Run.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -384,7 +384,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "trigger",
-            "Bounded daemon reaction: explicit kickoff/action/EOL/matchers; effective server pacing still applies.",
+            "Run bounded daemon-side repeated writes and matchers.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -402,7 +402,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "wait",
-            "Wait from adapter cursor. Use at most one of expect/regex; otherwise use effective prompt or post-RX quiet.",
+            "Wait for RX using a literal, regex, prompt, or quiet boundary.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -416,7 +416,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "search",
-            "Bounded search. Omit scope for current Run; archive requires explicit epoch.",
+            "Search the current Run by default; archive requires epoch.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
@@ -433,7 +433,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "monitor_start",
-            "Start a persistent seriald Monitor and return immediately. Supply exactly one literal or regex matcher; notification delivery is platform policy, not an Agent parameter.",
+            "Start a persistent Monitor with one literal or regex matcher.",
             {
                 let mut schema = object(
                     json!({
@@ -441,7 +441,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "contains":{"type":"string","minLength":1,"maxLength":4096},
                     "regex":{"type":"string","minLength":1,"maxLength":4096},
                     "description":{"type":"string","minLength":1,"maxLength":1024},
-                    "idempotency_key":{"type":"string","format":"uuid","description":"Optional UUID to reuse when retrying this start."}
+                    "idempotency_key":{"type":"string","format":"uuid","description":"Reuse on retry."}
                     }),
                     &["slot_id"],
                 );
@@ -455,13 +455,13 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "monitor_list",
-            "List persistent Monitor Jobs from seriald. Optionally filter by Slot.",
+            "List persistent Monitors; optionally filter by Slot.",
             object(json!({"slot_id":{"type":"string"}}), &[]),
             true,
         ),
         tool(
             "monitor_status",
-            "Get authoritative state for one persistent Monitor Job.",
+            "Get one Monitor's authoritative state.",
             object(
                 json!({"monitor_id":{"type":"string","format":"uuid"}}),
                 &["monitor_id"],
@@ -470,7 +470,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "monitor_incidents",
-            "Read bounded retained incidents for one Monitor. Omit after for the recent tail, use after=\"0\" to page from the oldest retained incident, or continue with the opaque after cursor returned by a previous page.",
+            "Read retained incidents; continue with the returned after cursor.",
             object(
                 json!({
                     "monitor_id":{"type":"string","format":"uuid"},
@@ -482,7 +482,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "monitor_stop",
-            "Stop a persistent Monitor Job. Retained incidents remain queryable.",
+            "Stop a Monitor; retained incidents remain readable.",
             object(
                 json!({"monitor_id":{"type":"string","format":"uuid"}}),
                 &["monitor_id"],
@@ -491,7 +491,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_start",
-            "Acquire write control and start an evidence boundary. Does not reset device state.",
+            "Acquire write control and start an evidence Run.",
             object(
                 json!({
                     "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
@@ -502,13 +502,13 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_end",
-            "End this MCP's Run and release control; serial observation stays open.",
+            "End this MCP's Run and release control.",
             object(json!({"slot_id":{"type":"string"}}), &["slot_id"]),
             false,
         ),
         tool(
             "release",
-            "Release this MCP's control lease without closing the serial port.",
+            "Release control without closing the serial port.",
             object(
                 json!({"slot_id":{"type":"string"},"abort_run":{"type":"boolean"}}),
                 &["slot_id"],
@@ -800,7 +800,9 @@ mod tests {
     fn report_tool_definition_json_size() {
         let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
         eprintln!("tool_definition_json_bytes={bytes}");
-        assert!(bytes <= 6_000, "tool definitions grew to {bytes} bytes");
+        // v0.5 adds five persistent Monitor operations while keeping the
+        // complete 16-tool MCP surface below a bounded prompt cost.
+        assert!(bytes <= 7_800, "tool definitions grew to {bytes} bytes");
         for tool in tool_definitions() {
             assert!(
                 tool["description"].as_str().unwrap().len() <= 180,
