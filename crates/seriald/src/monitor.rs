@@ -2777,7 +2777,7 @@ mod tests {
                 epoch,
                 after_seq: 42,
             },
-            cooldown_until_wall_time_ns: wall_time_ns().saturating_add(ms_to_ns(30_000)),
+            cooldown_until_wall_time_ns: Some(wall_time_ns().saturating_add(ms_to_ns(30_000))),
             pending: None,
         };
         manager
