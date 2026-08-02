@@ -16,7 +16,9 @@ use serial_protocol::{
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
@@ -258,7 +260,7 @@ impl MonitorManager {
             started_wall_time_ns: now,
             expires_wall_time_ns,
             stopped_wall_time_ns: None,
-            current_cursor: Some(cursor),
+            current_cursor: Some(cursor.clone()),
             incident_count: 0,
             unacked_incident_count: 0,
             gap_count: 0,
@@ -324,7 +326,7 @@ impl MonitorManager {
         updated.started_wall_time_ns = now;
         updated.expires_wall_time_ns = duration_deadline(now, updated.spec.duration_ms);
         updated.stopped_wall_time_ns = None;
-        updated.current_cursor = Some(cursor);
+        updated.current_cursor = Some(cursor.clone());
         updated.last_error = None;
         if let Err(error) = self
             .mutate_and_persist(|state| {
@@ -670,16 +672,11 @@ impl MonitorManager {
             if let Err(error) = result
                 && !manager.is_shutting_down()
             {
-                if manager
+                // `fail_monitor` restores supervision itself when persistence
+                // rolls the authoritative state back to Running.
+                let _ = manager
                     .fail_monitor(monitor_id, revision, error.to_string())
-                    .await
-                    .is_err()
-                {
-                    // Persistence failure rolls the durable state back to
-                    // Running. Replace this dead worker only if the same
-                    // revision remains authoritative.
-                    manager.ensure_current_worker(monitor_id).await;
-                }
+                    .await;
             }
         });
         worker.task = Some(task);
@@ -715,12 +712,20 @@ impl MonitorManager {
         }
     }
 
-    async fn ensure_current_worker(&self, monitor_id: Uuid) {
-        if let Ok(monitor) = self.get_view(monitor_id).await
-            && monitor.status == MonitorStatus::Running
-        {
-            self.spawn_worker(monitor_id, monitor.revision).await;
-        }
+    // Worker-failure recovery can re-enter `spawn_worker`. Erasing this future
+    // type breaks that recursive async type while retaining the Send bound
+    // required by the owning Tokio task.
+    fn ensure_current_worker(
+        &self,
+        monitor_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Ok(monitor) = self.get_view(monitor_id).await
+                && monitor.status == MonitorStatus::Running
+            {
+                self.spawn_worker(monitor_id, monitor.revision).await;
+            }
+        })
     }
 
     async fn fail_monitor(
