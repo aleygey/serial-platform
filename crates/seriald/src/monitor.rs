@@ -998,7 +998,14 @@ impl MonitorManager {
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.inner.shutdown.send(true);
+        // `send` drops the new value when there are no receivers. That is a
+        // real startup race here: an immediately shut down manager may not
+        // have spawned a Monitor or sink receiver yet, and its startup task
+        // would then observe `false` and create a sink task that shutdown waits
+        // on forever. `send_replace` makes shutdown authoritative even with no
+        // current subscribers; later subscribers also observe the terminal
+        // state before starting work.
+        self.inner.shutdown.send_replace(true);
         let startup = self
             .inner
             .startup_task
@@ -2268,6 +2275,7 @@ mod matcher_tests {
         spec.debounce_ms = 1_000;
         let mut runtime = WorkerRuntime::new(&spec, None, None).unwrap();
         let first = rx_event(epoch, 1, 0, b"panic");
+        assert!(runtime.observes_boundary(&first).is_none());
         let candidate = runtime.matcher.push(&first).unwrap();
         assert!(
             runtime
@@ -2398,6 +2406,19 @@ mod tests {
         )
         .unwrap();
         (manager, registry, journal, epoch)
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_startup_subscribes_is_bounded() {
+        let temp = TempDir::new().unwrap();
+        let (manager, registry, journal, _) = fixture(&temp).await;
+
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("Monitor shutdown must retain its signal without receivers");
+
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2780,6 +2801,10 @@ mod tests {
             cooldown_until_wall_time_ns: Some(wall_time_ns().saturating_add(ms_to_ns(30_000))),
             pending: None,
         };
+        // Isolate the persistence contract under test. A live worker owns its
+        // checkpoint and is expected to persist its own cursor when cancelled;
+        // it must not race this deliberately injected checkpoint.
+        manager.stop_worker(monitor_id, created.revision).await;
         manager
             .checkpoint_progress(monitor_id, created.revision, checkpoint.clone())
             .await
