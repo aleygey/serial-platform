@@ -72,6 +72,7 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
             &EventQuery {
                 epoch: Some(snapshot.daemon_epoch),
                 after_seq: Some(snapshot.head_seq.saturating_sub(100)),
+                through_seq: None,
                 before_wall_time_ns: None,
                 after_wall_time_ns: None,
                 direction: Some(Direction::None),
@@ -426,6 +427,7 @@ pub async fn stream(api: &ApiClient, args: DoctorStreamArgs) -> Result<()> {
                 &EventQuery {
                     epoch: Some(before.daemon_epoch),
                     after_seq: Some(before.head_seq),
+                    through_seq: Some(after.head_seq),
                     before_wall_time_ns: None,
                     after_wall_time_ns: None,
                     direction: Some(Direction::Rx),

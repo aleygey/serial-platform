@@ -1078,6 +1078,10 @@ pub struct ArchiveListResponse {
 pub struct EventQuery {
     pub epoch: Option<Uuid>,
     pub after_seq: Option<u64>,
+    /// Inclusive upper sequence bound. Together with `after_seq`, this selects
+    /// the exact half-open/closed interval `(after_seq, through_seq]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_seq: Option<u64>,
     pub before_wall_time_ns: Option<i64>,
     pub after_wall_time_ns: Option<i64>,
     pub direction: Option<Direction>,
@@ -1232,8 +1236,9 @@ pub struct MonitorIncident {
     pub evidence_ref: String,
     pub created_wall_time_ns: i64,
     /// Notification freshness deadline. This only expires webhook/outbox
-    /// delivery; the Incident itself is retained until bounded retention or
-    /// acknowledgement-based pruning removes it.
+    /// delivery; the Incident itself is retained until bounded retention
+    /// removes it. At a hard bound, the oldest summary yields to newer evidence
+    /// regardless of ACK.
     pub expires_wall_time_ns: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acked_wall_time_ns: Option<i64>,
@@ -1247,7 +1252,9 @@ pub struct MonitorIncidentResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorIncidentListResponse {
     pub incidents: Vec<MonitorIncident>,
-    /// Decimal incident sequence; pass it as `after_incident_seq`.
+    /// Decimal incident high-water sequence; pass it as
+    /// `after_incident_seq`. This advances across filtered ACKed Incidents and
+    /// can therefore be present even when `incidents` is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<u64>,
     pub truncated: bool,

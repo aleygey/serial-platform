@@ -105,8 +105,13 @@ short preview plus `evidence_ref`, `evidence_cursor`, and the exact serial
 sequence range; fetch deeper serial evidence only when it is relevant instead
 of placing an unbounded UART history in Agent context. For an exact follow-up,
 call `read` with `scope=archive`, the incident Slot, and the returned
-`evidence_cursor` epoch/after-sequence pair. `truncated=true` means the returned
-page is incomplete, not that no later incident exists.
+`evidence_cursor` epoch/after-sequence pair, plus `through_seq=seq_end` from
+the Incident. That inclusive upper bound prevents output arriving after the
+Incident from being mixed into its evidence. `truncated=true` means the
+returned page is incomplete, not that no later incident exists.
+`next_after` is also the server's observed incident high-water mark, so it can
+advance even when a page is empty after ACK filtering; clients should persist
+it exactly as returned rather than deriving a cursor from the result array.
 
 Notification delivery is optional platform configuration. Without a message
 center, incidents remain durable and queryable with these tools. With one

@@ -336,7 +336,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "slot_id":{"type":"string"},
                     "scope":{"type":"string","enum":["tail","continue","archive"]},
                     "epoch":{"type":"string","format":"uuid"},
-                    "after_seq":{"type":"integer","minimum":0}
+                    "after_seq":{"type":"integer","minimum":0},
+                    "through_seq":{"type":"integer","minimum":1,"description":"Archive inclusive end."}
                 }),
                 &["slot_id"],
             ),
@@ -634,6 +635,12 @@ mod tests {
         assert_eq!(
             search["inputSchema"]["properties"]["query"]["maxLength"],
             4096
+        );
+
+        let read = tools.iter().find(|tool| tool["name"] == "read").unwrap();
+        assert_eq!(
+            read["inputSchema"]["properties"]["through_seq"]["minimum"],
+            1
         );
 
         let wait = tools.iter().find(|tool| tool["name"] == "wait").unwrap();

@@ -110,6 +110,9 @@ impl AgentTools {
     async fn read(&self, args: ReadArgs) -> Result<Value> {
         let slot = self.slot(&args.slot_id).await?;
         let scope = args.scope.as_deref().unwrap_or("tail");
+        if args.through_seq.is_some() && scope != "archive" {
+            bail!("through_seq is only valid with scope=archive");
+        }
         let (epoch, after_seq) = match scope {
             "tail" => read_window(None, None, Some(200), &slot)?,
             "continue" => {
@@ -137,6 +140,7 @@ impl AgentTools {
                 &EventQuery {
                     epoch: Some(epoch),
                     after_seq,
+                    through_seq: args.through_seq,
                     before_wall_time_ns: None,
                     after_wall_time_ns: None,
                     direction: None,
@@ -213,6 +217,7 @@ impl AgentTools {
         let query = EventQuery {
             epoch: Some(epoch),
             after_seq,
+            through_seq: None,
             before_wall_time_ns: None,
             after_wall_time_ns: None,
             direction: None,
@@ -1945,6 +1950,7 @@ struct ReadArgs {
     scope: Option<String>,
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
+    through_seq: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2076,17 +2082,19 @@ mod tests {
     }
 
     #[test]
-    fn read_args_keep_only_scope_and_archive_cursor() {
+    fn read_args_keep_only_scope_and_bounded_archive_cursor() {
         let args: ReadArgs = serde_json::from_value(json!({
             "slot_id": "bench",
             "scope": "archive",
             "epoch": Uuid::nil(),
             "after_seq": 42,
+            "through_seq": 47,
         }))
         .unwrap();
         assert_eq!(args.scope.as_deref(), Some("archive"));
         assert_eq!(args.epoch, Some(Uuid::nil()));
         assert_eq!(args.after_seq, Some(42));
+        assert_eq!(args.through_seq, Some(47));
         assert!(
             serde_json::from_value::<ReadArgs>(json!({"slot_id":"bench","include_raw":true}))
                 .is_err()

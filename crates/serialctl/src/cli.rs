@@ -198,6 +198,10 @@ pub struct LogsArgs {
     #[arg(long)]
     after_seq: Option<u64>,
 
+    /// Return events through this sequence, inclusively.
+    #[arg(long)]
+    through_seq: Option<u64>,
+
     /// Only return events strictly after this RFC3339 timestamp.
     #[arg(long, value_parser = parse_rfc3339_ns)]
     after_time: Option<i64>,
@@ -508,9 +512,15 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
     {
         bail!(tr("m.logs.time.order"));
     }
+    if let (Some(after), Some(through)) = (args.after_seq, args.through_seq)
+        && after > through
+    {
+        bail!(tr("m.logs.seq.order"));
+    }
     let query_spans_epoch = args.run.is_none()
         && args.operation.is_none()
         && args.after_seq.is_none()
+        && args.through_seq.is_none()
         && args.after_time.is_none()
         && args.before_time.is_none();
     if query_spans_epoch && !args.json {
@@ -541,6 +551,7 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
             &EventQuery {
                 epoch: args.epoch,
                 after_seq: args.after_seq,
+                through_seq: args.through_seq,
                 before_wall_time_ns: args.before_time,
                 after_wall_time_ns: args.after_time,
                 direction: args.direction,

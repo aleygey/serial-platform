@@ -29,11 +29,14 @@ const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MONITORS: usize = 128;
 const MAX_ACTIVE_MONITORS: usize = 64;
-const MAX_INCIDENTS_PER_MONITOR: usize = 2_048;
-const MAX_INCIDENTS_TOTAL: usize = 8_192;
-const MAX_OUTBOX_EVENTS: usize = 4_096;
+const MAX_INCIDENTS_PER_MONITOR: usize = 512;
+const MAX_INCIDENTS_TOTAL: usize = 1_024;
+const MAX_OUTBOX_EVENTS: usize = 512;
 const MAX_PATTERN_BYTES: usize = 4_096;
-const MAX_DESCRIPTION_BYTES: usize = 4_096;
+// Keep the daemon contract aligned with the MCP schema. More importantly,
+// this participates in the persisted-state budget below because descriptions
+// are copied into both retained Incidents and notification events.
+const MAX_DESCRIPTION_BYTES: usize = 1_024;
 const MAX_PREVIEW_BYTES: usize = 1_024;
 const MAX_MATCH_WINDOW_BYTES: usize = 64 * 1024;
 const MAX_REGEX_COMPILED_BYTES: usize = 2 * 1024 * 1024;
@@ -46,6 +49,20 @@ const MAX_PAGE: usize = 200;
 /// This bounds disk work on the Monitor worker; the Slot RX actor never waits
 /// for a checkpoint and broadcast/ring replay cover a worker that falls behind.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+
+// Conservative JSON-size envelopes include worst-case JSON escaping for all
+// bounded strings plus fixed field/pretty-print overhead. Keep the legal state
+// comfortably below the hard file limit so reaching a documented retention
+// bound cannot itself make the next atomic persistence fail.
+const ESTIMATED_MONITOR_AND_CHECKPOINT_BYTES: u64 = 64 * 1024;
+const ESTIMATED_INCIDENT_BYTES: u64 = 24 * 1024;
+const ESTIMATED_OUTBOX_EVENT_BYTES: u64 = 40 * 1024;
+const ESTIMATED_STATE_FIXED_BYTES: u64 = 1024 * 1024;
+const MAX_ESTIMATED_STATE_BYTES: u64 = ESTIMATED_STATE_FIXED_BYTES
+    + MAX_MONITORS as u64 * ESTIMATED_MONITOR_AND_CHECKPOINT_BYTES
+    + MAX_INCIDENTS_TOTAL as u64 * ESTIMATED_INCIDENT_BYTES
+    + MAX_OUTBOX_EVENTS as u64 * ESTIMATED_OUTBOX_EVENT_BYTES;
+const _: () = assert!(MAX_ESTIMATED_STATE_BYTES < MAX_STATE_FILE_BYTES);
 
 #[derive(Clone)]
 pub struct MonitorManager {
@@ -94,7 +111,7 @@ struct PersistedState {
     next_outbox_seq: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MonitorCheckpoint {
     cursor: Cursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,9 +473,11 @@ impl MonitorManager {
         include_acked: bool,
     ) -> Result<MonitorIncidentListResponse, MonitorError> {
         let state = self.inner.state.read().await;
-        if !state.monitors.contains_key(&monitor_id) {
-            return Err(MonitorError::NotFound(monitor_id));
-        }
+        let monitor = state
+            .monitors
+            .get(&monitor_id)
+            .ok_or(MonitorError::NotFound(monitor_id))?;
+        let high_water = monitor.incident_count;
         let all = state
             .incidents
             .get(&monitor_id)
@@ -467,7 +486,8 @@ impl MonitorManager {
         let limit = limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
         let first_available_incident_seq = all.front().map(|incident| incident.incident_seq);
         let retention_gap = after_incident_seq.is_some_and(|after| {
-            first_available_incident_seq.is_some_and(|first| after < first.saturating_sub(1))
+            first_available_incident_seq
+                .map_or(after < high_water, |first| after < first.saturating_sub(1))
         });
         let eligible = all
             .into_iter()
@@ -486,7 +506,16 @@ impl MonitorManager {
         let truncated = after_incident_seq.is_some() && selected.len() > limit
             || after_incident_seq.is_none() && eligible_len > limit;
         let incidents = selected.into_iter().take(limit).collect::<Vec<_>>();
-        let next_cursor = incidents.last().map(|incident| incident.incident_seq);
+        // `next_cursor` is also the observed high-water mark. In particular,
+        // an empty page caused by filtering ACKed Incidents must still advance
+        // a poller instead of making it scan the same filtered range forever.
+        let next_cursor = if after_incident_seq.is_none() {
+            Some(high_water).filter(|cursor| *cursor > 0)
+        } else if truncated {
+            incidents.last().map(|incident| incident.incident_seq)
+        } else {
+            Some(after_incident_seq.unwrap_or_default().max(high_water))
+        };
         Ok(MonitorIncidentListResponse {
             incidents,
             next_cursor,
@@ -799,7 +828,9 @@ impl MonitorManager {
         expected_revision: u64,
         checkpoint: MonitorCheckpoint,
     ) -> Result<(), MonitorError> {
-        self.mutate_and_persist(|state| {
+        let _mutation = self.inner.mutation.lock().await;
+        {
+            let state = self.inner.state.read().await;
             let monitor = state
                 .monitors
                 .get(&monitor_id)
@@ -807,10 +838,23 @@ impl MonitorManager {
             if monitor.status != MonitorStatus::Running || monitor.revision != expected_revision {
                 return Ok(());
             }
-            state.checkpoints.insert(monitor_id, checkpoint);
-            Ok(())
-        })
-        .await
+            if state.checkpoints.get(&monitor_id) == Some(&checkpoint) {
+                return Ok(());
+            }
+        }
+
+        let previous = self.inner.state.read().await.clone();
+        self.inner
+            .state
+            .write()
+            .await
+            .checkpoints
+            .insert(monitor_id, checkpoint);
+        if let Err(error) = self.persist().await {
+            *self.inner.state.write().await = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn checkpoint_for(&self, monitor: &MonitorView, fallback: Cursor) -> MonitorCheckpoint {
@@ -867,38 +911,21 @@ impl MonitorManager {
             if monitor.status != MonitorStatus::Running || monitor.revision != expected_revision {
                 return Ok(());
             }
-            let total_incidents = state.incidents.values().map(VecDeque::len).sum::<usize>();
-            if total_incidents >= MAX_INCIDENTS_TOTAL {
-                prune_one_global_incident(state, now);
+            if state
+                .incidents
+                .get(&monitor_id)
+                .is_some_and(|incidents| incidents.len() >= MAX_INCIDENTS_PER_MONITOR)
+            {
+                prune_one_monitor_incident(state, monitor_id);
             }
             if state.incidents.values().map(VecDeque::len).sum::<usize>() >= MAX_INCIDENTS_TOTAL {
-                let monitor = state
-                    .monitors
-                    .get_mut(&monitor_id)
-                    .ok_or(MonitorError::NotFound(monitor_id))?;
-                monitor.gap_count = monitor.gap_count.saturating_add(1);
-                monitor.last_error =
-                    Some("global incident retention is full; a match was dropped".into());
-                return Ok(());
+                prune_one_global_incident(state);
             }
             let monitor = state
                 .monitors
                 .get_mut(&monitor_id)
                 .ok_or(MonitorError::NotFound(monitor_id))?;
             let incidents = state.incidents.entry(monitor_id).or_default();
-            if incidents.len() >= MAX_INCIDENTS_PER_MONITOR {
-                if let Some(index) = incidents
-                    .iter()
-                    .position(|incident| incident.acked_wall_time_ns.is_some())
-                {
-                    incidents.remove(index);
-                } else {
-                    monitor.gap_count = monitor.gap_count.saturating_add(1);
-                    monitor.last_error =
-                        Some("incident retention is full; a match was dropped".into());
-                    return Ok(());
-                }
-            }
             let incident_seq = monitor.incident_count.saturating_add(1);
             let incident_id = Uuid::new_v4();
             let expires = now.saturating_add(ms_to_ns(monitor.spec.event_ttl_ms));
@@ -1215,20 +1242,6 @@ async fn send_cloud_event(
 }
 
 fn prune_expired_metadata(state: &mut PersistedState, now: i64) {
-    for incidents in state.incidents.values_mut() {
-        // Incident retention is independent of notification TTL. Only ACKed
-        // incidents can make room automatically; otherwise a dropped match is
-        // surfaced as a retention gap instead of silently deleting evidence.
-        while incidents.len() >= MAX_INCIDENTS_PER_MONITOR {
-            let Some(index) = incidents
-                .iter()
-                .position(|incident| incident.acked_wall_time_ns.is_some())
-            else {
-                break;
-            };
-            incidents.remove(index);
-        }
-    }
     for entry in &mut state.outbox {
         if entry.public.status == MonitorOutboxStatus::Pending
             && entry.public.expires_wall_time_ns <= now
@@ -1339,7 +1352,7 @@ fn truncate_text(value: &str, limit: usize) -> String {
     format!("{}…", &value[..end])
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingIncident {
     daemon_epoch: Uuid,
     seq_start: u64,
@@ -2021,14 +2034,22 @@ fn prune_monitor_capacity(state: &mut PersistedState, _now: i64) {
             .monitors
             .values()
             .filter(|monitor| monitor.status != MonitorStatus::Running)
-            .filter(|monitor| {
-                state.incidents.get(&monitor.id).is_none_or(|incidents| {
+            // Prefer a fully acknowledged Job, but never let missing ACKs
+            // permanently exhaust the catalog. At the hard bound the oldest
+            // stopped Job yields to newer work; raw evidence remains in the
+            // serial journal even when its Monitor summary is pruned.
+            .min_by_key(|monitor| {
+                let has_unacked = state.incidents.get(&monitor.id).is_some_and(|incidents| {
                     incidents
                         .iter()
-                        .all(|incident| incident.acked_wall_time_ns.is_some())
-                })
+                        .any(|incident| incident.acked_wall_time_ns.is_none())
+                });
+                (
+                    has_unacked,
+                    monitor.stopped_wall_time_ns,
+                    monitor.created_wall_time_ns,
+                )
             })
-            .min_by_key(|monitor| (monitor.stopped_wall_time_ns, monitor.created_wall_time_ns))
             .map(|monitor| monitor.id);
         let Some(id) = candidate else {
             break;
@@ -2039,7 +2060,28 @@ fn prune_monitor_capacity(state: &mut PersistedState, _now: i64) {
     }
 }
 
-fn prune_one_global_incident(state: &mut PersistedState, _now: i64) {
+fn mark_incident_retention_gap(state: &mut PersistedState, monitor_id: Uuid, message: &str) {
+    if let Some(monitor) = state.monitors.get_mut(&monitor_id) {
+        monitor.gap_count = monitor.gap_count.saturating_add(1);
+        monitor.last_error = Some(message.into());
+    }
+}
+
+fn prune_one_monitor_incident(state: &mut PersistedState, monitor_id: Uuid) {
+    let removed = state
+        .incidents
+        .get_mut(&monitor_id)
+        .and_then(VecDeque::pop_front);
+    if removed.is_some() {
+        mark_incident_retention_gap(
+            state,
+            monitor_id,
+            "oldest retained Incident was pruned at the per-Monitor capacity",
+        );
+    }
+}
+
+fn prune_one_global_incident(state: &mut PersistedState) {
     let candidate = state
         .incidents
         .iter()
@@ -2047,19 +2089,18 @@ fn prune_one_global_incident(state: &mut PersistedState, _now: i64) {
             incidents
                 .iter()
                 .enumerate()
-                .filter_map(move |(index, incident)| {
-                    incident.acked_wall_time_ns.is_some().then_some((
-                        *monitor_id,
-                        index,
-                        incident.created_wall_time_ns,
-                    ))
-                })
+                .map(move |(index, incident)| (*monitor_id, index, incident.created_wall_time_ns))
         })
         .min_by_key(|(_, _, created)| *created);
     if let Some((monitor_id, index, _)) = candidate
         && let Some(incidents) = state.incidents.get_mut(&monitor_id)
     {
         incidents.remove(index);
+        mark_incident_retention_gap(
+            state,
+            monitor_id,
+            "oldest retained Incident was pruned at the global capacity",
+        );
     }
 }
 
@@ -2348,6 +2389,57 @@ mod tests {
             data: data.to_vec(),
             metadata: BTreeMap::new(),
             durable: true,
+        }
+    }
+
+    fn retained_incident(monitor_id: Uuid, epoch: Uuid, incident_seq: u64) -> MonitorIncident {
+        MonitorIncident {
+            id: Uuid::new_v4(),
+            incident_seq,
+            monitor_id,
+            slot_id: "slot-1".into(),
+            daemon_epoch: epoch,
+            seq_start: incident_seq,
+            seq_end: incident_seq,
+            wall_time_start_ns: incident_seq as i64,
+            wall_time_end_ns: incident_seq as i64,
+            severity: MonitorSeverity::Error,
+            description: Some("watch the DUT".into()),
+            preview: format!("kernel panic {incident_seq}"),
+            evidence_cursor: Cursor {
+                epoch,
+                after_seq: incident_seq.saturating_sub(1),
+            },
+            evidence_ref: format!("serial://test/{incident_seq}"),
+            created_wall_time_ns: incident_seq as i64,
+            expires_wall_time_ns: i64::MAX,
+            acked_wall_time_ns: None,
+        }
+    }
+
+    fn stopped_monitor(id: Uuid, epoch: Uuid, created_wall_time_ns: i64) -> MonitorView {
+        let mut monitor_spec = spec("slot-1");
+        monitor_spec.start_cursor = Some(Cursor {
+            epoch,
+            after_seq: 0,
+        });
+        MonitorView {
+            id,
+            revision: 2,
+            spec: monitor_spec,
+            status: MonitorStatus::Stopped,
+            created_wall_time_ns,
+            started_wall_time_ns: created_wall_time_ns,
+            expires_wall_time_ns: None,
+            stopped_wall_time_ns: Some(created_wall_time_ns),
+            current_cursor: Some(Cursor {
+                epoch,
+                after_seq: 0,
+            }),
+            incident_count: 1,
+            unacked_incident_count: 1,
+            gap_count: 0,
+            last_error: None,
         }
     }
 
@@ -2721,6 +2813,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_empty_incident_page_advances_to_the_observed_high_water() {
+        let temp = TempDir::new().unwrap();
+        let (manager, registry, journal, epoch) = fixture(&temp).await;
+        let monitor_id = Uuid::new_v4();
+        let created = manager
+            .create(CreateMonitorRequest {
+                request_id: monitor_id,
+                spec: spec("slot-1"),
+            })
+            .await
+            .unwrap()
+            .monitor;
+        manager.stop_worker(monitor_id, created.revision).await;
+        {
+            let mut state = manager.inner.state.write().await;
+            let incidents = (1..=3)
+                .map(|seq| {
+                    let mut incident = retained_incident(monitor_id, epoch, seq);
+                    incident.acked_wall_time_ns = Some(seq as i64);
+                    incident
+                })
+                .collect::<VecDeque<_>>();
+            state.incidents.insert(monitor_id, incidents);
+            let monitor = state.monitors.get_mut(&monitor_id).unwrap();
+            monitor.incident_count = 3;
+            monitor.unacked_incident_count = 0;
+        }
+
+        let page = manager
+            .incidents(monitor_id, Some(0), Some(20), false)
+            .await
+            .unwrap();
+        assert!(page.incidents.is_empty());
+        assert_eq!(page.next_cursor, Some(3));
+        assert!(!page.truncated);
+
+        let beyond_head = manager
+            .incidents(monitor_id, Some(99), Some(20), false)
+            .await
+            .unwrap();
+        assert!(beyond_head.incidents.is_empty());
+        assert_eq!(beyond_head.next_cursor, Some(99));
+
+        manager.shutdown().await;
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unacked_incident_capacity_evicts_oldest_and_retains_newest_match() {
+        let temp = TempDir::new().unwrap();
+        let (manager, registry, journal, epoch) = fixture(&temp).await;
+        let monitor_id = Uuid::new_v4();
+        let created = manager
+            .create(CreateMonitorRequest {
+                request_id: monitor_id,
+                spec: spec("slot-1"),
+            })
+            .await
+            .unwrap()
+            .monitor;
+        manager.stop_worker(monitor_id, created.revision).await;
+        {
+            let mut state = manager.inner.state.write().await;
+            state.incidents.insert(
+                monitor_id,
+                (1..=MAX_INCIDENTS_PER_MONITOR as u64)
+                    .map(|seq| retained_incident(monitor_id, epoch, seq))
+                    .collect(),
+            );
+            let monitor = state.monitors.get_mut(&monitor_id).unwrap();
+            monitor.incident_count = MAX_INCIDENTS_PER_MONITOR as u64;
+            monitor.unacked_incident_count = MAX_INCIDENTS_PER_MONITOR as u64;
+        }
+
+        let newest_seq = MAX_INCIDENTS_PER_MONITOR as u64 + 1;
+        manager
+            .record_incident(
+                monitor_id,
+                created.revision,
+                PendingIncident {
+                    daemon_epoch: epoch,
+                    seq_start: newest_seq,
+                    seq_end: newest_seq,
+                    wall_time_start_ns: newest_seq as i64,
+                    wall_time_end_ns: newest_seq as i64,
+                    preview: "newest kernel panic".into(),
+                },
+                MonitorCheckpoint {
+                    cursor: Cursor {
+                        epoch,
+                        after_seq: newest_seq,
+                    },
+                    cooldown_until_wall_time_ns: None,
+                    pending: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let state = manager.inner.state.read().await;
+        let incidents = state.incidents.get(&monitor_id).unwrap();
+        assert_eq!(incidents.len(), MAX_INCIDENTS_PER_MONITOR);
+        assert_eq!(incidents.front().unwrap().incident_seq, 2);
+        assert_eq!(incidents.back().unwrap().incident_seq, newest_seq);
+        assert!(
+            incidents
+                .iter()
+                .all(|incident| incident.acked_wall_time_ns.is_none())
+        );
+        let monitor = state.monitors.get(&monitor_id).unwrap();
+        assert_eq!(monitor.incident_count, newest_seq);
+        assert_eq!(
+            monitor.unacked_incident_count,
+            MAX_INCIDENTS_PER_MONITOR as u64
+        );
+        assert_eq!(monitor.gap_count, 1);
+        drop(state);
+
+        let page = manager
+            .incidents(monitor_id, Some(0), Some(20), true)
+            .await
+            .unwrap();
+        assert!(page.retention_gap);
+        assert_eq!(page.first_available_incident_seq, Some(2));
+
+        manager.shutdown().await;
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn hard_retention_bounds_do_not_depend_on_acknowledgement() {
+        let epoch = Uuid::new_v4();
+        let oldest_monitor = Uuid::new_v4();
+        let newer_monitor = Uuid::new_v4();
+        let mut global = PersistedState::default();
+        global
+            .monitors
+            .insert(oldest_monitor, stopped_monitor(oldest_monitor, epoch, 1));
+        global
+            .monitors
+            .insert(newer_monitor, stopped_monitor(newer_monitor, epoch, 2));
+        global.incidents.insert(
+            oldest_monitor,
+            VecDeque::from([retained_incident(oldest_monitor, epoch, 1)]),
+        );
+        global.incidents.insert(
+            newer_monitor,
+            VecDeque::from([retained_incident(newer_monitor, epoch, 1)]),
+        );
+
+        prune_one_global_incident(&mut global);
+        assert!(global.incidents[&oldest_monitor].is_empty());
+        assert_eq!(global.incidents[&newer_monitor].len(), 1);
+        assert_eq!(global.monitors[&oldest_monitor].gap_count, 1);
+
+        let mut catalog = PersistedState::default();
+        let mut ids = Vec::new();
+        for index in 0..MAX_MONITORS {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            catalog
+                .monitors
+                .insert(id, stopped_monitor(id, epoch, index as i64));
+            catalog
+                .incidents
+                .insert(id, VecDeque::from([retained_incident(id, epoch, 1)]));
+        }
+        prune_monitor_capacity(&mut catalog, wall_time_ns());
+        assert_eq!(catalog.monitors.len(), MAX_MONITORS - 1);
+        assert!(!catalog.monitors.contains_key(&ids[0]));
+        assert!(catalog.monitors.contains_key(ids.last().unwrap()));
+    }
+
+    #[test]
+    fn legal_retention_bounds_fit_the_atomic_state_file_budget() {
+        assert!(MAX_ESTIMATED_STATE_BYTES < MAX_STATE_FILE_BYTES);
+        assert_eq!(MAX_DESCRIPTION_BYTES, 1_024);
+        assert_eq!(MAX_INCIDENTS_PER_MONITOR, 512);
+        assert_eq!(MAX_INCIDENTS_TOTAL, 1_024);
+        assert_eq!(MAX_OUTBOX_EVENTS, 512);
+    }
+
+    #[tokio::test]
     async fn incident_page_marks_a_cursor_before_retained_history_as_a_gap() {
         let temp = TempDir::new().unwrap();
         let (manager, registry, journal, epoch) = fixture(&temp).await;
@@ -2834,6 +3111,70 @@ mod tests {
             checkpoint.cooldown_until_wall_time_ns
         );
         reopened.shutdown().await;
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn identical_checkpoint_skips_disk_write_but_a_rewind_is_persisted() {
+        let temp = TempDir::new().unwrap();
+        let (manager, registry, journal, epoch) = fixture(&temp).await;
+        let created = manager
+            .create(CreateMonitorRequest {
+                request_id: Uuid::new_v4(),
+                spec: spec("slot-1"),
+            })
+            .await
+            .unwrap()
+            .monitor;
+        manager.stop_worker(created.id, created.revision).await;
+        let forward = MonitorCheckpoint {
+            cursor: Cursor {
+                epoch,
+                after_seq: 42,
+            },
+            cooldown_until_wall_time_ns: Some(wall_time_ns().saturating_add(ms_to_ns(30_000))),
+            pending: None,
+        };
+        manager
+            .checkpoint_progress(created.id, created.revision, forward.clone())
+            .await
+            .unwrap();
+
+        manager.set_persist_failure(true);
+        manager
+            .checkpoint_progress(created.id, created.revision, forward.clone())
+            .await
+            .expect("an unchanged checkpoint must not touch persistence");
+        let mut rewound = forward.clone();
+        rewound.cursor.after_seq = 10;
+        assert!(
+            manager
+                .checkpoint_progress(created.id, created.revision, rewound.clone())
+                .await
+                .is_err(),
+            "a changed rewind must not be mistaken for a monotonic no-op"
+        );
+
+        manager.set_persist_failure(false);
+        manager
+            .checkpoint_progress(created.id, created.revision, rewound.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .checkpoint_for(
+                    &created,
+                    Cursor {
+                        epoch,
+                        after_seq: 0,
+                    },
+                )
+                .await,
+            rewound
+        );
+
+        manager.shutdown().await;
         registry.shutdown().await;
         journal.shutdown().await.unwrap();
     }

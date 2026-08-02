@@ -1594,6 +1594,13 @@ fn query_files_with_limits(
             "after_wall_time_ns must be less than before_wall_time_ns".into(),
         ));
     }
+    if let (Some(after), Some(through)) = (query.after_seq, query.through_seq)
+        && after > through
+    {
+        return Err(JournalError::InvalidConfig(
+            "after_seq must not exceed through_seq".into(),
+        ));
+    }
     if query
         .contains
         .as_ref()
@@ -1681,6 +1688,7 @@ fn query_files_with_limits(
             slot_id,
             epoch,
             query.after_seq,
+            query.through_seq,
             &mut budget,
         )?,
         None => Vec::new(),
@@ -1719,9 +1727,13 @@ fn query_files_with_limits(
     // continuity chain. Records at or before the cursor may be scanned to seed
     // a cross-record text search, but must not move the chain backwards.
     let sequence_floor = query.after_seq.unwrap_or(0);
+    let sequence_ceiling = query.through_seq.unwrap_or(u64::MAX);
     let mut previous_contiguous_seq = sequence_floor;
 
     'segments: for segment in descriptors {
+        if segment.header.first_seq > sequence_ceiling {
+            break;
+        }
         let fully_consumed = query
             .after_seq
             .is_some_and(|after| segment.last_seq.is_some_and(|last| last <= after));
@@ -1823,6 +1835,9 @@ fn query_files_with_limits(
                     &segment.path,
                     "record identity does not match segment",
                 ));
+            }
+            if event.seq > sequence_ceiling {
+                break 'segments;
             }
             last_good_seq = Some(event.seq);
 
@@ -1932,15 +1947,20 @@ fn query_files_with_limits(
     {
         let missing_first = after.saturating_add(1);
         if missing_first < first_available {
-            push_uncovered_gap(
-                &mut gaps,
-                GapRange {
-                    epoch,
-                    first_seq: missing_first,
-                    last_seq: first_available - 1,
-                    reason: GapReason::Retention,
-                },
-            )?;
+            let missing_last = first_available
+                .saturating_sub(1)
+                .min(query.through_seq.unwrap_or(u64::MAX));
+            if missing_first <= missing_last {
+                push_uncovered_gap(
+                    &mut gaps,
+                    GapRange {
+                        epoch,
+                        first_seq: missing_first,
+                        last_seq: missing_last,
+                        reason: GapReason::Retention,
+                    },
+                )?;
+            }
         }
     }
     gaps = merge_gap_ranges(gaps);
@@ -2484,6 +2504,7 @@ fn load_query_gap_ranges(
     slot_id: &str,
     epoch: Uuid,
     after_seq: Option<u64>,
+    through_seq: Option<u64>,
     budget: &mut QueryBudget,
 ) -> Result<Vec<GapRange>, JournalError> {
     let mut gaps = Vec::new();
@@ -2491,13 +2512,20 @@ fn load_query_gap_ranges(
         if gap.slot_id == slot_id
             && gap.epoch == epoch
             && after_seq.is_none_or(|after| gap.last_seq > after)
+            && through_seq.is_none_or(|through| gap.first_seq <= through)
         {
+            let first_seq = after_seq
+                .map(|after| gap.first_seq.max(after.saturating_add(1)))
+                .unwrap_or(gap.first_seq);
+            let last_seq = through_seq
+                .map(|through| gap.last_seq.min(through))
+                .unwrap_or(gap.last_seq);
             push_gap_bounded(
                 &mut gaps,
                 GapRange {
                     epoch: gap.epoch,
-                    first_seq: gap.first_seq,
-                    last_seq: gap.last_seq,
+                    first_seq,
+                    last_seq,
                     reason: gap.reason,
                 },
             )?;
@@ -2660,6 +2688,7 @@ mod tests {
         EventQuery {
             epoch: Some(epoch),
             after_seq: None,
+            through_seq: None,
             before_wall_time_ns: None,
             after_wall_time_ns: None,
             direction: None,
@@ -2871,6 +2900,49 @@ mod tests {
         assert_eq!(response.events.len(), 1);
         assert!(response.truncated);
         assert_eq!(response.next_cursor.unwrap().after_seq, 1);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_honors_inclusive_sequence_upper_bound() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+        for (seq, data) in [
+            (1, b"before".as_slice()),
+            (2, b"evidence".as_slice()),
+            (3, b"later".as_slice()),
+        ] {
+            handle
+                .append(event(epoch, seq, Direction::Rx, data.to_vec()))
+                .await
+                .unwrap();
+        }
+
+        let mut bounded = query(epoch);
+        bounded.after_seq = Some(1);
+        bounded.through_seq = Some(2);
+        let response = handle.query("slot-1", bounded).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|event| (event.seq, event.data.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![(2, b"evidence".as_slice())]
+        );
+        assert!(!response.truncated);
+        assert_eq!(response.next_cursor.unwrap().after_seq, 2);
+
+        let mut invalid = query(epoch);
+        invalid.after_seq = Some(3);
+        invalid.through_seq = Some(2);
+        assert!(matches!(
+            handle.query("slot-1", invalid).await,
+            Err(JournalError::InvalidConfig(message))
+                if message == "after_seq must not exceed through_seq"
+        ));
         manager.shutdown().await.unwrap();
     }
 
@@ -3554,10 +3626,44 @@ mod tests {
 
         let mut budget = QueryBudget::new(QueryLimits::default());
         let gaps =
-            load_query_gap_ranges(&config.root_dir, "slot-1", epoch, None, &mut budget).unwrap();
+            load_query_gap_ranges(&config.root_dir, "slot-1", epoch, None, None, &mut budget)
+                .unwrap();
         assert_eq!(gaps.len(), 2);
         assert_eq!((gaps[0].first_seq, gaps[0].last_seq), (1, 1));
         assert_eq!((gaps[1].first_seq, gaps[1].last_seq), (3, 3));
+    }
+
+    #[test]
+    fn query_gap_ranges_are_clipped_to_sequence_bounds() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(&temp);
+        fs::create_dir_all(&config.root_dir).unwrap();
+        let epoch = Uuid::new_v4();
+        append_gap_ledger(
+            &config.root_dir,
+            &StoredGap {
+                slot_id: "slot-1".into(),
+                epoch,
+                first_seq: 1,
+                last_seq: 10,
+                reason: GapReason::LoggingFault,
+                recorded_wall_time_ns: 100,
+            },
+        )
+        .unwrap();
+
+        let mut budget = QueryBudget::new(QueryLimits::default());
+        let gaps = load_query_gap_ranges(
+            &config.root_dir,
+            "slot-1",
+            epoch,
+            Some(3),
+            Some(6),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!((gaps[0].first_seq, gaps[0].last_seq), (4, 6));
     }
 
     #[tokio::test]

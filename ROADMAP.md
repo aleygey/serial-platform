@@ -99,7 +99,9 @@ primitives.
   pagination under additive `/api/v1/monitors` routes.
 - Bounded local Monitor state and notification outbox with explicit capacity
   errors/gaps. Incident evidence remains in the serial journal rather than
-  being copied without bound into notification payloads.
+  being copied without bound into notification payloads. Oldest summaries
+  yield to newer evidence at hard bounds without requiring every Agent adapter
+  to expose acknowledgement, and cursor pages surface the resulting gap.
 - Optional station-configured HTTP CloudEvents 1.0-shaped sink. With no sink,
   Monitor incidents and outbox events remain available through pull APIs; with
   a sink, delivery retries with bounded exponential backoff until success or

@@ -777,6 +777,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "--after-time 必须早于 --before-time",
     ),
     (
+        "m.logs.seq.order",
+        "--after-seq must not exceed --through-seq",
+        "--after-seq 不能大于 --through-seq",
+    ),
+    (
         "m.limit.int",
         "limit must be a positive integer",
         "limit 必须是正整数",

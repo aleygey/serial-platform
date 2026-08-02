@@ -347,6 +347,7 @@ serial archives
 serial archives --slot slot-1
 serial logs --slot slot-1 --limit 200
 serial logs --slot slot-1 --after-seq 1200 --epoch <epoch-uuid>
+serial logs --slot slot-1 --after-seq 1200 --through-seq 1250 --epoch <epoch-uuid>
 serial logs --slot slot-1 --epoch <epoch-uuid> --direction rx
 serial logs --slot slot-1 --after-time 2026-07-19T09:00:00+08:00
 serial logs --slot slot-1 --contains panic
@@ -375,6 +376,9 @@ historical epoch UUIDs, then pass one to `logs --epoch`. `archives --json` and
 output displays RFC3339 timestamps in the client's local timezone at
 millisecond precision. Time filters require RFC3339 input with an explicit
 timezone, and `--direction` accepts `rx`, `tx`, or `none`.
+`--through-seq` is inclusive, so `--after-seq A --through-seq B` reads exactly
+`(A, B]`; use that range when dereferencing a Monitor Incident so later serial
+output cannot enter its evidence.
 Without `--run`, `--operation`, or seq/time bounds, ordinary `logs` output
 warns that the query spans the entire selected daemon epoch and may include
 older test cycles. A text or regex filter only filters that selected range; it
@@ -420,8 +424,11 @@ most 20 compact incidents per call; omit `after` for the recent tail, use
 `next_after` cursor to continue forward. Each incident includes a short
 preview, exact `(epoch, seq_start, seq_end)` range, and `evidence_ref`/
 `evidence_cursor` so the caller can fetch authoritative serial bytes without
-putting an unbounded log in model context. `serial_monitor_stop` prevents future
-matches but retains already recorded incidents.
+putting an unbounded log in model context. An exact MCP follow-up uses
+`read(scope=archive, epoch=evidence_cursor.epoch,
+after_seq=evidence_cursor.after_seq, through_seq=seq_end)`.
+`serial_monitor_stop` prevents future matches but retains already recorded
+incidents.
 
 `serial_trigger` handles short timing windows without making the Agent or the
 Linux VM loop `serial_command`/`serial_write` calls. It requires an
@@ -604,10 +611,13 @@ window, preview, Job, incident, and outbox limits. A daemon restart reloads
 running Jobs and resumes their workers; replay-safe checkpoints are throttled
 to once per second, while Incident/cooldown state commits immediately so a
 restart does not re-alert a match already suppressed by cooldown. Notification
-TTL expires only outbox delivery, never retained incident evidence; bounded
-incident retention reports `retention_gap` and `first_available_incident_seq`
-when a pull cursor is too old. Explicit gaps remain visible rather than being
-treated as an empty observation.
+TTL expires only outbox delivery, never retained incident evidence by itself.
+At a hard bound the oldest incident yields to newer evidence even when no
+consumer exposes ACK; bounded retention reports `retention_gap` and
+`first_available_incident_seq` when a pull cursor is too old. The returned
+cursor advances to the observed high-water mark even when ACK filtering makes a
+page empty. Explicit gaps remain visible rather than being treated as an empty
+observation.
 
 No message center is required. The default configuration has no sink, while
 `GET /api/v1/monitors/{monitor_id}/incidents` and the MCP

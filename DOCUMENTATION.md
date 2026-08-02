@@ -438,23 +438,31 @@ Monitor status. A 250-ms default debounce window groups a burst of matches into
 one incident, followed by a default 30-second cooldown. Each retained incident
 contains a bounded preview, exact daemon epoch and sequence range, and both an
 `evidence_cursor` and `evidence_ref`; the serial journal remains the source of
-truth.
+truth. Event queries accept an inclusive `through_seq`; dereferencing an
+Incident therefore uses the exact `(after_seq, through_seq]` interval and
+cannot absorb unrelated output that arrived after the Incident closed.
 
 Monitor state is atomically persisted in `monitors.json` under seriald's data
 directory. Running Jobs are resumed after restart. A replay-safe cursor is
 checkpointed at most once a second, while every Incident immediately commits
 its cursor and cooldown barrier; an unfinished debounce group checkpoints before
 its first match so a restart can replay it rather than lose it. Bounds are enforced before
-untrusted work reaches hot paths: 4,096-byte patterns/descriptions, a 64-KiB
-match window, a 2-MiB compiled-regex budget, a 1,024-byte preview, 128 retained
-Jobs, 64 active Jobs, 2,048 incidents per Monitor, 8,192 incidents globally,
-4,096 outbox events, and 200 results per HTTP page. Capacity loss is reported
-as a gap/error; it is never represented as an empty successful observation.
-`event_ttl_ms` expires only the notification/outbox entry: retained Incident
-evidence is not deleted on that deadline and is removed only under bounded
-retention after acknowledgement. Incident pages return
-`first_available_incident_seq` and `retention_gap`; a cursor older than retained
-history is an explicit evidence gap, not an empty page.
+untrusted work reaches hot paths: 4,096-byte patterns, 1,024-byte descriptions,
+a 64-KiB match window, a 2-MiB compiled-regex budget, a 1,024-byte preview, 128
+retained Jobs, 64 active Jobs, 512 incidents per Monitor, 1,024 incidents
+globally, 512 outbox events, and 200 results per HTTP page. These limits have a
+conservative encoded-size envelope below the 64-MiB atomic state-file bound, so
+reaching a legal retention maximum cannot itself make persistence fail.
+`event_ttl_ms` expires only the notification/outbox entry; it never removes an
+Incident merely because notification freshness elapsed. At a hard retention
+bound, the oldest Incident is pruned regardless of ACK state so a consumer that
+does not expose ACK cannot permanently block newer evidence. `gap_count`,
+`first_available_incident_seq`, and `retention_gap` make that loss explicit.
+The oldest stopped Monitor may likewise be pruned when the 128-Job catalog is
+full (fully acknowledged Jobs are preferred), while exact serial evidence
+continues to follow the independent journal retention policy. Incident
+`next_cursor` is the observed high-water mark and advances even on an empty page
+whose newer entries were filtered because they were acknowledged.
 
 The HTTP management and pull surface is additive under `/api/v1`:
 
@@ -712,7 +720,7 @@ All endpoints require a role token.
 | `GET /api/v1/diagnostics` | observer | Daemon, WebSocket, journal, and per-Slot health |
 | `GET /api/v1/diagnostics/storage` | observer | Journal quota, usage, queue, and logging health |
 | `GET /api/v1/slots/{id}/diagnostics` | observer | One authoritative Slot plus subscriber metrics |
-| `GET /api/v1/slots/{id}/events` | observer | Bounded durable query |
+| `GET /api/v1/slots/{id}/events` | observer | Bounded durable query; `after_seq` is exclusive and `through_seq` is inclusive |
 | `POST /api/v1/monitors` | operator | Idempotently create a persistent live-RX Monitor |
 | `GET /api/v1/monitors[/{id}]` | observer | List or inspect persistent Monitors |
 | `PUT/DELETE /api/v1/monitors/{id}` | operator | Replace or stop a Monitor |
