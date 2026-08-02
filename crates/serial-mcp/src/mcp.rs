@@ -216,7 +216,13 @@ fn request_is_cancellable(request: &RpcRequest) -> bool {
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default(),
-        "devices" | "read" | "wait" | "search"
+        "devices"
+            | "read"
+            | "wait"
+            | "search"
+            | "monitor_list"
+            | "monitor_status"
+            | "monitor_incidents"
     )
 }
 
@@ -239,7 +245,7 @@ async fn dispatch_request(tools: &AgentTools, request: RpcRequest, id: Value) ->
                     "protocolVersion": protocol,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "serial-mcp", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Inspect devices, start a Run before writes, and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. End the Run when finished."
+                    "instructions": "Inspect devices, start a Run before writes, and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed."
                 }),
             )
         }
@@ -426,6 +432,64 @@ pub fn tool_definitions() -> Vec<Value> {
             true,
         ),
         tool(
+            "monitor_start",
+            "Start a persistent seriald Monitor and return immediately. Supply exactly one literal or regex matcher; notification delivery is platform policy, not an Agent parameter.",
+            {
+                let mut schema = object(
+                    json!({
+                    "slot_id":{"type":"string"},
+                    "contains":{"type":"string","minLength":1,"maxLength":4096},
+                    "regex":{"type":"string","minLength":1,"maxLength":4096},
+                    "description":{"type":"string","minLength":1,"maxLength":1024},
+                    "idempotency_key":{"type":"string","format":"uuid","description":"Optional UUID to reuse when retrying this start."}
+                    }),
+                    &["slot_id"],
+                );
+                schema["oneOf"] = json!([
+                    {"required":["contains"]},
+                    {"required":["regex"]}
+                ]);
+                schema
+            },
+            false,
+        ),
+        tool(
+            "monitor_list",
+            "List persistent Monitor Jobs from seriald. Optionally filter by Slot.",
+            object(json!({"slot_id":{"type":"string"}}), &[]),
+            true,
+        ),
+        tool(
+            "monitor_status",
+            "Get authoritative state for one persistent Monitor Job.",
+            object(
+                json!({"monitor_id":{"type":"string","format":"uuid"}}),
+                &["monitor_id"],
+            ),
+            true,
+        ),
+        tool(
+            "monitor_incidents",
+            "Read bounded retained incidents for one Monitor. Omit after for the recent tail, use after=\"0\" to page from the oldest retained incident, or continue with the opaque after cursor returned by a previous page.",
+            object(
+                json!({
+                    "monitor_id":{"type":"string","format":"uuid"},
+                    "after":{"type":"string","pattern":"^[0-9]+$","minLength":1,"maxLength":20}
+                }),
+                &["monitor_id"],
+            ),
+            true,
+        ),
+        tool(
+            "monitor_stop",
+            "Stop a persistent Monitor Job. Retained incidents remain queryable.",
+            object(
+                json!({"monitor_id":{"type":"string","format":"uuid"}}),
+                &["monitor_id"],
+            ),
+            false,
+        ),
+        tool(
             "run_start",
             "Acquire write control and start an evidence boundary. Does not reset device state.",
             object(
@@ -487,6 +551,11 @@ mod tests {
                 "trigger",
                 "wait",
                 "search",
+                "monitor_start",
+                "monitor_list",
+                "monitor_status",
+                "monitor_incidents",
+                "monitor_stop",
                 "run_start",
                 "run_end",
                 "release"
@@ -576,6 +645,52 @@ mod tests {
     }
 
     #[test]
+    fn monitor_schemas_keep_daemon_policy_out_of_agent_arguments() {
+        let tools = tool_definitions();
+        let start = tools
+            .iter()
+            .find(|tool| tool["name"] == "monitor_start")
+            .unwrap();
+        let properties = start["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(start["inputSchema"]["required"], json!(["slot_id"]));
+        for expected in [
+            "slot_id",
+            "contains",
+            "regex",
+            "description",
+            "idempotency_key",
+        ] {
+            assert!(properties.contains_key(expected));
+        }
+        assert_eq!(start["inputSchema"]["oneOf"].as_array().unwrap().len(), 2);
+        for hidden in [
+            "message_center",
+            "delivery_mode",
+            "cooldown_seconds",
+            "max_incidents",
+            "poll_interval_ms",
+        ] {
+            assert!(!properties.contains_key(hidden));
+        }
+
+        let incidents = tools
+            .iter()
+            .find(|tool| tool["name"] == "monitor_incidents")
+            .unwrap();
+        assert_eq!(incidents["inputSchema"]["required"], json!(["monitor_id"]));
+        assert!(
+            incidents["inputSchema"]["properties"]
+                .get("after")
+                .is_some()
+        );
+        assert!(
+            incidents["inputSchema"]["properties"]
+                .get("limit")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn tool_result_uses_compact_compatibility_text() {
         let value = json!({"slot_id":"bench","nested":{"ready":true}});
         let result = tool_result(value.clone(), false);
@@ -614,7 +729,15 @@ mod tests {
 
     #[test]
     fn only_read_only_tool_calls_are_cancellable() {
-        for name in ["devices", "read", "wait", "search"] {
+        for name in [
+            "devices",
+            "read",
+            "wait",
+            "search",
+            "monitor_list",
+            "monitor_status",
+            "monitor_incidents",
+        ] {
             assert!(request_is_cancellable(&RpcRequest {
                 jsonrpc: Some("2.0".into()),
                 id: Some(json!(1)),
@@ -627,6 +750,8 @@ mod tests {
             "input",
             "signal",
             "trigger",
+            "monitor_start",
+            "monitor_stop",
             "run_start",
             "run_end",
             "release",

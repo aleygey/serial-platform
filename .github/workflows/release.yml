@@ -3,6 +3,8 @@ name: Release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "codex/**"
     tags:
       - "v*"
 
@@ -65,7 +67,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $packageName = "serial-platform-${env:GITHUB_REF_NAME}-windows-x86_64"
+          $version = (Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
+          $packageName = "serial-platform-v${version}-windows-x86_64"
           $packageDir = Join-Path "dist" $packageName
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item "target\release\seriald.exe" $packageDir
@@ -157,7 +160,8 @@ jobs:
 
       - name: Package Ubuntu baseline clients
         run: |
-          package_name="serial-platform-${GITHUB_REF_NAME}-linux-x86_64-ubuntu20.04"
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          package_name="serial-platform-v${version}-linux-x86_64-ubuntu20.04"
           package_dir="dist/${package_name}"
           mkdir -p "${package_dir}"
           install -m 0755 target/release/serialctl "${package_dir}/serialctl"

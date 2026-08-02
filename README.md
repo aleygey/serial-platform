@@ -9,9 +9,11 @@ It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
-v0.4.0 adds one user-facing launcher without collapsing those runtime
-boundaries: `serial serve` starts the backend, `serial console` opens the TUI,
-`serial setup` configures a station, `serial profile ...` manages reusable
+v0.5.0 adds persistent, daemon-owned Monitor Jobs for rare serial conditions.
+The five additive MCP tools start, list, inspect, read incidents from, and stop
+those Jobs without holding an Agent turn open. The unified launcher introduced
+in v0.4 remains: `serial serve` starts the backend, `serial console` opens the
+TUI, `serial setup` configures a station, `serial profile ...` manages reusable
 profiles, and `serial mcp` starts the MCP adapter. The component executables
 remain in the release package and can still be invoked directly.
 
@@ -19,7 +21,7 @@ See [ROADMAP.md](ROADMAP.md) for released capabilities, the next practical
 work, and longer-term candidates separated by `seriald`, `serialctl`, and
 `serial-mcp`.
 
-## What v0.4 provides
+## What v0.5 provides
 
 - Interactive COM discovery and Slot configuration from `serial setup`.
 - Two explicit reusable configuration layers: a Transport Profile for physical
@@ -57,6 +59,12 @@ work, and longer-term candidates separated by `seriald`, `serialctl`, and
   `initial_write -> repeated action -> live RX stop` reactions. It is
   byte-oriented and device-agnostic; every fire uses the normal fenced,
   confirmed, audited write path.
+- Persistent Monitor Jobs that match one literal or bounded UTF-8 regular
+  expression against live RX, group bursts into retained incidents, and keep
+  an exact evidence cursor/range. Notification delivery is optional: without a
+  message center, incidents remain pullable through HTTP and `serial-mcp`; with
+  a configured sink, seriald also emits CloudEvents-shaped notifications from
+  a durable bounded outbox.
 - Bounded cross-reconnect write safety within one daemon epoch: recent duplicate
   request IDs return their cached result, older executed IDs are rejected
   instead of being written again, and an unacknowledged outcome remains
@@ -93,20 +101,20 @@ Each release provides two x86_64 packages:
   i386/i686 Ubuntu.
 
 Use every executable from the same release across the Windows host and Linux
-VM. v0.4.0 speaks WebSocket protocol v3 and must not be mixed with the
-protocol-v2 executables from 0.3.x or protocol-v1 executables from 0.2.x.
-v3 adds protocol enum variants and capabilities such as Break; a mixed client
-could fail while decoding an otherwise valid event. The HTTP route namespace
-is intentionally still `/api/v1`; the route namespace and WebSocket payload
-protocol are versioned independently.
+VM. v0.5.0 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
+peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
+and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
+protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
+namespace remains `/api/v1`; the route namespace and WebSocket payload protocol
+are versioned independently.
 
 Extract the Windows package on the host connected to the serial card. Extract
 the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.4.0-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.4.0-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.5.0-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.5.0-linux-x86_64-ubuntu20.04
 chmod +x serial serialctl serial-mcp
 ./serial --version
 ```
@@ -289,7 +297,7 @@ occupies several 80-column screen rows. Local presentation remains bounded to
 synthetic oldest-row boundary state that local display history was truncated
 and direct the operator to `serial logs`; durable history is not presented
 as though the retained local row were its true beginning.
-Repeated device rows remain uncollapsed in v0.4: live monitoring stays faithful
+Repeated device rows remain uncollapsed in v0.5: live monitoring stays faithful
 to their exact order, while bounded log/search tools handle high-volume review.
 Run lifecycle events are drawn as full-width colored start/end/abort rules, so
 an operator can see exactly which output interval belongs to an Agent task
@@ -385,8 +393,8 @@ Install `serial-mcp` on the same Windows or Linux machine where the Agent
 platform runs. It reuses the endpoint and operator token written by
 `serial setup`, so Agent config contains no secret. Configure the MCP host to
 run `serial mcp` (or the component `serial-mcp` directly). Ready-to-copy
-OpenCode JSONC and Codex TOML examples, the stable eleven-tool surface, compact
-result contract, and expected Run workflow are in
+OpenCode JSONC and Codex TOML examples, the stable eleven core tools, five
+additive Monitor tools, compact result contract, and expected Run workflow are in
 [adapters/README.md](./adapters/README.md).
 
 The adapter connects directly to `seriald`; the Agent is not asked to compose
@@ -394,13 +402,26 @@ shell commands around `serialctl`. OpenCode exposes the tools as
 `serial_devices`, `serial_command`, and so on. Codex exposes the same tools in
 the configured `serial` MCP namespace.
 
-The eleven tools are `devices`, `read`, `command`, `input`, `signal`,
-`trigger`, `wait`, `search`, `run_start`, `run_end`, and `release`. Ordinary
-calls expose only task-level inputs; the adapter owns request/operation IDs,
-control fences, capture cursors, prompt selection, bounded rendering, and lease
-renewal. Compact results keep the main evidence (`text`, completion/confidence,
-warnings, and one continuation cursor) while internal audit identifiers remain
-in the authoritative timeline.
+The eleven core tools are `devices`, `read`, `command`, `input`, `signal`,
+`trigger`, `wait`, `search`, `run_start`, `run_end`, and `release`. The additive
+Monitor tools are `monitor_start`, `monitor_list`, `monitor_status`,
+`monitor_incidents`, and `monitor_stop`. Ordinary calls expose only task-level
+inputs; the adapter owns request/operation IDs, control fences, capture cursors,
+prompt selection, bounded rendering, and lease renewal. Compact results keep
+the main evidence (`text`, completion/confidence, warnings, and one continuation
+cursor) while internal audit identifiers remain in the authoritative timeline.
+
+`serial_monitor_start` takes a Slot plus exactly one `contains` or `regex`
+matcher and returns a stable Monitor ID immediately. The Job starts at the
+current Slot head by default, persists in `seriald`, and therefore survives the
+stdio MCP process or Agent turn ending. `serial_monitor_incidents` returns at
+most 20 compact incidents per call; omit `after` for the recent tail, use
+`after="0"` to page from the oldest retained incident, or pass its decimal
+`next_after` cursor to continue forward. Each incident includes a short
+preview, exact `(epoch, seq_start, seq_end)` range, and `evidence_ref`/
+`evidence_cursor` so the caller can fetch authoritative serial bytes without
+putting an unbounded log in model context. `serial_monitor_stop` prevents future
+matches but retains already recorded incidents.
 
 `serial_trigger` handles short timing windows without making the Agent or the
 Linux VM loop `serial_command`/`serial_write` calls. It requires an
@@ -571,6 +592,46 @@ Run loss/mismatch is an explicit conflict containing “no bytes were written”
 The Run ID is part of the write idempotency fingerprint, so one request ID
 cannot be reused under a different task boundary.
 
+## Monitor persistence and optional notifications
+
+Monitor Jobs and their retained incidents live in `seriald`, not in an MCP
+process or Agent session. A new Monitor starts strictly after the Slot head at
+creation time, so an old matching line cannot be reported as a new incident.
+Matching spans adjacent live RX events only within one serial generation; close,
+open, reconfigure, removal, generation changes, and explicit gaps reset the
+matcher. It is bounded by pattern, compiled-regex,
+window, preview, Job, incident, and outbox limits. A daemon restart reloads
+running Jobs and resumes their workers; replay-safe checkpoints are throttled
+to once per second, while Incident/cooldown state commits immediately so a
+restart does not re-alert a match already suppressed by cooldown. Notification
+TTL expires only outbox delivery, never retained incident evidence; bounded
+incident retention reports `retention_gap` and `first_available_incident_seq`
+when a pull cursor is too old. Explicit gaps remain visible rather than being
+treated as an empty observation.
+
+No message center is required. The default configuration has no sink, while
+`GET /api/v1/monitors/{monitor_id}/incidents` and the MCP
+`monitor_incidents` tool continue to provide bounded pull access. To integrate a
+message center such as Agent Message Center, configure a station-owned HTTP
+sink in `seriald.toml`:
+
+```toml
+[monitor_event_sink]
+endpoint = "http://127.0.0.1:8080/api/v1/events"
+token_file = "message-center.token" # relative paths resolve under the config directory
+retry_min_ms = 1000
+retry_max_ms = 60000
+```
+
+The bearer secret is read from the file and is never placed in the event or
+Agent tool arguments. Each incident is first persisted locally, then represented
+as a CloudEvents 1.0-shaped event in a bounded outbox. Delivery retries use
+bounded exponential backoff until success or the event's freshness TTL. The
+event carries only routing/evidence metadata and a bounded preview; serial bytes
+remain authoritative in the journal. `seriald` does not know Agent instance,
+session, or return-route semantics—the message center and its adapters own those
+policies.
+
 ## Control tuning
 
 Write-control leases and queues are bounded by the optional `[control]`
@@ -583,14 +644,14 @@ wait_timeout_ms = 60000 # queued acquire lifetime; configured ceiling <= 1h
 max_waiters = 128       # per-Slot wait-queue bound
 ```
 
-The defaults match the compiled-in v0.4 behavior, so the section can be omitted
+The defaults match the compiled-in v0.5 behavior, so the section can be omitted
 entirely; changes apply on the next daemon start. Configuration above the
 24-hour lease or one-hour wait ceilings is rejected instead of reaching
 platform `Instant` arithmetic.
 
 ## Current boundaries
 
-v0.4 does not include device-pool Reservations, flashing recipes, automatic
+v0.5 does not include device-pool Reservations, flashing recipes, automatic
 probes, full VT100 emulation, external `screen/minicom` handoff, TLS,
 compression, or a Windows Service installer. `serial serve` is the backend
 entrypoint and `serial console` is a separate client process; putting both

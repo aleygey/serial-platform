@@ -8,11 +8,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
-    Direction, EchoMode, EventQuery, MAX_BREAK_DURATION_MS, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
-    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
-    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES,
+    DEFAULT_TRIGGER_TIMEOUT_MS, Direction, EchoMode, EventQuery, MAX_BREAK_DURATION_MS,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
     MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, PROTOCOL_VERSION, SessionState, SlotSnapshot,
     StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
 };
@@ -31,6 +31,7 @@ use crate::{
 const DEFAULT_TEXT_CHARS: usize = 16_000;
 const MAX_WRITE_BYTES: usize = 4096;
 const MAX_REGEX_BYTES: usize = 4096;
+const MAX_MONITOR_DESCRIPTION_BYTES: usize = 1024;
 const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
 const TRIGGER_STATUS_MARGIN: Duration =
     Duration::from_millis(MAX_PHYSICAL_WRITE_TIMEOUT_MS + 5_000);
@@ -73,6 +74,11 @@ impl AgentTools {
             "trigger" => self.trigger(parse(arguments)?).await,
             "wait" => self.wait(parse(arguments)?).await,
             "search" => self.search(parse(arguments)?).await,
+            "monitor_start" => self.monitor_start(parse(arguments)?).await,
+            "monitor_list" => self.monitor_list(parse(arguments)?).await,
+            "monitor_status" => self.monitor_status(parse(arguments)?).await,
+            "monitor_incidents" => self.monitor_incidents(parse(arguments)?).await,
+            "monitor_stop" => self.monitor_stop(parse(arguments)?).await,
             "run_start" => self.run_start(parse(arguments)?).await,
             "run_end" => self.run_end(parse(arguments)?).await,
             "release" => self.release(parse(arguments)?).await,
@@ -267,6 +273,126 @@ impl AgentTools {
             .and_then(|list| list.archives.first().map(|archive| archive.epoch))
             .unwrap_or(slot.daemon_epoch);
         format!("scope=archive requires an explicit epoch, for example epoch={example}")
+    }
+
+    async fn monitor_start(&self, args: MonitorStartArgs) -> Result<Value> {
+        let request = create_monitor_request(args)?;
+        let status = self.status().await?;
+        if !status
+            .slots
+            .iter()
+            .any(|slot| slot.config.id == request.spec.slot_id)
+        {
+            bail!("unknown Slot {:?}", request.spec.slot_id);
+        }
+        let response = self.api.create_monitor(&request).await?;
+        let monitor = monitor_from_response(response)?;
+        let mut output = compact_monitor(&monitor);
+        output["persistent"] = json!(true);
+        output["returns_immediately"] = json!(true);
+        output["guidance"] = json!(
+            "The Monitor runs in seriald after this MCP call ends. Call monitor_incidents without after for the recent tail, then continue with that tool's next_after cursor."
+        );
+        Ok(output)
+    }
+
+    async fn monitor_list(&self, args: MonitorListArgs) -> Result<Value> {
+        self.status().await?;
+        let response = serde_json::to_value(self.api.monitors(args.slot_id.as_deref()).await?)
+            .context("seriald returned an invalid Monitor list")?;
+        let monitors = response
+            .get("monitors")
+            .and_then(Value::as_array)
+            .context("seriald Monitor list omitted monitors")?
+            .iter()
+            .map(compact_monitor)
+            .collect::<Vec<_>>();
+        let count = monitors.len();
+        Ok(json!({"monitors": monitors, "count": count}))
+    }
+
+    async fn monitor_status(&self, args: MonitorIdArgs) -> Result<Value> {
+        self.status().await?;
+        let response = self.api.monitor(args.monitor_id).await?;
+        Ok(compact_monitor(&monitor_from_response(response)?))
+    }
+
+    async fn monitor_incidents(&self, args: MonitorIncidentsArgs) -> Result<Value> {
+        let requested_tail = args.after.is_none();
+        let after = args
+            .after
+            .as_deref()
+            .map(parse_monitor_cursor)
+            .transpose()?;
+        self.status().await?;
+        let response =
+            serde_json::to_value(self.api.monitor_incidents(args.monitor_id, after).await?)
+                .context("seriald returned an invalid Monitor incident page")?;
+        let incidents = response
+            .get("incidents")
+            .and_then(Value::as_array)
+            .context("seriald Monitor incident page omitted incidents")?
+            .iter()
+            .map(compact_monitor_incident)
+            .collect::<Vec<_>>();
+        let count = incidents.len();
+        let next_after = response
+            .get("next_cursor")
+            .and_then(Value::as_u64)
+            .map(|cursor| cursor.to_string());
+        let truncated = response
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let first_available = response
+            .get("first_available_incident_seq")
+            .and_then(Value::as_u64)
+            .map(|cursor| cursor.to_string());
+        let retention_gap = response
+            .get("retention_gap")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let guidance = match (requested_tail, truncated) {
+            (true, true) => {
+                "This is the recent tail; older retained incidents were omitted. Use after=\"0\" to page from the oldest retained incident, or next_after to poll only newer incidents."
+            }
+            (true, false) => {
+                "This is the complete retained tail. Use next_after as after to poll only newer incidents."
+            }
+            (false, true) => {
+                "More incidents are retained after the requested cursor; call monitor_incidents again with next_after as after."
+            }
+            (false, false) => {
+                "This is the complete retained page after the requested cursor. Use next_after later to poll newer incidents."
+            }
+        };
+        Ok(json!({
+            "monitor_id": args.monitor_id,
+            "started_after": args.after,
+            "mode": if requested_tail { "recent_tail" } else { "forward" },
+            "incidents": incidents,
+            "count": count,
+            "next_after": next_after,
+            "truncated": truncated,
+            "first_available_after": first_available,
+            "retention_gap": retention_gap,
+            "has_older_retained": requested_tail && truncated,
+            "warning": retention_gap.then_some("The requested cursor predates retained Monitor incidents; some evidence has been pruned."),
+            "guidance": guidance
+        }))
+    }
+
+    async fn monitor_stop(&self, args: MonitorIdArgs) -> Result<Value> {
+        let existing = monitor_from_response(self.api.monitor(args.monitor_id).await?)?;
+        let revision = existing
+            .get("revision")
+            .and_then(Value::as_u64)
+            .context("seriald Monitor response omitted revision")?;
+        let response = self.api.stop_monitor(args.monitor_id, revision).await?;
+        let mut output = compact_monitor(&monitor_from_response(response)?);
+        output["stopped"] = json!(true);
+        output["incidents_retained"] = json!(true);
+        Ok(output)
     }
 
     /// Point an empty search at wider scopes and the retained archive epochs.
@@ -1053,6 +1179,114 @@ fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
     serde_json::from_value(value).context("invalid tool arguments")
 }
 
+fn validate_monitor_matcher(contains: Option<&str>, regex: Option<&str>) -> Result<()> {
+    match (contains, regex) {
+        (Some(contains), None) => {
+            if contains.is_empty() {
+                bail!("contains must not be empty");
+            }
+            if contains.len() > MAX_REGEX_BYTES {
+                bail!("contains must not exceed {MAX_REGEX_BYTES} UTF-8 bytes");
+            }
+            Ok(())
+        }
+        (None, Some(regex)) => {
+            let compiled = compile_regex(regex, "regex")?;
+            if compiled.is_match("") {
+                bail!("regex must not match an empty serial stream");
+            }
+            Ok(())
+        }
+        (None, None) => bail!("provide exactly one of contains or regex"),
+        (Some(_), Some(_)) => bail!("contains and regex are alternatives; choose exactly one"),
+    }
+}
+
+fn create_monitor_request(args: MonitorStartArgs) -> Result<CreateMonitorRequest> {
+    validate_monitor_matcher(args.contains.as_deref(), args.regex.as_deref())?;
+    if let Some(description) = args.description.as_deref() {
+        if description.is_empty() {
+            bail!("description must not be empty when provided");
+        }
+        if description.len() > MAX_MONITOR_DESCRIPTION_BYTES {
+            bail!("description must not exceed {MAX_MONITOR_DESCRIPTION_BYTES} UTF-8 bytes");
+        }
+    }
+    serde_json::from_value(json!({
+        "request_id": args.idempotency_key.unwrap_or_else(Uuid::new_v4),
+        "spec": {
+            "slot_id": args.slot_id,
+            "contains": args.contains,
+            "regex": args.regex,
+            "description": args.description,
+        }
+    }))
+    .context("failed to construct Monitor request")
+}
+
+fn parse_monitor_cursor(value: &str) -> Result<u64> {
+    value.parse::<u64>().with_context(|| {
+        format!("after must be the decimal cursor returned by seriald, got {value:?}")
+    })
+}
+
+fn monitor_from_response(response: impl serde::Serialize) -> Result<Value> {
+    let response =
+        serde_json::to_value(response).context("seriald returned an invalid Monitor response")?;
+    response
+        .get("monitor")
+        .cloned()
+        .context("seriald Monitor response omitted monitor")
+}
+
+fn compact_monitor(monitor: &Value) -> Value {
+    let spec = monitor.get("spec").unwrap_or(&Value::Null);
+    let matcher = if let Some(value) = spec.get("contains").and_then(Value::as_str) {
+        json!({"kind": "literal", "value": value})
+    } else if let Some(value) = spec.get("regex").and_then(Value::as_str) {
+        json!({"kind": "regex", "value": value})
+    } else {
+        Value::Null
+    };
+    json!({
+        "monitor_id": monitor.get("id").cloned().unwrap_or(Value::Null),
+        "slot_id": spec.get("slot_id").cloned().unwrap_or(Value::Null),
+        "status": monitor.get("status").cloned().unwrap_or(Value::Null),
+        "severity": spec.get("severity").cloned().unwrap_or(Value::Null),
+        "description": spec.get("description").cloned().unwrap_or(Value::Null),
+        "matcher": matcher,
+        "current_cursor": monitor.get("current_cursor").cloned().unwrap_or(Value::Null),
+        "incident_count": monitor.get("incident_count").cloned().unwrap_or(Value::Null),
+        "unacked_incident_count": monitor.get("unacked_incident_count").cloned().unwrap_or(Value::Null),
+        "gap_count": monitor.get("gap_count").cloned().unwrap_or(Value::Null),
+        "expires_wall_time_ns": monitor.get("expires_wall_time_ns").cloned().unwrap_or(Value::Null),
+        "last_error": monitor.get("last_error").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn compact_monitor_incident(incident: &Value) -> Value {
+    json!({
+        "incident_id": incident.get("id").cloned().unwrap_or(Value::Null),
+        "incident_seq": incident.get("incident_seq").cloned().unwrap_or(Value::Null),
+        "slot_id": incident.get("slot_id").cloned().unwrap_or(Value::Null),
+        "severity": incident.get("severity").cloned().unwrap_or(Value::Null),
+        "description": incident.get("description").cloned().unwrap_or(Value::Null),
+        "preview": incident.get("preview").cloned().unwrap_or(Value::Null),
+        "serial_range": {
+            "epoch": incident.get("daemon_epoch").cloned().unwrap_or(Value::Null),
+            "seq_start": incident.get("seq_start").cloned().unwrap_or(Value::Null),
+            "seq_end": incident.get("seq_end").cloned().unwrap_or(Value::Null)
+        },
+        "evidence_ref": incident.get("evidence_ref").cloned().unwrap_or(Value::Null),
+        "evidence_cursor": incident.get("evidence_cursor").cloned().unwrap_or(Value::Null),
+        "wall_time_start_ns": incident.get("wall_time_start_ns").cloned().unwrap_or(Value::Null),
+        "wall_time_end_ns": incident.get("wall_time_end_ns").cloned().unwrap_or(Value::Null),
+        "created_wall_time_ns": incident.get("created_wall_time_ns").cloned().unwrap_or(Value::Null),
+        "expires_wall_time_ns": incident.get("expires_wall_time_ns").cloned().unwrap_or(Value::Null),
+        "acked": incident.get("acked_wall_time_ns").is_some_and(|value| !value.is_null())
+    })
+}
+
 fn requested_cursor(
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
@@ -1726,6 +1960,31 @@ struct SearchArgs {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MonitorStartArgs {
+    slot_id: String,
+    contains: Option<String>,
+    regex: Option<String>,
+    description: Option<String>,
+    idempotency_key: Option<Uuid>,
+}
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MonitorListArgs {
+    slot_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorIdArgs {
+    monitor_id: Uuid,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorIncidentsArgs {
+    monitor_id: Uuid,
+    after: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WaitArgs {
     slot_id: String,
     expect: Option<String>,
@@ -1848,6 +2107,121 @@ mod tests {
         let wait: WaitArgs =
             serde_json::from_value(json!({"slot_id": "bench", "expect": "ready"})).unwrap();
         assert_eq!(wait.expect.as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn monitor_arguments_are_small_and_matchers_are_unambiguous() {
+        let literal: MonitorStartArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "contains": "kernel panic",
+            "description": "intermittent crash"
+        }))
+        .unwrap();
+        validate_monitor_matcher(literal.contains.as_deref(), literal.regex.as_deref()).unwrap();
+        let request = create_monitor_request(literal).unwrap();
+        assert!(!request.request_id.is_nil());
+        assert_eq!(request.spec.slot_id, "bench");
+        assert_eq!(request.spec.contains.as_deref(), Some("kernel panic"));
+        assert_eq!(
+            request.spec.description.as_deref(),
+            Some("intermittent crash")
+        );
+        assert_eq!(request.spec.debounce_ms, 250);
+        assert_eq!(request.spec.cooldown_ms, 30_000);
+        assert_eq!(request.spec.event_ttl_ms, 10 * 60 * 1_000);
+
+        let idempotency_key = Uuid::new_v4();
+        let retry: MonitorStartArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "contains": "kernel panic",
+            "idempotency_key": idempotency_key,
+        }))
+        .unwrap();
+        assert_eq!(
+            create_monitor_request(retry).unwrap().request_id,
+            idempotency_key
+        );
+
+        let regex: MonitorStartArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "regex": "(?i)watchdog|panic"
+        }))
+        .unwrap();
+        validate_monitor_matcher(regex.contains.as_deref(), regex.regex.as_deref()).unwrap();
+
+        for invalid in [
+            json!({"slot_id":"bench"}),
+            json!({"slot_id":"bench","contains":"panic","regex":"panic"}),
+            json!({"slot_id":"bench","contains":""}),
+            json!({"slot_id":"bench","regex":".*"}),
+        ] {
+            let args: MonitorStartArgs = serde_json::from_value(invalid).unwrap();
+            assert!(
+                validate_monitor_matcher(args.contains.as_deref(), args.regex.as_deref()).is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<MonitorStartArgs>(json!({
+                "slot_id":"bench", "contains":"panic", "delivery_mode":"push"
+            }))
+            .is_err()
+        );
+        for description in [
+            "".to_string(),
+            "x".repeat(MAX_MONITOR_DESCRIPTION_BYTES + 1),
+        ] {
+            let args: MonitorStartArgs = serde_json::from_value(json!({
+                "slot_id": "bench", "contains": "panic", "description": description
+            }))
+            .unwrap();
+            assert!(create_monitor_request(args).is_err());
+        }
+    }
+
+    #[test]
+    fn monitor_incident_cursor_is_opaque_decimal_text() {
+        let args: MonitorIncidentsArgs = serde_json::from_value(json!({
+            "monitor_id": Uuid::nil(),
+            "after": "18446744073709551615"
+        }))
+        .unwrap();
+        assert_eq!(
+            parse_monitor_cursor(args.after.as_deref().unwrap()).unwrap(),
+            u64::MAX
+        );
+        for invalid in ["-1", " 1", "1.0", "next"] {
+            assert!(parse_monitor_cursor(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn compact_monitor_incident_keeps_evidence_without_internal_policy() {
+        let incident = json!({
+            "id": Uuid::from_u128(1),
+            "incident_seq": 7,
+            "monitor_id": Uuid::from_u128(2),
+            "slot_id": "bench",
+            "daemon_epoch": Uuid::from_u128(3),
+            "seq_start": 40,
+            "seq_end": 43,
+            "severity": "error",
+            "description": "panic",
+            "preview": "Kernel panic",
+            "evidence_cursor": {"epoch": Uuid::from_u128(3), "after_seq": 39},
+            "evidence_ref": "serial://bench/epochs/3/events?after_seq=39&through_seq=43",
+            "wall_time_start_ns": 10,
+            "wall_time_end_ns": 20,
+            "created_wall_time_ns": 21,
+            "expires_wall_time_ns": 30,
+            "acked_wall_time_ns": null,
+            "internal_outbox_attempt": 8
+        });
+        let compact = compact_monitor_incident(&incident);
+        assert_eq!(compact["incident_id"], json!(Uuid::from_u128(1)));
+        assert_eq!(compact["serial_range"]["seq_start"], 40);
+        assert_eq!(compact["evidence_cursor"]["after_seq"], 39);
+        assert_eq!(compact["acked"], false);
+        assert!(compact.get("internal_outbox_attempt").is_none());
     }
 
     #[test]

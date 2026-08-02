@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod control;
 pub mod journal;
+pub mod monitor;
 pub mod registry;
 pub mod ring;
 pub mod slot;
@@ -40,14 +41,15 @@ pub async fn serve(
         loaded.config.device_profiles.clone(),
         loaded.config.control.limits(),
     );
-    let state = AppState::new(
+    let state = AppState::try_new(
         store,
         loaded.config,
         registry,
         journal.handle(),
         loaded.daemon_epoch,
         started,
-    );
+    )
+    .context("open durable Monitor state")?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind seriald to {bind}"))?;

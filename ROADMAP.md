@@ -30,8 +30,12 @@ primitives.
 
 ## Status
 
-- **Released before v0.4.0**: established platform behavior retained by v0.4.
-- **Released in v0.4.0**: implemented by this release.
+- **Released before v0.4.0**: established platform behavior retained by the
+  current release.
+- **Released in v0.4.0**: the Profile/diagnostic/Agent-tool consolidation
+  retained by v0.5.
+- **Released in v0.5.0**: persistent serial Monitor Jobs and their additive
+  MCP/notification surfaces.
 - **Next**: practical validation or refinement work, not yet complete.
 - **Later / candidate**: retained options with no delivery promise.
 
@@ -82,8 +86,33 @@ primitives.
   result and compiled-automaton limits.
 - Fenced, Run-bound physical serial Break with an audited timeline event.
 
+### Released in v0.5.0
+
+- Durable, daemon-owned Monitor Jobs over live Slot RX. A Job starts after an
+  explicit cursor or the current head, persists independently of Agent turns,
+  and resumes after daemon restart.
+- Literal and bounded byte-regex matching across adjacent RX events, with
+  explicit gap reset/recovery, 250-ms default burst grouping, 30-second default
+  cooldown, optional duration, and bounded incident previews/evidence ranges.
+- Idempotent Monitor creation keyed by `request_id`, authoritative status and
+  cursor, retained incident acknowledgement, and recent-tail/cursor-forward
+  pagination under additive `/api/v1/monitors` routes.
+- Bounded local Monitor state and notification outbox with explicit capacity
+  errors/gaps. Incident evidence remains in the serial journal rather than
+  being copied without bound into notification payloads.
+- Optional station-configured HTTP CloudEvents 1.0-shaped sink. With no sink,
+  Monitor incidents and outbox events remain available through pull APIs; with
+  a sink, delivery retries with bounded exponential backoff until success or
+  freshness-TTL expiry. Agent/session routing remains outside seriald.
+- WebSocket protocol remains v3. The Monitor surface is additive HTTP/MCP, so
+  protocol-v3 v0.4 peers remain wire-compatible for existing realtime features;
+  Monitor use requires v0.5 seriald and adapter components.
+
 ### Next
 
+- Exercise Monitor restart, replay-gap, burst grouping, regex-boundary,
+  incident/outbox-capacity, sink outage/recovery, duplicate delivery, and TTL
+  expiry paths against sustained real 115200-baud output.
 - Run the two-Slot 115200-baud station matrix continuously: sustained RX,
   slow subscriber, repeated unplug/replug, daemon restart, disk pressure,
   Profile mutation conflicts, and Break support/unsupported drivers.
@@ -107,6 +136,9 @@ primitives.
   periodic guessed heartbeat.
 - Device-pool reservations and asset identity if station scale grows beyond a
   small fixed set of frequently swapped boards.
+- Compound Monitor rules, update/delete UX, or Monitor-aware diagnostics only
+  after real station incidents show that one literal/regex plus status is
+  insufficient.
 
 ### Non-goals
 
@@ -158,6 +190,12 @@ primitives.
 - RAW Ctrl-D and Ctrl-Z transmit `0x04`/`0x1a`; Ctrl-C transmits `0x03` in both
   modes without quitting the console.
 
+### Released in v0.5.0
+
+- The Windows and Ubuntu client packages track the v0.5 daemon/MCP release
+  while preserving the existing console workflow. The first Monitor release
+  does not add Monitor policy or message-center routing to the human TUI.
+
 ### Next
 
 - Validate selection, wrapped/wide-character rows, high-rate output, queued
@@ -174,6 +212,8 @@ primitives.
 - Saved coloring themes and user rules with safe precedence over built-ins.
 - A richer native OpenChamber serial panel that reuses the protocol/state
   model rather than embedding the TUI.
+- A compact Monitor list/incident indicator only if operators need to manage
+  Jobs without MCP or HTTP tooling; exact serial output remains the primary TUI.
 - Full terminal emulation only if real DUT workflows require cursor
   addressing; the default remains a serial log console, not a PTY.
 
@@ -219,8 +259,27 @@ primitives.
 - Repeated-line folding and bounded ANSI-cleaned evidence reduce context while
   preserving warnings, exact cursors, and durable raw events in `seriald`.
 
+### Released in v0.5.0
+
+- Five additive tools alongside the unchanged eleven core tools:
+  `monitor_start`, `monitor_list`, `monitor_status`, `monitor_incidents`, and
+  `monitor_stop`.
+- `monitor_start` exposes only Slot, exactly one literal/regex matcher, and an
+  optional description. The adapter owns the idempotency UUID and safe
+  debounce/cooldown/TTL defaults; message-center and delivery policy never
+  become routine Agent arguments.
+- Monitor calls return immediately and leave the Job in seriald. Incident reads
+  are capped at 20 compact entries and carry an opaque decimal continuation,
+  exact serial range, bounded preview, and evidence reference/cursor.
+- The same tools work without a message center by pull polling. When seriald's
+  optional CloudEvents sink is configured, an external message center can
+  initiate a new Agent turn while MCP remains the recovery/audit path.
+
 ### Next
 
+- Add real OpenCode/Codex regression scenarios where a Monitor outlives the
+  initiating turn, then verify pull-only recovery and Agent Message Center push
+  delivery produce the same incident/evidence identity.
 - Keep real-device regression fixtures for sustained output, delayed prompts,
   partial echo, target wrapping, foreign Human writes, reconnects, cancellation,
   raw signals, Break, and Trigger-based boot interruption.

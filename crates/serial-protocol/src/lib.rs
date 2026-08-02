@@ -1093,6 +1093,226 @@ pub struct EventQuery {
     pub limit_bytes: Option<usize>,
 }
 
+/// A long-lived, daemon-owned matcher over one Slot's live RX stream.
+///
+/// `contains` and `regex` are mutually exclusive. They are strings rather
+/// than device-profile fields because monitors describe one observation job,
+/// not the DUT's shell protocol. Matching uses the byte representation of the
+/// UTF-8 strings and spans contiguous RX timeline events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorSpec {
+    pub slot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    /// First event considered is strictly after this cursor. When omitted,
+    /// seriald resolves it to the Slot head at creation/update time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cursor: Option<Cursor>,
+    #[serde(default)]
+    pub severity: MonitorSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Fixed grouping window beginning at the first match. Further matches in
+    /// the window expand the same Incident instead of creating more turns.
+    #[serde(default = "default_monitor_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Minimum delay after an Incident before another may be emitted.
+    #[serde(default = "default_monitor_cooldown_ms")]
+    pub cooldown_ms: u64,
+    /// Optional wall-clock lifetime of the Monitor Job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Notification freshness deadline. Expired outbox entries remain
+    /// inspectable but are never delivered to a webhook sink.
+    #[serde(default = "default_monitor_event_ttl_ms")]
+    pub event_ttl_ms: u64,
+}
+
+fn default_monitor_debounce_ms() -> u64 {
+    250
+}
+
+fn default_monitor_cooldown_ms() -> u64 {
+    30_000
+}
+
+fn default_monitor_event_ttl_ms() -> u64 {
+    10 * 60 * 1_000
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorSeverity {
+    Info,
+    #[default]
+    Warning,
+    Error,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorStatus {
+    Running,
+    Completed,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorView {
+    pub id: Uuid,
+    pub revision: u64,
+    pub spec: MonitorSpec,
+    pub status: MonitorStatus,
+    pub created_wall_time_ns: i64,
+    pub started_wall_time_ns: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_wall_time_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_wall_time_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_cursor: Option<Cursor>,
+    #[serde(default)]
+    pub incident_count: u64,
+    #[serde(default)]
+    pub unacked_incident_count: u64,
+    #[serde(default)]
+    pub gap_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateMonitorRequest {
+    /// Idempotency key and stable Monitor ID. Repeating the same request
+    /// returns the existing Monitor; reusing it with a different spec fails.
+    pub request_id: Uuid,
+    pub spec: MonitorSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateMonitorRequest {
+    pub spec: MonitorSpec,
+    /// Optimistic concurrency guard from `MonitorView.revision`. A stale
+    /// replacement must not silently revive a Monitor another operator stopped
+    /// or overwrite a newer matcher.
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorResponse {
+    pub monitor: MonitorView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorListResponse {
+    pub monitors: Vec<MonitorView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorIncident {
+    pub id: Uuid,
+    /// Stable, monotonically increasing cursor within one Monitor Job.
+    pub incident_seq: u64,
+    pub monitor_id: Uuid,
+    pub slot_id: String,
+    pub daemon_epoch: Uuid,
+    pub seq_start: u64,
+    pub seq_end: u64,
+    pub wall_time_start_ns: i64,
+    pub wall_time_end_ns: i64,
+    pub severity: MonitorSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub preview: String,
+    pub evidence_cursor: Cursor,
+    pub evidence_ref: String,
+    pub created_wall_time_ns: i64,
+    /// Notification freshness deadline. This only expires webhook/outbox
+    /// delivery; the Incident itself is retained until bounded retention or
+    /// acknowledgement-based pruning removes it.
+    pub expires_wall_time_ns: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_wall_time_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorIncidentResponse {
+    pub incident: MonitorIncident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorIncidentListResponse {
+    pub incidents: Vec<MonitorIncident>,
+    /// Decimal incident sequence; pass it as `after_incident_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
+    pub truncated: bool,
+    /// Oldest retained sequence for this Monitor, when any Incident remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_available_incident_seq: Option<u64>,
+    /// True when `after_incident_seq` precedes retained history and results
+    /// begin after an irrecoverable retention gap.
+    #[serde(default)]
+    pub retention_gap: bool,
+}
+
+/// Strict CloudEvents-shaped notification retained by seriald until ACK,
+/// webhook delivery, or TTL expiry. The serial byte stream remains in the
+/// journal and is referenced through the Incident evidence fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorCloudEvent {
+    pub specversion: String,
+    pub id: String,
+    pub source: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub subject: String,
+    pub time: String,
+    pub datacontenttype: String,
+    /// CloudEvents extension attribute. Consumers must not start stale work
+    /// after this RFC3339 timestamp.
+    pub expiresat: String,
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorOutboxStatus {
+    Pending,
+    Delivered,
+    Acknowledged,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorOutboxEvent {
+    pub outbox_seq: u64,
+    pub event: MonitorCloudEvent,
+    pub status: MonitorOutboxStatus,
+    pub created_wall_time_ns: i64,
+    pub expires_wall_time_ns: i64,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorOutboxListResponse {
+    pub events: Vec<MonitorOutboxEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorOutboxEventResponse {
+    pub event: MonitorOutboxEvent,
+}
+
 /// Read-only journal health and retention metrics. Gathering this information
 /// never probes a target, opens a port, or writes serial bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

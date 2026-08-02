@@ -34,6 +34,8 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * GIB;
 pub const DEFAULT_RETENTION_TARGET_PERCENT: u8 = 90;
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MONITOR_SINK_RETRY_MIN_MS: u64 = 1_000;
+pub const DEFAULT_MONITOR_SINK_RETRY_MAX_MS: u64 = 60_000;
 /// Hard bound for both one active configuration and the number of distinct
 /// Slot identities retained during one daemon epoch.
 pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
@@ -57,6 +59,7 @@ pub struct ConfigPaths {
     pub config_file: PathBuf,
     pub journal_dir: PathBuf,
     pub journal_index: PathBuf,
+    pub monitor_state_file: PathBuf,
 }
 
 impl ConfigPaths {
@@ -76,6 +79,7 @@ impl ConfigPaths {
             config_file: config_dir.join("seriald.toml"),
             journal_dir: data_dir.join("journal"),
             journal_index: data_dir.join("journal.sqlite3"),
+            monitor_state_file: data_dir.join("monitors.json"),
             config_dir,
             data_dir,
         }
@@ -123,6 +127,30 @@ pub struct ControlConfig {
     pub max_waiters: usize,
 }
 
+/// Optional generic CloudEvents HTTP sink for durable Monitor notifications.
+/// The bearer secret is loaded from `token_file` and never persisted inline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorEventSinkConfig {
+    /// Exact HTTP endpoint, for example the message center Event API. `None`
+    /// keeps events in the pullable outbox without attempting delivery.
+    pub endpoint: Option<String>,
+    pub token_file: Option<PathBuf>,
+    pub retry_min_ms: u64,
+    pub retry_max_ms: u64,
+}
+
+impl Default for MonitorEventSinkConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            token_file: None,
+            retry_min_ms: DEFAULT_MONITOR_SINK_RETRY_MIN_MS,
+            retry_max_ms: DEFAULT_MONITOR_SINK_RETRY_MAX_MS,
+        }
+    }
+}
+
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
@@ -165,6 +193,8 @@ pub struct DaemonConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub control: ControlConfig,
+    #[serde(default)]
+    pub monitor_event_sink: MonitorEventSinkConfig,
     pub auth: AuthConfig,
     #[serde(default)]
     pub slots: Vec<SlotConfig>,
@@ -189,6 +219,7 @@ impl DaemonConfig {
                 bind: default_bind_address(),
                 logging: LoggingConfig::default(),
                 control: ControlConfig::default(),
+                monitor_event_sink: MonitorEventSinkConfig::default(),
                 auth,
                 slots: Vec::new(),
                 transport_profiles: Vec::new(),
@@ -212,6 +243,7 @@ impl DaemonConfig {
         }
         validate_logging(&self.logging)?;
         validate_control(&self.control)?;
+        validate_monitor_event_sink(&self.monitor_event_sink)?;
         self.auth.validate()?;
         validate_transport_profiles(&self.transport_profiles)?;
         validate_device_profiles(&self.device_profiles)?;
@@ -518,6 +550,12 @@ pub enum ConfigValidationError {
         "control.wait_timeout_ms is {actual}, exceeding the queued-acquire ceiling of {limit} ms"
     )]
     ControlWaitTimeoutTooLarge { actual: u64, limit: u64 },
+    #[error("monitor_event_sink endpoint must be an http:// URL no longer than 2048 bytes")]
+    InvalidMonitorSinkEndpoint,
+    #[error("monitor_event_sink token_file must be non-empty and no longer than 4096 bytes")]
+    InvalidMonitorSinkTokenFile,
+    #[error("monitor_event_sink retry bounds must satisfy 100 <= min <= max <= 3600000 ms")]
+    InvalidMonitorSinkRetry,
     #[error("authentication configuration is invalid: {0}")]
     Authentication(#[from] AuthError),
     #[error("Slot at index {index} has invalid field {field}: {reason}")]
@@ -596,6 +634,27 @@ fn validate_control(control: &ControlConfig) -> Result<(), ConfigValidationError
             actual: control.wait_timeout_ms,
             limit: wait_limit_ms,
         });
+    }
+    Ok(())
+}
+
+fn validate_monitor_event_sink(sink: &MonitorEventSinkConfig) -> Result<(), ConfigValidationError> {
+    if let Some(endpoint) = sink.endpoint.as_deref()
+        && (endpoint.is_empty() || endpoint.len() > 2_048 || !endpoint.starts_with("http://"))
+    {
+        return Err(ConfigValidationError::InvalidMonitorSinkEndpoint);
+    }
+    if let Some(path) = sink.token_file.as_ref() {
+        let text = path.as_os_str().to_string_lossy();
+        if text.is_empty() || text.len() > 4_096 {
+            return Err(ConfigValidationError::InvalidMonitorSinkTokenFile);
+        }
+    }
+    if sink.retry_min_ms < 100
+        || sink.retry_min_ms > sink.retry_max_ms
+        || sink.retry_max_ms > 3_600_000
+    {
+        return Err(ConfigValidationError::InvalidMonitorSinkRetry);
     }
     Ok(())
 }
@@ -940,7 +999,7 @@ fn io_error(path: &Path, source: io::Error) -> ConfigError {
     }
 }
 
-fn atomic_write(target: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "configuration has no parent")
     })?;
@@ -1260,6 +1319,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn monitor_sink_accepts_http_but_rejects_unsupported_schemes() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.monitor_event_sink.endpoint = Some("http://127.0.0.1:3000/api/v1/events".into());
+        config.validate().unwrap();
+
+        config.monitor_event_sink.endpoint =
+            Some("https://message-center.example/api/v1/events".into());
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigValidationError::InvalidMonitorSinkEndpoint
+        );
+
+        config.monitor_event_sink.endpoint = Some("file:///tmp/events".into());
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigValidationError::InvalidMonitorSinkEndpoint
+        );
     }
 
     #[test]

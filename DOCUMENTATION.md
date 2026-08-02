@@ -20,11 +20,14 @@ consume the same platform protocol.
 and journals over HTTP, observes realtime events over WebSocket, and keeps one
 Agent control connection with bounded lease renewal. It can queue for control
 but cannot request takeover, configure/remove a Slot, suspend/close a serial
-handle, or flash a target. Its stable eleven tools are `devices`, `read`,
+handle, or flash a target. Its stable eleven core tools are `devices`, `read`,
 `command`, `input`, `signal`, `trigger`, `wait`, `search`, `run_start`,
-`run_end`, and `release`. Internal request IDs, operation IDs, control/fencing,
-lease renewal, prompt selection, capture bounds, and cursor bookkeeping stay
-inside the adapter instead of becoming routine Agent parameters.
+`run_end`, and `release`. Five additive tools—`monitor_start`, `monitor_list`,
+`monitor_status`, `monitor_incidents`, and `monitor_stop`—manage persistent
+Monitor Jobs owned by `seriald`. Internal request IDs, operation IDs,
+control/fencing, lease renewal, prompt selection, capture bounds, cursor
+bookkeeping, Monitor policy, and notification delivery stay inside the adapter
+or daemon instead of becoming routine Agent parameters.
 
 Agent `search` defaults to the active Run. Cross-Run or old-epoch history is
 never inferred from a text match: current-cursor and archive scopes require an
@@ -90,14 +93,15 @@ never retried automatically.
 
 The stdio dispatcher runs independent MCP requests concurrently and serializes
 stdout frames through one writer. MCP/JSON-RPC cancellation applies only to
-the pure observations `devices`, `read`, `wait`, and `search`. A command,
-signal, Trigger, Run transition, or release may already have crossed a
-side-effect boundary, so its task is allowed to converge to an authoritative
-result even when the host cancels or closes stdin; hiding that result could
-invite an unsafe retry. Per-Slot write locks still serialize `command`,
-`input`, `signal`, and `trigger`, so concurrency cannot interleave physical
-bytes. A long observation on one Slot therefore does not prevent another
-request or lease renewal from making progress.
+the pure observations `devices`, `read`, `wait`, `search`, `monitor_list`,
+`monitor_status`, and `monitor_incidents`. A command, signal, Trigger, Monitor
+mutation, Run transition, or release may already have crossed a side-effect
+boundary, so its task is allowed to converge to an authoritative result even
+when the host cancels or closes stdin; hiding that result could invite an unsafe
+retry. Per-Slot write locks still serialize `command`, `input`, `signal`, and
+`trigger`, so concurrency cannot interleave physical bytes. A long observation
+on one Slot therefore does not prevent another request or lease renewal from
+making progress.
 
 `serial-mcp` also keeps a process-local, per-Slot live cursor so a delayed RX
 event cannot fall into the gap between one tool response and the next `wait`
@@ -120,9 +124,9 @@ requires a Run owned by this adapter process and submits one bounded,
 device-agnostic Trigger Job to `seriald`; the adapter does not loop writes
 across the host/VM boundary. Kickoff/action text, EOL, and start/stop literals
 are explicit call parameters and are never inferred from a device profile. The
-MCP v0.4 arguments expose UTF-8 `text` plus `eol`; the lower WebSocket protocol
-remains byte-oriented and carries arbitrary raw Trigger payloads and literals
-as base64. The adapter attaches before starting the Job, waits for an
+MCP arguments introduced in v0.4 expose UTF-8 `text` plus `eol`; the lower
+WebSocket protocol remains byte-oriented and carries arbitrary raw Trigger
+payloads and literals as base64. The adapter attaches before starting the Job, waits for an
 authoritative terminal state on a separate live channel, keeps lease renewal
 available, and returns a bounded Run/cursor-scoped capture. A matched literal
 is evidence that the requested serial state was observed, not proof that a
@@ -288,7 +292,7 @@ bounds.
 - Agent writes set `expected_run_id`; the Slot actor requires that exact active
   Run to be owned by the writing actor before calculating a pacing budget or
   entering the port queue. Legacy/human writes may omit the field.
-- A checkpoint is a finer marker inside a Run and is not an Agent tool in v0.4.
+- A checkpoint is a finer marker inside a Run and is not an Agent tool in v0.5.
 - Run/checkpoint labels must be non-empty, already trimmed, contain no control
   characters, and be at most 256 UTF-8 bytes.
 - Run metadata is limited to 64 top-level keys and 16 KiB of encoded JSON.
@@ -403,6 +407,90 @@ evidence is strictly clipped to the Trigger's authoritative
 `start_seq..=end_seq`; if Run ownership was lost, the result warns that a new
 Run is required before any further write.
 
+## Monitor Jobs
+
+A Monitor is a durable, daemon-owned observation Job over one Slot's live RX.
+It solves a different problem from MCP `wait`: `wait` holds one bounded tool
+call open for one result, while a Monitor returns an ID immediately and remains
+active after that Agent turn or the entire `serial-mcp` process ends.
+
+Creation supplies a UUID `request_id`, used both as the stable Monitor ID and an
+idempotency key, plus a `MonitorSpec`. Repeating the same ID and spec returns the
+existing Job; reusing the ID with another spec fails. Exactly one non-empty
+literal `contains` or bounded byte-regex is required. When no `start_cursor` is
+provided, the daemon resolves it to the current Slot head, so pre-existing
+history cannot become a new incident. The public platform DTO also carries
+severity, description, debounce, cooldown, optional duration, and event TTL.
+The MCP surface intentionally exposes only Slot, matcher, description, and an
+optional UUID `idempotency_key`; reuse that key after an uncertain
+`monitor_start` response to obtain the same Job. It otherwise uses fixed safe
+policy defaults and never asks the model to select a webhook, Agent session,
+retry policy, or event freshness deadline.
+
+Matching runs on an independent broadcast receiver and cannot block the Slot
+actor or serial reader. Literals and regular expressions may span adjacent RX
+events only within one Slot generation; explicit gaps and serial open/close,
+reconfigure, remove, or generation-change boundaries reset the matcher and
+flush pending debounce evidence as its own incident. Subscriber lag reattaches from
+the exact last processed cursor when the replay ring can recover it; an actual
+gap resets the match window, increments `gap_count`, and remains visible in
+Monitor status. A 250-ms default debounce window groups a burst of matches into
+one incident, followed by a default 30-second cooldown. Each retained incident
+contains a bounded preview, exact daemon epoch and sequence range, and both an
+`evidence_cursor` and `evidence_ref`; the serial journal remains the source of
+truth.
+
+Monitor state is atomically persisted in `monitors.json` under seriald's data
+directory. Running Jobs are resumed after restart. A replay-safe cursor is
+checkpointed at most once a second, while every Incident immediately commits
+its cursor and cooldown barrier; an unfinished debounce group checkpoints before
+its first match so a restart can replay it rather than lose it. Bounds are enforced before
+untrusted work reaches hot paths: 4,096-byte patterns/descriptions, a 64-KiB
+match window, a 2-MiB compiled-regex budget, a 1,024-byte preview, 128 retained
+Jobs, 64 active Jobs, 2,048 incidents per Monitor, 8,192 incidents globally,
+4,096 outbox events, and 200 results per HTTP page. Capacity loss is reported
+as a gap/error; it is never represented as an empty successful observation.
+`event_ttl_ms` expires only the notification/outbox entry: retained Incident
+evidence is not deleted on that deadline and is removed only under bounded
+retention after acknowledgement. Incident pages return
+`first_available_incident_seq` and `retention_gap`; a cursor older than retained
+history is an explicit evidence gap, not an empty page.
+
+The HTTP management and pull surface is additive under `/api/v1`:
+
+| Route | Minimum role | Purpose |
+|---|---|---|
+| `POST /api/v1/monitors` | operator | Idempotently create a Job |
+| `GET /api/v1/monitors` | observer | List Jobs; optionally filter by Slot/status |
+| `GET /api/v1/monitors/{id}` | observer | Read authoritative state and cursor |
+| `PUT /api/v1/monitors/{id}` | operator | Replace the spec and restart matching; body includes `expected_revision` |
+| `DELETE /api/v1/monitors/{id}?expected_revision=N` | operator | Conditionally stop future matching; retain incidents |
+| `GET /api/v1/monitors/{id}/incidents` | observer | Recent tail or cursor-forward bounded page |
+| `POST /api/v1/monitors/{id}/incidents/{incident_id}/ack` | operator | Acknowledge one retained incident |
+| `GET /api/v1/monitor-events` | observer | Read the generic notification outbox |
+| `POST /api/v1/monitor-events/{outbox_seq}/ack` | operator | Acknowledge one outbox entry |
+
+With no `[monitor_event_sink]` endpoint, incidents and CloudEvents-shaped outbox
+entries stay locally pullable; this is the complete standalone mode. When an
+HTTP endpoint is configured, seriald loads its bearer credential from
+`token_file` and delivers the same persisted CloudEvents 1.0-shaped event with
+bounded exponential backoff until delivery or TTL expiry. Serial bytes are
+referenced rather than copied without bound. The event type is
+`io.openchamber.serial.monitor.incident.detected.v1`. Agent Message Center is
+one compatible consumer, not a seriald dependency: routing to an AgentInstance,
+choosing `reuse_or_create`, resolving a return route, and starting an Agent turn
+remain message-center/adapter responsibilities.
+
+The MCP adapter adds five tools without changing the eleven core tools.
+`monitor_start` returns immediately, `monitor_list`/`monitor_status` show
+authoritative state, `monitor_incidents` returns a 20-item recent tail, starts
+from the oldest retained incident with `after="0"`, or continues cursor-forward,
+and `monitor_stop` stops future detection without deleting
+incidents. The decimal `next_after` value is deliberately opaque to the model.
+If no message center exists, an Agent or user can poll these tools later; if a
+message center exists, the push path can start a new turn while the same pull
+tools remain the recovery and audit path.
+
 ## Timeline events
 
 RX is an event, but never one event per byte. The serial worker reads bounded
@@ -505,7 +593,7 @@ long wrapped command therefore cannot hide the newest output or prompt while
 follow mode is active. Per-Slot presentation is bounded to 20,000 completed
 rows and 4 MiB. Any front eviction creates persistent truncation state, a
 synthetic oldest-row gap, and a title warning that directs the operator to the
-durable `serial logs` view. Exact repeated RX rows are intentionally not folded in v0.4,
+durable `serial logs` view. Exact repeated RX rows are intentionally not folded in v0.5,
 because hiding their cadence/order would weaken the human monitoring surface.
 Human-readable live and log views include the sanitized actor label and actor
 ID (compact ID in the TUI, full ID in ordinary logs), so Agent, script, and
@@ -527,7 +615,8 @@ Consumers use two complementary network planes:
 
 - HTTP request/response is the low-frequency query and administration plane:
   health, authoritative snapshots, port discovery, Profile/Slot configuration,
-  diagnostics, archives, and bounded history.
+  diagnostics, archives, bounded history, persistent Monitor management,
+  incident pages, and the notification outbox.
 - One long-lived WebSocket is the realtime plane: attach/replay/live RX/TX,
   Control, Run, Trigger, write, signal, and lifecycle events. One connection
   may attach several Slots.
@@ -548,13 +637,12 @@ dispatch.
 Endpoint: `GET /api/v1/ws`, authenticated by `Authorization: Bearer …`.
 Incoming WebSocket messages and frames are capped at 64 KiB.
 
-v0.4.0 speaks WebSocket protocol v3 and all components in one station must come
-from the same release. It is not wire-compatible with protocol-v2 executables
-from 0.3.x or protocol-v1 executables from 0.2.x. v3 adds enum variants such as
-Break events/errors, so pretending the extension were still v2 would allow a
-mixed client to fail at runtime while decoding a valid frame. The HTTP
-endpoints remain under `/api/v1`; that stable route namespace does not imply a
-WebSocket protocol version.
+v0.5.0 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
+are wire-compatible for the v3 realtime surface, while the additive Monitor
+HTTP APIs and MCP tools require v0.5 components. Protocol-v2 executables from
+0.3.x and protocol-v1 executables from 0.2.x are not wire-compatible with v3.
+The HTTP endpoints remain under `/api/v1`; that stable route namespace does not
+imply a WebSocket protocol version.
 
 Binary envelope:
 
@@ -625,6 +713,11 @@ All endpoints require a role token.
 | `GET /api/v1/diagnostics/storage` | observer | Journal quota, usage, queue, and logging health |
 | `GET /api/v1/slots/{id}/diagnostics` | observer | One authoritative Slot plus subscriber metrics |
 | `GET /api/v1/slots/{id}/events` | observer | Bounded durable query |
+| `POST /api/v1/monitors` | operator | Idempotently create a persistent live-RX Monitor |
+| `GET /api/v1/monitors[/{id}]` | observer | List or inspect persistent Monitors |
+| `PUT/DELETE /api/v1/monitors/{id}` | operator | Replace or stop a Monitor |
+| `GET /api/v1/monitors/{id}/incidents` | observer | Read retained incidents with bounded cursor pagination |
+| `GET /api/v1/monitor-events` | observer | Read the CloudEvents-shaped notification outbox |
 | `GET /api/v1/ws` | observer | Realtime protocol; writes require operator |
 
 Config writes run under one mutation gate: validate the full replacement,
@@ -743,7 +836,7 @@ use `.open`; sealed files use `.slog`.
   read boundary does not hide a keyword or pattern. Regex length, compiled
   automaton size, scan bytes, scan time, result events, and result bytes are
   independently bounded. `serial logs` and MCP `search` first require a daemon
-  that advertises the v0.4 configuration-revision capability; against an older
+  that advertises the configuration-revision capability introduced in v0.4; against an older
   daemon they fail closed instead of attempting an unbounded client-side regex
   fallback. Returned payload remains exact bytes.
 - Queries independently compare adjacent retained records after the requested

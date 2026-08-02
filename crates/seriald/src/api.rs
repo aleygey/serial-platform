@@ -1,6 +1,7 @@
 use crate::auth::{AuthError, Principal, role_allows};
 use crate::config::{ConfigError, ConfigStore, DaemonConfig};
 use crate::journal::{JournalError, JournalHandle};
+use crate::monitor::{MonitorError, MonitorManager};
 use crate::registry::{RegistryError, RegistryRollbackError, SlotRegistry};
 use crate::slot::{AttachState, SlotError, SlotHandle};
 use axum::Json;
@@ -9,15 +10,17 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
     Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceProfilesRequest,
     ConfigureDeviceProfilesResponse, ConfigureSlotsRequest, ConfigureSlotsResponse,
-    ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse,
+    ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse, CreateMonitorRequest,
     DaemonDiagnosticsResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
-    EventQueryResponse, HealthResponse, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage,
-    SlotDiagnostics, StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse,
+    EventQueryResponse, HealthResponse, MonitorIncidentListResponse, MonitorIncidentResponse,
+    MonitorListResponse, MonitorOutboxEventResponse, MonitorOutboxListResponse, MonitorResponse,
+    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage, SlotDiagnostics,
+    StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse, UpdateMonitorRequest,
     encode_control, encode_event,
 };
 use std::collections::HashMap;
@@ -42,6 +45,7 @@ struct AppStateInner {
     config_updates: Mutex<()>,
     registry: SlotRegistry,
     journal: JournalHandle,
+    monitors: MonitorManager,
     daemon_epoch: Uuid,
     started: Instant,
     ws_connections: Arc<Semaphore>,
@@ -56,22 +60,56 @@ impl AppState {
         daemon_epoch: Uuid,
         started: Instant,
     ) -> Self {
-        Self {
+        Self::try_new(
+            config_store,
+            config,
+            registry,
+            journal,
+            daemon_epoch,
+            started,
+        )
+        .expect("AppState requires valid Monitor storage")
+    }
+
+    pub fn try_new(
+        config_store: ConfigStore,
+        config: DaemonConfig,
+        registry: SlotRegistry,
+        journal: JournalHandle,
+        daemon_epoch: Uuid,
+        started: Instant,
+    ) -> Result<Self, MonitorError> {
+        let mut sink = config.monitor_event_sink.clone();
+        if let Some(path) = sink.token_file.as_mut()
+            && path.is_relative()
+        {
+            *path = config_store.paths().config_dir.join(&*path);
+        }
+        let monitors = MonitorManager::open(
+            config_store.paths().monitor_state_file.clone(),
+            registry.clone(),
+            daemon_epoch,
+            config.server_id,
+            sink,
+        )?;
+        Ok(Self {
             inner: Arc::new(AppStateInner {
                 config_store,
                 config: RwLock::new(config),
                 config_updates: Mutex::new(()),
                 registry,
                 journal,
+                monitors,
                 daemon_epoch,
                 started,
                 ws_connections: Arc::new(Semaphore::new(MAX_WS_CONNECTIONS)),
             }),
-        }
+        })
     }
 
     pub async fn shutdown(&self) {
         let _update = self.inner.config_updates.lock().await;
+        self.inner.monitors.shutdown().await;
         self.inner.registry.shutdown().await;
     }
 
@@ -260,6 +298,24 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/diagnostics/storage", get(storage_diagnostics))
         .route("/api/v1/slots/{slot_id}/diagnostics", get(slot_diagnostics))
         .route("/api/v1/slots/{slot_id}/events", get(events))
+        .route("/api/v1/monitors", get(list_monitors).post(create_monitor))
+        .route(
+            "/api/v1/monitors/{monitor_id}",
+            get(get_monitor).put(update_monitor).delete(stop_monitor),
+        )
+        .route(
+            "/api/v1/monitors/{monitor_id}/incidents",
+            get(list_monitor_incidents),
+        )
+        .route(
+            "/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack",
+            post(acknowledge_monitor_incident),
+        )
+        .route("/api/v1/monitor-events", get(list_monitor_outbox))
+        .route(
+            "/api/v1/monitor-events/{outbox_seq}/ack",
+            post(acknowledge_monitor_outbox),
+        )
         .route("/api/v1/ws", get(websocket))
         .with_state(state)
 }
@@ -532,6 +588,154 @@ async fn events(
     // history remains available by explicitly supplying its epoch.
     query.epoch.get_or_insert(state.inner.daemon_epoch);
     Ok(Json(state.inner.journal.query(slot_id, query).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MonitorListQuery {
+    slot_id: Option<String>,
+    status: Option<MonitorStatus>,
+}
+
+async fn create_monitor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateMonitorRequest>,
+) -> Result<Json<MonitorResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    Ok(Json(state.inner.monitors.create(request).await?))
+}
+
+async fn list_monitors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MonitorListQuery>,
+) -> Result<Json<MonitorListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    Ok(Json(
+        state
+            .inner
+            .monitors
+            .list(query.slot_id.as_deref(), query.status)
+            .await,
+    ))
+}
+
+async fn get_monitor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(monitor_id): Path<Uuid>,
+) -> Result<Json<MonitorResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    Ok(Json(state.inner.monitors.get(monitor_id).await?))
+}
+
+async fn update_monitor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(monitor_id): Path<Uuid>,
+    Json(request): Json<UpdateMonitorRequest>,
+) -> Result<Json<MonitorResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    Ok(Json(
+        state.inner.monitors.update(monitor_id, request).await?,
+    ))
+}
+
+async fn stop_monitor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(monitor_id): Path<Uuid>,
+    Query(query): Query<MonitorMutationQuery>,
+) -> Result<Json<MonitorResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    Ok(Json(
+        state
+            .inner
+            .monitors
+            .stop(monitor_id, query.expected_revision)
+            .await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MonitorMutationQuery {
+    expected_revision: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MonitorIncidentQuery {
+    after_incident_seq: Option<u64>,
+    limit: Option<usize>,
+    #[serde(default)]
+    include_acked: bool,
+}
+
+async fn list_monitor_incidents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(monitor_id): Path<Uuid>,
+    Query(query): Query<MonitorIncidentQuery>,
+) -> Result<Json<MonitorIncidentListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    Ok(Json(
+        state
+            .inner
+            .monitors
+            .incidents(
+                monitor_id,
+                query.after_incident_seq,
+                query.limit,
+                query.include_acked,
+            )
+            .await?,
+    ))
+}
+
+async fn acknowledge_monitor_incident(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((monitor_id, incident_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<MonitorIncidentResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    Ok(Json(MonitorIncidentResponse {
+        incident: state
+            .inner
+            .monitors
+            .acknowledge_incident(monitor_id, incident_id)
+            .await?,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MonitorOutboxQuery {
+    after_outbox_seq: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn list_monitor_outbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<MonitorOutboxQuery>,
+) -> Result<Json<MonitorOutboxListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    Ok(Json(
+        state
+            .inner
+            .monitors
+            .outbox(query.after_outbox_seq, query.limit)
+            .await,
+    ))
+}
+
+async fn acknowledge_monitor_outbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(outbox_seq): Path<u64>,
+) -> Result<Json<MonitorOutboxEventResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    Ok(Json(MonitorOutboxEventResponse {
+        event: state.inner.monitors.acknowledge_outbox(outbox_seq).await?,
+    }))
 }
 
 async fn websocket(
@@ -1225,6 +1429,8 @@ pub enum ApiError {
     #[error(transparent)]
     Journal(#[from] JournalError),
     #[error(transparent)]
+    Monitor(#[from] MonitorError),
+    #[error(transparent)]
     Slot(#[from] SlotError),
     #[error("{0}")]
     NotFound(String),
@@ -1263,6 +1469,20 @@ impl IntoResponse for ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::QueryBudgetExceeded,
             ),
+            Self::Monitor(
+                MonitorError::NotFound(_)
+                | MonitorError::OutboxNotFound(_)
+                | MonitorError::UnknownSlot(_),
+            ) => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
+            Self::Monitor(
+                MonitorError::RequestIdReused(_) | MonitorError::RevisionMismatch { .. },
+            ) => (StatusCode::CONFLICT, ErrorCode::Conflict),
+            Self::Monitor(MonitorError::Capacity | MonitorError::ActiveCapacity) => {
+                (StatusCode::TOO_MANY_REQUESTS, ErrorCode::ResourceExhausted)
+            }
+            Self::Monitor(MonitorError::InvalidSpec(_) | MonitorError::CursorAhead) => {
+                (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
+            }
             Self::NotFound(_) => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
             Self::TooManyConnections => {
                 (StatusCode::TOO_MANY_REQUESTS, ErrorCode::ResourceExhausted)
@@ -1275,6 +1495,7 @@ impl IntoResponse for ApiError {
             | Self::ConfigRollback { .. }
             | Self::ConfigCommitRestore { .. }
             | Self::Journal(_)
+            | Self::Monitor(_)
             | Self::Slot(_)
             | Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
         };

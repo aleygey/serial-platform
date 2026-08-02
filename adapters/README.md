@@ -22,10 +22,10 @@ command argument. For setup automation, use `--admin-token-file` and
 destination. Setup rejects global `--token-file` and refuses input/output path
 aliases so it cannot overwrite a supplied credential.
 
-Use every component from the same release. v0.4.0 speaks WebSocket protocol v3
-and must not be mixed with protocol-v2 builds from 0.3.x or protocol-v1 builds
-from 0.2.x. v3 includes new enum variants such as Break events/errors, so a
-mixed client can fail while decoding an otherwise valid frame.
+Use every component from the same release. v0.5.0 retains WebSocket protocol v3
+from v0.4.0; the existing realtime surface is wire-compatible with v0.4, while
+the Monitor HTTP APIs and MCP tools require v0.5 components. Protocol-v2 builds
+from 0.3.x and protocol-v1 builds from 0.2.x are not compatible with v3.
 
 Ready-to-copy examples are under `opencode/` and `codex/`. They invoke the
 component executable directly; using the unified launcher is equivalent:
@@ -39,12 +39,18 @@ The launcher starts only a sibling `serial-mcp` from the same release
 directory. It never falls back to a different executable on `PATH`.
 
 When an OpenCode configuration explicitly lists permissions, allow the
-read-only tools (`devices`, `read`, `wait`, `search`) and require confirmation
-for write/state-changing tools, including the new `input` and `signal`.
+read-only tools (`devices`, `read`, `wait`, `search`, `monitor_list`,
+`monitor_status`, and `monitor_incidents`) and require confirmation for
+write/state-changing tools, including `input`, `signal`, `monitor_start`, and
+`monitor_stop`.
 OpenCode prefixes names as `serial_devices`, `serial_command`, and so on.
 Codex exposes them under the configured `serial` MCP server.
 
-## Stable eleven-tool surface
+## Stable core and Monitor tool surface
+
+The original eleven tools keep their names and arguments. Five additive
+Monitor tools manage persistent observation Jobs owned by `seriald`; restarting
+or closing the stdio MCP process does not stop them.
 
 | Tool | Required inputs | Optional inputs | Purpose |
 |---|---|---|---|
@@ -56,6 +62,11 @@ Codex exposes them under the configured `serial` MCP server.
 | `trigger` | `slot_id`, `action` | `kickoff`, `start_contains`, `stop_contains`, interval/timeout/fire bounds | One bounded daemon-side low-latency reaction |
 | `wait` | `slot_id` | one of `expect`/`regex`, `timeout_seconds` | Wait from the adapter's live cursor |
 | `search` | `slot_id`, `query` | `regex`, scope, explicit continuation fields | Bounded search; current Run by default |
+| `monitor_start` | `slot_id`, exactly one of `contains`/`regex` | `description` | Create a persistent Monitor and return its ID immediately |
+| `monitor_list` | none | `slot_id` | List authoritative persistent Monitors |
+| `monitor_status` | `monitor_id` | none | Inspect one Monitor's state, cursor, counts, and last error |
+| `monitor_incidents` | `monitor_id` | opaque decimal `after` cursor | Read one bounded page of retained incidents and evidence references |
+| `monitor_stop` | `monitor_id` | none | Stop future detection without deleting retained incidents |
 | `run_start` | `slot_id`, `label` | — | Queue for Control and establish an evidence boundary |
 | `run_end` | `slot_id` | — | End the owned Run and best-effort release Control |
 | `release` | `slot_id` | `abort_run` | Release this adapter's lease without closing the port |
@@ -65,6 +76,44 @@ Operation UUIDs, Control ID/fence, generation validation, pacing, effective
 prompt selection, bounded capture settings, cursor memory, lease renewal, and
 cleanup. This keeps Agent calls small while `seriald` retains the complete
 auditable timeline.
+
+## Persistent Monitor Jobs
+
+`monitor_start` installs one literal or bounded-regex matcher in `seriald` and
+returns immediately. It is not a long-running MCP request and does not keep an
+Agent turn open. The daemon owns the Monitor state, live cursor, match window,
+incident retention, and any configured notification/outbox policy; those
+mechanics are deliberately absent from the Agent tool schema.
+The adapter generates the idempotent creation ID internally and reuses it for
+one transport retry, so a lost HTTP response cannot create a second Monitor.
+
+For example:
+
+```json
+{
+  "slot_id": "slot-1",
+  "regex": "(?i)kernel panic|watchdog",
+  "description": "Capture an intermittent DUT crash"
+}
+```
+
+Use `monitor_status` or `monitor_list` to inspect whether it is still running.
+`monitor_incidents` returns the recent bounded tail when `after` is omitted.
+Use `after="0"` to page from the oldest retained incident, or pass the returned
+decimal `next_after` back as `after` for the next forward page. Each incident includes a
+short preview plus `evidence_ref`, `evidence_cursor`, and the exact serial
+sequence range; fetch deeper serial evidence only when it is relevant instead
+of placing an unbounded UART history in Agent context. For an exact follow-up,
+call `read` with `scope=archive`, the incident Slot, and the returned
+`evidence_cursor` epoch/after-sequence pair. `truncated=true` means the returned
+page is incomplete, not that no later incident exists.
+
+Notification delivery is optional platform configuration. Without a message
+center, incidents remain durable and queryable with these tools. With one
+configured, the same persisted incident may also initiate a new Agent turn;
+the model does not select a message-center endpoint or delivery strategy.
+`monitor_stop` durably stops future matching but preserves existing incidents
+for audit and later queries.
 
 ## Normal workflow
 
@@ -225,8 +274,9 @@ larger flashing/debug workflow succeeded.
 The executable speaks newline-delimited JSON-RPC over stdin/stdout. stdout is
 reserved for MCP frames; diagnostics go to stderr. Independent requests run
 concurrently and completed frames are serialized through one writer.
-`notifications/cancelled`/`$/cancelRequest` cancel only the pure observations
-`devices`, `read`, `wait`, and `search`. A command, input, signal, Trigger, Run
+`notifications/cancelled`/`$/cancelRequest` cancel only pure observations:
+`devices`, `read`, `wait`, `search`, `monitor_list`, `monitor_status`, and
+`monitor_incidents`. A command, input, signal, Trigger, Monitor mutation, Run
 transition, or release may already have crossed a side-effect boundary, so it
 is allowed to reach an authoritative result rather than hiding the outcome and
 encouraging an unsafe retry. Per-Slot write serialization prevents physical
