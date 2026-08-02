@@ -416,7 +416,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "search",
-            "Search the current Run by default; archive requires epoch.",
+            "Search current Run by default; archive requires explicit epoch.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
