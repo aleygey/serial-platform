@@ -386,23 +386,17 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "trigger",
-            "Arm daemon-side RX matchers and bounded writes; max_fires limits sends, not observation.",
+            "Repeat writes; max_fires only limits sends.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
-                    "kickoff": trigger_write_schema(
-                        MAX_TRIGGER_INITIAL_WRITE_BYTES,
-                        "One-time write after arming; excluded from max_fires."
-                    ),
-                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES,"description":"RX literal gating the first fire."},
-                    "action": trigger_write_schema(
-                        MAX_TRIGGER_ACTION_BYTES,
-                        "Per-fire confirmed and audited write."
-                    ),
-                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS,"description":"Delay after a confirmed fire."},
-                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"description":"RX success literals; observation continues after max_fires until match or timeout.","items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
-                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS,"description":"Overall observation deadline."},
-                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":"Send budget for confirmed action writes, not observation cutoff."}
+                    "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
+                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},
+                    "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
+                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS},
+                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"description":"Observe after max_fires until timeout.","items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
+                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS},
+                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":"Send budget only."}
                 }),
                 &["slot_id", "action"],
             ),
@@ -526,10 +520,9 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-fn trigger_write_schema(max_length: usize, description: &str) -> Value {
+fn trigger_write_schema(max_length: usize) -> Value {
     json!({
         "type":"object",
-        "description":description,
         "properties":{
             "text":{"type":"string","maxLength":max_length},
             "eol":{"type":"string","maxLength":max_length}
