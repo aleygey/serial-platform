@@ -1,12 +1,15 @@
-use crate::config::{ConfigValidationError, MAX_SLOT_IDENTITIES_PER_DAEMON, validate_slots};
+use crate::config::{
+    ConfigValidationError, MAX_SLOT_IDENTITIES_PER_DAEMON, validate_device_models,
+    validate_slot_device_bindings, validate_slots,
+};
 use crate::control::ControlLimits;
 use crate::journal::JournalHandle;
 use crate::slot::{SlotError, SlotHandle};
 use serial_protocol::{
-    DeviceProfile, SlotConfig, SlotSnapshot, TransportProfile, resolve_device_settings,
-    resolve_transport_settings,
+    DeviceModel, DeviceProfile, SlotConfig, SlotSnapshot, TransportProfile,
+    resolve_device_settings, resolve_transport_settings,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
@@ -217,18 +220,50 @@ impl SlotRegistry {
         device_profiles: Vec<DeviceProfile>,
         control_limits: ControlLimits,
     ) -> Self {
+        Self::new_with_device_models(
+            daemon_epoch,
+            daemon_started,
+            journal,
+            configs,
+            transport_profiles,
+            device_profiles,
+            Vec::new(),
+            BTreeMap::new(),
+            control_limits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_device_models(
+        daemon_epoch: Uuid,
+        daemon_started: Instant,
+        journal: JournalHandle,
+        configs: Vec<SlotConfig>,
+        transport_profiles: Vec<TransportProfile>,
+        device_profiles: Vec<DeviceProfile>,
+        device_models: Vec<DeviceModel>,
+        slot_device_bindings: BTreeMap<String, String>,
+        control_limits: ControlLimits,
+    ) -> Self {
         validate_slots(&configs, &transport_profiles, &device_profiles)
             .expect("SlotRegistry requires validated Slot configuration");
+        validate_device_models(&device_models, &device_profiles)
+            .expect("SlotRegistry requires validated Device Model configuration");
+        validate_slot_device_bindings(&configs, &device_models, &slot_device_bindings)
+            .expect("SlotRegistry requires validated Slot Device bindings");
         let active = configs
             .into_iter()
             .map(|config| {
                 let id = config.id.clone();
                 let transport_profile = find_transport_profile(&transport_profiles, &config);
                 let device_profile = find_device_profile(&device_profiles, &config);
+                let device_model =
+                    find_device_model(&device_models, &slot_device_bindings, &config);
                 let handle = SlotHandle::spawn(
                     config,
                     transport_profile,
                     device_profile,
+                    device_model,
                     control_limits,
                     daemon_epoch,
                     daemon_started,
@@ -293,7 +328,27 @@ impl SlotRegistry {
         transport_profiles: Vec<TransportProfile>,
         device_profiles: Vec<DeviceProfile>,
     ) -> Result<AppliedSlotReplacement, RegistryError> {
+        self.apply_replacement_with_devices(
+            configs,
+            transport_profiles,
+            device_profiles,
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn apply_replacement_with_devices(
+        &self,
+        configs: Vec<SlotConfig>,
+        transport_profiles: Vec<TransportProfile>,
+        device_profiles: Vec<DeviceProfile>,
+        device_models: Vec<DeviceModel>,
+        slot_device_bindings: BTreeMap<String, String>,
+    ) -> Result<AppliedSlotReplacement, RegistryError> {
         validate_slots(&configs, &transport_profiles, &device_profiles)?;
+        validate_device_models(&device_models, &device_profiles)?;
+        validate_slot_device_bindings(&configs, &device_models, &slot_device_bindings)?;
         let gate = self.inner.mutation.clone().lock_owned().await;
         match gate.lifecycle {
             RegistryLifecycle::Running => {}
@@ -338,11 +393,13 @@ impl SlotRegistry {
                     let snapshot = previous.active[*id].snapshot();
                     let transport = find_transport_profile(&transport_profiles, config);
                     let device = find_device_profile(&device_profiles, config);
+                    let model = find_device_model(&device_models, &slot_device_bindings, config);
                     let expected_transport =
                         resolve_transport_settings(&config.settings, transport.as_ref());
                     let expected_device =
                         resolve_device_settings(&config.settings, device.as_ref());
                     snapshot.config != *config
+                        || snapshot.device_model != model
                         || snapshot.effective_transport != Some(expected_transport)
                         || snapshot.effective_shell_prompt != expected_device.shell_prompt
                         || snapshot.effective_uboot_prompt != expected_device.uboot_prompt
@@ -367,6 +424,7 @@ impl SlotRegistry {
                         config.clone(),
                         find_transport_profile(&transport_profiles, config),
                         find_device_profile(&device_profiles, config),
+                        find_device_model(&device_models, &slot_device_bindings, config),
                         true,
                     )
                     .await
@@ -399,6 +457,7 @@ impl SlotRegistry {
                     config.clone(),
                     find_transport_profile(&transport_profiles, config),
                     find_device_profile(&device_profiles, config),
+                    find_device_model(&device_models, &slot_device_bindings, config),
                     false,
                 )
                 .await
@@ -420,10 +479,13 @@ impl SlotRegistry {
             } else {
                 let transport_profile = find_transport_profile(&transport_profiles, &config);
                 let device_profile = find_device_profile(&device_profiles, &config);
+                let device_model =
+                    find_device_model(&device_models, &slot_device_bindings, &config);
                 let handle = SlotHandle::spawn_staged(
                     config,
                     transport_profile,
                     device_profile,
+                    device_model,
                     self.inner.control_limits,
                     self.inner.daemon_epoch,
                     self.inner.daemon_started,
@@ -567,6 +629,18 @@ fn find_device_profile(
         .cloned()
 }
 
+fn find_device_model(
+    device_models: &[DeviceModel],
+    slot_device_bindings: &BTreeMap<String, String>,
+    config: &SlotConfig,
+) -> Option<DeviceModel> {
+    let model_id = slot_device_bindings.get(&config.id)?;
+    device_models
+        .iter()
+        .find(|model| model.id == *model_id)
+        .cloned()
+}
+
 fn find_transport_profile(
     transport_profiles: &[TransportProfile],
     config: &SlotConfig,
@@ -626,6 +700,133 @@ mod tests {
             Vec::new(),
             ControlLimits::default(),
         )
+    }
+
+    fn device_profile(name: &str) -> DeviceProfile {
+        DeviceProfile {
+            name: name.into(),
+            shell_prompt: Some("]# ".into()),
+            uboot_prompt: None,
+            write_eol: None,
+            echo: None,
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
+        }
+    }
+
+    fn device_model(id: &str, display_name: &str, profile: &str) -> DeviceModel {
+        DeviceModel {
+            id: id.into(),
+            display_name: display_name.into(),
+            category_path: vec!["AS7230".into()],
+            device_profile: profile.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn concrete_model_refresh_updates_identity_without_reopening_port() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = JournalManager::open(JournalConfig::new(temporary.path())).unwrap();
+        let mut config = disabled_slot("slot-1", "bench");
+        config.device_profile = Some("as7230-v1".into());
+        let profiles = vec![device_profile("as7230-v1")];
+        let original_model = device_model("as7230-w", "AS7230-W", "as7230-v1");
+        let bindings = BTreeMap::from([("slot-1".into(), "as7230-w".into())]);
+        let registry = SlotRegistry::new_with_device_models(
+            Uuid::new_v4(),
+            Instant::now(),
+            journal.handle(),
+            vec![config.clone()],
+            Vec::new(),
+            profiles.clone(),
+            vec![original_model],
+            bindings.clone(),
+            ControlLimits::default(),
+        );
+        let handle = registry.get("slot-1").await.unwrap();
+        assert_eq!(
+            handle
+                .snapshot()
+                .device_model
+                .as_ref()
+                .map(|model| model.display_name.as_str()),
+            Some("AS7230-W")
+        );
+        let generation = handle.snapshot().generation;
+
+        let renamed = device_model("as7230-w", "AS7230-W production", "as7230-v1");
+        let actor = serial_protocol::Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: serial_protocol::ActorKind::Agent,
+        };
+        let lease = match handle
+            .acquire_control(
+                Uuid::new_v4(),
+                actor.clone(),
+                serial_protocol::ControlMode::Queue,
+                60_000,
+            )
+            .await
+            .unwrap()
+        {
+            serial_protocol::CommandResult::ControlGranted { lease } => lease,
+            other => panic!("unexpected acquire result: {other:?}"),
+        };
+        let run = match handle
+            .start_run(
+                Uuid::new_v4(),
+                actor.clone(),
+                lease.id,
+                lease.fence,
+                "model-bound-run".into(),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+        {
+            serial_protocol::CommandResult::RunStarted { run } => run,
+            other => panic!("unexpected Run result: {other:?}"),
+        };
+        let busy = registry
+            .apply_replacement_with_devices(
+                vec![config.clone()],
+                Vec::new(),
+                profiles.clone(),
+                vec![renamed.clone()],
+                bindings.clone(),
+            )
+            .await
+            .err()
+            .expect("active Run must reject a model identity change");
+        assert!(matches!(
+            busy,
+            RegistryError::Slot(SlotError::ProfileChangeBusy)
+        ));
+        handle
+            .end_run(Uuid::new_v4(), actor, lease.id, lease.fence, run.id)
+            .await
+            .unwrap();
+
+        let snapshots = registry
+            .apply_replacement_with_devices(
+                vec![config],
+                Vec::new(),
+                profiles,
+                vec![renamed.clone()],
+                bindings,
+            )
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(snapshots[0].device_model, Some(renamed));
+        assert_eq!(snapshots[0].generation, generation);
+        assert_eq!(snapshots[0].session_state, SessionState::Disabled);
+
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
     }
 
     #[tokio::test]

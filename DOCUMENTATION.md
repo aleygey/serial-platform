@@ -337,7 +337,8 @@ arm live byte matchers
 -> optional one-time initial_write kickoff (not a fire)
 -> optional start_contains gate
 -> one bounded action write at a time
--> stop_contains match, timeout, max_fires, cancellation, or invalidation
+-> max_fires stops writes
+-> stop_contains match, timeout, cancellation, or invalidation ends observation
 ```
 
 All payloads and patterns are exact raw bytes. Matching is literal,
@@ -369,6 +370,14 @@ already accepted write may take up to the ordinary 15-second physical-write
 budget to settle and be audited before the Job reaches its authoritative
 terminal state. Partial or uncertain writes terminate the Job and are never
 retried automatically.
+
+`max_fires` is a write budget rather than an RX-observation boundary. Once it
+is exhausted, no further action write can be scheduled. With one or more
+`stop_contains` literals, the Trigger remains active until a literal arrives or
+the original deadline expires; this lets output produced after the last write
+complete the Job. With no stop literal, exhausting the budget terminates
+immediately as `max_fires_reached`. At the deadline, an exhausted budget is
+reported as `max_fires_reached`; otherwise it is `timed_out`.
 
 Trigger requests are rejected unless all of these hard limits hold:
 
@@ -645,7 +654,7 @@ dispatch.
 Endpoint: `GET /api/v1/ws`, authenticated by `Authorization: Bearer …`.
 Incoming WebSocket messages and frames are capped at 64 KiB.
 
-v0.5.0 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
+v0.5.1 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
 are wire-compatible for the v3 realtime surface, while the additive Monitor
 HTTP APIs and MCP tools require v0.5 components. Protocol-v2 executables from
 0.3.x and protocol-v1 executables from 0.2.x are not wire-compatible with v3.
@@ -716,6 +725,9 @@ All endpoints require a role token.
 | `PUT /api/v1/config/transport-profiles` | admin | Validate, persist, and replace the transport catalog |
 | `GET /api/v1/config/device-profiles` | observer | List the device profile catalog |
 | `PUT /api/v1/config/device-profiles` | admin | Validate, persist, and replace the catalog |
+| `GET /api/v1/config/device-models` | observer | List concrete DUT models and their owning Device Profiles |
+| `GET /api/v1/slots/{id}/device-binding` | observer | Read one Slot's authoritative Profile/model binding |
+| `PUT /api/v1/slots/{id}/device-binding` | operator | Atomically select Generic, Profile-only, an existing model, or add-and-bind model metadata |
 | `GET /api/v1/archives` | observer | List bounded retained Slot/epoch archives |
 | `GET /api/v1/diagnostics` | observer | Daemon, WebSocket, journal, and per-Slot health |
 | `GET /api/v1/diagnostics/storage` | observer | Journal quota, usage, queue, and logging health |
@@ -741,7 +753,7 @@ topology. Existing Slot IDs are reconfigured in place: changed/removed ports
 are fully stopped first, unchanged actors keep their sequence/ring/live
 channel, and only genuinely new Slot IDs create new actors.
 
-Status and both Profile-list responses carry one monotonically increasing
+Status, Profile/model catalogs, and binding responses carry one monotonically increasing
 `config_revision`. Every replacement request may carry `expected_revision`;
 a stale value returns `config_revision_mismatch` without staging or saving
 anything. `serial setup` and `serial profile` always read a revision and submit
@@ -765,10 +777,25 @@ Device Profile changes are rejected while the affected Slot has an active Run
 or Trigger, so an operation cannot continue under silently changed capture or
 pacing behavior.
 
+A Device Model is separate identity metadata: stable ID, display name,
+optional category path, and a reference to exactly one Device Profile. This
+allows marketed/hardware variants that share firmware behavior to reuse one
+Profile. The concrete Slot binding is stored separately from the full Slot
+document so an older setup client cannot silently erase it. Selecting a model
+derives its Device Profile server-side; a caller cannot submit a mismatched
+pair. Model/Profile switches are rejected during an active Run or Trigger,
+emit a `SlotReconfigured` identity boundary, and keep the physical port open.
+The restricted Operator binding endpoint may add only model metadata; it cannot
+change any behavior or transport field.
+
 The persisted/wire `SlotConfig.profile` field retains its old name but now
 means the Transport Profile binding. `SlotConfig.device_profile` is the
 optional DUT binding. An unbound Device Profile is displayed as `Generic` and
 does not imply model detection.
+
+`SlotSnapshot.device_model` is the authoritative concrete DUT identity. `None`
+means it has not been configured, not that the daemon inferred a generic or
+unknown model. Slot ID/display name remain stable station-channel identifiers.
 
 An attached `device_profile` is authoritative for Shell/U-Boot prompt
 presence: an omitted prompt remains unset rather than inheriting legacy Slot

@@ -26,6 +26,8 @@ Setup discovers ports on the daemon host and selects two independent layers:
   auto-open.
 - Device Profile: optional DUT Shell/U-Boot prompts, EOL, echo, and safe write
   chunk size/delay.
+- Device Model: concrete DUT identity which references a shared Device Profile;
+  multiple product variants can therefore share the same behavior.
 
 Use `Generic` when DUT behavior is unknown. A quick reusable configuration is:
 
@@ -47,6 +49,14 @@ and/or the Transport to the safe baseline. Mutations prompt once for the admin
 credential or accept `--admin-token-file`; the credential is never saved.
 Every mutation carries `config_revision`, so a stale setup/profile client is
 rejected rather than overwriting a newer change.
+
+Inside the Console, `Ctrl-] m` opens the non-blocking Profile/model picker for
+the selected Slot. Arrow keys and Enter select `Profile → model`; Generic and
+Profile-only are explicit choices, and `N` adds and binds a metadata-only model
+under the highlighted Profile. The daily Operator token is sufficient because
+this path cannot edit COM/UART or Device Profile behavior. It is rejected
+during an active Run or Trigger and never reopens the serial handle. The tab
+keeps the stable station-channel name; the output title shows the concrete DUT.
 
 Non-interactive setup reads `--admin-token-file` and
 `--operator-token-file`, then saves the validated daily credential only to

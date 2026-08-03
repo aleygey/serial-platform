@@ -888,6 +888,7 @@ impl AgentTools {
             .as_deref()
             .map(|pattern| String::from_utf8_lossy(pattern).into_owned());
         let outcome = trigger_status_label(terminal.status);
+        let send_budget_exhausted = trigger_send_budget_exhausted(&terminal);
         let capture_complete = !capture.truncated
             && capture.gaps.is_empty()
             && matches!(&capture.completion, Completion::Signal(_))
@@ -906,6 +907,8 @@ impl AgentTools {
             "outcome": outcome,
             "matched": terminal.status.is_matched(),
             "fires": terminal.fires_confirmed,
+            "fire_budget": terminal.spec.max_fires,
+            "send_budget_exhausted": send_budget_exhausted,
             "confidence": confidence,
             "text": rendered.text,
             "truncated": truncated,
@@ -929,8 +932,17 @@ impl AgentTools {
         if !run_ownership_retained {
             warnings.push("MCP no longer owns the Run; start a new Run before writing".to_string());
         }
+        if terminal.status.is_matched()
+            && send_budget_exhausted
+            && !terminal.spec.stop_contains.is_empty()
+        {
+            warnings.push(
+                "The stop matcher remained armed after the final permitted action write; no extra action writes were scheduled"
+                    .to_string(),
+            );
+        }
         if !terminal.status.is_matched() {
-            warnings.push(trigger_guidance(terminal.status).to_string());
+            warnings.push(trigger_guidance(&terminal).to_string());
         }
         if !warnings.is_empty() {
             output["warnings"] = json!(warnings);
@@ -1790,15 +1802,30 @@ fn trigger_status_label(status: TriggerStatus) -> &'static str {
     }
 }
 
-fn trigger_guidance(status: TriggerStatus) -> &'static str {
-    match status {
+fn trigger_send_budget_exhausted(trigger: &TriggerInfo) -> bool {
+    trigger.fires_confirmed >= trigger.spec.max_fires
+}
+
+fn trigger_guidance(trigger: &TriggerInfo) -> &'static str {
+    match trigger.status {
         TriggerStatus::Matched => {
             "A caller-supplied stop literal was observed in live RX. This confirms only the \
              Trigger boundary, not that a later flashing or debug workflow succeeded."
         }
-        TriggerStatus::TimedOut | TriggerStatus::MaxFiresReached => {
-            "No stop literal was observed before the hard Trigger bound. Inspect this bounded \
-             capture/current Run before deciding whether a different action is safe."
+        TriggerStatus::TimedOut => {
+            "The observation deadline elapsed without a stop match. Confirmed TX proves only \
+             that bytes were accepted by the serial driver, not that the target action failed. \
+             Inspect this capture/current Run before changing parameters or retrying."
+        }
+        TriggerStatus::MaxFiresReached if !trigger.spec.stop_contains.is_empty() => {
+            "The action send budget was exhausted, then seriald kept observing until the \
+             original deadline without a stop match. Confirmed TX is not proof that the target \
+             action failed; inspect TX/RX and current device state before any retry."
+        }
+        TriggerStatus::MaxFiresReached => {
+            "No stop literal was configured, so exhausting the action send budget completed \
+             this Trigger. That proves neither target success nor target failure; inspect the \
+             resulting state instead of blindly retrying."
         }
         TriggerStatus::Cancelled => {
             "The Trigger was cancelled and reached an authoritative terminal state; no future \
@@ -1882,6 +1909,13 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
             "owner": actor_summary(&trigger.owner)
         })
     });
+    let device_model = slot.device_model.as_ref().map(|model| {
+        json!({
+            "id": model.id,
+            "display_name": model.display_name,
+            "category_path": model.category_path
+        })
+    });
     json!({
         "slot_id": slot.config.id,
         "display_name": slot.config.display_name,
@@ -1889,6 +1923,7 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
         "enabled": slot.config.enabled,
         "transport_profile": slot.config.profile,
         "device_profile": slot.config.device_profile,
+        "device_model": device_model,
         "endpoint_present": slot.endpoint_present,
         "session_state": slot.session_state,
         "state_code": slot.state_code,
@@ -2401,6 +2436,33 @@ mod tests {
     }
 
     #[test]
+    fn trigger_guidance_separates_send_budget_from_observation() {
+        let with_stop = test_terminal_trigger(
+            TriggerStatus::MaxFiresReached,
+            DEFAULT_TRIGGER_MAX_FIRES,
+            vec![b"prompt".to_vec()],
+        );
+        assert!(trigger_send_budget_exhausted(&with_stop));
+        let guidance = trigger_guidance(&with_stop);
+        assert!(guidance.contains("send budget was exhausted"));
+        assert!(guidance.contains("kept observing until the original deadline"));
+        assert!(guidance.contains("not proof"));
+
+        let without_stop = test_terminal_trigger(
+            TriggerStatus::MaxFiresReached,
+            DEFAULT_TRIGGER_MAX_FIRES,
+            Vec::new(),
+        );
+        let guidance = trigger_guidance(&without_stop);
+        assert!(guidance.contains("No stop literal was configured"));
+        assert!(guidance.contains("instead of blindly retrying"));
+
+        let timed_out = test_terminal_trigger(TriggerStatus::TimedOut, 1, vec![b"ready".to_vec()]);
+        assert!(!trigger_send_budget_exhausted(&timed_out));
+        assert!(trigger_guidance(&timed_out).contains("observation deadline"));
+    }
+
+    #[test]
     fn trigger_rejects_empty_or_unbounded_payload_plans() {
         let empty: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
@@ -2561,6 +2623,12 @@ mod tests {
             kind: serial_protocol::ActorKind::Agent,
         };
         slot.config.device_profile = Some("luckfox".into());
+        slot.device_model = Some(serial_protocol::DeviceModel {
+            id: "as7230-w".into(),
+            display_name: "AS7230-W".into(),
+            category_path: vec!["AS7230".into(), "Wireless".into()],
+            device_profile: "luckfox".into(),
+        });
         slot.control = Some(serial_protocol::ControlLease {
             id: Uuid::from_u128(1),
             owner: owner.clone(),
@@ -2611,6 +2679,13 @@ mod tests {
         assert_eq!(summary["slot_id"], "bench");
         assert_eq!(summary["transport_profile"], "linux");
         assert_eq!(summary["device_profile"], "luckfox");
+        assert_eq!(summary["device_model"]["id"], "as7230-w");
+        assert_eq!(summary["device_model"]["display_name"], "AS7230-W");
+        assert_eq!(
+            summary["device_model"]["category_path"],
+            json!(["AS7230", "Wireless"])
+        );
+        assert!(summary["device_model"].get("device_profile").is_none());
         assert_eq!(summary["session_state"], "online");
         assert_eq!(summary["cursor"]["epoch"], json!(Uuid::nil()));
         assert_eq!(summary["cursor"]["after_seq"], 42);
@@ -2683,6 +2758,44 @@ mod tests {
             "logging": "healthy"
         }))
         .unwrap()
+    }
+
+    fn test_terminal_trigger(
+        status: TriggerStatus,
+        fires_confirmed: u32,
+        stop_contains: Vec<Vec<u8>>,
+    ) -> TriggerInfo {
+        TriggerInfo {
+            id: Uuid::from_u128(30),
+            owner: serial_protocol::Actor {
+                id: "agent:test".into(),
+                label: "test".into(),
+                kind: serial_protocol::ActorKind::Agent,
+            },
+            daemon_epoch: Uuid::nil(),
+            generation: 1,
+            control_id: Uuid::from_u128(31),
+            fence: 1,
+            operation_id: Some(Uuid::from_u128(32)),
+            expected_run_id: Some(Uuid::from_u128(33)),
+            spec: TriggerSpec {
+                initial_write: None,
+                start_contains: None,
+                action: b"x".to_vec(),
+                interval_ms: DEFAULT_TRIGGER_INTERVAL_MS,
+                stop_contains,
+                timeout_ms: DEFAULT_TRIGGER_TIMEOUT_MS,
+                max_fires: DEFAULT_TRIGGER_MAX_FIRES,
+                pacing: None,
+            },
+            status,
+            start_seq: 1,
+            end_seq: Some(5),
+            last_write_seq: Some(3),
+            fires_confirmed,
+            tx_bytes_confirmed: fires_confirmed as u64,
+            matched_pattern: None,
+        }
     }
 
     #[test]

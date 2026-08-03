@@ -333,6 +333,17 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
             safe_inline(slot.config.device_profile.as_deref().unwrap_or("Generic"))
         );
         println!(
+            "Device     model={} id={}",
+            slot.device_model
+                .as_ref()
+                .map(|model| safe_inline(&model.display_name))
+                .unwrap_or_else(|| "unconfigured".into()),
+            slot.device_model
+                .as_ref()
+                .map(|model| safe_inline(&model.id))
+                .unwrap_or_else(|| "-".into())
+        );
+        println!(
             "Effective  transport={:?} pacing={:?} EOL={:?} echo={:?}",
             slot.effective_transport,
             slot.effective_write_pacing,

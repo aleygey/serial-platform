@@ -9,13 +9,15 @@ It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
-v0.5.0 adds persistent, daemon-owned Monitor Jobs for rare serial conditions.
-The five additive MCP tools start, list, inspect, read incidents from, and stop
-those Jobs without holding an Agent turn open. The unified launcher introduced
-in v0.4 remains: `serial serve` starts the backend, `serial console` opens the
-TUI, `serial setup` configures a station, `serial profile ...` manages reusable
-profiles, and `serial mcp` starts the MCP adapter. The component executables
-remain in the release package and can still be invoked directly.
+v0.5.1 separates reusable DUT behavior Profiles from the concrete model
+connected to each Slot, adds the in-console Profile/model picker, and keeps a
+Trigger's stop matcher observing after its final permitted write. It retains
+the persistent, daemon-owned Monitor Jobs introduced in v0.5.0. The unified
+launcher introduced in v0.4 remains: `serial serve` starts the backend,
+`serial console` opens the TUI, `serial setup` configures a station,
+`serial profile ...` manages reusable profiles, and `serial mcp` starts the
+MCP adapter. The component executables remain in the release package and can
+still be invoked directly.
 
 See [ROADMAP.md](ROADMAP.md) for released capabilities, the next practical
 work, and longer-term candidates separated by `seriald`, `serialctl`, and
@@ -27,6 +29,9 @@ work, and longer-term candidates separated by `seriald`, `serialctl`, and
 - Two explicit reusable configuration layers: a Transport Profile for physical
   UART settings and an optional Device Profile for DUT behavior and safe write
   pacing.
+- A separate concrete Device Model identity for the DUT actually connected to
+  a Slot. Multiple models can reuse one Device Profile when they share
+  firmware behavior.
 - Interactive and scriptable Profile list/show/create/update/clone/import/export/
   attach/detach commands with optimistic `config_revision` protection.
 - Long-lived serial ownership with auto-open and reconnect.
@@ -101,7 +106,7 @@ Each release provides two x86_64 packages:
   i386/i686 Ubuntu.
 
 Use every executable from the same release across the Windows host and Linux
-VM. v0.5.0 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
+VM. v0.5.1 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
 peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
 and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
 protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
@@ -113,8 +118,8 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.5.0-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.5.0-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.5.1-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.5.1-linux-x86_64-ubuntu20.04
 chmod +x serial serialctl serial-mcp
 ./serial --version
 ```
@@ -179,7 +184,7 @@ Slots omitted from a new scan, including temporarily absent COM ports, are kept
 by default; deletion requires an explicit confirmation. A Slot is the stable
 station channel, not a device model or serial number. Replacing the sample
 connected to the same serial-card channel normally means attaching a different
-Device Profile, not changing the Slot.
+Device Profile/model binding, not changing the Slot.
 
 Create a reusable profile before setup, or attach it later:
 
@@ -216,6 +221,7 @@ keys:
 | `Ctrl-] PgUp` / `Ctrl-] PgDn` | Local scroll, including in RAW mode |
 | `Ctrl-] v` | Toggle compact/detailed timeline |
 | `Ctrl-] g` | Switch UI language and save it |
+| `Ctrl-] m` | Select the current DUT Profile/model, or add a model label |
 | `Ctrl-] t` | Explicitly take over write control |
 | `Ctrl-] c` | Release control or cancel queued input |
 | `Ctrl-] d` | Delete the newest queued LINE command |
@@ -234,6 +240,14 @@ the unsent local draft, sends only ETX without the Profile EOL, and returns the
 view to live output. It does not quit `serialctl` or release Human Control.
 In RAW mode, Ctrl-D and Ctrl-Z are ordinary raw control bytes; they do not exit
 the local console or suspend its process.
+
+The model picker is an Operator-scoped daily action inside the Console. It
+first selects reusable DUT behavior, then a concrete model under that Profile.
+`Generic` and Profile-only choices remain explicit. Adding a model records only
+bounded identity metadata and binds it atomically; it cannot change COM, baud,
+Prompt, EOL, echo, or pacing. Global Profile editing still requires the
+one-time administrator credential. The output title shows the authoritative
+model and Profile while the tab keeps the stable Slot/channel name.
 
 Mouse capture is on by default. The wheel scrolls only the serial-output
 viewport; clicking the output or input pane changes focus; output left-drag
@@ -452,6 +466,12 @@ be audited before the authoritative terminal result. See
 [Trigger Jobs](./DOCUMENTATION.md#trigger-jobs) for hard limits and terminal
 status semantics.
 
+`max_fires` is only the confirmed-action send budget. If `stop_contains` is
+configured, exhausting that budget stops additional writes but keeps the live
+RX matcher armed until a stop literal appears or the original `timeout_ms`
+expires. A confirmed Trigger TX therefore does not prove that the target
+action either succeeded or failed.
+
 `serial_command` requires a Run previously created by this `serial-mcp`
 process. Every Agent write carries that Run ID; inside the same serialized Slot
 actor that validates the control lease/fence, `seriald` rejects a missing,
@@ -495,7 +515,7 @@ execution.
 
 ## Profile adjustments
 
-Configuration has three explicit layers:
+Configuration has four explicit concepts:
 
 1. A Slot identifies the fixed station channel: stable ID, display name, and
    host port such as `COM4`.
@@ -505,10 +525,17 @@ Configuration has three explicit layers:
 3. Its optional Device Profile defines DUT-facing behavior: Shell/U-Boot prompt
    literals, command EOL, echo policy, `write_chunk_size`, and
    `write_chunk_delay_ms`.
+4. Its optional Device Model identifies the concrete DUT, such as `AS7230-W`.
+   A model references one Device Profile, so `AS7230-W` and `AS7230-F4GE` can
+   both reuse `AS7230v1` without duplicating behavior.
 
 For wire/TOML compatibility the Slot field named `profile` is the Transport
 Profile binding; `device_profile` is the optional DUT binding. `Generic` means
 no Device Profile is attached—it is a safe fallback, not a guessed model.
+Concrete model identity is stored in a separate catalog and Slot binding, so
+the stable Slot display name remains a station channel rather than a product
+name. An unset model is authoritative “not configured”; consumers must not
+guess it from boot logs.
 
 Pacing belongs to the Device Profile because it compensates for how quickly a
 DUT consumes input, not for the COM endpoint. `write_chunk_size` is the maximum
@@ -530,6 +557,13 @@ serial profile device update my-dut --interactive
 serial profile attach --slot slot-1 --transport uart-115200 --device my-dut
 serial doctor state --slot slot-1
 ```
+
+For the normal “replace the board connected to this cable” workflow, open
+`serial console` and press `Ctrl-] m`. Use arrows and Enter to choose
+`Device Profile → concrete model`; press `N` in the model list to add a new
+model label under the selected Profile. This operation uses the saved Operator
+token and never exposes the Profile behavior fields. A model/Profile switch is
+rejected while a Run or Trigger is active and does not close the COM handle.
 
 `update` changes only the fields named on the command line; `--interactive`
 walks every field while showing the existing values as defaults. Use `clone`

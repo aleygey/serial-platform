@@ -6,7 +6,7 @@
 //! current state.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs, io,
     io::Write as _,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -16,7 +16,9 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serial_protocol::{DeviceProfile, FlowControl, SlotConfig, TransportProfile};
+use serial_protocol::{
+    DeviceModel, DeviceProfile, FlowControl, SlotConfig, SlotDeviceSelection, TransportProfile,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,8 +41,11 @@ pub const DEFAULT_MONITOR_SINK_RETRY_MAX_MS: u64 = 60_000;
 /// Hard bound for both one active configuration and the number of distinct
 /// Slot identities retained during one daemon epoch.
 pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
-/// Hard bound for the device-model profile catalog.
+/// Hard bound for the reusable DUT behavior Profile catalog.
 pub const MAX_DEVICE_PROFILES: usize = 128;
+/// Hard bound for the concrete DUT model catalog. This is metadata-only and
+/// intentionally larger than the reusable behavior-profile catalog.
+pub const MAX_DEVICE_MODELS: usize = 512;
 /// Hard bound for the physical UART profile catalog.
 pub const MAX_TRANSPORT_PROFILES: usize = 128;
 
@@ -50,6 +55,8 @@ const MAX_DISPLAY_NAME_BYTES: usize = 128;
 const MAX_PORT_NAME_BYTES: usize = 512;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_PROMPT_PATTERN_BYTES: usize = 4096;
+const MAX_DEVICE_MODEL_ID_BYTES: usize = 64;
+const MAX_DEVICE_MODEL_CATEGORY_DEPTH: usize = 4;
 
 /// Files owned by one serial-platform installation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +209,13 @@ pub struct DaemonConfig {
     pub transport_profiles: Vec<TransportProfile>,
     #[serde(default)]
     pub device_profiles: Vec<DeviceProfile>,
+    /// Concrete DUT identities are separate from reusable behavior profiles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_models: Vec<DeviceModel>,
+    /// Slot-to-model identity is persisted separately from `SlotConfig`, so a
+    /// legacy full Slot replacement cannot silently erase it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_device_bindings: BTreeMap<String, String>,
 }
 
 const fn default_config_revision() -> u64 {
@@ -224,6 +238,8 @@ impl DaemonConfig {
                 slots: Vec::new(),
                 transport_profiles: Vec::new(),
                 device_profiles: Vec::new(),
+                device_models: Vec::new(),
+                slot_device_bindings: BTreeMap::new(),
             },
             credentials,
         )
@@ -247,15 +263,39 @@ impl DaemonConfig {
         self.auth.validate()?;
         validate_transport_profiles(&self.transport_profiles)?;
         validate_device_profiles(&self.device_profiles)?;
-        validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)
+        validate_device_models(&self.device_models, &self.device_profiles)?;
+        validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)?;
+        validate_slot_device_bindings(&self.slots, &self.device_models, &self.slot_device_bindings)
     }
 
     /// Replaces all Slot configuration in memory after validating the complete
     /// resulting daemon configuration.
     pub fn replace_slots(&mut self, slots: Vec<SlotConfig>) -> Result<(), ConfigValidationError> {
         let previous = std::mem::replace(&mut self.slots, slots);
+        let previous_bindings = self.slot_device_bindings.clone();
+        // A full Slot replacement predates concrete model identities. Preserve
+        // the separate binding when the caller leaves the behavior Profile
+        // unchanged. An explicit attach/detach/profile change clears only that
+        // Slot's concrete model, because the old model can no longer be claimed
+        // without creating an identity/behavior mismatch. Removed Slots are
+        // pruned as part of the same transaction.
+        let incoming_profiles = self
+            .slots
+            .iter()
+            .map(|slot| (slot.id.as_str(), slot.device_profile.as_deref()))
+            .collect::<HashMap<_, _>>();
+        let previous_profiles = previous
+            .iter()
+            .map(|slot| (slot.id.as_str(), slot.device_profile.as_deref()))
+            .collect::<HashMap<_, _>>();
+        self.slot_device_bindings.retain(|slot_id, _| {
+            incoming_profiles
+                .get(slot_id.as_str())
+                .is_some_and(|incoming| previous_profiles.get(slot_id.as_str()) == Some(incoming))
+        });
         if let Err(error) = self.validate() {
             self.slots = previous;
+            self.slot_device_bindings = previous_bindings;
             return Err(error);
         }
         Ok(())
@@ -316,6 +356,65 @@ impl DaemonConfig {
     ) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
         staged.replace_device_profiles(device_profiles)?;
+        staged.bump_revision()?;
+        Ok(staged)
+    }
+
+    /// Builds an atomic candidate for one Slot's DUT binding. Concrete models
+    /// derive their Device Profile here; clients cannot submit both values and
+    /// accidentally create an inconsistent identity/behavior pair.
+    pub fn staged_with_slot_device_binding(
+        &self,
+        slot_id: &str,
+        selection: SlotDeviceSelection,
+    ) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        let slot_index = staged
+            .slots
+            .iter()
+            .position(|slot| slot.id == slot_id)
+            .ok_or_else(|| ConfigValidationError::UnknownBindingSlot(slot_id.to_owned()))?;
+
+        match selection {
+            SlotDeviceSelection::Generic => {
+                staged.slot_device_bindings.remove(slot_id);
+                staged.slots[slot_index].device_profile = None;
+            }
+            SlotDeviceSelection::Profile { device_profile } => {
+                staged.slot_device_bindings.remove(slot_id);
+                staged.slots[slot_index].device_profile = Some(device_profile);
+            }
+            SlotDeviceSelection::Model { model_id } => {
+                let model = staged
+                    .device_models
+                    .iter()
+                    .find(|model| model.id == model_id)
+                    .ok_or_else(|| ConfigValidationError::UnknownDeviceModel(model_id.clone()))?;
+                staged.slots[slot_index].device_profile = Some(model.device_profile.clone());
+                staged
+                    .slot_device_bindings
+                    .insert(slot_id.to_owned(), model_id);
+            }
+            SlotDeviceSelection::NewModel { model } => {
+                match staged
+                    .device_models
+                    .iter()
+                    .find(|existing| existing.id == model.id)
+                {
+                    Some(existing) if existing != &model => {
+                        return Err(ConfigValidationError::DeviceModelIdConflict(model.id));
+                    }
+                    Some(_) => {}
+                    None => staged.device_models.push(model.clone()),
+                }
+                staged.slots[slot_index].device_profile = Some(model.device_profile.clone());
+                staged
+                    .slot_device_bindings
+                    .insert(slot_id.to_owned(), model.id);
+            }
+        }
+
+        staged.validate()?;
         staged.bump_revision()?;
         Ok(staged)
     }
@@ -580,6 +679,35 @@ pub enum ConfigValidationError {
     DuplicateDeviceProfileName { first: usize, second: usize },
     #[error("configuration contains {actual} device profiles; the maximum is {limit}")]
     TooManyDeviceProfiles { actual: usize, limit: usize },
+    #[error("device model at index {index} has invalid field {field}: {reason}")]
+    InvalidDeviceModel {
+        index: usize,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("device models at indexes {first} and {second} use the same id")]
+    DuplicateDeviceModelId { first: usize, second: usize },
+    #[error("configuration contains {actual} device models; the maximum is {limit}")]
+    TooManyDeviceModels { actual: usize, limit: usize },
+    #[error("device model {model_id:?} references unknown device profile {profile:?}")]
+    UnknownDeviceModelProfile { model_id: String, profile: String },
+    #[error("device model id {0:?} already exists with different metadata")]
+    DeviceModelIdConflict(String),
+    #[error("unknown device model {0:?}")]
+    UnknownDeviceModel(String),
+    #[error("Slot {0:?} does not exist")]
+    UnknownBindingSlot(String),
+    #[error("Slot {slot_id:?} is bound to unknown device model {model_id:?}")]
+    UnknownBoundDeviceModel { slot_id: String, model_id: String },
+    #[error(
+        "Slot {slot_id:?} binds model {model_id:?}, which requires device profile {expected:?}, not {actual:?}"
+    )]
+    DeviceModelProfileMismatch {
+        slot_id: String,
+        model_id: String,
+        expected: String,
+        actual: Option<String>,
+    },
     #[error("transport profile at index {index} has invalid field {field}: {reason}")]
     InvalidTransportProfile {
         index: usize,
@@ -861,6 +989,114 @@ pub(crate) fn validate_device_profiles(
                 index,
                 field: "write_chunk_delay_ms",
                 reason: "must not exceed 10000 ms",
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_device_models(
+    models: &[DeviceModel],
+    device_profiles: &[DeviceProfile],
+) -> Result<(), ConfigValidationError> {
+    if models.len() > MAX_DEVICE_MODELS {
+        return Err(ConfigValidationError::TooManyDeviceModels {
+            actual: models.len(),
+            limit: MAX_DEVICE_MODELS,
+        });
+    }
+    let mut ids: HashMap<&str, usize> = HashMap::new();
+    for (index, model) in models.iter().enumerate() {
+        let valid_id = !model.id.is_empty()
+            && model.id.len() <= MAX_DEVICE_MODEL_ID_BYTES
+            && model
+                .id
+                .bytes()
+                .enumerate()
+                .all(|(position, byte)| match byte {
+                    b'a'..=b'z' | b'0'..=b'9' => true,
+                    b'-' | b'_' => position > 0,
+                    _ => false,
+                });
+        if !valid_id {
+            return Err(ConfigValidationError::InvalidDeviceModel {
+                index,
+                field: "id",
+                reason: "use 1-64 lowercase ASCII letters, digits, '-' or '_'",
+            });
+        }
+        if let Some(first) = ids.insert(&model.id, index) {
+            return Err(ConfigValidationError::DuplicateDeviceModelId {
+                first,
+                second: index,
+            });
+        }
+        if model.display_name.is_empty()
+            || model.display_name.len() > MAX_DISPLAY_NAME_BYTES
+            || model.display_name != model.display_name.trim()
+            || model.display_name.chars().any(char::is_control)
+        {
+            return Err(ConfigValidationError::InvalidDeviceModel {
+                index,
+                field: "display_name",
+                reason: "must be a non-empty, trimmed value of at most 128 bytes",
+            });
+        }
+        if model.category_path.len() > MAX_DEVICE_MODEL_CATEGORY_DEPTH {
+            return Err(ConfigValidationError::InvalidDeviceModel {
+                index,
+                field: "category_path",
+                reason: "must contain at most 4 segments",
+            });
+        }
+        if model.category_path.iter().any(|segment| {
+            segment.is_empty()
+                || segment.len() > MAX_PROFILE_NAME_BYTES
+                || segment != segment.trim()
+                || segment.chars().any(char::is_control)
+        }) {
+            return Err(ConfigValidationError::InvalidDeviceModel {
+                index,
+                field: "category_path",
+                reason: "segments must be non-empty, trimmed values of at most 64 bytes",
+            });
+        }
+        if !device_profiles
+            .iter()
+            .any(|profile| profile.name == model.device_profile)
+        {
+            return Err(ConfigValidationError::UnknownDeviceModelProfile {
+                model_id: model.id.clone(),
+                profile: model.device_profile.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_slot_device_bindings(
+    slots: &[SlotConfig],
+    models: &[DeviceModel],
+    bindings: &BTreeMap<String, String>,
+) -> Result<(), ConfigValidationError> {
+    for (slot_id, model_id) in bindings {
+        let slot = slots
+            .iter()
+            .find(|slot| slot.id == *slot_id)
+            .ok_or_else(|| ConfigValidationError::UnknownBindingSlot(slot_id.clone()))?;
+        let model = models
+            .iter()
+            .find(|model| model.id == *model_id)
+            .ok_or_else(|| ConfigValidationError::UnknownBoundDeviceModel {
+                slot_id: slot_id.clone(),
+                model_id: model_id.clone(),
+            })?;
+        if slot.device_profile.as_deref() != Some(model.device_profile.as_str()) {
+            return Err(ConfigValidationError::DeviceModelProfileMismatch {
+                slot_id: slot_id.clone(),
+                model_id: model_id.clone(),
+                expected: model.device_profile.clone(),
+                actual: slot.device_profile.clone(),
             });
         }
     }
@@ -1155,6 +1391,15 @@ mod tests {
             echo: None,
             write_chunk_size: None,
             write_chunk_delay_ms: None,
+        }
+    }
+
+    fn device_model(id: &str, display_name: &str, profile: &str) -> DeviceModel {
+        DeviceModel {
+            id: id.to_owned(),
+            display_name: display_name.to_owned(),
+            category_path: vec!["AS7230".to_owned()],
+            device_profile: profile.to_owned(),
         }
     }
 
@@ -1581,6 +1826,139 @@ mod tests {
     }
 
     #[test]
+    fn concrete_model_binding_derives_profile_and_round_trips_separately() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let (mut config, _) = DaemonConfig::generate();
+        config.slots = vec![slot("slot-1", "COM3")];
+        config.device_profiles = vec![device_profile("as7230-v1")];
+
+        let model = device_model("as7230-w", "AS7230-W", "as7230-v1");
+        let staged = config
+            .staged_with_slot_device_binding(
+                "slot-1",
+                SlotDeviceSelection::NewModel {
+                    model: model.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(staged.slots[0].device_profile.as_deref(), Some("as7230-v1"));
+        assert_eq!(
+            staged
+                .slot_device_bindings
+                .get("slot-1")
+                .map(String::as_str),
+            Some("as7230-w")
+        );
+        assert_eq!(staged.device_models, vec![model]);
+        assert_eq!(staged.config_revision, config.config_revision + 1);
+
+        store.save(&staged).unwrap();
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.device_models, staged.device_models);
+        assert_eq!(reloaded.slot_device_bindings, staged.slot_device_bindings);
+    }
+
+    #[test]
+    fn full_slot_replacement_preserves_only_unchanged_model_bindings() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.slots = vec![slot("slot-1", "COM3")];
+        config.device_profiles = vec![device_profile("as7230-v1")];
+        config = config
+            .staged_with_slot_device_binding(
+                "slot-1",
+                SlotDeviceSelection::NewModel {
+                    model: device_model("as7230-w", "AS7230-W", "as7230-v1"),
+                },
+            )
+            .unwrap();
+
+        let unchanged = config.slots.clone();
+        let preserved = config.staged_with_slots(unchanged).unwrap();
+        assert_eq!(
+            preserved
+                .slot_device_bindings
+                .get("slot-1")
+                .map(String::as_str),
+            Some("as7230-w")
+        );
+
+        let mut detached = config.slots.clone();
+        detached[0].device_profile = None;
+        let detached = config.staged_with_slots(detached).unwrap();
+        assert!(detached.slot_device_bindings.is_empty());
+        assert_eq!(detached.slots[0].device_profile, None);
+
+        let removed = config.staged_with_slots(Vec::new()).unwrap();
+        assert!(removed.slot_device_bindings.is_empty());
+
+        let mut manually_mismatched = config;
+        manually_mismatched.slots[0].device_profile = None;
+        assert!(matches!(
+            manually_mismatched.validate(),
+            Err(ConfigValidationError::DeviceModelProfileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn device_model_catalog_rejects_invalid_or_mismatched_metadata() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.device_profiles = vec![device_profile("as7230-v1")];
+
+        config.device_models = vec![device_model(" padded ", "AS7230-W", "as7230-v1")];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceModel { field: "id", .. })
+        ));
+
+        config.device_models = vec![device_model("as7230-w", "AS7230-W", "missing")];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::UnknownDeviceModelProfile { .. })
+        ));
+
+        let mut invalid_category = device_model("as7230-w", "AS7230-W", "as7230-v1");
+        invalid_category.category_path = vec!["bad\ncategory".into()];
+        config.device_models = vec![invalid_category];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::InvalidDeviceModel {
+                field: "category_path",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn new_model_id_is_idempotent_only_for_identical_metadata() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.slots = vec![slot("slot-1", "COM3")];
+        config.device_profiles = vec![device_profile("as7230-v1")];
+        let model = device_model("as7230-w", "AS7230-W", "as7230-v1");
+        config.device_models = vec![model.clone()];
+
+        let rebound = config
+            .staged_with_slot_device_binding(
+                "slot-1",
+                SlotDeviceSelection::NewModel {
+                    model: model.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(rebound.device_models, vec![model.clone()]);
+
+        let mut conflicting = model;
+        conflicting.display_name = "AS7230-F4GE".into();
+        assert!(matches!(
+            config.staged_with_slot_device_binding(
+                "slot-1",
+                SlotDeviceSelection::NewModel { model: conflicting }
+            ),
+            Err(ConfigValidationError::DeviceModelIdConflict(_))
+        ));
+    }
+
+    #[test]
     fn legacy_toml_without_revision_or_profile_catalogs_uses_safe_defaults() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
@@ -1604,6 +1982,8 @@ mod tests {
         assert_eq!(reloaded.config_revision, 1);
         assert!(reloaded.transport_profiles.is_empty());
         assert!(reloaded.device_profiles.is_empty());
+        assert!(reloaded.device_models.is_empty());
+        assert!(reloaded.slot_device_bindings.is_empty());
         assert_eq!(reloaded.server_id, loaded.config.server_id);
     }
 

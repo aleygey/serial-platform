@@ -22,7 +22,7 @@ command argument. For setup automation, use `--admin-token-file` and
 destination. Setup rejects global `--token-file` and refuses input/output path
 aliases so it cannot overwrite a supplied credential.
 
-Use every component from the same release. v0.5.0 retains WebSocket protocol v3
+Use every component from the same release. v0.5.1 retains WebSocket protocol v3
 from v0.4.0; the existing realtime surface is wire-compatible with v0.4, while
 the Monitor HTTP APIs and MCP tools require v0.5 components. Protocol-v2 builds
 from 0.3.x and protocol-v1 builds from 0.2.x are not compatible with v3.
@@ -54,7 +54,7 @@ or closing the stdio MCP process does not stop them.
 
 | Tool | Required inputs | Optional inputs | Purpose |
 |---|---|---|---|
-| `devices` | — | `slot_id` | Authoritative Slot, Profile, state, ownership, Run, Trigger, and cursor head |
+| `devices` | — | `slot_id` | Authoritative Slot, concrete Device Model, Profile, state, ownership, Run, Trigger, and cursor head |
 | `read` | `slot_id` | `scope=tail|continue|archive`, archive `epoch`/`after_seq` | Bounded retained text and continuation cursor |
 | `command` | `slot_id`, `command` | one of `expect`/`regex`, `timeout_seconds` | Append effective EOL, write in the owned Run, capture post-TX RX |
 | `input` | `slot_id`, `text` | — | Exact UTF-8 bytes with no EOL |
@@ -259,9 +259,16 @@ tool call:
 
 The daemon arms live literal matchers before the optional one-time `kickoff`,
 then sends one `action` at a time. `start_contains` can gate the first action;
-any `stop_contains` literal, timeout, or fire limit ends scheduling. Pacing and
+any `stop_contains` literal or timeout ends observation; the fire limit ends
+only further scheduling. Pacing and
 physical-write time are additional to `interval_ms`; missed ticks never create
 a catch-up burst.
+
+When `stop_contains` is configured, reaching `max_fires` leaves the RX matcher
+armed until a literal matches or the original timeout expires. The result
+reports both the fire budget and whether it was exhausted. Confirmed TX is only
+transport evidence, so an Agent must inspect subsequent RX/state instead of
+blindly retrying.
 
 Every kickoff/action uses the ordinary confirmed, fenced, Run-bound, audited
 write path and inherits effective Device Profile pacing. The MCP schema exposes

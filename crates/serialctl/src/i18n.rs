@@ -176,6 +176,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "  Ctrl-] v                 紧凑/详细时间线",
     ),
     (
+        "help.device",
+        "  Ctrl-] m                 select DUT Profile / concrete model",
+        "  Ctrl-] m                 选择 DUT Profile / 具体机型",
+    ),
+    (
         "help.lang",
         "  Ctrl-] g                 switch language (中文/EN)",
         "  Ctrl-] g                 切换语言 (中文/EN)",
@@ -303,6 +308,56 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // ---- Status messages ----
     ("st.connecting", "connecting…", "连接中…"),
     ("st.viewing", "viewing {} ({})", "正在查看 {}({})"),
+    (
+        "st.device.unavailable",
+        "DUT Profile/model manager is unavailable",
+        "DUT Profile/机型管理不可用",
+    ),
+    (
+        "st.device.loading",
+        "loading DUT Profile and model catalog…",
+        "正在加载 DUT Profile 与机型目录…",
+    ),
+    (
+        "st.device.catalog.changed",
+        "the Profile/model catalog changed while it was loading; retry",
+        "加载期间 Profile/机型目录已变化；请重试",
+    ),
+    (
+        "st.device.queue.failed",
+        "cannot queue DUT configuration request: {}",
+        "无法提交 DUT 配置请求：{}",
+    ),
+    (
+        "st.device.saving",
+        "saving DUT Profile/model binding…",
+        "正在保存 DUT Profile/机型绑定…",
+    ),
+    (
+        "st.device.saving.wait",
+        "DUT Profile/model binding is still being saved",
+        "DUT Profile/机型绑定仍在保存中",
+    ),
+    (
+        "st.device.ready",
+        "select a DUT Profile and concrete model",
+        "请选择 DUT Profile 与具体机型",
+    ),
+    (
+        "st.device.saved",
+        "{} DUT Profile/model binding saved",
+        "{} 的 DUT Profile/机型绑定已保存",
+    ),
+    (
+        "st.device.failed",
+        "DUT Profile/model operation failed: {}",
+        "DUT Profile/机型操作失败：{}",
+    ),
+    (
+        "st.device.paste.ignored",
+        "paste is disabled while the DUT picker is open",
+        "DUT 选择器打开时不接受粘贴",
+    ),
     (
         "st.transport",
         "transport connected; authenticating and attaching all Slots",
@@ -516,8 +571,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.prefix.hint",
-        "command prefix: 1-9 Slot, l/r mode, PgUp/PgDn scroll, t takeover, d/e queued delete/edit, c release/cancel, ? help",
-        "命令前缀: 1-9 Slot, l/r 模式, PgUp/PgDn 滚动, t 接管, d/e 删除/编辑排队命令, c 释放/取消, ? 帮助",
+        "command prefix: 1-9 Slot, l/r mode, m DUT, PgUp/PgDn scroll, t takeover, d/e queued delete/edit, c release/cancel, ? help",
+        "命令前缀: 1-9 Slot, l/r 模式, m DUT, PgUp/PgDn 滚动, t 接管, d/e 删除/编辑排队命令, c 释放/取消, ? 帮助",
     ),
     (
         "st.line.mode",
@@ -641,6 +696,102 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "BREAK confirmed at sequence {}",
         "串口 BREAK 已确认，序号 {}",
     ),
+    // ---- DUT Profile/model picker ----
+    ("device.identity.generic", "Generic", "通用配置"),
+    ("device.identity.profile", "Profile [{}]", "Profile [{}]"),
+    (
+        "device.picker.title",
+        " DUT Profile / concrete model ",
+        " DUT Profile / 具体机型 ",
+    ),
+    (
+        "device.picker.title.saving",
+        " Saving DUT binding… ",
+        " 正在保存 DUT 绑定… ",
+    ),
+    ("device.picker.slot", "Slot: {}", "Slot：{}"),
+    ("device.picker.current", "Current: {}", "当前：{}"),
+    (
+        "device.picker.current.model",
+        "{}  [Profile: {}]",
+        "{}  [Profile：{}]",
+    ),
+    ("device.picker.current.suffix", "  (current)", "  (当前)"),
+    (
+        "device.picker.stage.profiles",
+        "1/2  Select behavior Profile",
+        "1/2  选择行为 Profile",
+    ),
+    (
+        "device.picker.stage.models",
+        "2/2  Select concrete DUT model",
+        "2/2  选择具体 DUT 机型",
+    ),
+    (
+        "device.picker.stage.new",
+        "New concrete DUT model name",
+        "新增具体 DUT 机型名",
+    ),
+    (
+        "device.picker.generic",
+        "Generic (no DUT Profile)",
+        "通用配置(不绑定 DUT Profile)",
+    ),
+    (
+        "device.picker.profile.only",
+        "Use this Profile only (model unknown)",
+        "仅使用此 Profile(具体机型未知)",
+    ),
+    (
+        "device.picker.add.model",
+        "+ Add and bind a concrete model…",
+        "+ 新增并绑定具体机型…",
+    ),
+    (
+        "device.picker.hint.profiles",
+        "↑/↓ select · Enter/→ next · Esc close",
+        "↑/↓ 选择 · Enter/→ 下一步 · Esc 关闭",
+    ),
+    (
+        "device.picker.hint.models",
+        "↑/↓ select · Enter bind · N add · ← back · Esc back",
+        "↑/↓ 选择 · Enter 绑定 · N 新增 · ←/Esc 返回",
+    ),
+    (
+        "device.picker.hint.new",
+        "Enter create and bind · Esc back",
+        "Enter 创建并绑定 · Esc 返回",
+    ),
+    (
+        "device.picker.loading",
+        "Loading the authoritative catalog from seriald…",
+        "正在从 seriald 加载权威目录…",
+    ),
+    (
+        "device.picker.hint.loading",
+        "Esc closes this picker",
+        "Esc 关闭选择器",
+    ),
+    (
+        "device.picker.hint.error",
+        "Enter/R reloads · Esc closes",
+        "Enter/R 重新加载 · Esc 关闭",
+    ),
+    (
+        "device.picker.saving",
+        "Saving atomically; input is temporarily disabled…",
+        "正在原子保存；暂时禁用输入…",
+    ),
+    (
+        "device.picker.name.required",
+        "model name cannot be empty",
+        "机型名不能为空",
+    ),
+    (
+        "device.picker.name.long",
+        "model name exceeds 128 UTF-8 bytes",
+        "机型名超过 128 个 UTF-8 字节",
+    ),
     // ---- display.rs labels ----
     ("d.dev", "DEV", "设备"),
     ("d.tx", "TX>", "发送>"),
@@ -705,6 +856,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "seriald {}  epoch {}  {} Slot(s)",
         "seriald {}  epoch {}  {} 个 Slot",
     ),
+    ("m.status.device", "  device: {} [{}]", "  设备：{} [{}]"),
     ("m.status.control", "control: {}", "控制: {}"),
     ("m.status.reason", "  reason: {}", "  原因: {}"),
     (

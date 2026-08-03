@@ -36,6 +36,8 @@ primitives.
   retained by v0.5.
 - **Released in v0.5.0**: persistent serial Monitor Jobs and their additive
   MCP/notification surfaces.
+- **Released in v0.5.1**: concrete DUT model bindings, in-console model
+  selection, and Trigger send-budget/observation separation.
 - **Next**: practical validation or refinement work, not yet complete.
 - **Later / candidate**: retained options with no delivery promise.
 
@@ -110,8 +112,25 @@ primitives.
   protocol-v3 v0.4 peers remain wire-compatible for existing realtime features;
   Monitor use requires v0.5 seriald and adapter components.
 
+### Released in v0.5.1
+
+- A concrete Device Model catalog is separate from reusable Device Profiles.
+  Multiple marketed models can share one firmware/behavior Profile, while each
+  Slot exposes the actual connected model to human and Agent consumers.
+- Operator-scoped Slot model binding derives the owning Device Profile on the
+  server, uses optimistic configuration revisions, and changes metadata and
+  DUT behavior without reopening an unchanged UART transport.
+- Model/Profile changes are rejected while a Run or Trigger is active, and
+  configuration staging, persistence, actor commit, and rollback remain atomic.
+- Trigger `max_fires` is now only the confirmed-action send budget. A configured
+  stop matcher remains armed after the final write until it matches or the
+  original deadline expires, including matches split across RX chunks.
+
 ### Next
 
+- Run the concrete Device Model binding matrix on real stations: Profile/model
+  reuse, revision conflicts, active Run/Trigger rejection, legacy full-Slot
+  updates, and model-only changes without a COM reopen.
 - Exercise Monitor restart, replay-gap, burst grouping, regex-boundary,
   incident/outbox-capacity, sink outage/recovery, duplicate delivery, and TTL
   expiry paths against sustained real 115200-baud output.
@@ -198,8 +217,21 @@ primitives.
   while preserving the existing console workflow. The first Monitor release
   does not add Monitor policy or message-center routing to the human TUI.
 
+### Released in v0.5.1
+
+- `Ctrl-] m` opens a non-blocking Profile → model picker for the selected Slot.
+  Arrow keys choose an existing concrete model and `N` adds a metadata-only
+  model under the selected behavior Profile.
+- The output title and status/diagnostic surfaces show the actual model and its
+  shared Profile without replacing the stable Slot/station-channel name.
+- Picker HTTP requests are generation-scoped and cannot overwrite newer
+  WebSocket state when responses arrive out of order.
+
 ### Next
 
+- Validate the released `Ctrl-] m` picker, metadata-only model creation,
+  keyboard navigation, stale-revision recovery, and model title projection on
+  Windows and Ubuntu terminals with real DUT swaps.
 - Validate selection, wrapped/wide-character rows, high-rate output, queued
   editing, and Run boundaries in Windows Terminal and the Ubuntu station.
 - Improve Profile setup prompts from first-time user feedback while preserving
@@ -210,6 +242,9 @@ primitives.
 
 ### Later / candidate
 
+- Versioned Device Model catalog import/export, global rename/delete, and
+  incremental picker search if real stations grow beyond arrow-friendly lists.
+  Daily Console binding remains separate from global catalog administration.
 - Export a selected sequence/time range as text plus authoritative metadata.
 - Saved coloring themes and user rules with safe precedence over built-ins.
 - A richer native OpenChamber serial panel that reuses the protocol/state
@@ -277,7 +312,18 @@ primitives.
   optional CloudEvents sink is configured, an external message center can
   initiate a new Agent turn while MCP remains the recovery/audit path.
 
+### Released in v0.5.1
+
+- `devices` projects the authoritative concrete Device Model, category path,
+  and shared behavior Profile without adding routine Agent parameters.
+- Trigger schemas and terminal guidance explicitly distinguish the action send
+  budget from the subsequent RX observation window, preventing a late U-Boot
+  prompt from being misreported as failure after the final write.
+
 ### Next
+
+- Validate the released Device Model projection and Trigger late-stop guidance
+  against several MCP hosts/models and real boot-interruption windows.
 
 - Add real OpenCode/Codex regression scenarios where a Monitor outlives the
   initiating turn, then verify pull-only recovery and Agent Message Center push

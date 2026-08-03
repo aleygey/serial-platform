@@ -5,8 +5,8 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceProfile, Direction,
-    ErrorCode, EventKind, FlowControl, LoggingState, MAX_BREAK_DURATION_MS,
+    Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceModel, DeviceProfile,
+    Direction, ErrorCode, EventKind, FlowControl, LoggingState, MAX_BREAK_DURATION_MS,
     MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
     MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
     MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
@@ -218,7 +218,7 @@ pub enum SlotError {
     BreakUnsupported,
     #[error("UART BREAK failed and the physical port state is uncertain: {message}")]
     BreakFailed { message: String },
-    #[error("device profile cannot change while a Run or Trigger Job is active")]
+    #[error("device identity or profile cannot change while a Run or Trigger Job is active")]
     ProfileChangeBusy,
 }
 
@@ -229,10 +229,12 @@ impl From<ReplayError> for SlotError {
 }
 
 impl SlotHandle {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
@@ -242,6 +244,7 @@ impl SlotHandle {
             config,
             transport_profile,
             device_profile,
+            device_model,
             control_limits,
             daemon_epoch,
             daemon_started,
@@ -252,10 +255,12 @@ impl SlotHandle {
 
     /// Creates a candidate Slot actor that cannot open its port until the
     /// surrounding configuration transaction has been persisted and commits.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_staged(
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
@@ -265,6 +270,7 @@ impl SlotHandle {
             config,
             transport_profile,
             device_profile,
+            device_model,
             control_limits,
             daemon_epoch,
             daemon_started,
@@ -278,6 +284,7 @@ impl SlotHandle {
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
@@ -288,6 +295,7 @@ impl SlotHandle {
             config.clone(),
             transport_profile.clone(),
             device_profile.clone(),
+            device_model.clone(),
             daemon_epoch,
             staged,
         );
@@ -311,6 +319,7 @@ impl SlotHandle {
                 config,
                 transport_profile,
                 device_profile,
+                device_model,
                 daemon_epoch,
                 daemon_started,
                 journal,
@@ -678,6 +687,7 @@ impl SlotHandle {
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
         let (reply, result) = oneshot::channel();
@@ -686,6 +696,7 @@ impl SlotHandle {
                 config: Box::new(config),
                 transport_profile,
                 device_profile,
+                device_model,
                 resume_on_rollback,
                 reply,
             })
@@ -876,6 +887,7 @@ enum SlotCommand {
         config: Box<SlotConfig>,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
@@ -1135,6 +1147,55 @@ impl ActiveTrigger {
     fn status_snapshot(&self) -> TriggerInfo {
         self.info.clone()
     }
+
+    fn observe_rx(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if let Some(matched) = self.stop_matcher.push(data) {
+            return Some(matched);
+        }
+        if !self.start_seen
+            && self
+                .start_matcher
+                .as_mut()
+                .is_some_and(|matcher| matcher.push(data).is_some())
+        {
+            self.start_seen = true;
+            self.start_matcher = None;
+            if !self.initial_pending && self.pending_terminal.is_none() {
+                self.info.status = TriggerStatus::Running;
+                self.next_write_at = Some(Instant::now());
+            }
+        }
+        None
+    }
+
+    fn deadline_status(&self) -> TriggerStatus {
+        if self.info.fires_confirmed >= self.info.spec.max_fires {
+            TriggerStatus::MaxFiresReached
+        } else {
+            TriggerStatus::TimedOut
+        }
+    }
+
+    /// Records one fully-confirmed action write. Reaching the send budget is
+    /// not necessarily terminal: when a stop matcher exists, the Trigger keeps
+    /// observing RX until its original deadline so output caused by the final
+    /// write can still prove completion.
+    fn confirm_action_write(&mut self, now: Instant) -> Option<TriggerStatus> {
+        self.info.fires_confirmed = self.info.fires_confirmed.saturating_add(1);
+        if self.info.fires_confirmed < self.info.spec.max_fires {
+            if self.pending_terminal.is_none() {
+                self.next_write_at = Some(now + Duration::from_millis(self.info.spec.interval_ms));
+            }
+            return None;
+        }
+
+        self.next_write_at = None;
+        self.info
+            .spec
+            .stop_contains
+            .is_empty()
+            .then_some(TriggerStatus::MaxFiresReached)
+    }
 }
 
 #[derive(Default)]
@@ -1164,6 +1225,7 @@ enum PendingReconfiguration {
         config: Box<SlotConfig>,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         resume_on_rollback: bool,
         reopened: bool,
     },
@@ -1180,6 +1242,7 @@ struct SlotActor {
     config: SlotConfig,
     transport_profile: Option<TransportProfile>,
     device_profile: Option<DeviceProfile>,
+    device_model: Option<DeviceModel>,
     daemon_epoch: Uuid,
     daemon_started: Instant,
     journal: JournalHandle,
@@ -1549,6 +1612,7 @@ impl SlotActor {
                 config,
                 transport_profile,
                 device_profile,
+                device_model,
                 resume_on_rollback,
                 reply,
             } => {
@@ -1557,6 +1621,7 @@ impl SlotActor {
                         *config,
                         transport_profile,
                         device_profile,
+                        device_model,
                         resume_on_rollback,
                     )
                     .await;
@@ -2266,24 +2331,7 @@ impl SlotActor {
     }
 
     fn observe_trigger_rx(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        let trigger = self.active_trigger.as_mut()?;
-        if let Some(matched) = trigger.stop_matcher.push(data) {
-            return Some(matched);
-        }
-        if !trigger.start_seen
-            && trigger
-                .start_matcher
-                .as_mut()
-                .is_some_and(|matcher| matcher.push(data).is_some())
-        {
-            trigger.start_seen = true;
-            trigger.start_matcher = None;
-            if !trigger.initial_pending && trigger.pending_terminal.is_none() {
-                trigger.info.status = TriggerStatus::Running;
-                trigger.next_write_at = Some(Instant::now());
-            }
-        }
-        None
+        self.active_trigger.as_mut()?.observe_rx(data)
     }
 
     fn trigger_write_is_due(&self) -> bool {
@@ -2362,8 +2410,8 @@ impl SlotActor {
             return false;
         }
         if Instant::now() >= trigger.deadline {
-            self.request_trigger_stop(TriggerStatus::TimedOut, None)
-                .await;
+            let status = trigger.deadline_status();
+            self.request_trigger_stop(status, None).await;
             return false;
         }
         if self.trigger_write_is_due() {
@@ -2373,13 +2421,10 @@ impl SlotActor {
     }
 
     async fn begin_trigger_write(&mut self) {
-        if self
-            .active_trigger
-            .as_ref()
-            .is_some_and(|trigger| Instant::now() >= trigger.deadline)
-        {
-            self.request_trigger_stop(TriggerStatus::TimedOut, None)
-                .await;
+        if let Some(status) = self.active_trigger.as_ref().and_then(|trigger| {
+            (Instant::now() >= trigger.deadline).then(|| trigger.deadline_status())
+        }) {
+            self.request_trigger_stop(status, None).await;
             return;
         }
         let Some(trigger) = self.active_trigger.as_ref() else {
@@ -2446,8 +2491,15 @@ impl SlotActor {
                 return;
             }
             if trigger.info.fires_confirmed >= trigger.info.spec.max_fires {
-                self.request_trigger_stop(TriggerStatus::MaxFiresReached, None)
-                    .await;
+                if trigger.info.spec.stop_contains.is_empty() {
+                    self.request_trigger_stop(TriggerStatus::MaxFiresReached, None)
+                        .await;
+                } else if let Some(trigger) = self.active_trigger.as_mut() {
+                    // Defensive repair for any stale schedule: after the send
+                    // budget is exhausted, only the original deadline and RX
+                    // matcher can wake this Trigger.
+                    trigger.next_write_at = None;
+                }
                 return;
             }
             (
@@ -2491,8 +2543,11 @@ impl SlotActor {
         // bounded, but the deadline is authoritative at the final enqueue
         // boundary too: no new physical write may start after it.
         if Instant::now() >= trigger_deadline {
-            self.request_trigger_stop(TriggerStatus::TimedOut, None)
-                .await;
+            let status = self
+                .active_trigger
+                .as_ref()
+                .map_or(TriggerStatus::TimedOut, ActiveTrigger::deadline_status);
+            self.request_trigger_stop(status, None).await;
             return;
         }
 
@@ -2616,7 +2671,7 @@ impl SlotActor {
         let full_write = written == result.data.len() && write_error.is_none();
         if full_write {
             let now = Instant::now();
-            let reached_max_fires = match result.kind {
+            let terminal_status = match result.kind {
                 TriggerWriteKind::Initial => {
                     let trigger = self.active_trigger.as_mut().expect("checked above");
                     trigger.initial_pending = false;
@@ -2629,21 +2684,15 @@ impl SlotActor {
                             trigger.next_write_at = None;
                         }
                     }
-                    false
+                    None
                 }
                 TriggerWriteKind::Action { .. } => {
                     let trigger = self.active_trigger.as_mut().expect("checked above");
-                    trigger.info.fires_confirmed = trigger.info.fires_confirmed.saturating_add(1);
-                    let reached_max = trigger.info.fires_confirmed >= trigger.info.spec.max_fires;
-                    if !reached_max && trigger.pending_terminal.is_none() {
-                        trigger.next_write_at =
-                            Some(now + Duration::from_millis(trigger.info.spec.interval_ms));
-                    }
-                    reached_max
+                    trigger.confirm_action_write(now)
                 }
             };
-            if reached_max_fires {
-                self.mark_trigger_stopping(TriggerStatus::MaxFiresReached, None);
+            if let Some(status) = terminal_status {
+                self.mark_trigger_stopping(status, None);
             }
         } else {
             self.mark_trigger_stopping(TriggerStatus::WriteFailed, None);
@@ -3054,6 +3103,7 @@ impl SlotActor {
         let effective_settings = self.effective_serial_settings();
         self.snapshot.send_replace(SlotSnapshot {
             config: self.config.clone(),
+            device_model: self.device_model.clone(),
             daemon_epoch: self.daemon_epoch,
             head_seq: self.seq,
             ring_oldest_seq: oldest,
@@ -3148,6 +3198,7 @@ impl SlotActor {
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
         if config.id != self.config.id {
@@ -3165,6 +3216,7 @@ impl SlotActor {
             || self.config.enabled != config.enabled
             || previous_transport != next_transport;
         let device_changed = self.device_profile != device_profile
+            || self.device_model != device_model
             || self.config.device_profile != config.device_profile
             || previous_device != next_device;
         if profile_change_requires_idle(
@@ -3182,6 +3234,7 @@ impl SlotActor {
             config: Box::new(config),
             transport_profile,
             device_profile,
+            device_model,
             resume_on_rollback,
             reopened,
         });
@@ -3225,6 +3278,7 @@ impl SlotActor {
                 config,
                 transport_profile,
                 device_profile,
+                device_model,
                 reopened,
                 ..
             } => {
@@ -3232,6 +3286,7 @@ impl SlotActor {
                     *config,
                     transport_profile,
                     device_profile,
+                    device_model,
                     reopened,
                 )
                 .await;
@@ -3331,6 +3386,7 @@ impl SlotActor {
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         reopened: bool,
     ) {
         let previous_effective =
@@ -3338,6 +3394,7 @@ impl SlotActor {
         let previous_transport =
             resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
         let previous = std::mem::replace(&mut self.config, config);
+        let previous_device_model = std::mem::replace(&mut self.device_model, device_model);
         self.transport_profile = transport_profile;
         self.device_profile = device_profile;
         if reopened {
@@ -3370,6 +3427,14 @@ impl SlotActor {
                             .map(|profile| profile.name.as_str()),
                     )
                     .unwrap_or(Value::Null),
+                ),
+                (
+                    "previous_device_model",
+                    serde_json::to_value(previous_device_model).unwrap_or(Value::Null),
+                ),
+                (
+                    "device_model",
+                    serde_json::to_value(&self.device_model).unwrap_or(Value::Null),
                 ),
                 (
                     "previous_effective",
@@ -4073,6 +4138,7 @@ enum CommandDisposition {
         config: Box<SlotConfig>,
         transport_profile: Option<TransportProfile>,
         device_profile: Option<DeviceProfile>,
+        device_model: Option<DeviceModel>,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
@@ -4321,12 +4387,14 @@ impl SlotCommand {
                 config,
                 transport_profile,
                 device_profile,
+                device_model,
                 resume_on_rollback,
                 reply,
             } => CommandDisposition::StageReconfiguration {
                 config,
                 transport_profile,
                 device_profile,
+                device_model,
                 resume_on_rollback,
                 reply,
             },
@@ -4353,6 +4421,7 @@ fn initial_snapshot(
     config: SlotConfig,
     transport_profile: Option<TransportProfile>,
     device_profile: Option<DeviceProfile>,
+    device_model: Option<DeviceModel>,
     daemon_epoch: Uuid,
     staged: bool,
 ) -> SlotSnapshot {
@@ -4369,6 +4438,7 @@ fn initial_snapshot(
     let transport = resolve_transport_settings(&config.settings, transport_profile.as_ref());
     SlotSnapshot {
         config,
+        device_model,
         daemon_epoch,
         head_seq: 0,
         ring_oldest_seq: None,
@@ -5725,6 +5795,93 @@ mod tests {
             max_fires: 250,
             pacing: None,
         }
+    }
+
+    fn active_trigger_for_test(spec: TriggerSpec, now: Instant) -> ActiveTrigger {
+        let stop_matcher = LiteralMatcher::new(spec.stop_contains.clone());
+        ActiveTrigger {
+            info: TriggerInfo {
+                id: Uuid::new_v4(),
+                owner: Actor {
+                    id: "agent:test".into(),
+                    label: "test".into(),
+                    kind: ActorKind::Agent,
+                },
+                daemon_epoch: Uuid::new_v4(),
+                generation: 1,
+                control_id: Uuid::new_v4(),
+                fence: 1,
+                operation_id: None,
+                expected_run_id: None,
+                spec,
+                status: TriggerStatus::Running,
+                start_seq: 1,
+                end_seq: None,
+                last_write_seq: None,
+                fires_confirmed: 0,
+                tx_bytes_confirmed: 0,
+                matched_pattern: None,
+            },
+            bound_run_id: None,
+            deadline: now + Duration::from_secs(5),
+            next_write_at: Some(now),
+            initial_pending: false,
+            start_seen: true,
+            start_matcher: None,
+            stop_matcher,
+            write_in_flight: None,
+            buffered_rx: TriggerRxAuditBuffer::default(),
+            pending_terminal: None,
+        }
+    }
+
+    #[test]
+    fn trigger_observes_a_late_stop_match_after_reaching_one_fire() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"slp\r");
+        spec.max_fires = 1;
+        spec.stop_contains = vec![b"SigmaStar #".to_vec()];
+        let mut trigger = active_trigger_for_test(spec, now);
+
+        assert_eq!(trigger.confirm_action_write(now), None);
+        assert_eq!(trigger.info.fires_confirmed, 1);
+        assert_eq!(trigger.next_write_at, None);
+        assert_eq!(trigger.deadline_status(), TriggerStatus::MaxFiresReached);
+
+        // The prompt can be emitted only after the final write completes and
+        // can cross serial read boundaries. It must still prove completion.
+        assert_eq!(trigger.observe_rx(b"SigmaStar "), None);
+        assert_eq!(trigger.observe_rx(b"#"), Some(b"SigmaStar #".to_vec()));
+    }
+
+    #[test]
+    fn trigger_without_a_stop_matcher_finishes_at_the_fire_limit() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"x");
+        spec.max_fires = 1;
+        spec.stop_contains.clear();
+        let mut trigger = active_trigger_for_test(spec, now);
+
+        assert_eq!(
+            trigger.confirm_action_write(now),
+            Some(TriggerStatus::MaxFiresReached)
+        );
+        assert_eq!(trigger.info.fires_confirmed, 1);
+        assert_eq!(trigger.next_write_at, None);
+    }
+
+    #[test]
+    fn trigger_deadline_distinguishes_timeout_from_an_exhausted_fire_budget() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"x");
+        spec.max_fires = 2;
+        let mut trigger = active_trigger_for_test(spec, now);
+
+        assert_eq!(trigger.deadline_status(), TriggerStatus::TimedOut);
+        assert_eq!(trigger.confirm_action_write(now), None);
+        assert_eq!(trigger.deadline_status(), TriggerStatus::TimedOut);
+        assert_eq!(trigger.confirm_action_write(now), None);
+        assert_eq!(trigger.deadline_status(), TriggerStatus::MaxFiresReached);
     }
 
     #[test]

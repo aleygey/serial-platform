@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    ArchiveListResponse, DeviceProfile, EventQuery, EventQueryResponse, HealthResponse,
-    JournalDiagnostics, PortDescriptor, SlotConfig, SlotDiagnostics, SlotSnapshot, StatusResponse,
+    ArchiveListResponse, ConfigureSlotDeviceBindingRequest, DeviceModelListResponse, DeviceProfile,
+    EventQuery, EventQueryResponse, HealthResponse, JournalDiagnostics, PortDescriptor, SlotConfig,
+    SlotDeviceBindingResponse, SlotDiagnostics, SlotSnapshot, StatusResponse,
     StorageDiagnosticsResponse, TransportProfile,
 };
 
@@ -155,6 +156,38 @@ impl ApiClient {
 
     pub async fn device_profiles(&self) -> Result<ProfileCatalog<DeviceProfile>> {
         self.get_json("/api/v1/config/device-profiles").await
+    }
+
+    pub async fn device_models(&self) -> Result<DeviceModelListResponse> {
+        self.get_json("/api/v1/config/device-models").await
+    }
+
+    pub async fn slot_device_binding(&self, slot_id: &str) -> Result<SlotDeviceBindingResponse> {
+        self.get_json(&format!(
+            "/api/v1/slots/{}/device-binding",
+            encode_path_segment(slot_id)
+        ))
+        .await
+    }
+
+    pub async fn configure_slot_device_binding(
+        &self,
+        slot_id: &str,
+        request: &ConfigureSlotDeviceBindingRequest,
+    ) -> Result<SlotDeviceBindingResponse> {
+        let response = self
+            .authorize(
+                self.client
+                    .put(self.url(&format!(
+                        "/api/v1/slots/{}/device-binding",
+                        encode_path_segment(slot_id)
+                    )))
+                    .json(request),
+            )
+            .send()
+            .await
+            .context("seriald Slot device-binding request failed")?;
+        decode_response(response).await
     }
 
     pub async fn configure_device_profiles(

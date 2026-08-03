@@ -322,6 +322,25 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
             baud_rate,
             trf("m.status.control", &[&safe_inline(control)])
         );
+        println!(
+            "{}",
+            trf(
+                "m.status.device",
+                &[
+                    &slot
+                        .device_model
+                        .as_ref()
+                        .map(|model| safe_inline(&model.display_name))
+                        .unwrap_or_else(|| "-".into()),
+                    &slot
+                        .config
+                        .device_profile
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| "Generic".into()),
+                ],
+            )
+        );
         if let Some(reason) = slot.state_reason {
             println!("{}", trf("m.status.reason", &[&safe_inline(&reason)]));
         }

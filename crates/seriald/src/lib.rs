@@ -32,13 +32,15 @@ pub async fn serve(
     journal_config.max_segment_bytes = loaded.config.logging.segment_max_bytes;
     journal_config.max_segment_age = Duration::from_secs(60 * 60);
     let journal = JournalManager::open(journal_config).context("open serial journal")?;
-    let registry = SlotRegistry::new(
+    let registry = SlotRegistry::new_with_device_models(
         loaded.daemon_epoch,
         started,
         journal.handle(),
         loaded.config.slots.clone(),
         loaded.config.transport_profiles.clone(),
         loaded.config.device_profiles.clone(),
+        loaded.config.device_models.clone(),
+        loaded.config.slot_device_bindings.clone(),
         loaded.config.control.limits(),
     );
     let state = AppState::try_new(

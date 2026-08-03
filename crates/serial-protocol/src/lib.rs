@@ -243,8 +243,10 @@ impl WritePacing {
 /// One bounded, device-agnostic reaction to the live serial byte stream.
 ///
 /// The daemon arms its literal-byte matchers before performing the optional
-/// initial write. It then sends `action` at the requested interval, stopping
-/// when a `stop_contains` pattern is observed or either hard bound is reached.
+/// initial write. It then sends `action` at the requested interval. Reaching
+/// `max_fires` stops further writes; when `stop_contains` is configured the
+/// Trigger keeps observing RX until a pattern matches or `timeout_ms` expires,
+/// so output emitted after the final confirmed write is not missed.
 /// Device-model meaning and higher-level workflows deliberately remain in
 /// clients; every byte field here is encoded as base64 on the JSON wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +282,7 @@ pub struct TriggerSpec {
     #[serde(default = "default_trigger_timeout_ms")]
     pub timeout_ms: u64,
     /// Hard bound on confirmed action writes. The initial write is not a fire.
+    /// This is a send budget, not an RX-observation deadline.
     #[serde(default = "default_trigger_max_fires")]
     pub max_fires: u32,
     /// Optional pacing applied to both the initial write and every action
@@ -336,18 +339,18 @@ pub struct SlotConfig {
     pub display_name: String,
     pub port: String,
     pub profile: String,
-    /// Name of the device-model profile this Slot is attached to. Prompts and
-    /// similar device behavior belong to the device model and override the
-    /// generic/legacy behavior baseline stored in Slot settings.
+    /// Name of the reusable DUT behavior Profile this Slot is attached to.
+    /// Prompts, line endings, echo, and pacing are resolved from this Profile;
+    /// concrete DUT identity is exposed separately as `device_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_profile: Option<String>,
     pub enabled: bool,
     pub settings: SerialSettings,
 }
 
-/// A reusable device-model profile. Prompt and line-ending defaults describe
-/// the device connected behind any number of Slots, so they are configured
-/// once per model instead of being embedded in every Slot's settings.
+/// A reusable DUT behavior Profile. Prompt, line-ending, echo, and pacing
+/// defaults can be shared by multiple concrete models that run the same
+/// firmware instead of being embedded in every Slot's settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceProfile {
     pub name: String,
@@ -368,6 +371,24 @@ pub struct DeviceProfile {
     pub write_chunk_delay_ms: Option<u64>,
 }
 
+/// A concrete DUT model that reuses one Device Profile's behavior.
+///
+/// The model identity is deliberately separate from [`DeviceProfile`]:
+/// multiple marketed or hardware variants may run the same firmware and share
+/// prompts, EOL, echo, and pacing without losing their concrete identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceModel {
+    /// Stable catalog identity, for example `as7230-w`.
+    pub id: String,
+    /// Human-facing model name, for example `AS7230-W`.
+    pub display_name: String,
+    /// Optional hierarchy below the owning Device Profile. Empty is valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub category_path: Vec<String>,
+    /// Name of the reusable Device Profile that owns DUT behavior.
+    pub device_profile: String,
+}
+
 /// Device-interaction settings after applying the attached device profile to
 /// the Slot's generic/legacy baseline. Generic transport defaults deliberately
 /// do not guess device-specific Shell or U-Boot prompts.
@@ -381,7 +402,7 @@ pub struct ResolvedDeviceSettings {
 }
 
 /// Resolves the effective device behavior for one Slot. An attached
-/// device-model profile owns Shell/U-Boot prompt presence as well as any
+/// DUT behavior Profile owns Shell/U-Boot prompt presence as well as any
 /// provided EOL/echo overrides. Without a profile, old Slot prompt values
 /// remain compatible.
 ///
@@ -558,6 +579,10 @@ pub struct TriggerInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotSnapshot {
     pub config: SlotConfig,
+    /// Concrete DUT identity currently connected to this Slot. This remains
+    /// separate from `config.device_profile`, which describes shared behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<DeviceModel>,
     pub daemon_epoch: Uuid,
     pub head_seq: u64,
     pub ring_oldest_seq: Option<u64>,
@@ -582,16 +607,17 @@ pub struct SlotSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_trigger: Option<TriggerInfo>,
     pub logging: LoggingState,
-    /// Authoritative prompts after resolving the attached device profile (or
-    /// legacy Slot values when no model is attached). Omitted on the wire when
-    /// unset; current clients use effective EOL/echo presence to distinguish
-    /// an authoritative `None` from an older daemon lacking this bundle.
+    /// Authoritative prompts after resolving the attached Device Profile (or
+    /// legacy Slot values when no Profile is attached). Omitted on the wire
+    /// when unset; current clients use effective EOL/echo presence to
+    /// distinguish an authoritative `None` from an older daemon lacking this
+    /// bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_shell_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_uboot_prompt: Option<String>,
-    /// Effective line ending and echo policy after applying the attached
-    /// device-model profile. Optional on the wire for older-daemon
+    /// Effective line ending and echo policy after applying the attached DUT
+    /// behavior Profile. Optional on the wire for older-daemon
     /// compatibility; current daemons always publish both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_write_eol: Option<String>,
@@ -1026,7 +1052,7 @@ pub struct ConfigureTransportProfilesResponse {
     pub config_revision: u64,
 }
 
-/// Read model for the configured device-model profile catalog.
+/// Read model for the configured DUT behavior Profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceProfileListResponse {
     pub profiles: Vec<DeviceProfile>,
@@ -1034,7 +1060,7 @@ pub struct DeviceProfileListResponse {
     pub config_revision: u64,
 }
 
-/// Full replacement of the device-model profile catalog.
+/// Full replacement of the DUT behavior Profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigureDeviceProfilesRequest {
     pub profiles: Vec<DeviceProfile>,
@@ -1045,6 +1071,43 @@ pub struct ConfigureDeviceProfilesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigureDeviceProfilesResponse {
     pub profiles: Vec<DeviceProfile>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+/// Read model for concrete DUT identities known to this station.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceModelListResponse {
+    pub models: Vec<DeviceModel>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+/// One unambiguous Slot binding operation. A concrete model always derives
+/// its Device Profile server-side, so callers cannot create a mismatched pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SlotDeviceSelection {
+    /// No target-specific behavior or concrete model is attached.
+    Generic,
+    /// Attach reusable behavior without claiming a concrete DUT model.
+    Profile { device_profile: String },
+    /// Bind one existing concrete model from the station catalog.
+    Model { model_id: String },
+    /// Atomically add a metadata-only model and bind it to this Slot.
+    NewModel { model: DeviceModel },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureSlotDeviceBindingRequest {
+    pub selection: SlotDeviceSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlotDeviceBindingResponse {
+    pub slot: SlotSnapshot,
     #[serde(default)]
     pub config_revision: u64,
 }
@@ -1863,6 +1926,33 @@ mod tests {
     }
 
     #[test]
+    fn slot_device_selection_has_an_unambiguous_tagged_wire_shape() {
+        let model = DeviceModel {
+            id: "as7230-w".into(),
+            display_name: "AS7230-W".into(),
+            category_path: vec!["AS7230".into(), "Wi-Fi".into()],
+            device_profile: "as7230-v1".into(),
+        };
+        let encoded = serde_json::to_value(SlotDeviceSelection::NewModel {
+            model: model.clone(),
+        })
+        .unwrap();
+        assert_eq!(encoded["mode"], "new_model");
+        assert_eq!(encoded["model"]["id"], "as7230-w");
+        assert_eq!(
+            serde_json::from_value::<SlotDeviceSelection>(encoded).unwrap(),
+            SlotDeviceSelection::NewModel { model }
+        );
+        assert_eq!(
+            serde_json::from_value::<SlotDeviceSelection>(serde_json::json!({
+                "mode": "generic"
+            }))
+            .unwrap(),
+            SlotDeviceSelection::Generic
+        );
+    }
+
+    #[test]
     fn snapshot_omits_unset_effective_prompts_on_the_wire() {
         let json = serde_json::to_value(SlotSnapshot {
             config: SlotConfig {
@@ -1874,6 +1964,7 @@ mod tests {
                 enabled: true,
                 settings: SerialSettings::default(),
             },
+            device_model: None,
             daemon_epoch: Uuid::new_v4(),
             head_seq: 0,
             ring_oldest_seq: None,
@@ -1904,6 +1995,7 @@ mod tests {
         assert!(!object.contains_key("effective_uboot_prompt"));
         assert!(!object.contains_key("effective_write_eol"));
         assert!(!object.contains_key("effective_echo"));
+        assert!(!object.contains_key("device_model"));
         // ...and an older daemon's snapshot without the keys still decodes.
         let decoded: SlotSnapshot = serde_json::from_value(json).unwrap();
         assert!(decoded.effective_shell_prompt.is_none());

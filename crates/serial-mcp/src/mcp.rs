@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
+    DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
     MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
     MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
     MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
@@ -245,7 +246,7 @@ async fn dispatch_request(tools: &AgentTools, request: RpcRequest, id: Value) ->
                     "protocolVersion": protocol,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "serial-mcp", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Inspect devices, start a Run before writes, and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed."
+                    "instructions": "Inspect devices, start a Run before writes, and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. Trigger max_fires limits sends, while configured stop matchers remain armed until match or timeout; confirmed TX alone is not target success or failure. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed."
                 }),
             )
         }
@@ -324,7 +325,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "devices",
-            "List authoritative Slots and ownership.",
+            "List authoritative Slots, attached DUT models, and ownership.",
             object(json!({"slot_id":{"type":"string"}}), &[]),
             true,
         ),
@@ -385,17 +386,23 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "trigger",
-            "Run bounded daemon-side repeated writes and matchers.",
+            "Arm daemon-side RX matchers and bounded writes; max_fires limits sends, not observation.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
-                    "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
-                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},
-                    "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
-                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS},
-                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
-                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS},
-                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES}
+                    "kickoff": trigger_write_schema(
+                        MAX_TRIGGER_INITIAL_WRITE_BYTES,
+                        "One-time write after arming; excluded from max_fires."
+                    ),
+                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES,"description":"RX literal gating the first fire."},
+                    "action": trigger_write_schema(
+                        MAX_TRIGGER_ACTION_BYTES,
+                        "Per-fire confirmed and audited write."
+                    ),
+                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS,"description":"Delay after a confirmed fire."},
+                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"description":"RX success literals; observation continues after max_fires until match or timeout.","items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
+                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS,"description":"Overall observation deadline."},
+                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":"Send budget for confirmed action writes, not observation cutoff."}
                 }),
                 &["slot_id", "action"],
             ),
@@ -519,9 +526,10 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-fn trigger_write_schema(max_length: usize) -> Value {
+fn trigger_write_schema(max_length: usize, description: &str) -> Value {
     json!({
         "type":"object",
+        "description":description,
         "properties":{
             "text":{"type":"string","maxLength":max_length},
             "eol":{"type":"string","maxLength":max_length}
@@ -794,6 +802,30 @@ mod tests {
         );
         assert!(schema["properties"].get("chunk_size").is_none());
         assert!(schema["properties"].get("inter_char_delay_ms").is_none());
+        assert_eq!(
+            schema["properties"]["interval_ms"]["default"],
+            DEFAULT_TRIGGER_INTERVAL_MS
+        );
+        assert_eq!(
+            schema["properties"]["timeout_ms"]["default"],
+            DEFAULT_TRIGGER_TIMEOUT_MS
+        );
+        assert_eq!(
+            schema["properties"]["max_fires"]["default"],
+            DEFAULT_TRIGGER_MAX_FIRES
+        );
+        assert!(
+            schema["properties"]["max_fires"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Send budget")
+        );
+        assert!(
+            schema["properties"]["stop_contains"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("after max_fires")
+        );
         let serialized = serde_json::to_string(&trigger).unwrap().to_lowercase();
         for forbidden in ["sigmastar", "uboot"] {
             assert!(

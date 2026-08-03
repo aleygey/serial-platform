@@ -27,10 +27,11 @@ use ratatui::{
 #[cfg(test)]
 use serial_protocol::WritePacing;
 use serial_protocol::{
-    Actor, ClientMessage, CommandResult, ControlLease, ControlMode, EchoMode, EventKind,
-    LoggingState, ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo, ServerMessage,
-    SessionState, SlotSnapshot, TargetActivity, TimelineEvent, TriggerInfo, TriggerStatus,
-    WireFrame,
+    Actor, ClientMessage, CommandResult, ConfigureSlotDeviceBindingRequest, ControlLease,
+    ControlMode, DeviceModel, DeviceProfile, EchoMode, EventKind, LoggingState,
+    ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo, ServerMessage, SessionState,
+    SlotDeviceBindingResponse, SlotDeviceSelection, SlotSnapshot, TargetActivity, TimelineEvent,
+    TriggerInfo, TriggerStatus, WireFrame,
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -537,7 +538,14 @@ impl SlotView {
                     .and_then(|value| u32::try_from(value).ok())
                 {
                     trigger.fires_confirmed = trigger.fires_confirmed.max(fire_index);
-                    trigger.status = if was_stopping || fire_index >= trigger.spec.max_fires {
+                    // Reaching max_fires exhausts only the Trigger's write
+                    // budget. When a stop matcher is configured, seriald
+                    // continues observing RX until the original deadline so
+                    // a prompt emitted after the final write can still match.
+                    trigger.status = if was_stopping
+                        || (fire_index >= trigger.spec.max_fires
+                            && trigger.spec.stop_contains.is_empty())
+                    {
                         TriggerStatus::Stopping
                     } else {
                         TriggerStatus::Running
@@ -732,6 +740,338 @@ struct QueuedControl {
     since: Instant,
 }
 
+#[derive(Debug)]
+enum DeviceBindingCommand {
+    Load {
+        slot_id: String,
+        request_id: Uuid,
+    },
+    Save {
+        slot_id: String,
+        request: ConfigureSlotDeviceBindingRequest,
+    },
+}
+
+#[derive(Debug)]
+enum DeviceBindingEvent {
+    Loaded {
+        slot_id: String,
+        request_id: Uuid,
+        profiles: Vec<DeviceProfile>,
+        models: Vec<DeviceModel>,
+        binding: Box<SlotDeviceBindingResponse>,
+    },
+    Saved {
+        slot_id: String,
+    },
+    Failed {
+        slot_id: String,
+        request_id: Option<Uuid>,
+        saving: bool,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevicePickerStage {
+    Profiles,
+    Models,
+    NewModel,
+}
+
+#[derive(Debug)]
+struct DevicePicker {
+    slot_id: String,
+    profiles: Vec<DeviceProfile>,
+    models: Vec<DeviceModel>,
+    config_revision: u64,
+    stage: DevicePickerStage,
+    profile_index: usize,
+    model_index: usize,
+    new_name: Vec<char>,
+    new_name_cursor: usize,
+    current_profile: Option<String>,
+    current_model_id: Option<String>,
+    error: Option<String>,
+}
+
+impl DevicePicker {
+    fn new(
+        slot_id: String,
+        mut profiles: Vec<DeviceProfile>,
+        mut models: Vec<DeviceModel>,
+        binding: &SlotDeviceBindingResponse,
+    ) -> Self {
+        profiles.sort_by_key(|profile| profile.name.to_ascii_lowercase());
+        models.sort_by_key(|model| {
+            (
+                model.device_profile.to_ascii_lowercase(),
+                model.category_path.join("/").to_ascii_lowercase(),
+                model.display_name.to_ascii_lowercase(),
+            )
+        });
+        let profile_index = binding
+            .slot
+            .config
+            .device_profile
+            .as_ref()
+            .and_then(|current| profiles.iter().position(|profile| &profile.name == current))
+            .map_or(0, |index| index + 1);
+        Self {
+            slot_id,
+            profiles,
+            models,
+            config_revision: binding.config_revision,
+            stage: DevicePickerStage::Profiles,
+            profile_index,
+            model_index: 0,
+            new_name: Vec::new(),
+            new_name_cursor: 0,
+            current_profile: binding.slot.config.device_profile.clone(),
+            current_model_id: binding
+                .slot
+                .device_model
+                .as_ref()
+                .map(|model| model.id.clone()),
+            error: None,
+        }
+    }
+
+    fn selected_profile(&self) -> Option<&DeviceProfile> {
+        self.profile_index
+            .checked_sub(1)
+            .and_then(|index| self.profiles.get(index))
+    }
+
+    fn matching_models(&self) -> Vec<&DeviceModel> {
+        let Some(profile) = self.selected_profile() else {
+            return Vec::new();
+        };
+        self.models
+            .iter()
+            .filter(|model| model.device_profile == profile.name)
+            .collect()
+    }
+
+    fn model_option_count(&self) -> usize {
+        // Profile-only + concrete models + New model.
+        self.matching_models().len() + 2
+    }
+}
+
+#[derive(Debug)]
+enum DevicePickerState {
+    Loading { slot_id: String, request_id: Uuid },
+    Ready(DevicePicker),
+    Saving(DevicePicker),
+    Error { slot_id: String, message: String },
+}
+
+enum DevicePickerAction {
+    None,
+    Close,
+    Save(SlotDeviceSelection),
+}
+
+fn move_picker_selection(index: &mut usize, count: usize, previous: bool) {
+    if count == 0 {
+        *index = 0;
+    } else if previous {
+        *index = if *index == 0 { count - 1 } else { *index - 1 };
+    } else {
+        *index = (*index + 1) % count;
+    }
+}
+
+fn unique_model_slug(display_name: &str, models: &[DeviceModel]) -> String {
+    let mut base = String::new();
+    let mut separator_pending = false;
+    for character in display_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator_pending && !base.is_empty() {
+                base.push('-');
+            }
+            base.push(character.to_ascii_lowercase());
+            separator_pending = false;
+        } else {
+            separator_pending = !base.is_empty();
+        }
+    }
+    while base.ends_with('-') {
+        base.pop();
+    }
+    if base.is_empty() {
+        base.push_str("model");
+    }
+    base.truncate(64);
+    if !models.iter().any(|model| model.id == base) {
+        return base;
+    }
+    for suffix in 2u32.. {
+        let suffix = format!("-{suffix}");
+        let keep = 64usize.saturating_sub(suffix.len());
+        let mut candidate = base[..base.len().min(keep)]
+            .trim_end_matches('-')
+            .to_string();
+        candidate.push_str(&suffix);
+        if !models.iter().any(|model| model.id == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the numeric model suffix space is not finite")
+}
+
+fn handle_ready_device_picker_key(picker: &mut DevicePicker, key: KeyEvent) -> DevicePickerAction {
+    picker.error = None;
+    match picker.stage {
+        DevicePickerStage::Profiles => match key.code {
+            KeyCode::Esc | KeyCode::Left => DevicePickerAction::Close,
+            KeyCode::Up => {
+                move_picker_selection(&mut picker.profile_index, picker.profiles.len() + 1, true);
+                DevicePickerAction::None
+            }
+            KeyCode::Down => {
+                move_picker_selection(&mut picker.profile_index, picker.profiles.len() + 1, false);
+                DevicePickerAction::None
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                if picker.profile_index == 0 {
+                    DevicePickerAction::Save(SlotDeviceSelection::Generic)
+                } else {
+                    let current_model = picker.current_model_id.as_deref();
+                    picker.model_index = picker
+                        .matching_models()
+                        .iter()
+                        .position(|model| Some(model.id.as_str()) == current_model)
+                        .map_or(0, |index| index + 1);
+                    picker.stage = DevicePickerStage::Models;
+                    DevicePickerAction::None
+                }
+            }
+            _ => DevicePickerAction::None,
+        },
+        DevicePickerStage::Models => match key.code {
+            KeyCode::Esc | KeyCode::Left => {
+                picker.stage = DevicePickerStage::Profiles;
+                DevicePickerAction::None
+            }
+            KeyCode::Up => {
+                let count = picker.model_option_count();
+                move_picker_selection(&mut picker.model_index, count, true);
+                DevicePickerAction::None
+            }
+            KeyCode::Down => {
+                let count = picker.model_option_count();
+                move_picker_selection(&mut picker.model_index, count, false);
+                DevicePickerAction::None
+            }
+            KeyCode::Char('n' | 'N') => {
+                picker.stage = DevicePickerStage::NewModel;
+                picker.new_name.clear();
+                picker.new_name_cursor = 0;
+                DevicePickerAction::None
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                let Some(profile_name) = picker
+                    .selected_profile()
+                    .map(|profile| profile.name.clone())
+                else {
+                    picker.stage = DevicePickerStage::Profiles;
+                    return DevicePickerAction::None;
+                };
+                let matching = picker.matching_models();
+                if picker.model_index == 0 {
+                    DevicePickerAction::Save(SlotDeviceSelection::Profile {
+                        device_profile: profile_name,
+                    })
+                } else if let Some(model) = matching.get(picker.model_index - 1) {
+                    DevicePickerAction::Save(SlotDeviceSelection::Model {
+                        model_id: model.id.clone(),
+                    })
+                } else {
+                    picker.stage = DevicePickerStage::NewModel;
+                    picker.new_name.clear();
+                    picker.new_name_cursor = 0;
+                    DevicePickerAction::None
+                }
+            }
+            _ => DevicePickerAction::None,
+        },
+        DevicePickerStage::NewModel => match key.code {
+            KeyCode::Esc => {
+                picker.stage = DevicePickerStage::Models;
+                DevicePickerAction::None
+            }
+            KeyCode::Enter => {
+                let display_name = picker.new_name.iter().collect::<String>();
+                let display_name = display_name.trim().to_string();
+                if display_name.is_empty() {
+                    picker.error = Some(tr("device.picker.name.required").into());
+                    return DevicePickerAction::None;
+                }
+                if display_name.len() > 128 {
+                    picker.error = Some(tr("device.picker.name.long").into());
+                    return DevicePickerAction::None;
+                }
+                let Some(device_profile) = picker
+                    .selected_profile()
+                    .map(|profile| profile.name.clone())
+                else {
+                    picker.stage = DevicePickerStage::Profiles;
+                    return DevicePickerAction::None;
+                };
+                DevicePickerAction::Save(SlotDeviceSelection::NewModel {
+                    model: DeviceModel {
+                        id: unique_model_slug(&display_name, &picker.models),
+                        display_name,
+                        category_path: Vec::new(),
+                        device_profile,
+                    },
+                })
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.new_name.insert(picker.new_name_cursor, character);
+                picker.new_name_cursor += 1;
+                DevicePickerAction::None
+            }
+            KeyCode::Backspace => {
+                if picker.new_name_cursor > 0 {
+                    picker.new_name_cursor -= 1;
+                    picker.new_name.remove(picker.new_name_cursor);
+                }
+                DevicePickerAction::None
+            }
+            KeyCode::Delete => {
+                if picker.new_name_cursor < picker.new_name.len() {
+                    picker.new_name.remove(picker.new_name_cursor);
+                }
+                DevicePickerAction::None
+            }
+            KeyCode::Left => {
+                picker.new_name_cursor = picker.new_name_cursor.saturating_sub(1);
+                DevicePickerAction::None
+            }
+            KeyCode::Right => {
+                picker.new_name_cursor = (picker.new_name_cursor + 1).min(picker.new_name.len());
+                DevicePickerAction::None
+            }
+            KeyCode::Home => {
+                picker.new_name_cursor = 0;
+                DevicePickerAction::None
+            }
+            KeyCode::End => {
+                picker.new_name_cursor = picker.new_name.len();
+                DevicePickerAction::None
+            }
+            _ => DevicePickerAction::None,
+        },
+    }
+}
+
 struct App {
     slots: Vec<SlotView>,
     selected: usize,
@@ -761,6 +1101,8 @@ struct App {
     /// `selection_copy` so live output resumes immediately.
     selection: Option<TextSelection>,
     selection_copy: Option<String>,
+    device_binding_commands: Option<mpsc::Sender<DeviceBindingCommand>>,
+    device_picker: Option<DevicePickerState>,
     config: Option<LoadedConfig>,
     should_quit: bool,
     dirty: bool,
@@ -800,6 +1142,8 @@ impl App {
             layout: None,
             selection: None,
             selection_copy: None,
+            device_binding_commands: None,
+            device_picker: None,
             config: None,
             should_quit: false,
             dirty: true,
@@ -832,6 +1176,173 @@ impl App {
             self.status = trf("st.viewing", &[&name, &port]);
             self.dirty = true;
         }
+    }
+
+    fn start_device_picker_load(&mut self, slot_id: String) {
+        let Some(commands) = &self.device_binding_commands else {
+            self.status = tr("st.device.unavailable").into();
+            return;
+        };
+        let request_id = Uuid::new_v4();
+        match commands.try_send(DeviceBindingCommand::Load {
+            slot_id: slot_id.clone(),
+            request_id,
+        }) {
+            Ok(()) => {
+                self.help = false;
+                self.device_picker = Some(DevicePickerState::Loading {
+                    slot_id,
+                    request_id,
+                });
+                self.status = tr("st.device.loading").into();
+            }
+            Err(error) => {
+                self.status = trf("st.device.queue.failed", &[&error.to_string()]);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn open_device_picker(&mut self) {
+        self.start_device_picker_load(self.selected_slot_id());
+    }
+
+    fn submit_device_binding(&mut self, picker: DevicePicker, selection: SlotDeviceSelection) {
+        let request = ConfigureSlotDeviceBindingRequest {
+            selection,
+            expected_revision: Some(picker.config_revision),
+        };
+        let Some(commands) = &self.device_binding_commands else {
+            let mut picker = picker;
+            picker.error = Some(tr("st.device.unavailable").into());
+            self.device_picker = Some(DevicePickerState::Ready(picker));
+            return;
+        };
+        match commands.try_send(DeviceBindingCommand::Save {
+            slot_id: picker.slot_id.clone(),
+            request,
+        }) {
+            Ok(()) => {
+                self.status = tr("st.device.saving").into();
+                self.device_picker = Some(DevicePickerState::Saving(picker));
+            }
+            Err(error) => {
+                let mut picker = picker;
+                picker.error = Some(trf("st.device.queue.failed", &[&error.to_string()]));
+                self.device_picker = Some(DevicePickerState::Ready(picker));
+            }
+        }
+    }
+
+    fn handle_device_picker_key(&mut self, key: KeyEvent) -> bool {
+        let Some(state) = self.device_picker.take() else {
+            return false;
+        };
+        match state {
+            DevicePickerState::Loading {
+                slot_id,
+                request_id,
+            } => {
+                if key.code != KeyCode::Esc {
+                    self.device_picker = Some(DevicePickerState::Loading {
+                        slot_id,
+                        request_id,
+                    });
+                }
+            }
+            DevicePickerState::Saving(picker) => {
+                self.status = tr("st.device.saving.wait").into();
+                self.device_picker = Some(DevicePickerState::Saving(picker));
+            }
+            DevicePickerState::Error { slot_id, message } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Char('r' | 'R') | KeyCode::Enter => {
+                    self.start_device_picker_load(slot_id);
+                }
+                _ => {
+                    self.device_picker = Some(DevicePickerState::Error { slot_id, message });
+                }
+            },
+            DevicePickerState::Ready(mut picker) => {
+                match handle_ready_device_picker_key(&mut picker, key) {
+                    DevicePickerAction::None => {
+                        self.device_picker = Some(DevicePickerState::Ready(picker));
+                    }
+                    DevicePickerAction::Close => {}
+                    DevicePickerAction::Save(selection) => {
+                        self.submit_device_binding(picker, selection);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
+    fn handle_device_binding_event(&mut self, event: DeviceBindingEvent) {
+        match event {
+            DeviceBindingEvent::Loaded {
+                slot_id,
+                request_id,
+                profiles,
+                models,
+                binding,
+            } => {
+                let accepts = matches!(
+                    self.device_picker.as_ref(),
+                    Some(DevicePickerState::Loading {
+                        slot_id: pending,
+                        request_id: pending_request,
+                    }) if pending == &slot_id && pending_request == &request_id
+                );
+                if accepts {
+                    self.device_picker = Some(DevicePickerState::Ready(DevicePicker::new(
+                        slot_id, profiles, models, &binding,
+                    )));
+                    self.status = tr("st.device.ready").into();
+                }
+            }
+            DeviceBindingEvent::Saved { slot_id } => {
+                let accepts = matches!(
+                    self.device_picker.as_ref(),
+                    Some(DevicePickerState::Saving(picker)) if picker.slot_id == slot_id
+                );
+                if accepts {
+                    self.device_picker = None;
+                    self.status = trf("st.device.saved", &[&safe_inline(&slot_id)]);
+                }
+            }
+            DeviceBindingEvent::Failed {
+                slot_id,
+                request_id,
+                saving,
+                message,
+            } => {
+                let state = self.device_picker.take();
+                self.device_picker = match state {
+                    Some(DevicePickerState::Saving(picker))
+                        if saving && picker.slot_id == slot_id =>
+                    {
+                        Some(DevicePickerState::Error {
+                            slot_id,
+                            message: safe_inline(&message),
+                        })
+                    }
+                    Some(DevicePickerState::Loading {
+                        slot_id: pending,
+                        request_id: pending_request,
+                    }) if !saving && pending == slot_id && request_id == Some(pending_request) => {
+                        Some(DevicePickerState::Error {
+                            slot_id,
+                            message: safe_inline(&message),
+                        })
+                    }
+                    other => other,
+                };
+                self.status = trf("st.device.failed", &[&safe_inline(&message)]);
+            }
+        }
+        self.dirty = true;
     }
 
     fn handle_network(&mut self, event: NetworkEvent, commands: &mpsc::Sender<NetworkCommand>) {
@@ -1294,6 +1805,20 @@ impl App {
                     })
                 {
                     snapshot.effective_transport = Some(effective_transport);
+                }
+                if let Some(device_model) = event.metadata.get("device_model") {
+                    if device_model.is_null() {
+                        snapshot.device_model = None;
+                    } else {
+                        match serde_json::from_value::<DeviceModel>(device_model.clone()) {
+                            Ok(device_model) => snapshot.device_model = Some(device_model),
+                            Err(error) => tracing::warn!(
+                                slot_id = %snapshot.config.id,
+                                %error,
+                                "ignored malformed device_model in SlotReconfigured event"
+                            ),
+                        }
+                    }
                 }
             }
             EventKind::SlotRemoved => {
@@ -1842,10 +2367,17 @@ impl App {
                 self.handle_key(key, commands)
             }
             Event::Paste(value) => {
+                if self.device_picker.is_some() {
+                    self.status = tr("st.device.paste.ignored").into();
+                    self.dirty = true;
+                    return;
+                }
                 self.clear_text_selection();
                 self.handle_paste(value, commands);
             }
-            Event::Mouse(mouse) => self.handle_mouse(mouse, commands),
+            Event::Mouse(mouse) if self.device_picker.is_none() => {
+                self.handle_mouse(mouse, commands)
+            }
             Event::Resize(_, _) | Event::FocusLost => {
                 self.clear_text_selection();
                 self.dirty = true;
@@ -1857,6 +2389,9 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         self.focus = PaneFocus::Input;
         self.clear_text_selection();
+        if self.handle_device_picker_key(key) {
+            return;
+        }
         if self.help {
             self.help = false;
             if is_prefix(key) {
@@ -2071,6 +2606,7 @@ impl App {
                 };
             }
             KeyCode::Char('g' | 'G') => self.toggle_language(),
+            KeyCode::Char('m' | 'M') => self.open_device_picker(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Char('t' | 'T') => {
@@ -2429,6 +2965,72 @@ impl App {
     }
 }
 
+fn spawn_device_binding_worker(
+    api: ApiClient,
+) -> (
+    mpsc::Sender<DeviceBindingCommand>,
+    mpsc::Receiver<DeviceBindingEvent>,
+) {
+    let (commands, mut command_rx) = mpsc::channel::<DeviceBindingCommand>(8);
+    let (events, event_rx) = mpsc::channel::<DeviceBindingEvent>(8);
+    tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            let event = match command {
+                DeviceBindingCommand::Load {
+                    slot_id,
+                    request_id,
+                } => {
+                    match tokio::try_join!(
+                        api.device_profiles(),
+                        api.device_models(),
+                        api.slot_device_binding(&slot_id)
+                    ) {
+                        Ok((profiles, models, binding))
+                            if profiles.config_revision == Some(models.config_revision)
+                                && models.config_revision == binding.config_revision =>
+                        {
+                            DeviceBindingEvent::Loaded {
+                                slot_id,
+                                request_id,
+                                profiles: profiles.profiles,
+                                models: models.models,
+                                binding: Box::new(binding),
+                            }
+                        }
+                        Ok(_) => DeviceBindingEvent::Failed {
+                            slot_id,
+                            request_id: Some(request_id),
+                            saving: false,
+                            message: tr("st.device.catalog.changed").into(),
+                        },
+                        Err(error) => DeviceBindingEvent::Failed {
+                            slot_id,
+                            request_id: Some(request_id),
+                            saving: false,
+                            message: error.to_string(),
+                        },
+                    }
+                }
+                DeviceBindingCommand::Save { slot_id, request } => {
+                    match api.configure_slot_device_binding(&slot_id, &request).await {
+                        Ok(_) => DeviceBindingEvent::Saved { slot_id },
+                        Err(error) => DeviceBindingEvent::Failed {
+                            slot_id,
+                            request_id: None,
+                            saving: true,
+                            message: error.to_string(),
+                        },
+                    }
+                }
+            };
+            if events.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    (commands, event_rx)
+}
+
 pub async fn run(
     api: ApiClient,
     mut loaded: LoadedConfig,
@@ -2463,6 +3065,8 @@ pub async fn run(
     }
     app.mouse_capture = loaded.config.mouse_capture.unwrap_or(true);
     let mut network = ws::spawn(endpoint, token, slot_ids);
+    let (device_binding_commands, mut device_binding_events) = spawn_device_binding_worker(api);
+    app.device_binding_commands = Some(device_binding_commands);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
     let _guard = TerminalGuard {
@@ -2473,6 +3077,7 @@ pub async fn run(
         &mut app,
         &network.commands,
         &mut network.events,
+        &mut device_binding_events,
     )
     .await;
     let _ = network.commands.try_send(NetworkCommand::Shutdown);
@@ -2489,9 +3094,11 @@ async fn run_loop(
     app: &mut App,
     commands: &mpsc::Sender<NetworkCommand>,
     network_events: &mut mpsc::Receiver<NetworkEvent>,
+    device_binding_events: &mut mpsc::Receiver<DeviceBindingEvent>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut network_events_open = true;
+    let mut device_binding_events_open = true;
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renew_tick = tokio::time::interval(Duration::from_secs(10));
@@ -2509,6 +3116,28 @@ async fn run_loop(
             },
             event = network_events.recv(), if network_events_open => {
                 network_events_open = handle_network_channel_event(app, event, commands);
+            },
+            event = device_binding_events.recv(), if device_binding_events_open => {
+                match event {
+                    Some(event) => app.handle_device_binding_event(event),
+                    None => {
+                        device_binding_events_open = false;
+                        app.device_binding_commands = None;
+                        if let Some(slot_id) = app.device_picker.as_ref().map(|state| match state {
+                            DevicePickerState::Loading { slot_id, .. }
+                            | DevicePickerState::Error { slot_id, .. } => slot_id.clone(),
+                            DevicePickerState::Ready(picker)
+                            | DevicePickerState::Saving(picker) => picker.slot_id.clone(),
+                        }) {
+                            app.device_picker = Some(DevicePickerState::Error {
+                                slot_id,
+                                message: tr("st.device.unavailable").into(),
+                            });
+                        }
+                        app.status = tr("st.device.unavailable").into();
+                        app.dirty = true;
+                    }
+                }
             },
             _ = renew_tick.tick() => app.maintain_controls(commands),
             _ = activity_tick.tick() => {
@@ -2673,7 +3302,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_status(frame, app, chunks[2]);
     draw_input(frame, app, chunks[3]);
     draw_help_line(frame, app, chunks[4]);
-    if app.help {
+    if let Some(device_picker) = &app.device_picker {
+        draw_device_picker(frame, device_picker, area);
+    } else if app.help {
         draw_help(frame, app, area);
     }
 }
@@ -2755,8 +3386,9 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .map(|transport| transport.baud_rate)
         .unwrap_or(view.snapshot.config.settings.baud_rate);
     let title = format!(
-        " {} · {} · {} baud{}{} ",
+        " {} · {} · {} · {} baud{}{} ",
         safe_inline(&view.snapshot.config.display_name),
+        device_identity_label(&view.snapshot),
         safe_inline(&view.snapshot.config.port),
         baud_rate,
         if view.scroll_from_bottom > 0 {
@@ -2792,6 +3424,22 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(visual_lines).block(block), area);
+}
+
+fn device_identity_label(snapshot: &SlotSnapshot) -> String {
+    match (
+        snapshot.device_model.as_ref(),
+        snapshot.config.device_profile.as_deref(),
+    ) {
+        (Some(model), Some(profile)) => format!(
+            "{} [{}]",
+            safe_inline(&model.display_name),
+            safe_inline(profile)
+        ),
+        (Some(model), None) => safe_inline(&model.display_name),
+        (None, Some(profile)) => trf("device.identity.profile", &[&safe_inline(profile)]),
+        (None, None) => tr("device.identity.generic").into(),
+    }
 }
 
 fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
@@ -3236,6 +3884,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
     if let Some(cursor_column) = cursor_column
         && app.focus == PaneFocus::Input
+        && app.device_picker.is_none()
     {
         frame.set_cursor_position(Position::new(
             inner.x.saturating_add(cursor_column),
@@ -3353,9 +4002,276 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+fn device_model_path(model: &DeviceModel) -> String {
+    if model.category_path.is_empty() {
+        safe_inline(&model.display_name)
+    } else {
+        format!(
+            "{} / {}",
+            model
+                .category_path
+                .iter()
+                .map(|segment| safe_inline(segment))
+                .collect::<Vec<_>>()
+                .join(" / "),
+            safe_inline(&model.display_name)
+        )
+    }
+}
+
+fn device_picker_current_label(picker: &DevicePicker) -> String {
+    if let Some(model_id) = picker.current_model_id.as_deref() {
+        if let Some(model) = picker.models.iter().find(|model| model.id == model_id) {
+            return trf(
+                "device.picker.current.model",
+                &[
+                    &device_model_path(model),
+                    &safe_inline(&model.device_profile),
+                ],
+            );
+        }
+        return safe_inline(model_id);
+    }
+    picker.current_profile.as_deref().map_or_else(
+        || tr("device.identity.generic").into(),
+        |profile| trf("device.identity.profile", &[&safe_inline(profile)]),
+    )
+}
+
+fn draw_picker_choices(frame: &mut Frame<'_>, area: Rect, labels: &[String], selected: usize) {
+    let capacity = area.height as usize;
+    if capacity == 0 || labels.is_empty() {
+        return;
+    }
+    let selected = selected.min(labels.len() - 1);
+    let start = if labels.len() <= capacity {
+        0
+    } else {
+        selected
+            .saturating_sub(capacity / 2)
+            .min(labels.len().saturating_sub(capacity))
+    };
+    let lines = labels
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(capacity)
+        .map(|(index, label)| {
+            if index == selected {
+                Line::from(vec![
+                    Span::styled(
+                        " › ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        label.clone(),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            } else {
+                Line::from(format!("   {label}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_ready_device_picker(
+    frame: &mut Frame<'_>,
+    picker: &DevicePicker,
+    popup: Rect,
+    saving: bool,
+) {
+    let title = if saving {
+        tr("device.picker.title.saving")
+    } else {
+        tr("device.picker.title")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(trf("device.picker.slot", &[&safe_inline(&picker.slot_id)])),
+            Line::from(trf(
+                "device.picker.current",
+                &[&device_picker_current_label(picker)],
+            )),
+        ]),
+        chunks[0],
+    );
+
+    let (stage_title, hint) = match picker.stage {
+        DevicePickerStage::Profiles => (
+            tr("device.picker.stage.profiles"),
+            tr("device.picker.hint.profiles"),
+        ),
+        DevicePickerStage::Models => (
+            tr("device.picker.stage.models"),
+            tr("device.picker.hint.models"),
+        ),
+        DevicePickerStage::NewModel => {
+            (tr("device.picker.stage.new"), tr("device.picker.hint.new"))
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(stage_title).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        chunks[1],
+    );
+
+    match picker.stage {
+        DevicePickerStage::Profiles => {
+            let current_suffix = tr("device.picker.current.suffix");
+            let mut labels = Vec::with_capacity(picker.profiles.len() + 1);
+            labels.push(format!(
+                "{}{}",
+                tr("device.picker.generic"),
+                if picker.current_profile.is_none() {
+                    current_suffix
+                } else {
+                    ""
+                }
+            ));
+            labels.extend(picker.profiles.iter().map(|profile| {
+                format!(
+                    "{}{}",
+                    safe_inline(&profile.name),
+                    if picker.current_profile.as_deref() == Some(profile.name.as_str()) {
+                        current_suffix
+                    } else {
+                        ""
+                    }
+                )
+            }));
+            draw_picker_choices(frame, chunks[2], &labels, picker.profile_index);
+        }
+        DevicePickerStage::Models => {
+            let matching = picker.matching_models();
+            let current_suffix = tr("device.picker.current.suffix");
+            let mut labels = Vec::with_capacity(matching.len() + 2);
+            labels.push(format!(
+                "{}{}",
+                tr("device.picker.profile.only"),
+                if picker.current_model_id.is_none()
+                    && picker.current_profile.as_deref()
+                        == picker
+                            .selected_profile()
+                            .map(|profile| profile.name.as_str())
+                {
+                    current_suffix
+                } else {
+                    ""
+                }
+            ));
+            labels.extend(matching.iter().map(|model| {
+                format!(
+                    "{}{}",
+                    device_model_path(model),
+                    if picker.current_model_id.as_deref() == Some(model.id.as_str()) {
+                        current_suffix
+                    } else {
+                        ""
+                    }
+                )
+            }));
+            labels.push(tr("device.picker.add.model").into());
+            draw_picker_choices(frame, chunks[2], &labels, picker.model_index);
+        }
+        DevicePickerStage::NewModel => {
+            let (text, cursor_column) =
+                line_input_projection(&picker.new_name, picker.new_name_cursor, chunks[2].width);
+            frame.render_widget(Paragraph::new(text), chunks[2]);
+            if !saving {
+                frame.set_cursor_position(Position::new(
+                    chunks[2].x.saturating_add(cursor_column),
+                    chunks[2].y,
+                ));
+            }
+        }
+    }
+
+    let footer = if saving {
+        vec![Line::from(""), Line::from(tr("device.picker.saving"))]
+    } else if let Some(error) = picker.error.as_deref() {
+        vec![
+            Line::styled(
+                safe_inline(error),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(hint),
+        ]
+    } else {
+        vec![Line::from(""), Line::from(hint)]
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[3]);
+}
+
+fn draw_device_picker(frame: &mut Frame<'_>, state: &DevicePickerState, area: Rect) {
+    let popup = centered_rect(area.width.min(82), area.height.min(24), area);
+    match state {
+        DevicePickerState::Ready(picker) => {
+            draw_ready_device_picker(frame, picker, popup, false);
+        }
+        DevicePickerState::Saving(picker) => {
+            draw_ready_device_picker(frame, picker, popup, true);
+        }
+        DevicePickerState::Loading { slot_id, .. } | DevicePickerState::Error { slot_id, .. } => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(tr("device.picker.title"))
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(popup);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(block, popup);
+            let mut lines = vec![Line::from(trf(
+                "device.picker.slot",
+                &[&safe_inline(slot_id)],
+            ))];
+            match state {
+                DevicePickerState::Loading { .. } => {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(tr("device.picker.loading")));
+                    lines.push(Line::from(tr("device.picker.hint.loading")));
+                }
+                DevicePickerState::Error { message, .. } => {
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled(
+                        safe_inline(message),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                    lines.push(Line::from(tr("device.picker.hint.error")));
+                }
+                DevicePickerState::Ready(_) | DevicePickerState::Saving(_) => unreachable!(),
+            }
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        }
+    }
+}
+
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width.min(76);
-    let height = area.height.min(34);
+    let height = area.height.min(35);
     let popup = centered_rect(width, height, area);
     let idle_seconds = app.human_idle_release.as_secs().to_string();
     let mouse_help = if app.mouse_capture {
@@ -3369,6 +4285,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("help.next").to_string(),
         tr("help.mode").to_string(),
         tr("help.view").to_string(),
+        tr("help.device").to_string(),
         tr("help.lang").to_string(),
         tr("help.scroll").to_string(),
         mouse_help.to_string(),
@@ -3491,6 +4408,40 @@ mod tests {
 
     use super::*;
 
+    fn profile(name: &str) -> DeviceProfile {
+        DeviceProfile {
+            name: name.into(),
+            shell_prompt: None,
+            uboot_prompt: None,
+            write_eol: None,
+            echo: None,
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
+        }
+    }
+
+    fn model(id: &str, display_name: &str, categories: &[&str], profile: &str) -> DeviceModel {
+        DeviceModel {
+            id: id.into(),
+            display_name: display_name.into(),
+            category_path: categories.iter().map(|value| (*value).into()).collect(),
+            device_profile: profile.into(),
+        }
+    }
+
+    fn device_binding(
+        profile_name: Option<&str>,
+        device_model: Option<DeviceModel>,
+    ) -> SlotDeviceBindingResponse {
+        let mut slot = snapshot();
+        slot.config.device_profile = profile_name.map(str::to_string);
+        slot.device_model = device_model;
+        SlotDeviceBindingResponse {
+            slot,
+            config_revision: 9,
+        }
+    }
+
     #[test]
     fn raw_ctrl_c_is_etx_and_arrows_are_xterm() {
         assert_eq!(
@@ -3509,6 +4460,161 @@ mod tests {
             raw_key_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(b"\x1b[A".to_vec())
         );
+    }
+
+    #[test]
+    fn device_picker_uses_profile_then_concrete_model_without_duplication() {
+        let profiles = vec![profile("AS7230v1"), profile("Luckfox")];
+        let wireless = model("as7230-w", "AS7230-W", &["AS7230", "Wireless"], "AS7230v1");
+        let wired = model(
+            "as7230-f4ge",
+            "AS7230-F4GE",
+            &["AS7230", "Wired"],
+            "AS7230v1",
+        );
+        let binding = device_binding(Some("AS7230v1"), Some(wireless.clone()));
+        let mut picker = DevicePicker::new(
+            "slot-1".into(),
+            profiles,
+            vec![wireless.clone(), wired.clone()],
+            &binding,
+        );
+
+        assert_eq!(picker.selected_profile().unwrap().name, "AS7230v1");
+        assert!(matches!(
+            handle_ready_device_picker_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            DevicePickerAction::None
+        ));
+        assert_eq!(picker.stage, DevicePickerStage::Models);
+        assert_eq!(
+            picker.matching_models().len(),
+            2,
+            "both concrete variants reuse one behavior Profile"
+        );
+        assert_eq!(device_model_path(&wireless), "AS7230 / Wireless / AS7230-W");
+
+        let selected_model_id = picker.matching_models()[0].id.clone();
+        picker.model_index = 1;
+        assert!(matches!(
+            handle_ready_device_picker_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            DevicePickerAction::Save(SlotDeviceSelection::Model { model_id })
+                if model_id == selected_model_id
+        ));
+    }
+
+    #[test]
+    fn device_picker_can_add_a_concrete_model_under_the_selected_profile() {
+        let binding = device_binding(Some("AS7230v1"), None);
+        let mut picker = DevicePicker::new(
+            "slot-1".into(),
+            vec![profile("AS7230v1")],
+            vec![model("as7230-w", "AS7230-W", &[], "AS7230v1")],
+            &binding,
+        );
+        picker.stage = DevicePickerStage::Models;
+        handle_ready_device_picker_key(
+            &mut picker,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        for character in "AS7230-F4GE".chars() {
+            handle_ready_device_picker_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+
+        assert!(matches!(
+            handle_ready_device_picker_key(
+                &mut picker,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            DevicePickerAction::Save(SlotDeviceSelection::NewModel { model })
+                if model.id == "as7230-f4ge"
+                    && model.display_name == "AS7230-F4GE"
+                    && model.device_profile == "AS7230v1"
+        ));
+    }
+
+    #[test]
+    fn generated_model_ids_are_stable_and_avoid_catalog_collisions() {
+        let existing = vec![model("as7230-w", "AS7230-W", &[], "AS7230v1")];
+        assert_eq!(unique_model_slug("AS7230-W", &existing), "as7230-w-2");
+        assert_eq!(unique_model_slug("新机型", &existing), "model");
+    }
+
+    #[test]
+    fn binding_http_load_never_overwrites_live_websocket_state() {
+        let mut live = snapshot();
+        live.head_seq = 200;
+        live.rx_offset = 8_000;
+        live.tx_offset = 300;
+        live.config.device_profile = Some("new-profile".into());
+        let mut app = App::new(vec![live], None);
+        let mut response = snapshot();
+        response.head_seq = 2;
+        response.rx_offset = 4;
+        response.tx_offset = 1;
+        response.config.device_profile = Some("AS7230v1".into());
+        response.device_model = Some(model(
+            "as7230-w",
+            "AS7230-W",
+            &["AS7230", "Wireless"],
+            "AS7230v1",
+        ));
+        let request_id = Uuid::new_v4();
+        app.device_picker = Some(DevicePickerState::Loading {
+            slot_id: "slot-1".into(),
+            request_id,
+        });
+
+        app.handle_device_binding_event(DeviceBindingEvent::Loaded {
+            slot_id: "slot-1".into(),
+            request_id,
+            profiles: vec![profile("AS7230v1")],
+            models: vec![],
+            binding: Box::new(SlotDeviceBindingResponse {
+                slot: response,
+                config_revision: 9,
+            }),
+        });
+
+        let merged = &app.slots[0].snapshot;
+        assert_eq!(merged.head_seq, 200);
+        assert_eq!(merged.rx_offset, 8_000);
+        assert_eq!(merged.tx_offset, 300);
+        assert_eq!(merged.config.device_profile.as_deref(), Some("new-profile"));
+        assert!(merged.device_model.is_none());
+    }
+
+    #[test]
+    fn device_picker_ignores_a_load_response_from_an_older_open() {
+        let mut app = App::new(vec![snapshot()], None);
+        let old_request = Uuid::new_v4();
+        let current_request = Uuid::new_v4();
+        app.device_picker = Some(DevicePickerState::Loading {
+            slot_id: "slot-1".into(),
+            request_id: current_request,
+        });
+
+        app.handle_device_binding_event(DeviceBindingEvent::Loaded {
+            slot_id: "slot-1".into(),
+            request_id: old_request,
+            profiles: vec![profile("stale")],
+            models: vec![],
+            binding: Box::new(device_binding(Some("stale"), None)),
+        });
+
+        assert!(matches!(
+            app.device_picker,
+            Some(DevicePickerState::Loading { request_id, .. })
+                if request_id == current_request
+        ));
     }
 
     #[test]
@@ -3779,7 +4885,7 @@ mod tests {
     }
 
     #[test]
-    fn max_fire_and_local_timeout_project_stopping_before_terminal_event() {
+    fn max_fire_budget_keeps_observing_when_stop_literal_exists() {
         let mut app = App::new(vec![snapshot()], None);
         let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
         let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
@@ -3806,6 +4912,52 @@ mod tests {
         app.push_event(fire, false, &commands);
         assert_eq!(
             app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Running
+        );
+
+        for (seq, bytes) in [(3, b"rea".as_slice()), (4, b"dy".as_slice())] {
+            let mut rx = event(EventKind::Rx, Direction::Rx, seq, bytes);
+            rx.daemon_epoch = daemon_epoch;
+            app.push_event(rx, false, &commands);
+        }
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Stopping
+        );
+
+        let mut no_match_app = App::new(vec![snapshot()], None);
+        let daemon_epoch = no_match_app.slots[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&no_match_app.slots[0].snapshot, TriggerStatus::Running);
+        trigger.spec.max_fires = 1;
+        trigger.spec.stop_contains.clear();
+        let trigger_id = trigger.id;
+        let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
+        started.daemon_epoch = daemon_epoch;
+        started
+            .metadata
+            .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
+        no_match_app.push_event(started, false, &commands);
+        let mut fire = event(EventKind::Tx, Direction::Tx, 2, b"slp");
+        fire.daemon_epoch = daemon_epoch;
+        fire.metadata
+            .insert("trigger_id".into(), serde_json::json!(trigger_id));
+        fire.metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("action"));
+        fire.metadata
+            .insert("fire_index".into(), serde_json::json!(1));
+        no_match_app.push_event(fire, false, &commands);
+        assert_eq!(
+            no_match_app.slots[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -4725,6 +5877,7 @@ mod tests {
                 settings: SerialSettings::default(),
                 device_profile: None,
             },
+            device_model: None,
             daemon_epoch: Uuid::new_v4(),
             head_seq: 0,
             ring_oldest_seq: None,

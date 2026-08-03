@@ -14,14 +14,15 @@ use axum::routing::{get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
     Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceProfilesRequest,
-    ConfigureDeviceProfilesResponse, ConfigureSlotsRequest, ConfigureSlotsResponse,
-    ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse, CreateMonitorRequest,
-    DaemonDiagnosticsResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
-    EventQueryResponse, HealthResponse, MonitorIncidentListResponse, MonitorIncidentResponse,
-    MonitorListResponse, MonitorOutboxEventResponse, MonitorOutboxListResponse, MonitorResponse,
-    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage, SlotDiagnostics,
-    StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse, UpdateMonitorRequest,
-    encode_control, encode_event,
+    ConfigureDeviceProfilesResponse, ConfigureSlotDeviceBindingRequest, ConfigureSlotsRequest,
+    ConfigureSlotsResponse, ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse,
+    CreateMonitorRequest, DaemonDiagnosticsResponse, DeviceModelListResponse,
+    DeviceProfileListResponse, ErrorCode, EventQuery, EventQueryResponse, HealthResponse,
+    MonitorIncidentListResponse, MonitorIncidentResponse, MonitorListResponse,
+    MonitorOutboxEventResponse, MonitorOutboxListResponse, MonitorResponse, MonitorStatus,
+    PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage, SlotDeviceBindingResponse,
+    SlotDiagnostics, StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse,
+    UpdateMonitorRequest, encode_control, encode_event,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,10 +128,12 @@ impl AppState {
         let applied = self
             .inner
             .registry
-            .apply_replacement(
+            .apply_replacement_with_devices(
                 staged.slots.clone(),
                 staged.transport_profiles.clone(),
                 staged.device_profiles.clone(),
+                staged.device_models.clone(),
+                staged.slot_device_bindings.clone(),
             )
             .await?;
 
@@ -211,10 +214,12 @@ impl AppState {
         let applied = self
             .inner
             .registry
-            .apply_replacement(
+            .apply_replacement_with_devices(
                 staged.slots.clone(),
                 staged.transport_profiles.clone(),
                 staged.device_profiles.clone(),
+                staged.device_models.clone(),
+                staged.slot_device_bindings.clone(),
             )
             .await?;
 
@@ -230,6 +235,62 @@ impl AppState {
                 let revision = staged.config_revision;
                 *self.inner.config.write().await = staged.clone();
                 Ok((staged.transport_profiles, revision))
+            }
+            Err(save) => match applied.rollback().await {
+                Ok(()) => Err(ApiError::Config(save)),
+                Err(rollback) => Err(ApiError::ConfigRollback { save, rollback }),
+            },
+        }
+    }
+
+    async fn configure_slot_device_binding_transaction(
+        &self,
+        slot_id: String,
+        selection: serial_protocol::SlotDeviceSelection,
+        expected_revision: Option<u64>,
+    ) -> Result<(serial_protocol::SlotSnapshot, u64), ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(expected_revision, current.config_revision)?;
+        if !current.slots.iter().any(|slot| slot.id == slot_id) {
+            return Err(ApiError::NotFound(format!("unknown Slot {slot_id:?}")));
+        }
+        let staged = current
+            .staged_with_slot_device_binding(&slot_id, selection)
+            .map_err(ConfigError::from)?;
+        let applied = self
+            .inner
+            .registry
+            .apply_replacement_with_devices(
+                staged.slots.clone(),
+                staged.transport_profiles.clone(),
+                staged.device_profiles.clone(),
+                staged.device_models.clone(),
+                staged.slot_device_bindings.clone(),
+            )
+            .await?;
+
+        match self.inner.config_store.save(&staged) {
+            Ok(()) => {
+                let snapshots = match applied.commit().await {
+                    Ok(snapshots) => snapshots,
+                    Err(commit) => {
+                        return Err(compensate_commit_failure(
+                            &self.inner.config_store,
+                            &current,
+                            commit,
+                        ));
+                    }
+                };
+                let slot = snapshots
+                    .into_iter()
+                    .find(|snapshot| snapshot.config.id == slot_id)
+                    .ok_or_else(|| {
+                        ApiError::Internal("committed Slot binding snapshot is missing".into())
+                    })?;
+                let revision = staged.config_revision;
+                *self.inner.config.write().await = staged;
+                Ok((slot, revision))
             }
             Err(save) => match applied.rollback().await {
                 Ok(()) => Err(ApiError::Config(save)),
@@ -292,6 +353,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/config/device-profiles",
             get(list_device_profiles).put(configure_device_profiles),
+        )
+        .route("/api/v1/config/device-models", get(list_device_models))
+        .route(
+            "/api/v1/slots/{slot_id}/device-binding",
+            get(get_slot_device_binding).put(configure_slot_device_binding),
         )
         .route("/api/v1/archives", get(archives))
         .route("/api/v1/diagnostics", get(diagnostics))
@@ -478,6 +544,66 @@ async fn configure_device_profiles(
     .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
     Ok(Json(ConfigureDeviceProfilesResponse {
         profiles,
+        config_revision,
+    }))
+}
+
+async fn list_device_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceModelListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let config = state.inner.config.read().await;
+    Ok(Json(DeviceModelListResponse {
+        models: config.device_models.clone(),
+        config_revision: config.config_revision,
+    }))
+}
+
+async fn get_slot_device_binding(
+    State(state): State<AppState>,
+    Path(slot_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SlotDeviceBindingResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let _update = state.inner.config_updates.lock().await;
+    let config_revision = state.inner.config.read().await.config_revision;
+    let slot = state
+        .inner
+        .registry
+        .get(&slot_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id:?}")))?
+        .snapshot();
+    Ok(Json(SlotDeviceBindingResponse {
+        slot,
+        config_revision,
+    }))
+}
+
+async fn configure_slot_device_binding(
+    State(state): State<AppState>,
+    Path(slot_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigureSlotDeviceBindingRequest>,
+) -> Result<Json<SlotDeviceBindingResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    // Complete persist/publish or rollback even if the client disconnects
+    // after actors have been staged.
+    let transaction = state.clone();
+    let (slot, config_revision) = tokio::spawn(async move {
+        transaction
+            .configure_slot_device_binding_transaction(
+                slot_id,
+                request.selection,
+                request.expected_revision,
+            )
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::Internal("device binding transaction task failed".into()))??;
+    Ok(Json(SlotDeviceBindingResponse {
+        slot,
         config_revision,
     }))
 }
@@ -1944,6 +2070,81 @@ mod tests {
             write_chunk_size: None,
             write_chunk_delay_ms: None,
         }
+    }
+
+    #[tokio::test]
+    async fn slot_device_binding_commits_model_profile_and_snapshot_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let loaded = store.load_or_create().unwrap();
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let slot = disabled_slot("slot-1", "Slot 1", "COM3");
+        let profile = sigmastar_profile();
+        let mut config = loaded.config.clone();
+        config.slots = vec![slot.clone()];
+        config.device_profiles = vec![profile.clone()];
+        store.save(&config).unwrap();
+        let registry = SlotRegistry::new_with_device_models(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![slot],
+            Vec::new(),
+            vec![profile],
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            ControlLimits::default(),
+        );
+        let state = AppState::new(
+            store.clone(),
+            config.clone(),
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+        let model = serial_protocol::DeviceModel {
+            id: "as7230-w".into(),
+            display_name: "AS7230-W".into(),
+            category_path: vec!["AS7230".into(), "Wi-Fi".into()],
+            device_profile: "sigmastar-evb".into(),
+        };
+
+        let (snapshot, revision) = state
+            .configure_slot_device_binding_transaction(
+                "slot-1".into(),
+                serial_protocol::SlotDeviceSelection::NewModel {
+                    model: model.clone(),
+                },
+                Some(config.config_revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.device_model, Some(model.clone()));
+        assert_eq!(
+            snapshot.config.device_profile.as_deref(),
+            Some("sigmastar-evb")
+        );
+        assert_eq!(snapshot.generation, 0);
+        assert_eq!(revision, config.config_revision + 1);
+
+        let memory = state.inner.config.read().await.clone();
+        let persisted = store.load().unwrap();
+        assert_eq!(memory.device_models, vec![model.clone()]);
+        assert_eq!(persisted.device_models, vec![model]);
+        assert_eq!(
+            persisted
+                .slot_device_bindings
+                .get("slot-1")
+                .map(String::as_str),
+            Some("as7230-w")
+        );
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
     }
 
     #[tokio::test]
