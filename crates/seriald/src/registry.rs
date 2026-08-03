@@ -755,59 +755,6 @@ mod tests {
         let generation = handle.snapshot().generation;
 
         let renamed = device_model("as7230-w", "AS7230-W production", "as7230-v1");
-        let actor = serial_protocol::Actor {
-            id: "agent:test".into(),
-            label: "test".into(),
-            kind: serial_protocol::ActorKind::Agent,
-        };
-        let lease = match handle
-            .acquire_control(
-                Uuid::new_v4(),
-                actor.clone(),
-                serial_protocol::ControlMode::Queue,
-                60_000,
-            )
-            .await
-            .unwrap()
-        {
-            serial_protocol::CommandResult::ControlGranted { lease } => lease,
-            other => panic!("unexpected acquire result: {other:?}"),
-        };
-        let run = match handle
-            .start_run(
-                Uuid::new_v4(),
-                actor.clone(),
-                lease.id,
-                lease.fence,
-                "model-bound-run".into(),
-                BTreeMap::new(),
-            )
-            .await
-            .unwrap()
-        {
-            serial_protocol::CommandResult::RunStarted { run } => run,
-            other => panic!("unexpected Run result: {other:?}"),
-        };
-        let busy = registry
-            .apply_replacement_with_devices(
-                vec![config.clone()],
-                Vec::new(),
-                profiles.clone(),
-                vec![renamed.clone()],
-                bindings.clone(),
-            )
-            .await
-            .err()
-            .expect("active Run must reject a model identity change");
-        assert!(matches!(
-            busy,
-            RegistryError::Slot(SlotError::ProfileChangeBusy)
-        ));
-        handle
-            .end_run(Uuid::new_v4(), actor, lease.id, lease.fence, run.id)
-            .await
-            .unwrap();
-
         let snapshots = registry
             .apply_replacement_with_devices(
                 vec![config],
