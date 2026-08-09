@@ -1,0 +1,15 @@
+# Cross-compilation linkers used by `ci/build.sh package`.
+#
+# Linux Jenkins agent setup example (Debian/Ubuntu):
+#   sudo apt-get install gcc-x86-64-linux-gnu gcc-mingw-w64-x86-64
+#   rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
+#
+# macOS artifacts should be built on a macOS Jenkins agent with Xcode CLT.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "x86_64-linux-gnu-gcc"
+ar = "x86_64-linux-gnu-ar"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
