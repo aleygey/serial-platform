@@ -249,10 +249,10 @@ impl ControlState {
 
     pub fn expire(&mut self, wall_now_ns: i64, monotonic_now: Instant) -> Option<ReleaseOutcome> {
         self.queue.retain(|waiter| monotonic_now < waiter.deadline);
-        if !self
+        if self
             .current
             .as_ref()
-            .is_some_and(|active| monotonic_now >= active.deadline)
+            .is_none_or(|active| monotonic_now < active.deadline)
         {
             return None;
         }
@@ -268,10 +268,10 @@ impl ControlState {
         monotonic_now: Instant,
     ) -> Option<ReleaseOutcome> {
         self.queue.retain(|waiter| waiter.actor.id != actor_id);
-        if !self
+        if self
             .current
             .as_ref()
-            .is_some_and(|active| active.lease.owner.id == actor_id)
+            .is_none_or(|active| active.lease.owner.id != actor_id)
         {
             return None;
         }

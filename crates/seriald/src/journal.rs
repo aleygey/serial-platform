@@ -1991,25 +1991,25 @@ fn cursor_progressed(last_scanned: Option<u64>, after_seq: Option<u64>) -> bool 
 }
 
 fn event_matches_query_scope(event: &TimelineEvent, query: &EventQuery) -> bool {
-    !query
+    query
         .after_wall_time_ns
-        .is_some_and(|after| event.wall_time_ns <= after)
-        && !query
+        .is_none_or(|after| event.wall_time_ns > after)
+        && query
             .before_wall_time_ns
-            .is_some_and(|before| event.wall_time_ns >= before)
-        && !query
+            .is_none_or(|before| event.wall_time_ns < before)
+        && query
             .direction
-            .is_some_and(|direction| event.direction != direction)
-        && !query.kind.is_some_and(|kind| event.kind != kind)
-        && !query.actor_id.as_ref().is_some_and(|actor_id| {
-            event.actor.as_ref().map(|actor| actor.id.as_str()) != Some(actor_id.as_str())
+            .is_none_or(|direction| event.direction == direction)
+        && query.kind.is_none_or(|kind| event.kind == kind)
+        && query.actor_id.as_ref().is_none_or(|actor_id| {
+            event.actor.as_ref().map(|actor| actor.id.as_str()) == Some(actor_id.as_str())
         })
-        && !query
+        && query
             .run_id
-            .is_some_and(|run_id| event.run_id != Some(run_id))
-        && !query
+            .is_none_or(|run_id| event.run_id == Some(run_id))
+        && query
             .operation_id
-            .is_some_and(|operation_id| event.operation_id != Some(operation_id))
+            .is_none_or(|operation_id| event.operation_id == Some(operation_id))
 }
 
 fn event_breaks_stream(kind: serial_protocol::EventKind) -> bool {

@@ -2387,9 +2387,9 @@ impl SlotActor {
         };
         if trigger.pending_terminal.is_some()
             || trigger.write_in_flight.is_some()
-            || !trigger
+            || trigger
                 .next_write_at
-                .is_some_and(|deadline| Instant::now() >= deadline)
+                .is_none_or(|deadline| Instant::now() < deadline)
         {
             return;
         }
