@@ -2519,7 +2519,7 @@ mod tests {
     #[test]
     fn rendered_text_truncation_reduces_command_and_wait_confidence() {
         let rendered_text_truncated = true;
-        let output_truncated = false || rendered_text_truncated;
+        let output_truncated = rendered_text_truncated;
         assert_eq!(
             command_confidence(
                 &Completion::Prompt("]# ".into()),

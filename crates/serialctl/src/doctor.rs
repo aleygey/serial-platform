@@ -134,7 +134,7 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
         );
         println!("Assessment {}", report.assessment);
         if let Some(code) = report.state_code {
-            println!("State code {:?}", code);
+            println!("State code {code:?}");
         }
         if let Some(reason) = &report.state_reason {
             println!("Reason     {}", safe_inline(reason));
@@ -319,7 +319,7 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
             .as_ref()
             .map(|run| format!("{} {:?} {}", run.id, run.status, safe_inline(&run.label)))
             .unwrap_or_else(|| "none".into());
-        println!("Run        {}", run);
+        println!("Run        {run}");
         println!(
             "Trigger    {}",
             slot.active_trigger
@@ -361,7 +361,7 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
             println!("Reason     {}", safe_inline(reason));
         }
         if let Some(code) = slot.state_code {
-            println!("State code {:?}", code);
+            println!("State code {code:?}");
         }
     }
     Ok(())
