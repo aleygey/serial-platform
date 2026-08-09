@@ -1,13 +1,13 @@
 pipeline {
     agent {
-        label 'serial-platform'
+        label 'rust'
     }
 
     stages {
         stage('Checkout') {
             steps {
                 echo 'Checking out serial-platform repository...'
-                git clone 'git@github.com:aleygey/serial-platform.git'
+                sh "git clone 'git@github.com:aleygey/serial-platform.git'"
             }
         }
 
