@@ -28,7 +28,7 @@ pipeline {
             description: '构建、冒烟验证并归档 Release 二进制'
         )
 
-        stringParam(
+        string(
             name: 'PACKAGE_TARGETS',
             defaultValue: 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu',
             description: '在当前 Linux agent 上交叉打包的 Rust target，逗号分隔；Windows 需要 mingw-w64'
@@ -40,13 +40,13 @@ pipeline {
             description: '是否打包 macOS 产物；需要可用的 macOS Jenkins agent'
         )
 
-        stringParam(
+        string(
             name: 'MACOS_AGENT_LABEL',
             defaultValue: 'macos',
             description: '用于构建 macOS 产物的 Jenkins agent label'
         )
 
-        stringParam(
+        string(
             name: 'MACOS_TARGETS',
             defaultValue: 'aarch64-apple-darwin,x86_64-apple-darwin',
             description: 'macOS agent 上构建的 Rust target，逗号分隔'
