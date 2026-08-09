@@ -2948,7 +2948,7 @@ mod tests {
         );
         global.incidents.insert(
             newer_monitor,
-            VecDeque::from([retained_incident(newer_monitor, epoch, 1)]),
+            VecDeque::from([retained_incident(newer_monitor, epoch, 2)]),
         );
 
         prune_one_global_incident(&mut global);
