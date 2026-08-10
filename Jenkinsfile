@@ -135,6 +135,28 @@ pipeline {
             }
         }
 
+        stage('Install Cross Toolchain') {
+            when {
+                expression {
+                    return params.BUILD_RELEASE
+                }
+            }
+
+            steps {
+                script {
+                    def targets = (params.PACKAGE_TARGETS ?: '').tokenize(',').collect { it.trim() }
+                    if (targets.any { it.contains('windows') }) {
+                        sh '''
+                            if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+                                sudo -n apt-get update
+                                sudo -n apt-get install -y gcc-mingw-w64-x86-64
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
         stage('Package Cross Artifacts') {
             when {
                 expression {
