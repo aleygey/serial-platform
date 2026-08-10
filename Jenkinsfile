@@ -30,7 +30,7 @@ pipeline {
 
         string(
             name: 'PACKAGE_TARGETS',
-            defaultValue: 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu',
+            defaultValue: 'x86_64-pc-windows-gnu',
             description: '在当前 Linux agent 上交叉打包的 Rust target，逗号分隔；Windows 需要 mingw-w64'
         )
 

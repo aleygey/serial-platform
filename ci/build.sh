@@ -92,6 +92,18 @@ host_target() {
     rustc -vV | sed -n 's/^host: //p'
 }
 
+ensure_rust_target() {
+    local target="$1"
+
+    [[ "$(host_target)" == "${target}" ]] && return 0
+    if command -v rustup >/dev/null 2>&1; then
+        rustup target add "${target}"
+    else
+        rustc --print target-libdir --target "${target}" >/dev/null 2>&1 \
+            || fail "Rust target is not installed and rustup is unavailable: ${target}"
+    fi
+}
+
 run_package() {
     CURRENT_PHASE="package"
 
@@ -115,6 +127,7 @@ run_package_target() {
     local target="$1"
 
     log "Building release binaries for ${target}"
+    ensure_rust_target "${target}"
     case "${target}" in
         x86_64-unknown-linux-gnu)
             [[ "$(host_target)" == "${target}" ]] || require_command x86_64-linux-gnu-gcc
