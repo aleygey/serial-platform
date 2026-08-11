@@ -18,6 +18,7 @@ use crate::{
         format_event_plain, format_wall_time_local, pad_display, safe_inline, trigger_status_label,
     },
     i18n::{self, Lang, tr, trf},
+    model,
     profile::{self, SAFE_TRANSPORT_NAME},
     tui, ws,
 };
@@ -62,6 +63,8 @@ pub enum Command {
     Setup(SetupArgs),
     /// Manage reusable UART and DUT Profiles.
     Profile(profile::ProfileArgs),
+    /// Manage the hierarchical DUT model catalog and per-Slot assignments.
+    Model(model::ModelArgs),
     /// Print the daemon and Slot state.
     Status(OutputArgs),
     /// Diagnose the saved client connection, ports, stream, storage, or Slot state.
@@ -272,6 +275,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Status(args)) => run_status(&api, args).await,
         Some(Command::Doctor(args)) => run_doctor(&api, &loaded, &resolved, args).await,
         Some(Command::Profile(args)) => profile::run(&api, args).await,
+        Some(Command::Model(args)) => model::run(&api, args).await,
         Some(Command::Archives(args)) => run_archives(&api, args).await,
         Some(Command::Logs(args)) => run_logs(&api, resolved.last_slot, args).await,
         Some(Command::Setup(_)) => unreachable!("handled before resolving configuration"),
@@ -531,7 +535,7 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
     {
         bail!(
             "regular-expression log queries require seriald WebSocket protocol \
-             {PROTOCOL_VERSION}; use the matching v0.4 release or --contains"
+             {PROTOCOL_VERSION}; use matching-version components or --contains"
         );
     }
     let slot_id = match args.slot.or(last_slot) {
@@ -1491,6 +1495,38 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn model_commands_expose_help_and_parse_script_json_modes() {
+        let help = Cli::try_parse_from(["serialctl", "model", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let rendered = help.to_string();
+        for command in ["list", "tree", "add", "update", "attach", "detach"] {
+            assert!(
+                rendered.contains(command),
+                "missing model help for {command}"
+            );
+        }
+
+        let list = Cli::try_parse_from(["serialctl", "model", "list", "--json"]).unwrap();
+        assert!(matches!(list.command, Some(Command::Model(_))));
+
+        let attach = Cli::try_parse_from([
+            "serialctl",
+            "model",
+            "attach",
+            "--slot",
+            "dut-1",
+            "--model",
+            "tl-as7230-w",
+            "--confirm-via",
+            "serial",
+            "--expect-unbound",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(attach.command, Some(Command::Model(_))));
     }
 
     #[test]

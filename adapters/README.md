@@ -22,7 +22,7 @@ command argument. For setup automation, use `--admin-token-file` and
 destination. Setup rejects global `--token-file` and refuses input/output path
 aliases so it cannot overwrite a supplied credential.
 
-Use every component from the same release. v0.5.0 retains WebSocket protocol v3
+Use every component from the same release. v0.6.0 retains WebSocket protocol v3
 from v0.4.0; the existing realtime surface is wire-compatible with v0.4, while
 the Monitor HTTP APIs and MCP tools require v0.5 components. Protocol-v2 builds
 from 0.3.x and protocol-v1 builds from 0.2.x are not compatible with v3.

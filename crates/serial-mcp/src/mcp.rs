@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
+    DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
     MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
     MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
     MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
@@ -21,6 +22,7 @@ use crate::tools::AgentTools;
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records a confirmed assignment through the operator-only binding API; it does not prove identity. Start a Run before writes and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed.";
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -217,6 +219,7 @@ fn request_is_cancellable(request: &RpcRequest) -> bool {
             .and_then(Value::as_str)
             .unwrap_or_default(),
         "devices"
+            | "device_models"
             | "read"
             | "wait"
             | "search"
@@ -245,7 +248,7 @@ async fn dispatch_request(tools: &AgentTools, request: RpcRequest, id: Value) ->
                     "protocolVersion": protocol,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "serial-mcp", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Inspect devices, start a Run before writes, and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed."
+                    "instructions": SERVER_INSTRUCTIONS
                 }),
             )
         }
@@ -314,9 +317,25 @@ fn object(properties: Value, required: &[&str]) -> Value {
 }
 
 fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> Value {
+    // These annotations are safety hints consumed by MCP hosts. Serial writes
+    // can change or reboot a physical DUT, so they must not be advertised as
+    // harmless merely because the adapter itself keeps an audit trail.
+    let destructive = matches!(
+        name,
+        "device_model_set" | "command" | "input" | "signal" | "trigger" | "monitor_stop"
+    );
+    let open_world = matches!(
+        name,
+        "devices" | "read" | "command" | "input" | "signal" | "trigger" | "wait" | "search"
+    );
     json!({
         "name": name, "description": description, "inputSchema": input_schema,
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": false, "idempotentHint": read_only, "openWorldHint": false}
+        "annotations": {
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+            "idempotentHint": read_only,
+            "openWorldHint": open_world
+        }
     })
 }
 
@@ -324,9 +343,37 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "devices",
-            "List authoritative Slots and ownership.",
+            "List Slots, configured model/Profile, and ownership; independently confirm the physical DUT before any connection or write.",
             object(json!({"slot_id":{"type":"string"}}), &[]),
             true,
+        ),
+        tool(
+            "device_models",
+            "Read the model catalog and Slot bindings. Names are not evidence of the physical DUT; on first connection or doubt, verify by serial, telnet, web, or human.",
+            object(json!({"slot_id":{"type":"string"}}), &[]),
+            true,
+        ),
+        tool(
+            "device_model_set",
+            "Assign/create a Slot model or guarded-update its current node; shared edits affect bound Slots. Confirm physical DUT on first connection or doubt via serial, telnet, web, or human.",
+            object(
+                json!({
+                    "slot_id":{"type":"string","minLength":1},
+                    "model_id":{"type":"string","minLength":1,"maxLength":128},
+                    "create_if_missing":{"type":"boolean"},
+                    "update_existing":{"type":"boolean","description":"Guarded patch of this Slot's current node; conflicts with create."},
+                    "name":{"type":"string","minLength":1,"maxLength":128,"description":"Create name or replacement name."},
+                    "parent":{"type":"string","minLength":1,"maxLength":128,"description":"Create/replacement parent ID."},
+                    "clear_parent":{"type":"boolean"},
+                    "aliases":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":128}},
+                    "clear_aliases":{"type":"boolean"},
+                    "expected_current":{"description":"Omit to guard the observed binding; null requires unbound; string requires that model ID.","anyOf":[{"type":"string","minLength":1,"maxLength":128},{"type":"null"}]},
+                    "confirmation_method":{"type":"string","enum":["serial","telnet","web","human","other"],"description":"How the physical DUT identity was confirmed."},
+                    "note":{"type":"string","maxLength":2048}
+                }),
+                &["slot_id", "model_id", "confirmation_method"],
+            ),
+            false,
         ),
         tool(
             "read",
@@ -385,17 +432,17 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "trigger",
-            "Run bounded daemon-side repeated writes and matchers.",
+            "Repeat bounded writes; max_fires limits sends, while configured stop matchers remain armed until match or timeout.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
                     "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
                     "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},
                     "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
-                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS},
-                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
-                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS},
-                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES}
+                    "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS},
+                    "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"description":"Observation continues after max_fires until match or timeout.","items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
+                    "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS},
+                    "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":"Confirmed-action send budget, not an observation cutoff."}
                 }),
                 &["slot_id", "action"],
             ),
@@ -492,7 +539,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_start",
-            "Acquire write control and start an evidence Run.",
+            "Acquire write control and start an evidence Run only after confirming the physical DUT model by serial, telnet, web UI, or a human.",
             object(
                 json!({
                     "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
@@ -545,6 +592,8 @@ mod tests {
             names,
             [
                 "devices",
+                "device_models",
+                "device_model_set",
                 "read",
                 "command",
                 "input",
@@ -565,10 +614,107 @@ mod tests {
     }
 
     #[test]
+    fn agent_guidance_requires_physical_model_confirmation() {
+        for evidence in ["serial evidence", "telnet", "web UI", "human"] {
+            assert!(SERVER_INSTRUCTIONS.contains(evidence));
+        }
+        assert!(SERVER_INSTRUCTIONS.contains("max_fires limits sends"));
+        assert!(SERVER_INSTRUCTIONS.contains("remain armed until match or timeout"));
+        assert!(SERVER_INSTRUCTIONS.contains("not target success or failure"));
+        assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
+
+        let tools = tool_definitions();
+        for name in ["devices", "device_models", "device_model_set", "run_start"] {
+            let description =
+                tools.iter().find(|tool| tool["name"] == name).unwrap()["description"]
+                    .as_str()
+                    .unwrap();
+            assert!(description.contains("physical DUT"));
+            if matches!(name, "device_models" | "device_model_set") {
+                assert!(description.contains("first connection or doubt"));
+                for evidence in ["serial", "telnet", "web", "human"] {
+                    assert!(description.contains(evidence));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn schemas_reject_unknown_arguments() {
         for tool in tool_definitions() {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
+    }
+
+    #[test]
+    fn annotations_do_not_hide_physical_or_persistent_side_effects() {
+        let tools = tool_definitions();
+        for name in [
+            "device_model_set",
+            "command",
+            "input",
+            "signal",
+            "trigger",
+            "monitor_stop",
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(tool["annotations"]["destructiveHint"], true, "{name}");
+        }
+        for name in [
+            "devices", "read", "command", "input", "signal", "trigger", "wait", "search",
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(tool["annotations"]["openWorldHint"], true, "{name}");
+        }
+        let catalog = tools
+            .iter()
+            .find(|tool| tool["name"] == "device_models")
+            .unwrap();
+        assert_eq!(catalog["annotations"]["readOnlyHint"], true);
+        assert_eq!(catalog["annotations"]["destructiveHint"], false);
+        assert_eq!(catalog["annotations"]["openWorldHint"], false);
+    }
+
+    #[test]
+    fn device_model_tools_expose_catalog_read_and_narrow_operator_binding() {
+        let tools = tool_definitions();
+        let read = tools
+            .iter()
+            .find(|tool| tool["name"] == "device_models")
+            .unwrap();
+        assert_eq!(read["annotations"]["readOnlyHint"], true);
+        assert!(read["inputSchema"]["properties"].get("slot_id").is_some());
+
+        let set = tools
+            .iter()
+            .find(|tool| tool["name"] == "device_model_set")
+            .unwrap();
+        assert_eq!(set["annotations"]["readOnlyHint"], false);
+        assert_eq!(
+            set["inputSchema"]["required"],
+            json!(["slot_id", "model_id", "confirmation_method"])
+        );
+        let properties = set["inputSchema"]["properties"].as_object().unwrap();
+        for field in [
+            "create_if_missing",
+            "update_existing",
+            "name",
+            "parent",
+            "clear_parent",
+            "aliases",
+            "clear_aliases",
+            "expected_current",
+            "confirmation_method",
+            "note",
+        ] {
+            assert!(properties.contains_key(field), "missing {field}");
+        }
+        assert_eq!(
+            properties["confirmation_method"]["enum"],
+            json!(["serial", "telnet", "web", "human", "other"])
+        );
+        assert!(properties.get("models").is_none());
+        assert!(properties.get("expected_revision").is_none());
     }
 
     #[test]
@@ -738,6 +884,7 @@ mod tests {
     fn only_read_only_tool_calls_are_cancellable() {
         for name in [
             "devices",
+            "device_models",
             "read",
             "wait",
             "search",
@@ -753,6 +900,7 @@ mod tests {
             }));
         }
         for name in [
+            "device_model_set",
             "command",
             "input",
             "signal",
@@ -794,6 +942,30 @@ mod tests {
         );
         assert!(schema["properties"].get("chunk_size").is_none());
         assert!(schema["properties"].get("inter_char_delay_ms").is_none());
+        assert_eq!(
+            schema["properties"]["interval_ms"]["default"],
+            DEFAULT_TRIGGER_INTERVAL_MS
+        );
+        assert_eq!(
+            schema["properties"]["timeout_ms"]["default"],
+            DEFAULT_TRIGGER_TIMEOUT_MS
+        );
+        assert_eq!(
+            schema["properties"]["max_fires"]["default"],
+            DEFAULT_TRIGGER_MAX_FIRES
+        );
+        assert!(
+            schema["properties"]["max_fires"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("send budget")
+        );
+        assert!(
+            schema["properties"]["stop_contains"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("after max_fires")
+        );
         let serialized = serde_json::to_string(&trigger).unwrap().to_lowercase();
         for forbidden in ["sigmastar", "uboot"] {
             assert!(
@@ -807,9 +979,8 @@ mod tests {
     fn report_tool_definition_json_size() {
         let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
         eprintln!("tool_definition_json_bytes={bytes}");
-        // v0.5 adds five persistent Monitor operations while keeping the
-        // complete 16-tool MCP surface below a bounded prompt cost.
-        assert!(bytes <= 7_800, "tool definitions grew to {bytes} bytes");
+        // Keep the complete 18-tool MCP surface below a bounded prompt cost.
+        assert!(bytes <= 10_000, "tool definitions grew to {bytes} bytes");
         for tool in tool_definitions() {
             assert!(
                 tool["description"].as_str().unwrap().len() <= 180,

@@ -3,6 +3,13 @@ pipeline {
         label 'rust'
     }
 
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+        timeout(time: 90, unit: 'MINUTES')
+    }
+
     parameters {
         booleanParam(
             name: 'RUN_FORMAT_CHECK',
@@ -25,31 +32,13 @@ pipeline {
         booleanParam(
             name: 'BUILD_RELEASE',
             defaultValue: true,
-            description: '构建、冒烟验证并归档 Release 二进制'
+            description: '构建、验证并归档正式 Release 产物'
         )
 
         string(
             name: 'PACKAGE_TARGETS',
-            defaultValue: 'x86_64-pc-windows-gnu',
-            description: '在当前 Linux agent 上交叉打包的 Rust target，逗号分隔；Windows 需要 mingw-w64'
-        )
-
-        booleanParam(
-            name: 'BUILD_MACOS',
-            defaultValue: false,
-            description: '是否打包 macOS 产物；需要可用的 macOS Jenkins agent'
-        )
-
-        string(
-            name: 'MACOS_AGENT_LABEL',
-            defaultValue: 'macos',
-            description: '用于构建 macOS 产物的 Jenkins agent label'
-        )
-
-        string(
-            name: 'MACOS_TARGETS',
-            defaultValue: 'aarch64-apple-darwin,x86_64-apple-darwin',
-            description: 'macOS agent 上构建的 Rust target，逗号分隔'
+            defaultValue: 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu',
+            description: '正式 target，逗号分隔；Linux 由 cargo-zigbuild 固定到 glibc 2.31，Windows 使用 GNU/MinGW-w64 ABI'
         )
     }
 
@@ -61,6 +50,13 @@ pipeline {
     }
 
     stages {
+        stage('Clean checkout') {
+            steps {
+                deleteDir()
+                checkout scm
+            }
+        }
+
         stage('Environment') {
             steps {
                 sh 'ci/build.sh env'
@@ -111,7 +107,7 @@ pipeline {
             }
         }
 
-        stage('Release Build') {
+        stage('Host Release Build') {
             when {
                 expression {
                     return params.BUILD_RELEASE
@@ -123,7 +119,7 @@ pipeline {
             }
         }
 
-        stage('Smoke Test') {
+        stage('Host Smoke Test') {
             when {
                 expression {
                     return params.BUILD_RELEASE
@@ -135,7 +131,7 @@ pipeline {
             }
         }
 
-        stage('Package Cross Artifacts') {
+        stage('Cross-build Release Packages') {
             when {
                 expression {
                     return params.BUILD_RELEASE
@@ -143,55 +139,39 @@ pipeline {
             }
 
             steps {
-                script {
-                    def packageBranches = [:]
-
-                    if (params.PACKAGE_TARGETS?.trim()) {
-                        packageBranches['linux-windows-cross'] = {
-                            sh "ci/build.sh package ${params.PACKAGE_TARGETS}"
-                            archiveArtifacts(
-                                artifacts: 'target/artifacts/*.tar.gz',
-                                allowEmptyArchive: false,
-                                fingerprint: true
-                            )
-                        }
-                    }
-
-                    if (params.BUILD_MACOS) {
-                        packageBranches['macos'] = {
-                            node(params.MACOS_AGENT_LABEL) {
-                                checkout scm
-                                sh "ci/build.sh package ${params.MACOS_TARGETS}"
-                                archiveArtifacts(
-                                    artifacts: 'target/artifacts/*.tar.gz',
-                                    allowEmptyArchive: false,
-                                    fingerprint: true
-                                )
-                            }
-                        }
-                    }
-
-                    if (packageBranches.isEmpty()) {
-                        echo 'No cross package targets enabled.'
-                    } else {
-                        parallel packageBranches
-                    }
+                withEnv(["RELEASE_PACKAGE_TARGETS=${params.PACKAGE_TARGETS}"]) {
+                    sh 'ci/build.sh package "$RELEASE_PACKAGE_TARGETS"'
                 }
+            }
+        }
+
+        stage('Archive Release Packages') {
+            when {
+                expression {
+                    return params.BUILD_RELEASE
+                }
+            }
+
+            steps {
+                archiveArtifacts(
+                    artifacts: 'target/artifacts/*.tar.gz,target/artifacts/*.zip,target/artifacts/SHA256SUMS',
+                    allowEmptyArchive: false,
+                    fingerprint: true
+                )
             }
         }
     }
 
     post {
         success {
-            archiveArtifacts(
-                artifacts: 'target/release/serial,target/release/seriald,target/release/serialctl,target/release/serial-mcp',
-                allowEmptyArchive: true,
-                fingerprint: true
-            )
+            script {
+                def commit = env.GIT_COMMIT ? env.GIT_COMMIT.take(12) : 'unknown'
+                currentBuild.description = "${commit} · x86_64 Linux glibc 2.31 + Windows GNU"
+            }
         }
 
         failure {
-            echo 'Rust CI 构建失败，请检查首个失败的 stage 日志。'
+            echo 'Rust Release 构建失败，请检查首个失败的 stage 日志。'
         }
 
         always {

@@ -120,8 +120,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "ui.input.title.line.queued",
-        " command · QUEUED {} · {} · Ctrl-] d/e/c delete/edit/cancel ",
-        " 命令 · 已排队 {} 条 · {} · Ctrl-] d/e/c 删除/编辑/取消 ",
+        " command · QUEUED {} · {} · Ctrl-] d/e/c/u delete/edit/cancel/select ",
+        " 命令 · 已排队 {} 条 · {} · Ctrl-] d/e/c/u 删除/编辑/取消/选择 ",
     ),
     (
         "ui.input.raw.text",
@@ -136,6 +136,380 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("ui.input.queued.raw", "{} raw byte(s)", "{} 个原始字节"),
     (
+        "ui.input.agent",
+        "Agent is using this serial port · current task: <{}>",
+        "Agent 正在使用，当前正在执行 <{}>",
+    ),
+    (
+        "ui.queue.title",
+        " queued commands · Ctrl-] u then ↑/↓ cards, PgUp/PgDn text, d delete, e edit ",
+        " 排队命令 · Ctrl-] u 后用 ↑/↓ 选卡片，PgUp/PgDn 看全文，d 删除，e 编辑 ",
+    ),
+    (
+        "ui.queue.more",
+        "… {} more visual row(s) · Ctrl-] u to inspect full commands",
+        "… 另有 {} 个视觉行 · Ctrl-] u 查看命令全文",
+    ),
+    (
+        "ui.queue.page",
+        "{} · text rows {}-{}/{} · PgUp/PgDn",
+        "{} · 正文行 {}-{}/{} · PgUp/PgDn",
+    ),
+    ("ui.queue.empty", "<empty command>", "<空命令>"),
+    (
+        "ui.queue.sending",
+        " · SENDING (locked)",
+        " · 发送中（已锁定）",
+    ),
+    // ---- Extensible configuration menu ----
+    ("menu.title", "Serial settings menu", "串口配置总菜单"),
+    ("menu.loading", "loading configuration…", "正在加载配置…"),
+    (
+        "menu.loaded",
+        "configuration catalog loaded",
+        "配置目录已加载",
+    ),
+    (
+        "menu.busy",
+        "a configuration request is still running",
+        "配置请求仍在执行",
+    ),
+    (
+        "menu.io.unavailable",
+        "configuration worker is unavailable",
+        "配置后台任务不可用",
+    ),
+    (
+        "menu.io.full",
+        "configuration request queue is full; retry shortly",
+        "配置请求队列已满；请稍后重试",
+    ),
+    (
+        "menu.io.failed",
+        "configuration request failed: {}",
+        "配置请求失败：{}",
+    ),
+    (
+        "menu.catalog.unavailable",
+        "catalog is not loaded; press r to retry",
+        "目录尚未加载；按 r 重试",
+    ),
+    (
+        "menu.current",
+        "Slot {} · Transport {} · Device {} · Model {}",
+        "槽位 {} · 传输 {} · 设备 {} · 机型 {}",
+    ),
+    ("menu.root.profile", "Profile", "Profile 配置"),
+    ("menu.root.model", "DUT model", "样机机型"),
+    ("menu.root.serial", "Serial port settings", "串口设置"),
+    ("menu.root.help", "Help", "帮助"),
+    (
+        "menu.root.detail",
+        "Enter opens a submenu. Reads are asynchronous; every administrator mutation asks for a one-time in-memory token.",
+        "Enter 进入子菜单。读取异步执行；每次管理员写入都会索取仅驻留内存的一次性令牌。",
+    ),
+    ("menu.profile.title", "Profiles", "Profile"),
+    (
+        "menu.profile.transport",
+        "Transport Profiles (physical UART)",
+        "Transport Profile（物理 UART）",
+    ),
+    (
+        "menu.profile.device",
+        "Device Profiles (prompt/EOL/echo/pacing)",
+        "Device Profile（提示符/EOL/回显/节奏）",
+    ),
+    (
+        "menu.transport.title",
+        "Transport Profiles",
+        "Transport Profile",
+    ),
+    (
+        "menu.transport.new",
+        "+ New and bind safe 115200 8N1 Profile",
+        "+ 新建并绑定安全 115200 8N1 Profile",
+    ),
+    (
+        "menu.transport.new.detail",
+        "Creates one reusable 115200/8N1/no-flow Transport Profile and binds this Slot.",
+        "创建可复用的 115200/8N1/无流控 Transport Profile，并绑定当前槽位。",
+    ),
+    (
+        "menu.transport.bound",
+        "Transport Profile {} bound to the current Slot",
+        "Transport Profile {} 已绑定到当前槽位",
+    ),
+    (
+        "menu.transport.created",
+        "Transport Profile {} created and bound",
+        "Transport Profile {} 已创建并绑定",
+    ),
+    (
+        "menu.transport.missing",
+        "Transport Profile {} no longer exists",
+        "Transport Profile {} 已不存在",
+    ),
+    ("menu.device.title", "Device Profiles", "Device Profile"),
+    (
+        "menu.device.generic",
+        "Generic (unbound)",
+        "Generic（不绑定）",
+    ),
+    (
+        "menu.device.new",
+        "+ Clone current effective device settings and bind",
+        "+ 克隆当前生效设备设置并绑定",
+    ),
+    (
+        "menu.device.clone.detail",
+        "The new Profile clones the current effective prompts, EOL, echo and write pacing; presets change only the named field.",
+        "新 Profile 会克隆当前生效的提示符、EOL、回显和写入节奏；预设仅修改所示字段。",
+    ),
+    (
+        "menu.device.generic.detail",
+        "Unbinds the Device Profile and returns to the Slot's generic compatibility settings.",
+        "解除 Device Profile 绑定，恢复槽位的通用兼容设置。",
+    ),
+    (
+        "menu.device.bound",
+        "Device Profile {} bound to the current Slot",
+        "Device Profile {} 已绑定到当前槽位",
+    ),
+    (
+        "menu.device.generic.bound",
+        "Device Profile unbound; Generic behavior is active",
+        "已解除 Device Profile；当前使用 Generic 行为",
+    ),
+    (
+        "menu.device.created",
+        "Device Profile {} created from effective settings and bound",
+        "Device Profile {} 已从生效设置克隆并绑定",
+    ),
+    (
+        "menu.device.missing",
+        "Device Profile {} no longer exists",
+        "Device Profile {} 已不存在",
+    ),
+    (
+        "menu.device.echo.on",
+        "+ Clone with Echo On",
+        "+ 克隆并设 Echo On",
+    ),
+    (
+        "menu.device.echo.off",
+        "+ Clone with Echo Off",
+        "+ 克隆并设 Echo Off",
+    ),
+    (
+        "menu.device.echo.auto",
+        "+ Clone with Echo Auto (conservative)",
+        "+ 克隆并设 Echo Auto（保守）",
+    ),
+    (
+        "menu.device.eol.cr",
+        "+ Clone with EOL CR",
+        "+ 克隆并设 EOL CR",
+    ),
+    (
+        "menu.device.eol.lf",
+        "+ Clone with EOL LF",
+        "+ 克隆并设 EOL LF",
+    ),
+    (
+        "menu.device.eol.crlf",
+        "+ Clone with EOL CRLF",
+        "+ 克隆并设 EOL CRLF",
+    ),
+    (
+        "menu.device.eol.custom",
+        "+ Clone with custom EOL",
+        "+ 克隆并设自定义 EOL",
+    ),
+    (
+        "menu.profile.exists",
+        "Profile {} already exists; choose another name",
+        "Profile {} 已存在；请选择其他名称",
+    ),
+    ("menu.model.title", "DUT model catalog", "样机机型目录"),
+    (
+        "menu.model.parent.title",
+        "Choose parent model/family",
+        "选择父级机型/系列",
+    ),
+    (
+        "menu.model.add.root",
+        "+ Add root model/family",
+        "+ 新建一级机型/系列",
+    ),
+    (
+        "menu.model.add.child",
+        "+ Add derived child model",
+        "+ 新建二级/衍生机型",
+    ),
+    (
+        "menu.model.no.parent",
+        "add a root model before adding a child",
+        "请先新建一级机型，再添加子级",
+    ),
+    (
+        "menu.model.verify",
+        "Before binding, confirm the real DUT via serial identity output, Telnet, Web UI, or a Human. Enter expands parents and binds leaves; b binds any selected node.",
+        "绑定前请通过串口身份信息、Telnet、Web 页面或人工确认真实样机。Enter 展开父级并绑定叶子；b 可绑定任意所选节点。",
+    ),
+    (
+        "menu.model.confirm.note",
+        "Selected in serialctl TUI after Human verification; reconfirm via serial/Telnet/Web/Human before Agent use",
+        "由人工确认后在 serialctl TUI 选择；Agent 使用前应再经串口/Telnet/Web/人工确认",
+    ),
+    (
+        "menu.model.bound",
+        "model {} bound to the current Slot",
+        "机型 {} 已绑定到当前槽位",
+    ),
+    (
+        "menu.model.created",
+        "model {} created and bound to the current Slot",
+        "机型 {} 已创建并绑定到当前槽位",
+    ),
+    ("menu.serial.title", "Serial port presets", "串口设置预设"),
+    (
+        "menu.serial.current",
+        "Current authoritative Transport Profile: {}",
+        "当前权威 Transport Profile：{}",
+    ),
+    (
+        "menu.serial.baud",
+        "Clone current Profile · baud {}",
+        "克隆当前 Profile · 波特率 {}",
+    ),
+    ("menu.serial.8n1", "Clone · 8N1", "克隆 · 8N1"),
+    ("menu.serial.8e1", "Clone · 8E1", "克隆 · 8E1"),
+    ("menu.serial.8o1", "Clone · 8O1", "克隆 · 8O1"),
+    ("menu.serial.8n2", "Clone · 8N2", "克隆 · 8N2"),
+    (
+        "menu.serial.flow.none",
+        "Clone · flow control None",
+        "克隆 · 无流控",
+    ),
+    (
+        "menu.serial.flow.hardware",
+        "Clone · hardware flow control",
+        "克隆 · 硬件流控",
+    ),
+    ("menu.serial.dtr", "Clone · toggle DTR", "克隆 · 切换 DTR"),
+    ("menu.serial.rts", "Clone · toggle RTS", "克隆 · 切换 RTS"),
+    (
+        "menu.serial.auto",
+        "Clone · toggle auto-open",
+        "克隆 · 切换自动打开",
+    ),
+    (
+        "menu.help.title",
+        "Terminal workflow help",
+        "终端工作流帮助",
+    ),
+    (
+        "menu.help.menu",
+        "Ctrl-] m opens this extensible menu; Up/Down, Enter and Esc navigate it.",
+        "Ctrl-] m 打开此可扩展菜单；使用上下、Enter 和 Esc 导航。",
+    ),
+    (
+        "menu.help.queue",
+        "Ordinary Enter queues a non-empty LINE operation without takeover; Ctrl-] u selects queued cards.",
+        "普通 Enter 会在不接管的情况下排队非空 LINE 操作；Ctrl-] u 选择排队卡片。",
+    ),
+    (
+        "menu.help.enter",
+        "While an Agent Run is active, empty Enter never queues bytes; it only returns output to the live tail.",
+        "Agent Run 活动时，空 Enter 不会排队任何字节，只会让输出回到实时尾部。",
+    ),
+    (
+        "menu.help.cooperative",
+        "Alt+Enter sends direct input bound to the exact matching Agent Run while that Agent keeps its lease.",
+        "Alt+Enter 发送绑定到精确匹配 Agent Run 的协作直写；该 Agent 继续持有租约。",
+    ),
+    (
+        "menu.help.takeover",
+        "Ctrl-] t is the separate explicit takeover path and may abort the Agent's current Run.",
+        "Ctrl-] t 是独立的显式接管路径，可能中止 Agent 当前 Run。",
+    ),
+    (
+        "menu.help.echo",
+        "The dot is local TX projection. With device echo, echo=on plus merge_echo merges exact RX; auto conservatively suppresses nothing, so two copies may appear.",
+        "圆点是本地 TX 投影。设备会回显时，echo=on 配合 merge_echo 才合并精确 RX；auto 保守地不抑制，因此可能显示两份。",
+    ),
+    (
+        "menu.help.model",
+        "Confirm the connected model through serial, Telnet, Web, or a Human before Human or Agent operations.",
+        "人或 Agent 操作前，应通过串口、Telnet、Web 或人工确认当前连接机型。",
+    ),
+    (
+        "menu.help.token",
+        "Administrator tokens are masked, passed only to the asynchronous request, never logged, and never saved.",
+        "管理员令牌会被遮罩，仅传给异步请求，不记录日志，也不保存。",
+    ),
+    (
+        "menu.footer",
+        "↑/↓ select · Enter open/apply · Esc back · r reload",
+        "↑/↓ 选择 · Enter 打开/应用 · Esc 返回 · r 重载",
+    ),
+    (
+        "menu.footer.models",
+        "Enter expand/bind leaf · ←/→ collapse/expand · b bind node · Esc back",
+        "Enter 展开/绑定叶子 · ←/→ 收起/展开 · b 绑定节点 · Esc 返回",
+    ),
+    (
+        "menu.footer.help",
+        "Esc returns to the menu",
+        "Esc 返回菜单",
+    ),
+    (
+        "menu.prompt.admin",
+        "One-time administrator token (masked)",
+        "一次性管理员令牌（已遮罩）",
+    ),
+    (
+        "menu.prompt.transport.name",
+        "New Transport Profile name",
+        "新 Transport Profile 名称",
+    ),
+    (
+        "menu.prompt.device.name",
+        "New Device Profile name",
+        "新 Device Profile 名称",
+    ),
+    (
+        "menu.prompt.model.root",
+        "New root model name",
+        "新一级机型名称",
+    ),
+    (
+        "menu.prompt.model.child",
+        "New derived child model name",
+        "新衍生子机型名称",
+    ),
+    ("menu.prompt.cancelled", "input cancelled", "已取消输入"),
+    (
+        "menu.admin.memory",
+        "Token is masked and used only for this request; it is never saved.",
+        "令牌已遮罩且仅用于本次请求；不会保存。",
+    ),
+    (
+        "menu.admin.required",
+        "administrator token is required",
+        "必须输入管理员令牌",
+    ),
+    (
+        "menu.name.invalid",
+        "name must be non-empty, trimmed, control-free, and at most 128 bytes",
+        "名称必须非空、无首尾空白和控制字符，且不超过 128 字节",
+    ),
+    (
+        "menu.slot.missing",
+        "Slot {} no longer exists",
+        "槽位 {} 已不存在",
+    ),
+    (
         "ui.search.title",
         " history search · Enter accepts · Esc cancels ",
         " 历史搜索 · 回车接受 · Esc 取消 ",
@@ -143,8 +517,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // ---- Bottom help line ----
     (
         "ui.helpline",
-        " Ctrl-] ? help · Alt-1/2 switch · {} · Ctrl-] q quit ",
-        " Ctrl-] ? 帮助 · Alt-1/2 切换 · {} · Ctrl-] q 退出 ",
+        " Ctrl-] m menu · Ctrl-] ? help · Alt-1/2 switch · {} · Ctrl-] q quit ",
+        " Ctrl-] m 菜单 · Ctrl-] ? 帮助 · Alt-1/2 切换 · {} · Ctrl-] q 退出 ",
     ),
     (
         "ui.scroll.prefix",
@@ -201,9 +575,19 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "  输入框右键 / Ctrl-Shift-V      粘贴(右键为 Windows 原生支持)",
     ),
     (
+        "help.menu",
+        "  Ctrl-] m                 open Profile / model / serial settings menu",
+        "  Ctrl-] m                 打开 Profile / 机型 / 串口设置菜单",
+    ),
+    (
         "help.takeover",
         "  Ctrl-] t                 explicit human takeover",
         "  Ctrl-] t                 显式人工接管",
+    ),
+    (
+        "help.cooperative",
+        "  Alt-Enter                direct LINE bound to matching Agent Run; lease stays",
+        "  Alt-Enter                绑定到匹配 Agent Run 的协作直写；租约不变",
     ),
     (
         "help.release",
@@ -217,8 +601,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.queue.edit",
-        "  Ctrl-] e                 return newest queued LINE command to editor",
-        "  Ctrl-] e                 将最新排队 LINE 命令取回编辑框",
+        "  Ctrl-] e                 return newest LINE to editor; Enter requeues at tail",
+        "  Ctrl-] e                 将最新 LINE 取回编辑；Enter 后重新排到队尾",
+    ),
+    (
+        "help.queue.select",
+        "  Ctrl-] u                 select command; ↑/↓ cards, PgUp/PgDn text, d/e",
+        "  Ctrl-] u                 选择命令；↑/↓ 选卡片，PgUp/PgDn 看全文，d/e",
+    ),
+    (
+        "help.queue.behavior",
+        "  ordinary Enter           queue each non-empty LINE; Agent Run empty Enter only follows",
+        "  普通 Enter               每条非空 LINE 独立排队；Agent Run 时空 Enter 仅跟随到底部",
     ),
     (
         "help.follow",
@@ -227,8 +621,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.echo",
-        "  ✓ marker                 confirmed TX and exact device echo were reconciled",
-        "  ✓ 标记                   已确认发送，并与设备精确回显完成对账",
+        "  ● / ✓ marker             local TX / exact RX merged; echo=auto suppresses nothing",
+        "  ● / ✓ 标记               本地 TX / 与精确 RX 合并；echo=auto 不抑制回显",
     ),
     (
         "help.paste",
@@ -252,18 +646,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.line1",
-        "LINE: Enter sends the line plus the Profile EOL (default CR) and",
-        "LINE: 回车发送该行并附加 Profile EOL(默认 CR),",
+        "LINE: Enter queues the line plus Profile EOL without takeover; Alt-Enter",
+        "LINE: Enter 不接管并排队该行及 Profile EOL；Alt-Enter",
     ),
     (
         "help.line2",
-        "returns to the live tail. Up/Down browse history; Ctrl-R starts an",
-        "并回到实时尾部。上/下浏览历史;Ctrl-R 开始",
+        "is cooperative direct input. Both return to the live tail. Up/Down browse",
+        "是协作直写。两者都回到实时尾部。上/下浏览历史；",
     ),
     (
         "help.line3",
-        "incremental history search; Tab completes from history.",
-        "增量历史搜索;Tab 从历史补全。",
+        "history; Ctrl-R searches and Tab completes. Agent Run empty Enter only follows.",
+        "Ctrl-R 搜索、Tab 补全；Agent Run 时空 Enter 仅跟随到底部。",
     ),
     (
         "help.raw1",
@@ -516,8 +910,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.prefix.hint",
-        "command prefix: 1-9 Slot, l/r mode, PgUp/PgDn scroll, t takeover, d/e queued delete/edit, c release/cancel, ? help",
-        "命令前缀: 1-9 Slot, l/r 模式, PgUp/PgDn 滚动, t 接管, d/e 删除/编辑排队命令, c 释放/取消, ? 帮助",
+        "command prefix: 1-9 Slot, m menu, l/r mode, PgUp/PgDn scroll, t takeover, u queue list, d/e newest queue item, c release/cancel, ? help",
+        "命令前缀: 1-9 Slot, m 菜单, l/r 模式, PgUp/PgDn 滚动, t 接管, u 队列列表, d/e 最新排队项, c 释放/取消, ? 帮助",
     ),
     (
         "st.line.mode",
@@ -567,13 +961,48 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.queue.deleted",
-        "newest queued LINE command deleted",
-        "已删除最新一条排队 LINE 命令",
+        "queued LINE command deleted",
+        "已删除所选排队 LINE 命令",
     ),
     (
         "st.queue.restored",
-        "newest queued LINE command returned to the editor",
-        "已将最新一条排队 LINE 命令取回编辑框",
+        "queued LINE command returned to the editor; Enter requeues it at the tail",
+        "已将所选排队 LINE 命令取回编辑框；Enter 后重新排到队尾",
+    ),
+    (
+        "st.queue.select",
+        "queued-command selection: ↑/↓ cards, PgUp/PgDn text, d deletes, e edits (Enter requeues at tail), Esc closes",
+        "排队命令选择：↑/↓ 选卡片，PgUp/PgDn 看全文，d 删除，e 编辑（Enter 后排到队尾），Esc 关闭",
+    ),
+    (
+        "st.queue.select.closed",
+        "queued-command selection closed",
+        "已关闭排队命令选择",
+    ),
+    (
+        "st.agent.enter.follow",
+        "Agent Run is active; empty Enter only resumed live output",
+        "Agent Run 正在执行；空回车仅恢复到底部实时输出",
+    ),
+    (
+        "st.cooperative.unavailable",
+        "cooperative input requires a matching active Agent lease and Run; draft kept",
+        "协作输入要求当前 Agent 租约与活动 Run 匹配；命令草稿已保留",
+    ),
+    (
+        "st.cooperative.sent",
+        "cooperative input sent without takeover",
+        "协作输入已发送，未接管串口",
+    ),
+    (
+        "st.menu.open",
+        "configuration menu opened",
+        "已打开配置菜单",
+    ),
+    (
+        "st.menu.closed",
+        "configuration menu closed",
+        "已关闭配置菜单",
     ),
     (
         "st.clipboard.copied",

@@ -1,5 +1,13 @@
 # Serial Platform Architecture
 
+Reference indexes:
+
+- [Complete transport protocol](./docs/PROTOCOL.md): MCP stdio lifecycle,
+  HTTP routes/roles, WebSocket v3 messages, Control, Runs, Triggers, Profiles,
+  and device-model bindings.
+- [MCP tool catalog](./docs/MCP_TOOLS.md): all current tool schemas, result
+  contracts, safety rules, and the `serial mcp --dump-tools` inspection path.
+
 ## Ownership boundary
 
 This directory is a standalone Rust workspace:
@@ -20,11 +28,11 @@ consume the same platform protocol.
 and journals over HTTP, observes realtime events over WebSocket, and keeps one
 Agent control connection with bounded lease renewal. It can queue for control
 but cannot request takeover, configure/remove a Slot, suspend/close a serial
-handle, or flash a target. Its stable eleven core tools are `devices`, `read`,
-`command`, `input`, `signal`, `trigger`, `wait`, `search`, `run_start`,
-`run_end`, and `release`. Five additive tools—`monitor_start`, `monitor_list`,
-`monitor_status`, `monitor_incidents`, and `monitor_stop`—manage persistent
-Monitor Jobs owned by `seriald`. Internal request IDs, operation IDs,
+handle, or flash a target. Its current registry has 18 tools spanning serial,
+Run, Trigger, Monitor, and independent device-model operations. The
+authoritative schemas are emitted by `tools/list` or
+`serial mcp --dump-tools` and documented in
+[MCP_TOOLS.md](./docs/MCP_TOOLS.md). Internal request IDs, operation IDs,
 control/fencing, lease renewal, prompt selection, capture bounds, cursor
 bookkeeping, Monitor policy, and notification delivery stay inside the adapter
 or daemon instead of becoming routine Agent parameters.
@@ -93,15 +101,15 @@ never retried automatically.
 
 The stdio dispatcher runs independent MCP requests concurrently and serializes
 stdout frames through one writer. MCP/JSON-RPC cancellation applies only to
-the pure observations `devices`, `read`, `wait`, `search`, `monitor_list`,
-`monitor_status`, and `monitor_incidents`. A command, signal, Trigger, Monitor
-mutation, Run transition, or release may already have crossed a side-effect
-boundary, so its task is allowed to converge to an authoritative result even
-when the host cancels or closes stdin; hiding that result could invite an unsafe
-retry. Per-Slot write locks still serialize `command`, `input`, `signal`, and
-`trigger`, so concurrency cannot interleave physical bytes. A long observation
-on one Slot therefore does not prevent another request or lease renewal from
-making progress.
+the pure observations `devices`, `device_models`, `read`, `wait`, `search`,
+`monitor_list`, `monitor_status`, and `monitor_incidents`. A command, signal,
+Trigger, Monitor mutation, Run transition, or release may already have crossed
+a side-effect boundary, so its task is allowed to converge to an authoritative
+result even when the host cancels or closes stdin; hiding that result could
+invite an unsafe retry. Per-Slot write locks still serialize `command`, `input`,
+`signal`, and `trigger`, so concurrency cannot interleave physical bytes. A long
+observation on one Slot therefore does not prevent another request or lease
+renewal from making progress.
 
 `serial-mcp` also keeps a process-local, per-Slot live cursor so a delayed RX
 event cannot fall into the gap between one tool response and the next `wait`
@@ -276,10 +284,9 @@ bounds.
 - An explicit takeover revokes the current owner.
 - A client can withdraw its own queued acquire with `cancel_acquire`; the
   daemon removes only that actor's queue entry and answers
-  `acquire_cancelled { removed }`. `serialctl` keeps queued position/age/input
-  visible and still cancels a queued human command by deliberately
-  reconnecting that actor: all of its queues and controls are released, then
-  its Slot subscriptions attach again.
+  `acquire_cancelled { removed }`. `serialctl` uses that directed request, so
+  cancelling one Slot's queued Human input preserves every other Slot's local
+  command queue and acquire state.
 - `serialctl` renews a human lease only while that Slot has manual activity or
   an in-flight write. It releases the lease after 60 seconds idle; queued human
   input also expires after 60 seconds idle.
@@ -291,8 +298,10 @@ bounds.
   event interval.
 - Agent writes set `expected_run_id`; the Slot actor requires that exact active
   Run to be owned by the writing actor before calculating a pacing budget or
-  entering the port queue. Legacy/human writes may omit the field.
-- A checkpoint is a finer marker inside a Run and is not an Agent tool in v0.5.
+  entering the port queue. Legacy and ordinary non-cooperative Human writes
+  may omit the field; cooperative Human writes must bind it to the exact Agent
+  Run they are intentionally interrupting.
+- A checkpoint is a finer marker inside a Run and is not an Agent tool in v0.6.
 - Run/checkpoint labels must be non-empty, already trimmed, contain no control
   characters, and be at most 256 UTF-8 bytes.
 - Run metadata is limited to 64 top-level keys and 16 KiB of encoded JSON.
@@ -301,11 +310,15 @@ bounds.
 Each request has a UUID. Non-write requests use a bounded actor-scoped cache.
 Writes use a separate result cache keyed by
 `(Slot, daemon_epoch, request_id)`; their stable fingerprint contains bytes,
-`operation_id`, optional `expected_run_id`, and the requested pacing override,
+`operation_id`, optional `expected_run_id`, the requested pacing override, and
+the `cooperative` flag,
 so a recent duplicate can return the same result after a WebSocket reconnect
-issues a new actor and lease. A cache hit still has to present the current
-actor's valid control ID/fence and, when supplied, the same currently active Run
-owned by that actor.
+issues a new actor and lease. A cache hit is still re-authorized. An ordinary
+write must present the current actor's valid Control ID/fence and, when
+supplied, the same active Run owned by that actor. A cooperative write instead
+revalidates the Human declaration, the current same-owner Agent lease and Run,
+its exact `expected_run_id`, and the no-pacing/no-Trigger constraints; its nil
+ordinary lease fields never borrow the Agent fence.
 
 Every write iteration checks an already-signalled port cancellation and an
 already-reached total deadline before polling the driver. Its biased wait order
@@ -337,7 +350,8 @@ arm live byte matchers
 -> optional one-time initial_write kickoff (not a fire)
 -> optional start_contains gate
 -> one bounded action write at a time
--> stop_contains match, timeout, max_fires, cancellation, or invalidation
+-> max_fires stops further writes
+-> stop_contains match, timeout, cancellation, or invalidation ends observation
 ```
 
 All payloads and patterns are exact raw bytes. Matching is literal,
@@ -370,6 +384,15 @@ budget to settle and be audited before the Job reaches its authoritative
 terminal state. Partial or uncertain writes terminate the Job and are never
 retried automatically.
 
+`max_fires` is a confirmed-action send budget rather than an RX-observation
+boundary. Once it is exhausted, no further action write can be scheduled. With
+one or more `stop_contains` literals, the Trigger remains active until a
+literal arrives or the original deadline expires; this lets output produced
+after the final write complete the Job. With no stop literal, exhausting the
+budget terminates immediately as `max_fires_reached`. At the deadline, an
+exhausted budget is reported as `max_fires_reached`; otherwise it is
+`timed_out`.
+
 Trigger requests are rejected unless all of these hard limits hold:
 
 | Field/budget | Allowed value |
@@ -400,9 +423,10 @@ match: it covers terminal status `matched`, `timed_out`, and
 `max_fires_reached`. Consumers must inspect event metadata `status`.
 `matched=true` means only `status=matched`, and `matched_pattern` is the exact
 caller-supplied stop literal that was observed. The compact MCP result reports
-`outcome`, `matched`, confirmed `fires`, `confidence`, bounded `text`,
-truncation/gap, one cursor, and warnings when needed. It does not promote a
-timeout, fire-limit outcome, truncated capture, or gap into success. Agent
+`outcome`, `matched`, confirmed `fires`, `fire_budget`,
+`send_budget_exhausted`, `confidence`, bounded `text`, truncation/gap, one
+cursor, and warnings when needed. It does not promote a timeout, fire-limit
+outcome, truncated capture, or gap into success. Agent
 evidence is strictly clipped to the Trigger's authoritative
 `start_seq..=end_seq`; if Run ownership was lost, the result warns that a new
 Run is required before any further write.
@@ -489,7 +513,8 @@ one compatible consumer, not a seriald dependency: routing to an AgentInstance,
 choosing `reuse_or_create`, resolving a return route, and starting an Agent turn
 remain message-center/adapter responsibilities.
 
-The MCP adapter adds five tools without changing the eleven core tools.
+The current 18-tool MCP registry includes five persistent-Monitor operations
+alongside the serial, Run, Trigger, and device-model operations.
 `monitor_start` returns immediately, `monitor_list`/`monitor_status` show
 authoritative state, `monitor_incidents` returns a 20-item recent tail, starts
 from the oldest retained incident with `after="0"`, or continues cursor-forward,
@@ -497,7 +522,8 @@ and `monitor_stop` stops future detection without deleting
 incidents. The decimal `next_after` value is deliberately opaque to the model.
 If no message center exists, an Agent or user can poll these tools later; if a
 message center exists, the push path can start a new turn while the same pull
-tools remain the recovery and audit path.
+tools remain the recovery and audit path. See
+[MCP_TOOLS.md](./docs/MCP_TOOLS.md) for the complete generated surface.
 
 ## Timeline events
 
@@ -558,17 +584,50 @@ cross-session text mixing. `echo=auto` remains lossless and does not suppress
 RX until an authoritative probe exists. A TX command ending in CR stays on the prompt row;
 if the target responds with text without a newline, the projection commits the
 command first instead of allowing column-zero output to overwrite it. LINE
-multiline paste is queued as separate commands under one Operation ID, while
+multiline paste is queued as separate commands with independent Operation IDs, while
 RAW paste remains an unmodified burst. Adjacent RAW bytes that are still in the
 local unsent queue are coalesced into bounded 4 KiB chunks. This keeps ordinary
 character-at-a-time input from consuming the 16-chunk limit while it waits for
 Control. The 64 KiB aggregate cap is checked before publication of the
 candidate queue, so an over-cap input is explicitly rejected without partially
-appending that input. The input title exposes the queued LINE count and newest
-command preview. `Ctrl-] d` removes the newest queued LINE operation and
-`Ctrl-] e` restores it to the editor, but neither can recall bytes whose
-physical write has started. RAW queues stay byte-exact and are cancelled as a
-whole instead of being converted back to text.
+appending that input. Each queued LINE operation is rendered above the editor as
+an oldest-first numbered card containing the complete command. Text wraps by
+terminal display width, including double-width CJK characters. A short terminal
+shows an explicit selected-card detail viewport; PageUp/PageDown scrolls its
+text instead of silently truncating it. `Ctrl-] d`
+removes the newest queued LINE operation, `Ctrl-] e` restores that newest item
+to the editor, and `Ctrl-] u` opens an Up/Down selector whose `d`/`e` actions can
+remove or restore any card. None can recall bytes whose physical write has
+started. Pressing Enter after editing requeues the restored command at the
+tail, rather than returning it to its former position. RAW queues stay
+byte-exact and are cancelled as a whole instead of
+being converted back to text.
+
+During an Agent Run, empty `Enter` only follows the live tail and never creates
+a write or control request. Non-empty ordinary `Enter` remains the non-takeover
+queue path. `Alt-Enter` sends an explicit `cooperative=true` Human write only
+when the current Agent lease and Run owner match; it does not acquire, revoke,
+or transfer that lease, and it must bind `expected_run_id` to that exact Agent
+Run. `Ctrl-] t` is the distinct takeover path and may abort
+the Agent Run. A cooperative TX is audited under the Human actor with the
+interfered Run/owner in metadata, so overlapping Agent capture is downgraded
+rather than silently treated as isolated evidence.
+
+`Ctrl-] m` opens a reusable overlay state machine with Profile, DUT model,
+serial-settings, and help pages. Configuration I/O runs on a separate async
+command/result channel rather than blocking the terminal key handler. Catalog
+lists use Up/Down/Enter/Esc; model parents must be expanded before indented
+children are shown. Administrator-only mutations collect a masked one-time
+token, keep temporary copies only for that request, drop them afterward, and
+never save it. The serial
+settings page clones the current Transport Profile before changing common UART
+fields, preserving Transport Profiles as the single source of truth.
+
+Output scrollback is measured in wrapped visual rows. The first upward scroll
+freezes the visible row projection, so later RX/TX and CR-in-place updates do not
+move the inspected page. A history shorter than the viewport cannot scroll;
+follow, resize, language, or timeline-detail changes release and rebuild the
+snapshot.
 
 `Ctrl-C` is the one asynchronous interrupt available
 directly in both input modes: LINE discards its unsent draft and sends only ETX
@@ -601,7 +660,7 @@ long wrapped command therefore cannot hide the newest output or prompt while
 follow mode is active. Per-Slot presentation is bounded to 20,000 completed
 rows and 4 MiB. Any front eviction creates persistent truncation state, a
 synthetic oldest-row gap, and a title warning that directs the operator to the
-durable `serial logs` view. Exact repeated RX rows are intentionally not folded in v0.5,
+durable `serial logs` view. Exact repeated RX rows are intentionally not folded in v0.6,
 because hiding their cadence/order would weaken the human monitoring surface.
 Human-readable live and log views include the sanitized actor label and actor
 ID (compact ID in the TUI, full ID in ordinary logs), so Agent, script, and
@@ -616,6 +675,29 @@ The in-memory replay ring is bounded by event count and an estimated resident
 byte size. Its accounting includes raw data, actor/Slot strings, Run and
 Operation IDs, recursively encoded metadata, and map-entry overhead; large
 control metadata therefore cannot bypass the ring's memory ceiling.
+
+## Release construction
+
+Jenkins is the authoritative v0.6.0 release builder. Its ARM64 Linux worker first
+runs the locked workspace tests, Clippy, native release smoke checks, and the
+exact 18-entry `serial-mcp --dump-tools` check. It then builds the two supported
+x86_64 targets independently:
+
+- `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31` produces `serial`,
+  `serialctl`, and `serial-mcp` for Ubuntu 20.04 or newer. Every ELF is checked
+  for x86-64, the expected interpreter, and no GLIBC symbol newer than 2.31.
+- ordinary Cargo plus the MinGW-w64 linker produces `serial.exe`,
+  `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe` for Windows x86_64. This
+  is the GNU ABI, not an MSVC build; every executable is checked as PE32+
+  x86-64 and rejected if it imports an unbundled MinGW runtime DLL.
+
+Both archives contain `README.md`, `DOCUMENTATION.md`, `ROADMAP.md`, `LICENSE`,
+the `docs/` and `adapters/` trees, `BUILD-INFO.json`, and an internal
+`MANIFEST.sha256`. Sorted, normalized-time archives make repeated builds from
+one commit reproducible where the underlying Rust toolchain is deterministic.
+Jenkins also emits archive-level `SHA256SUMS`. GitHub Actions may validate
+development builds manually or on `codex/**`, but tags do not invoke it and it
+does not publish releases, preventing a second publisher from racing Jenkins.
 
 ## Consumer protocol split
 
@@ -645,7 +727,7 @@ dispatch.
 Endpoint: `GET /api/v1/ws`, authenticated by `Authorization: Bearer …`.
 Incoming WebSocket messages and frames are capped at 64 KiB.
 
-v0.5.0 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
+v0.6.0 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
 are wire-compatible for the v3 realtime surface, while the additive Monitor
 HTTP APIs and MCP tools require v0.5 components. Protocol-v2 executables from
 0.3.x and protocol-v1 executables from 0.2.x are not wire-compatible with v3.
@@ -679,8 +761,14 @@ grow connection or control-queue state without limit.
 Writes carry base64 bytes, an optional client-chosen `operation_id`, an optional
 backward-compatible `expected_run_id`, and an optional per-request `pacing`
 override (`chunk_size`, `chunk_delay_ms`) that takes precedence over the Slot
-settings for that one write. New Agent adapters always set `expected_run_id`;
-human and old clients may omit it. Zero-byte writes
+settings for that one write. The additive `cooperative` flag is a Human-only,
+no-takeover injection while one Agent owns both Control and the active Run; it
+requires that Run's `expected_run_id`, preserves the Agent lease, and audits the
+resulting foreign TX as interference. New Agent adapters always set
+`expected_run_id`; ordinary human and old clients may omit it, but cooperative
+writes may not. Actor kind is an Operator-credential-scoped audit/cooperation
+declaration, not independently authenticated proof that a person is operating
+the connection. Zero-byte writes
 are rejected, so clients send at least the line ending. A queued acquire can be
 withdrawn with `cancel_acquire`; the reply is `acquire_cancelled` with a
 `removed` flag, and the request travels through the same per-actor idempotency
@@ -697,8 +785,8 @@ encoding as ordinary writes.
 
 Ctrl-C/D/Z are ordinary one-byte `write` requests. A physical UART Break uses
 `send_break` with a bounded duration because it changes the TX line condition
-rather than transmitting a byte. It requires the same epoch, generation,
-Control ID/fence, Operation ID, and optional expected Run as a write. Success
+rather than transmitting a byte. It requires a current epoch/generation-bound
+Control ID/fence plus an optional Operation ID and expected Run. Success
 creates a `break` timeline event; unsupported drivers return the stable
 `break_unsupported` code.
 
@@ -716,6 +804,9 @@ All endpoints require a role token.
 | `PUT /api/v1/config/transport-profiles` | admin | Validate, persist, and replace the transport catalog |
 | `GET /api/v1/config/device-profiles` | observer | List the device profile catalog |
 | `PUT /api/v1/config/device-profiles` | admin | Validate, persist, and replace the catalog |
+| `GET /api/v1/config/device-models` | observer | List the independent model tree and Slot bindings |
+| `PUT /api/v1/config/device-models` | admin | Validate, persist, and replace the model tree |
+| `PUT /api/v1/slots/{id}/device-model` | operator | Atomically attach/detach a model and optionally create a missing model |
 | `GET /api/v1/archives` | observer | List bounded retained Slot/epoch archives |
 | `GET /api/v1/diagnostics` | observer | Daemon, WebSocket, journal, and per-Slot health |
 | `GET /api/v1/diagnostics/storage` | observer | Journal quota, usage, queue, and logging health |
@@ -725,7 +816,9 @@ All endpoints require a role token.
 | `GET /api/v1/monitors[/{id}]` | observer | List or inspect persistent Monitors |
 | `PUT/DELETE /api/v1/monitors/{id}` | operator | Replace or stop a Monitor |
 | `GET /api/v1/monitors/{id}/incidents` | observer | Read retained incidents with bounded cursor pagination |
+| `POST /api/v1/monitors/{id}/incidents/{incident_id}/ack` | operator | Idempotently acknowledge one incident |
 | `GET /api/v1/monitor-events` | observer | Read the CloudEvents-shaped notification outbox |
+| `POST /api/v1/monitor-events/{outbox_seq}/ack` | operator | Idempotently acknowledge one outbox event |
 | `GET /api/v1/ws` | observer | Realtime protocol; writes require operator |
 
 Config writes run under one mutation gate: validate the full replacement,
@@ -741,12 +834,12 @@ topology. Existing Slot IDs are reconfigured in place: changed/removed ports
 are fully stopped first, unchanged actors keep their sequence/ring/live
 channel, and only genuinely new Slot IDs create new actors.
 
-Status and both Profile-list responses carry one monotonically increasing
-`config_revision`. Every replacement request may carry `expected_revision`;
-a stale value returns `config_revision_mismatch` without staging or saving
-anything. `serial setup` and `serial profile` always read a revision and submit
-it with the mutation, preventing two administrators from silently overwriting
-one another.
+Status, Profile-list responses, and the model catalog carry one monotonically
+increasing `config_revision`. Every replacement request may carry
+`expected_revision`; a stale value returns `config_revision_mismatch` without
+staging or saving anything. `serial setup`, `serial profile`, and `serial model`
+read a revision and submit it with the mutation, preventing two administrators
+from silently overwriting one another.
 
 A Profile catalog can be managed through list/show/create/update/clone/import/
 export/delete commands, followed by Slot-level attach/detach. `update` applies
@@ -769,6 +862,16 @@ The persisted/wire `SlotConfig.profile` field retains its old name but now
 means the Transport Profile binding. `SlotConfig.device_profile` is the
 optional DUT binding. An unbound Device Profile is displayed as `Generic` and
 does not imply model detection.
+
+Device identity is a fourth, independent layer rather than a Device Profile
+parent field. `DeviceModel {id,name,parent_id,aliases}` forms an arbitrary-depth
+display tree, while `SlotModelBinding` records the selected model plus its
+confirmation method, note, update time, and source. Identity changes do not
+change prompts, EOL, echo, pacing, or port lifecycle. The Operator binding API
+supports a three-state `expected_current` guard and an atomic
+create-if-missing-plus-bind operation. A configured name is not proof of the
+physical DUT: Human and Agent workflows must confirm it through serial,
+telnet, the web UI, or a person before relying on the assignment.
 
 An attached `device_profile` is authoritative for Shell/U-Boot prompt
 presence: an omitted prompt remains unset rather than inheriting legacy Slot

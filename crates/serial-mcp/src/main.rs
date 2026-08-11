@@ -14,6 +14,10 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "serial-mcp", version, about = "MCP adapter for seriald")]
 struct Args {
+    /// Print the complete MCP tool definitions as JSON and exit without
+    /// reading credentials or connecting to seriald.
+    #[arg(long)]
+    dump_tools: bool,
     /// serialctl-compatible TOML config path.
     #[arg(long, env = "SERIALCTL_CONFIG")]
     config: Option<PathBuf>,
@@ -38,6 +42,13 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    if args.dump_tools {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&mcp::tool_definitions())?
+        );
+        return Ok(());
+    }
     let actor_label = args.actor_label.trim().to_string();
     if actor_label.is_empty()
         || actor_label.len() > 128
@@ -56,4 +67,18 @@ async fn run() -> Result<()> {
         resolved.capture,
     ))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_tools_needs_no_connection_arguments() {
+        let args = Args::try_parse_from(["serial-mcp", "--dump-tools"]).unwrap();
+        assert!(args.dump_tools);
+        assert!(args.config.is_none());
+        assert!(args.endpoint.is_none());
+        assert!(args.token_file.is_none());
+    }
 }

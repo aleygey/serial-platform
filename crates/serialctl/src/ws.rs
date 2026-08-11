@@ -27,9 +27,10 @@ pub enum NetworkCommand {
         generation: u64,
         message: ClientMessage,
     },
-    /// Close the current actor connection and immediately reconnect. This is
-    /// the v1 escape hatch for cancelling a queued control request because the
-    /// protocol does not yet expose a dedicated cancel-acquire message.
+    /// Close the current actor connection and immediately reconnect. Directed
+    /// queued-control cancellation now uses `CancelAcquire`; retain this
+    /// transport-level recovery hook for future connection-wide faults.
+    #[allow(dead_code)]
     Reconnect {
         reason: String,
     },

@@ -4,17 +4,19 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use serial_protocol::{
-    CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES,
-    DEFAULT_TRIGGER_TIMEOUT_MS, Direction, EchoMode, EventQuery, MAX_BREAK_DURATION_MS,
-    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
-    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
-    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, PROTOCOL_VERSION, SessionState, SlotSnapshot,
-    StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
+    Actor, ActorKind, CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS,
+    DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, DeviceModelListResponse, Direction,
+    EchoMode, EventKind, EventQuery, MAX_BREAK_DURATION_MS, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
+    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
+    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
+    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelConfirmationMethod, PROTOCOL_VERSION,
+    SessionState, SetSlotDeviceModelRequest, SlotSnapshot, StatusResponse, TriggerInfo,
+    TriggerSpec, TriggerStatus, WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -36,6 +38,8 @@ const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
 const TRIGGER_STATUS_MARGIN: Duration =
     Duration::from_millis(MAX_PHYSICAL_WRITE_TIMEOUT_MS + 5_000);
 const TRIGGER_CANCEL_MARGIN: Duration = Duration::from_secs(5);
+const MODEL_BINDING_SOURCE: &str = "agent:serial-mcp";
+const MODEL_IDENTITY_WARNING: &str = "A configured model name is an assignment, not evidence of the connected hardware. On first connection or whenever the identity is uncertain, confirm it via serial evidence, telnet, the device web UI, or a human.";
 
 #[derive(Clone)]
 pub struct AgentTools {
@@ -67,6 +71,8 @@ impl AgentTools {
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
         match name {
             "devices" => self.devices(parse(arguments)?).await,
+            "device_models" => self.device_models(parse(arguments)?).await,
+            "device_model_set" => self.device_model_set(parse(arguments)?).await,
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,
             "input" => self.input(parse(arguments)?).await,
@@ -88,11 +94,18 @@ impl AgentTools {
 
     async fn devices(&self, args: DevicesArgs) -> Result<Value> {
         let status = self.status().await?;
+        let model_catalog = self.api.device_models_if_supported().await?;
         let mut slots: Vec<Value> = status
             .slots
             .iter()
             .filter(|slot| args.slot_id.as_ref().is_none_or(|id| &slot.config.id == id))
-            .map(slot_summary)
+            .map(|slot| {
+                let mut summary = slot_summary(slot);
+                summary["device_model"] = model_catalog.as_ref().map_or(Value::Null, |catalog| {
+                    slot_device_model_summary(&slot.config.id, catalog)
+                });
+                summary
+            })
             .collect();
         disambiguate_display_names(&mut slots);
         if let Some(slot_id) = args.slot_id
@@ -102,8 +115,69 @@ impl AgentTools {
         }
         Ok(json!({
             "daemon_epoch": status.daemon_epoch,
+            "model_config_revision": model_catalog.as_ref().map(|catalog| catalog.config_revision),
+            "device_model_capability": if model_catalog.is_some() { "available" } else { "unavailable" },
             "slots": slots,
-            "selection_note": "Choose a Slot explicitly before writing. A Run isolates only its log/event interval; it does not reset, initialize, or otherwise isolate device state."
+            "selection_note": "Choose a Slot explicitly and confirm that its configured model matches the physical DUT before connecting or writing. Confirm by serial evidence, telnet, the device web UI, or a human; a configured name alone is not proof. A Run isolates only its log/event interval; it does not reset, initialize, or otherwise isolate device state."
+        }))
+    }
+
+    async fn device_models(&self, args: DeviceModelsArgs) -> Result<Value> {
+        if let Some(slot_id) = args.slot_id.as_deref() {
+            // A missing binding is valid for a known Slot, so validate the
+            // filter independently instead of treating an empty result as an
+            // unknown Slot.
+            self.slot(slot_id).await?;
+        }
+        let catalog = self.api.device_models().await?;
+        let bindings = catalog
+            .bindings
+            .into_iter()
+            .filter(|binding| {
+                args.slot_id
+                    .as_deref()
+                    .is_none_or(|slot_id| binding.slot_id == slot_id)
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "config_revision": catalog.config_revision,
+            "models": catalog.models,
+            "bindings": bindings,
+            "slot_id_filter": args.slot_id,
+            "identity_warning": MODEL_IDENTITY_WARNING,
+        }))
+    }
+
+    async fn device_model_set(&self, args: DeviceModelSetArgs) -> Result<Value> {
+        let catalog = self.api.device_models().await?;
+        let observed_previous_model_id = catalog
+            .bindings
+            .iter()
+            .find(|binding| binding.slot_id == args.slot_id)
+            .map(|binding| binding.model_id.clone());
+        let request = build_device_model_set_request(&args, &catalog)?;
+        let response = self
+            .api
+            .set_slot_device_model(&args.slot_id, &request)
+            .await?;
+        let shared_model_warning =
+            (args.update_existing && response.affected_slots.len() > 1).then(|| {
+            format!(
+                "This model node is shared by {} Slots; updated name, parent, or aliases are visible to every affected Slot.",
+                response.affected_slots.len()
+            )
+        });
+        Ok(json!({
+            "slot_id": args.slot_id,
+            "previous_model_id": observed_previous_model_id,
+            "binding": response.binding,
+            "model": response.model,
+            "created": response.created,
+            "affected_slots": response.affected_slots,
+            "shared_model_warning": shared_model_warning,
+            "config_revision": response.config_revision,
+            "identity_warning": MODEL_IDENTITY_WARNING,
+            "next_step": "Before connecting or issuing commands, re-confirm the physical DUT whenever this is its first connection or its identity remains uncertain."
         }))
     }
 
@@ -426,6 +500,7 @@ impl AgentTools {
 
     async fn wait(&self, args: WaitArgs) -> Result<Value> {
         let slot = self.slot_online(&args.slot_id).await?;
+        let watched_run = slot.active_run.as_ref().map(|run| (run.id, run.start_seq));
         let (patterns, until_regex, completion_mode) =
             requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
         let complete_on_quiet = completion_mode == "quiet";
@@ -442,6 +517,10 @@ impl AgentTools {
             self.capture_limits,
         )
         .await?;
+        let capture = match watched_run {
+            Some((run_id, _)) => capture.watch_run(run_id),
+            None => capture,
+        };
         let result = capture
             .collect(CaptureOptions {
                 timeout: seconds(args.timeout_seconds, 10, 1, 120),
@@ -452,6 +531,22 @@ impl AgentTools {
                 allow_empty_quiet: false,
             })
             .await;
+        if let Completion::RunAborted { run_id, reason } = &result.completion {
+            let last_seq = result.through_seq.unwrap_or(started_after_seq);
+            self.remember_live_cursor(
+                &slot.config.id,
+                Cursor {
+                    epoch: started_epoch,
+                    after_seq: last_seq,
+                },
+            );
+            let start_seq = watched_run
+                .filter(|(watched, _)| watched == run_id)
+                .map_or(started_after_seq, |(_, start_seq)| start_seq);
+            return Err(self
+                .run_abort_error(&slot, *run_id, start_seq, reason, true)
+                .await);
+        }
         let rendered = render_events(
             &result.events,
             RenderOptions {
@@ -503,11 +598,12 @@ impl AgentTools {
     async fn command(&self, args: CommandArgs) -> Result<Value> {
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
-        let expected_run_id = slot
+        let active_run = slot
             .active_run
             .as_ref()
-            .map(|run| run.id)
             .context("no active Run; call run_start before command")?;
+        let expected_run_id = active_run.id;
+        let run_start_seq = active_run.start_seq;
         let operation_id = Uuid::new_v4();
         let capture_after_seq = slot.head_seq;
         let cursor = Cursor {
@@ -522,7 +618,8 @@ impl AgentTools {
             cursor,
             self.capture_limits,
         )
-        .await?;
+        .await?
+        .watch_run(expected_run_id);
         let bytes = compose_write_bytes(&args.command, effective_write_eol(&slot))?;
 
         let (patterns, until_regex, completion_mode) =
@@ -533,7 +630,7 @@ impl AgentTools {
         let echo_mode = effective_echo_mode(&slot);
         let expected_echo =
             (matches!(echo_mode, EchoMode::On) && !args.command.is_empty()).then(|| bytes.clone());
-        let write = self
+        let write = match self
             .session
             .write(
                 args.slot_id.clone(),
@@ -542,7 +639,15 @@ impl AgentTools {
                 expected_run_id,
                 effective_write_pacing(&slot),
             )
-            .await?;
+            .await
+        {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(self
+                    .session_run_error(&slot, expected_run_id, run_start_seq, error, true)
+                    .await);
+            }
+        };
         let result = capture
             .collect_after_write(
                 CaptureOptions {
@@ -563,6 +668,19 @@ impl AgentTools {
                 },
             )
             .await;
+        if let Completion::RunAborted { run_id, reason } = &result.completion {
+            let last_seq = result.through_seq.unwrap_or(write.event_seq);
+            self.remember_live_cursor(
+                &slot.config.id,
+                Cursor {
+                    epoch: slot.daemon_epoch,
+                    after_seq: last_seq,
+                },
+            );
+            return Err(self
+                .run_abort_error(&slot, *run_id, run_start_seq, reason, false)
+                .await);
+        }
         let rendered = render_events(
             &result.events,
             RenderOptions {
@@ -666,13 +784,13 @@ impl AgentTools {
     }
 
     async fn send_break(&self, slot: &SlotSnapshot, duration_ms: u64) -> Result<Value> {
-        let expected_run_id = slot
+        let active_run = slot
             .active_run
             .as_ref()
-            .map(|run| run.id)
             .context("no active Run; call run_start before signal")?;
+        let expected_run_id = active_run.id;
         let operation_id = Uuid::new_v4();
-        let sent = self
+        let sent = match self
             .session
             .send_break(
                 slot.config.id.clone(),
@@ -680,7 +798,15 @@ impl AgentTools {
                 operation_id,
                 expected_run_id,
             )
-            .await?;
+            .await
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                return Err(self
+                    .session_run_error(slot, expected_run_id, active_run.start_seq, error, true)
+                    .await);
+            }
+        };
         self.remember_live_cursor(
             &slot.config.id,
             Cursor {
@@ -697,14 +823,14 @@ impl AgentTools {
     }
 
     async fn write_raw(&self, slot: &SlotSnapshot, bytes: Vec<u8>, label: &str) -> Result<Value> {
-        let expected_run_id = slot
+        let active_run = slot
             .active_run
             .as_ref()
-            .map(|run| run.id)
             .context("no active Run; call run_start before input/signal")?;
+        let expected_run_id = active_run.id;
         let operation_id = Uuid::new_v4();
         let byte_count = bytes.len();
-        let write = self
+        let write = match self
             .session
             .write(
                 slot.config.id.clone(),
@@ -713,7 +839,15 @@ impl AgentTools {
                 expected_run_id,
                 effective_write_pacing(slot),
             )
-            .await?;
+            .await
+        {
+            Ok(write) => write,
+            Err(error) => {
+                return Err(self
+                    .session_run_error(slot, expected_run_id, active_run.start_seq, error, true)
+                    .await);
+            }
+        };
         self.remember_live_cursor(
             &slot.config.id,
             Cursor {
@@ -733,11 +867,11 @@ impl AgentTools {
     async fn trigger(&self, args: TriggerArgs) -> Result<Value> {
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
-        let expected_run_id = slot
+        let active_run = slot
             .active_run
             .as_ref()
-            .map(|run| run.id)
             .context("no active Run; call run_start before trigger")?;
+        let expected_run_id = active_run.id;
         if let Some(active) = &slot.active_trigger {
             bail!(
                 "Slot already has Trigger {} in status {:?}; wait for it to finish or cancel it \
@@ -789,7 +923,9 @@ impl AgentTools {
             Err(error) => {
                 let _ = capture_stop.send(None);
                 let _ = capture_task.await;
-                return Err(error);
+                return Err(self
+                    .session_run_error(&slot, expected_run_id, active_run.start_seq, error, true)
+                    .await);
             }
         };
         let started_id = started.id;
@@ -888,6 +1024,7 @@ impl AgentTools {
             .as_deref()
             .map(|pattern| String::from_utf8_lossy(pattern).into_owned());
         let outcome = trigger_status_label(terminal.status);
+        let send_budget_exhausted = trigger_send_budget_exhausted(&terminal);
         let capture_complete = !capture.truncated
             && capture.gaps.is_empty()
             && matches!(&capture.completion, Completion::Signal(_))
@@ -901,11 +1038,22 @@ impl AgentTools {
         } else {
             "high"
         };
+        let takeover_diagnosis = if matches!(
+            terminal.status,
+            TriggerStatus::ControlLost | TriggerStatus::RunLost
+        ) {
+            self.diagnose_run_abort(&slot, expected_run_id, active_run.start_seq)
+                .await
+        } else {
+            None
+        };
         let mut output = json!({
             "slot_id": slot.config.id,
             "outcome": outcome,
             "matched": terminal.status.is_matched(),
             "fires": terminal.fires_confirmed,
+            "fire_budget": terminal.spec.max_fires,
+            "send_budget_exhausted": send_budget_exhausted,
             "confidence": confidence,
             "text": rendered.text,
             "truncated": truncated,
@@ -915,6 +1063,9 @@ impl AgentTools {
         if let Some(matched_pattern) = matched_pattern {
             output["matched_pattern"] = json!(matched_pattern);
         }
+        let confirmed_human_takeover = takeover_diagnosis.as_ref().is_some_and(|diagnosis| {
+            attach_trigger_takeover_diagnosis(&mut output, expected_run_id, diagnosis)
+        });
         let mut warnings = Vec::new();
         if gap {
             warnings.push("RX gap; Trigger evidence is unreliable".to_string());
@@ -929,8 +1080,23 @@ impl AgentTools {
         if !run_ownership_retained {
             warnings.push("MCP no longer owns the Run; start a new Run before writing".to_string());
         }
+        if confirmed_human_takeover {
+            warnings.push(
+                "Human takeover aborted the Run after seriald accepted the Trigger Job; kickoff or action bytes may already have reached the physical DUT (no_bytes_written=false)"
+                    .to_string(),
+            );
+        }
+        if terminal.status.is_matched()
+            && send_budget_exhausted
+            && !terminal.spec.stop_contains.is_empty()
+        {
+            warnings.push(
+                "The stop matcher remained armed after the final permitted action write; no extra action writes were scheduled"
+                    .to_string(),
+            );
+        }
         if !terminal.status.is_matched() {
-            warnings.push(trigger_guidance(terminal.status).to_string());
+            warnings.push(trigger_guidance(&terminal).to_string());
         }
         if !warnings.is_empty() {
             output["warnings"] = json!(warnings);
@@ -1035,7 +1201,7 @@ impl AgentTools {
             "slot_id": args.slot_id,
             "run_id": run.id,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
-            "warning": "Run scopes evidence only; initialize device state explicitly"
+            "warning": "Run scopes evidence only. Before commands, confirm the configured model matches the physical DUT using serial evidence, telnet, web UI, or a human, then initialize device state explicitly."
         }))
     }
 
@@ -1096,6 +1262,139 @@ impl AgentTools {
         Ok(slot)
     }
 
+    async fn diagnose_run_abort(
+        &self,
+        slot: &SlotSnapshot,
+        run_id: Uuid,
+        start_seq: u64,
+    ) -> Option<RunAbortDiagnosis> {
+        let response = self
+            .api
+            .events(
+                &slot.config.id,
+                &EventQuery {
+                    epoch: Some(slot.daemon_epoch),
+                    after_seq: Some(start_seq.saturating_sub(1)),
+                    through_seq: None,
+                    before_wall_time_ns: None,
+                    after_wall_time_ns: None,
+                    direction: None,
+                    kind: Some(EventKind::RunAborted),
+                    actor_id: None,
+                    run_id: Some(run_id),
+                    operation_id: None,
+                    contains: None,
+                    regex: None,
+                    limit_events: Some(8),
+                    limit_bytes: Some(64 * 1024),
+                },
+            )
+            .await
+            .ok()?;
+        let aborted =
+            response.events.iter().rev().find(|event| {
+                event.kind == EventKind::RunAborted && event.run_id == Some(run_id)
+            })?;
+        let abort_seq = aborted.seq;
+        let reason = aborted
+            .metadata
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unspecified")
+            .to_string();
+        let taken_over_by = if reason == "human takeover" {
+            self.api
+                .events(
+                    &slot.config.id,
+                    &EventQuery {
+                        epoch: Some(slot.daemon_epoch),
+                        after_seq: Some(abort_seq),
+                        // Human takeover emits RunAborted, ControlRevoked, then
+                        // ControlGranted in one serialized Slot transition.
+                        through_seq: Some(abort_seq.saturating_add(4)),
+                        before_wall_time_ns: None,
+                        after_wall_time_ns: None,
+                        direction: None,
+                        kind: Some(EventKind::ControlRevoked),
+                        actor_id: None,
+                        run_id: None,
+                        operation_id: None,
+                        contains: None,
+                        regex: None,
+                        limit_events: Some(4),
+                        limit_bytes: Some(32 * 1024),
+                    },
+                )
+                .await
+                .ok()
+                .and_then(|response| {
+                    response.events.into_iter().find_map(|event| {
+                        event.actor.filter(|actor| actor.kind == ActorKind::Human)
+                    })
+                })
+        } else {
+            None
+        };
+        Some(RunAbortDiagnosis {
+            reason,
+            taken_over_by,
+        })
+    }
+
+    async fn run_abort_error(
+        &self,
+        slot: &SlotSnapshot,
+        run_id: Uuid,
+        start_seq: u64,
+        observed_reason: &str,
+        no_bytes_written: bool,
+    ) -> anyhow::Error {
+        let diagnosis = self
+            .diagnose_run_abort(slot, run_id, start_seq)
+            .await
+            .unwrap_or_else(|| RunAbortDiagnosis {
+                reason: observed_reason.to_string(),
+                taken_over_by: None,
+            });
+        anyhow!(format_run_abort_error(
+            &slot.config.id,
+            run_id,
+            &diagnosis,
+            no_bytes_written,
+        ))
+    }
+
+    async fn session_run_error(
+        &self,
+        slot: &SlotSnapshot,
+        run_id: Uuid,
+        start_seq: u64,
+        error: anyhow::Error,
+        no_bytes_written: bool,
+    ) -> anyhow::Error {
+        if !error_indicates_run_or_control_loss(&error) {
+            return error;
+        }
+        if let Some(diagnosis) = self.diagnose_run_abort(slot, run_id, start_seq).await {
+            return anyhow!(format_run_abort_error(
+                &slot.config.id,
+                run_id,
+                &diagnosis,
+                no_bytes_written,
+            ));
+        }
+        anyhow!(
+            "human_takeover_or_control_revoked: Slot {:?} Run {} lost fenced serial control; \
+             taken_over_by=unknown; run_id={}; no_bytes_written={}; start a new Run only after \
+             the current owner releases control and the DUT model/state is reconfirmed: {}",
+            slot.config.id,
+            run_id,
+            run_id,
+            no_bytes_written,
+            error
+        )
+    }
+
     fn live_cursor(&self, slot_id: &str) -> Option<Cursor> {
         self.live_cursors
             .lock()
@@ -1125,6 +1424,77 @@ impl AgentTools {
             .clone();
         lock.lock_owned().await
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunAbortDiagnosis {
+    reason: String,
+    taken_over_by: Option<Actor>,
+}
+
+fn format_run_abort_error(
+    slot_id: &str,
+    run_id: Uuid,
+    diagnosis: &RunAbortDiagnosis,
+    no_bytes_written: bool,
+) -> String {
+    let taken_over_by = diagnosis
+        .taken_over_by
+        .as_ref()
+        .map(|actor| format!("{} ({})", actor.label, actor.id))
+        .unwrap_or_else(|| "unknown".into());
+    let code = if diagnosis.reason == "human takeover" {
+        "human_takeover"
+    } else {
+        "run_aborted"
+    };
+    format!(
+        "{code}: Slot {slot_id:?} Run {run_id} was aborted; reason={:?}; \
+         taken_over_by={taken_over_by:?}; run_id={run_id}; \
+         no_bytes_written={no_bytes_written}; start a new Run only after the current owner \
+         releases control and the DUT model/state is reconfirmed",
+        diagnosis.reason,
+    )
+}
+
+/// Add a machine-readable diagnosis to an already accepted Trigger Job.
+///
+/// Unlike a rejected write request, a Trigger can have emitted its kickoff or
+/// one or more actions before ownership loss became terminal. Consequently the
+/// stable diagnostic must never claim that zero physical bytes were written.
+fn attach_trigger_takeover_diagnosis(
+    output: &mut Value,
+    run_id: Uuid,
+    diagnosis: &RunAbortDiagnosis,
+) -> bool {
+    if diagnosis.reason != "human takeover" {
+        return false;
+    }
+    output["abort_diagnosis"] = json!({
+        "code": "human_takeover",
+        "reason": diagnosis.reason,
+        "taken_over_by": diagnosis.taken_over_by.as_ref(),
+        "run_id": run_id,
+        "no_bytes_written": false,
+    });
+    true
+}
+
+fn error_indicates_run_or_control_loss(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    [
+        "human_takeover_or_control_revoked",
+        "ControlRequired",
+        "StaleFence",
+        "expected Run boundary is no longer valid",
+        "does not own an active Run",
+        "lost the control lease",
+        "control renewal failed",
+        "Run boundary is no longer valid",
+        "can no longer be trusted",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1426,6 +1796,7 @@ fn completion_kind(completion: &Completion) -> &'static str {
         Completion::Regex(_) => "regex",
         Completion::Quiet => "quiet",
         Completion::Signal(_) => "signal",
+        Completion::RunAborted { .. } => "run_aborted",
         Completion::Timeout => "timeout",
         Completion::Disconnected(_) => "disconnected",
     }
@@ -1439,7 +1810,12 @@ fn command_confidence(
     echo_missing: bool,
     rx_event_count: usize,
 ) -> &'static str {
-    if has_gap || matches!(completion, Completion::Disconnected(_)) {
+    if has_gap
+        || matches!(
+            completion,
+            Completion::Disconnected(_) | Completion::RunAborted { .. }
+        )
+    {
         "unreliable"
     } else if output_truncated {
         "partial"
@@ -1463,7 +1839,12 @@ fn capture_confidence(
     output_truncated: bool,
     has_gap: bool,
 ) -> &'static str {
-    if has_gap || matches!(completion, Completion::Disconnected(_)) {
+    if has_gap
+        || matches!(
+            completion,
+            Completion::Disconnected(_) | Completion::RunAborted { .. }
+        )
+    {
         "unreliable"
     } else if output_truncated {
         "partial"
@@ -1487,29 +1868,36 @@ fn attach_capture_warnings(
     echo_missing: bool,
     no_rx: bool,
 ) {
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     if gap {
-        warnings.push("RX gap; evidence is incomplete");
+        warnings.push("RX gap; evidence is incomplete".into());
     }
     if capture_truncated {
-        warnings.push("capture hit its hard limit");
+        warnings.push("capture hit its hard limit".into());
     }
     if text_truncated {
-        warnings.push("text was summarized");
+        warnings.push("text was summarized".into());
     }
     if interfered {
-        warnings.push("another actor wrote during capture");
+        warnings.push("another actor wrote during capture".into());
     }
     if echo_missing {
-        warnings.push("configured echo missing; target delivery may be incomplete");
+        warnings.push("configured echo missing; target delivery may be incomplete".into());
     }
     if no_rx {
-        warnings.push("no post-boundary RX observed");
+        warnings.push("no post-boundary RX observed".into());
     }
     match completion {
-        Completion::Quiet => warnings.push("quiet is not proof of command completion"),
-        Completion::Timeout => warnings.push("completion boundary not observed before timeout"),
-        Completion::Disconnected(_) => warnings.push("capture disconnected before completion"),
+        Completion::Quiet => warnings.push("quiet is not proof of command completion".into()),
+        Completion::Timeout => {
+            warnings.push("completion boundary not observed before timeout".into())
+        }
+        Completion::Disconnected(_) => {
+            warnings.push("capture disconnected before completion".into())
+        }
+        Completion::RunAborted { reason, .. } => {
+            warnings.push(format!("active Run was aborted: {reason}"))
+        }
         _ => {}
     }
     if !warnings.is_empty() {
@@ -1790,15 +2178,30 @@ fn trigger_status_label(status: TriggerStatus) -> &'static str {
     }
 }
 
-fn trigger_guidance(status: TriggerStatus) -> &'static str {
-    match status {
+fn trigger_send_budget_exhausted(trigger: &TriggerInfo) -> bool {
+    trigger.fires_confirmed >= trigger.spec.max_fires
+}
+
+fn trigger_guidance(trigger: &TriggerInfo) -> &'static str {
+    match trigger.status {
         TriggerStatus::Matched => {
             "A caller-supplied stop literal was observed in live RX. This confirms only the \
              Trigger boundary, not that a later flashing or debug workflow succeeded."
         }
-        TriggerStatus::TimedOut | TriggerStatus::MaxFiresReached => {
-            "No stop literal was observed before the hard Trigger bound. Inspect this bounded \
-             capture/current Run before deciding whether a different action is safe."
+        TriggerStatus::TimedOut => {
+            "The observation deadline elapsed without a stop match. Confirmed TX proves only \
+             that bytes were accepted by the serial driver, not that the target action failed. \
+             Inspect this capture/current Run before changing parameters or retrying."
+        }
+        TriggerStatus::MaxFiresReached if !trigger.spec.stop_contains.is_empty() => {
+            "The action send budget was exhausted, then seriald kept observing until the \
+             original deadline without a stop match. Confirmed TX is not proof that the target \
+             action failed; inspect TX/RX and current device state before any retry."
+        }
+        TriggerStatus::MaxFiresReached => {
+            "No stop literal was configured, so exhausting the action send budget completed \
+             this Trigger. That proves neither target success nor target failure; inspect the \
+             resulting state instead of blindly retrying."
         }
         TriggerStatus::Cancelled => {
             "The Trigger was cancelled and reached an authoritative terminal state; no future \
@@ -1912,8 +2315,141 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
     })
 }
 
+fn slot_device_model_summary(slot_id: &str, catalog: &DeviceModelListResponse) -> Value {
+    let Some(binding) = catalog
+        .bindings
+        .iter()
+        .find(|binding| binding.slot_id == slot_id)
+    else {
+        return Value::Null;
+    };
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| model.id == binding.model_id);
+    json!({
+        "id": binding.model_id.as_str(),
+        "name": model.map(|model| model.name.as_str()),
+        "parent_id": model.and_then(|model| model.parent_id.as_deref()),
+        "aliases": model.map(|model| model.aliases.as_slice()).unwrap_or(&[]),
+        "confirmation_method": binding.confirmation_method,
+        "confirmation_note": binding.note.as_deref(),
+        "confirmed_wall_time_ns": binding.updated_wall_time_ns,
+        "source": binding.source.as_str(),
+    })
+}
+
 fn actor_summary(actor: &serial_protocol::Actor) -> Value {
     json!({"id": actor.id, "label": actor.label, "kind": actor.kind})
+}
+
+fn build_device_model_set_request(
+    args: &DeviceModelSetArgs,
+    catalog: &DeviceModelListResponse,
+) -> Result<SetSlotDeviceModelRequest> {
+    if args.model_id.is_empty() {
+        bail!("model_id must not be empty");
+    }
+    if args.create_if_missing && args.update_existing {
+        bail!("create_if_missing and update_existing are mutually exclusive");
+    }
+    let observed_current = catalog
+        .bindings
+        .iter()
+        .find(|binding| binding.slot_id == args.slot_id)
+        .map(|binding| binding.model_id.clone());
+    if args.create_if_missing {
+        if args.name.is_none() {
+            bail!("name is required when create_if_missing=true");
+        }
+        if args.clear_parent || args.clear_aliases {
+            bail!("clear_parent and clear_aliases require update_existing=true");
+        }
+    } else if args.update_existing {
+        if !catalog.models.iter().any(|model| model.id == args.model_id) {
+            bail!("cannot update unknown device model {:?}", args.model_id);
+        }
+        if observed_current.as_deref() != Some(args.model_id.as_str()) {
+            bail!(
+                "update_existing may only modify the model currently bound to Slot {:?}; observed {:?}",
+                args.slot_id,
+                observed_current
+            );
+        }
+        if args.parent.is_some() && args.clear_parent {
+            bail!("parent and clear_parent are mutually exclusive");
+        }
+        if !args.aliases.is_empty() && args.clear_aliases {
+            bail!("aliases and clear_aliases are mutually exclusive");
+        }
+        if args.name.is_none()
+            && args.parent.is_none()
+            && !args.clear_parent
+            && args.aliases.is_empty()
+            && !args.clear_aliases
+        {
+            bail!(
+                "update_existing requires at least one of name, parent, clear_parent, aliases, or clear_aliases"
+            );
+        }
+    } else if args.name.is_some()
+        || args.parent.is_some()
+        || args.clear_parent
+        || !args.aliases.is_empty()
+        || args.clear_aliases
+    {
+        bail!("model definition fields require create_if_missing=true or update_existing=true");
+    } else if !catalog.models.iter().any(|model| model.id == args.model_id) {
+        bail!(
+            "unknown device model {:?}; call device_models or set create_if_missing=true",
+            args.model_id
+        );
+    }
+
+    if let Some(expected_current) = args.expected_current.as_ref()
+        && expected_current.as_deref() != observed_current.as_deref()
+    {
+        bail!(
+            "Slot {:?} model binding changed: expected {:?}, observed {:?}; inspect device_models \
+             and re-confirm the physical DUT before retrying",
+            args.slot_id,
+            expected_current,
+            observed_current,
+        );
+    }
+    // Even when the caller omits expected_current, guard the PUT with the
+    // binding observed in the immediately preceding catalog read. Together
+    // with expected_revision this prevents an Agent from overwriting a Human
+    // correction made concurrently.
+    let expected_current = args
+        .expected_current
+        .clone()
+        .unwrap_or_else(|| observed_current.clone());
+    Ok(SetSlotDeviceModelRequest {
+        model_id: Some(args.model_id.clone()),
+        create_if_missing: args.create_if_missing,
+        update_existing: args.update_existing,
+        name: args.name.clone(),
+        parent_id: args.parent.clone(),
+        clear_parent: args.clear_parent,
+        aliases: args.aliases.clone(),
+        clear_aliases: args.clear_aliases,
+        confirmation_method: Some(args.confirmation_method),
+        note: args.note.clone(),
+        source: MODEL_BINDING_SOURCE.into(),
+        expected_revision: Some(catalog.config_revision),
+        expected_current: Some(expected_current),
+    })
+}
+
+fn deserialize_present_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Keep display names usable as identifiers: an empty name falls back to the
@@ -1942,6 +2478,33 @@ fn disambiguate_display_names(slots: &mut [Value]) {
 #[serde(deny_unknown_fields)]
 struct DevicesArgs {
     slot_id: Option<String>,
+}
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DeviceModelsArgs {
+    slot_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceModelSetArgs {
+    slot_id: String,
+    model_id: String,
+    #[serde(default)]
+    create_if_missing: bool,
+    #[serde(default)]
+    update_existing: bool,
+    name: Option<String>,
+    parent: Option<String>,
+    #[serde(default)]
+    clear_parent: bool,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    clear_aliases: bool,
+    confirmation_method: ModelConfirmationMethod,
+    note: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    expected_current: Option<Option<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2061,6 +2624,170 @@ struct ReleaseArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn device_model_catalog() -> DeviceModelListResponse {
+        DeviceModelListResponse {
+            models: vec![serial_protocol::DeviceModel {
+                id: "tl-as7230".into(),
+                name: "TL-AS7230".into(),
+                parent_id: None,
+                aliases: vec!["7230".into()],
+            }],
+            bindings: vec![serial_protocol::SlotModelBinding {
+                slot_id: "bench".into(),
+                model_id: "tl-as7230".into(),
+                confirmation_method: ModelConfirmationMethod::Human,
+                note: Some("operator checked label".into()),
+                updated_wall_time_ns: 1,
+                source: "human:serialctl".into(),
+            }],
+            config_revision: 9,
+        }
+    }
+
+    #[test]
+    fn device_summary_exposes_the_confirmed_model_binding() {
+        let catalog = device_model_catalog();
+        let summary = slot_device_model_summary("bench", &catalog);
+        assert_eq!(summary["id"], "tl-as7230");
+        assert_eq!(summary["name"], "TL-AS7230");
+        assert_eq!(summary["aliases"], json!(["7230"]));
+        assert_eq!(summary["confirmation_method"], "human");
+        assert_eq!(summary["confirmation_note"], "operator checked label");
+        assert!(slot_device_model_summary("unbound", &catalog).is_null());
+    }
+
+    #[test]
+    fn device_model_set_preserves_expected_current_tristate() {
+        let omitted: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "model_id": "tl-as7230",
+            "confirmation_method": "serial"
+        }))
+        .unwrap();
+        assert_eq!(omitted.expected_current, None);
+
+        let unbound: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "model_id": "tl-as7230",
+            "confirmation_method": "human",
+            "expected_current": null
+        }))
+        .unwrap();
+        assert_eq!(unbound.expected_current, Some(None));
+
+        let exact: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "model_id": "tl-as7230",
+            "confirmation_method": "web",
+            "expected_current": "old-model"
+        }))
+        .unwrap();
+        assert_eq!(exact.expected_current, Some(Some("old-model".into())));
+    }
+
+    #[test]
+    fn device_model_set_uses_observed_revision_and_binding_guards() {
+        let catalog = device_model_catalog();
+        let args: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "model_id": "tl-as7230",
+            "confirmation_method": "serial",
+            "note": "confirmed from boot banner"
+        }))
+        .unwrap();
+        let request = build_device_model_set_request(&args, &catalog).unwrap();
+        assert_eq!(request.expected_revision, Some(9));
+        assert_eq!(request.expected_current, Some(Some("tl-as7230".into())));
+        assert_eq!(
+            request.confirmation_method,
+            Some(ModelConfirmationMethod::Serial)
+        );
+        assert_eq!(request.source, MODEL_BINDING_SOURCE);
+
+        let mismatch: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "model_id": "tl-as7230",
+            "confirmation_method": "human",
+            "expected_current": null
+        }))
+        .unwrap();
+        let error = build_device_model_set_request(&mismatch, &catalog)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected None"));
+        assert!(error.contains("re-confirm the physical DUT"));
+    }
+
+    #[test]
+    fn device_model_set_maps_create_fields_without_catalog_admin_access() {
+        let catalog = device_model_catalog();
+        let args: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench-2",
+            "model_id": "tl-as7230-w",
+            "create_if_missing": true,
+            "name": "TL-AS7230-W",
+            "parent": "tl-as7230",
+            "aliases": ["7230-W"],
+            "confirmation_method": "telnet",
+            "expected_current": null,
+            "note": "confirmed from telnet identity output"
+        }))
+        .unwrap();
+        let request = build_device_model_set_request(&args, &catalog).unwrap();
+        assert_eq!(request.parent_id.as_deref(), Some("tl-as7230"));
+        assert_eq!(request.aliases, vec!["7230-W".to_string()]);
+        assert_eq!(request.expected_current, Some(None));
+        assert_eq!(request.expected_revision, Some(9));
+        assert_eq!(request.model_id.as_deref(), Some("tl-as7230-w"));
+
+        let serialized = serde_json::to_value(request).unwrap();
+        assert!(serialized.get("models").is_none());
+        assert_eq!(serialized["create_if_missing"], true);
+    }
+
+    #[test]
+    fn device_model_set_updates_only_the_exact_current_model_with_guards() {
+        let catalog = device_model_catalog();
+        let args: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "model_id": "tl-as7230",
+            "update_existing": true,
+            "name": "TL-AS7230 rev2",
+            "clear_aliases": true,
+            "confirmation_method": "web"
+        }))
+        .unwrap();
+        let request = build_device_model_set_request(&args, &catalog).unwrap();
+        assert!(request.update_existing);
+        assert_eq!(request.expected_revision, Some(9));
+        assert_eq!(request.expected_current, Some(Some("tl-as7230".into())));
+        assert_eq!(request.name.as_deref(), Some("TL-AS7230 rev2"));
+        assert!(request.clear_aliases);
+
+        let wrong_slot: DeviceModelSetArgs = serde_json::from_value(json!({
+            "slot_id": "unbound",
+            "model_id": "tl-as7230",
+            "update_existing": true,
+            "name": "wrong",
+            "confirmation_method": "human"
+        }))
+        .unwrap();
+        assert!(
+            build_device_model_set_request(&wrong_slot, &catalog)
+                .unwrap_err()
+                .to_string()
+                .contains("only modify the model currently bound")
+        );
+    }
+
+    #[test]
+    fn device_model_results_warn_that_configuration_is_not_evidence() {
+        assert!(MODEL_IDENTITY_WARNING.contains("not evidence"));
+        for method in ["serial", "telnet", "web UI", "human"] {
+            assert!(MODEL_IDENTITY_WARNING.contains(method));
+        }
+    }
 
     #[test]
     fn empty_command_is_allowed_when_eol_contributes_bytes() {
@@ -2401,6 +3128,33 @@ mod tests {
     }
 
     #[test]
+    fn trigger_guidance_separates_send_budget_from_observation() {
+        let with_stop = test_terminal_trigger(
+            TriggerStatus::MaxFiresReached,
+            DEFAULT_TRIGGER_MAX_FIRES,
+            vec![b"prompt".to_vec()],
+        );
+        assert!(trigger_send_budget_exhausted(&with_stop));
+        let guidance = trigger_guidance(&with_stop);
+        assert!(guidance.contains("send budget was exhausted"));
+        assert!(guidance.contains("kept observing until the original deadline"));
+        assert!(guidance.contains("not proof"));
+
+        let without_stop = test_terminal_trigger(
+            TriggerStatus::MaxFiresReached,
+            DEFAULT_TRIGGER_MAX_FIRES,
+            Vec::new(),
+        );
+        let guidance = trigger_guidance(&without_stop);
+        assert!(guidance.contains("No stop literal was configured"));
+        assert!(guidance.contains("instead of blindly retrying"));
+
+        let timed_out = test_terminal_trigger(TriggerStatus::TimedOut, 1, vec![b"ready".to_vec()]);
+        assert!(!trigger_send_budget_exhausted(&timed_out));
+        assert!(trigger_guidance(&timed_out).contains("observation deadline"));
+    }
+
+    #[test]
     fn trigger_rejects_empty_or_unbounded_payload_plans() {
         let empty: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
@@ -2513,6 +3267,88 @@ mod tests {
                 1,
             ),
             "medium"
+        );
+    }
+
+    #[test]
+    fn human_takeover_error_has_stable_machine_readable_fields() {
+        let run_id = Uuid::new_v4();
+        let message = format_run_abort_error(
+            "bench",
+            run_id,
+            &RunAbortDiagnosis {
+                reason: "human takeover".into(),
+                taken_over_by: Some(Actor {
+                    id: "human:operator-1".into(),
+                    label: "operator-1".into(),
+                    kind: ActorKind::Human,
+                }),
+            },
+            true,
+        );
+        assert!(message.starts_with("human_takeover:"));
+        assert!(message.contains("taken_over_by=\"operator-1 (human:operator-1)\""));
+        assert!(message.contains(&format!("run_id={run_id}")));
+        assert!(message.contains("no_bytes_written=true"));
+        assert!(message.contains("DUT model/state is reconfirmed"));
+
+        for diagnostic in [
+            "human_takeover_or_control_revoked: taken_over_by=unknown",
+            "seriald StaleFence (retryable=false)",
+            "seriald ControlRequired (retryable=false)",
+        ] {
+            assert!(error_indicates_run_or_control_loss(&anyhow!(diagnostic)));
+        }
+        assert!(!error_indicates_run_or_control_loss(&anyhow!(
+            "ordinary serial I/O error"
+        )));
+    }
+
+    #[test]
+    fn accepted_trigger_takeover_has_structured_diagnosis_without_zero_write_claim() {
+        let run_id = Uuid::new_v4();
+        let actor = Actor {
+            id: "human:operator-1".into(),
+            label: "operator-1".into(),
+            kind: ActorKind::Human,
+        };
+        let mut output = json!({"outcome": "control_lost"});
+        assert!(attach_trigger_takeover_diagnosis(
+            &mut output,
+            run_id,
+            &RunAbortDiagnosis {
+                reason: "human takeover".into(),
+                taken_over_by: Some(actor.clone()),
+            },
+        ));
+        assert_eq!(output["abort_diagnosis"]["code"], "human_takeover");
+        assert_eq!(output["abort_diagnosis"]["taken_over_by"], json!(actor));
+        assert_eq!(output["abort_diagnosis"]["run_id"], json!(run_id));
+        assert_eq!(output["abort_diagnosis"]["no_bytes_written"], false);
+
+        let mut non_human = json!({"outcome": "run_lost"});
+        assert!(!attach_trigger_takeover_diagnosis(
+            &mut non_human,
+            run_id,
+            &RunAbortDiagnosis {
+                reason: "control lease expired".into(),
+                taken_over_by: None,
+            },
+        ));
+        assert!(non_human.get("abort_diagnosis").is_none());
+    }
+
+    #[test]
+    fn aborted_capture_is_never_reported_as_successful_evidence() {
+        let completion = Completion::RunAborted {
+            run_id: Uuid::new_v4(),
+            reason: "human takeover".into(),
+        };
+        assert_eq!(completion_kind(&completion), "run_aborted");
+        assert_eq!(capture_confidence(&completion, false, false), "unreliable");
+        assert_eq!(
+            command_confidence(&completion, false, false, false, false, 1),
+            "unreliable"
         );
     }
 
@@ -2683,6 +3519,44 @@ mod tests {
             "logging": "healthy"
         }))
         .unwrap()
+    }
+
+    fn test_terminal_trigger(
+        status: TriggerStatus,
+        fires_confirmed: u32,
+        stop_contains: Vec<Vec<u8>>,
+    ) -> TriggerInfo {
+        TriggerInfo {
+            id: Uuid::from_u128(30),
+            owner: Actor {
+                id: "agent:test".into(),
+                label: "test".into(),
+                kind: ActorKind::Agent,
+            },
+            daemon_epoch: Uuid::nil(),
+            generation: 1,
+            control_id: Uuid::from_u128(31),
+            fence: 1,
+            operation_id: Some(Uuid::from_u128(32)),
+            expected_run_id: Some(Uuid::from_u128(33)),
+            spec: TriggerSpec {
+                initial_write: None,
+                start_contains: None,
+                action: b"x".to_vec(),
+                interval_ms: DEFAULT_TRIGGER_INTERVAL_MS,
+                stop_contains,
+                timeout_ms: DEFAULT_TRIGGER_TIMEOUT_MS,
+                max_fires: DEFAULT_TRIGGER_MAX_FIRES,
+                pacing: None,
+            },
+            status,
+            start_seq: 1,
+            end_seq: Some(5),
+            last_write_seq: Some(3),
+            fires_confirmed,
+            tx_bytes_confirmed: fires_confirmed as u64,
+            matched_pattern: None,
+        }
     }
 
     #[test]

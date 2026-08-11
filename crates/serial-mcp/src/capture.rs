@@ -3,8 +3,8 @@ use std::{collections::VecDeque, time::Duration};
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
-    ActorKind, ClientMessage, Cursor, PROTOCOL_VERSION, ServerMessage, Subscription, TimelineEvent,
-    WireFrame, decode_wire_frame, encode_client_control,
+    ActorKind, ClientMessage, Cursor, EventKind, PROTOCOL_VERSION, ServerMessage, Subscription,
+    TimelineEvent, WireFrame, decode_wire_frame, encode_client_control,
 };
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -26,6 +26,7 @@ pub struct Capture {
     truncated: bool,
     gaps: Vec<String>,
     limits: CaptureLimits,
+    watched_run_id: Option<Uuid>,
 }
 
 pub struct CaptureOptions {
@@ -150,6 +151,7 @@ pub enum Completion {
     Regex(String),
     Quiet,
     Signal(String),
+    RunAborted { run_id: Uuid, reason: String },
     Timeout,
     Disconnected(String),
 }
@@ -163,6 +165,9 @@ impl Completion {
             Self::Regex(pattern) => format!("regex:{pattern}"),
             Self::Quiet => "quiet".into(),
             Self::Signal(signal) => format!("signal:{signal}"),
+            Self::RunAborted { run_id, reason } => {
+                format!("run_aborted:{run_id}:{reason}")
+            }
             Self::Timeout => "timeout".into(),
             Self::Disconnected(reason) => format!("disconnected:{reason}"),
         }
@@ -241,6 +246,7 @@ impl Capture {
             truncated: false,
             gaps: Vec::new(),
             limits,
+            watched_run_id: None,
         };
         loop {
             match capture.next().await? {
@@ -250,6 +256,16 @@ impl Capture {
                 Frame::Other => {}
             }
         }
+    }
+
+    /// End an observation as soon as the authoritative timeline says that the
+    /// Run it belongs to was aborted. This is especially important for human
+    /// takeover: otherwise a prompt/regex wait can sit until its ordinary
+    /// timeout and hide the actual ownership change from the Agent.
+    #[must_use]
+    pub fn watch_run(mut self, run_id: Uuid) -> Self {
+        self.watched_run_id = Some(run_id);
+        self
     }
 
     pub async fn collect(self, options: CaptureOptions) -> CaptureResult {
@@ -340,11 +356,15 @@ impl Capture {
         let attached_events: Vec<_> = self.events.drain(..).collect();
         self.retained_bytes = 0;
         for event in attached_events {
+            let run_aborted = run_abort_completion(&event, self.watched_run_id);
             let accepted = match &mut boundary {
                 Some(boundary) => boundary.accept(event),
                 None => AcceptedEvents::single(event),
             };
             self.observe_accepted(accepted, &mut watcher, &mut rolling);
+            if let Some(completion) = run_aborted {
+                return self.finish(completion, boundary);
+            }
         }
 
         loop {
@@ -356,11 +376,15 @@ impl Capture {
             match tokio::time::timeout_at(watcher.wake_at(), self.next()).await {
                 Ok(Ok(Frame::Event(event))) => {
                     let event = *event;
+                    let run_aborted = run_abort_completion(&event, self.watched_run_id);
                     let accepted = match &mut boundary {
                         Some(boundary) => boundary.accept(event),
                         None => AcceptedEvents::single(event),
                     };
                     self.observe_accepted(accepted, &mut watcher, &mut rolling);
+                    if let Some(completion) = run_aborted {
+                        return self.finish(completion, boundary);
+                    }
                 }
                 Ok(Ok(Frame::Gap(gap))) => self.gaps.push(gap),
                 Ok(Ok(Frame::Ready | Frame::Other)) => {}
@@ -507,6 +531,20 @@ impl Capture {
             command_boundary,
         }
     }
+}
+
+fn run_abort_completion(event: &TimelineEvent, watched_run_id: Option<Uuid>) -> Option<Completion> {
+    let run_id = event.run_id?;
+    if event.kind != EventKind::RunAborted || watched_run_id != Some(run_id) {
+        return None;
+    }
+    let reason = event
+        .metadata
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unspecified")
+        .to_string();
+    Some(Completion::RunAborted { run_id, reason })
 }
 
 struct AcceptedEvents {
@@ -1135,6 +1173,35 @@ mod tests {
             metadata: Default::default(),
             durable: true,
         }
+    }
+
+    #[test]
+    fn watched_run_abort_is_an_immediate_reasoned_completion() {
+        let run_id = Uuid::new_v4();
+        let mut aborted = event(42, Direction::None, b"", None);
+        aborted.kind = EventKind::RunAborted;
+        aborted.run_id = Some(run_id);
+        aborted
+            .metadata
+            .insert("reason".into(), serde_json::json!("human takeover"));
+
+        assert_eq!(
+            run_abort_completion(&aborted, Some(run_id)),
+            Some(Completion::RunAborted {
+                run_id,
+                reason: "human takeover".into(),
+            })
+        );
+        let completion = Completion::RunAborted {
+            run_id,
+            reason: "human takeover".into(),
+        };
+        assert!(
+            !completion.is_complete(),
+            "an aborted Run is a failure, not successful capture completion"
+        );
+        assert_eq!(run_abort_completion(&aborted, Some(Uuid::new_v4())), None);
+        assert_eq!(run_abort_completion(&aborted, None), None);
     }
 
     #[test]

@@ -247,6 +247,22 @@ impl ControlState {
             .saturating_duration_since(monotonic_now))
     }
 
+    /// Returns the monotonic time remaining on whichever lease is current.
+    ///
+    /// This intentionally does not authorize a caller. It is used only after
+    /// another policy check has established an explicit relationship to the
+    /// current owner, such as a Human cooperative write into an Agent Run.
+    pub fn current_remaining_ttl(&self, monotonic_now: Instant) -> Result<Duration, ControlError> {
+        let current = self.current.as_ref().ok_or(ControlError::NotOwner)?;
+        if current.lease.epoch != self.daemon_epoch || current.lease.generation != self.generation {
+            return Err(ControlError::StaleFence);
+        }
+        if monotonic_now >= current.deadline {
+            return Err(ControlError::Expired);
+        }
+        Ok(current.deadline.saturating_duration_since(monotonic_now))
+    }
+
     pub fn expire(&mut self, wall_now_ns: i64, monotonic_now: Instant) -> Option<ReleaseOutcome> {
         self.queue.retain(|waiter| monotonic_now < waiter.deadline);
         if self
@@ -574,12 +590,20 @@ mod tests {
             Duration::from_millis(75)
         );
         assert_eq!(
+            state.current_remaining_ttl(near_expiry).unwrap(),
+            Duration::from_millis(75)
+        );
+        assert_eq!(
             state.remaining_ttl(
                 "a",
                 lease.id,
                 lease.fence,
                 started + Duration::from_millis(MIN_TTL_MS),
             ),
+            Err(ControlError::Expired)
+        );
+        assert_eq!(
+            state.current_remaining_ttl(started + Duration::from_millis(MIN_TTL_MS),),
             Err(ControlError::Expired)
         );
     }

@@ -1,12 +1,13 @@
-name: Release
+# Jenkins is the authoritative release builder, and GitHub Releases receives
+# only its verified artifacts. This workflow validates portable builds on
+# demand and on Codex branches; tags deliberately do not trigger it.
+name: Release validation (non-publishing)
 
 on:
   workflow_dispatch:
   push:
     branches:
       - "codex/**"
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -16,18 +17,20 @@ env:
 
 jobs:
   verify:
-    name: Verify release metadata
+    name: Verify locked workspace metadata
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Match tag to Cargo version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          test "v${version}" = "${GITHUB_REF_NAME}"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Verify Cargo.lock
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
   windows:
     name: Windows x86_64
@@ -42,6 +45,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
 
       - name: Test workspace
         run: cargo test --workspace --locked
@@ -68,7 +73,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           $version = (Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-          $packageName = "serial-platform-v${version}-windows-x86_64"
+          $packageName = "serial-platform-v${version}-windows-x86_64-msvc-validation"
           $packageDir = Join-Path "dist" $packageName
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           Copy-Item "target\release\seriald.exe" $packageDir
@@ -76,6 +81,7 @@ jobs:
           Copy-Item "target\release\serial-mcp.exe" $packageDir
           Copy-Item "target\release\serial.exe" $packageDir
           Copy-Item "adapters" $packageDir -Recurse
+          Copy-Item "docs" $packageDir -Recurse
           Copy-Item "README.md" $packageDir
           Copy-Item "DOCUMENTATION.md" $packageDir
           Copy-Item "ROADMAP.md" $packageDir
@@ -94,7 +100,7 @@ jobs:
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: windows-x86_64
+          name: windows-x86_64-msvc-validation
           path: dist/*.zip
           if-no-files-found: error
           retention-days: 7
@@ -119,6 +125,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
 
       - name: Test workspace natively
         run: cargo test --workspace --locked
@@ -161,13 +169,13 @@ jobs:
       - name: Package Ubuntu baseline clients
         run: |
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          package_name="serial-platform-v${version}-linux-x86_64-ubuntu20.04"
+          package_name="serial-platform-v${version}-linux-x86_64-ubuntu20.04-validation"
           package_dir="dist/${package_name}"
           mkdir -p "${package_dir}"
           install -m 0755 target/release/serialctl "${package_dir}/serialctl"
           install -m 0755 target/release/serial-mcp "${package_dir}/serial-mcp"
           install -m 0755 target/release/serial "${package_dir}/serial"
-          cp -r README.md DOCUMENTATION.md ROADMAP.md LICENSE adapters "${package_dir}/"
+          cp -r README.md DOCUMENTATION.md ROADMAP.md LICENSE adapters docs "${package_dir}/"
           tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
           mkdir -p dist/smoke
           tar -C dist/smoke -xzf "dist/${package_name}.tar.gz"
@@ -180,37 +188,7 @@ jobs:
       - name: Upload Linux package
         uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64-ubuntu20.04
+          name: linux-x86_64-ubuntu20.04-validation
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
-
-  publish:
-    name: Publish GitHub Release
-    needs: [windows, linux]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download release packages
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Create checksums
-        run: |
-          cd dist
-          sha256sum *.zip *.tar.gz > SHA256SUMS
-
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}" dist/*
-          --repo "${GITHUB_REPOSITORY}"
-          --verify-tag
-          --title "Serial Platform ${GITHUB_REF_NAME}"
-          --generate-notes

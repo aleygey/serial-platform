@@ -743,6 +743,16 @@ impl SessionState {
                      start a new Run before writing"
                 )
             }
+            Err(error) if is_control_loss_rejection(&error) => {
+                self.disconnect();
+                bail!(
+                    "human_takeover_or_control_revoked: serial control for Run \
+                     {expected_run_id} was revoked before renewal completed; \
+                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true; \
+                     start a new Run only after the current owner releases control and the DUT \
+                     model/state is reconfirmed: {error}"
+                )
+            }
             Err(error) => {
                 self.disconnect();
                 bail!(
@@ -780,6 +790,15 @@ impl SessionState {
         match self.call(request).await {
             Ok(CommandResult::TriggerStarted { trigger }) => Ok(*trigger),
             Ok(other) => bail!("unexpected trigger-start result: {other:?}"),
+            Err(error) if is_control_loss_rejection(&error) => {
+                self.disconnect();
+                bail!(
+                    "human_takeover_or_control_revoked: serial control for Run \
+                     {expected_run_id} was revoked before Trigger {request_id} was accepted; \
+                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true: \
+                     {error}"
+                )
+            }
             Err(error) if error.downcast_ref::<DaemonRequestError>().is_some() => bail!(
                 "seriald rejected Trigger start request {request_id} (operation {operation_id}) \
                  before accepting a Job: {error}"
@@ -825,6 +844,15 @@ impl SessionState {
                     "seriald rejected Break request {request_id} (operation {operation_id}) \
                      because the expected Run boundary is no longer valid. Start a new Run \
                      before retrying: {error}"
+                )
+            }
+            Err(error) if is_control_loss_rejection(&error) => {
+                self.disconnect();
+                bail!(
+                    "human_takeover_or_control_revoked: serial control for Run \
+                     {expected_run_id} was revoked before Break {request_id} reached the port; \
+                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true: \
+                     {error}"
                 )
             }
             Err(error) => bail!(
@@ -946,6 +974,9 @@ impl SessionState {
             // Agent tools never override Slot/Device pacing. The effective
             // value is used only for the local RPC deadline below.
             pacing: None,
+            // Cooperative injection is Human-only. Agent writes always use
+            // the ordinary fenced owner path.
+            cooperative: false,
         };
         let rpc_timeout = write_request_timeout(
             match &request {
@@ -963,6 +994,16 @@ impl SessionState {
                     "seriald rejected write request {request_id} (operation {operation_id}) \
                      because the expected Run boundary is no longer valid; no bytes reached the \
                      serial port. Start a new Run before retrying: {error}"
+                )
+            }
+            Err(error) if is_control_loss_rejection(&error) => {
+                self.disconnect();
+                bail!(
+                    "human_takeover_or_control_revoked: serial control for Run \
+                     {expected_run_id} was revoked before write {request_id} reached the port; \
+                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true; \
+                     start a new Run only after the current owner releases control and the DUT \
+                     model/state is reconfirmed: {error}"
                 )
             }
             Err(error) if is_definite_prewrite_rejection(&error) => bail!(
@@ -1310,6 +1351,14 @@ fn is_definite_prewrite_rejection(error: &anyhow::Error) -> bool {
     let Some(error) = error.downcast_ref::<DaemonRequestError>() else {
         return false;
     };
+    // These authorization checks happen before seriald calls the physical
+    // writer, so their retry safety does not depend on daemon prose.
+    if matches!(
+        error.code,
+        ErrorCode::ControlRequired | ErrorCode::StaleFence
+    ) {
+        return true;
+    }
     let explicitly_unwritten = error.message.contains("(no bytes were written)");
     explicitly_unwritten
         && ((error.code == ErrorCode::BadRequest
@@ -1321,6 +1370,17 @@ fn is_definite_prewrite_rejection(error: &anyhow::Error) -> bool {
                     || error
                         .message
                         .starts_with("serial write expected active Run "))))
+}
+
+fn is_control_loss_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DaemonRequestError>()
+        .is_some_and(|error| {
+            matches!(
+                error.code,
+                ErrorCode::ControlRequired | ErrorCode::StaleFence
+            )
+        })
 }
 
 fn is_expected_run_rejection(error: &anyhow::Error) -> bool {
@@ -1425,6 +1485,7 @@ mod tests {
             operation_id: Some(Uuid::nil()),
             expected_run_id: Some(Uuid::nil()),
             pacing: None,
+            cooperative: false,
         };
         assert_eq!(request_timeout(&write, None), Duration::from_secs(20));
         assert_eq!(
@@ -1504,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_no_byte_write_rejections_are_safe_to_retry() {
+    fn definite_prewrite_rejections_are_safe_to_retry() {
         let pacing = daemon_error(
             ErrorCode::BadRequest,
             false,
@@ -1535,6 +1596,12 @@ mod tests {
         );
         assert!(is_expected_run_rejection(&run));
         assert!(is_definite_prewrite_rejection(&run));
+
+        for code in [ErrorCode::ControlRequired, ErrorCode::StaleFence] {
+            let revoked = daemon_error(code, false, "lease is no longer current".into());
+            assert!(is_control_loss_rejection(&revoked));
+            assert!(is_definite_prewrite_rejection(&revoked));
+        }
 
         let partial = daemon_error(
             ErrorCode::Conflict,

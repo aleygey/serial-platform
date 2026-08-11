@@ -36,6 +36,9 @@ primitives.
   retained by v0.5.
 - **Released in v0.5.0**: persistent serial Monitor Jobs and their additive
   MCP/notification surfaces.
+- **Released in v0.6.0**: in-terminal Profile/model/serial configuration,
+  stable scrollback and Human/Agent command coexistence, plus independent
+  Agent-visible model binding and a verified Jenkins release matrix.
 - **Next**: practical validation or refinement work, not yet complete.
 - **Later / candidate**: retained options with no delivery promise.
 
@@ -109,6 +112,20 @@ primitives.
 - WebSocket protocol remains v3. The Monitor surface is additive HTTP/MCP, so
   protocol-v3 v0.4 peers remain wire-compatible for existing realtime features;
   Monitor use requires v0.5 seriald and adapter components.
+
+### Released in v0.6.0
+
+- An independent, arbitrary-depth `DeviceModel` tree and guarded per-Slot
+  binding record model identity without changing Device Profile behavior.
+  Confirmation method, source, note, and timestamp are retained explicitly;
+  a configured name alone is never treated as physical-DUT proof.
+- A Human may submit an audited cooperative write into the exact active Agent
+  Run without acquiring or revoking its lease. Ordinary Human queueing and
+  explicit takeover remain separate paths, and foreign TX is exposed as Agent
+  evidence interference.
+- Directed acquire cancellation preserves unrelated Slot queues and controls.
+  Run aborts caused by Human takeover carry an explicit reason so an Agent can
+  distinguish takeover from transport or generic cancellation failure.
 
 ### Next
 
@@ -198,6 +215,24 @@ primitives.
   while preserving the existing console workflow. The first Monitor release
   does not add Monitor policy or message-center routing to the human TUI.
 
+### Released in v0.6.0
+
+- `Ctrl-] m` opens an extensible menu for Transport/Device Profiles,
+  arbitrary-depth DUT models, common serial settings, and help. Hierarchical
+  model children remain indented and hidden until their parent is expanded;
+  CLI management uses the same catalogs and optimistic revision guards.
+- Scrollback freezes a wrapped visual-row snapshot when the operator leaves
+  the live tail. Later output cannot push the inspected page, and a history
+  shorter than the viewport cannot scroll into blank rows.
+- Queued LINE commands render as oldest-first numbered cards and can be edited
+  or removed individually. Empty Enter follows the live tail, ordinary Enter
+  queues without takeover, Alt-Enter requests a cooperative Human write, and
+  explicit takeover remains a visibly separate operation.
+- Jenkins produces the official x86_64 packages from one ARM64 Linux worker:
+  cargo-zigbuild enforces the Ubuntu 20.04/glibc-2.31 ceiling and MinGW-w64
+  produces the Windows GNU-ABI archive. Architecture, version, MCP tool count,
+  manifests, and archive checksums are verified before publication.
+
 ### Next
 
 - Validate selection, wrapped/wide-character rows, high-rate output, queued
@@ -276,6 +311,18 @@ primitives.
 - The same tools work without a message center by pull polling. When seriald's
   optional CloudEvents sink is configured, an external message center can
   initiate a new Agent turn while MCP remains the recovery/audit path.
+
+### Released in v0.6.0
+
+- `device_models` and `device_model_set` extend the registry to 18 tools. The
+  first reads the hierarchy and Slot bindings; the second performs a guarded
+  existing-node update or atomic create-if-missing-and-bind operation through
+  the narrow Operator API.
+- Server instructions and both model-tool results require the Agent to confirm
+  the configured identity against the physical DUT through serial evidence,
+  Telnet, the device web UI, or a human before model-specific operations.
+- Human takeover is surfaced as a distinct Run-abort reason instead of an
+  unexplained generic tool cancellation, reducing unsafe automatic retries.
 
 ### Next
 

@@ -4,9 +4,11 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    ArchiveListResponse, DeviceProfile, EventQuery, EventQueryResponse, HealthResponse,
-    JournalDiagnostics, PortDescriptor, SlotConfig, SlotDiagnostics, SlotSnapshot, StatusResponse,
-    StorageDiagnosticsResponse, TransportProfile,
+    ArchiveListResponse, ConfigureDeviceModelsRequest, ConfigureDeviceModelsResponse, DeviceModel,
+    DeviceModelListResponse, DeviceProfile, EventQuery, EventQueryResponse, HealthResponse,
+    JournalDiagnostics, PortDescriptor, SetSlotDeviceModelRequest, SetSlotDeviceModelResponse,
+    SlotConfig, SlotDiagnostics, SlotSnapshot, StatusResponse, StorageDiagnosticsResponse,
+    TransportProfile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +170,50 @@ impl ApiClient {
             expected_revision,
         )
         .await
+    }
+
+    pub async fn device_models(&self) -> Result<DeviceModelListResponse> {
+        self.get_json("/api/v1/config/device-models").await
+    }
+
+    pub async fn configure_device_models(
+        &self,
+        models: Vec<DeviceModel>,
+        expected_revision: Option<u64>,
+    ) -> Result<ConfigureDeviceModelsResponse> {
+        let response = self
+            .authorize(
+                self.client
+                    .put(self.url("/api/v1/config/device-models"))
+                    .json(&ConfigureDeviceModelsRequest {
+                        models,
+                        expected_revision,
+                    }),
+            )
+            .send()
+            .await
+            .context("seriald device model configuration request failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn set_slot_device_model(
+        &self,
+        slot_id: &str,
+        request: &SetSlotDeviceModelRequest,
+    ) -> Result<SetSlotDeviceModelResponse> {
+        let response = self
+            .authorize(
+                self.client
+                    .put(self.url(&format!(
+                        "/api/v1/slots/{}/device-model",
+                        encode_path_segment(slot_id)
+                    )))
+                    .json(request),
+            )
+            .send()
+            .await
+            .context("seriald Slot model binding request failed")?;
+        decode_response(response).await
     }
 
     pub async fn archives(&self, slot_id: Option<&str>) -> Result<ArchiveListResponse> {

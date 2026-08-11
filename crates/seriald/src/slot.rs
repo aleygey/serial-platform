@@ -489,6 +489,7 @@ impl SlotHandle {
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        cooperative: bool,
     ) -> Result<CommandResult, SlotError> {
         if data.len() > MAX_WRITE_BYTES {
             return Err(SlotError::WriteTooLarge);
@@ -502,6 +503,7 @@ impl SlotHandle {
             operation_id,
             expected_run_id,
             pacing,
+            cooperative,
             reply,
         })
         .await
@@ -802,6 +804,7 @@ enum SlotCommand {
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        cooperative: bool,
         reply: Reply,
     },
     SendBreak {
@@ -1134,6 +1137,55 @@ impl ActiveTrigger {
 
     fn status_snapshot(&self) -> TriggerInfo {
         self.info.clone()
+    }
+
+    fn observe_rx(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if let Some(matched) = self.stop_matcher.push(data) {
+            return Some(matched);
+        }
+        if !self.start_seen
+            && self
+                .start_matcher
+                .as_mut()
+                .is_some_and(|matcher| matcher.push(data).is_some())
+        {
+            self.start_seen = true;
+            self.start_matcher = None;
+            if !self.initial_pending && self.pending_terminal.is_none() {
+                self.info.status = TriggerStatus::Running;
+                self.next_write_at = Some(Instant::now());
+            }
+        }
+        None
+    }
+
+    fn deadline_status(&self) -> TriggerStatus {
+        if self.info.fires_confirmed >= self.info.spec.max_fires {
+            TriggerStatus::MaxFiresReached
+        } else {
+            TriggerStatus::TimedOut
+        }
+    }
+
+    /// Records one fully-confirmed action write. Reaching the send budget is
+    /// not necessarily terminal: when a stop matcher exists, the Trigger keeps
+    /// observing RX until its original deadline so output caused by the final
+    /// write can still prove completion.
+    fn confirm_action_write(&mut self, now: Instant) -> Option<TriggerStatus> {
+        self.info.fires_confirmed = self.info.fires_confirmed.saturating_add(1);
+        if self.info.fires_confirmed < self.info.spec.max_fires {
+            if self.pending_terminal.is_none() {
+                self.next_write_at = Some(now + Duration::from_millis(self.info.spec.interval_ms));
+            }
+            return None;
+        }
+
+        self.next_write_at = None;
+        self.info
+            .spec
+            .stop_contains
+            .is_empty()
+            .then_some(TriggerStatus::MaxFiresReached)
     }
 }
 
@@ -1768,12 +1820,22 @@ impl SlotActor {
                 operation_id,
                 expected_run_id,
                 pacing,
+                cooperative,
                 ..
             } => {
                 if self.active_trigger.is_some() {
                     return Err(SlotError::TriggerActive);
                 }
-                validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
+                if cooperative {
+                    validate_cooperative_write(
+                        &actor,
+                        expected_run_id,
+                        &self.control,
+                        self.active_run.as_ref(),
+                    )?;
+                } else {
+                    validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
+                }
                 if data.len() > MAX_WRITE_BYTES {
                     return Err(SlotError::WriteTooLarge);
                 }
@@ -1793,9 +1855,12 @@ impl SlotActor {
                     maximum_ms: duration_millis_saturating(MAX_WRITE_TIMEOUT),
                 })?;
                 let authorization_now = Instant::now();
-                let lease_remaining =
+                let lease_remaining = if cooperative {
+                    self.control.current_remaining_ttl(authorization_now)?
+                } else {
                     self.control
-                        .remaining_ttl(&actor.id, control_id, fence, authorization_now)?;
+                        .remaining_ttl(&actor.id, control_id, fence, authorization_now)?
+                };
                 ensure_lease_covers_write(lease_remaining, write_timeout)?;
                 let Some(port) = &self.port else {
                     return Err(SlotError::PortOffline);
@@ -1824,6 +1889,17 @@ impl SlotActor {
                     message: "serial writer stopped before confirming the outcome; the physical write may have occurred".into(),
                 })?;
                 let event_seq = if outcome.written > 0 {
+                    let mut event_metadata = metadata([
+                        ("partial", json!(outcome.written != total)),
+                        ("cooperative", json!(cooperative)),
+                    ]);
+                    if cooperative && let Some(run) = self.active_run.as_ref() {
+                        event_metadata.insert("interfered_run_id".into(), json!(run.id));
+                        event_metadata.insert(
+                            "interfered_run_owner".into(),
+                            serde_json::to_value(&run.owner).unwrap_or(Value::Null),
+                        );
+                    }
                     Some(
                         self.emit(
                             EventKind::Tx,
@@ -1831,7 +1907,7 @@ impl SlotActor {
                             data[..outcome.written].to_vec(),
                             Some(actor),
                             operation_id,
-                            metadata([("partial", json!(outcome.written != total))]),
+                            event_metadata,
                         )
                         .await,
                     )
@@ -2266,24 +2342,7 @@ impl SlotActor {
     }
 
     fn observe_trigger_rx(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        let trigger = self.active_trigger.as_mut()?;
-        if let Some(matched) = trigger.stop_matcher.push(data) {
-            return Some(matched);
-        }
-        if !trigger.start_seen
-            && trigger
-                .start_matcher
-                .as_mut()
-                .is_some_and(|matcher| matcher.push(data).is_some())
-        {
-            trigger.start_seen = true;
-            trigger.start_matcher = None;
-            if !trigger.initial_pending && trigger.pending_terminal.is_none() {
-                trigger.info.status = TriggerStatus::Running;
-                trigger.next_write_at = Some(Instant::now());
-            }
-        }
-        None
+        self.active_trigger.as_mut()?.observe_rx(data)
     }
 
     fn trigger_write_is_due(&self) -> bool {
@@ -2362,8 +2421,8 @@ impl SlotActor {
             return false;
         }
         if Instant::now() >= trigger.deadline {
-            self.request_trigger_stop(TriggerStatus::TimedOut, None)
-                .await;
+            let status = trigger.deadline_status();
+            self.request_trigger_stop(status, None).await;
             return false;
         }
         if self.trigger_write_is_due() {
@@ -2373,13 +2432,10 @@ impl SlotActor {
     }
 
     async fn begin_trigger_write(&mut self) {
-        if self
-            .active_trigger
-            .as_ref()
-            .is_some_and(|trigger| Instant::now() >= trigger.deadline)
-        {
-            self.request_trigger_stop(TriggerStatus::TimedOut, None)
-                .await;
+        if let Some(status) = self.active_trigger.as_ref().and_then(|trigger| {
+            (Instant::now() >= trigger.deadline).then(|| trigger.deadline_status())
+        }) {
+            self.request_trigger_stop(status, None).await;
             return;
         }
         let Some(trigger) = self.active_trigger.as_ref() else {
@@ -2446,8 +2502,15 @@ impl SlotActor {
                 return;
             }
             if trigger.info.fires_confirmed >= trigger.info.spec.max_fires {
-                self.request_trigger_stop(TriggerStatus::MaxFiresReached, None)
-                    .await;
+                if trigger.info.spec.stop_contains.is_empty() {
+                    self.request_trigger_stop(TriggerStatus::MaxFiresReached, None)
+                        .await;
+                } else if let Some(trigger) = self.active_trigger.as_mut() {
+                    // Defensive repair for any stale schedule: after the send
+                    // budget is exhausted, only the original deadline and RX
+                    // matcher can wake this Trigger.
+                    trigger.next_write_at = None;
+                }
                 return;
             }
             (
@@ -2491,8 +2554,11 @@ impl SlotActor {
         // bounded, but the deadline is authoritative at the final enqueue
         // boundary too: no new physical write may start after it.
         if Instant::now() >= trigger_deadline {
-            self.request_trigger_stop(TriggerStatus::TimedOut, None)
-                .await;
+            let status = self
+                .active_trigger
+                .as_ref()
+                .map_or(TriggerStatus::TimedOut, ActiveTrigger::deadline_status);
+            self.request_trigger_stop(status, None).await;
             return;
         }
 
@@ -2616,7 +2682,7 @@ impl SlotActor {
         let full_write = written == result.data.len() && write_error.is_none();
         if full_write {
             let now = Instant::now();
-            let reached_max_fires = match result.kind {
+            let terminal_status = match result.kind {
                 TriggerWriteKind::Initial => {
                     let trigger = self.active_trigger.as_mut().expect("checked above");
                     trigger.initial_pending = false;
@@ -2629,21 +2695,15 @@ impl SlotActor {
                             trigger.next_write_at = None;
                         }
                     }
-                    false
+                    None
                 }
                 TriggerWriteKind::Action { .. } => {
                     let trigger = self.active_trigger.as_mut().expect("checked above");
-                    trigger.info.fires_confirmed = trigger.info.fires_confirmed.saturating_add(1);
-                    let reached_max = trigger.info.fires_confirmed >= trigger.info.spec.max_fires;
-                    if !reached_max && trigger.pending_terminal.is_none() {
-                        trigger.next_write_at =
-                            Some(now + Duration::from_millis(trigger.info.spec.interval_ms));
-                    }
-                    reached_max
+                    trigger.confirm_action_write(now)
                 }
             };
-            if reached_max_fires {
-                self.mark_trigger_stopping(TriggerStatus::MaxFiresReached, None);
+            if let Some(status) = terminal_status {
+                self.mark_trigger_stopping(status, None);
             }
         } else {
             self.mark_trigger_stopping(TriggerStatus::WriteFailed, None);
@@ -3571,6 +3631,7 @@ enum SlotRequest {
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        cooperative: bool,
     },
     SendBreak {
         actor: Actor,
@@ -3668,10 +3729,18 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 pacing,
+                cooperative,
                 ..
             } => Some(
-                serde_json::to_vec(&("write", data, operation_id, expected_run_id, pacing))
-                    .expect("write request fields are serializable"),
+                serde_json::to_vec(&(
+                    "write",
+                    data,
+                    operation_id,
+                    expected_run_id,
+                    pacing,
+                    cooperative,
+                ))
+                .expect("write request fields are serializable"),
             ),
             Self::StartTrigger {
                 daemon_epoch,
@@ -3715,9 +3784,21 @@ impl SlotRequest {
                 control_id,
                 fence,
                 expected_run_id,
+                pacing,
+                cooperative,
                 ..
+            } => {
+                if *cooperative {
+                    if pacing.is_some() {
+                        return Err(ControlError::NotOwner.into());
+                    }
+                    validate_cooperative_write(actor, *expected_run_id, control, active_run)
+                } else {
+                    control.validate(&actor.id, *control_id, *fence, Instant::now())?;
+                    validate_expected_write_run(*expected_run_id, actor, active_run)
+                }
             }
-            | Self::StartTrigger {
+            Self::StartTrigger {
                 actor,
                 control_id,
                 fence,
@@ -3768,6 +3849,7 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 pacing,
+                cooperative,
             } => serde_json::to_vec(&(
                 "write",
                 &actor.id,
@@ -3777,6 +3859,7 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 pacing,
+                cooperative,
             )),
             Self::StartTrigger {
                 actor,
@@ -3883,6 +3966,40 @@ fn validate_expected_write_run(
     }
     if active_run.owner.id != actor.id {
         return Err(SlotError::WriteRunNotOwner { expected_run_id });
+    }
+    Ok(())
+}
+
+/// Authorizes the explicit Human/Agent cooperative-write escape hatch.
+///
+/// Cooperative writes never borrow the Agent's fence and never transfer
+/// ownership. They are accepted only while the current lease and active Run
+/// belong to the same Agent, so an ordinary nil/stale lease cannot silently
+/// turn into an unfenced write. The resulting foreign TX remains visible to
+/// Agent capture and therefore downgrades command confidence as interference.
+fn validate_cooperative_write(
+    actor: &Actor,
+    expected_run_id: Option<Uuid>,
+    control: &ControlState,
+    active_run: Option<&RunInfo>,
+) -> Result<(), SlotError> {
+    if actor.kind != ActorKind::Human {
+        return Err(ControlError::NotOwner.into());
+    }
+    let expected_run_id = expected_run_id.ok_or(ControlError::NotOwner)?;
+    let lease = control.current().ok_or(ControlError::NotOwner)?;
+    let run = active_run.ok_or(SlotError::WriteRunMissing { expected_run_id })?;
+    if run.id != expected_run_id {
+        return Err(SlotError::WriteRunMismatch {
+            expected_run_id,
+            active_run_id: run.id,
+        });
+    }
+    if lease.owner.kind != ActorKind::Agent
+        || run.owner.kind != ActorKind::Agent
+        || lease.owner.id != run.owner.id
+    {
+        return Err(ControlError::NotOwner.into());
     }
     Ok(())
 }
@@ -4164,6 +4281,7 @@ impl SlotCommand {
                 operation_id,
                 expected_run_id,
                 pacing,
+                cooperative,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
                 request: SlotRequest::Write {
@@ -4174,6 +4292,7 @@ impl SlotCommand {
                     operation_id,
                     expected_run_id,
                     pacing,
+                    cooperative,
                 },
                 reply,
             },
@@ -5727,6 +5846,93 @@ mod tests {
         }
     }
 
+    fn active_trigger_for_test(spec: TriggerSpec, now: Instant) -> ActiveTrigger {
+        let stop_matcher = LiteralMatcher::new(spec.stop_contains.clone());
+        ActiveTrigger {
+            info: TriggerInfo {
+                id: Uuid::new_v4(),
+                owner: Actor {
+                    id: "agent:test".into(),
+                    label: "test".into(),
+                    kind: ActorKind::Agent,
+                },
+                daemon_epoch: Uuid::new_v4(),
+                generation: 1,
+                control_id: Uuid::new_v4(),
+                fence: 1,
+                operation_id: None,
+                expected_run_id: None,
+                spec,
+                status: TriggerStatus::Running,
+                start_seq: 1,
+                end_seq: None,
+                last_write_seq: None,
+                fires_confirmed: 0,
+                tx_bytes_confirmed: 0,
+                matched_pattern: None,
+            },
+            bound_run_id: None,
+            deadline: now + Duration::from_secs(5),
+            next_write_at: Some(now),
+            initial_pending: false,
+            start_seen: true,
+            start_matcher: None,
+            stop_matcher,
+            write_in_flight: None,
+            buffered_rx: TriggerRxAuditBuffer::default(),
+            pending_terminal: None,
+        }
+    }
+
+    #[test]
+    fn trigger_observes_a_late_stop_match_after_reaching_one_fire() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"slp\r");
+        spec.max_fires = 1;
+        spec.stop_contains = vec![b"SigmaStar #".to_vec()];
+        let mut trigger = active_trigger_for_test(spec, now);
+
+        assert_eq!(trigger.confirm_action_write(now), None);
+        assert_eq!(trigger.info.fires_confirmed, 1);
+        assert_eq!(trigger.next_write_at, None);
+        assert_eq!(trigger.deadline_status(), TriggerStatus::MaxFiresReached);
+
+        // The prompt can be emitted only after the final write completes and
+        // can cross serial read boundaries. It must still prove completion.
+        assert_eq!(trigger.observe_rx(b"SigmaStar "), None);
+        assert_eq!(trigger.observe_rx(b"#"), Some(b"SigmaStar #".to_vec()));
+    }
+
+    #[test]
+    fn trigger_without_a_stop_matcher_finishes_at_the_fire_limit() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"x");
+        spec.max_fires = 1;
+        spec.stop_contains.clear();
+        let mut trigger = active_trigger_for_test(spec, now);
+
+        assert_eq!(
+            trigger.confirm_action_write(now),
+            Some(TriggerStatus::MaxFiresReached)
+        );
+        assert_eq!(trigger.info.fires_confirmed, 1);
+        assert_eq!(trigger.next_write_at, None);
+    }
+
+    #[test]
+    fn trigger_deadline_distinguishes_timeout_from_an_exhausted_fire_budget() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"x");
+        spec.max_fires = 2;
+        let mut trigger = active_trigger_for_test(spec, now);
+
+        assert_eq!(trigger.deadline_status(), TriggerStatus::TimedOut);
+        assert_eq!(trigger.confirm_action_write(now), None);
+        assert_eq!(trigger.deadline_status(), TriggerStatus::TimedOut);
+        assert_eq!(trigger.confirm_action_write(now), None);
+        assert_eq!(trigger.deadline_status(), TriggerStatus::MaxFiresReached);
+    }
+
     #[test]
     fn literal_matcher_matches_across_real_chunks_without_self_replaying_one_chunk() {
         let mut single_observation = LiteralMatcher::new(vec![b"abcabc".to_vec()]);
@@ -5892,6 +6098,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            cooperative: false,
         };
         let same = SlotRequest::Write {
             actor: actor.clone(),
@@ -5901,6 +6108,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            cooperative: false,
         };
         let different = SlotRequest::Write {
             actor,
@@ -5910,6 +6118,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            cooperative: false,
         };
         assert_eq!(first.fingerprint(), same.fingerprint());
         assert_ne!(first.fingerprint(), different.fingerprint());
@@ -5931,6 +6140,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            cooperative: false,
         };
         let paced = SlotRequest::Write {
             actor,
@@ -5943,6 +6153,7 @@ mod tests {
                 chunk_size: 1,
                 chunk_delay_ms: 5,
             }),
+            cooperative: false,
         };
         assert_ne!(unpaced.write_fingerprint(), paced.write_fingerprint());
     }
@@ -5965,6 +6176,7 @@ mod tests {
             operation_id: None,
             expected_run_id,
             pacing: None,
+            cooperative: false,
         };
         assert_ne!(
             request(Some(run_id)).write_fingerprint(),
@@ -6021,6 +6233,109 @@ mod tests {
     }
 
     #[test]
+    fn cooperative_write_requires_a_human_and_matching_agent_lease_and_run() {
+        let daemon_epoch = Uuid::new_v4();
+        let mut control = ControlState::new(daemon_epoch, 1, ControlLimits::default());
+        let agent = Actor {
+            id: "agent:owner".into(),
+            label: "owner".into(),
+            kind: ActorKind::Agent,
+        };
+        let human = Actor {
+            id: "human:operator".into(),
+            label: "operator".into(),
+            kind: ActorKind::Human,
+        };
+        let lease =
+            match control.acquire(agent.clone(), ControlMode::Queue, 30_000, 1, Instant::now()) {
+                AcquireOutcome::Granted(lease) => lease,
+                other => panic!("expected granted lease, got {other:?}"),
+            };
+        let run = RunInfo {
+            id: Uuid::new_v4(),
+            owner: agent.clone(),
+            label: "inspect DUT".into(),
+            status: RunStatus::Active,
+            start_seq: 1,
+            end_seq: None,
+            metadata: BTreeMap::new(),
+        };
+        let request = SlotRequest::Write {
+            actor: human.clone(),
+            control_id: Uuid::nil(),
+            fence: 0,
+            data: b"status\r".to_vec(),
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(run.id),
+            pacing: None,
+            cooperative: true,
+        };
+        assert!(
+            request
+                .validate_write_authorization(&control, Some(&run))
+                .is_ok()
+        );
+
+        let mut non_cooperative = request;
+        if let SlotRequest::Write {
+            cooperative,
+            control_id,
+            fence,
+            ..
+        } = &mut non_cooperative
+        {
+            *cooperative = false;
+            *control_id = lease.id;
+            *fence = lease.fence;
+        }
+        assert!(
+            non_cooperative
+                .validate_write_authorization(&control, Some(&run))
+                .is_err(),
+            "a Human must not borrow the Agent's ordinary fenced lease"
+        );
+        assert!(validate_cooperative_write(&agent, Some(run.id), &control, Some(&run)).is_err());
+        assert!(validate_cooperative_write(&human, Some(run.id), &control, None).is_err());
+        assert!(validate_cooperative_write(&human, None, &control, Some(&run)).is_err());
+        assert!(matches!(
+            validate_cooperative_write(&human, Some(Uuid::new_v4()), &control, Some(&run),),
+            Err(SlotError::WriteRunMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn cooperative_write_retry_is_bound_to_the_expected_agent_run() {
+        let actor = Actor {
+            id: "human:operator".into(),
+            label: "operator".into(),
+            kind: ActorKind::Human,
+        };
+        let operation_id = Some(Uuid::new_v4());
+        let old_run_id = Uuid::new_v4();
+        let new_run_id = Uuid::new_v4();
+        let request = |expected_run_id| SlotRequest::Write {
+            actor: actor.clone(),
+            control_id: Uuid::nil(),
+            fence: 0,
+            data: b"status\r".to_vec(),
+            operation_id,
+            expected_run_id: Some(expected_run_id),
+            pacing: None,
+            cooperative: true,
+        };
+
+        let old = request(old_run_id).write_fingerprint().unwrap();
+        let retry_in_new_run = request(new_run_id).write_fingerprint().unwrap();
+        assert_ne!(old, retry_in_new_run);
+
+        let cached = CachedResult {
+            fingerprint: old,
+            result: Ok(CommandResult::WriteAccepted { event_seq: 41 }),
+        };
+        assert_ne!(cached.fingerprint, retry_in_new_run);
+    }
+
+    #[test]
     fn write_idempotency_fingerprint_survives_server_actor_reissue() {
         let operation_id = Some(Uuid::new_v4());
         let original = SlotRequest::Write {
@@ -6035,6 +6350,7 @@ mod tests {
             operation_id,
             expected_run_id: None,
             pacing: None,
+            cooperative: false,
         };
         let reconnected = SlotRequest::Write {
             actor: Actor {
@@ -6048,6 +6364,7 @@ mod tests {
             operation_id,
             expected_run_id: None,
             pacing: None,
+            cooperative: false,
         };
 
         assert_ne!(original.fingerprint(), reconnected.fingerprint());

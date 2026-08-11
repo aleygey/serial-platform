@@ -5,6 +5,7 @@ mod config;
 mod display;
 mod doctor;
 mod i18n;
+mod model;
 mod profile;
 mod tui;
 mod ws;

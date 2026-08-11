@@ -3,25 +3,56 @@
 `serial-platform` is an independent shared serial-port control plane. `seriald`
 runs on the machine physically connected to the serial card; any number of
 `serialctl` clients can observe the same Slots, while a fenced control lease
-ensures that only one actor writes to a Slot at a time.
+serializes ordinary writers. A separately audited cooperative Human write may
+be injected without taking over an Agent-owned Run.
 
 It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
-v0.5.0 adds persistent, daemon-owned Monitor Jobs for rare serial conditions.
-The five additive MCP tools start, list, inspect, read incidents from, and stop
-those Jobs without holding an Agent turn open. The unified launcher introduced
-in v0.4 remains: `serial serve` starts the backend, `serial console` opens the
-TUI, `serial setup` configures a station, `serial profile ...` manages reusable
-profiles, and `serial mcp` starts the MCP adapter. The component executables
-remain in the release package and can still be invoked directly.
+v0.6.0 adds in-terminal Profile, hierarchical DUT-model, and serial-setting
+menus; stable scrollback while live output continues; editable Human command
+queues and cooperative no-takeover writes during Agent Runs; explicit Human
+takeover diagnostics; and Agent-readable model inspection/binding. The current
+18-tool MCP registry also retains the persistent Monitor Jobs introduced in
+v0.5.0 and the ordinary serial/Run/Trigger operations. The unified launcher
+introduced in v0.4 remains: `serial serve` starts the backend,
+`serial console` opens the TUI, `serial setup` configures a station,
+`serial profile ...` manages reusable profiles, `serial model ...` manages the
+DUT identity tree, and `serial mcp` starts the MCP adapter. The component
+executables remain in the release package and can still be invoked directly.
 
 See [ROADMAP.md](ROADMAP.md) for released capabilities, the next practical
 work, and longer-term candidates separated by `seriald`, `serialctl`, and
 `serial-mcp`.
 
-## What v0.5 provides
+Protocol and integration references:
+
+- [Complete MCP/HTTP/WebSocket protocol](./docs/PROTOCOL.md)
+- [All MCP tool schemas and result contracts](./docs/MCP_TOOLS.md); inspect the
+  installed executable directly with `serial mcp --dump-tools`.
+
+## v0.6.0 release highlights
+
+- Operators can select or create Profiles and arbitrarily deep DUT-model
+  entries directly in the terminal, and can clone/edit common UART settings
+  without leaving the console. The same model catalog remains scriptable from
+  the CLI.
+- A frozen visual-row scrollback snapshot no longer jumps when live RX/TX
+  arrives. Short initial histories no longer scroll into blank or disappearing
+  rows.
+- Commands typed while an Agent owns the Run appear as ordered, individually
+  editable/removable cards. Empty Enter only follows the live tail; ordinary
+  Enter queues without takeover, Alt-Enter is an audited cooperative Human
+  write, and explicit takeover remains separate.
+- `device_models` and `device_model_set` bring the MCP registry to exactly
+  18 tools. Agents must confirm that the configured model matches the physical
+  DUT through serial, Telnet, web UI, or a human before model-specific work.
+- Release archives are built and verified by Jenkins from one ARM64 Linux
+  worker: cargo-zigbuild targets x86_64 GNU/Linux with a glibc 2.31 ceiling,
+  while MinGW-w64 produces the Windows x86_64 GNU-ABI package.
+
+## What v0.6 provides
 
 - Interactive COM discovery and Slot configuration from `serial setup`.
 - Two explicit reusable configuration layers: a Transport Profile for physical
@@ -29,6 +60,9 @@ work, and longer-term candidates separated by `seriald`, `serialctl`, and
   pacing.
 - Interactive and scriptable Profile list/show/create/update/clone/import/export/
   attach/detach commands with optimistic `config_revision` protection.
+- A separate hierarchical `DeviceModel` catalog with aliases, per-Slot
+  confirmation records, CLI/TUI selection, and narrow Agent binding updates;
+  model identity never silently changes Device Profile behavior.
 - Long-lived serial ownership with auto-open and reconnect.
 - In-place Slot reconfiguration: an existing Slot keeps its epoch, sequence,
   replay ring, and subscribers while the old OS handle is fully stopped before
@@ -92,16 +126,17 @@ untouched, or use electrical isolation/reset gating.
 Each release provides two x86_64 packages:
 
 - `serial-platform-<version>-windows-x86_64.zip` contains the unified
-  `serial.exe` plus `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe`.
-- `serial-platform-<version>-linux-x86_64-ubuntu20.04.tar.gz` contains native
+  `serial.exe` plus `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe`. These
+  binaries use the GNU/MinGW-w64 ABI, not the MSVC ABI.
+- `serial-platform-<version>-linux-x86_64-ubuntu20.04.tar.gz` contains
   `x86_64-unknown-linux-gnu`/glibc `serial`, `serialctl`, and `serial-mcp`
-  clients built on the Ubuntu 20.04 baseline (glibc 2.31). It is intended for
-  64-bit x86 Ubuntu 20.04 or newer. It does not contain `seriald`, because the
-  Windows host owns the workstation COM ports, and it does not support 32-bit
-  i386/i686 Ubuntu.
+  clients cross-built with cargo-zigbuild against the Ubuntu 20.04 glibc 2.31
+  ceiling. It is intended for 64-bit x86 Ubuntu 20.04 or newer. It does not
+  contain `seriald`, because the Windows host owns the workstation COM ports,
+  and it does not support 32-bit i386/i686 Ubuntu.
 
 Use every executable from the same release across the Windows host and Linux
-VM. v0.5.0 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
+VM. v0.6.0 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
 peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
 and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
 protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
@@ -113,14 +148,20 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.5.0-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.5.0-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.6.0-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.6.0-linux-x86_64-ubuntu20.04
 chmod +x serial serialctl serial-mcp
 ./serial --version
 ```
 
-Release checksums are published in `SHA256SUMS`. The command examples below
-assume the executables are on `PATH`. From an extracted package directory, use
+Release checksums are published in `SHA256SUMS`. Each package also contains
+`BUILD-INFO.json`, an internal `MANIFEST.sha256`, the complete `docs/` and
+`adapters/` trees, and the top-level product documentation. Jenkins verifies
+the target architecture, application version, exact 18-tool MCP registry,
+Linux glibc ceiling, absence of unbundled MinGW runtime imports, archive
+integrity, and both checksum layers before the artifacts are published. The
+command examples below assume the executables are on `PATH`. From an extracted
+package directory, use
 `.\serial.exe` on Windows and `./serial` on Linux. Linux does not search the
 current directory by default, so `serial setup` returns `command not found`
 unless the binary was installed on `PATH`; from the extracted directory, run
@@ -130,9 +171,10 @@ that same directory and never falls back to another `seriald`, `serialctl`, or
 
 ## Build
 
-Install Rust 1.88 or newer. On Windows, the normal MSVC Rust target also needs
-the Visual Studio C++ Build Tools and Windows SDK; on Linux, install the
-distribution's C/C++ build tools. Then run from this directory:
+Install Rust 1.88 or newer. A local Windows MSVC source build needs the Visual
+Studio C++ Build Tools and Windows SDK; this is distinct from the published
+GNU/MinGW-w64 package. On Linux, install the distribution's C/C++ build tools.
+Then run from this directory:
 
 ```sh
 cargo build --release
@@ -216,10 +258,13 @@ keys:
 | `Ctrl-] PgUp` / `Ctrl-] PgDn` | Local scroll, including in RAW mode |
 | `Ctrl-] v` | Toggle compact/detailed timeline |
 | `Ctrl-] g` | Switch UI language and save it |
+| `Ctrl-] m` | Open the Profile / device-model / serial-settings / help menu |
+| `Alt-Enter` | Send the current LINE command cooperatively without taking the Agent lease |
 | `Ctrl-] t` | Explicitly take over write control |
 | `Ctrl-] c` | Release control or cancel queued input |
 | `Ctrl-] d` | Delete the newest queued LINE command |
 | `Ctrl-] e` | Return the newest queued LINE command to the editor |
+| `Ctrl-] u` | Select any queued LINE command; Up/Down selects cards, PageUp/PageDown scrolls long text, and `d`/`e` deletes/edits |
 | `Ctrl-] p` | Confirm a blocked multiline/large paste |
 | `Ctrl-] ?` | Help |
 | `Ctrl-] q` | Quit |
@@ -247,18 +292,36 @@ copy uses OSC 52 and may require clipboard access to be enabled in the terminal
 emulator. Set `mouse_capture = false` in `serialctl.toml` to return mouse
 selection to the terminal emulator; that also disables in-app wheel scrolling.
 After confirmation, a LINE-mode multiline paste is queued as distinct logical
-commands that share one Operation ID and each receive the effective EOL. RAW
+commands, each with its own Operation ID and effective EOL. RAW
 paste remains one unmodified byte burst. Adjacent RAW keystrokes that have not
 started a physical write are coalesced into bounded 4 KiB chunks, so waiting
 behind another actor does not exhaust the 16-chunk queue after only 16
 characters. The 64 KiB total local write bound still applies; input that would
 cross it is rejected as one unit and is not partially appended.
 
-Opening the console only subscribes. The first write asks for Human Control.
-If another actor owns it, the request queues; only `Takeover` revokes it.
-The input title and footer keep the queued command preview, queue position,
-age, and held chunk count visible. Before a queued LINE command starts sending,
-`Ctrl-] d` removes the newest command and `Ctrl-] e` returns it to the editor.
+Opening the console only subscribes. The first ordinary `Enter` asks for Human
+Control. If another actor owns it, the request queues; only `Takeover` revokes
+it. While an Agent Run is active, an empty `Enter` queues no bytes and simply
+returns the output to its live tail. A non-empty command appears above the input
+as its own oldest-first numbered card with the complete command text. Before a
+queued LINE command starts sending, `Ctrl-] d` removes the newest command and
+`Ctrl-] e` returns it to the editor; `Ctrl-] u` opens the queue selector so any
+card can be deleted or returned for modification. Card text wraps by terminal
+display width, including double-width CJK characters. A short terminal exposes
+an explicit selected-card detail viewport; PageUp/PageDown scrolls that text
+instead of silently truncating it. Bytes already in a physical write are locked
+and cannot be recalled. Submitting a restored command places the edited version
+at the queue tail.
+
+`Alt-Enter` is a separate, explicit cooperative path available only while the
+same Agent owns both the current lease and active Run. It writes immediately
+without transferring or revoking that lease, binds the request and its retry
+identity to that exact Run, remains attributed to the Human in the audit
+timeline, and makes the Agent's overlapping evidence
+`interfered`. `Ctrl-] t` remains the explicit takeover path and aborts the
+Agent Run. These two choices are intentionally visible rather than inferred
+from typing.
+
 RAW bytes are not lossily converted into editable text; cancel their queue with
 `Ctrl-] c`. Queued input expires after 60 seconds without human activity.
 `Ctrl-] c` cancels it by reconnecting the actor connection; the protocol carries a dedicated
@@ -268,6 +331,21 @@ restores all subscriptions.
 An acquired human lease is renewed only while that Slot has recent manual
 activity or an in-flight write, and is released after 60 seconds idle. LINE/RAW
 mode and command history are independent for every Slot.
+
+`Ctrl-] m` opens the extensible configuration menu. Its current pages are
+Transport/Device Profiles, hierarchical DUT models, serial settings, and help.
+Lists use Up/Down/Enter/Esc. Model parents expand before their indented children
+become selectable. In the model tree, Enter toggles a parent or binds a leaf,
+Left/Right collapses or expands, and `b` binds the selected node including a
+parent model. Profile catalog changes and serial-setting clones ask for a
+masked one-time administrator token. Its temporary values are dropped after
+the request, and the token is never written to the client config. Device-model binding uses the
+narrow operator API and records how the physical identity was confirmed.
+
+When the output is scrolled upward, the console freezes the currently wrapped
+visual rows. New output therefore cannot push the inspected page away. If the
+history does not exceed the output viewport, upward scrolling is a no-op; this
+also prevents the disappearing-text behavior immediately after a port opens.
 The compact console is a derived terminal projection rather than one visual row
 per audit event: a prompt, confirmed TX command, and exact device echo remain on
 one row, including character-at-a-time RAW input. Actor-colored markers are
@@ -297,7 +375,7 @@ occupies several 80-column screen rows. Local presentation remains bounded to
 synthetic oldest-row boundary state that local display history was truncated
 and direct the operator to `serial logs`; durable history is not presented
 as though the retained local row were its true beginning.
-Repeated device rows remain uncollapsed in v0.5: live monitoring stays faithful
+Repeated device rows remain uncollapsed in v0.6: live monitoring stays faithful
 to their exact order, while bounded log/search tools handle high-volume review.
 Run lifecycle events are drawn as full-width colored start/end/abort rules, so
 an operator can see exactly which output interval belongs to an Agent task
@@ -397,23 +475,23 @@ Install `serial-mcp` on the same Windows or Linux machine where the Agent
 platform runs. It reuses the endpoint and operator token written by
 `serial setup`, so Agent config contains no secret. Configure the MCP host to
 run `serial mcp` (or the component `serial-mcp` directly). Ready-to-copy
-OpenCode JSONC and Codex TOML examples, the stable eleven core tools, five
-additive Monitor tools, compact result contract, and expected Run workflow are in
-[adapters/README.md](./adapters/README.md).
+OpenCode JSONC and Codex TOML examples and the expected Run workflow are in
+[adapters/README.md](./adapters/README.md). The current 18-tool registry and
+result contracts are documented in [MCP_TOOLS.md](./docs/MCP_TOOLS.md) and can
+be inspected as authoritative JSON with `serial mcp --dump-tools`.
 
 The adapter connects directly to `seriald`; the Agent is not asked to compose
 shell commands around `serialctl`. OpenCode exposes the tools as
 `serial_devices`, `serial_command`, and so on. Codex exposes the same tools in
 the configured `serial` MCP namespace.
 
-The eleven core tools are `devices`, `read`, `command`, `input`, `signal`,
-`trigger`, `wait`, `search`, `run_start`, `run_end`, and `release`. The additive
-Monitor tools are `monitor_start`, `monitor_list`, `monitor_status`,
-`monitor_incidents`, and `monitor_stop`. Ordinary calls expose only task-level
-inputs; the adapter owns request/operation IDs, control fences, capture cursors,
-prompt selection, bounded rendering, and lease renewal. Compact results keep
-the main evidence (`text`, completion/confidence, warnings, and one continuation
-cursor) while internal audit identifiers remain in the authoritative timeline.
+Ordinary calls expose only task-level inputs; the adapter owns
+request/operation IDs, control fences, capture cursors, prompt selection,
+bounded rendering, and lease renewal. Compact results keep the main evidence
+(`text`, completion/confidence, warnings, and one continuation cursor) while
+internal audit identifiers remain in the authoritative timeline. Model names
+remain assertions: the Agent must confirm the physical DUT through serial,
+telnet, the web UI, or a person before relying on a configured assignment.
 
 `serial_monitor_start` takes a Slot plus exactly one `contains` or `regex`
 matcher and returns a stable Monitor ID immediately. The Job starts at the
@@ -431,7 +509,7 @@ after_seq=evidence_cursor.after_seq, through_seq=seq_end)`.
 incidents.
 
 `serial_trigger` handles short timing windows without making the Agent or the
-Linux VM loop `serial_command`/`serial_write` calls. It requires an
+Linux VM loop repeated `serial_command` or `serial_input` calls. It requires an
 adapter-owned Run and takes explicit UTF-8 text plus EOL for an optional
 one-time `kickoff` and the repeated `action`, along with an optional start
 literal, stop literals, interval, timeout, and maximum-fire bounds.
@@ -452,12 +530,18 @@ be audited before the authoritative terminal result. See
 [Trigger Jobs](./DOCUMENTATION.md#trigger-jobs) for hard limits and terminal
 status semantics.
 
+`max_fires` limits only confirmed action sends. If `stop_contains` is
+configured, exhausting that budget stops additional writes but keeps the live
+RX matcher armed until a stop literal appears or the original `timeout_ms`
+expires. A confirmed Trigger TX therefore does not prove that the target
+action either succeeded or failed.
+
 `serial_command` requires a Run previously created by this `serial-mcp`
 process. Every Agent write carries that Run ID; inside the same serialized Slot
 actor that validates the control lease/fence, `seriald` rejects a missing,
 changed, or foreign-owned Run before pacing-budget calculation or physical
-write. Human and legacy clients may omit this optional boundary and retain
-lease-only writes. A Run isolates only its log/event interval—it does not reset,
+write. Ordinary Human and legacy non-cooperative clients may omit this optional
+boundary and retain lease-only writes. A Run isolates only its log/event interval—it does not reset,
 initialize, or otherwise clean the device.
 
 The adapter renews control only for Runs it currently owns. A lost connection
@@ -481,8 +565,9 @@ Ctrl-C (`0x03`), Ctrl-D (`0x04`), Ctrl-Z (`0x1a`), or a physical serial Break
 with a bounded duration. Break is a UART line condition rather than an encoded
 byte and is still fenced, Run-bound, and audited.
 
-MCP requests may run concurrently, but cancellation applies only to the four
-pure observations: `devices`, `read`, `wait`, and `search`. Once a mutating
+MCP requests may run concurrently, but cancellation applies only to the
+read-only observations `devices`, `device_models`, `read`, `wait`, `search`,
+`monitor_list`, `monitor_status`, and `monitor_incidents`. Once a mutating
 tool may have crossed a serial/Run/Control side-effect boundary, the adapter
 waits for its authoritative result instead of hiding the outcome and inviting
 an unsafe retry.
@@ -495,7 +580,7 @@ execution.
 
 ## Profile adjustments
 
-Configuration has three explicit layers:
+Configuration has four explicit layers:
 
 1. A Slot identifies the fixed station channel: stable ID, display name, and
    host port such as `COM4`.
@@ -505,6 +590,8 @@ Configuration has three explicit layers:
 3. Its optional Device Profile defines DUT-facing behavior: Shell/U-Boot prompt
    literals, command EOL, echo policy, `write_chunk_size`, and
    `write_chunk_delay_ms`.
+4. Its independent Device Model binding records the confirmed DUT identity in
+   a hierarchical catalog without changing any serial behavior.
 
 For wire/TOML compatibility the Slot field named `profile` is the Transport
 Profile binding; `device_profile` is the optional DUT binding. `Generic` means
@@ -528,8 +615,17 @@ serial profile device list
 serial profile device create --interactive
 serial profile device update my-dut --interactive
 serial profile attach --slot slot-1 --transport uart-115200 --device my-dut
+serial model tree
+serial model attach --slot slot-1
 serial doctor state --slot slot-1
 ```
+
+`serial model add/update/list/tree/attach/detach` maintains the independent
+identity catalog. Parent and child names may repeat, children render indented,
+and interactive attach expands a parent before selecting a descendant. A
+binding records whether identity was confirmed by serial, telnet, web UI, a
+Human, or another documented method; the configured label alone is never
+treated as proof.
 
 `update` changes only the fields named on the command line; `--interactive`
 walks every field while showing the existing values as defaults. Use `clone`
@@ -654,14 +750,14 @@ wait_timeout_ms = 60000 # queued acquire lifetime; configured ceiling <= 1h
 max_waiters = 128       # per-Slot wait-queue bound
 ```
 
-The defaults match the compiled-in v0.5 behavior, so the section can be omitted
+The defaults match the compiled-in v0.6 behavior, so the section can be omitted
 entirely; changes apply on the next daemon start. Configuration above the
 24-hour lease or one-hour wait ceilings is rejected instead of reaching
 platform `Instant` arithmetic.
 
 ## Current boundaries
 
-v0.5 does not include device-pool Reservations, flashing recipes, automatic
+v0.6 does not include device-pool Reservations, flashing recipes, automatic
 probes, full VT100 emulation, external `screen/minicom` handoff, TLS,
 compression, or a Windows Service installer. `serial serve` is the backend
 entrypoint and `serial console` is a separate client process; putting both
@@ -678,5 +774,7 @@ matching and hard limits, and sends its optional kickoff and every action fire
 through the ordinary confirmed/audited write path. Device-specific recipes
 remain explicit caller parameters rather than daemon or Profile behavior.
 
-See [DOCUMENTATION.md](./DOCUMENTATION.md) for protocol, state, logging, and
-correctness invariants.
+See [DOCUMENTATION.md](./DOCUMENTATION.md) for architecture, state, logging,
+and correctness invariants; [PROTOCOL.md](./docs/PROTOCOL.md) for the complete
+MCP/HTTP/WebSocket contract; and [MCP_TOOLS.md](./docs/MCP_TOOLS.md) for the
+generated Agent tool surface.

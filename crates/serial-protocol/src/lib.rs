@@ -6,7 +6,7 @@
 //! and `0x03`. Raw serial bytes are never converted to text by this crate.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -368,6 +368,53 @@ pub struct DeviceProfile {
     pub write_chunk_delay_ms: Option<u64>,
 }
 
+/// One node in the station-owned DUT model catalog.
+///
+/// Model identity is deliberately separate from [`DeviceProfile`]. A model
+/// name describes the hardware connected to a Slot, while a Device Profile
+/// changes prompts, line endings, echo handling, and write pacing. Keeping the
+/// two catalogs independent lets Human and Agent clients correct model
+/// identity without implicitly changing serial behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceModel {
+    /// Stable catalog identity used by bindings and parent references.
+    pub id: String,
+    /// Human-readable model or family name. Names may repeat at different
+    /// levels (for example a family and its base variant can share a label).
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+/// How the connected DUT's model identity was confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelConfirmationMethod {
+    Serial,
+    Telnet,
+    Web,
+    Human,
+    Other,
+}
+
+/// Persisted assignment of one configured Slot to one catalog model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotModelBinding {
+    pub slot_id: String,
+    pub model_id: String,
+    pub confirmation_method: ModelConfirmationMethod,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Wall-clock time of the latest assignment, in Unix nanoseconds.
+    pub updated_wall_time_ns: i64,
+    /// Bounded caller/audit label such as `human:serialctl` or
+    /// `agent:serial-mcp`. Authentication still comes from the bearer role;
+    /// this field records the declared workflow source only.
+    pub source: String,
+}
+
 /// Device-interaction settings after applying the attached device profile to
 /// the Slot's generic/legacy baseline. Generic transport defaults deliberately
 /// do not guess device-specific Shell or U-Boot prompts.
@@ -610,6 +657,21 @@ const fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Deserializes an optional JSON property while preserving whether it was
+/// present with a `null` value. Serde normally maps both a missing property
+/// and an explicit `null` to `None` for `Option<Option<T>>`.
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -746,14 +808,22 @@ pub enum ClientMessage {
         data: Vec<u8>,
         operation_id: Option<Uuid>,
         /// Optional optimistic Run boundary for one physical write. New Agent
-        /// adapters set this to the Run they own; human and legacy clients may
-        /// omit it and retain lease-only write authorization.
+        /// adapters set this to the Run they own; ordinary human and legacy
+        /// clients may omit it and retain lease-only write authorization. A
+        /// cooperative Human write must set it to the current Agent Run so its
+        /// authorization and cross-connection idempotency remain Run-scoped.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_run_id: Option<Uuid>,
         /// Per-write pacing override. Older clients omit the field and keep
         /// using the Slot's configured pacing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pacing: Option<WritePacing>,
+        /// Explicit Human-only injection while an Agent owns control. This
+        /// bypasses takeover but does not transfer or revoke the Agent lease.
+        /// Daemons must reject the flag for non-Human actors, a missing or
+        /// mismatched `expected_run_id`, and every other ownership situation.
+        #[serde(default, skip_serializing_if = "is_false")]
+        cooperative: bool,
     },
     /// Assert the UART BREAK condition. This is a physical line signal, not a
     /// control byte; Ctrl-C/Ctrl-D/Ctrl-Z remain ordinary write payloads.
@@ -1045,6 +1115,91 @@ pub struct ConfigureDeviceProfilesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigureDeviceProfilesResponse {
     pub profiles: Vec<DeviceProfile>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+/// Authoritative model tree plus the current per-Slot assignments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceModelListResponse {
+    pub models: Vec<DeviceModel>,
+    pub bindings: Vec<SlotModelBinding>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+/// Full replacement of the model catalog. Existing bindings are retained and
+/// therefore prevent deletion of an assigned model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureDeviceModelsRequest {
+    pub models: Vec<DeviceModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureDeviceModelsResponse {
+    pub models: Vec<DeviceModel>,
+    pub bindings: Vec<SlotModelBinding>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+/// Atomically attach, replace, or remove one Slot's model assignment.
+///
+/// `model_id = null` detaches. When `create_if_missing` is true, the remaining
+/// model fields describe a catalog leaf to create in the same configuration
+/// transaction before it is bound. `update_existing` instead patches the
+/// existing node currently bound to this Slot; it requires exact revision and
+/// binding guards. `expected_current` is intentionally a
+/// nested Option: an omitted key disables this guard, JSON `null` expects an
+/// unbound Slot, and a string expects that exact current model ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSlotDeviceModelRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_if_missing: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub update_existing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_parent: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_aliases: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_method: Option<ModelConfirmationMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_current: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSlotDeviceModelResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<SlotModelBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<DeviceModel>,
+    #[serde(default)]
+    pub created: bool,
+    /// Slots whose bindings refer to the returned model after this transaction.
+    /// Updating one shared catalog node changes its metadata for every listed
+    /// Slot even though only the path Slot authorizes the mutation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_slots: Vec<String>,
     #[serde(default)]
     pub config_revision: u64,
 }
@@ -1927,6 +2082,7 @@ mod tests {
                 chunk_size: 4,
                 chunk_delay_ms: 10,
             }),
+            cooperative: false,
         };
         let frame = encode_client_control(&message).unwrap();
         assert_eq!(decode_client_control(&frame).unwrap(), message);
@@ -1987,7 +2143,82 @@ mod tests {
                 operation_id: None,
                 expected_run_id: None,
                 pacing: None,
+                cooperative: false,
             }
+        );
+    }
+
+    #[test]
+    fn cooperative_write_is_additive_and_legacy_writes_default_to_false() {
+        let request_id = Uuid::new_v4();
+        let control_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "type": "write",
+            "request_id": request_id,
+            "slot_id": "slot-1",
+            "control_id": control_id,
+            "fence": 3,
+            "data": BASE64.encode(b"status\r"),
+            "operation_id": null,
+        });
+        let decoded: ClientMessage = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            ClientMessage::Write {
+                cooperative: false,
+                ..
+            }
+        ));
+
+        let cooperative = ClientMessage::Write {
+            request_id,
+            slot_id: "slot-1".into(),
+            control_id,
+            fence: 3,
+            data: b"status\r".to_vec(),
+            operation_id: None,
+            expected_run_id: Some(Uuid::new_v4()),
+            pacing: None,
+            cooperative: true,
+        };
+        let encoded = serde_json::to_value(&cooperative).unwrap();
+        assert_eq!(encoded["cooperative"], true);
+        assert!(encoded["expected_run_id"].is_string());
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(encoded).unwrap(),
+            cooperative
+        );
+    }
+
+    #[test]
+    fn slot_model_expected_current_preserves_three_states() {
+        let base = serde_json::json!({
+            "model_id": "tl-as7230-w",
+            "source": "human:serialctl"
+        });
+        let omitted: SetSlotDeviceModelRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.expected_current, None);
+        assert!(
+            !serde_json::to_value(&omitted)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("expected_current")
+        );
+
+        let mut unbound = base.clone();
+        unbound["expected_current"] = serde_json::Value::Null;
+        let unbound: SetSlotDeviceModelRequest = serde_json::from_value(unbound).unwrap();
+        assert_eq!(unbound.expected_current, Some(None));
+        assert!(serde_json::to_value(&unbound).unwrap()["expected_current"].is_null());
+
+        let mut bound = base;
+        bound["expected_current"] = serde_json::json!("tl-as7230");
+        let bound: SetSlotDeviceModelRequest = serde_json::from_value(bound).unwrap();
+        assert_eq!(bound.expected_current, Some(Some("tl-as7230".into())));
+        assert_eq!(
+            serde_json::to_value(&bound).unwrap()["expected_current"],
+            serde_json::json!("tl-as7230")
         );
     }
 

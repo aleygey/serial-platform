@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,10 +27,12 @@ use ratatui::{
 #[cfg(test)]
 use serial_protocol::WritePacing;
 use serial_protocol::{
-    Actor, ClientMessage, CommandResult, ControlLease, ControlMode, EchoMode, EventKind,
-    LoggingState, ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo, ServerMessage,
-    SessionState, SlotSnapshot, TargetActivity, TimelineEvent, TriggerInfo, TriggerStatus,
-    WireFrame,
+    Actor, ClientMessage, CommandResult, ControlLease, ControlMode, DataBits, DeviceModel,
+    DeviceModelListResponse, DeviceProfile, EchoMode, EventKind, FlowControl, LoggingState,
+    ModelConfirmationMethod, Parity, ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo,
+    ServerMessage, SessionState, SetSlotDeviceModelRequest, SlotModelBinding, SlotSnapshot,
+    StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerStatus,
+    WireFrame, apply_transport_profile,
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -68,6 +70,7 @@ enum InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneFocus {
     Output,
+    Queue,
     Input,
 }
 
@@ -76,6 +79,15 @@ struct ConsoleLayout {
     output_area: Rect,
     output_inner: Rect,
     input_area: Rect,
+}
+
+/// A paused viewport is an immutable set of already wrapped terminal rows.
+/// Live serial events continue to update the underlying Slot, but they cannot
+/// move these rows. Returning to offset zero drops the snapshot and resumes
+/// the ordinary live projection.
+#[derive(Debug, Clone)]
+struct ScrollSnapshot {
+    rows: Vec<Line<'static>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -133,6 +145,55 @@ struct PendingWrite {
     kind: PendingWriteKind,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedLineOperation {
+    operation_id: Option<Uuid>,
+    start: usize,
+    end: usize,
+    data: Vec<u8>,
+}
+
+fn queued_line_operations(queue: &VecDeque<PendingWrite>) -> Vec<QueuedLineOperation> {
+    let mut operations: Vec<QueuedLineOperation> = Vec::new();
+    for (index, write) in queue.iter().enumerate() {
+        if write.kind != PendingWriteKind::Line {
+            continue;
+        }
+        if let Some(operation) = operations.last_mut()
+            && operation.end == index
+            && operation.operation_id == write.operation_id
+        {
+            operation.end += 1;
+            operation.data.extend_from_slice(&write.data);
+            continue;
+        }
+        operations.push(QueuedLineOperation {
+            operation_id: write.operation_id,
+            start: index,
+            end: index + 1,
+            data: write.data.clone(),
+        });
+    }
+    operations
+}
+
+fn take_queued_line_operation(
+    queue: &mut VecDeque<PendingWrite>,
+    operation_index: usize,
+) -> Option<QueuedLineOperation> {
+    let operation = queued_line_operations(queue)
+        .into_iter()
+        .nth(operation_index)?;
+    let removed = queue
+        .drain(operation.start..operation.end)
+        .flat_map(|write| write.data)
+        .collect::<Vec<_>>();
+    Some(QueuedLineOperation {
+        data: removed,
+        ..operation
+    })
+}
+
 fn append_pending_write(
     queue: &mut VecDeque<PendingWrite>,
     data: &[u8],
@@ -162,23 +223,14 @@ fn append_pending_write(
 }
 
 fn queued_line_count(queue: &VecDeque<PendingWrite>) -> usize {
-    let mut count = 0usize;
-    let mut previous_operation = None;
-    for write in queue
-        .iter()
-        .filter(|write| write.kind == PendingWriteKind::Line)
-    {
-        if count == 0 || write.operation_id != previous_operation {
-            count = count.saturating_add(1);
-        }
-        previous_operation = write.operation_id;
-    }
-    count
+    queued_line_operations(queue).len()
 }
 
 /// Removes the newest complete LINE operation from a local, not-yet-sent
-/// queue. One long line or confirmed multiline paste may occupy several
-/// physical chunks, but it remains one editable queue entry.
+/// queue. One long line may occupy several physical chunks, but it remains
+/// one editable queue entry. Each normalized command in a multiline paste has
+/// its own operation ID and therefore its own entry.
+#[cfg(test)]
 fn pop_last_queued_line(queue: &mut VecDeque<PendingWrite>) -> Option<Vec<u8>> {
     let newest = queue.back()?;
     if newest.kind != PendingWriteKind::Line {
@@ -197,10 +249,23 @@ fn pop_last_queued_line(queue: &mut VecDeque<PendingWrite>) -> Option<Vec<u8>> {
 
 #[derive(Debug)]
 enum PendingRequest {
-    Acquire { slot_id: String },
-    Renew { slot_id: String },
-    Release { slot_id: String },
-    Write { slot_id: String },
+    Acquire {
+        slot_id: String,
+    },
+    Renew {
+        slot_id: String,
+    },
+    Release {
+        slot_id: String,
+    },
+    CancelAcquire {
+        slot_id: String,
+    },
+    Write {
+        slot_id: String,
+        operation_id: Option<Uuid>,
+        cooperative: bool,
+    },
 }
 
 impl PendingRequest {
@@ -209,9 +274,17 @@ impl PendingRequest {
             Self::Acquire { slot_id }
             | Self::Renew { slot_id }
             | Self::Release { slot_id }
-            | Self::Write { slot_id } => slot_id,
+            | Self::CancelAcquire { slot_id }
+            | Self::Write { slot_id, .. } => slot_id,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InFlightWrite {
+    operation_id: Option<Uuid>,
+    kind: PendingWriteKind,
+    chunk_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +433,10 @@ struct SlotView {
     /// row. The durable journal remains authoritative; this bit keeps a
     /// synthetic warning visible at the oldest local boundary.
     local_history_truncated: bool,
+    scroll_snapshot: Option<ScrollSnapshot>,
+    /// Visual-row offset within `scroll_snapshot`. When no snapshot exists,
+    /// this retains the legacy logical-row offset used by a few recovery paths
+    /// and tests, but all interactive scrolling creates a snapshot first.
     scroll_from_bottom: usize,
     unseen: usize,
     last_epoch: Option<Uuid>,
@@ -376,6 +453,10 @@ struct SlotView {
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
+    /// The Agent activity hint is hidden after the operator focuses/types in
+    /// the input for this Run. A different Run UUID makes the hint visible
+    /// again without needing an explicit reset.
+    dismissed_agent_run: Option<Uuid>,
 }
 
 /// Ctrl-R incremental history search state (LINE mode).
@@ -408,6 +489,7 @@ impl SlotView {
             stream: TerminalStreamParser::new(),
             buffered_bytes: 0,
             local_history_truncated: false,
+            scroll_snapshot: None,
             scroll_from_bottom: 0,
             unseen: 0,
             merge_echo: true,
@@ -419,6 +501,7 @@ impl SlotView {
             history_search: None,
             completion: None,
             last_manual_activity: None,
+            dismissed_agent_run: None,
         };
         view.sync_trigger_projection(false);
         view
@@ -537,7 +620,14 @@ impl SlotView {
                     .and_then(|value| u32::try_from(value).ok())
                 {
                     trigger.fires_confirmed = trigger.fires_confirmed.max(fire_index);
-                    trigger.status = if was_stopping || fire_index >= trigger.spec.max_fires {
+                    // Reaching max_fires exhausts only the Trigger's write
+                    // budget. When a stop matcher is configured, seriald
+                    // continues observing RX until the original deadline so
+                    // a prompt emitted after the final write can still match.
+                    trigger.status = if was_stopping
+                        || (fire_index >= trigger.spec.max_fires
+                            && trigger.spec.stop_contains.is_empty())
+                    {
                         TriggerStatus::Stopping
                     } else {
                         TriggerStatus::Running
@@ -604,7 +694,11 @@ impl SlotView {
         }
         let first_truncation = evicted > 0 && !self.local_history_truncated;
         self.local_history_truncated |= evicted > 0;
-        if self.scroll_from_bottom > 0 {
+        if self.scroll_snapshot.is_some() {
+            // The paused viewport owns immutable visual rows. New output is
+            // counted, but it must never alter the visual offset.
+            self.unseen = self.unseen.saturating_add(1);
+        } else if self.scroll_from_bottom > 0 {
             // Paused viewport: keep the same rows in view by pushing the
             // bottom-offset up with each appended row, and pulling it back
             // down for rows evicted from the front. The first eviction also
@@ -640,14 +734,13 @@ impl SlotView {
         for line in batch.completed {
             self.push_line(line, selected);
         }
-        if completed_pending && (!selected || self.scroll_from_bottom > 0) {
+        if completed_pending && (!selected || self.is_paused()) {
             // The unterminated row was already counted as unseen when it first
             // appeared; committing it must not count the same row twice.
             self.unseen = self.unseen.saturating_sub(1);
         }
         self.pending_line = batch.pending;
-        if !had_pending && self.pending_line.is_some() && (!selected || self.scroll_from_bottom > 0)
-        {
+        if !had_pending && self.pending_line.is_some() && (!selected || self.is_paused()) {
             self.unseen = self.unseen.saturating_add(1);
         }
     }
@@ -663,8 +756,31 @@ impl SlotView {
     }
 
     fn follow(&mut self) {
+        self.scroll_snapshot = None;
         self.scroll_from_bottom = 0;
         self.unseen = 0;
+    }
+
+    fn is_paused(&self) -> bool {
+        self.scroll_snapshot.is_some() || self.scroll_from_bottom > 0
+    }
+
+    fn active_agent_run(&self) -> Option<&RunInfo> {
+        self.snapshot.active_run.as_ref().filter(|run| {
+            run.owner.kind == serial_protocol::ActorKind::Agent
+                && run.status == serial_protocol::RunStatus::Active
+        })
+    }
+
+    fn visible_agent_run(&self) -> Option<&RunInfo> {
+        let run = self.active_agent_run()?;
+        (self.dismissed_agent_run != Some(run.id)).then_some(run)
+    }
+
+    fn dismiss_agent_run_hint(&mut self) {
+        if let Some(run_id) = self.active_agent_run().map(|run| run.id) {
+            self.dismissed_agent_run = Some(run_id);
+        }
     }
 
     fn logical_line_count(&self) -> usize {
@@ -732,6 +848,459 @@ struct QueuedControl {
     since: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct QueueSelection {
+    slot_id: String,
+    selected: usize,
+    detail_scroll: usize,
+}
+
+#[derive(Clone)]
+struct MenuCatalog {
+    slots: Vec<SlotSnapshot>,
+    transport_profiles: Vec<TransportProfile>,
+    device_profiles: Vec<DeviceProfile>,
+    models: Vec<DeviceModel>,
+    model_bindings: Vec<SlotModelBinding>,
+    model_revision: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuPage {
+    Root,
+    Profiles,
+    TransportProfiles,
+    DeviceProfiles,
+    Models,
+    ModelParents,
+    SerialSettings,
+    Help,
+}
+
+struct MenuState {
+    page: MenuPage,
+    selected: usize,
+    stack: Vec<(MenuPage, usize)>,
+    catalog: Option<MenuCatalog>,
+    expanded_models: HashSet<String>,
+    prompt: Option<MenuPrompt>,
+    busy: bool,
+    message: String,
+}
+
+impl MenuState {
+    fn new() -> Self {
+        Self {
+            page: MenuPage::Root,
+            selected: 0,
+            stack: Vec::new(),
+            catalog: None,
+            expanded_models: HashSet::new(),
+            prompt: None,
+            busy: false,
+            message: tr("menu.loading").into(),
+        }
+    }
+
+    fn push(&mut self, page: MenuPage) {
+        self.stack.push((self.page, self.selected));
+        self.page = page;
+        self.selected = 0;
+    }
+
+    fn back(&mut self) -> bool {
+        if let Some((page, selected)) = self.stack.pop() {
+            self.page = page;
+            self.selected = selected;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct MenuPrompt {
+    title: String,
+    value: Vec<char>,
+    cursor: usize,
+    secret: bool,
+    purpose: MenuPromptPurpose,
+}
+
+enum MenuPromptPurpose {
+    Admin(MenuAdminMutation),
+    TransportName {
+        slot_id: String,
+        profile: TransportProfile,
+    },
+    DeviceName {
+        slot_id: String,
+        profile: DeviceProfile,
+    },
+    ModelName {
+        slot_id: String,
+        parent_id: Option<String>,
+    },
+}
+
+enum MenuAdminMutation {
+    BindTransport {
+        slot_id: String,
+        profile_name: String,
+    },
+    BindDevice {
+        slot_id: String,
+        profile_name: Option<String>,
+    },
+    CreateTransportAndBind {
+        slot_id: String,
+        profile: TransportProfile,
+    },
+    CreateDeviceAndBind {
+        slot_id: String,
+        profile: DeviceProfile,
+    },
+}
+
+enum MenuIoCommand {
+    Reload,
+    Admin {
+        token: String,
+        mutation: MenuAdminMutation,
+    },
+    BindModel {
+        slot_id: String,
+        model_id: String,
+        expected_revision: u64,
+        expected_current: Option<String>,
+    },
+    CreateAndBindModel {
+        slot_id: String,
+        model_id: String,
+        name: String,
+        parent_id: Option<String>,
+        expected_revision: u64,
+        expected_current: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+enum MenuSuccess {
+    Loaded,
+    TransportBound(String),
+    DeviceBound(Option<String>),
+    TransportCreated(String),
+    DeviceCreated(String),
+    ModelBound(String),
+    ModelCreated(String),
+}
+
+enum MenuIoEvent {
+    Completed {
+        catalog: MenuCatalog,
+        success: MenuSuccess,
+    },
+    Failed(String),
+}
+
+#[derive(Clone, Copy)]
+enum TransportPreset {
+    Baud(u32),
+    EightNOne,
+    EightEOne,
+    EightOOne,
+    EightNTwo,
+    FlowNone,
+    FlowHardware,
+    ToggleDtr,
+    ToggleRts,
+    ToggleAutoOpen,
+}
+
+const TRANSPORT_PRESETS: &[TransportPreset] = &[
+    TransportPreset::Baud(9_600),
+    TransportPreset::Baud(57_600),
+    TransportPreset::Baud(115_200),
+    TransportPreset::Baud(230_400),
+    TransportPreset::Baud(921_600),
+    TransportPreset::EightNOne,
+    TransportPreset::EightEOne,
+    TransportPreset::EightOOne,
+    TransportPreset::EightNTwo,
+    TransportPreset::FlowNone,
+    TransportPreset::FlowHardware,
+    TransportPreset::ToggleDtr,
+    TransportPreset::ToggleRts,
+    TransportPreset::ToggleAutoOpen,
+];
+
+#[derive(Clone, Copy)]
+enum DevicePreset {
+    Echo(EchoMode),
+    Eol(&'static str),
+}
+
+const DEVICE_PRESETS: &[DevicePreset] = &[
+    DevicePreset::Echo(EchoMode::On),
+    DevicePreset::Echo(EchoMode::Off),
+    DevicePreset::Echo(EchoMode::Auto),
+    DevicePreset::Eol("\r"),
+    DevicePreset::Eol("\n"),
+    DevicePreset::Eol("\r\n"),
+];
+
+impl DevicePreset {
+    fn apply(self, profile: &mut DeviceProfile) {
+        match self {
+            Self::Echo(echo) => profile.echo = Some(echo),
+            Self::Eol(eol) => profile.write_eol = Some(eol.into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Echo(EchoMode::On) => tr("menu.device.echo.on"),
+            Self::Echo(EchoMode::Off) => tr("menu.device.echo.off"),
+            Self::Echo(EchoMode::Auto) => tr("menu.device.echo.auto"),
+            Self::Eol("\r") => tr("menu.device.eol.cr"),
+            Self::Eol("\n") => tr("menu.device.eol.lf"),
+            Self::Eol("\r\n") => tr("menu.device.eol.crlf"),
+            Self::Eol(_) => tr("menu.device.eol.custom"),
+        }
+    }
+}
+
+impl TransportPreset {
+    fn apply(self, profile: &mut TransportProfile) {
+        match self {
+            Self::Baud(baud_rate) => profile.baud_rate = baud_rate,
+            Self::EightNOne => {
+                profile.data_bits = DataBits::Eight;
+                profile.parity = Parity::None;
+                profile.stop_bits = StopBits::One;
+            }
+            Self::EightEOne => {
+                profile.data_bits = DataBits::Eight;
+                profile.parity = Parity::Even;
+                profile.stop_bits = StopBits::One;
+            }
+            Self::EightOOne => {
+                profile.data_bits = DataBits::Eight;
+                profile.parity = Parity::Odd;
+                profile.stop_bits = StopBits::One;
+            }
+            Self::EightNTwo => {
+                profile.data_bits = DataBits::Eight;
+                profile.parity = Parity::None;
+                profile.stop_bits = StopBits::Two;
+            }
+            Self::FlowNone => profile.flow_control = FlowControl::None,
+            Self::FlowHardware => profile.flow_control = FlowControl::Hardware,
+            Self::ToggleDtr => profile.dtr = !profile.dtr,
+            Self::ToggleRts => profile.rts = !profile.rts,
+            Self::ToggleAutoOpen => profile.auto_open = !profile.auto_open,
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Baud(value) => trf("menu.serial.baud", &[&value.to_string()]),
+            Self::EightNOne => tr("menu.serial.8n1").into(),
+            Self::EightEOne => tr("menu.serial.8e1").into(),
+            Self::EightOOne => tr("menu.serial.8o1").into(),
+            Self::EightNTwo => tr("menu.serial.8n2").into(),
+            Self::FlowNone => tr("menu.serial.flow.none").into(),
+            Self::FlowHardware => tr("menu.serial.flow.hardware").into(),
+            Self::ToggleDtr => tr("menu.serial.dtr").into(),
+            Self::ToggleRts => tr("menu.serial.rts").into(),
+            Self::ToggleAutoOpen => tr("menu.serial.auto").into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ModelTreeRow {
+    index: usize,
+    depth: usize,
+}
+
+fn visible_model_rows(models: &[DeviceModel], expanded: &HashSet<String>) -> Vec<ModelTreeRow> {
+    fn visit(
+        models: &[DeviceModel],
+        parent: Option<&str>,
+        depth: usize,
+        expanded: &HashSet<String>,
+        rows: &mut Vec<ModelTreeRow>,
+    ) {
+        for (index, model) in models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| model.parent_id.as_deref() == parent)
+        {
+            rows.push(ModelTreeRow { index, depth });
+            if expanded.contains(&model.id) {
+                visit(models, Some(&model.id), depth + 1, expanded, rows);
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    visit(models, None, 0, expanded, &mut rows);
+    rows
+}
+
+fn all_model_rows(models: &[DeviceModel]) -> Vec<ModelTreeRow> {
+    let expanded = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    visible_model_rows(models, &expanded)
+}
+
+fn model_has_children(models: &[DeviceModel], model_id: &str) -> bool {
+    models
+        .iter()
+        .any(|model| model.parent_id.as_deref() == Some(model_id))
+}
+
+fn slot_model_binding<'a>(catalog: &'a MenuCatalog, slot_id: &str) -> Option<&'a SlotModelBinding> {
+    catalog
+        .model_bindings
+        .iter()
+        .find(|binding| binding.slot_id == slot_id)
+}
+
+fn normalize_model_id(name: &str, models: &[DeviceModel]) -> String {
+    let base = name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let base = if base.is_empty() {
+        "model".to_owned()
+    } else {
+        base
+    };
+    if !models.iter().any(|model| model.id == base) {
+        return base;
+    }
+    for suffix in 2..=9_999 {
+        let candidate = format!("{base}-{suffix}");
+        if !models.iter().any(|model| model.id == candidate) {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", Uuid::new_v4().simple())
+}
+
+fn default_transport_profile(name: String) -> TransportProfile {
+    TransportProfile {
+        name,
+        baud_rate: 115_200,
+        data_bits: DataBits::Eight,
+        parity: Parity::None,
+        stop_bits: StopBits::One,
+        flow_control: FlowControl::None,
+        dtr: false,
+        rts: false,
+        auto_open: true,
+    }
+}
+
+fn current_transport_template(view: &SlotView, catalog: &MenuCatalog) -> TransportProfile {
+    if let Some(profile) = catalog
+        .transport_profiles
+        .iter()
+        .find(|profile| profile.name == view.snapshot.config.profile)
+    {
+        return profile.clone();
+    }
+    let settings = view.snapshot.effective_transport.unwrap_or_else(|| {
+        serial_protocol::resolve_transport_settings(&view.snapshot.config.settings, None)
+    });
+    TransportProfile {
+        name: view.snapshot.config.profile.clone(),
+        baud_rate: settings.baud_rate,
+        data_bits: settings.data_bits,
+        parity: settings.parity,
+        stop_bits: settings.stop_bits,
+        flow_control: settings.flow_control,
+        dtr: settings.dtr,
+        rts: settings.rts,
+        auto_open: settings.auto_open,
+    }
+}
+
+fn current_device_template(view: &SlotView) -> DeviceProfile {
+    let pacing = view
+        .snapshot
+        .effective_write_pacing
+        .unwrap_or(serial_protocol::WritePacing {
+            chunk_size: view.snapshot.config.settings.write_chunk_size,
+            chunk_delay_ms: view.snapshot.config.settings.write_chunk_delay_ms,
+        });
+    DeviceProfile {
+        name: String::new(),
+        shell_prompt: view.effective_shell_prompt().map(ToOwned::to_owned),
+        uboot_prompt: view.effective_uboot_prompt().map(ToOwned::to_owned),
+        write_eol: Some(view.effective_write_eol().to_owned()),
+        echo: Some(view.effective_echo()),
+        write_chunk_size: Some(pacing.chunk_size),
+        write_chunk_delay_ms: Some(pacing.chunk_delay_ms),
+    }
+}
+
+fn valid_menu_name(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.len() <= 128
+        && !value.chars().any(char::is_control)
+}
+
+fn menu_item_count(menu: &MenuState) -> usize {
+    match menu.page {
+        MenuPage::Root => 4,
+        MenuPage::Profiles => 2,
+        MenuPage::TransportProfiles => menu
+            .catalog
+            .as_ref()
+            .map_or(0, |catalog| catalog.transport_profiles.len() + 1),
+        MenuPage::DeviceProfiles => menu.catalog.as_ref().map_or(0, |catalog| {
+            catalog.device_profiles.len() + 2 + DEVICE_PRESETS.len()
+        }),
+        MenuPage::Models => menu.catalog.as_ref().map_or(0, |catalog| {
+            visible_model_rows(&catalog.models, &menu.expanded_models).len() + 2
+        }),
+        MenuPage::ModelParents => menu
+            .catalog
+            .as_ref()
+            .map_or(0, |catalog| all_model_rows(&catalog.models).len()),
+        MenuPage::SerialSettings => TRANSPORT_PRESETS.len(),
+        MenuPage::Help => 0,
+    }
+}
+
+fn menu_success_message(success: &MenuSuccess) -> String {
+    match success {
+        MenuSuccess::Loaded => tr("menu.loaded").into(),
+        MenuSuccess::TransportBound(name) => trf("menu.transport.bound", &[name]),
+        MenuSuccess::DeviceBound(Some(name)) => trf("menu.device.bound", &[name]),
+        MenuSuccess::DeviceBound(None) => tr("menu.device.generic.bound").into(),
+        MenuSuccess::TransportCreated(name) => trf("menu.transport.created", &[name]),
+        MenuSuccess::DeviceCreated(name) => trf("menu.device.created", &[name]),
+        MenuSuccess::ModelBound(name) => trf("menu.model.bound", &[name]),
+        MenuSuccess::ModelCreated(name) => trf("menu.model.created", &[name]),
+    }
+}
+
 struct App {
     slots: Vec<SlotView>,
     selected: usize,
@@ -749,8 +1318,15 @@ struct App {
     status: String,
     pending_paste: Option<PendingPaste>,
     pending_writes: HashMap<String, VecDeque<PendingWrite>>,
+    /// Current physical chunk within the first queued operation for each Slot.
+    /// The complete operation stays in `pending_writes` until every chunk is
+    /// acknowledged, so its UI card never disappears or shrinks in flight.
+    inflight_writes: HashMap<String, InFlightWrite>,
     pending_requests: HashMap<Uuid, PendingRequest>,
     queued_controls: HashMap<String, QueuedControl>,
+    queue_selection: Option<QueueSelection>,
+    menu: Option<MenuState>,
+    menu_commands: Option<mpsc::Sender<MenuIoCommand>>,
     uncertain_write_outcomes: usize,
     human_idle_release: Duration,
     mouse_capture: bool,
@@ -791,8 +1367,12 @@ impl App {
             status: tr("st.connecting").into(),
             pending_paste: None,
             pending_writes: HashMap::new(),
+            inflight_writes: HashMap::new(),
             pending_requests: HashMap::new(),
             queued_controls: HashMap::new(),
+            queue_selection: None,
+            menu: None,
+            menu_commands: None,
             uncertain_write_outcomes: 0,
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
             mouse_capture: true,
@@ -825,6 +1405,7 @@ impl App {
     fn select(&mut self, index: usize) {
         if index < self.slots.len() {
             self.clear_text_selection();
+            self.queue_selection = None;
             self.selected = index;
             self.current_mut().unseen = 0;
             let name = self.current().snapshot.config.display_name.clone();
@@ -861,6 +1442,7 @@ impl App {
                 self.connection_generation = None;
                 self.pending_requests.clear();
                 self.pending_writes.clear();
+                self.inflight_writes.clear();
                 self.queued_controls.clear();
                 self.pending_paste = None;
                 for slot in &mut self.slots {
@@ -891,6 +1473,7 @@ impl App {
             }
             NetworkEvent::Frame(frame) => self.handle_frame(*frame, commands),
         }
+        self.normalize_queue_selection();
         self.dirty = true;
     }
 
@@ -964,19 +1547,36 @@ impl App {
                 retryable,
             } => {
                 let mut discarded_suffix = String::new();
+                let mut cooperative_slot = None;
                 if let Some(request_id) = request_id {
                     match self.pending_requests.remove(&request_id) {
                         Some(PendingRequest::Acquire { slot_id })
-                        | Some(PendingRequest::Write { slot_id }) => {
+                        | Some(PendingRequest::Write {
+                            slot_id,
+                            cooperative: false,
+                            ..
+                        }) => {
                             self.queued_controls.remove(&slot_id);
                             let discarded = self
                                 .pending_writes
                                 .remove(&slot_id)
                                 .map_or(0, |writes| writes.len());
+                            self.inflight_writes.remove(&slot_id);
                             if discarded > 0 {
                                 discarded_suffix =
                                     trf("st.discarded.chunks", &[&slot_id, &discarded.to_string()]);
                             }
+                        }
+                        Some(PendingRequest::Write {
+                            slot_id,
+                            cooperative: true,
+                            ..
+                        }) => {
+                            // Cooperative input never owns the queued Human
+                            // suffix or its acquire request. A rejection (for
+                            // example an Agent lease expiring at the boundary)
+                            // ends only this one opportunistic write.
+                            cooperative_slot = Some(slot_id);
                         }
                         _ => {}
                     }
@@ -986,6 +1586,14 @@ impl App {
                     code,
                     if retryable { tr("st.retryable") } else { "" }
                 );
+                if let Some(slot_id) = cooperative_slot {
+                    // A queue-mode acquire can be granted while the
+                    // cooperative request is still in flight. That grant
+                    // deliberately waits behind all writes; once this request
+                    // is rejected, resume the untouched ordinary queue if the
+                    // Human now owns the lease.
+                    self.flush_pending_writes(&slot_id, commands);
+                }
             }
             ServerMessage::Gap {
                 slot_id,
@@ -1093,15 +1701,40 @@ impl App {
                     self.status = trf("st.released", &[&slot_id]);
                 }
             }
-            CommandResult::AcquireCancelled { .. } => {
-                if let Some(PendingRequest::Acquire { slot_id }) = pending {
+            CommandResult::AcquireCancelled { removed } => {
+                if let Some(
+                    PendingRequest::Acquire { slot_id } | PendingRequest::CancelAcquire { slot_id },
+                ) = pending
+                {
                     self.queued_controls.remove(&slot_id);
                     self.status = trf("st.acquire.cancelled", &[&slot_id]);
+                    // The queued waiter can be promoted just before its
+                    // directed cancellation is processed. If that happened,
+                    // release the now-idle Human lease immediately instead of
+                    // holding it until the idle timer expires.
+                    if !removed
+                        && self
+                            .slot_index(&slot_id)
+                            .is_some_and(|index| self.owns_control(index))
+                        && !self.pending_writes.contains_key(&slot_id)
+                        && let Some(index) = self.slot_index(&slot_id)
+                        && let Some(lease) = self.slots[index].snapshot.control.clone()
+                    {
+                        self.release_slot_control(commands, slot_id, lease, false);
+                    }
                 }
             }
             CommandResult::WriteAccepted { event_seq } => {
-                if let Some(PendingRequest::Write { slot_id }) = pending {
+                if let Some(PendingRequest::Write {
+                    slot_id,
+                    cooperative,
+                    ..
+                }) = pending
+                {
                     self.status = trf("st.write.confirmed", &[&slot_id, &event_seq.to_string()]);
+                    if !cooperative {
+                        self.acknowledge_inflight_write(&slot_id);
+                    }
                     self.flush_pending_writes(&slot_id, commands);
                 }
             }
@@ -1337,6 +1970,7 @@ impl App {
             .pending_writes
             .remove(slot_id)
             .map_or(0, |writes| writes.len());
+        self.inflight_writes.remove(slot_id);
         let before = self.pending_requests.len();
         self.pending_requests
             .retain(|_, request| request.slot_id() != slot_id);
@@ -1441,13 +2075,83 @@ impl App {
         self.request_write_batch_with_kind(commands, vec![data], None, PendingWriteKind::Raw)
     }
 
+    /// Sends an explicit Human/Agent cooperative write without acquiring or
+    /// taking over the Agent's control lease. The daemon independently checks
+    /// the same lease/Run relationship; this local gate keeps an accidental
+    /// Alt+Enter from becoming an opaque rejected request.
+    fn request_cooperative_write(
+        &mut self,
+        commands: &mpsc::Sender<NetworkCommand>,
+        data: Vec<u8>,
+        operation_id: Option<Uuid>,
+    ) -> bool {
+        if !self.transport_connected || !self.authenticated {
+            self.status = tr("st.not.auth2").into();
+            return false;
+        }
+        if !self.slot_ready(self.selected) {
+            self.status = trf("st.not.live", &[&self.selected_slot_id()]);
+            return false;
+        }
+        let human = self
+            .actor
+            .as_ref()
+            .is_some_and(|actor| actor.kind == serial_protocol::ActorKind::Human);
+        let matching_run_id = self
+            .current()
+            .snapshot
+            .control
+            .as_ref()
+            .zip(self.current().active_agent_run())
+            .and_then(|(lease, run)| {
+                (lease.owner.kind == serial_protocol::ActorKind::Agent
+                    && lease.owner.id == run.owner.id)
+                    .then_some(run.id)
+            });
+        let Some(expected_run_id) = matching_run_id.filter(|_| human) else {
+            self.status = tr("st.cooperative.unavailable").into();
+            return false;
+        };
+
+        let slot_id = self.selected_slot_id();
+        let sent = self.send_message(
+            commands,
+            ClientMessage::Write {
+                request_id: Uuid::new_v4(),
+                slot_id: slot_id.clone(),
+                control_id: Uuid::nil(),
+                fence: 0,
+                data,
+                operation_id,
+                // Bind this exceptional write to the exact Agent Run that
+                // justified cooperation. The daemon rejects delayed/replayed
+                // input after that Run ends or a successor begins.
+                expected_run_id: Some(expected_run_id),
+                pacing: None,
+                cooperative: true,
+            },
+            Some(PendingRequest::Write {
+                slot_id,
+                operation_id,
+                cooperative: true,
+            }),
+        );
+        if sent {
+            self.status = tr("st.cooperative.sent").into();
+        }
+        sent
+    }
+
     fn request_write_batch(
         &mut self,
         commands: &mpsc::Sender<NetworkCommand>,
         writes: Vec<Vec<u8>>,
-        operation_id: Option<Uuid>,
     ) -> bool {
-        self.request_write_batch_with_kind(commands, writes, operation_id, PendingWriteKind::Line)
+        let writes = writes
+            .into_iter()
+            .map(|write| (write, Some(Uuid::new_v4())))
+            .collect();
+        self.request_write_operations(commands, writes, PendingWriteKind::Line)
     }
 
     fn request_write_batch_with_kind(
@@ -1457,7 +2161,23 @@ impl App {
         operation_id: Option<Uuid>,
         kind: PendingWriteKind,
     ) -> bool {
-        if writes.iter().all(Vec::is_empty) {
+        self.request_write_operations(
+            commands,
+            writes
+                .into_iter()
+                .map(|write| (write, operation_id))
+                .collect(),
+            kind,
+        )
+    }
+
+    fn request_write_operations(
+        &mut self,
+        commands: &mpsc::Sender<NetworkCommand>,
+        writes: Vec<(Vec<u8>, Option<Uuid>)>,
+        kind: PendingWriteKind,
+    ) -> bool {
+        if writes.iter().all(|(write, _)| write.is_empty()) {
             return true;
         }
         if !self.transport_connected || !self.authenticated {
@@ -1469,18 +2189,18 @@ impl App {
             return false;
         }
         let slot_id = self.selected_slot_id();
-        let total_new_bytes = writes
-            .iter()
-            .fold(0usize, |total, write| total.saturating_add(write.len()));
+        let total_new_bytes = writes.iter().fold(0usize, |total, (write, _)| {
+            total.saturating_add(write.len())
+        });
         let previous_slot_writes = self
             .pending_writes
             .get(&slot_id)
             .cloned()
             .unwrap_or_default();
         let previous_slot_count = previous_slot_writes.len();
-        let mut candidate_slot_writes = previous_slot_writes;
-        for write in writes.iter().filter(|write| !write.is_empty()) {
-            append_pending_write(&mut candidate_slot_writes, write, operation_id, kind);
+        let mut candidate_slot_writes = previous_slot_writes.clone();
+        for (write, operation_id) in writes.iter().filter(|(write, _)| !write.is_empty()) {
+            append_pending_write(&mut candidate_slot_writes, write, *operation_id, kind);
         }
 
         let total_pending = self
@@ -1508,14 +2228,23 @@ impl App {
         self.slots[self.selected].last_manual_activity = Some(Instant::now());
 
         if self.owns_control(self.selected) {
-            return self.flush_pending_writes(&slot_id, commands);
+            let flushed = self.flush_pending_writes(&slot_id, commands);
+            // A saturated outbound channel leaves the complete operation in
+            // the visible local queue. Treat that as accepted local enqueue so
+            // Enter may clear the draft without risking a later duplicate.
+            return flushed || self.pending_writes.contains_key(&slot_id);
         }
 
         let acquire_already_pending = self.pending_requests.values().any(|request| {
             matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == &slot_id)
         });
         if !acquire_already_pending && !self.acquire_control(commands, ControlMode::Queue) {
-            self.pending_writes.remove(&slot_id);
+            if previous_slot_writes.is_empty() {
+                self.pending_writes.remove(&slot_id);
+            } else {
+                self.pending_writes
+                    .insert(slot_id.clone(), previous_slot_writes);
+            }
             return false;
         }
         true
@@ -1576,33 +2305,85 @@ impl App {
             return;
         }
         self.pending_writes.remove(&slot_id);
+        self.inflight_writes.remove(&slot_id);
         self.release_slot_control(commands, slot_id, lease, false);
     }
 
-    fn remove_last_queued_line(&mut self, restore_to_editor: bool) {
+    fn remove_last_queued_line(
+        &mut self,
+        restore_to_editor: bool,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
         let slot_id = self.selected_slot_id();
-        if self.owns_control(self.selected)
-            || self.pending_requests.values().any(
-                |request| matches!(request, PendingRequest::Write { slot_id: pending } if pending == &slot_id),
-            )
-        {
-            self.status = tr("st.queue.already.sending").into();
+        let count = self
+            .pending_writes
+            .get(&slot_id)
+            .map_or(0, |queue| queued_line_operations(queue).len());
+        if count == 0 {
+            self.status = if self
+                .pending_writes
+                .get(&slot_id)
+                .is_some_and(|queue| !queue.is_empty())
+            {
+                tr("st.queue.raw.only").into()
+            } else {
+                tr("st.queue.none").into()
+            };
             return;
         }
-        let Some(queue) = self.pending_writes.get_mut(&slot_id) else {
+        self.remove_queued_line_operation(count - 1, restore_to_editor, commands);
+    }
+
+    fn remove_queued_line_operation(
+        &mut self,
+        operation_index: usize,
+        restore_to_editor: bool,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
+        let slot_id = self.selected_slot_id();
+        let Some(operation) = self.pending_writes.get(&slot_id).and_then(|queue| {
+            queued_line_operations(queue)
+                .into_iter()
+                .nth(operation_index)
+        }) else {
             self.status = tr("st.queue.none").into();
             return;
         };
-        let Some(mut bytes) = pop_last_queued_line(queue) else {
-            self.status = tr("st.queue.raw.only").into();
+
+        let sending = self.pending_requests.values().any(|request| match request {
+            PendingRequest::Write {
+                slot_id: pending_slot,
+                operation_id,
+                ..
+            } if pending_slot == &slot_id => {
+                operation.operation_id.is_none() || operation.operation_id == *operation_id
+            }
+            _ => false,
+        });
+        if sending {
+            self.status = tr("st.queue.already.sending").into();
+            return;
+        }
+
+        let Some(mut bytes) = self
+            .pending_writes
+            .get_mut(&slot_id)
+            .and_then(|queue| take_queued_line_operation(queue, operation_index))
+            .map(|operation| operation.data)
+        else {
+            self.status = tr("st.queue.none").into();
             return;
         };
-        if queue.is_empty() {
+        let queue_empty = self
+            .pending_writes
+            .get(&slot_id)
+            .is_some_and(VecDeque::is_empty);
+        if queue_empty {
             self.pending_writes.remove(&slot_id);
         }
         if restore_to_editor {
-            let eol = self.current().effective_write_eol().as_bytes();
-            if !eol.is_empty() && bytes.ends_with(eol) {
+            let eol = self.current().effective_write_eol().as_bytes().to_vec();
+            if !eol.is_empty() && bytes.ends_with(&eol) {
                 bytes.truncate(bytes.len() - eol.len());
             }
             let text = String::from_utf8_lossy(&bytes);
@@ -1613,11 +2394,120 @@ impl App {
             view.history_cursor = None;
             view.history_search = None;
             view.completion = None;
+            view.dismiss_agent_run_hint();
+            self.queue_selection = None;
             self.focus = PaneFocus::Input;
             self.status = tr("st.queue.restored").into();
         } else {
             self.status = tr("st.queue.deleted").into();
+            self.normalize_queue_selection();
         }
+        if !self.pending_writes.contains_key(&slot_id)
+            && !self.owns_control(self.selected)
+            && (self.queued_controls.contains_key(&slot_id)
+                || self.pending_requests.values().any(
+                    |request| matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == &slot_id),
+                ))
+        {
+            self.cancel_queued_control(commands, &slot_id, tr("st.cancel.reason"));
+        }
+    }
+
+    fn open_queue_selection(&mut self) {
+        let slot_id = self.selected_slot_id();
+        let count = self
+            .pending_writes
+            .get(&slot_id)
+            .map_or(0, |queue| queued_line_operations(queue).len());
+        if count == 0 {
+            self.status = tr("st.queue.none").into();
+            self.queue_selection = None;
+            self.focus = PaneFocus::Input;
+            return;
+        }
+        self.queue_selection = Some(QueueSelection {
+            slot_id,
+            selected: 0,
+            detail_scroll: 0,
+        });
+        self.focus = PaneFocus::Queue;
+        self.status = tr("st.queue.select").into();
+    }
+
+    fn normalize_queue_selection(&mut self) {
+        let Some(selection) = self.queue_selection.as_ref() else {
+            return;
+        };
+        let count = self
+            .pending_writes
+            .get(&selection.slot_id)
+            .map_or(0, |queue| queued_line_operations(queue).len());
+        if count == 0 {
+            self.queue_selection = None;
+            self.focus = PaneFocus::Input;
+        } else if let Some(selection) = self.queue_selection.as_mut() {
+            selection.selected = selection.selected.min(count - 1);
+        }
+    }
+
+    fn handle_queue_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        self.normalize_queue_selection();
+        let Some(selection) = self.queue_selection.as_ref() else {
+            return;
+        };
+        let slot_id = selection.slot_id.clone();
+        let selected = selection.selected;
+        let count = self
+            .pending_writes
+            .get(&slot_id)
+            .map_or(0, |queue| queued_line_operations(queue).len());
+        match key.code {
+            KeyCode::Up => {
+                if let Some(selection) = self.queue_selection.as_mut() {
+                    selection.selected = selected.saturating_sub(1);
+                    selection.detail_scroll = 0;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(selection) = self.queue_selection.as_mut() {
+                    selection.selected = (selected + 1).min(count - 1);
+                    selection.detail_scroll = 0;
+                }
+            }
+            KeyCode::Home => {
+                if let Some(selection) = self.queue_selection.as_mut() {
+                    selection.selected = 0;
+                    selection.detail_scroll = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(selection) = self.queue_selection.as_mut() {
+                    selection.selected = count - 1;
+                    selection.detail_scroll = 0;
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(selection) = self.queue_selection.as_mut() {
+                    selection.detail_scroll = selection.detail_scroll.saturating_sub(5);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(selection) = self.queue_selection.as_mut() {
+                    selection.detail_scroll = selection.detail_scroll.saturating_add(5);
+                }
+            }
+            KeyCode::Char('d' | 'D') => {
+                self.remove_queued_line_operation(selected, false, commands)
+            }
+            KeyCode::Char('e' | 'E') => self.remove_queued_line_operation(selected, true, commands),
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('u' | 'U') => {
+                self.queue_selection = None;
+                self.focus = PaneFocus::Input;
+                self.status = tr("st.queue.select.closed").into();
+            }
+            _ => {}
+        }
+        self.normalize_queue_selection();
     }
 
     fn has_queued_control(&self, slot_id: &str) -> bool {
@@ -1634,24 +2524,35 @@ impl App {
         slot_id: &str,
         reason: &str,
     ) {
-        let reconnect_reason = trf("st.reconnect.reason", &[reason, slot_id]);
-        match commands.try_send(NetworkCommand::Reconnect {
-            reason: reconnect_reason.clone(),
-        }) {
-            Ok(()) => {
-                self.pending_writes.clear();
-                self.queued_controls.clear();
-                self.pending_requests
-                    .retain(|_, request| !matches!(request, PendingRequest::Acquire { .. }));
+        let message = ClientMessage::CancelAcquire {
+            request_id: Uuid::new_v4(),
+            slot_id: slot_id.to_owned(),
+            // A queued waiter has no lease identity; seriald intentionally
+            // matches it by authenticated actor and treats this field as
+            // forward-compatible wire context.
+            control_id: Uuid::nil(),
+        };
+        if self.send_message(
+            commands,
+            message,
+            Some(PendingRequest::CancelAcquire {
+                slot_id: slot_id.to_owned(),
+            }),
+        ) {
+            self.pending_writes.remove(slot_id);
+            self.inflight_writes.remove(slot_id);
+            self.queued_controls.remove(slot_id);
+            self.pending_requests.retain(|_, request| {
+                !matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == slot_id)
+            });
+            if self
+                .pending_paste
+                .as_ref()
+                .is_some_and(|paste| paste.slot_id == slot_id)
+            {
                 self.pending_paste = None;
-                self.status = reconnect_reason;
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.status = tr("st.cancel.full").into();
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.status = tr("st.cancel.stopped").into();
-            }
+            self.status = trf("st.reconnect.reason", &[reason, slot_id]);
         }
     }
 
@@ -1729,9 +2630,13 @@ impl App {
             let index = self
                 .slot_index(&slot_id)
                 .expect("lease came from this Slot");
+            // Retry a locally accepted operation whose previous outbound send
+            // hit channel backpressure. Pending Write requests and active
+            // Triggers are already guarded inside `flush_pending_writes`.
+            self.flush_pending_writes(&slot_id, commands);
             let operation_pending = self.pending_writes.contains_key(&slot_id)
                 || self.pending_requests.values().any(
-                    |request| matches!(request, PendingRequest::Write { slot_id: pending } if pending == &slot_id),
+                    |request| matches!(request, PendingRequest::Write { slot_id: pending, .. } if pending == &slot_id),
                 );
             let recently_active = self.slots[index]
                 .last_manual_activity
@@ -1777,29 +2682,66 @@ impl App {
             return true;
         }
         let write_already_pending = self.pending_requests.values().any(|request| {
-            matches!(request, PendingRequest::Write { slot_id: pending } if pending == slot_id)
+            matches!(request, PendingRequest::Write { slot_id: pending, .. } if pending == slot_id)
         });
         if write_already_pending {
             return true;
         }
-        let write = self
-            .pending_writes
-            .get_mut(slot_id)
-            .and_then(VecDeque::pop_front);
-        if self
-            .pending_writes
-            .get(slot_id)
-            .is_some_and(VecDeque::is_empty)
-        {
-            self.pending_writes.remove(slot_id);
-        }
-        if let Some(write) = write
-            && !self.send_write_now(commands, slot_id, write.data, write.operation_id)
-        {
-            self.pending_writes.remove(slot_id);
-            return false;
+        let progress = self.inflight_writes.get(slot_id).copied().or_else(|| {
+            self.pending_writes
+                .get(slot_id)
+                .and_then(|writes| writes.front())
+                .map(|write| InFlightWrite {
+                    operation_id: write.operation_id,
+                    kind: write.kind,
+                    chunk_index: 0,
+                })
+        });
+        let write = progress.and_then(|progress| {
+            self.pending_writes
+                .get(slot_id)
+                .and_then(|writes| writes.get(progress.chunk_index))
+                .filter(|write| {
+                    write.operation_id == progress.operation_id && write.kind == progress.kind
+                })
+                .cloned()
+                .map(|write| (progress, write))
+        });
+        if let Some((progress, write)) = write {
+            self.inflight_writes.insert(slot_id.to_owned(), progress);
+            if !self.send_write_now(commands, slot_id, write.data, write.operation_id) {
+                self.inflight_writes.remove(slot_id);
+                return false;
+            }
         }
         true
+    }
+
+    fn acknowledge_inflight_write(&mut self, slot_id: &str) {
+        let Some(mut progress) = self.inflight_writes.get(slot_id).copied() else {
+            return;
+        };
+        let next_index = progress.chunk_index.saturating_add(1);
+        let same_operation_continues = self
+            .pending_writes
+            .get(slot_id)
+            .and_then(|writes| writes.get(next_index))
+            .is_some_and(|write| {
+                write.operation_id == progress.operation_id && write.kind == progress.kind
+            });
+        if same_operation_continues {
+            progress.chunk_index = next_index;
+            self.inflight_writes.insert(slot_id.to_owned(), progress);
+            return;
+        }
+
+        if let Some(writes) = self.pending_writes.get_mut(slot_id) {
+            writes.drain(..next_index.min(writes.len()));
+            if writes.is_empty() {
+                self.pending_writes.remove(slot_id);
+            }
+        }
+        self.inflight_writes.remove(slot_id);
     }
 
     fn send_write_now(
@@ -1829,9 +2771,12 @@ impl App {
                 // by an Agent Run boundary.
                 expected_run_id: None,
                 pacing: None,
+                cooperative: false,
             },
             Some(PendingRequest::Write {
                 slot_id: slot_id.to_string(),
+                operation_id,
+                cooperative: false,
             }),
         )
     }
@@ -1843,10 +2788,23 @@ impl App {
             }
             Event::Paste(value) => {
                 self.clear_text_selection();
-                self.handle_paste(value, commands);
+                if self.menu.is_some() {
+                    self.handle_menu_paste(value);
+                } else {
+                    self.handle_paste(value, commands);
+                }
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse, commands),
-            Event::Resize(_, _) | Event::FocusLost => {
+            Event::Resize(_, _) => {
+                self.clear_text_selection();
+                for slot in &mut self.slots {
+                    slot.follow();
+                }
+                self.queue_selection = None;
+                self.focus = PaneFocus::Input;
+                self.dirty = true;
+            }
+            Event::FocusLost => {
                 self.clear_text_selection();
                 self.dirty = true;
             }
@@ -1855,8 +2813,18 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
-        self.focus = PaneFocus::Input;
         self.clear_text_selection();
+        if self.menu.is_some() {
+            self.handle_menu_key(key);
+            self.dirty = true;
+            return;
+        }
+        if self.queue_selection.is_some() {
+            self.handle_queue_key(key, commands);
+            self.dirty = true;
+            return;
+        }
+        self.focus = PaneFocus::Input;
         if self.help {
             self.help = false;
             if is_prefix(key) {
@@ -1931,7 +2899,9 @@ impl App {
         };
         let position = Position::new(mouse.column, mouse.row);
         if rect_contains(layout.input_area, position) {
+            self.queue_selection = None;
             self.focus = PaneFocus::Input;
+            self.current_mut().dismiss_agent_run_hint();
             self.clear_text_selection();
             return;
         }
@@ -2034,6 +3004,8 @@ impl App {
             return;
         }
         self.focus = PaneFocus::Input;
+        self.queue_selection = None;
+        self.current_mut().dismiss_agent_run_hint();
         self.clear_text_selection();
         match crate::clipboard::read_text() {
             Ok(Some(text)) => self.handle_paste(text, commands),
@@ -2063,6 +3035,9 @@ impl App {
                 self.status = tr("st.follow").into();
             }
             KeyCode::Char('v' | 'V') => {
+                for slot in &mut self.slots {
+                    slot.follow();
+                }
                 self.detailed_timeline = !self.detailed_timeline;
                 self.status = if self.detailed_timeline {
                     tr("st.detailed").into()
@@ -2071,14 +3046,16 @@ impl App {
                 };
             }
             KeyCode::Char('g' | 'G') => self.toggle_language(),
+            KeyCode::Char('m' | 'M') => self.open_menu(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Char('t' | 'T') => {
                 self.acquire_control(commands, ControlMode::Takeover);
             }
             KeyCode::Char('c' | 'C') => self.release_control(commands),
-            KeyCode::Char('d' | 'D') => self.remove_last_queued_line(false),
-            KeyCode::Char('e' | 'E') => self.remove_last_queued_line(true),
+            KeyCode::Char('d' | 'D') => self.remove_last_queued_line(false, commands),
+            KeyCode::Char('e' | 'E') => self.remove_last_queued_line(true, commands),
+            KeyCode::Char('u' | 'U') => self.open_queue_selection(),
             KeyCode::Char('p' | 'P') => self.confirm_paste(commands),
             KeyCode::Char('/') => {
                 self.status = tr("st.logs.hint").into();
@@ -2104,8 +3081,23 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let value = self.current().draft.iter().collect::<String>();
+                if value.is_empty() && self.current().active_agent_run().is_some() {
+                    self.current_mut().follow();
+                    self.status = tr("st.agent.enter.follow").into();
+                    return;
+                }
                 let mut bytes = value.as_bytes().to_vec();
                 bytes.extend_from_slice(self.current().effective_write_eol().as_bytes());
+                let operation_id = Some(Uuid::new_v4());
+                let cooperative = key.modifiers.contains(KeyModifiers::ALT);
+                let accepted = if cooperative {
+                    self.request_cooperative_write(commands, bytes.clone(), operation_id)
+                } else {
+                    self.request_write(commands, bytes, operation_id)
+                };
+                if !accepted {
+                    return;
+                }
                 {
                     let view = self.current_mut();
                     if !value.is_empty() {
@@ -2118,7 +3110,6 @@ impl App {
                     view.draft.clear();
                     view.draft_cursor = 0;
                 }
-                self.request_write(commands, bytes, Some(Uuid::new_v4()));
                 // Sending returns the view to the live tail, like Ctrl-] f.
                 self.current_mut().follow();
             }
@@ -2132,6 +3123,7 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 let view = self.current_mut();
+                view.dismiss_agent_run_hint();
                 view.draft.insert(view.draft_cursor, character);
                 view.draft_cursor += 1;
             }
@@ -2185,11 +3177,13 @@ impl App {
 
     fn handle_raw_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         if let Some(bytes) = raw_key_bytes(key) {
+            self.current_mut().dismiss_agent_run_hint();
             self.request_raw_write(commands, bytes);
         }
     }
 
     fn handle_paste(&mut self, value: String, commands: &mpsc::Sender<NetworkCommand>) {
+        self.current_mut().dismiss_agent_run_hint();
         if value.len() > MAX_PASTE_BYTES {
             self.status = trf(
                 "st.paste.rejected",
@@ -2252,7 +3246,7 @@ impl App {
                     command
                 })
                 .collect::<Vec<_>>();
-            self.request_write_batch(commands, writes, Some(Uuid::new_v4()))
+            self.request_write_batch(commands, writes)
         };
         self.selected = previous;
         if accepted {
@@ -2363,9 +3357,561 @@ impl App {
         }
     }
 
+    fn open_menu(&mut self) {
+        self.queue_selection = None;
+        self.focus = PaneFocus::Input;
+        let mut menu = MenuState::new();
+        self.submit_menu_command(&mut menu, MenuIoCommand::Reload);
+        self.menu = Some(menu);
+        self.status = tr("st.menu.open").into();
+    }
+
+    fn submit_menu_command(&mut self, menu: &mut MenuState, command: MenuIoCommand) -> bool {
+        if menu.busy {
+            menu.message = tr("menu.busy").into();
+            return false;
+        }
+        let Some(commands) = self.menu_commands.as_ref() else {
+            menu.message = tr("menu.io.unavailable").into();
+            self.status = menu.message.clone();
+            return false;
+        };
+        match commands.try_send(command) {
+            Ok(()) => {
+                menu.busy = true;
+                menu.message = tr("menu.loading").into();
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                menu.message = tr("menu.io.full").into();
+                self.status = menu.message.clone();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                menu.message = tr("menu.io.unavailable").into();
+                self.status = menu.message.clone();
+                false
+            }
+        }
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) {
+        let Some(mut menu) = self.menu.take() else {
+            return;
+        };
+        if let Some(prompt) = menu.prompt.take() {
+            self.handle_menu_prompt_key(&mut menu, prompt, key);
+            self.menu = Some(menu);
+            return;
+        }
+
+        let mut keep_open = true;
+        let count = menu_item_count(&menu);
+        match key.code {
+            KeyCode::Esc => {
+                if !menu.back() {
+                    keep_open = false;
+                    self.status = tr("st.menu.closed").into();
+                }
+            }
+            KeyCode::Up if count > 0 => {
+                menu.selected = menu.selected.saturating_sub(1);
+            }
+            KeyCode::Down if count > 0 => {
+                menu.selected = (menu.selected + 1).min(count - 1);
+            }
+            KeyCode::Home if count > 0 => menu.selected = 0,
+            KeyCode::End if count > 0 => menu.selected = count - 1,
+            KeyCode::Char('r' | 'R') => {
+                self.submit_menu_command(&mut menu, MenuIoCommand::Reload);
+            }
+            KeyCode::Right if menu.page == MenuPage::Models => {
+                self.expand_selected_model(&mut menu, true);
+            }
+            KeyCode::Left if menu.page == MenuPage::Models => {
+                self.expand_selected_model(&mut menu, false);
+            }
+            KeyCode::Char('b' | 'B') if menu.page == MenuPage::Models => {
+                self.bind_selected_model(&mut menu);
+            }
+            KeyCode::Enter => self.activate_menu_item(&mut menu),
+            _ => {}
+        }
+        if keep_open {
+            let count = menu_item_count(&menu);
+            menu.selected = menu.selected.min(count.saturating_sub(1));
+            self.menu = Some(menu);
+        }
+    }
+
+    fn handle_menu_prompt_key(
+        &mut self,
+        menu: &mut MenuState,
+        mut prompt: MenuPrompt,
+        key: KeyEvent,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                menu.message = tr("menu.prompt.cancelled").into();
+                return;
+            }
+            KeyCode::Left => prompt.cursor = prompt.cursor.saturating_sub(1),
+            KeyCode::Right => prompt.cursor = (prompt.cursor + 1).min(prompt.value.len()),
+            KeyCode::Home => prompt.cursor = 0,
+            KeyCode::End => prompt.cursor = prompt.value.len(),
+            KeyCode::Backspace => {
+                if prompt.cursor > 0 {
+                    prompt.cursor -= 1;
+                    prompt.value.remove(prompt.cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if prompt.cursor < prompt.value.len() {
+                    prompt.value.remove(prompt.cursor);
+                }
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let limit = if prompt.secret { 512 } else { 128 };
+                if prompt.value.len() < limit && !character.is_control() {
+                    prompt.value.insert(prompt.cursor, character);
+                    prompt.cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let value = prompt.value.iter().collect::<String>();
+                if prompt.secret {
+                    if value.trim().is_empty() {
+                        menu.message = tr("menu.admin.required").into();
+                        menu.prompt = Some(prompt);
+                        return;
+                    }
+                } else if !valid_menu_name(&value) {
+                    menu.message = tr("menu.name.invalid").into();
+                    menu.prompt = Some(prompt);
+                    return;
+                }
+                match prompt.purpose {
+                    MenuPromptPurpose::Admin(mutation) => {
+                        self.submit_menu_command(
+                            menu,
+                            MenuIoCommand::Admin {
+                                token: value.trim().to_owned(),
+                                mutation,
+                            },
+                        );
+                    }
+                    MenuPromptPurpose::TransportName {
+                        slot_id,
+                        mut profile,
+                    } => {
+                        profile.name = value;
+                        self.begin_admin_prompt(
+                            menu,
+                            MenuAdminMutation::CreateTransportAndBind { slot_id, profile },
+                        );
+                    }
+                    MenuPromptPurpose::DeviceName {
+                        slot_id,
+                        mut profile,
+                    } => {
+                        profile.name = value;
+                        self.begin_admin_prompt(
+                            menu,
+                            MenuAdminMutation::CreateDeviceAndBind { slot_id, profile },
+                        );
+                    }
+                    MenuPromptPurpose::ModelName { slot_id, parent_id } => {
+                        let Some((model_id, expected_revision, expected_current)) =
+                            menu.catalog.as_ref().map(|catalog| {
+                                (
+                                    normalize_model_id(&value, &catalog.models),
+                                    catalog.model_revision,
+                                    slot_model_binding(catalog, &slot_id)
+                                        .map(|binding| binding.model_id.clone()),
+                                )
+                            })
+                        else {
+                            menu.message = tr("menu.catalog.unavailable").into();
+                            return;
+                        };
+                        self.submit_menu_command(
+                            menu,
+                            MenuIoCommand::CreateAndBindModel {
+                                slot_id,
+                                model_id,
+                                name: value,
+                                parent_id,
+                                expected_revision,
+                                expected_current,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        menu.prompt = Some(prompt);
+    }
+
+    fn handle_menu_paste(&mut self, value: String) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(prompt) = menu.prompt.as_mut() else {
+            return;
+        };
+        let limit = if prompt.secret { 512 } else { 128 };
+        for character in value.chars().filter(|character| !character.is_control()) {
+            if prompt.value.len() >= limit {
+                break;
+            }
+            prompt.value.insert(prompt.cursor, character);
+            prompt.cursor += 1;
+        }
+        self.dirty = true;
+    }
+
+    fn begin_admin_prompt(&self, menu: &mut MenuState, mutation: MenuAdminMutation) {
+        menu.prompt = Some(MenuPrompt {
+            title: tr("menu.prompt.admin").into(),
+            value: Vec::new(),
+            cursor: 0,
+            secret: true,
+            purpose: MenuPromptPurpose::Admin(mutation),
+        });
+        menu.message = tr("menu.admin.memory").into();
+    }
+
+    fn begin_transport_name_prompt(
+        &self,
+        menu: &mut MenuState,
+        slot_id: String,
+        profile: TransportProfile,
+        suggested_name: String,
+    ) {
+        let value = suggested_name.chars().collect::<Vec<_>>();
+        menu.prompt = Some(MenuPrompt {
+            title: tr("menu.prompt.transport.name").into(),
+            cursor: value.len(),
+            value,
+            secret: false,
+            purpose: MenuPromptPurpose::TransportName { slot_id, profile },
+        });
+    }
+
+    fn begin_device_name_prompt(
+        &self,
+        menu: &mut MenuState,
+        slot_id: String,
+        profile: DeviceProfile,
+    ) {
+        let value = "device-profile".chars().collect::<Vec<_>>();
+        menu.prompt = Some(MenuPrompt {
+            title: tr("menu.prompt.device.name").into(),
+            cursor: value.len(),
+            value,
+            secret: false,
+            purpose: MenuPromptPurpose::DeviceName { slot_id, profile },
+        });
+    }
+
+    fn begin_model_name_prompt(
+        &self,
+        menu: &mut MenuState,
+        slot_id: String,
+        parent_id: Option<String>,
+    ) {
+        menu.prompt = Some(MenuPrompt {
+            title: if parent_id.is_some() {
+                tr("menu.prompt.model.child").into()
+            } else {
+                tr("menu.prompt.model.root").into()
+            },
+            value: Vec::new(),
+            cursor: 0,
+            secret: false,
+            purpose: MenuPromptPurpose::ModelName { slot_id, parent_id },
+        });
+    }
+
+    fn activate_menu_item(&mut self, menu: &mut MenuState) {
+        if menu.busy && menu.page != MenuPage::Root {
+            menu.message = tr("menu.busy").into();
+            return;
+        }
+        match menu.page {
+            MenuPage::Root => match menu.selected {
+                0 => menu.push(MenuPage::Profiles),
+                1 => menu.push(MenuPage::Models),
+                2 => menu.push(MenuPage::SerialSettings),
+                3 => menu.push(MenuPage::Help),
+                _ => {}
+            },
+            MenuPage::Profiles => match menu.selected {
+                0 => menu.push(MenuPage::TransportProfiles),
+                1 => menu.push(MenuPage::DeviceProfiles),
+                _ => {}
+            },
+            MenuPage::TransportProfiles => {
+                let Some((profiles_len, profile_name)) = menu.catalog.as_ref().map(|catalog| {
+                    (
+                        catalog.transport_profiles.len(),
+                        catalog
+                            .transport_profiles
+                            .get(menu.selected)
+                            .map(|profile| profile.name.clone()),
+                    )
+                }) else {
+                    menu.message = tr("menu.catalog.unavailable").into();
+                    return;
+                };
+                let slot_id = self.selected_slot_id();
+                if let Some(profile_name) = profile_name {
+                    self.begin_admin_prompt(
+                        menu,
+                        MenuAdminMutation::BindTransport {
+                            slot_id,
+                            profile_name,
+                        },
+                    );
+                } else if menu.selected == profiles_len {
+                    self.begin_transport_name_prompt(
+                        menu,
+                        slot_id,
+                        default_transport_profile(String::new()),
+                        "uart-115200-8n1".into(),
+                    );
+                }
+            }
+            MenuPage::DeviceProfiles => {
+                let Some((profiles_len, profile_name)) = menu.catalog.as_ref().map(|catalog| {
+                    (
+                        catalog.device_profiles.len(),
+                        menu.selected
+                            .checked_sub(1)
+                            .and_then(|index| catalog.device_profiles.get(index))
+                            .map(|profile| profile.name.clone()),
+                    )
+                }) else {
+                    menu.message = tr("menu.catalog.unavailable").into();
+                    return;
+                };
+                let slot_id = self.selected_slot_id();
+                if menu.selected == 0 {
+                    self.begin_admin_prompt(
+                        menu,
+                        MenuAdminMutation::BindDevice {
+                            slot_id,
+                            profile_name: None,
+                        },
+                    );
+                } else if let Some(profile_name) = profile_name {
+                    self.begin_admin_prompt(
+                        menu,
+                        MenuAdminMutation::BindDevice {
+                            slot_id,
+                            profile_name: Some(profile_name),
+                        },
+                    );
+                } else if menu.selected == profiles_len + 1 {
+                    self.begin_device_name_prompt(
+                        menu,
+                        slot_id,
+                        current_device_template(self.current()),
+                    );
+                } else if let Some(preset) = menu
+                    .selected
+                    .checked_sub(profiles_len + 2)
+                    .and_then(|index| DEVICE_PRESETS.get(index))
+                    .copied()
+                {
+                    let mut profile = current_device_template(self.current());
+                    preset.apply(&mut profile);
+                    self.begin_device_name_prompt(menu, slot_id, profile);
+                }
+            }
+            MenuPage::Models => self.activate_model_item(menu),
+            MenuPage::ModelParents => {
+                let Some(parent_id) = menu.catalog.as_ref().and_then(|catalog| {
+                    let rows = all_model_rows(&catalog.models);
+                    rows.get(menu.selected)
+                        .map(|row| catalog.models[row.index].id.clone())
+                }) else {
+                    menu.message = tr("menu.catalog.unavailable").into();
+                    return;
+                };
+                self.begin_model_name_prompt(menu, self.selected_slot_id(), Some(parent_id));
+            }
+            MenuPage::SerialSettings => {
+                let Some(mut profile) = menu
+                    .catalog
+                    .as_ref()
+                    .map(|catalog| current_transport_template(self.current(), catalog))
+                else {
+                    menu.message = tr("menu.catalog.unavailable").into();
+                    return;
+                };
+                let Some(preset) = TRANSPORT_PRESETS.get(menu.selected).copied() else {
+                    return;
+                };
+                preset.apply(&mut profile);
+                let suggested_name =
+                    format!("{}-custom", self.current().snapshot.config.profile.trim());
+                profile.name.clear();
+                self.begin_transport_name_prompt(
+                    menu,
+                    self.selected_slot_id(),
+                    profile,
+                    suggested_name,
+                );
+            }
+            MenuPage::Help => {}
+        }
+    }
+
+    fn activate_model_item(&mut self, menu: &mut MenuState) {
+        if menu.selected == 0 {
+            self.begin_model_name_prompt(menu, self.selected_slot_id(), None);
+            return;
+        }
+        if menu.selected == 1 {
+            if menu
+                .catalog
+                .as_ref()
+                .is_none_or(|catalog| catalog.models.is_empty())
+            {
+                menu.message = tr("menu.model.no.parent").into();
+            } else {
+                menu.push(MenuPage::ModelParents);
+            }
+            return;
+        }
+        let Some(catalog) = menu.catalog.as_ref() else {
+            menu.message = tr("menu.catalog.unavailable").into();
+            return;
+        };
+        let rows = visible_model_rows(&catalog.models, &menu.expanded_models);
+        let Some(row) = rows.get(menu.selected - 2).copied() else {
+            return;
+        };
+        let model_id = catalog.models[row.index].id.clone();
+        let has_children = model_has_children(&catalog.models, &model_id);
+        if has_children {
+            if !menu.expanded_models.remove(&model_id) {
+                menu.expanded_models.insert(model_id);
+            }
+        } else {
+            self.submit_model_binding(menu, model_id);
+        }
+    }
+
+    fn expand_selected_model(&mut self, menu: &mut MenuState, expand: bool) {
+        if menu.selected < 2 {
+            return;
+        }
+        let Some(catalog) = menu.catalog.as_ref() else {
+            return;
+        };
+        let rows = visible_model_rows(&catalog.models, &menu.expanded_models);
+        let Some(row) = rows.get(menu.selected - 2) else {
+            return;
+        };
+        let model_id = catalog.models[row.index].id.clone();
+        let has_children = model_has_children(&catalog.models, &model_id);
+        if expand && has_children {
+            menu.expanded_models.insert(model_id);
+        } else if !expand {
+            menu.expanded_models.remove(&model_id);
+        }
+    }
+
+    fn bind_selected_model(&mut self, menu: &mut MenuState) {
+        if menu.selected < 2 {
+            return;
+        }
+        let model_id = menu.catalog.as_ref().and_then(|catalog| {
+            let rows = visible_model_rows(&catalog.models, &menu.expanded_models);
+            rows.get(menu.selected - 2)
+                .map(|row| catalog.models[row.index].id.clone())
+        });
+        if let Some(model_id) = model_id {
+            self.submit_model_binding(menu, model_id);
+        }
+    }
+
+    fn submit_model_binding(&mut self, menu: &mut MenuState, model_id: String) {
+        let Some((expected_revision, expected_current)) = menu.catalog.as_ref().map(|catalog| {
+            let slot_id = self.selected_slot_id();
+            (
+                catalog.model_revision,
+                slot_model_binding(catalog, &slot_id).map(|binding| binding.model_id.clone()),
+            )
+        }) else {
+            menu.message = tr("menu.catalog.unavailable").into();
+            return;
+        };
+        let slot_id = self.selected_slot_id();
+        self.submit_menu_command(
+            menu,
+            MenuIoCommand::BindModel {
+                slot_id,
+                model_id,
+                expected_revision,
+                expected_current,
+            },
+        );
+    }
+
+    fn handle_menu_io_event(&mut self, event: MenuIoEvent) {
+        match event {
+            MenuIoEvent::Completed { catalog, success } => {
+                for fresh in &catalog.slots {
+                    if let Some(view) = self
+                        .slots
+                        .iter_mut()
+                        .find(|view| view.snapshot.config.id == fresh.config.id)
+                    {
+                        let configuration_changed = view.snapshot.config != fresh.config;
+                        view.snapshot = fresh.clone();
+                        view.sync_trigger_projection(false);
+                        if configuration_changed {
+                            view.follow();
+                        }
+                    }
+                }
+                let message = menu_success_message(&success);
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.catalog = Some(catalog);
+                    menu.busy = false;
+                    menu.message = message.clone();
+                    let count = menu_item_count(menu);
+                    menu.selected = menu.selected.min(count.saturating_sub(1));
+                }
+                self.status = message;
+            }
+            MenuIoEvent::Failed(error) => {
+                let message = trf("menu.io.failed", &[&safe_inline(&error)]);
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.busy = false;
+                    menu.message = message.clone();
+                }
+                self.status = message;
+            }
+        }
+        self.dirty = true;
+    }
+
     /// Ctrl-] g: switch between English and Chinese at runtime and persist
     /// the choice to the client config on a best-effort basis.
     fn toggle_language(&mut self) {
+        for slot in &mut self.slots {
+            slot.follow();
+        }
         let next = i18n::lang().toggled();
         i18n::set_lang(next);
         if let Some(loaded) = &mut self.config {
@@ -2415,18 +3961,280 @@ impl App {
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        let max = self.current().logical_line_count().saturating_sub(1);
+        if self.current().scroll_snapshot.is_none() {
+            let Some(layout) = self.layout else {
+                // Before the first draw there is no trustworthy visual width.
+                // Retain the old bounded behavior for tests/recovery only.
+                let max = self.current().logical_line_count().saturating_sub(1);
+                let view = self.current_mut();
+                view.scroll_from_bottom = (view.scroll_from_bottom + amount).min(max);
+                return;
+            };
+            let rows = all_output_visual_lines(self, layout.output_inner.width);
+            let max = rows
+                .len()
+                .saturating_sub(layout.output_inner.height as usize);
+            if max == 0 {
+                self.current_mut().follow();
+                return;
+            }
+            let view = self.current_mut();
+            view.scroll_snapshot = Some(ScrollSnapshot { rows });
+            view.scroll_from_bottom = 0;
+        }
+
+        let visible_height = self
+            .layout
+            .map_or(0, |layout| layout.output_inner.height as usize);
+        let max = self
+            .current()
+            .scroll_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| {
+                snapshot.rows.len().saturating_sub(visible_height)
+            });
         let view = self.current_mut();
         view.scroll_from_bottom = (view.scroll_from_bottom + amount).min(max);
+        if view.scroll_from_bottom == 0 {
+            view.follow();
+        }
     }
 
     fn scroll_down(&mut self, amount: usize) {
         let view = self.current_mut();
         view.scroll_from_bottom = view.scroll_from_bottom.saturating_sub(amount);
         if view.scroll_from_bottom == 0 {
-            view.unseen = 0;
+            view.follow();
         }
     }
+}
+
+struct MenuIo {
+    commands: mpsc::Sender<MenuIoCommand>,
+    events: mpsc::Receiver<MenuIoEvent>,
+}
+
+fn spawn_menu_io(api: ApiClient) -> MenuIo {
+    let (command_tx, mut command_rx) = mpsc::channel(8);
+    let (event_tx, event_rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            let event = match execute_menu_io(&api, command).await {
+                Ok((catalog, success)) => MenuIoEvent::Completed { catalog, success },
+                Err(error) => MenuIoEvent::Failed(error.to_string()),
+            };
+            if event_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    MenuIo {
+        commands: command_tx,
+        events: event_rx,
+    }
+}
+
+async fn execute_menu_io(
+    api: &ApiClient,
+    command: MenuIoCommand,
+) -> Result<(MenuCatalog, MenuSuccess)> {
+    let success = match command {
+        MenuIoCommand::Reload => MenuSuccess::Loaded,
+        MenuIoCommand::Admin { token, mutation } => {
+            // The prompt already trims this value before constructing the
+            // command. Move that single allocation into the short-lived API
+            // client instead of retaining a second plaintext copy. Rust's
+            // ordinary String drop is not a guaranteed memory zeroization.
+            if token.is_empty() {
+                bail!(tr("menu.admin.required"));
+            }
+            let admin = ApiClient::new(api.endpoint().to_owned(), Some(token))?;
+            execute_admin_menu_mutation(&admin, mutation).await?
+        }
+        MenuIoCommand::BindModel {
+            slot_id,
+            model_id,
+            expected_revision,
+            expected_current,
+        } => {
+            api.set_slot_device_model(
+                &slot_id,
+                &SetSlotDeviceModelRequest {
+                    model_id: Some(model_id.clone()),
+                    create_if_missing: false,
+                    update_existing: false,
+                    name: None,
+                    parent_id: None,
+                    clear_parent: false,
+                    aliases: Vec::new(),
+                    clear_aliases: false,
+                    confirmation_method: Some(ModelConfirmationMethod::Human),
+                    note: Some(tr("menu.model.confirm.note").into()),
+                    source: "human:serialctl-tui".into(),
+                    expected_revision: Some(expected_revision),
+                    expected_current: Some(expected_current),
+                },
+            )
+            .await?;
+            MenuSuccess::ModelBound(model_id)
+        }
+        MenuIoCommand::CreateAndBindModel {
+            slot_id,
+            model_id,
+            name,
+            parent_id,
+            expected_revision,
+            expected_current,
+        } => {
+            api.set_slot_device_model(
+                &slot_id,
+                &SetSlotDeviceModelRequest {
+                    model_id: Some(model_id.clone()),
+                    create_if_missing: true,
+                    update_existing: false,
+                    name: Some(name),
+                    parent_id,
+                    clear_parent: false,
+                    aliases: Vec::new(),
+                    clear_aliases: false,
+                    confirmation_method: Some(ModelConfirmationMethod::Human),
+                    note: Some(tr("menu.model.confirm.note").into()),
+                    source: "human:serialctl-tui".into(),
+                    expected_revision: Some(expected_revision),
+                    expected_current: Some(expected_current),
+                },
+            )
+            .await?;
+            MenuSuccess::ModelCreated(model_id)
+        }
+    };
+    Ok((load_menu_catalog(api).await?, success))
+}
+
+async fn execute_admin_menu_mutation(
+    admin: &ApiClient,
+    mutation: MenuAdminMutation,
+) -> Result<MenuSuccess> {
+    match mutation {
+        MenuAdminMutation::BindTransport {
+            slot_id,
+            profile_name,
+        } => {
+            bind_transport_profile(admin, &slot_id, &profile_name).await?;
+            Ok(MenuSuccess::TransportBound(profile_name))
+        }
+        MenuAdminMutation::BindDevice {
+            slot_id,
+            profile_name,
+        } => {
+            bind_device_profile(admin, &slot_id, profile_name.as_deref()).await?;
+            Ok(MenuSuccess::DeviceBound(profile_name))
+        }
+        MenuAdminMutation::CreateTransportAndBind { slot_id, profile } => {
+            let profile_name = profile.name.clone();
+            let mut catalog = admin.transport_profiles().await?;
+            if catalog
+                .profiles
+                .iter()
+                .any(|existing| existing.name == profile.name)
+            {
+                bail!(trf("menu.profile.exists", &[&profile.name]));
+            }
+            catalog.profiles.push(profile);
+            admin
+                .configure_transport_profiles(catalog.profiles, catalog.config_revision)
+                .await?;
+            bind_transport_profile(admin, &slot_id, &profile_name).await?;
+            Ok(MenuSuccess::TransportCreated(profile_name))
+        }
+        MenuAdminMutation::CreateDeviceAndBind { slot_id, profile } => {
+            let profile_name = profile.name.clone();
+            let mut catalog = admin.device_profiles().await?;
+            if catalog
+                .profiles
+                .iter()
+                .any(|existing| existing.name == profile.name)
+            {
+                bail!(trf("menu.profile.exists", &[&profile.name]));
+            }
+            catalog.profiles.push(profile);
+            admin
+                .configure_device_profiles(catalog.profiles, catalog.config_revision)
+                .await?;
+            bind_device_profile(admin, &slot_id, Some(&profile_name)).await?;
+            Ok(MenuSuccess::DeviceCreated(profile_name))
+        }
+    }
+}
+
+async fn bind_transport_profile(api: &ApiClient, slot_id: &str, profile_name: &str) -> Result<()> {
+    let status = api.configuration_status().await?;
+    let catalog = api.transport_profiles().await?;
+    let profile = catalog
+        .profiles
+        .iter()
+        .find(|profile| profile.name == profile_name)
+        .with_context(|| trf("menu.transport.missing", &[profile_name]))?;
+    let mut slots = status
+        .slots
+        .into_iter()
+        .map(|slot| slot.config)
+        .collect::<Vec<_>>();
+    let slot = slots
+        .iter_mut()
+        .find(|slot| slot.id == slot_id)
+        .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
+    slot.settings = apply_transport_profile(&slot.settings, Some(profile));
+    slot.profile = profile.name.clone();
+    api.configure_slots(slots, status.config_revision).await?;
+    Ok(())
+}
+
+async fn bind_device_profile(
+    api: &ApiClient,
+    slot_id: &str,
+    profile_name: Option<&str>,
+) -> Result<()> {
+    let status = api.configuration_status().await?;
+    if let Some(profile_name) = profile_name {
+        let catalog = api.device_profiles().await?;
+        if !catalog
+            .profiles
+            .iter()
+            .any(|profile| profile.name == profile_name)
+        {
+            bail!(trf("menu.device.missing", &[profile_name]));
+        }
+    }
+    let mut slots = status
+        .slots
+        .into_iter()
+        .map(|slot| slot.config)
+        .collect::<Vec<_>>();
+    let slot = slots
+        .iter_mut()
+        .find(|slot| slot.id == slot_id)
+        .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
+    slot.device_profile = profile_name.map(ToOwned::to_owned);
+    api.configure_slots(slots, status.config_revision).await?;
+    Ok(())
+}
+
+async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
+    let (status, transport, device, models): (_, _, _, DeviceModelListResponse) = tokio::try_join!(
+        api.configuration_status(),
+        api.transport_profiles(),
+        api.device_profiles(),
+        api.device_models(),
+    )?;
+    Ok(MenuCatalog {
+        slots: status.slots,
+        transport_profiles: transport.profiles,
+        device_profiles: device.profiles,
+        models: models.models,
+        model_bindings: models.bindings,
+        model_revision: models.config_revision,
+    })
 }
 
 pub async fn run(
@@ -2462,6 +4270,8 @@ pub async fn run(
         view.merge_echo = merge_echo;
     }
     app.mouse_capture = loaded.config.mouse_capture.unwrap_or(true);
+    let mut menu_io = spawn_menu_io(api.clone());
+    app.menu_commands = Some(menu_io.commands.clone());
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
@@ -2473,6 +4283,7 @@ pub async fn run(
         &mut app,
         &network.commands,
         &mut network.events,
+        &mut menu_io.events,
     )
     .await;
     let _ = network.commands.try_send(NetworkCommand::Shutdown);
@@ -2489,6 +4300,7 @@ async fn run_loop(
     app: &mut App,
     commands: &mpsc::Sender<NetworkCommand>,
     network_events: &mut mpsc::Receiver<NetworkEvent>,
+    menu_events: &mut mpsc::Receiver<MenuIoEvent>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut network_events_open = true;
@@ -2509,6 +4321,11 @@ async fn run_loop(
             },
             event = network_events.recv(), if network_events_open => {
                 network_events_open = handle_network_channel_event(app, event, commands);
+            },
+            event = menu_events.recv() => {
+                if let Some(event) = event {
+                    app.handle_menu_io_event(event);
+                }
             },
             _ = renew_tick.tick() => app.maintain_controls(commands),
             _ = activity_tick.tick() => {
@@ -2650,18 +4467,110 @@ fn local_history_truncated_title() -> &'static str {
     }
 }
 
+struct QueueCard {
+    operation_index: usize,
+    sending: bool,
+    header: String,
+    body: Vec<String>,
+}
+
+fn queue_cards(app: &App, inner_width: u16) -> Vec<QueueCard> {
+    let slot_id = app.selected_slot_id();
+    let Some(queue) = app.pending_writes.get(&slot_id) else {
+        return Vec::new();
+    };
+    let eol = app.current().effective_write_eol().as_bytes();
+    queued_line_operations(queue)
+        .into_iter()
+        .enumerate()
+        .map(|(operation_index, operation)| {
+            let sending = app.pending_requests.values().any(|request| match request {
+                PendingRequest::Write {
+                    slot_id: pending_slot,
+                    operation_id,
+                    ..
+                } if pending_slot == &slot_id => {
+                    operation.operation_id.is_none() || operation.operation_id == *operation_id
+                }
+                _ => false,
+            });
+            let mut bytes = operation.data.as_slice();
+            if !eol.is_empty() && bytes.ends_with(eol) {
+                bytes = &bytes[..bytes.len() - eol.len()];
+            }
+            let command = safe_inline(&String::from_utf8_lossy(bytes));
+            let command = if command.is_empty() {
+                tr("ui.queue.empty").to_string()
+            } else {
+                command
+            };
+            let header = format!(
+                "{}.{}",
+                operation_index + 1,
+                if sending { tr("ui.queue.sending") } else { "" }
+            );
+            QueueCard {
+                operation_index,
+                sending,
+                header,
+                body: wrap_queue_text(&command, inner_width.saturating_sub(2).max(1)),
+            }
+        })
+        .collect()
+}
+
+fn wrap_queue_text(value: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if character_width > 0 && !row.is_empty() && used.saturating_add(character_width) > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(character);
+        used = used.saturating_add(character_width);
+        if used >= width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    let queue_visual_rows = queue_cards(app, area.width.saturating_sub(2))
+        .iter()
+        .map(|card| card.body.len().saturating_add(1))
+        .sum::<usize>();
+    // Preserve the existing four-row minimum output pane. On a normal
+    // terminal every queued operation gets one row; very short terminals use
+    // a bounded queue viewport that follows the selected operation.
+    let max_queue_height = area.height.saturating_sub(12);
+    let queue_height = if queue_visual_rows == 0 {
+        0
+    } else {
+        queue_visual_rows
+            .saturating_add(2)
+            .min(max_queue_height as usize) as u16
+    };
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
         Constraint::Length(1),
+        Constraint::Length(queue_height),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(area);
     let output_area = chunks[1];
-    let input_area = chunks[3];
+    let input_area = chunks[4];
     app.layout = Some(ConsoleLayout {
         output_area,
         output_inner: inset_border(output_area),
@@ -2671,10 +4580,16 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_tabs(frame, app, chunks[0]);
     draw_output(frame, app, chunks[1]);
     draw_status(frame, app, chunks[2]);
-    draw_input(frame, app, chunks[3]);
-    draw_help_line(frame, app, chunks[4]);
+    if queue_height > 0 {
+        draw_queue(frame, app, chunks[3]);
+    }
+    draw_input(frame, app, chunks[4]);
+    draw_help_line(frame, app, chunks[5]);
     if app.help {
         draw_help(frame, app, area);
+    }
+    if let Some(menu) = app.menu.as_ref() {
+        draw_menu(frame, app, menu, area);
     }
 }
 
@@ -2759,7 +4674,7 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         safe_inline(&view.snapshot.config.display_name),
         safe_inline(&view.snapshot.config.port),
         baud_rate,
-        if view.scroll_from_bottom > 0 {
+        if view.is_paused() {
             tr("ui.paused")
         } else {
             ""
@@ -2796,6 +4711,15 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     let view = app.current();
+    let visible_height = inner.height as usize;
+    if let Some(snapshot) = view.scroll_snapshot.as_ref() {
+        let max_scroll = snapshot.rows.len().saturating_sub(visible_height);
+        let scroll = view.scroll_from_bottom.min(max_scroll);
+        let end = snapshot.rows.len().saturating_sub(scroll);
+        let start = end.saturating_sub(visible_height);
+        return snapshot.rows[start..end].to_vec();
+    }
+
     let truncation_line = view.local_truncation_line();
     let total_lines = view.logical_line_count();
     // Clamp the paused offset so a vanished pending row can never produce an
@@ -2803,7 +4727,6 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     // and front-eviction.
     let scroll = view.scroll_from_bottom.min(total_lines.saturating_sub(1));
     let end = total_lines.saturating_sub(scroll);
-    let visible_height = inner.height as usize;
     // Every logical row occupies at least one wrapped visual row, so the last
     // `visible_height` logical rows before the requested boundary are a
     // sufficient suffix. Paragraph then scrolls inside that suffix by its
@@ -2840,6 +4763,38 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
         .collect::<Vec<_>>();
     let visual_start = visual_lines.len().saturating_sub(visible_height);
     visual_lines.into_iter().skip(visual_start).collect()
+}
+
+/// Renders the complete bounded local history into visual terminal rows. This
+/// intentionally runs only when the operator first pauses output. The frozen
+/// rows make subsequent live appends O(1) for viewport stability and avoid
+/// mixing logical-row offsets with post-wrap visual-row offsets.
+fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let view = app.current();
+    let truncation_line = view.local_truncation_line();
+    let shell_prompt = view.effective_shell_prompt();
+    let uboot_prompt = view.effective_uboot_prompt();
+    let source_width = detailed_source_width(width as usize);
+    truncation_line
+        .iter()
+        .chain(view.lines.iter().chain(view.pending_line.iter()))
+        .flat_map(|entry| {
+            wrap_timeline_line(
+                timeline_line(
+                    entry,
+                    app.detailed_timeline,
+                    source_width,
+                    shell_prompt,
+                    uboot_prompt,
+                    width as usize,
+                ),
+                width,
+            )
+        })
+        .collect()
 }
 
 fn wrap_timeline_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
@@ -3192,6 +5147,135 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(content).style(style), area);
 }
 
+fn draw_queue(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tr("ui.queue.title"))
+        .border_style(if app.focus == PaneFocus::Queue {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+    let inner = block.inner(area);
+    let cards = queue_cards(app, inner.width);
+    if cards.is_empty() || inner.height == 0 {
+        return;
+    }
+    let height = inner.height as usize;
+    let selected = app.queue_selection.as_ref().and_then(|selection| {
+        (selection.slot_id == app.selected_slot_id())
+            .then_some(selection.selected.min(cards.len() - 1))
+    });
+
+    let style_for = |card: &QueueCard| {
+        if selected == Some(card.operation_index) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if card.sending {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    };
+    let card_rows = |card: &QueueCard, header: String, body: &[String]| {
+        let style = style_for(card);
+        std::iter::once(Line::from(Span::styled(header, style)))
+            .chain(
+                body.iter()
+                    .map(move |row| Line::from(Span::styled(format!("│ {row}"), style))),
+            )
+            .collect::<Vec<_>>()
+    };
+
+    let rows = if let Some(selected_index) = selected {
+        let selected_card = &cards[selected_index];
+        let total_visual_rows = cards
+            .iter()
+            .map(|card| card.body.len().saturating_add(1))
+            .sum::<usize>();
+        if selected_card.body.len().saturating_add(1) > height {
+            let body_height = height.saturating_sub(1);
+            let max_scroll = selected_card.body.len().saturating_sub(body_height);
+            let scroll = app
+                .queue_selection
+                .as_ref()
+                .map_or(0, |selection| selection.detail_scroll.min(max_scroll));
+            let through = scroll
+                .saturating_add(body_height)
+                .min(selected_card.body.len());
+            let header = trf(
+                "ui.queue.page",
+                &[
+                    &selected_card.header,
+                    &(scroll + 1).to_string(),
+                    &through.to_string(),
+                    &selected_card.body.len().to_string(),
+                ],
+            );
+            card_rows(
+                selected_card,
+                format!("▶ {header}"),
+                &selected_card.body[scroll..through],
+            )
+        } else if total_visual_rows > height {
+            // In a short terminal, selection mode is an explicit detail view:
+            // show the chosen card in full instead of clipping neighboring
+            // commands mid-card. Up/Down changes which complete card is shown.
+            card_rows(
+                selected_card,
+                format!("▶ {}", selected_card.header),
+                &selected_card.body,
+            )
+        } else {
+            let flattened = cards
+                .iter()
+                .flat_map(|card| {
+                    let marker = if card.operation_index == selected_index {
+                        "▶"
+                    } else {
+                        " "
+                    };
+                    card_rows(card, format!("{marker} {}", card.header), &card.body)
+                })
+                .collect::<Vec<_>>();
+            let selected_start = cards
+                .iter()
+                .take(selected_index)
+                .map(|card| card.body.len().saturating_add(1))
+                .sum::<usize>();
+            let selected_end = selected_start
+                .saturating_add(selected_card.body.len())
+                .saturating_add(1);
+            let start = selected_end
+                .saturating_sub(height)
+                .min(flattened.len().saturating_sub(height));
+            flattened.into_iter().skip(start).take(height).collect()
+        }
+    } else {
+        let flattened = cards
+            .iter()
+            .flat_map(|card| card_rows(card, format!("  {}", card.header), &card.body))
+            .collect::<Vec<_>>();
+        if flattened.len() <= height {
+            flattened
+        } else {
+            let hidden = flattened.len().saturating_sub(height.saturating_sub(1));
+            let mut rows = flattened
+                .into_iter()
+                .take(height.saturating_sub(1))
+                .collect::<Vec<_>>();
+            rows.push(Line::from(Span::styled(
+                trf("ui.queue.more", &[&hidden.to_string()]),
+                Style::default().fg(Color::Yellow),
+            )));
+            rows
+        }
+    };
+    frame.render_widget(Paragraph::new(rows).block(block), area);
+}
+
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(search) = &app.current().history_search {
         let matched = search
@@ -3218,20 +5302,54 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default()
             });
     let inner = block.inner(area);
+    let agent_hint = app
+        .current()
+        .visible_agent_run()
+        .map(|run| trf("ui.input.agent", &[&safe_inline(&run.label)]));
     let (text, cursor_column, title) = match app.current_mode() {
         InputMode::Line => {
-            let (text, cursor_column) = line_input_projection(
-                &app.current().draft,
-                app.current().draft_cursor,
-                inner.width,
-            );
-            (text, Some(cursor_column), input_title(app, InputMode::Line))
+            if app.current().draft.is_empty()
+                && let Some(agent_hint) = agent_hint
+            {
+                (
+                    Line::from(Span::styled(
+                        agent_hint,
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    None,
+                    input_title(app, InputMode::Line),
+                )
+            } else {
+                let (text, cursor_column) = line_input_projection(
+                    &app.current().draft,
+                    app.current().draft_cursor,
+                    inner.width,
+                );
+                (
+                    Line::from(text),
+                    Some(cursor_column),
+                    input_title(app, InputMode::Line),
+                )
+            }
         }
-        InputMode::Raw => (
-            format!("> {}", tr("ui.input.raw.text")),
-            None,
-            input_title(app, InputMode::Raw),
-        ),
+        InputMode::Raw => {
+            if let Some(agent_hint) = agent_hint {
+                (
+                    Line::from(Span::styled(
+                        agent_hint,
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    None,
+                    input_title(app, InputMode::Raw),
+                )
+            } else {
+                (
+                    Line::from(format!("> {}", tr("ui.input.raw.text"))),
+                    None,
+                    input_title(app, InputMode::Raw),
+                )
+            }
+        }
     };
     frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
     if let Some(cursor_column) = cursor_column
@@ -3355,7 +5473,7 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = area.width.min(76);
-    let height = area.height.min(34);
+    let height = area.height.min(38);
     let popup = centered_rect(width, height, area);
     let idle_seconds = app.human_idle_release.as_secs().to_string();
     let mouse_help = if app.mouse_capture {
@@ -3373,10 +5491,14 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("help.scroll").to_string(),
         mouse_help.to_string(),
         tr("help.mouse.paste").to_string(),
+        tr("help.menu").to_string(),
         tr("help.takeover").to_string(),
+        tr("help.cooperative").to_string(),
         tr("help.release").to_string(),
         tr("help.queue.delete").to_string(),
         tr("help.queue.edit").to_string(),
+        tr("help.queue.select").to_string(),
+        tr("help.queue.behavior").to_string(),
         tr("help.follow").to_string(),
         tr("help.echo").to_string(),
         tr("help.paste").to_string(),
@@ -3407,6 +5529,391 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         popup,
     );
+}
+
+fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
+    let width = area.width.saturating_sub(4).clamp(1, 100);
+    let height = area.height.saturating_sub(2).clamp(1, 34);
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", menu_page_title(menu.page)))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let current_model = menu
+        .catalog
+        .as_ref()
+        .and_then(|catalog| slot_model_binding(catalog, &app.selected_slot_id()))
+        .map(|binding| binding.model_id.as_str())
+        .unwrap_or("-");
+    let slot_id = safe_inline(&app.selected_slot_id());
+    let transport = safe_inline(&app.current().snapshot.config.profile);
+    let device = safe_inline(
+        app.current()
+            .snapshot
+            .config
+            .device_profile
+            .as_deref()
+            .unwrap_or("Generic"),
+    );
+    let model = safe_inline(current_model);
+    let header = trf("menu.current", &[&slot_id, &transport, &device, &model]);
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().fg(Color::LightCyan)),
+        chunks[0],
+    );
+
+    let rows = menu_rows(app, menu);
+    let viewport = chunks[1].height as usize;
+    let selected_row = menu_selected_visual_row(menu);
+    let start = selected_row
+        .map(|selected| selected.saturating_add(1).saturating_sub(viewport))
+        .unwrap_or(0)
+        .min(rows.len().saturating_sub(viewport));
+    frame.render_widget(
+        Paragraph::new(
+            rows.into_iter()
+                .skip(start)
+                .take(viewport)
+                .collect::<Vec<_>>(),
+        ),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(menu_detail(app, menu))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Gray)),
+        chunks[2],
+    );
+    frame.render_widget(
+        Paragraph::new(if menu.busy {
+            format!("◐ {}", menu.message)
+        } else {
+            menu.message.clone()
+        })
+        .style(if menu.busy {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(menu_footer(menu.page))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[4],
+    );
+
+    if let Some(prompt) = menu.prompt.as_ref() {
+        draw_menu_prompt(frame, prompt, popup);
+    }
+}
+
+fn draw_menu_prompt(frame: &mut Frame<'_>, prompt: &MenuPrompt, parent: Rect) {
+    let width = parent.width.saturating_sub(6).clamp(1, 76);
+    let popup = centered_rect(width, 5.min(parent.height).max(1), parent);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", prompt.title))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    let visible = if prompt.secret {
+        vec!['•'; prompt.value.len()]
+    } else {
+        prompt.value.clone()
+    };
+    let (text, cursor) = line_input_projection(&visible, prompt.cursor, inner.width);
+    frame.render_widget(Paragraph::new(text).block(block), popup);
+    if inner.width > 0 && inner.height > 0 {
+        frame.set_cursor_position(Position::new(
+            inner
+                .x
+                .saturating_add(cursor.min(inner.width.saturating_sub(1))),
+            inner.y,
+        ));
+    }
+}
+
+fn menu_page_title(page: MenuPage) -> &'static str {
+    match page {
+        MenuPage::Root => tr("menu.title"),
+        MenuPage::Profiles => tr("menu.profile.title"),
+        MenuPage::TransportProfiles => tr("menu.transport.title"),
+        MenuPage::DeviceProfiles => tr("menu.device.title"),
+        MenuPage::Models => tr("menu.model.title"),
+        MenuPage::ModelParents => tr("menu.model.parent.title"),
+        MenuPage::SerialSettings => tr("menu.serial.title"),
+        MenuPage::Help => tr("menu.help.title"),
+    }
+}
+
+fn menu_footer(page: MenuPage) -> &'static str {
+    match page {
+        MenuPage::Models => tr("menu.footer.models"),
+        MenuPage::Help => tr("menu.footer.help"),
+        _ => tr("menu.footer"),
+    }
+}
+
+fn selected_menu_line(index: usize, selected: usize, text: String) -> Line<'static> {
+    let active = index == selected;
+    let marker = if active { "▶" } else { " " };
+    Line::from(Span::styled(
+        format!("{marker} {text}"),
+        if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        },
+    ))
+}
+
+fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
+    match menu.page {
+        MenuPage::Root => [
+            tr("menu.root.profile"),
+            tr("menu.root.model"),
+            tr("menu.root.serial"),
+            tr("menu.root.help"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
+        .collect(),
+        MenuPage::Profiles => [tr("menu.profile.transport"), tr("menu.profile.device")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
+            .collect(),
+        MenuPage::TransportProfiles => {
+            let Some(catalog) = menu.catalog.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let current = &app.current().snapshot.config.profile;
+            catalog
+                .transport_profiles
+                .iter()
+                .map(|profile| {
+                    format!(
+                        "{}{}",
+                        if &profile.name == current {
+                            "✓ "
+                        } else {
+                            "  "
+                        },
+                        safe_inline(&profile.name)
+                    )
+                })
+                .chain(std::iter::once(tr("menu.transport.new").into()))
+                .enumerate()
+                .map(|(index, text)| selected_menu_line(index, menu.selected, text))
+                .collect()
+        }
+        MenuPage::DeviceProfiles => {
+            let Some(catalog) = menu.catalog.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let current = app.current().snapshot.config.device_profile.as_deref();
+            std::iter::once(format!(
+                "{}{}",
+                if current.is_none() { "✓ " } else { "  " },
+                tr("menu.device.generic")
+            ))
+            .chain(catalog.device_profiles.iter().map(|profile| {
+                format!(
+                    "{}{}",
+                    if current == Some(profile.name.as_str()) {
+                        "✓ "
+                    } else {
+                        "  "
+                    },
+                    safe_inline(&profile.name)
+                )
+            }))
+            .chain(std::iter::once(tr("menu.device.new").into()))
+            .chain(DEVICE_PRESETS.iter().map(|preset| preset.label().into()))
+            .enumerate()
+            .map(|(index, text)| selected_menu_line(index, menu.selected, text))
+            .collect()
+        }
+        MenuPage::Models => {
+            let Some(catalog) = menu.catalog.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let bound = slot_model_binding(catalog, &app.selected_slot_id())
+                .map(|binding| binding.model_id.as_str());
+            let mut rows = vec![
+                selected_menu_line(0, menu.selected, tr("menu.model.add.root").into()),
+                selected_menu_line(1, menu.selected, tr("menu.model.add.child").into()),
+            ];
+            for (offset, row) in visible_model_rows(&catalog.models, &menu.expanded_models)
+                .into_iter()
+                .enumerate()
+            {
+                let model = &catalog.models[row.index];
+                let children = model_has_children(&catalog.models, &model.id);
+                let disclosure = if !children {
+                    "  "
+                } else if menu.expanded_models.contains(&model.id) {
+                    "▾ "
+                } else {
+                    "▸ "
+                };
+                let text = format!(
+                    "{}{}{}{} ({})",
+                    "  ".repeat(row.depth),
+                    disclosure,
+                    if bound == Some(model.id.as_str()) {
+                        "✓ "
+                    } else {
+                        "  "
+                    },
+                    safe_inline(&model.name),
+                    safe_inline(&model.id),
+                );
+                rows.push(selected_menu_line(offset + 2, menu.selected, text));
+            }
+            rows
+        }
+        MenuPage::ModelParents => {
+            let Some(catalog) = menu.catalog.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            all_model_rows(&catalog.models)
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    selected_menu_line(
+                        index,
+                        menu.selected,
+                        format!(
+                            "{}{} ({})",
+                            "  ".repeat(row.depth),
+                            safe_inline(&catalog.models[row.index].name),
+                            safe_inline(&catalog.models[row.index].id),
+                        ),
+                    )
+                })
+                .collect()
+        }
+        MenuPage::SerialSettings => TRANSPORT_PRESETS
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, preset)| selected_menu_line(index, menu.selected, preset.label()))
+            .collect(),
+        MenuPage::Help => menu_help_lines()
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White))))
+            .collect(),
+    }
+}
+
+fn menu_selected_visual_row(menu: &MenuState) -> Option<usize> {
+    (menu.page != MenuPage::Help && menu_item_count(menu) > 0).then_some(menu.selected)
+}
+
+fn menu_detail(app: &App, menu: &MenuState) -> String {
+    match menu.page {
+        MenuPage::TransportProfiles => menu
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.transport_profiles.get(menu.selected))
+            .map_or_else(
+                || tr("menu.transport.new.detail").into(),
+                transport_profile_detail,
+            ),
+        MenuPage::DeviceProfiles => {
+            if menu.selected == 0 {
+                tr("menu.device.generic.detail").into()
+            } else {
+                menu.catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.device_profiles.get(menu.selected - 1))
+                    .map_or_else(
+                        || tr("menu.device.clone.detail").into(),
+                        device_profile_detail,
+                    )
+            }
+        }
+        MenuPage::Models | MenuPage::ModelParents => tr("menu.model.verify").into(),
+        MenuPage::SerialSettings => {
+            let Some(catalog) = menu.catalog.as_ref() else {
+                return tr("menu.loading").into();
+            };
+            trf(
+                "menu.serial.current",
+                &[&transport_profile_detail(&current_transport_template(
+                    app.current(),
+                    catalog,
+                ))],
+            )
+        }
+        MenuPage::Help => String::new(),
+        _ => tr("menu.root.detail").into(),
+    }
+}
+
+fn transport_profile_detail(profile: &TransportProfile) -> String {
+    format!(
+        "{} baud · {:?} {:?} {:?} · {:?} · DTR={} RTS={} auto={}",
+        profile.baud_rate,
+        profile.data_bits,
+        profile.parity,
+        profile.stop_bits,
+        profile.flow_control,
+        profile.dtr,
+        profile.rts,
+        profile.auto_open,
+    )
+}
+
+fn device_profile_detail(profile: &DeviceProfile) -> String {
+    format!(
+        "shell={} · uboot={} · eol={} · echo={:?} · pacing={:?}/{:?}ms",
+        safe_inline(profile.shell_prompt.as_deref().unwrap_or("-")),
+        safe_inline(profile.uboot_prompt.as_deref().unwrap_or("-")),
+        match profile.write_eol.as_deref() {
+            Some("\r") => "CR",
+            Some("\n") => "LF",
+            Some("\r\n") => "CRLF",
+            Some("") => "none",
+            Some(_) => "custom",
+            None => "inherit",
+        },
+        profile.echo,
+        profile.write_chunk_size,
+        profile.write_chunk_delay_ms,
+    )
+}
+
+fn menu_help_lines() -> Vec<&'static str> {
+    vec![
+        tr("menu.help.menu"),
+        tr("menu.help.queue"),
+        tr("menu.help.enter"),
+        tr("menu.help.cooperative"),
+        tr("menu.help.takeover"),
+        tr("menu.help.echo"),
+        tr("menu.help.model"),
+        tr("menu.help.token"),
+    ]
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -3779,7 +6286,7 @@ mod tests {
     }
 
     #[test]
-    fn max_fire_and_local_timeout_project_stopping_before_terminal_event() {
+    fn max_fire_budget_keeps_observing_when_stop_literal_exists() {
         let mut app = App::new(vec![snapshot()], None);
         let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
         let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
@@ -3806,6 +6313,52 @@ mod tests {
         app.push_event(fire, false, &commands);
         assert_eq!(
             app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Running
+        );
+
+        for (seq, bytes) in [(3, b"rea".as_slice()), (4, b"dy".as_slice())] {
+            let mut rx = event(EventKind::Rx, Direction::Rx, seq, bytes);
+            rx.daemon_epoch = daemon_epoch;
+            app.push_event(rx, false, &commands);
+        }
+        assert_eq!(
+            app.slots[0]
+                .snapshot
+                .active_trigger
+                .as_ref()
+                .unwrap()
+                .status,
+            TriggerStatus::Stopping
+        );
+
+        let mut no_match_app = App::new(vec![snapshot()], None);
+        let daemon_epoch = no_match_app.slots[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&no_match_app.slots[0].snapshot, TriggerStatus::Running);
+        trigger.spec.max_fires = 1;
+        trigger.spec.stop_contains.clear();
+        let trigger_id = trigger.id;
+        let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
+        started.daemon_epoch = daemon_epoch;
+        started
+            .metadata
+            .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
+        no_match_app.push_event(started, false, &commands);
+        let mut fire = event(EventKind::Tx, Direction::Tx, 2, b"slp");
+        fire.daemon_epoch = daemon_epoch;
+        fire.metadata
+            .insert("trigger_id".into(), serde_json::json!(trigger_id));
+        fire.metadata
+            .insert("trigger_write_kind".into(), serde_json::json!("action"));
+        fire.metadata
+            .insert("fire_index".into(), serde_json::json!(1));
+        no_match_app.push_event(fire, false, &commands);
+        assert_eq!(
+            no_match_app.slots[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -3928,6 +6481,8 @@ mod tests {
             Uuid::new_v4(),
             PendingRequest::Write {
                 slot_id: "slot-1".into(),
+                operation_id: Some(Uuid::new_v4()),
+                cooperative: false,
             },
         );
         let (commands, _) = mpsc::channel(4);
@@ -3997,13 +6552,15 @@ mod tests {
         let (commands, _received) = mpsc::channel(4);
         assert!(app.request_write(&commands, b"echo queued\r".to_vec(), Some(Uuid::new_v4())));
 
-        app.remove_last_queued_line(true);
+        app.remove_last_queued_line(true, &commands);
 
         assert!(!app.pending_writes.contains_key("slot-1"));
         assert_eq!(app.slots[0].draft.iter().collect::<String>(), "echo queued");
         assert_eq!(app.slots[0].draft_cursor, "echo queued".chars().count());
         assert_eq!(app.slots[0].mode, InputMode::Line);
-        assert_eq!(app.status, tr("st.queue.restored"));
+        assert!(app.pending_requests.values().any(
+            |request| matches!(request, PendingRequest::CancelAcquire { slot_id } if slot_id == "slot-1")
+        ));
     }
 
     #[test]
@@ -4012,7 +6569,7 @@ mod tests {
         let (commands, _received) = mpsc::channel(4);
         assert!(app.request_raw_write(&commands, vec![0x03]));
 
-        app.remove_last_queued_line(true);
+        app.remove_last_queued_line(true, &commands);
 
         assert_eq!(app.pending_writes["slot-1"][0].data, vec![0x03]);
         assert!(app.slots[0].draft.is_empty());
@@ -4090,7 +6647,13 @@ mod tests {
         let (first_id, first_data, first_operation) = take_write(&mut received);
         assert_eq!(first_data.len(), MAX_WRITE_BYTES);
         assert_eq!(first_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["slot-1"].len(), 2);
+        assert_eq!(app.pending_writes["slot-1"].len(), 3);
+        assert_eq!(
+            queued_line_operations(&app.pending_writes["slot-1"])[0]
+                .data
+                .len(),
+            MAX_WRITE_BYTES * 2 + 17
+        );
         assert!(received.try_recv().is_err());
 
         app.handle_result(
@@ -4102,7 +6665,13 @@ mod tests {
         assert_ne!(first_id, second_id);
         assert_eq!(second_data.len(), MAX_WRITE_BYTES);
         assert_eq!(second_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+        assert_eq!(app.pending_writes["slot-1"].len(), 3);
+        assert_eq!(
+            queued_line_operations(&app.pending_writes["slot-1"])[0]
+                .data
+                .len(),
+            MAX_WRITE_BYTES * 2 + 17
+        );
 
         app.handle_result(
             second_id,
@@ -4113,6 +6682,12 @@ mod tests {
         assert_ne!(second_id, third_id);
         assert_eq!(third_data.len(), 17);
         assert_eq!(third_operation, Some(operation_id));
+        assert_eq!(app.pending_writes["slot-1"].len(), 3);
+        app.handle_result(
+            third_id,
+            CommandResult::WriteAccepted { event_seq: 3 },
+            &commands,
+        );
         assert!(!app.pending_writes.contains_key("slot-1"));
     }
 
@@ -4128,7 +6703,7 @@ mod tests {
         );
         let (request_id, first_data, _) = take_write(&mut received);
         assert_eq!(first_data.len(), MAX_WRITE_BYTES);
-        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+        assert_eq!(app.pending_writes["slot-1"].len(), 2);
 
         app.handle_server_message(
             ServerMessage::Error {
@@ -4159,7 +6734,7 @@ mod tests {
         let (first_id, first_data, operation_id) = take_write(&mut received);
         assert_eq!(first_data, vec![b'x'; MAX_WRITE_BYTES]);
         let operation_id = operation_id.expect("line paste operation ID");
-        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+        assert_eq!(app.pending_writes["slot-1"].len(), 2);
 
         app.handle_result(
             first_id,
@@ -4170,11 +6745,17 @@ mod tests {
         assert_ne!(first_id, second_id);
         assert_eq!(second_data, b"x\r");
         assert_eq!(second_operation, Some(operation_id));
+        assert_eq!(app.pending_writes["slot-1"].len(), 2);
+        app.handle_result(
+            second_id,
+            CommandResult::WriteAccepted { event_seq: 2 },
+            &commands,
+        );
         assert!(!app.pending_writes.contains_key("slot-1"));
     }
 
     #[test]
-    fn confirmed_multiline_paste_queues_distinct_commands_in_one_operation() {
+    fn confirmed_multiline_paste_assigns_each_command_a_distinct_operation() {
         let mut app = ready_app_with_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
@@ -4185,10 +6766,10 @@ mod tests {
 
         app.confirm_paste(&commands);
 
-        let (first_id, first_data, operation_id) = take_write(&mut received);
-        let operation_id = operation_id.expect("line paste operation ID");
+        let (first_id, first_data, first_operation) = take_write(&mut received);
+        let first_operation = first_operation.expect("first line paste operation ID");
         assert_eq!(first_data, b"pwd\r");
-        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+        assert_eq!(app.pending_writes["slot-1"].len(), 2);
 
         app.handle_result(
             first_id,
@@ -4197,8 +6778,57 @@ mod tests {
         );
         let (_, second_data, second_operation) = take_write(&mut received);
         assert_eq!(second_data, b"version\r");
-        assert_eq!(second_operation, Some(operation_id));
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(second_operation.is_some());
+        assert_ne!(second_operation, Some(first_operation));
+        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+    }
+
+    #[test]
+    fn foreign_control_multiline_paste_creates_oldest_first_independent_cards() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(8);
+        app.pending_paste = Some(PendingPaste {
+            slot_id: "slot-1".into(),
+            bytes: b"first\nsecond\nthird\n".to_vec(),
+            raw: false,
+        });
+
+        app.confirm_paste(&commands);
+
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("queue-mode acquire")
+        else {
+            panic!("expected queue-mode acquire")
+        };
+        assert!(matches!(
+            message,
+            ClientMessage::AcquireControl {
+                mode: ControlMode::Queue,
+                ..
+            }
+        ));
+        assert!(received.try_recv().is_err());
+
+        let operations = queued_line_operations(&app.pending_writes["slot-1"]);
+        assert_eq!(operations.len(), 3);
+        assert_eq!(operations[0].data, b"first\r");
+        assert_eq!(operations[1].data, b"second\r");
+        assert_eq!(operations[2].data, b"third\r");
+        let ids = operations
+            .iter()
+            .map(|operation| operation.operation_id.expect("LINE operation ID"))
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 3);
+
+        app.remove_queued_line_operation(1, true, &commands);
+        assert_eq!(app.current().draft.iter().collect::<String>(), "second");
+        let remaining = queued_line_operations(&app.pending_writes["slot-1"])
+            .into_iter()
+            .map(|operation| operation.data)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![b"first\r".to_vec(), b"third\r".to_vec()]);
+        assert!(app.pending_requests.values().any(
+            |request| matches!(request, PendingRequest::Acquire { slot_id } if slot_id == "slot-1")
+        ));
     }
 
     #[test]
@@ -4216,7 +6846,7 @@ mod tests {
         let (_, data, operation_id) = take_write(&mut received);
         assert_eq!(data, b"pwd\nversion\n");
         assert_eq!(operation_id, None);
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(app.pending_writes.contains_key("slot-1"));
     }
 
     #[test]
@@ -4428,7 +7058,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_control_can_be_cancelled_and_forces_actor_reconnect() {
+    fn queued_control_cancel_is_directed_and_preserves_other_slots() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
         let slot_id = app.selected_slot_id();
@@ -4461,21 +7091,53 @@ mod tests {
                 slot_id: slot_id.clone(),
             },
         );
+        let mut other = snapshot();
+        other.config.id = "slot-2".into();
+        other.config.display_name = "Slot 2".into();
+        other.config.port = "COM4".into();
+        let mut other = SlotView::new(other);
+        other.subscription = SubscriptionPhase::Ready { head_seq: 0 };
+        app.slots.push(other);
+        app.pending_writes.insert(
+            "slot-2".into(),
+            VecDeque::from([PendingWrite {
+                data: b"version\r".to_vec(),
+                operation_id: Some(Uuid::new_v4()),
+                kind: PendingWriteKind::Line,
+            }]),
+        );
+        app.queued_controls.insert(
+            "slot-2".into(),
+            QueuedControl {
+                position: 2,
+                since: Instant::now(),
+            },
+        );
+        app.pending_requests.insert(
+            Uuid::new_v4(),
+            PendingRequest::Acquire {
+                slot_id: "slot-2".into(),
+            },
+        );
         let (commands, mut received) = mpsc::channel(4);
 
         app.release_control(&commands);
 
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("directed cancel")
+        else {
+            panic!("expected directed cancel request")
+        };
         assert!(matches!(
-            received.try_recv(),
-            Ok(NetworkCommand::Reconnect { reason }) if reason.contains("cancelled queued input")
+            message,
+            ClientMessage::CancelAcquire { slot_id, .. } if slot_id == "slot-1"
         ));
-        assert!(app.pending_writes.is_empty());
-        assert!(app.queued_controls.is_empty());
-        assert!(
-            app.pending_requests
-                .values()
-                .all(|request| !matches!(request, PendingRequest::Acquire { .. }))
-        );
+        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(app.pending_writes.contains_key("slot-2"));
+        assert!(!app.queued_controls.contains_key("slot-1"));
+        assert!(app.queued_controls.contains_key("slot-2"));
+        assert!(app.pending_requests.values().any(
+            |request| matches!(request, PendingRequest::Acquire { slot_id } if slot_id == "slot-2")
+        ));
     }
 
     #[test]
@@ -4791,6 +7453,22 @@ mod tests {
         }
     }
 
+    fn agent_run(label: &str) -> RunInfo {
+        RunInfo {
+            id: Uuid::new_v4(),
+            owner: Actor {
+                id: "agent:test".into(),
+                label: "Test Agent".into(),
+                kind: ActorKind::Agent,
+            },
+            label: label.into(),
+            status: serial_protocol::RunStatus::Active,
+            start_seq: 1,
+            end_seq: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
     fn ready_app_with_control() -> App {
         let mut snapshot = snapshot();
         let actor = Actor {
@@ -4999,6 +7677,105 @@ mod tests {
         let end = view.lines.len() - view.scroll_from_bottom;
         assert_eq!(view.lines[end - 1].text, "row-14");
         assert_eq!(view.unseen, 3);
+    }
+
+    #[test]
+    fn visual_scroll_does_nothing_when_history_fits_the_viewport() {
+        let mut app = App::new(vec![snapshot()], None);
+        for seq in 0..3 {
+            app.slots[0].push_line(stream_row(seq, Direction::Rx, "short"), true);
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TUI");
+
+        app.scroll_up(3);
+
+        assert!(app.current().scroll_snapshot.is_none());
+        assert_eq!(app.current().scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn visual_scroll_can_move_inside_one_wrapped_logical_line() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.slots[0].push_line(stream_row(1, Direction::Rx, &"x".repeat(2_000)), true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TUI");
+
+        app.scroll_up(3);
+
+        assert!(app.current().scroll_snapshot.is_some());
+        assert_eq!(app.current().scroll_from_bottom, 3);
+    }
+
+    #[test]
+    fn paused_visual_snapshot_does_not_drift_when_live_rows_arrive() {
+        let mut app = App::new(vec![snapshot()], None);
+        for seq in 0..30 {
+            app.slots[0].push_line(stream_row(seq, Direction::Rx, &format!("row-{seq}")), true);
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TUI");
+        let inner = app.layout.expect("layout").output_inner;
+        app.scroll_up(3);
+        let before = visible_output_lines(&app, inner)
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>();
+
+        for seq in 30..35 {
+            app.slots[0].push_line(stream_row(seq, Direction::Rx, &format!("live-{seq}")), true);
+        }
+        let after = visible_output_lines(&app, inner)
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(after, before);
+        assert_eq!(app.current().scroll_from_bottom, 3);
+        assert_eq!(app.current().unseen, 5);
+        app.current_mut().follow();
+        assert!(app.current().scroll_snapshot.is_none());
+        assert!(
+            visible_output_lines(&app, inner)
+                .iter()
+                .map(line_plain_text)
+                .any(|line| line.contains("live-34"))
+        );
+    }
+
+    #[test]
+    fn detailed_view_change_releases_frozen_rows_for_every_slot() {
+        let mut second = snapshot();
+        second.config.id = "slot-2".into();
+        second.config.display_name = "Slot 2".into();
+        let mut app = App::new(vec![snapshot(), second], None);
+        for slot in &mut app.slots {
+            slot.scroll_snapshot = Some(ScrollSnapshot {
+                rows: vec![Line::from("frozen")],
+            });
+            slot.scroll_from_bottom = 1;
+            slot.unseen = 2;
+        }
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_prefix_key(
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            &commands,
+        );
+
+        assert!(app.detailed_timeline);
+        assert!(app.slots.iter().all(|slot| slot.scroll_snapshot.is_none()
+            && slot.scroll_from_bottom == 0
+            && slot.unseen == 0));
     }
 
     #[test]
@@ -5260,6 +8037,423 @@ mod tests {
     }
 
     #[test]
+    fn empty_enter_during_foreign_agent_run_only_follows_live_output() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = ready_app_with_foreign_control();
+        app.slots[0].snapshot.active_run = Some(agent_run("diagnose boot"));
+        app.slots[0].scroll_from_bottom = 5;
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+
+        assert!(received.try_recv().is_err());
+        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert_eq!(app.current().scroll_from_bottom, 0);
+        assert!(app.status.contains("empty Enter"));
+    }
+
+    #[test]
+    fn ordinary_enter_keeps_draft_when_local_enqueue_is_rejected() {
+        let mut app = ready_app_with_foreign_control();
+        app.transport_connected = false;
+        app.slots[0].draft = "must survive".chars().collect();
+        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        let (commands, mut received) = mpsc::channel(1);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+
+        assert_eq!(
+            app.current().draft.iter().collect::<String>(),
+            "must survive"
+        );
+        assert!(app.current().history.is_empty());
+        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn alt_enter_sends_matching_agent_cooperative_write_without_acquire() {
+        let mut app = ready_app_with_foreign_control();
+        let agent = app
+            .current()
+            .snapshot
+            .control
+            .as_ref()
+            .unwrap()
+            .owner
+            .clone();
+        let mut run = agent_run("diagnose boot");
+        run.owner = agent;
+        let run_id = run.id;
+        app.slots[0].snapshot.active_run = Some(run);
+        app.slots[0].snapshot.effective_write_eol = Some("\r\n".into());
+        app.slots[0].draft = "show version".chars().collect();
+        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &commands);
+
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("cooperative write")
+        else {
+            panic!("expected cooperative write")
+        };
+        let ClientMessage::Write {
+            control_id,
+            fence,
+            data,
+            operation_id,
+            expected_run_id,
+            pacing,
+            cooperative,
+            ..
+        } = message
+        else {
+            panic!("expected Write, not AcquireControl")
+        };
+        assert!(cooperative);
+        assert_eq!(control_id, Uuid::nil());
+        assert_eq!(fence, 0);
+        assert_eq!(data, b"show version\r\n");
+        assert!(operation_id.is_some());
+        assert_eq!(expected_run_id, Some(run_id));
+        assert_eq!(pacing, None);
+        assert!(received.try_recv().is_err());
+        assert!(app.current().draft.is_empty());
+        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(app.pending_requests.values().any(|request| matches!(
+            request,
+            PendingRequest::Write {
+                slot_id,
+                cooperative: true,
+                ..
+            } if slot_id == "slot-1"
+        )));
+    }
+
+    #[test]
+    fn rejected_cooperative_write_preserves_ordinary_queue_and_acquire() {
+        let mut app = ready_app_with_foreign_control();
+        let agent = app
+            .current()
+            .snapshot
+            .control
+            .as_ref()
+            .unwrap()
+            .owner
+            .clone();
+        let mut run = agent_run("lease boundary");
+        run.owner = agent;
+        app.slots[0].snapshot.active_run = Some(run);
+
+        let queued_operation = Uuid::new_v4();
+        app.pending_writes.insert(
+            "slot-1".into(),
+            VecDeque::from([PendingWrite {
+                data: b"ordinary queued\r".to_vec(),
+                operation_id: Some(queued_operation),
+                kind: PendingWriteKind::Line,
+            }]),
+        );
+        let acquire_request = Uuid::new_v4();
+        app.pending_requests.insert(
+            acquire_request,
+            PendingRequest::Acquire {
+                slot_id: "slot-1".into(),
+            },
+        );
+        app.queued_controls.insert(
+            "slot-1".into(),
+            QueuedControl {
+                position: 2,
+                since: Instant::now(),
+            },
+        );
+        app.slots[0].draft = "cooperative at expiry".chars().collect();
+        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &commands);
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("cooperative write")
+        else {
+            panic!("expected cooperative write")
+        };
+        let ClientMessage::Write {
+            request_id,
+            cooperative,
+            ..
+        } = message
+        else {
+            panic!("expected cooperative Write")
+        };
+        assert!(cooperative);
+
+        app.handle_server_message(
+            ServerMessage::Error {
+                request_id: Some(request_id),
+                code: serial_protocol::ErrorCode::ControlRequired,
+                message: "Agent lease expired before cooperative write".into(),
+                retryable: true,
+            },
+            &commands,
+        );
+
+        let queue = app
+            .pending_writes
+            .get("slot-1")
+            .expect("ordinary queue must survive");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].data, b"ordinary queued\r");
+        assert_eq!(queue[0].operation_id, Some(queued_operation));
+        assert!(matches!(
+            app.pending_requests.get(&acquire_request),
+            Some(PendingRequest::Acquire { slot_id }) if slot_id == "slot-1"
+        ));
+        assert_eq!(app.queued_controls["slot-1"].position, 2);
+        assert!(!app.pending_requests.contains_key(&request_id));
+    }
+
+    #[test]
+    fn agent_run_hint_is_dimmed_dismissible_and_returns_for_the_next_run() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        app.slots[0].snapshot.active_run = Some(agent_run("FIRST_AGENT_TASK"));
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render Agent hint");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("FIRST_AGENT_TASK"));
+        let layout = app.layout.expect("layout");
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: layout.input_area.x + 1,
+                row: layout.input_area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render dismissed Agent hint");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("FIRST_AGENT_TASK"));
+
+        app.slots[0].snapshot.active_run = Some(agent_run("SECOND_AGENT_TASK"));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render next Agent hint");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("SECOND_AGENT_TASK"));
+    }
+
+    #[test]
+    fn configuration_menu_shortcut_navigates_and_reload_uses_command_channel() {
+        let mut app = App::new(vec![snapshot()], None);
+        let (menu_commands, mut menu_received) = mpsc::channel(2);
+        app.menu_commands = Some(menu_commands);
+        let (network_commands, _) = mpsc::channel(1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            &network_commands,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &network_commands,
+        );
+
+        assert!(matches!(
+            menu_received.try_recv(),
+            Ok(MenuIoCommand::Reload)
+        ));
+        assert!(matches!(
+            app.menu.as_ref().map(|menu| menu.page),
+            Some(MenuPage::Root)
+        ));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &network_commands,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &network_commands,
+        );
+        assert!(matches!(
+            app.menu.as_ref().map(|menu| menu.page),
+            Some(MenuPage::Models)
+        ));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &network_commands,
+        );
+        assert!(matches!(
+            app.menu.as_ref().map(|menu| menu.page),
+            Some(MenuPage::Root)
+        ));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &network_commands,
+        );
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn administrator_token_prompt_is_rendered_only_as_masked_cells() {
+        let secret = "ADMIN_TOKEN_MUST_NOT_RENDER";
+        let mut app = App::new(vec![snapshot()], None);
+        let mut menu = MenuState::new();
+        menu.prompt = Some(MenuPrompt {
+            title: tr("menu.prompt.admin").into(),
+            value: secret.chars().collect(),
+            cursor: secret.chars().count(),
+            secret: true,
+            purpose: MenuPromptPurpose::Admin(MenuAdminMutation::BindDevice {
+                slot_id: "slot-1".into(),
+                profile_name: None,
+            }),
+        });
+        app.menu = Some(menu);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render masked administrator prompt");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("••••"));
+    }
+
+    #[test]
+    fn new_device_profile_clones_effective_behavior_before_echo_or_eol_preset() {
+        let mut current = snapshot();
+        current.effective_shell_prompt = Some("dut# ".into());
+        current.effective_uboot_prompt = Some("dut=> ".into());
+        current.effective_write_eol = Some("\r\n".into());
+        current.effective_echo = Some(EchoMode::Auto);
+        current.effective_write_pacing = Some(WritePacing {
+            chunk_size: 7,
+            chunk_delay_ms: 13,
+        });
+        let view = SlotView::new(current);
+
+        let cloned = current_device_template(&view);
+        assert_eq!(cloned.name, "");
+        assert_eq!(cloned.shell_prompt.as_deref(), Some("dut# "));
+        assert_eq!(cloned.uboot_prompt.as_deref(), Some("dut=> "));
+        assert_eq!(cloned.write_eol.as_deref(), Some("\r\n"));
+        assert_eq!(cloned.echo, Some(EchoMode::Auto));
+        assert_eq!(cloned.write_chunk_size, Some(7));
+        assert_eq!(cloned.write_chunk_delay_ms, Some(13));
+
+        let mut echo_off = cloned.clone();
+        DevicePreset::Echo(EchoMode::Off).apply(&mut echo_off);
+        assert_eq!(echo_off.echo, Some(EchoMode::Off));
+        assert_eq!(echo_off.write_eol, cloned.write_eol);
+        assert_eq!(echo_off.shell_prompt, cloned.shell_prompt);
+        assert_eq!(echo_off.write_chunk_size, cloned.write_chunk_size);
+
+        let mut line_feed = cloned.clone();
+        DevicePreset::Eol("\n").apply(&mut line_feed);
+        assert_eq!(line_feed.write_eol.as_deref(), Some("\n"));
+        assert_eq!(line_feed.echo, cloned.echo);
+        assert_eq!(line_feed.uboot_prompt, cloned.uboot_prompt);
+    }
+
+    #[test]
+    fn model_tree_only_reveals_children_of_expanded_parents() {
+        let models = vec![
+            DeviceModel {
+                id: "tl-as7230".into(),
+                name: "TL-AS7230".into(),
+                parent_id: None,
+                aliases: Vec::new(),
+            },
+            DeviceModel {
+                id: "tl-as7230-w".into(),
+                name: "TL-AS7230-W".into(),
+                parent_id: Some("tl-as7230".into()),
+                aliases: Vec::new(),
+            },
+            DeviceModel {
+                id: "tl-kdp712-d".into(),
+                name: "TL-KDP712-D".into(),
+                parent_id: Some("tl-as7230-w".into()),
+                aliases: Vec::new(),
+            },
+            DeviceModel {
+                id: "other".into(),
+                name: "Other".into(),
+                parent_id: None,
+                aliases: Vec::new(),
+            },
+        ];
+
+        let collapsed = visible_model_rows(&models, &HashSet::new());
+        assert_eq!(
+            collapsed
+                .iter()
+                .map(|row| models[row.index].id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tl-as7230", "other"]
+        );
+
+        let root_expanded = HashSet::from(["tl-as7230".to_string()]);
+        let root_rows = visible_model_rows(&models, &root_expanded);
+        assert_eq!(
+            root_rows
+                .iter()
+                .map(|row| (models[row.index].id.as_str(), row.depth))
+                .collect::<Vec<_>>(),
+            vec![("tl-as7230", 0), ("tl-as7230-w", 1), ("other", 0)]
+        );
+
+        let fully_expanded = HashSet::from(["tl-as7230".to_string(), "tl-as7230-w".to_string()]);
+        let all_rows = visible_model_rows(&models, &fully_expanded);
+        assert_eq!(
+            all_rows
+                .iter()
+                .map(|row| (models[row.index].id.as_str(), row.depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tl-as7230", 0),
+                ("tl-as7230-w", 1),
+                ("tl-kdp712-d", 2),
+                ("other", 0),
+            ]
+        );
+    }
+
+    #[test]
     fn queued_line_command_is_visible_in_the_input_title() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
@@ -5276,6 +8470,306 @@ mod tests {
         assert!(title.contains("QUEUED 1"));
         assert!(title.contains("reboot"));
         assert!(title.contains("Ctrl-] d/e/c"));
+    }
+
+    #[test]
+    fn queue_selection_can_restore_the_middle_operation() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        let operations = ["first", "second", "third"];
+        let queue = app.pending_writes.entry("slot-1".into()).or_default();
+        for command in operations {
+            append_pending_write(
+                queue,
+                format!("{command}\r").as_bytes(),
+                Some(Uuid::new_v4()),
+                PendingWriteKind::Line,
+            );
+        }
+
+        app.open_queue_selection();
+        let (commands, _) = mpsc::channel(1);
+        app.handle_queue_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commands);
+        app.handle_queue_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &commands,
+        );
+
+        assert_eq!(app.current().draft.iter().collect::<String>(), "second");
+        assert!(app.queue_selection.is_none());
+        let remaining = queued_line_operations(app.pending_writes.get("slot-1").unwrap())
+            .into_iter()
+            .map(|operation| String::from_utf8(operation.data).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec!["first\r", "third\r"]);
+    }
+
+    #[test]
+    fn queue_selector_is_reachable_from_the_prefix_shortcut() {
+        let mut app = App::new(vec![snapshot()], None);
+        let queue = app.pending_writes.entry("slot-1".into()).or_default();
+        for command in ["first", "second"] {
+            append_pending_write(
+                queue,
+                format!("{command}\r").as_bytes(),
+                Some(Uuid::new_v4()),
+                PendingWriteKind::Line,
+            );
+        }
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            &commands,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            &commands,
+        );
+
+        assert_eq!(app.focus, PaneFocus::Queue);
+        assert_eq!(
+            app.queue_selection
+                .as_ref()
+                .map(|selection| selection.selected),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn sending_operation_is_locked_but_a_later_operation_is_editable() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        let sending_id = Uuid::new_v4();
+        let queued_id = Uuid::new_v4();
+        app.pending_writes.insert(
+            "slot-1".into(),
+            VecDeque::from([
+                PendingWrite {
+                    data: b"sending\r".to_vec(),
+                    operation_id: Some(sending_id),
+                    kind: PendingWriteKind::Line,
+                },
+                PendingWrite {
+                    data: b"editable\r".to_vec(),
+                    operation_id: Some(queued_id),
+                    kind: PendingWriteKind::Line,
+                },
+            ]),
+        );
+        app.pending_requests.insert(
+            Uuid::new_v4(),
+            PendingRequest::Write {
+                slot_id: "slot-1".into(),
+                operation_id: Some(sending_id),
+                cooperative: false,
+            },
+        );
+        let (commands, _) = mpsc::channel(1);
+
+        app.remove_queued_line_operation(0, true, &commands);
+        assert!(app.current().draft.is_empty());
+        assert_eq!(
+            queued_line_count(app.pending_writes.get("slot-1").unwrap()),
+            2
+        );
+        assert_eq!(app.status, tr("st.queue.already.sending"));
+
+        app.remove_queued_line_operation(1, true, &commands);
+        assert_eq!(app.current().draft.iter().collect::<String>(), "editable");
+        assert_eq!(
+            queued_line_count(app.pending_writes.get("slot-1").unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn real_flush_keeps_single_chunk_card_visible_and_locked_until_ack() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = ready_app_with_control();
+        let (commands, mut received) = mpsc::channel(4);
+
+        assert!(app.request_write(&commands, b"REAL_INFLIGHT\r".to_vec(), Some(Uuid::new_v4()),));
+        let (request_id, data, _) = take_write(&mut received);
+        assert_eq!(data, b"REAL_INFLIGHT\r");
+        assert_eq!(queued_line_count(&app.pending_writes["slot-1"]), 1);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render in-flight queue card");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("REAL_INFLIGHT"));
+        assert!(rendered.contains("SENDING (locked)"));
+
+        app.handle_result(
+            request_id,
+            CommandResult::WriteAccepted { event_seq: 1 },
+            &commands,
+        );
+        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.inflight_writes.contains_key("slot-1"));
+    }
+
+    #[test]
+    fn control_tick_retries_queue_after_outbound_channel_backpressure() {
+        let mut app = ready_app_with_control();
+        let (commands, mut received) = mpsc::channel(1);
+        commands.try_send(NetworkCommand::Shutdown).unwrap();
+
+        assert!(app.request_write(
+            &commands,
+            b"retry after full\r".to_vec(),
+            Some(Uuid::new_v4()),
+        ));
+        assert_eq!(queued_line_count(&app.pending_writes["slot-1"]), 1);
+        assert!(app.inflight_writes.is_empty());
+        assert!(matches!(received.try_recv(), Ok(NetworkCommand::Shutdown)));
+
+        app.maintain_controls(&commands);
+
+        let (_, data, _) = take_write(&mut received);
+        assert_eq!(data, b"retry after full\r");
+        assert!(app.pending_requests.values().any(
+            |request| matches!(request, PendingRequest::Write { slot_id, cooperative: false, .. } if slot_id == "slot-1")
+        ));
+        assert_eq!(queued_line_count(&app.pending_writes["slot-1"]), 1);
+    }
+
+    #[test]
+    fn queue_panel_renders_operations_oldest_first() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        let queue = app.pending_writes.entry("slot-1".into()).or_default();
+        for command in ["FIRST_QUEUED", "SECOND_QUEUED", "THIRD_QUEUED"] {
+            append_pending_write(
+                queue,
+                format!("{command}\r").as_bytes(),
+                Some(Uuid::new_v4()),
+                PendingWriteKind::Line,
+            );
+        }
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render queue panel");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let first = rendered.find("FIRST_QUEUED").unwrap();
+        let second = rendered.find("SECOND_QUEUED").unwrap();
+        let third = rendered.find("THIRD_QUEUED").unwrap();
+        assert!(first < second && second < third);
+    }
+
+    #[test]
+    fn queue_cards_wrap_long_ascii_without_losing_command_text() {
+        let mut app = App::new(vec![snapshot()], None);
+        let command = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        append_pending_write(
+            app.pending_writes.entry("slot-1".into()).or_default(),
+            format!("{command}\r").as_bytes(),
+            Some(Uuid::new_v4()),
+            PendingWriteKind::Line,
+        );
+
+        let cards = queue_cards(&app, 14);
+
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].body.len() > 1);
+        assert_eq!(cards[0].body.concat(), command);
+        assert!(
+            cards[0]
+                .body
+                .iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 12)
+        );
+    }
+
+    #[test]
+    fn queue_cards_wrap_cjk_by_display_width_without_losing_text() {
+        let mut app = App::new(vec![snapshot()], None);
+        let command = "中文样机命令参数甲乙丙丁戊己庚辛";
+        append_pending_write(
+            app.pending_writes.entry("slot-1".into()).or_default(),
+            format!("{command}\r").as_bytes(),
+            Some(Uuid::new_v4()),
+            PendingWriteKind::Line,
+        );
+
+        let cards = queue_cards(&app, 12);
+
+        assert_eq!(cards[0].body.concat(), command);
+        assert!(
+            cards[0]
+                .body
+                .iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 10)
+        );
+    }
+
+    #[test]
+    fn short_queue_viewport_pages_selected_command_without_silent_truncation() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        let command = ["A"; 30]
+            .into_iter()
+            .chain(["B"; 30])
+            .chain(["C"; 30])
+            .chain(["D"; 30])
+            .chain(["E"; 30])
+            .chain(["F"; 30])
+            .collect::<String>();
+        append_pending_write(
+            app.pending_writes.entry("slot-1".into()).or_default(),
+            format!("{command}\r").as_bytes(),
+            Some(Uuid::new_v4()),
+            PendingWriteKind::Line,
+        );
+        app.open_queue_selection();
+        let (commands, _) = mpsc::channel(1);
+        let backend = TestBackend::new(32, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let first_page = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(first_page.contains("AAAAAAAA"));
+        assert!(first_page.contains("text rows 1-"));
+
+        app.handle_queue_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &commands,
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let later_page = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!later_page.contains("text rows 1-"));
+        assert!(later_page.contains("EEEE") || later_page.contains("FFFF"));
     }
 
     #[test]

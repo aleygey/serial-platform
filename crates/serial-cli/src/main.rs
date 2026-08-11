@@ -14,8 +14,10 @@ Usage:
   serial [--root DIR] serve [seriald options]
   serial setup [serialctl options]
   serial profile <transport|device|attach|detach> ...
+  serial model <list|tree|add|update|attach|detach> ...
   serial status|doctor|archives|logs ...
   serial mcp [serial-mcp options]
+  serial mcp --dump-tools
   serial credentials|paths [seriald options]
 
 The legacy seriald, serialctl, and serial-mcp executables remain available
@@ -77,7 +79,8 @@ fn dispatch(mut args: Vec<OsString>) -> Dispatch {
         Some("serve" | "credentials" | "paths") => Component::Daemon,
         Some("mcp") => Component::Mcp,
         Some(
-            "console" | "setup" | "init" | "profile" | "status" | "doctor" | "archives" | "logs",
+            "console" | "setup" | "init" | "profile" | "model" | "status" | "doctor" | "archives"
+            | "logs",
         ) => Component::Console,
         Some(first) if daemon_root && first.starts_with('-') => Component::Daemon,
         Some(_) => Component::Console,
@@ -411,6 +414,13 @@ mod tests {
             Dispatch {
                 component: Component::Console,
                 args: values(&["doctor", "stream", "--slot", "dut-1"])
+            }
+        );
+        assert_eq!(
+            dispatch(values(&["model", "tree", "--json"])),
+            Dispatch {
+                component: Component::Console,
+                args: values(&["model", "tree", "--json"])
             }
         );
     }

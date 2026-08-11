@@ -16,7 +16,9 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serial_protocol::{DeviceProfile, FlowControl, SlotConfig, TransportProfile};
+use serial_protocol::{
+    DeviceModel, DeviceProfile, FlowControl, SlotConfig, SlotModelBinding, TransportProfile,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -43,6 +45,8 @@ pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
 pub const MAX_DEVICE_PROFILES: usize = 128;
 /// Hard bound for the physical UART profile catalog.
 pub const MAX_TRANSPORT_PROFILES: usize = 128;
+/// Hard bound for the station-owned DUT identity catalog.
+pub const MAX_DEVICE_MODELS: usize = 512;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SLOT_ID_BYTES: usize = 64;
@@ -50,6 +54,11 @@ const MAX_DISPLAY_NAME_BYTES: usize = 128;
 const MAX_PORT_NAME_BYTES: usize = 512;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_PROMPT_PATTERN_BYTES: usize = 4096;
+const MAX_DEVICE_MODEL_ID_BYTES: usize = 128;
+const MAX_DEVICE_MODEL_NAME_BYTES: usize = 128;
+const MAX_DEVICE_MODEL_ALIASES: usize = 32;
+const MAX_MODEL_BINDING_NOTE_BYTES: usize = 2048;
+const MAX_MODEL_BINDING_SOURCE_BYTES: usize = 128;
 
 /// Files owned by one serial-platform installation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +211,10 @@ pub struct DaemonConfig {
     pub transport_profiles: Vec<TransportProfile>,
     #[serde(default)]
     pub device_profiles: Vec<DeviceProfile>,
+    #[serde(default)]
+    pub device_models: Vec<DeviceModel>,
+    #[serde(default)]
+    pub slot_model_bindings: Vec<SlotModelBinding>,
 }
 
 const fn default_config_revision() -> u64 {
@@ -224,6 +237,8 @@ impl DaemonConfig {
                 slots: Vec::new(),
                 transport_profiles: Vec::new(),
                 device_profiles: Vec::new(),
+                device_models: Vec::new(),
+                slot_model_bindings: Vec::new(),
             },
             credentials,
         )
@@ -247,15 +262,26 @@ impl DaemonConfig {
         self.auth.validate()?;
         validate_transport_profiles(&self.transport_profiles)?;
         validate_device_profiles(&self.device_profiles)?;
-        validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)
+        validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)?;
+        validate_device_models(&self.device_models)?;
+        validate_slot_model_bindings(&self.slot_model_bindings, &self.slots, &self.device_models)
     }
 
     /// Replaces all Slot configuration in memory after validating the complete
     /// resulting daemon configuration.
     pub fn replace_slots(&mut self, slots: Vec<SlotConfig>) -> Result<(), ConfigValidationError> {
         let previous = std::mem::replace(&mut self.slots, slots);
+        let previous_bindings = self.slot_model_bindings.clone();
+        let retained_slot_ids = self
+            .slots
+            .iter()
+            .map(|slot| slot.id.as_str())
+            .collect::<HashSet<_>>();
+        self.slot_model_bindings
+            .retain(|binding| retained_slot_ids.contains(binding.slot_id.as_str()));
         if let Err(error) = self.validate() {
             self.slots = previous;
+            self.slot_model_bindings = previous_bindings;
             return Err(error);
         }
         Ok(())
@@ -316,6 +342,46 @@ impl DaemonConfig {
     ) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
         staged.replace_device_profiles(device_profiles)?;
+        staged.bump_revision()?;
+        Ok(staged)
+    }
+
+    /// Replaces the model identity tree without touching Device Profiles or
+    /// current Slot bindings. Removing a referenced model therefore fails
+    /// whole-configuration validation.
+    pub fn replace_device_models(
+        &mut self,
+        device_models: Vec<DeviceModel>,
+    ) -> Result<(), ConfigValidationError> {
+        let previous = std::mem::replace(&mut self.device_models, device_models);
+        if let Err(error) = self.validate() {
+            self.device_models = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn staged_with_device_models(
+        &self,
+        device_models: Vec<DeviceModel>,
+    ) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        staged.replace_device_models(device_models)?;
+        staged.bump_revision()?;
+        Ok(staged)
+    }
+
+    /// Builds one atomic candidate for a possible catalog-leaf creation plus
+    /// the resulting Slot binding replacement.
+    pub fn staged_with_model_state(
+        &self,
+        device_models: Vec<DeviceModel>,
+        slot_model_bindings: Vec<SlotModelBinding>,
+    ) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        staged.device_models = device_models;
+        staged.slot_model_bindings = slot_model_bindings;
+        staged.validate()?;
         staged.bump_revision()?;
         Ok(staged)
     }
@@ -606,6 +672,40 @@ pub enum ConfigValidationError {
         name: String,
         available: String,
     },
+    #[error("device model at index {index} has invalid field {field}: {reason}")]
+    InvalidDeviceModel {
+        index: usize,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("device models at indexes {first} and {second} use the same id")]
+    DuplicateDeviceModelId { first: usize, second: usize },
+    #[error(
+        "device models at indexes {first} and {second} use the same alias {alias:?} (case-insensitive)"
+    )]
+    DuplicateDeviceModelAlias {
+        first: usize,
+        second: usize,
+        alias: String,
+    },
+    #[error("configuration contains {actual} device models; the maximum is {limit}")]
+    TooManyDeviceModels { actual: usize, limit: usize },
+    #[error("device model {model_id:?} references unknown parent {parent_id:?}")]
+    UnknownDeviceModelParent { model_id: String, parent_id: String },
+    #[error("device model hierarchy contains a cycle through {model_id:?}")]
+    DeviceModelCycle { model_id: String },
+    #[error("Slot model binding at index {index} has invalid field {field}: {reason}")]
+    InvalidSlotModelBinding {
+        index: usize,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("Slot model bindings at indexes {first} and {second} use the same Slot")]
+    DuplicateSlotModelBinding { first: usize, second: usize },
+    #[error("Slot model binding references unknown Slot {slot_id:?}")]
+    UnknownModelBindingSlot { slot_id: String },
+    #[error("Slot {slot_id:?} references unknown device model {model_id:?}")]
+    UnknownBoundDeviceModel { slot_id: String, model_id: String },
 }
 
 fn validate_logging(logging: &LoggingConfig) -> Result<(), ConfigValidationError> {
@@ -861,6 +961,160 @@ pub(crate) fn validate_device_profiles(
                 index,
                 field: "write_chunk_delay_ms",
                 reason: "must not exceed 10000 ms",
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_device_models(models: &[DeviceModel]) -> Result<(), ConfigValidationError> {
+    if models.len() > MAX_DEVICE_MODELS {
+        return Err(ConfigValidationError::TooManyDeviceModels {
+            actual: models.len(),
+            limit: MAX_DEVICE_MODELS,
+        });
+    }
+
+    let mut ids: HashMap<&str, usize> = HashMap::new();
+    let mut aliases: HashMap<String, usize> = HashMap::new();
+    for (index, model) in models.iter().enumerate() {
+        validate_device_model_text(index, "id", &model.id, MAX_DEVICE_MODEL_ID_BYTES)?;
+        validate_device_model_text(index, "name", &model.name, MAX_DEVICE_MODEL_NAME_BYTES)?;
+        if let Some(parent_id) = model.parent_id.as_deref() {
+            validate_device_model_text(index, "parent_id", parent_id, MAX_DEVICE_MODEL_ID_BYTES)?;
+        }
+        if let Some(first) = ids.insert(&model.id, index) {
+            return Err(ConfigValidationError::DuplicateDeviceModelId {
+                first,
+                second: index,
+            });
+        }
+        if model.aliases.len() > MAX_DEVICE_MODEL_ALIASES {
+            return Err(ConfigValidationError::InvalidDeviceModel {
+                index,
+                field: "aliases",
+                reason: "must contain at most 32 entries",
+            });
+        }
+        for alias in &model.aliases {
+            validate_device_model_text(index, "aliases", alias, MAX_DEVICE_MODEL_NAME_BYTES)?;
+            let key = alias.to_lowercase();
+            if let Some(first) = aliases.insert(key, index) {
+                return Err(ConfigValidationError::DuplicateDeviceModelAlias {
+                    first,
+                    second: index,
+                    alias: alias.clone(),
+                });
+            }
+        }
+    }
+
+    for model in models {
+        if let Some(parent_id) = model.parent_id.as_deref()
+            && !ids.contains_key(parent_id)
+        {
+            return Err(ConfigValidationError::UnknownDeviceModelParent {
+                model_id: model.id.clone(),
+                parent_id: parent_id.to_owned(),
+            });
+        }
+
+        let mut path = HashSet::new();
+        let mut current = Some(model.id.as_str());
+        while let Some(id) = current {
+            if !path.insert(id) {
+                return Err(ConfigValidationError::DeviceModelCycle {
+                    model_id: id.to_owned(),
+                });
+            }
+            current = ids
+                .get(id)
+                .and_then(|index| models[*index].parent_id.as_deref());
+        }
+    }
+    Ok(())
+}
+
+fn validate_device_model_text(
+    index: usize,
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ConfigValidationError> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigValidationError::InvalidDeviceModel {
+            index,
+            field,
+            reason: "must be non-empty, trimmed, bounded text without control characters",
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_slot_model_bindings(
+    bindings: &[SlotModelBinding],
+    slots: &[SlotConfig],
+    models: &[DeviceModel],
+) -> Result<(), ConfigValidationError> {
+    let slot_ids = slots
+        .iter()
+        .map(|slot| slot.id.as_str())
+        .collect::<HashSet<_>>();
+    let model_ids = models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut bound_slots: HashMap<&str, usize> = HashMap::new();
+
+    for (index, binding) in bindings.iter().enumerate() {
+        if let Some(first) = bound_slots.insert(&binding.slot_id, index) {
+            return Err(ConfigValidationError::DuplicateSlotModelBinding {
+                first,
+                second: index,
+            });
+        }
+        if !slot_ids.contains(binding.slot_id.as_str()) {
+            return Err(ConfigValidationError::UnknownModelBindingSlot {
+                slot_id: binding.slot_id.clone(),
+            });
+        }
+        if !model_ids.contains(binding.model_id.as_str()) {
+            return Err(ConfigValidationError::UnknownBoundDeviceModel {
+                slot_id: binding.slot_id.clone(),
+                model_id: binding.model_id.clone(),
+            });
+        }
+        if binding.updated_wall_time_ns <= 0 {
+            return Err(ConfigValidationError::InvalidSlotModelBinding {
+                index,
+                field: "updated_wall_time_ns",
+                reason: "must be a positive Unix-nanosecond timestamp",
+            });
+        }
+        if binding.source.is_empty()
+            || binding.source.len() > MAX_MODEL_BINDING_SOURCE_BYTES
+            || binding.source != binding.source.trim()
+            || binding.source.chars().any(char::is_control)
+        {
+            return Err(ConfigValidationError::InvalidSlotModelBinding {
+                index,
+                field: "source",
+                reason: "must be non-empty, trimmed text of at most 128 bytes",
+            });
+        }
+        if binding
+            .note
+            .as_deref()
+            .is_some_and(|note| note.len() > MAX_MODEL_BINDING_NOTE_BYTES || note.contains('\0'))
+        {
+            return Err(ConfigValidationError::InvalidSlotModelBinding {
+                index,
+                field: "note",
+                reason: "must be at most 2048 bytes and contain no NUL",
             });
         }
     }
@@ -1173,6 +1427,26 @@ mod tests {
         }
     }
 
+    fn device_model(id: &str, name: &str, parent_id: Option<&str>) -> DeviceModel {
+        DeviceModel {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            parent_id: parent_id.map(str::to_owned),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn model_binding(slot_id: &str, model_id: &str) -> SlotModelBinding {
+        SlotModelBinding {
+            slot_id: slot_id.to_owned(),
+            model_id: model_id.to_owned(),
+            confirmation_method: serial_protocol::ModelConfirmationMethod::Human,
+            note: Some("confirmed on bench label".into()),
+            updated_wall_time_ns: 1,
+            source: "human:test".into(),
+        }
+    }
+
     #[test]
     fn first_load_creates_defaults_and_reload_preserves_server_identity() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1460,6 +1734,73 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigValidationError::TooManyDeviceProfiles { .. })
+        ));
+    }
+
+    #[test]
+    fn device_model_tree_rejects_unknown_parents_cycles_and_duplicate_ids() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.device_models = vec![device_model("child", "Child", Some("missing"))];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::UnknownDeviceModelParent { .. })
+        ));
+
+        config.device_models = vec![
+            device_model("a", "A", Some("b")),
+            device_model("b", "B", Some("a")),
+        ];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::DeviceModelCycle { .. })
+        ));
+
+        config.device_models = vec![
+            device_model("same", "Family", None),
+            device_model("same", "Variant", None),
+        ];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::DuplicateDeviceModelId { .. })
+        ));
+    }
+
+    #[test]
+    fn model_names_may_repeat_across_hierarchy_but_aliases_may_not_repeat_per_node() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.device_models = vec![
+            device_model("tl-as7230-family", "TL-AS7230", None),
+            device_model("tl-as7230", "TL-AS7230", Some("tl-as7230-family")),
+        ];
+        config.validate().unwrap();
+
+        config.device_models[0].aliases = vec!["7230".into()];
+        config.device_models[1].aliases = vec!["7230".into()];
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::DuplicateDeviceModelAlias { .. })
+        ));
+    }
+
+    #[test]
+    fn slot_model_bindings_validate_references_and_slot_replacement_cleans_removed_bindings() {
+        let (mut config, _) = DaemonConfig::generate();
+        config.slots = vec![slot("slot-1", "COM3"), slot("slot-2", "COM4")];
+        config.device_models = vec![device_model("tl-as7230", "TL-AS7230", None)];
+        config.slot_model_bindings = vec![
+            model_binding("slot-1", "tl-as7230"),
+            model_binding("slot-2", "tl-as7230"),
+        ];
+        config.validate().unwrap();
+
+        config.replace_slots(vec![slot("slot-1", "COM3")]).unwrap();
+        assert_eq!(config.slot_model_bindings.len(), 1);
+        assert_eq!(config.slot_model_bindings[0].slot_id, "slot-1");
+
+        config.slot_model_bindings[0].model_id = "missing".into();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::UnknownBoundDeviceModel { .. })
         ));
     }
 

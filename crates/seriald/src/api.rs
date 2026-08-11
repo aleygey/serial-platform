@@ -13,13 +13,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
-    Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceProfilesRequest,
-    ConfigureDeviceProfilesResponse, ConfigureSlotsRequest, ConfigureSlotsResponse,
-    ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse, CreateMonitorRequest,
-    DaemonDiagnosticsResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
+    Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceModelsRequest,
+    ConfigureDeviceModelsResponse, ConfigureDeviceProfilesRequest, ConfigureDeviceProfilesResponse,
+    ConfigureSlotsRequest, ConfigureSlotsResponse, ConfigureTransportProfilesRequest,
+    ConfigureTransportProfilesResponse, CreateMonitorRequest, DaemonDiagnosticsResponse,
+    DeviceModel, DeviceModelListResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
     EventQueryResponse, HealthResponse, MonitorIncidentListResponse, MonitorIncidentResponse,
     MonitorListResponse, MonitorOutboxEventResponse, MonitorOutboxListResponse, MonitorResponse,
-    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage, SlotDiagnostics,
+    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage,
+    SetSlotDeviceModelRequest, SetSlotDeviceModelResponse, SlotDiagnostics, SlotModelBinding,
     StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse, UpdateMonitorRequest,
     encode_control, encode_event,
 };
@@ -238,6 +240,265 @@ impl AppState {
         }
     }
 
+    async fn configure_device_models_transaction(
+        &self,
+        requested: Vec<DeviceModel>,
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<DeviceModel>, Vec<SlotModelBinding>, u64), ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(expected_revision, current.config_revision)?;
+        let staged = current
+            .staged_with_device_models(requested)
+            .map_err(ConfigError::from)?;
+        self.inner.config_store.save(&staged)?;
+        let revision = staged.config_revision;
+        let models = staged.device_models.clone();
+        let bindings = staged.slot_model_bindings.clone();
+        *self.inner.config.write().await = staged;
+        Ok((models, bindings, revision))
+    }
+
+    async fn set_slot_device_model_transaction(
+        &self,
+        slot_id: String,
+        request: SetSlotDeviceModelRequest,
+    ) -> Result<SetSlotDeviceModelResponse, ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(request.expected_revision, current.config_revision)?;
+        if !current.slots.iter().any(|slot| slot.id == slot_id) {
+            return Err(ApiError::NotFound(format!("unknown Slot {slot_id:?}")));
+        }
+        if request.source.is_empty()
+            || request.source.len() > 128
+            || request.source != request.source.trim()
+            || request.source.chars().any(char::is_control)
+        {
+            return Err(ApiError::BadRequest(
+                "source must be non-empty, trimmed text of at most 128 bytes".into(),
+            ));
+        }
+
+        let current_model = current
+            .slot_model_bindings
+            .iter()
+            .find(|binding| binding.slot_id == slot_id)
+            .map(|binding| binding.model_id.clone());
+        let has_expected_revision = request.expected_revision.is_some();
+        let expected_current_guard = request.expected_current.clone();
+        if let Some(expected) = request.expected_current.clone() {
+            if expected.as_deref() != current_model.as_deref() {
+                return Err(ApiError::ModelBindingMismatch {
+                    expected,
+                    actual: current_model,
+                });
+            }
+        }
+
+        let SetSlotDeviceModelRequest {
+            model_id,
+            create_if_missing,
+            update_existing,
+            name,
+            parent_id,
+            clear_parent,
+            aliases,
+            clear_aliases,
+            confirmation_method,
+            note,
+            source,
+            expected_revision: _,
+            expected_current: _,
+        } = request;
+        let mut models = current.device_models.clone();
+        let mut bindings = current.slot_model_bindings.clone();
+        bindings.retain(|binding| binding.slot_id != slot_id);
+
+        if create_if_missing && update_existing {
+            return Err(ApiError::BadRequest(
+                "create_if_missing and update_existing are mutually exclusive".into(),
+            ));
+        }
+
+        let (binding, model, created) = match model_id {
+            None => {
+                if create_if_missing
+                    || update_existing
+                    || name.is_some()
+                    || parent_id.is_some()
+                    || clear_parent
+                    || !aliases.is_empty()
+                    || clear_aliases
+                    || confirmation_method.is_some()
+                    || note.is_some()
+                {
+                    return Err(ApiError::BadRequest(
+                        "detaching a Slot cannot include model definition, confirmation, or note fields"
+                            .into(),
+                    ));
+                }
+                (None, None, false)
+            }
+            Some(model_id) => {
+                let existing_index = models.iter().position(|model| model.id == model_id);
+                let existing = existing_index.map(|index| models[index].clone());
+                let (model, created) = match existing {
+                    Some(existing) => {
+                        if create_if_missing {
+                            if clear_parent || clear_aliases {
+                                return Err(ApiError::BadRequest(
+                                    "clear_parent and clear_aliases require update_existing".into(),
+                                ));
+                            }
+                            let candidate = DeviceModel {
+                                id: model_id.clone(),
+                                name: name.clone().ok_or_else(|| {
+                                    ApiError::BadRequest(
+                                        "create_if_missing requires the model name".into(),
+                                    )
+                                })?,
+                                parent_id: parent_id.clone(),
+                                aliases: aliases.clone(),
+                            };
+                            if candidate != existing {
+                                return Err(ApiError::ModelDefinitionConflict { model_id });
+                            }
+                            (existing, false)
+                        } else if update_existing {
+                            if !has_expected_revision
+                                || expected_current_guard.as_ref() != Some(&Some(model_id.clone()))
+                                || current_model.as_deref() != Some(model_id.as_str())
+                            {
+                                return Err(ApiError::BadRequest(
+                                    "update_existing requires expected_revision and expected_current equal to the model currently bound to this Slot"
+                                        .into(),
+                                ));
+                            }
+                            if parent_id.is_some() && clear_parent {
+                                return Err(ApiError::BadRequest(
+                                    "parent_id and clear_parent are mutually exclusive".into(),
+                                ));
+                            }
+                            if !aliases.is_empty() && clear_aliases {
+                                return Err(ApiError::BadRequest(
+                                    "aliases and clear_aliases are mutually exclusive".into(),
+                                ));
+                            }
+                            if name.is_none()
+                                && parent_id.is_none()
+                                && !clear_parent
+                                && aliases.is_empty()
+                                && !clear_aliases
+                            {
+                                return Err(ApiError::BadRequest(
+                                    "update_existing requires at least one model field change"
+                                        .into(),
+                                ));
+                            }
+                            let mut updated = existing;
+                            if let Some(name) = name {
+                                updated.name = name;
+                            }
+                            if let Some(parent_id) = parent_id {
+                                updated.parent_id = Some(parent_id);
+                            } else if clear_parent {
+                                updated.parent_id = None;
+                            }
+                            if !aliases.is_empty() {
+                                updated.aliases = aliases;
+                            } else if clear_aliases {
+                                updated.aliases.clear();
+                            }
+                            models[existing_index.expect("existing index is present")] =
+                                updated.clone();
+                            (updated, false)
+                        } else if name.is_some()
+                            || parent_id.is_some()
+                            || clear_parent
+                            || !aliases.is_empty()
+                            || clear_aliases
+                        {
+                            return Err(ApiError::BadRequest(
+                                "model definition fields require create_if_missing or update_existing"
+                                    .into(),
+                            ));
+                        } else {
+                            (existing, false)
+                        }
+                    }
+                    None if create_if_missing => {
+                        if clear_parent || clear_aliases {
+                            return Err(ApiError::BadRequest(
+                                "clear_parent and clear_aliases require update_existing".into(),
+                            ));
+                        }
+                        let candidate = DeviceModel {
+                            id: model_id.clone(),
+                            name: name.ok_or_else(|| {
+                                ApiError::BadRequest(
+                                    "create_if_missing requires the model name".into(),
+                                )
+                            })?,
+                            parent_id,
+                            aliases,
+                        };
+                        models.push(candidate.clone());
+                        (candidate, true)
+                    }
+                    None if update_existing => {
+                        return Err(ApiError::NotFound(format!(
+                            "cannot update unknown device model {model_id:?}"
+                        )));
+                    }
+                    None => {
+                        return Err(ApiError::NotFound(format!(
+                            "unknown device model {model_id:?}"
+                        )));
+                    }
+                };
+                let confirmation_method = confirmation_method.ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "attaching a device model requires confirmation_method".into(),
+                    )
+                })?;
+                let binding = SlotModelBinding {
+                    slot_id,
+                    model_id: model.id.clone(),
+                    confirmation_method,
+                    note,
+                    updated_wall_time_ns: wall_time_ns(),
+                    source,
+                };
+                bindings.push(binding.clone());
+                (Some(binding), Some(model), created)
+            }
+        };
+
+        let staged = current
+            .staged_with_model_state(models, bindings)
+            .map_err(ConfigError::from)?;
+        self.inner.config_store.save(&staged)?;
+        let config_revision = staged.config_revision;
+        let mut affected_slots = model.as_ref().map_or_else(Vec::new, |model| {
+            staged
+                .slot_model_bindings
+                .iter()
+                .filter(|binding| binding.model_id == model.id)
+                .map(|binding| binding.slot_id.clone())
+                .collect::<Vec<_>>()
+        });
+        affected_slots.sort();
+        *self.inner.config.write().await = staged;
+        Ok(SetSlotDeviceModelResponse {
+            binding,
+            model,
+            created,
+            affected_slots,
+            config_revision,
+        })
+    }
+
     async fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -292,6 +553,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/config/device-profiles",
             get(list_device_profiles).put(configure_device_profiles),
+        )
+        .route(
+            "/api/v1/config/device-models",
+            get(list_device_models).put(configure_device_models),
+        )
+        .route(
+            "/api/v1/slots/{slot_id}/device-model",
+            put(set_slot_device_model),
         )
         .route("/api/v1/archives", get(archives))
         .route("/api/v1/diagnostics", get(diagnostics))
@@ -480,6 +749,58 @@ async fn configure_device_profiles(
         profiles,
         config_revision,
     }))
+}
+
+async fn list_device_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceModelListResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let config = state.inner.config.read().await;
+    Ok(Json(DeviceModelListResponse {
+        models: config.device_models.clone(),
+        bindings: config.slot_model_bindings.clone(),
+        config_revision: config.config_revision,
+    }))
+}
+
+async fn configure_device_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ConfigureDeviceModelsRequest>,
+) -> Result<Json<ConfigureDeviceModelsResponse>, ApiError> {
+    state.authenticate(&headers, Role::Admin).await?;
+    let transaction = state.clone();
+    let (models, bindings, config_revision) = tokio::spawn(async move {
+        transaction
+            .configure_device_models_transaction(request.models, request.expected_revision)
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::Internal("device model transaction task failed".into()))??;
+    Ok(Json(ConfigureDeviceModelsResponse {
+        models,
+        bindings,
+        config_revision,
+    }))
+}
+
+async fn set_slot_device_model(
+    State(state): State<AppState>,
+    Path(slot_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SetSlotDeviceModelRequest>,
+) -> Result<Json<SetSlotDeviceModelResponse>, ApiError> {
+    state.authenticate(&headers, Role::Operator).await?;
+    let transaction = state.clone();
+    let response = tokio::spawn(async move {
+        transaction
+            .set_slot_device_model_transaction(slot_id, request)
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::Internal("Slot model binding transaction task failed".into()))??;
+    Ok(Json(response))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1052,6 +1373,7 @@ async fn dispatch_slot_command(
             operation_id,
             expected_run_id,
             pacing,
+            cooperative,
             ..
         } => {
             handle
@@ -1064,6 +1386,7 @@ async fn dispatch_slot_command(
                     operation_id,
                     expected_run_id,
                     pacing,
+                    cooperative,
                 )
                 .await?
         }
@@ -1434,10 +1757,19 @@ pub enum ApiError {
     Slot(#[from] SlotError),
     #[error("{0}")]
     NotFound(String),
+    #[error("request is invalid: {0}")]
+    BadRequest(String),
     #[error("the seriald WebSocket connection limit has been reached")]
     TooManyConnections,
     #[error("configuration revision mismatch: expected {expected}, current {actual}")]
     ConfigRevisionMismatch { expected: u64, actual: u64 },
+    #[error("Slot model binding changed: expected {expected:?}, current {actual:?}")]
+    ModelBindingMismatch {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+    #[error("device model {model_id:?} already exists with a different definition")]
+    ModelDefinitionConflict { model_id: String },
     #[error("{0}")]
     Internal(String),
 }
@@ -1484,11 +1816,15 @@ impl IntoResponse for ApiError {
                 (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
             }
             Self::NotFound(_) => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
+            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, ErrorCode::BadRequest),
             Self::TooManyConnections => {
                 (StatusCode::TOO_MANY_REQUESTS, ErrorCode::ResourceExhausted)
             }
             Self::ConfigRevisionMismatch { .. } => {
                 (StatusCode::CONFLICT, ErrorCode::ConfigRevisionMismatch)
+            }
+            Self::ModelBindingMismatch { .. } | Self::ModelDefinitionConflict { .. } => {
+                (StatusCode::CONFLICT, ErrorCode::Conflict)
             }
             Self::Config(_)
             | Self::Registry(_)
@@ -1521,7 +1857,7 @@ mod tests {
     use crate::config::{ConfigPaths, ConfigStore};
     use crate::control::ControlLimits;
     use crate::journal::{JournalConfig, JournalManager};
-    use serial_protocol::{SerialSettings, SlotConfig, TransportProfile};
+    use serial_protocol::{ModelConfirmationMethod, SerialSettings, SlotConfig, TransportProfile};
 
     fn disabled_slot(id: &str, display_name: &str, port: &str) -> SlotConfig {
         SlotConfig {
@@ -1719,6 +2055,192 @@ mod tests {
         // The Slot snapshot remains backward compatible; the effective bundle
         // is authoritative when a transport catalog is attached.
         assert_eq!(snapshot.config.settings.baud_rate, 115_200);
+
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_creation_and_slot_binding_commit_atomically_and_honor_current_guard() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut loaded = store.load_or_create().unwrap();
+        let configured_slot = disabled_slot("slot-1", "Slot 1", "COM3");
+        store
+            .update_slots(&mut loaded.config, vec![configured_slot.clone()])
+            .unwrap();
+        let revision = loaded.config.config_revision;
+        let started = Instant::now();
+        let journal =
+            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
+                .unwrap();
+        let registry = SlotRegistry::new(
+            loaded.daemon_epoch,
+            started,
+            journal.handle(),
+            vec![configured_slot],
+            loaded.config.transport_profiles.clone(),
+            loaded.config.device_profiles.clone(),
+            ControlLimits::default(),
+        );
+        let state = AppState::new(
+            store.clone(),
+            loaded.config,
+            registry,
+            journal.handle(),
+            loaded.daemon_epoch,
+            started,
+        );
+
+        let response = state
+            .set_slot_device_model_transaction(
+                "slot-1".into(),
+                SetSlotDeviceModelRequest {
+                    model_id: Some("tl-as7230-w".into()),
+                    create_if_missing: true,
+                    update_existing: false,
+                    name: Some("TL-AS7230-W".into()),
+                    parent_id: None,
+                    clear_parent: false,
+                    aliases: vec!["7230W".into()],
+                    clear_aliases: false,
+                    confirmation_method: Some(ModelConfirmationMethod::Serial),
+                    note: Some("confirmed with show version".into()),
+                    source: "human:test".into(),
+                    expected_revision: Some(revision),
+                    expected_current: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.created);
+        assert_eq!(response.config_revision, revision + 1);
+        assert_eq!(response.model.unwrap().id, "tl-as7230-w");
+        assert_eq!(response.binding.unwrap().model_id, "tl-as7230-w");
+
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted.device_models.len(), 1);
+        assert_eq!(persisted.slot_model_bindings.len(), 1);
+        assert_eq!(
+            state.inner.config.read().await.slot_model_bindings,
+            persisted.slot_model_bindings
+        );
+
+        let error = state
+            .set_slot_device_model_transaction(
+                "slot-1".into(),
+                SetSlotDeviceModelRequest {
+                    model_id: None,
+                    create_if_missing: false,
+                    update_existing: false,
+                    name: None,
+                    parent_id: None,
+                    clear_parent: false,
+                    aliases: Vec::new(),
+                    clear_aliases: false,
+                    confirmation_method: None,
+                    note: None,
+                    source: "human:test".into(),
+                    expected_revision: Some(response.config_revision),
+                    expected_current: Some(Some("different-model".into())),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::ModelBindingMismatch { .. }));
+        assert_eq!(
+            state.inner.config.read().await.config_revision,
+            response.config_revision
+        );
+        assert_eq!(
+            store.load().unwrap().config_revision,
+            response.config_revision
+        );
+
+        let malformed_detach = state
+            .set_slot_device_model_transaction(
+                "slot-1".into(),
+                SetSlotDeviceModelRequest {
+                    model_id: None,
+                    create_if_missing: false,
+                    update_existing: false,
+                    name: None,
+                    parent_id: None,
+                    clear_parent: false,
+                    aliases: Vec::new(),
+                    clear_aliases: false,
+                    confirmation_method: Some(ModelConfirmationMethod::Human),
+                    note: Some("irrelevant on detach".into()),
+                    source: "human:test".into(),
+                    expected_revision: Some(response.config_revision),
+                    expected_current: Some(Some("tl-as7230-w".into())),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(malformed_detach, ApiError::BadRequest(_)));
+        assert_eq!(
+            store.load().unwrap().config_revision,
+            response.config_revision
+        );
+
+        let updated = state
+            .set_slot_device_model_transaction(
+                "slot-1".into(),
+                SetSlotDeviceModelRequest {
+                    model_id: Some("tl-as7230-w".into()),
+                    create_if_missing: false,
+                    update_existing: true,
+                    name: Some("TL-AS7230-W rev2".into()),
+                    parent_id: None,
+                    clear_parent: false,
+                    aliases: vec!["7230-W".into()],
+                    clear_aliases: false,
+                    confirmation_method: Some(ModelConfirmationMethod::Web),
+                    note: Some("confirmed in device web UI".into()),
+                    source: "agent:test".into(),
+                    expected_revision: Some(response.config_revision),
+                    expected_current: Some(Some("tl-as7230-w".into())),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.model.as_ref().unwrap().name, "TL-AS7230-W rev2");
+        assert_eq!(updated.model.as_ref().unwrap().aliases, ["7230-W"]);
+        assert_eq!(updated.affected_slots, ["slot-1"]);
+        assert!(!updated.created);
+
+        let cycle = state
+            .set_slot_device_model_transaction(
+                "slot-1".into(),
+                SetSlotDeviceModelRequest {
+                    model_id: Some("tl-as7230-w".into()),
+                    create_if_missing: false,
+                    update_existing: true,
+                    name: None,
+                    parent_id: Some("tl-as7230-w".into()),
+                    clear_parent: false,
+                    aliases: Vec::new(),
+                    clear_aliases: false,
+                    confirmation_method: Some(ModelConfirmationMethod::Serial),
+                    note: None,
+                    source: "agent:test".into(),
+                    expected_revision: Some(updated.config_revision),
+                    expected_current: Some(Some("tl-as7230-w".into())),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            cycle,
+            ApiError::Config(ConfigError::Validation(
+                crate::config::ConfigValidationError::DeviceModelCycle { .. }
+            ))
+        ));
+        assert_eq!(
+            store.load().unwrap().config_revision,
+            updated.config_revision
+        );
 
         state.shutdown().await;
         journal.shutdown().await.unwrap();

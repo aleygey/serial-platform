@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
 use serial_protocol::{
-    ArchiveListResponse, CreateMonitorRequest, EventQuery, EventQueryResponse,
-    MonitorIncidentListResponse, MonitorListResponse, MonitorResponse, StatusResponse,
+    ArchiveListResponse, CreateMonitorRequest, DeviceModelListResponse, EventQuery,
+    EventQueryResponse, MonitorIncidentListResponse, MonitorListResponse, MonitorResponse,
+    SetSlotDeviceModelRequest, SetSlotDeviceModelResponse, StatusResponse,
 };
 
 const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
@@ -37,6 +38,43 @@ impl ApiClient {
 
     pub async fn status(&self) -> Result<StatusResponse> {
         self.get_json("/api/v1/status").await
+    }
+
+    pub async fn device_models(&self) -> Result<DeviceModelListResponse> {
+        self.get_json("/api/v1/config/device-models").await
+    }
+
+    /// Compatibility probe used by the long-standing `devices` tool. A 404
+    /// means this daemon predates the additive model catalog; other transport,
+    /// authentication, and decoding failures remain visible to the caller.
+    pub async fn device_models_if_supported(&self) -> Result<Option<DeviceModelListResponse>> {
+        let response = self
+            .authorize(self.client.get(self.url("/api/v1/config/device-models")))
+            .send()
+            .await
+            .context("seriald device model capability probe failed")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        decode_response(response).await.map(Some)
+    }
+
+    pub async fn set_slot_device_model(
+        &self,
+        slot_id: &str,
+        request: &SetSlotDeviceModelRequest,
+    ) -> Result<SetSlotDeviceModelResponse> {
+        let encoded_slot = encode_path_segment(slot_id);
+        let response = self
+            .authorize(
+                self.client
+                    .put(self.url(&format!("/api/v1/slots/{encoded_slot}/device-model")))
+                    .json(request),
+            )
+            .send()
+            .await
+            .context("seriald Slot model binding request failed")?;
+        decode_response(response).await
     }
 
     pub async fn events(&self, slot_id: &str, query: &EventQuery) -> Result<EventQueryResponse> {
@@ -397,5 +435,65 @@ mod tests {
         assert!(error.contains("seriald returned 404 Not Found"));
         assert!(error.contains(&monitor_id.to_string()));
         assert!(!error.contains("does not expose the Monitor API"));
+    }
+
+    #[tokio::test]
+    async fn device_model_catalog_uses_the_observer_read_endpoint() {
+        let body =
+            r#"{"models":[{"id":"family","name":"Family"}],"bindings":[],"config_revision":7}"#;
+        let (client, server) = api_client_with_response("200 OK", body).await;
+
+        let catalog = client.device_models().await.unwrap();
+        server.await.expect("test server completed");
+
+        assert_eq!(catalog.config_revision, 7);
+        assert_eq!(catalog.models[0].id, "family");
+        assert!(catalog.bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn optional_device_model_probe_treats_only_not_found_as_unsupported() {
+        let (client, server) = api_client_with_response("404 Not Found", "route not found").await;
+
+        let catalog = client.device_models_if_supported().await.unwrap();
+        server.await.expect("test server completed");
+
+        assert!(catalog.is_none());
+    }
+
+    #[tokio::test]
+    async fn device_model_binding_decodes_the_operator_response() {
+        let body = r#"{"binding":{"slot_id":"bench","model_id":"variant","confirmation_method":"serial","updated_wall_time_ns":1,"source":"agent:serial-mcp"},"model":{"id":"variant","name":"Variant"},"created":true,"config_revision":8}"#;
+        let (client, server) = api_client_with_response("200 OK", body).await;
+        let request = SetSlotDeviceModelRequest {
+            model_id: Some("variant".into()),
+            create_if_missing: true,
+            update_existing: false,
+            name: Some("Variant".into()),
+            parent_id: None,
+            clear_parent: false,
+            aliases: Vec::new(),
+            clear_aliases: false,
+            confirmation_method: Some(serial_protocol::ModelConfirmationMethod::Serial),
+            note: None,
+            source: "agent:serial-mcp".into(),
+            expected_revision: Some(7),
+            expected_current: Some(None),
+        };
+
+        let response = client
+            .set_slot_device_model("bench", &request)
+            .await
+            .unwrap();
+        server.await.expect("test server completed");
+
+        assert!(response.created);
+        assert_eq!(response.config_revision, 8);
+        assert_eq!(response.binding.unwrap().model_id, "variant");
+    }
+
+    #[test]
+    fn device_model_binding_path_encodes_slot_ids() {
+        assert_eq!(encode_path_segment("bench / A"), "bench%20%2F%20A");
     }
 }
