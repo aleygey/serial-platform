@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
-    #[default]
     En,
+    #[default]
     Zh,
 }
 
@@ -38,7 +38,7 @@ impl Lang {
 static LANG: OnceLock<RwLock<Lang>> = OnceLock::new();
 
 fn lang_cell() -> &'static RwLock<Lang> {
-    LANG.get_or_init(|| RwLock::new(Lang::En))
+    LANG.get_or_init(|| RwLock::new(Lang::default()))
 }
 
 pub fn lang() -> Lang {
@@ -49,8 +49,9 @@ pub fn set_lang(lang: Lang) {
     *lang_cell().write().expect("language lock poisoned") = lang;
 }
 
-/// Serializes tests that depend on the process-global language and resets
-/// the language to English for the duration of the guard.
+/// Serializes tests that depend on the process-global language and gives
+/// legacy assertions a stable English baseline. Product code uses
+/// `Lang::default()` (Chinese) when no preference is configured.
 #[cfg(test)]
 pub(crate) fn lang_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -115,8 +116,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // ---- Input box ----
     (
         "ui.input.title.line",
-        " command · Enter sends Profile EOL ",
-        " 命令 · 回车发送并附加 Profile EOL ",
+        " command · Enter sends the interaction-profile line ending ",
+        " 命令 · 回车发送并附加样机交互方案换行符 ",
     ),
     (
         "ui.input.title.line.queued",
@@ -162,7 +163,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         " · 发送中（已锁定）",
     ),
     // ---- Extensible configuration menu ----
-    ("menu.title", "Serial settings menu", "串口配置总菜单"),
+    (
+        "menu.title",
+        "Serial console configuration",
+        "串口控制台配置",
+    ),
     ("menu.loading", "loading configuration…", "正在加载配置…"),
     (
         "menu.loaded",
@@ -196,141 +201,171 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current",
-        "Slot {} · Transport {} · Device {} · Model {}",
-        "槽位 {} · 传输 {} · 设备 {} · 机型 {}",
+        "Current port {} · UART profile {} · DUT interaction profile {} · bound model {}",
+        "当前串口 {} · 串口硬件方案 {} · 样机交互方案 {} · 已绑定机型 {}",
     ),
-    ("menu.root.profile", "Profile", "Profile 配置"),
-    ("menu.root.model", "DUT model", "样机机型"),
-    ("menu.root.serial", "Serial port settings", "串口设置"),
+    (
+        "menu.value.generic",
+        "Generic (no interaction profile)",
+        "通用设置（未绑定交互方案）",
+    ),
+    ("menu.value.unbound", "Unbound", "未绑定"),
+    ("menu.value.enabled", "enabled", "启用"),
+    ("menu.value.disabled", "disabled", "停用"),
+    ("menu.value.on", "on", "开启"),
+    ("menu.value.off", "off", "关闭"),
+    (
+        "menu.root.profile",
+        "Configuration profiles",
+        "配置方案（硬件 / 样机交互）",
+    ),
+    (
+        "menu.root.model",
+        "DUT model bound to this port",
+        "样机机型（当前串口绑定）",
+    ),
+    (
+        "menu.root.serial",
+        "Quickly change UART hardware parameters",
+        "快速修改串口硬件参数",
+    ),
     ("menu.root.help", "Help", "帮助"),
     (
         "menu.root.detail",
-        "Enter opens a submenu. Reads are asynchronous; every administrator mutation asks for a one-time in-memory token.",
-        "Enter 进入子菜单。读取异步执行；每次管理员写入都会索取仅驻留内存的一次性令牌。",
+        "Choose what the current serial port should use. Catalog reads run asynchronously; protected changes request temporary authorization only when the daemon requires it.",
+        "为当前串口选择生效配置。目录读取异步执行；仅当守护进程要求认证时，受保护修改才会请求临时授权。",
     ),
-    ("menu.profile.title", "Profiles", "Profile"),
+    ("menu.profile.title", "Configuration profiles", "配置方案"),
     (
         "menu.profile.transport",
-        "Transport Profiles (physical UART)",
-        "Transport Profile（物理 UART）",
+        "UART hardware profiles (baud/parity/flow)",
+        "串口硬件方案（波特率/校验/流控）",
     ),
     (
         "menu.profile.device",
-        "Device Profiles (prompt/EOL/echo/pacing)",
-        "Device Profile（提示符/EOL/回显/节奏）",
+        "DUT interaction profiles (prompt/EOL/echo/pacing)",
+        "样机交互方案（提示符/换行/回显/写入节奏）",
     ),
     (
         "menu.transport.title",
-        "Transport Profiles",
-        "Transport Profile",
+        "UART hardware profiles",
+        "串口硬件方案",
     ),
     (
         "menu.transport.new",
-        "+ New and bind safe 115200 8N1 Profile",
-        "+ 新建并绑定安全 115200 8N1 Profile",
+        "+ Create and bind safe 115200 8N1 profile",
+        "+ 新建并绑定安全的 115200 8N1 方案",
     ),
     (
         "menu.transport.new.detail",
-        "Creates one reusable 115200/8N1/no-flow Transport Profile and binds this Slot.",
-        "创建可复用的 115200/8N1/无流控 Transport Profile，并绑定当前槽位。",
+        "Creates a reusable 115200/8N1/no-flow UART hardware profile and binds it to this serial port.",
+        "创建可复用的 115200/8N1/无流控串口硬件方案，并绑定到当前串口。",
     ),
     (
         "menu.transport.bound",
-        "Transport Profile {} bound to the current Slot",
-        "Transport Profile {} 已绑定到当前槽位",
+        "UART hardware profile {} bound to the current port",
+        "串口硬件方案 {} 已绑定到当前串口",
     ),
     (
         "menu.transport.created",
-        "Transport Profile {} created and bound",
-        "Transport Profile {} 已创建并绑定",
+        "UART hardware profile {} created and bound",
+        "串口硬件方案 {} 已创建并绑定",
     ),
     (
         "menu.transport.missing",
-        "Transport Profile {} no longer exists",
-        "Transport Profile {} 已不存在",
+        "UART hardware profile {} no longer exists",
+        "串口硬件方案 {} 已不存在",
     ),
-    ("menu.device.title", "Device Profiles", "Device Profile"),
+    (
+        "menu.device.title",
+        "DUT interaction profiles",
+        "样机交互方案",
+    ),
     (
         "menu.device.generic",
-        "Generic (unbound)",
-        "Generic（不绑定）",
+        "Generic settings (unbind profile)",
+        "通用设置（解除方案绑定）",
     ),
     (
         "menu.device.new",
-        "+ Clone current effective device settings and bind",
-        "+ 克隆当前生效设备设置并绑定",
+        "+ Clone current effective DUT interaction and bind",
+        "+ 克隆当前生效的样机交互设置并绑定",
     ),
     (
         "menu.device.clone.detail",
-        "The new Profile clones the current effective prompts, EOL, echo and write pacing; presets change only the named field.",
-        "新 Profile 会克隆当前生效的提示符、EOL、回显和写入节奏；预设仅修改所示字段。",
+        "The new interaction profile clones current prompts, line ending, echo and write pacing; each preset changes only its named field.",
+        "新交互方案会克隆当前提示符、换行、回显和写入节奏；各预设只修改标明的字段。",
     ),
     (
         "menu.device.generic.detail",
-        "Unbinds the Device Profile and returns to the Slot's generic compatibility settings.",
-        "解除 Device Profile 绑定，恢复槽位的通用兼容设置。",
+        "Unbinds the DUT interaction profile and returns this port to generic compatibility settings.",
+        "解除样机交互方案绑定，让当前串口恢复通用兼容设置。",
     ),
     (
         "menu.device.bound",
-        "Device Profile {} bound to the current Slot",
-        "Device Profile {} 已绑定到当前槽位",
+        "DUT interaction profile {} bound to the current port",
+        "样机交互方案 {} 已绑定到当前串口",
     ),
     (
         "menu.device.generic.bound",
-        "Device Profile unbound; Generic behavior is active",
-        "已解除 Device Profile；当前使用 Generic 行为",
+        "DUT interaction profile unbound; generic settings are active",
+        "已解除样机交互方案；当前使用通用设置",
     ),
     (
         "menu.device.created",
-        "Device Profile {} created from effective settings and bound",
-        "Device Profile {} 已从生效设置克隆并绑定",
+        "DUT interaction profile {} created from effective settings and bound",
+        "样机交互方案 {} 已从生效设置克隆并绑定",
     ),
     (
         "menu.device.missing",
-        "Device Profile {} no longer exists",
-        "Device Profile {} 已不存在",
+        "DUT interaction profile {} no longer exists",
+        "样机交互方案 {} 已不存在",
     ),
     (
         "menu.device.echo.on",
         "+ Clone with Echo On",
-        "+ 克隆并设 Echo On",
+        "+ 克隆并设为回显开启",
     ),
     (
         "menu.device.echo.off",
         "+ Clone with Echo Off",
-        "+ 克隆并设 Echo Off",
+        "+ 克隆并设为回显关闭",
     ),
     (
         "menu.device.echo.auto",
         "+ Clone with Echo Auto (conservative)",
-        "+ 克隆并设 Echo Auto（保守）",
+        "+ 克隆并设为回显自动（保守）",
     ),
     (
         "menu.device.eol.cr",
         "+ Clone with EOL CR",
-        "+ 克隆并设 EOL CR",
+        "+ 克隆并设换行为 CR",
     ),
     (
         "menu.device.eol.lf",
         "+ Clone with EOL LF",
-        "+ 克隆并设 EOL LF",
+        "+ 克隆并设换行为 LF",
     ),
     (
         "menu.device.eol.crlf",
         "+ Clone with EOL CRLF",
-        "+ 克隆并设 EOL CRLF",
+        "+ 克隆并设换行为 CRLF",
     ),
     (
         "menu.device.eol.custom",
         "+ Clone with custom EOL",
-        "+ 克隆并设自定义 EOL",
+        "+ 克隆并设自定义换行符",
     ),
     (
         "menu.profile.exists",
-        "Profile {} already exists; choose another name",
-        "Profile {} 已存在；请选择其他名称",
+        "profile {} already exists; choose another name",
+        "配置方案 {} 已存在；请选择其他名称",
     ),
-    ("menu.model.title", "DUT model catalog", "样机机型目录"),
+    (
+        "menu.model.title",
+        "DUT model bound to this port",
+        "样机机型（当前串口绑定）",
+    ),
     (
         "menu.model.parent.title",
         "Choose parent model/family",
@@ -363,32 +398,52 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.model.bound",
-        "model {} bound to the current Slot",
-        "机型 {} 已绑定到当前槽位",
+        "model {} bound to the current serial port",
+        "机型 {} 已绑定到当前串口",
     ),
     (
         "menu.model.created",
-        "model {} created and bound to the current Slot",
-        "机型 {} 已创建并绑定到当前槽位",
+        "model {} created and bound to the current serial port",
+        "机型 {} 已创建并绑定到当前串口",
     ),
-    ("menu.serial.title", "Serial port presets", "串口设置预设"),
+    (
+        "menu.serial.title",
+        "Quickly change UART hardware parameters",
+        "快速修改串口硬件参数",
+    ),
     (
         "menu.serial.current",
-        "Current authoritative Transport Profile: {}",
-        "当前权威 Transport Profile：{}",
+        "Current UART hardware profile: {}. Applying a preset clones it as a new reusable profile.",
+        "当前串口硬件方案：{}。应用预设会克隆为新的可复用方案。",
     ),
     (
         "menu.serial.baud",
-        "Clone current Profile · baud {}",
-        "克隆当前 Profile · 波特率 {}",
+        "Clone current profile · baud rate {}",
+        "克隆当前方案 · 波特率 {}",
     ),
-    ("menu.serial.8n1", "Clone · 8N1", "克隆 · 8N1"),
-    ("menu.serial.8e1", "Clone · 8E1", "克隆 · 8E1"),
-    ("menu.serial.8o1", "Clone · 8O1", "克隆 · 8O1"),
-    ("menu.serial.8n2", "Clone · 8N2", "克隆 · 8N2"),
+    (
+        "menu.serial.8n1",
+        "Clone · 8 data / no parity / 1 stop",
+        "克隆 · 8 数据位 / 无校验 / 1 停止位",
+    ),
+    (
+        "menu.serial.8e1",
+        "Clone · 8 data / even parity / 1 stop",
+        "克隆 · 8 数据位 / 偶校验 / 1 停止位",
+    ),
+    (
+        "menu.serial.8o1",
+        "Clone · 8 data / odd parity / 1 stop",
+        "克隆 · 8 数据位 / 奇校验 / 1 停止位",
+    ),
+    (
+        "menu.serial.8n2",
+        "Clone · 8 data / no parity / 2 stop",
+        "克隆 · 8 数据位 / 无校验 / 2 停止位",
+    ),
     (
         "menu.serial.flow.none",
-        "Clone · flow control None",
+        "Clone · no flow control",
         "克隆 · 无流控",
     ),
     (
@@ -396,12 +451,69 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Clone · hardware flow control",
         "克隆 · 硬件流控",
     ),
-    ("menu.serial.dtr", "Clone · toggle DTR", "克隆 · 切换 DTR"),
-    ("menu.serial.rts", "Clone · toggle RTS", "克隆 · 切换 RTS"),
+    (
+        "menu.serial.dtr",
+        "Clone · toggle DTR line",
+        "克隆 · 切换 DTR 控制线",
+    ),
+    (
+        "menu.serial.rts",
+        "Clone · toggle RTS line",
+        "克隆 · 切换 RTS 控制线",
+    ),
     (
         "menu.serial.auto",
-        "Clone · toggle auto-open",
-        "克隆 · 切换自动打开",
+        "Clone · toggle automatic port opening",
+        "克隆 · 切换自动打开串口",
+    ),
+    ("menu.detail.baud", "baud {}", "波特率 {}"),
+    ("menu.detail.data_bits", "{} data bits", "{} 数据位"),
+    ("menu.detail.stop_bits", "{} stop bits", "{} 停止位"),
+    ("menu.detail.parity.none", "no parity", "无校验"),
+    ("menu.detail.parity.odd", "odd parity", "奇校验"),
+    ("menu.detail.parity.even", "even parity", "偶校验"),
+    ("menu.detail.flow.none", "no flow control", "无流控"),
+    (
+        "menu.detail.flow.software",
+        "software flow control",
+        "软件流控",
+    ),
+    (
+        "menu.detail.flow.hardware",
+        "hardware flow control",
+        "硬件流控",
+    ),
+    (
+        "menu.detail.transport",
+        "{} · {} · {} · {} · {} · DTR {} · RTS {} · automatic open {}",
+        "{} · {} · {} · {} · {} · DTR {} · RTS {} · 自动打开 {}",
+    ),
+    (
+        "menu.detail.prompt.shell",
+        "shell prompt {}",
+        "Shell 提示符 {}",
+    ),
+    (
+        "menu.detail.prompt.uboot",
+        "U-Boot prompt {}",
+        "U-Boot 提示符 {}",
+    ),
+    ("menu.detail.eol", "line ending {}", "换行 {}"),
+    ("menu.detail.eol.none", "none", "无"),
+    ("menu.detail.eol.custom", "custom", "自定义"),
+    ("menu.detail.eol.inherit", "inherit", "继承"),
+    ("menu.detail.echo.on", "echo on", "回显开启"),
+    ("menu.detail.echo.off", "echo off", "回显关闭"),
+    ("menu.detail.echo.auto", "echo auto", "回显自动"),
+    (
+        "menu.detail.pacing",
+        "write pacing {} byte(s) / {} ms",
+        "写入节奏 {} 字节 / {} 毫秒",
+    ),
+    (
+        "menu.detail.device",
+        "{} · {} · {} · {} · {}",
+        "{} · {} · {} · {} · {}",
     ),
     (
         "menu.help.title",
@@ -460,8 +572,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.footer.help",
-        "Esc returns to the menu",
-        "Esc 返回菜单",
+        "PgUp/PgDn scroll · Esc returns to the menu",
+        "PgUp/PgDn 滚动 · Esc 返回菜单",
     ),
     (
         "menu.prompt.admin",
@@ -470,13 +582,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.prompt.transport.name",
-        "New Transport Profile name",
-        "新 Transport Profile 名称",
+        "New UART hardware profile name",
+        "新串口硬件方案名称",
     ),
     (
         "menu.prompt.device.name",
-        "New Device Profile name",
-        "新 Device Profile 名称",
+        "New DUT interaction profile name",
+        "新样机交互方案名称",
     ),
     (
         "menu.prompt.model.root",
@@ -493,6 +605,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.admin.memory",
         "Token is masked and used only for this request; it is never saved.",
         "令牌已遮罩且仅用于本次请求；不会保存。",
+    ),
+    (
+        "menu.admin.not.required",
+        "Trusted local daemon: applying without an administrator token.",
+        "受信任的本机守护进程：无需管理员令牌，正在应用。",
     ),
     (
         "menu.admin.required",
@@ -514,6 +631,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
         " history search · Enter accepts · Esc cancels ",
         " 历史搜索 · 回车接受 · Esc 取消 ",
     ),
+    (
+        "ui.search.query",
+        "(reverse-i-search)`{}': {}",
+        "（反向历史搜索）`{}'：{}",
+    ),
+    ("ui.output.baud", "{} baud", "波特率 {}"),
     // ---- Bottom help line ----
     (
         "ui.helpline",
@@ -528,7 +651,20 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("ui.scroll.plain", "PgUp/PgDn scroll", "PgUp/PgDn 滚动"),
     // ---- Help popup ----
     ("help.title", " serialctl help ", " serialctl 帮助 "),
-    ("help.all.modes", "All modes", "所有模式"),
+    (
+        "help.group.navigation",
+        "Navigation and display",
+        "导航与显示",
+    ),
+    (
+        "help.group.control",
+        "Control and Agent cooperation",
+        "控制权与 Agent 协作",
+    ),
+    ("help.group.queue", "Queued input", "排队输入"),
+    ("help.group.line", "LINE mode", "LINE 模式"),
+    ("help.group.raw", "RAW mode", "RAW 模式"),
+    ("help.group.safety", "Safety and history", "安全与历史"),
     (
         "help.switch",
         "  Alt-1..9 / Ctrl-] 1..9   switch Slot",
@@ -576,13 +712,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.menu",
-        "  Ctrl-] m                 open Profile / model / serial settings menu",
-        "  Ctrl-] m                 打开 Profile / 机型 / 串口设置菜单",
+        "  Ctrl-] m                 profiles / bound model / quick UART settings",
+        "  Ctrl-] m                 配置方案 / 当前机型 / 快速串口硬件参数",
     ),
     (
         "help.takeover",
-        "  Ctrl-] t                 explicit human takeover",
-        "  Ctrl-] t                 显式人工接管",
+        "  Ctrl-] t                 force Human takeover; active Agent Run is aborted",
+        "  Ctrl-] t                 强制人工接管；活动 Agent Run 会被中止",
     ),
     (
         "help.cooperative",
@@ -646,28 +782,28 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.line1",
-        "LINE: Enter queues the line plus Profile EOL without takeover; Alt-Enter",
-        "LINE: Enter 不接管并排队该行及 Profile EOL；Alt-Enter",
+        "  Enter                    queue command + interaction-profile line ending",
+        "  Enter                    排队命令并附加交互方案的换行符",
     ),
     (
         "help.line2",
-        "is cooperative direct input. Both return to the live tail. Up/Down browse",
-        "是协作直写。两者都回到实时尾部。上/下浏览历史；",
+        "  Alt-Enter                cooperative direct input; does not take control",
+        "  Alt-Enter                协作直写，不抢占控制权",
     ),
     (
         "help.line3",
-        "history; Ctrl-R searches and Tab completes. Agent Run empty Enter only follows.",
-        "Ctrl-R 搜索、Tab 补全；Agent Run 时空 Enter 仅跟随到底部。",
+        "  Up/Down · Ctrl-R · Tab   history / search / complete; empty Agent Enter follows",
+        "  上/下 · Ctrl-R · Tab     历史 / 搜索 / 补全；Agent 活动时空回车仅到底部",
     ),
     (
         "help.raw1",
-        "RAW: keys are bytes; Ctrl-C is sent to the device and does not quit.",
-        "RAW: 按键即字节;Ctrl-C 发送到设备,不会退出。",
+        "  keys / Ctrl-C            send bytes directly; Ctrl-C does not quit",
+        "  按键 / Ctrl-C            直接发送字节；Ctrl-C 不会退出",
     ),
     (
         "help.raw2",
-        "RAW PageUp/PageDown go to the device; use the prefix for local scroll.",
-        "RAW 下 PageUp/PageDown 发往设备;本地滚动请用前缀。",
+        "  PageUp/PageDown          sent to device; prefix them for local scroll",
+        "  PageUp/PageDown          发往设备；加前缀才滚动本地历史",
     ),
     (
         "help.paste.note",
@@ -691,8 +827,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.close",
-        "Press any key to close help.",
-        "按任意键关闭帮助。",
+        "PgUp/PgDn scroll · Home/End jump · Esc or ? closes help.",
+        "PgUp/PgDn 滚动 · Home/End 跳转 · Esc 或 ? 关闭帮助。",
+    ),
+    (
+        "help.position",
+        "rows {}-{} / {} · PgUp/PgDn",
+        "第 {}-{} 行 / 共 {} 行 · PgUp/PgDn",
     ),
     // ---- Status messages ----
     ("st.connecting", "connecting…", "连接中…"),
@@ -860,8 +1001,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.requesting.takeover",
-        "requesting explicit takeover of {}…",
-        "正在请求显式接管 {}…",
+        "requesting forced Human takeover of {}… the active Agent Run will be aborted",
+        "正在请求强制人工接管 {}… 活动 Agent Run 将被中止",
+    ),
+    (
+        "st.takeover.granted",
+        "Human takeover of {} granted; the previous Agent Run was aborted",
+        "已取得 {} 的人工控制权；此前 Agent Run 已被中止",
+    ),
+    (
+        "st.run.aborted",
+        "Agent Run aborted: {} · reason: {}",
+        "Agent Run 已中止：{} · 原因：{}",
     ),
     (
         "st.slot.not.live",
@@ -915,8 +1066,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.line.mode",
-        "LINE mode: Enter sends the line plus Profile EOL",
-        "LINE 模式: 回车发送该行并附加 Profile EOL",
+        "LINE mode: Enter sends the line plus the interaction-profile line ending",
+        "LINE 模式: 回车发送该行并附加样机交互方案换行符",
     ),
     (
         "st.raw.mode",
@@ -1433,6 +1584,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn product_language_defaults_to_chinese() {
+        assert_eq!(Lang::default(), Lang::Zh);
+    }
+
+    #[test]
     fn language_switch_picks_the_matching_column() {
         let _guard = lang_test_lock();
         assert_eq!(tr("ui.paused"), " · PAUSED");
@@ -1471,6 +1627,17 @@ mod tests {
                 "placeholder count mismatch for {key}"
             );
         }
+    }
+
+    #[test]
+    fn main_menu_chinese_names_explain_the_binding_scope() {
+        let _guard = lang_test_lock();
+        set_lang(Lang::Zh);
+        assert_eq!(tr("menu.root.profile"), "配置方案（硬件 / 样机交互）");
+        assert_eq!(tr("menu.root.model"), "样机机型（当前串口绑定）");
+        assert_eq!(tr("menu.root.serial"), "快速修改串口硬件参数");
+        assert!(tr("menu.current").contains("当前串口"));
+        assert!(!tr("menu.current").contains("Transport"));
     }
 
     #[test]

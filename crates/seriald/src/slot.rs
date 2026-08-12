@@ -1167,6 +1167,27 @@ impl ActiveTrigger {
         }
     }
 
+    /// Completes the kickoff phase without inventing an RX start gate.
+    ///
+    /// An omitted `start_contains` sets `start_seen` when the Trigger is
+    /// created, so a confirmed kickoff makes the first action immediately
+    /// eligible. An explicit start matcher keeps the Trigger waiting until its
+    /// literal is observed. Keeping this transition here makes the two wire-
+    /// compatible modes explicit and independently testable.
+    fn confirm_initial_write(&mut self, now: Instant) {
+        self.initial_pending = false;
+        if self.pending_terminal.is_some() {
+            return;
+        }
+        if self.start_seen {
+            self.info.status = TriggerStatus::Running;
+            self.next_write_at = Some(now);
+        } else {
+            self.info.status = TriggerStatus::WaitingForStart;
+            self.next_write_at = None;
+        }
+    }
+
     /// Records one fully-confirmed action write. Reaching the send budget is
     /// not necessarily terminal: when a stop matcher exists, the Trigger keeps
     /// observing RX until its original deadline so output caused by the final
@@ -2685,16 +2706,7 @@ impl SlotActor {
             let terminal_status = match result.kind {
                 TriggerWriteKind::Initial => {
                     let trigger = self.active_trigger.as_mut().expect("checked above");
-                    trigger.initial_pending = false;
-                    if trigger.pending_terminal.is_none() {
-                        if trigger.start_seen {
-                            trigger.info.status = TriggerStatus::Running;
-                            trigger.next_write_at = Some(now);
-                        } else {
-                            trigger.info.status = TriggerStatus::WaitingForStart;
-                            trigger.next_write_at = None;
-                        }
-                    }
+                    trigger.confirm_initial_write(now);
                     None
                 }
                 TriggerWriteKind::Action { .. } => {
@@ -5917,6 +5929,55 @@ mod tests {
         );
         assert_eq!(trigger.info.fires_confirmed, 1);
         assert_eq!(trigger.next_write_at, None);
+    }
+
+    #[test]
+    fn kickoff_without_an_explicit_start_gate_immediately_enables_actions() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"action");
+        spec.initial_write = Some(b"kickoff\r".to_vec());
+        spec.start_contains = None;
+        let mut trigger = active_trigger_for_test(spec, now);
+        trigger.info.status = TriggerStatus::Armed;
+        trigger.initial_pending = true;
+        trigger.start_seen = true;
+        trigger.next_write_at = Some(now);
+
+        let after_kickoff = now + Duration::from_millis(1);
+        trigger.confirm_initial_write(after_kickoff);
+
+        assert!(!trigger.initial_pending);
+        assert_eq!(trigger.info.status, TriggerStatus::Running);
+        assert_eq!(trigger.next_write_at, Some(after_kickoff));
+        assert!(trigger.start_matcher.is_none());
+    }
+
+    #[test]
+    fn kickoff_with_an_explicit_start_gate_waits_for_live_rx() {
+        let now = Instant::now();
+        let mut spec = trigger_spec(b"action");
+        spec.initial_write = Some(b"kickoff\r".to_vec());
+        spec.start_contains = Some(b"go>".to_vec());
+        let mut trigger = active_trigger_for_test(spec.clone(), now);
+        trigger.info.status = TriggerStatus::Armed;
+        trigger.initial_pending = true;
+        trigger.start_seen = false;
+        trigger.start_matcher = spec
+            .start_contains
+            .map(|pattern| LiteralMatcher::new(vec![pattern]));
+        trigger.next_write_at = Some(now);
+
+        trigger.confirm_initial_write(now + Duration::from_millis(1));
+        assert_eq!(trigger.info.status, TriggerStatus::WaitingForStart);
+        assert_eq!(trigger.next_write_at, None);
+
+        assert_eq!(trigger.observe_rx(b"g"), None);
+        assert_eq!(trigger.info.status, TriggerStatus::WaitingForStart);
+        assert_eq!(trigger.observe_rx(b"o>"), None);
+        assert!(trigger.start_seen);
+        assert_eq!(trigger.info.status, TriggerStatus::Running);
+        assert!(trigger.next_write_at.is_some());
+        assert!(trigger.start_matcher.is_none());
     }
 
     #[test]

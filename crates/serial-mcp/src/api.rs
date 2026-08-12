@@ -12,11 +12,11 @@ const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
 pub struct ApiClient {
     client: Client,
     endpoint: String,
-    token: String,
+    token: Option<String>,
 }
 
 impl ApiClient {
-    pub fn new(endpoint: String, token: String) -> Result<Self> {
+    pub fn new(endpoint: String, token: Option<String>) -> Result<Self> {
         let endpoint = normalize_endpoint(&endpoint)?;
         Ok(Self {
             client: Client::builder()
@@ -32,8 +32,8 @@ impl ApiClient {
         &self.endpoint
     }
 
-    pub fn token(&self) -> &str {
-        &self.token
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     pub async fn status(&self) -> Result<StatusResponse> {
@@ -201,7 +201,10 @@ impl ApiClient {
     }
 
     fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
-        request.bearer_auth(&self.token)
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -318,7 +321,7 @@ mod tests {
                 .expect("write test response");
         });
         (
-            ApiClient::new(format!("http://{address}"), "test-token".to_owned())
+            ApiClient::new(format!("http://{address}"), Some("test-token".to_owned()))
                 .expect("construct API client"),
             server,
         )

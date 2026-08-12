@@ -18,7 +18,7 @@ Usage:
   serial status|doctor|archives|logs ...
   serial mcp [serial-mcp options]
   serial mcp --dump-tools
-  serial credentials|paths [seriald options]
+  serial credentials|auth|paths [seriald options]
 
 The legacy seriald, serialctl, and serial-mcp executables remain available
 during the 0.4 transition. `serial` delegates to the sibling component from
@@ -76,7 +76,7 @@ fn dispatch(mut args: Vec<OsString>) -> Dispatch {
     let component = match first {
         None if daemon_root => Component::Daemon,
         None => Component::Console,
-        Some("serve" | "credentials" | "paths") => Component::Daemon,
+        Some("serve" | "credentials" | "auth" | "paths") => Component::Daemon,
         Some("mcp") => Component::Mcp,
         Some(
             "console" | "setup" | "init" | "profile" | "model" | "status" | "doctor" | "archives"
@@ -439,6 +439,13 @@ mod tests {
             Dispatch {
                 component: Component::Mcp,
                 args: values(&["--actor-label", "codex"])
+            }
+        );
+        assert_eq!(
+            dispatch(values(&["auth", "disable"])),
+            Dispatch {
+                component: Component::Daemon,
+                args: values(&["auth", "disable"])
             }
         );
     }

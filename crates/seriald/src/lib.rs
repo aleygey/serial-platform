@@ -25,6 +25,11 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let bind = bind_override.unwrap_or(loaded.config.bind);
+    if !loaded.config.auth_required && !bind.ip().is_loopback() {
+        anyhow::bail!(
+            "authentication is disabled, so seriald may bind only to loopback (requested {bind})"
+        );
+    }
     let mut journal_config = JournalConfig::new(loaded.paths.journal_dir.clone());
     journal_config.max_total_bytes = loaded.config.logging.max_total_bytes;
     journal_config.cleanup_low_watermark =

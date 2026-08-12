@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::Deserialize;
 
@@ -52,7 +52,7 @@ impl Default for CaptureLimits {
 
 pub struct ResolvedConfig {
     pub endpoint: String,
-    pub token: String,
+    pub token: Option<String>,
     pub capture: CaptureLimits,
 }
 
@@ -79,21 +79,34 @@ pub fn resolve(
     let endpoint = endpoint_override
         .or(config.endpoint)
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    let token_file = token_file_override
-        .or(config.token_file)
-        .unwrap_or_else(|| {
-            config_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("token")
-        });
-    let token = fs::read_to_string(&token_file)
-        .with_context(|| format!("cannot read operator token {}", token_file.display()))?
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        bail!("operator token file {} is empty", token_file.display());
-    }
+    let legacy_default_token = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("token");
+    let token_file = token_file_override.or(config.token_file).or_else(|| {
+        // Before token-free personal mode, serial-mcp implicitly read this
+        // path even when serialctl.toml omitted token_file. Preserve that
+        // established installation shape, but no longer fail when the file
+        // does not exist.
+        legacy_default_token
+            .exists()
+            .then_some(legacy_default_token)
+    });
+    let token = token_file
+        .as_deref()
+        .map(|path| {
+            let token = fs::read_to_string(path)
+                .with_context(|| format!("cannot read operator token {}", path.display()))?
+                .trim()
+                .to_string();
+            anyhow::ensure!(
+                !token.is_empty(),
+                "operator token file {} is empty",
+                path.display()
+            );
+            Ok::<_, anyhow::Error>(token)
+        })
+        .transpose()?;
 
     // A zero limit would make every capture empty, so treat it as unset.
     // The upper bounds are deliberately not configurable: this process may
@@ -133,11 +146,11 @@ mod tests {
     fn resolved_config_debug_never_exposes_a_token() {
         let config = ResolvedConfig {
             endpoint: DEFAULT_ENDPOINT.into(),
-            token: "do-not-log-this-token".into(),
+            token: Some("do-not-log-this-token".into()),
             capture: CaptureLimits::default(),
         };
         let summary = format!("endpoint={}", config.endpoint);
-        assert!(!summary.contains(&config.token));
+        assert!(!summary.contains(config.token.as_deref().unwrap()));
     }
 
     #[test]
@@ -147,6 +160,26 @@ mod tests {
                 .unwrap();
         assert!(config.capture_max_events.is_none());
         assert!(config.capture_max_bytes.is_none());
+    }
+
+    #[test]
+    fn token_file_is_optional_for_loopback_personal_mode() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_path = temporary.path().join("serialctl.toml");
+        fs::write(&config_path, "endpoint = \"http://127.0.0.1:3210\"\n").unwrap();
+        let resolved = resolve(Some(config_path), None, None).unwrap();
+        assert_eq!(resolved.endpoint, DEFAULT_ENDPOINT);
+        assert!(resolved.token.is_none());
+    }
+
+    #[test]
+    fn existing_implicit_legacy_token_file_is_still_loaded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_path = temporary.path().join("serialctl.toml");
+        fs::write(&config_path, "endpoint = \"http://127.0.0.1:3210\"\n").unwrap();
+        fs::write(temporary.path().join("token"), "legacy-token\n").unwrap();
+        let resolved = resolve(Some(config_path), None, None).unwrap();
+        assert_eq!(resolved.token.as_deref(), Some("legacy-token"));
     }
 
     #[test]

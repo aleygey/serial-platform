@@ -12,7 +12,14 @@ authoritative tool registry as JSON without starting the stdio server.
 
 ## Shared conventions
 
-- HTTP and WebSocket endpoints use `Authorization: Bearer <token>`.
+- New personal installations default to token-free loopback-only mode. In that
+  mode HTTP and WebSocket requests omit Authorization and seriald grants the
+  local connection the admin role. seriald rejects both configured and
+  runtime bind overrides to non-loopback addresses while authentication is
+  disabled.
+- Existing configurations remain authenticated because a missing
+  `auth_required` field defaults to `true`; those HTTP and WebSocket endpoints
+  use `Authorization: Bearer <token>` and keep the three roles below.
 - Roles are ordered `observer < operator < admin`; a stronger credential may
   use every weaker-role operation.
 - JSON enum names and tagged-union `type` values use `snake_case`.
@@ -99,11 +106,16 @@ Agent calls from interleaving physical bytes.
 
 ## HTTP `/api/v1`
 
-Every route requires a bearer token, including health and WebSocket upgrade.
+Every route enforces the minimum role below. In token-free loopback mode,
+requests omit Authorization and receive the effective admin role. In
+authenticated mode, every route—including health and WebSocket upgrade—needs
+a bearer token meeting that role. `GET /api/v1/health` reports
+`auth_required`; clients decode the field as `true` when an older daemon omits
+it.
 
 | Method and path | Minimum role | Request/query and result |
 |---|---|---|
-| `GET /api/v1/health` | observer | Process status, `server_id`, `daemon_epoch`, uptime, protocol version. |
+| `GET /api/v1/health` | observer | Process status, `server_id`, `daemon_epoch`, uptime, protocol version, and `auth_required`. |
 | `GET /api/v1/status` | observer | All authoritative `SlotSnapshot`s plus identities and `config_revision`. |
 | `GET /api/v1/ports` | admin | Enumerates serial ports on the daemon host. |
 | `PUT /api/v1/config/slots` | admin | Body `{slots, expected_revision?}`; full validated Slot replacement and resulting snapshots. |
@@ -291,8 +303,14 @@ Every variant is tagged by `type` and carries `request_id`.
 | `ping` | observer | No fields beyond `request_id`; returns daemon wall time. |
 
 `WritePacing` is `{chunk_size, chunk_delay_ms}`; zero delay selects the
-full-speed path. Ordinary writes resolve an explicit override before the
-Slot/Device Profile pacing. Empty writes are rejected. One physical write is
+full-speed/no-sleep path (the daemon still chunks driver calls). The delay unit
+is milliseconds and is inserted only after a complete planned chunk when more
+payload remains. Thus `chunk_size=1, chunk_delay_ms=1` applies N-1 requested
+gaps to N bytes; partial driver acceptance within one chunk adds no pacing gap,
+and there is never a delay after the final chunk. Driver latency and scheduler
+granularity are additional, so this is a minimum requested cadence rather than
+an exact per-character clock. Ordinary writes resolve an explicit override
+before the effective Slot/Device Profile pacing. Empty writes are rejected. One physical write is
 bounded to 4 KiB and a computed maximum 15-second physical-write deadline.
 
 `send_break.duration_ms` is in `[1,5000]`. BREAK is a UART line condition, not
@@ -458,8 +476,8 @@ A Trigger is one daemon-owned, bounded, device-agnostic reaction job:
 
 | Field | Meaning/default/bound |
 |---|---|
-| `initial_write` | Optional one-time base64 write after matchers are armed; max 4 KiB. |
-| `start_contains` | Optional base64 RX literal gating the first action. |
+| `initial_write` | Optional one-time base64 write after matchers are armed; max 4 KiB. Once confirmed, action is immediately eligible unless an explicit start gate exists. |
+| `start_contains` | Optional advanced base64 RX literal gating the first action; omission means no RX start gate. |
 | `action` | Required non-empty base64 bytes for each fire; max 256 bytes. |
 | `interval_ms` | Delay after one confirmed action before the next; default 20, range 5–1000. |
 | `stop_contains` | Up to eight non-empty base64 RX literals, each max 256 bytes. |
@@ -471,6 +489,14 @@ The total bounded Trigger write plan may not exceed 64 KiB. Start requires
 current Control, exact daemon epoch and generation, an online port, no active
 Trigger, and a valid optional expected Run. The daemon drains the ordered RX
 barrier, arms matchers, emits `trigger_started`, and returns immediately.
+
+The field shape is unchanged from protocol v2/v3. Its explicit omission rule
+is: without `start_contains`, arming immediately enables `action` when
+`initial_write` is absent, or a confirmed `initial_write` immediately enables
+`action` when present. With `start_contains`, the Trigger instead enters
+`waiting_for_start` after the kickoff and does not schedule its first action
+until that literal is observed in live RX. This gate is optional; clients
+should not synthesize one for routine kickoff-then-action jobs.
 
 Exhausting `max_fires` prevents every later action write. With no
 `stop_contains`, that immediately completes as `max_fires_reached`. With one

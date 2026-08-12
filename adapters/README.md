@@ -13,16 +13,19 @@ Windows host: serial card -> serial serve
 Linux VM: serial console + serial mcp -> OpenCode / Codex
 ```
 
-Run `serial setup --endpoint http://192.168.56.1:3210` once in the Agent
-environment. `serial-mcp` reads the same saved endpoint and operator-token file,
-so the MCP host configuration contains no bearer token. You may instead pass
+Run `serial setup` once in the Agent environment. A fresh daemon is token-free
+and loopback-only, so `serial-mcp` omits Authorization. A remote host-only
+endpoint such as `http://192.168.56.1:3210` requires authentication;
+`serial-mcp` reads the operator-token file saved by setup, so the MCP host
+configuration itself contains no bearer token. You may instead pass
 `--config`, `--endpoint`, and `--token-file`; the token value itself is never a
-command argument. For setup automation, use `--admin-token-file` and
-`--operator-token-file` as inputs and `--save-operator-token-file` as the
-destination. Setup rejects global `--token-file` and refuses input/output path
-aliases so it cannot overwrite a supplied credential.
+command argument. For authenticated setup automation, use
+`--admin-token-file` and `--operator-token-file` as inputs and
+`--save-operator-token-file` as the destination. Setup rejects global
+`--token-file` and refuses input/output path aliases so it cannot overwrite a
+supplied credential.
 
-Use every component from the same release. v0.6.0 retains WebSocket protocol v3
+Use every component from the same release. v0.6.1 retains WebSocket protocol v3
 from v0.4.0; the existing realtime surface is wire-compatible with v0.4, while
 the Monitor HTTP APIs and MCP tools require v0.5 components. Protocol-v2 builds
 from 0.3.x and protocol-v1 builds from 0.2.x are not compatible with v3.
@@ -258,8 +261,10 @@ tool call:
 ```
 
 The daemon arms live literal matchers before the optional one-time `kickoff`,
-then sends one `action` at a time. `start_contains` can gate the first action;
-any `stop_contains` literal, timeout, or fire limit ends scheduling. Pacing and
+then sends one `action` at a time. Normal calls omit `start_contains`, so a
+confirmed kickoff immediately enables the first action. Set `start_contains`
+only for the advanced case where a live RX literal must gate that action. Any
+`stop_contains` literal, timeout, or fire limit ends scheduling. Pacing and
 physical-write time are additional to `interval_ms`; missed ticks never create
 a catch-up burst.
 

@@ -22,7 +22,7 @@ use crate::tools::AgentTools;
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records a confirmed assignment through the operator-only binding API; it does not prove identity. Start a Run before writes and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records a confirmed assignment through the operator-only binding API; it does not prove identity. Start a Run before writes and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed.";
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -432,12 +432,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "trigger",
-            "Repeat bounded writes; max_fires limits sends, while configured stop matchers remain armed until match or timeout.",
+            "Optional kickoff, then bounded actions. Omit start_contains normally; set it only to gate the first action on live RX.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
                     "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
-                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES},
+                    "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES,"description":"Advanced RX gate; omit for normal kickoff-then-action."},
                     "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
                     "interval_ms":{"type":"integer","minimum":MIN_TRIGGER_INTERVAL_MS,"maximum":MAX_TRIGGER_INTERVAL_MS,"default":DEFAULT_TRIGGER_INTERVAL_MS},
                     "stop_contains":{"type":"array","maxItems":MAX_TRIGGER_PATTERNS,"description":"Observation continues after max_fires until match or timeout.","items":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES}},
@@ -619,6 +619,9 @@ mod tests {
             assert!(SERVER_INSTRUCTIONS.contains(evidence));
         }
         assert!(SERVER_INSTRUCTIONS.contains("max_fires limits sends"));
+        assert!(SERVER_INSTRUCTIONS.contains("normal kickoff plus repeated action"));
+        assert!(SERVER_INSTRUCTIONS.contains("omit start_contains"));
+        assert!(SERVER_INSTRUCTIONS.contains("explicitly gate the first action"));
         assert!(SERVER_INSTRUCTIONS.contains("remain armed until match or timeout"));
         assert!(SERVER_INSTRUCTIONS.contains("not target success or failure"));
         assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
@@ -935,6 +938,11 @@ mod tests {
         );
         assert!(schema["properties"].get("kickoff").is_some());
         assert!(schema["properties"].get("initial_write").is_none());
+        let start_description = schema["properties"]["start_contains"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(start_description.contains("Advanced RX gate"));
+        assert!(start_description.contains("omit for normal"));
         assert!(
             schema["properties"]["stop_contains"]
                 .get("default")

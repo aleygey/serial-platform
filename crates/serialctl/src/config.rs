@@ -21,7 +21,7 @@ pub struct ClientConfig {
     /// Seconds of human inactivity before held write control is released.
     /// Defaults to 60 when unset.
     pub human_idle_release_seconds: Option<u64>,
-    /// UI language override ("en" or "zh"). Defaults to English when unset.
+    /// UI language override ("en" or "zh"). Defaults to Chinese when unset.
     pub language: Option<crate::i18n::Lang>,
     /// Reconcile exact device echoes with confirmed TX bytes in the terminal
     /// projection. Defaults to true. Durable RX/TX audit events are never

@@ -1,7 +1,7 @@
 # serial-mcp tool reference
 
 This document describes the complete Agent-facing tool surface implemented by
-`serial-mcp` 0.6.0. The executable is the schema authority: run
+`serial-mcp` 0.6.1. The executable is the schema authority: run
 
 ```console
 serial mcp --dump-tools
@@ -68,6 +68,12 @@ and `search`) declare `openWorldHint=true`; catalog and daemon-local bookkeeping
 tools keep it false.
 
 ## Tool definitions
+
+Connection authentication is outside individual tool schemas. With the
+default loopback-only personal daemon, `serial-mcp` has no `token_file` and
+omits Authorization on its HTTP, control-WebSocket, and capture-WebSocket
+connections. Existing authenticated or remote installations continue to use
+the serialctl-compatible operator `token_file`.
 
 ### `devices`
 
@@ -264,18 +270,21 @@ execution.
 
 ### `trigger`
 
-Creates one bounded daemon-side Trigger tied to the current Run. It optionally
-writes a kickoff, waits for `start_contains`, and repeats `action` until the
-send budget is exhausted. A configured stop matcher keeps observing without
-additional writes until it matches or the original timeout expires.
+Creates one bounded daemon-side Trigger tied to the current Run. The normal
+form supplies `kickoff` and `action` but omits `start_contains`: once kickoff
+is confirmed, the first action is immediately eligible. Use `start_contains`
+only for the advanced case where a specific live RX literal must gate the
+first action. A configured stop matcher keeps observing without additional
+writes after the send budget is exhausted until it matches or the original
+timeout expires.
 
 Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
 | `slot_id` | Yes | string | Online Slot |
-| `kickoff` | No | `{text, eol?}`; each string max 4096 schema characters, combined max 4096 UTF-8 bytes | One write after matchers are armed; omitted by default |
-| `start_contains` | No | string, 1..256 schema characters and UTF-8 bytes | Gate the first action on live RX |
+| `kickoff` | No | `{text, eol?}`; each string max 4096 schema characters, combined max 4096 UTF-8 bytes | One write after matchers are armed; confirmation immediately enables action unless an explicit start gate is present |
+| `start_contains` | No | string, 1..256 schema characters and UTF-8 bytes | Advanced live-RX gate for the first action; omit for normal kickoff-then-action use |
 | `action` | Yes | `{text, eol?}`; each string max 256 schema characters, combined max 256 UTF-8 bytes | Repeated non-empty write |
 | `interval_ms` | No | integer 5..1000, default 20 | Action interval |
 | `stop_contains` | No | array, default empty, max 8 strings of 1..256 schema characters and UTF-8 bytes | Any literal stops successfully; observation continues after the send budget is exhausted |
@@ -287,6 +296,20 @@ two strings are concatenated exactly. Empty combined kickoff/action payloads
 are rejected. Planned `kickoff + action * max_fires` is additionally capped at
 65,536 bytes. Trigger writes always inherit Slot pacing; pacing overrides are
 not tool arguments. Only one active Trigger is allowed on the Slot.
+
+Typical call shape:
+
+```json
+{
+  "slot_id": "bench",
+  "kickoff": {"text": "reboot", "eol": "\r"},
+  "action": {"text": "slp"},
+  "stop_contains": ["prompt>"]
+}
+```
+
+This does not wait for a separate start literal. Add `start_contains` only
+when target output must explicitly authorize the first `action`.
 
 The result fields are `slot_id`, terminal `outcome`, `matched`, confirmed
 `fires`, configured `fire_budget`, boolean `send_budget_exhausted`,

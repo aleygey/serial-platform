@@ -251,6 +251,7 @@ fn pop_last_queued_line(queue: &mut VecDeque<PendingWrite>) -> Option<Vec<u8>> {
 enum PendingRequest {
     Acquire {
         slot_id: String,
+        mode: ControlMode,
     },
     Renew {
         slot_id: String,
@@ -271,7 +272,7 @@ enum PendingRequest {
 impl PendingRequest {
     fn slot_id(&self) -> &str {
         match self {
-            Self::Acquire { slot_id }
+            Self::Acquire { slot_id, .. }
             | Self::Renew { slot_id }
             | Self::Release { slot_id }
             | Self::CancelAcquire { slot_id }
@@ -453,10 +454,6 @@ struct SlotView {
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
-    /// The Agent activity hint is hidden after the operator focuses/types in
-    /// the input for this Run. A different Run UUID makes the hint visible
-    /// again without needing an explicit reset.
-    dismissed_agent_run: Option<Uuid>,
 }
 
 /// Ctrl-R incremental history search state (LINE mode).
@@ -501,7 +498,6 @@ impl SlotView {
             history_search: None,
             completion: None,
             last_manual_activity: None,
-            dismissed_agent_run: None,
         };
         view.sync_trigger_projection(false);
         view
@@ -772,17 +768,6 @@ impl SlotView {
         })
     }
 
-    fn visible_agent_run(&self) -> Option<&RunInfo> {
-        let run = self.active_agent_run()?;
-        (self.dismissed_agent_run != Some(run.id)).then_some(run)
-    }
-
-    fn dismiss_agent_run_hint(&mut self) {
-        if let Some(run_id) = self.active_agent_run().map(|run| run.id) {
-            self.dismissed_agent_run = Some(run_id);
-        }
-    }
-
     fn logical_line_count(&self) -> usize {
         self.lines.len()
             + usize::from(self.pending_line.is_some())
@@ -857,6 +842,7 @@ struct QueueSelection {
 
 #[derive(Clone)]
 struct MenuCatalog {
+    auth_required: bool,
     slots: Vec<SlotSnapshot>,
     transport_profiles: Vec<TransportProfile>,
     device_profiles: Vec<DeviceProfile>,
@@ -884,6 +870,7 @@ struct MenuState {
     catalog: Option<MenuCatalog>,
     expanded_models: HashSet<String>,
     prompt: Option<MenuPrompt>,
+    help_scroll: usize,
     busy: bool,
     message: String,
 }
@@ -897,6 +884,7 @@ impl MenuState {
             catalog: None,
             expanded_models: HashSet::new(),
             prompt: None,
+            help_scroll: 0,
             busy: false,
             message: tr("menu.loading").into(),
         }
@@ -906,6 +894,7 @@ impl MenuState {
         self.stack.push((self.page, self.selected));
         self.page = page;
         self.selected = 0;
+        self.help_scroll = 0;
     }
 
     fn back(&mut self) -> bool {
@@ -965,7 +954,7 @@ enum MenuAdminMutation {
 enum MenuIoCommand {
     Reload,
     Admin {
-        token: String,
+        token: Option<String>,
         mutation: MenuAdminMutation,
     },
     BindModel {
@@ -1310,6 +1299,10 @@ struct App {
     /// draft or reopen help.
     help_dismiss_prefix: bool,
     help: bool,
+    /// First visual row displayed by the grouped help popup. Help owns its
+    /// own scroll state so narrow terminals do not overload serial output
+    /// scrolling or close the popup when PageUp/PageDown is pressed.
+    help_scroll: usize,
     detailed_timeline: bool,
     transport_connected: bool,
     authenticated: bool,
@@ -1359,6 +1352,7 @@ impl App {
             prefix_pending: false,
             help_dismiss_prefix: false,
             help: false,
+            help_scroll: 0,
             detailed_timeline: false,
             transport_connected: false,
             authenticated: false,
@@ -1550,7 +1544,7 @@ impl App {
                 let mut cooperative_slot = None;
                 if let Some(request_id) = request_id {
                     match self.pending_requests.remove(&request_id) {
-                        Some(PendingRequest::Acquire { slot_id })
+                        Some(PendingRequest::Acquire { slot_id, .. })
                         | Some(PendingRequest::Write {
                             slot_id,
                             cooperative: false,
@@ -1666,15 +1660,18 @@ impl App {
         let pending = self.pending_requests.remove(&request_id);
         match result {
             CommandResult::ControlGranted { lease } => {
-                if let Some(PendingRequest::Acquire { slot_id }) = pending {
+                if let Some(PendingRequest::Acquire { slot_id, mode }) = pending {
                     self.queued_controls.remove(&slot_id);
                     self.install_lease(&slot_id, lease);
-                    self.status = trf("st.granted", &[&slot_id]);
+                    self.status = match mode {
+                        ControlMode::Queue => trf("st.granted", &[&slot_id]),
+                        ControlMode::Takeover => trf("st.takeover.granted", &[&slot_id]),
+                    };
                     self.flush_pending_writes(&slot_id, commands);
                 }
             }
             CommandResult::ControlQueued { position } => {
-                if let Some(PendingRequest::Acquire { slot_id }) = pending {
+                if let Some(PendingRequest::Acquire { slot_id, mode }) = pending {
                     self.queued_controls.insert(
                         slot_id.clone(),
                         QueuedControl {
@@ -1683,7 +1680,7 @@ impl App {
                         },
                     );
                     self.pending_requests
-                        .insert(request_id, PendingRequest::Acquire { slot_id });
+                        .insert(request_id, PendingRequest::Acquire { slot_id, mode });
                 }
                 self.status = trf("st.queued", &[&position.to_string()]);
             }
@@ -1703,7 +1700,8 @@ impl App {
             }
             CommandResult::AcquireCancelled { removed } => {
                 if let Some(
-                    PendingRequest::Acquire { slot_id } | PendingRequest::CancelAcquire { slot_id },
+                    PendingRequest::Acquire { slot_id, .. }
+                    | PendingRequest::CancelAcquire { slot_id },
                 ) = pending
                 {
                     self.queued_controls.remove(&slot_id);
@@ -1818,11 +1816,29 @@ impl App {
                 self.slots[index].clear_trigger_projection();
             }
             self.apply_event_projection(index, &event);
+            if event.kind == EventKind::RunAborted {
+                let label = event
+                    .metadata
+                    .get("run")
+                    .and_then(|value| value.get("label"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(safe_inline)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| tr("menu.value.unbound").into());
+                let reason = event
+                    .metadata
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(safe_inline)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| tr("menu.value.unbound").into());
+                self.status = trf("st.run.aborted", &[&label, &reason]);
+            }
             self.slots[index].push_event(event, selected);
             if self.slots[index].subscription.is_ready() && self.owns_control(index) {
                 self.queued_controls.remove(&slot_id);
                 self.pending_requests.retain(|_, request| {
-                    !matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == &slot_id)
+                    !matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == &slot_id)
                 });
                 self.flush_pending_writes(&slot_id, commands);
             }
@@ -2236,7 +2252,7 @@ impl App {
         }
 
         let acquire_already_pending = self.pending_requests.values().any(|request| {
-            matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == &slot_id)
+            matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == &slot_id)
         });
         if !acquire_already_pending && !self.acquire_control(commands, ControlMode::Queue) {
             if previous_slot_writes.is_empty() {
@@ -2271,6 +2287,7 @@ impl App {
             message,
             Some(PendingRequest::Acquire {
                 slot_id: slot_id.clone(),
+                mode,
             }),
         ) {
             if mode == ControlMode::Takeover {
@@ -2394,7 +2411,6 @@ impl App {
             view.history_cursor = None;
             view.history_search = None;
             view.completion = None;
-            view.dismiss_agent_run_hint();
             self.queue_selection = None;
             self.focus = PaneFocus::Input;
             self.status = tr("st.queue.restored").into();
@@ -2406,7 +2422,7 @@ impl App {
             && !self.owns_control(self.selected)
             && (self.queued_controls.contains_key(&slot_id)
                 || self.pending_requests.values().any(
-                    |request| matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == &slot_id),
+                    |request| matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == &slot_id),
                 ))
         {
             self.cancel_queued_control(commands, &slot_id, tr("st.cancel.reason"));
@@ -2514,7 +2530,7 @@ impl App {
         self.queued_controls.contains_key(slot_id)
             || self.pending_writes.contains_key(slot_id)
             || self.pending_requests.values().any(
-                |request| matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == slot_id),
+                |request| matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == slot_id),
             )
     }
 
@@ -2543,7 +2559,7 @@ impl App {
             self.inflight_writes.remove(slot_id);
             self.queued_controls.remove(slot_id);
             self.pending_requests.retain(|_, request| {
-                !matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == slot_id)
+                !matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == slot_id)
             });
             if self
                 .pending_paste
@@ -2826,7 +2842,35 @@ impl App {
         }
         self.focus = PaneFocus::Input;
         if self.help {
+            let page = self.layout.map_or(10, |layout| {
+                usize::from(layout.output_area.height.max(3)).saturating_sub(2)
+            });
+            let max = help_lines(self).len().saturating_sub(page);
+            match key.code {
+                KeyCode::PageUp | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(page.max(1));
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageDown | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(page.max(1)).min(max);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::Home => {
+                    self.help_scroll = 0;
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::End => {
+                    self.help_scroll = max;
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
+            }
             self.help = false;
+            self.help_scroll = 0;
             if is_prefix(key) {
                 self.prefix_pending = true;
                 self.help_dismiss_prefix = true;
@@ -2901,7 +2945,6 @@ impl App {
         if rect_contains(layout.input_area, position) {
             self.queue_selection = None;
             self.focus = PaneFocus::Input;
-            self.current_mut().dismiss_agent_run_hint();
             self.clear_text_selection();
             return;
         }
@@ -3005,7 +3048,6 @@ impl App {
         }
         self.focus = PaneFocus::Input;
         self.queue_selection = None;
-        self.current_mut().dismiss_agent_run_hint();
         self.clear_text_selection();
         match crate::clipboard::read_text() {
             Ok(Some(text)) => self.handle_paste(text, commands),
@@ -3060,7 +3102,10 @@ impl App {
             KeyCode::Char('/') => {
                 self.status = tr("st.logs.hint").into();
             }
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('q' | 'Q') => self.should_quit = true,
             KeyCode::Char(']') => {
                 self.request_raw_write(commands, vec![0x1d]);
@@ -3123,7 +3168,6 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 let view = self.current_mut();
-                view.dismiss_agent_run_hint();
                 view.draft.insert(view.draft_cursor, character);
                 view.draft_cursor += 1;
             }
@@ -3177,13 +3221,11 @@ impl App {
 
     fn handle_raw_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         if let Some(bytes) = raw_key_bytes(key) {
-            self.current_mut().dismiss_agent_run_hint();
             self.request_raw_write(commands, bytes);
         }
     }
 
     fn handle_paste(&mut self, value: String, commands: &mpsc::Sender<NetworkCommand>) {
-        self.current_mut().dismiss_agent_run_hint();
         if value.len() > MAX_PASTE_BYTES {
             self.status = trf(
                 "st.paste.rejected",
@@ -3420,6 +3462,14 @@ impl App {
             KeyCode::Down if count > 0 => {
                 menu.selected = (menu.selected + 1).min(count - 1);
             }
+            KeyCode::PageUp if menu.page == MenuPage::Help => {
+                menu.help_scroll = menu.help_scroll.saturating_sub(8);
+            }
+            KeyCode::PageDown if menu.page == MenuPage::Help => {
+                menu.help_scroll = menu.help_scroll.saturating_add(8);
+            }
+            KeyCode::Home if menu.page == MenuPage::Help => menu.help_scroll = 0,
+            KeyCode::End if menu.page == MenuPage::Help => menu.help_scroll = usize::MAX,
             KeyCode::Home if count > 0 => menu.selected = 0,
             KeyCode::End if count > 0 => menu.selected = count - 1,
             KeyCode::Char('r' | 'R') => {
@@ -3499,7 +3549,7 @@ impl App {
                         self.submit_menu_command(
                             menu,
                             MenuIoCommand::Admin {
-                                token: value.trim().to_owned(),
+                                token: Some(value.trim().to_owned()),
                                 mutation,
                             },
                         );
@@ -3576,7 +3626,24 @@ impl App {
         self.dirty = true;
     }
 
-    fn begin_admin_prompt(&self, menu: &mut MenuState, mutation: MenuAdminMutation) {
+    fn begin_admin_prompt(&mut self, menu: &mut MenuState, mutation: MenuAdminMutation) {
+        if menu
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.auth_required)
+        {
+            self.submit_menu_command(
+                menu,
+                MenuIoCommand::Admin {
+                    token: None,
+                    mutation,
+                },
+            );
+            if menu.busy {
+                menu.message = tr("menu.admin.not.required").into();
+            }
+            return;
+        }
         menu.prompt = Some(MenuPrompt {
             title: tr("menu.prompt.admin").into(),
             value: Vec::new(),
@@ -4041,14 +4108,13 @@ async fn execute_menu_io(
     let success = match command {
         MenuIoCommand::Reload => MenuSuccess::Loaded,
         MenuIoCommand::Admin { token, mutation } => {
-            // The prompt already trims this value before constructing the
-            // command. Move that single allocation into the short-lived API
-            // client instead of retaining a second plaintext copy. Rust's
-            // ordinary String drop is not a guaranteed memory zeroization.
-            if token.is_empty() {
+            // `None` is the explicit trusted-loopback path advertised by
+            // health.auth_required=false. A legacy/authenticated daemon still
+            // reaches this branch with the one-time masked credential.
+            if token.as_deref().is_some_and(str::is_empty) {
                 bail!(tr("menu.admin.required"));
             }
-            let admin = ApiClient::new(api.endpoint().to_owned(), Some(token))?;
+            let admin = ApiClient::new(api.endpoint().to_owned(), token)?;
             execute_admin_menu_mutation(&admin, mutation).await?
         }
         MenuIoCommand::BindModel {
@@ -4221,13 +4287,15 @@ async fn bind_device_profile(
 }
 
 async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
-    let (status, transport, device, models): (_, _, _, DeviceModelListResponse) = tokio::try_join!(
+    let (health, status, transport, device, models): (_, _, _, _, DeviceModelListResponse) = tokio::try_join!(
+        api.health(),
         api.configuration_status(),
         api.transport_profiles(),
         api.device_profiles(),
         api.device_models(),
     )?;
     Ok(MenuCatalog {
+        auth_required: health.auth_required,
         slots: status.slots,
         transport_profiles: transport.profiles,
         device_profiles: device.profiles,
@@ -4670,10 +4738,10 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .map(|transport| transport.baud_rate)
         .unwrap_or(view.snapshot.config.settings.baud_rate);
     let title = format!(
-        " {} · {} · {} baud{}{} ",
+        " {} · {} · {}{}{} ",
         safe_inline(&view.snapshot.config.display_name),
         safe_inline(&view.snapshot.config.port),
-        baud_rate,
+        trf("ui.output.baud", &[&baud_rate.to_string()]),
         if view.is_paused() {
             tr("ui.paused")
         } else {
@@ -5095,7 +5163,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ],
         )
     } else if app.pending_requests.values().any(
-        |request| matches!(request, PendingRequest::Acquire { slot_id: pending } if pending == slot_id),
+        |request| matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == slot_id),
     ) {
         tr("ui.control.pending").into()
     } else {
@@ -5282,7 +5350,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .match_index
             .map(|index| safe_inline(&app.current().history[index]))
             .unwrap_or_default();
-        let text = format!("(reverse-i-search)`{}': {matched}", search.query);
+        let text = trf("ui.search.query", &[&search.query, &matched]);
         frame.render_widget(
             Paragraph::new(text).block(
                 Block::default()
@@ -5304,7 +5372,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(area);
     let agent_hint = app
         .current()
-        .visible_agent_run()
+        .active_agent_run()
         .map(|run| trf("ui.input.agent", &[&safe_inline(&run.label)]));
     let (text, cursor_column, title) = match app.current_mode() {
         InputMode::Line => {
@@ -5472,63 +5540,108 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let width = area.width.min(76);
-    let height = area.height.min(38);
+    let width = area.width.saturating_sub(2).clamp(1, 92);
+    let height = area.height.saturating_sub(2).clamp(1, 38);
     let popup = centered_rect(width, height, area);
-    let idle_seconds = app.human_idle_release.as_secs().to_string();
-    let mouse_help = if app.mouse_capture {
-        tr("help.wheel")
-    } else {
-        tr("help.selection")
-    };
-    let help = [
-        tr("help.all.modes").to_string(),
-        tr("help.switch").to_string(),
-        tr("help.next").to_string(),
-        tr("help.mode").to_string(),
-        tr("help.view").to_string(),
-        tr("help.lang").to_string(),
-        tr("help.scroll").to_string(),
-        mouse_help.to_string(),
-        tr("help.mouse.paste").to_string(),
-        tr("help.menu").to_string(),
-        tr("help.takeover").to_string(),
-        tr("help.cooperative").to_string(),
-        tr("help.release").to_string(),
-        tr("help.queue.delete").to_string(),
-        tr("help.queue.edit").to_string(),
-        tr("help.queue.select").to_string(),
-        tr("help.queue.behavior").to_string(),
-        tr("help.follow").to_string(),
-        tr("help.echo").to_string(),
-        tr("help.paste").to_string(),
-        tr("help.byte").to_string(),
-        tr("help.interrupt").to_string(),
-        tr("help.quit").to_string(),
-        String::new(),
-        tr("help.line1").to_string(),
-        tr("help.line2").to_string(),
-        tr("help.line3").to_string(),
-        tr("help.raw1").to_string(),
-        tr("help.raw2").to_string(),
-        tr("help.paste.note").to_string(),
-        trf("help.expire", &[&idle_seconds]),
-        tr("help.replay").to_string(),
-        tr("help.uncertain").to_string(),
-        String::new(),
-        tr("help.close").to_string(),
-    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tr("help.title"));
+    let inner = block.inner(popup);
+    let lines = help_lines(app);
+    let visible_height = usize::from(inner.height).max(1);
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = app.help_scroll.min(max_scroll);
+    let footer = trf(
+        "help.position",
+        &[
+            &(scroll.saturating_add(1)).min(lines.len()).to_string(),
+            &(scroll.saturating_add(visible_height))
+                .min(lines.len())
+                .to_string(),
+            &lines.len().to_string(),
+        ],
+    );
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(help.join("\n"))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(tr("help.title")),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block.title_bottom(Line::from(footer).alignment(Alignment::Center)))
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         popup,
     );
+}
+
+fn help_heading(key: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        tr(key),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn help_item(key: &'static str) -> Line<'static> {
+    Line::from(Span::styled(tr(key), Style::default().fg(Color::White)))
+}
+
+/// Builds explicit visual rows instead of joining one large string and
+/// relying on Paragraph wrapping. Every shortcut remains a distinct row;
+/// section gaps are preserved and the popup can scroll on narrow terminals.
+fn help_lines(app: &App) -> Vec<Line<'static>> {
+    let mouse_key = if app.mouse_capture {
+        "help.wheel"
+    } else {
+        "help.selection"
+    };
+    let idle_seconds = app.human_idle_release.as_secs().to_string();
+    vec![
+        help_heading("help.group.navigation"),
+        help_item("help.switch"),
+        help_item("help.next"),
+        help_item("help.mode"),
+        help_item("help.view"),
+        help_item("help.lang"),
+        help_item("help.scroll"),
+        help_item(mouse_key),
+        help_item("help.mouse.paste"),
+        help_item("help.menu"),
+        Line::default(),
+        help_heading("help.group.control"),
+        help_item("help.takeover"),
+        help_item("help.cooperative"),
+        help_item("help.release"),
+        Line::default(),
+        help_heading("help.group.queue"),
+        help_item("help.queue.behavior"),
+        help_item("help.queue.select"),
+        help_item("help.queue.delete"),
+        help_item("help.queue.edit"),
+        help_item("help.paste"),
+        Line::default(),
+        help_heading("help.group.line"),
+        help_item("help.line1"),
+        help_item("help.line2"),
+        help_item("help.line3"),
+        help_item("help.follow"),
+        help_item("help.echo"),
+        Line::default(),
+        help_heading("help.group.raw"),
+        help_item("help.raw1"),
+        help_item("help.raw2"),
+        help_item("help.byte"),
+        help_item("help.interrupt"),
+        Line::default(),
+        help_heading("help.group.safety"),
+        Line::from(tr("help.paste.note")),
+        Line::from(trf("help.expire", &[&idle_seconds])),
+        Line::from(tr("help.replay")),
+        Line::from(tr("help.uncertain")),
+        help_item("help.quit"),
+        Line::default(),
+        Line::from(Span::styled(
+            tr("help.close"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
 }
 
 fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
@@ -5556,18 +5669,19 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
         .as_ref()
         .and_then(|catalog| slot_model_binding(catalog, &app.selected_slot_id()))
         .map(|binding| binding.model_id.as_str())
-        .unwrap_or("-");
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("menu.value.unbound").into());
     let slot_id = safe_inline(&app.selected_slot_id());
     let transport = safe_inline(&app.current().snapshot.config.profile);
-    let device = safe_inline(
-        app.current()
-            .snapshot
-            .config
-            .device_profile
-            .as_deref()
-            .unwrap_or("Generic"),
-    );
-    let model = safe_inline(current_model);
+    let device = app
+        .current()
+        .snapshot
+        .config
+        .device_profile
+        .as_deref()
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("menu.value.generic").into());
+    let model = current_model;
     let header = trf("menu.current", &[&slot_id, &transport, &device, &model]);
     frame.render_widget(
         Paragraph::new(header).style(Style::default().fg(Color::LightCyan)),
@@ -5577,10 +5691,15 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
     let rows = menu_rows(app, menu);
     let viewport = chunks[1].height as usize;
     let selected_row = menu_selected_visual_row(menu);
-    let start = selected_row
-        .map(|selected| selected.saturating_add(1).saturating_sub(viewport))
-        .unwrap_or(0)
-        .min(rows.len().saturating_sub(viewport));
+    let max_start = rows.len().saturating_sub(viewport);
+    let start = if menu.page == MenuPage::Help {
+        menu.help_scroll.min(max_start)
+    } else {
+        selected_row
+            .map(|selected| selected.saturating_add(1).saturating_sub(viewport))
+            .unwrap_or(0)
+            .min(max_start)
+    };
     frame.render_widget(
         Paragraph::new(
             rows.into_iter()
@@ -5820,7 +5939,18 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
             .collect(),
         MenuPage::Help => menu_help_lines()
             .into_iter()
-            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White))))
+            .map(|line| match line {
+                Some((text, true)) => Line::from(Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Some((text, false)) => {
+                    Line::from(Span::styled(text, Style::default().fg(Color::White)))
+                }
+                None => Line::default(),
+            })
             .collect(),
     }
 }
@@ -5871,48 +6001,114 @@ fn menu_detail(app: &App, menu: &MenuState) -> String {
 }
 
 fn transport_profile_detail(profile: &TransportProfile) -> String {
-    format!(
-        "{} baud · {:?} {:?} {:?} · {:?} · DTR={} RTS={} auto={}",
-        profile.baud_rate,
-        profile.data_bits,
-        profile.parity,
-        profile.stop_bits,
-        profile.flow_control,
-        profile.dtr,
-        profile.rts,
-        profile.auto_open,
+    let data_bits = match profile.data_bits {
+        DataBits::Five => "5",
+        DataBits::Six => "6",
+        DataBits::Seven => "7",
+        DataBits::Eight => "8",
+    };
+    let stop_bits = match profile.stop_bits {
+        StopBits::One => "1",
+        StopBits::Two => "2",
+    };
+    let parity = match profile.parity {
+        Parity::None => tr("menu.detail.parity.none"),
+        Parity::Odd => tr("menu.detail.parity.odd"),
+        Parity::Even => tr("menu.detail.parity.even"),
+    };
+    let flow = match profile.flow_control {
+        FlowControl::None => tr("menu.detail.flow.none"),
+        FlowControl::Software => tr("menu.detail.flow.software"),
+        FlowControl::Hardware => tr("menu.detail.flow.hardware"),
+    };
+    let baud = trf("menu.detail.baud", &[&profile.baud_rate.to_string()]);
+    let data_bits = trf("menu.detail.data_bits", &[data_bits]);
+    let stop_bits = trf("menu.detail.stop_bits", &[stop_bits]);
+    trf(
+        "menu.detail.transport",
+        &[
+            &baud,
+            &data_bits,
+            parity,
+            &stop_bits,
+            flow,
+            if profile.dtr {
+                tr("menu.value.on")
+            } else {
+                tr("menu.value.off")
+            },
+            if profile.rts {
+                tr("menu.value.on")
+            } else {
+                tr("menu.value.off")
+            },
+            if profile.auto_open {
+                tr("menu.value.enabled")
+            } else {
+                tr("menu.value.disabled")
+            },
+        ],
     )
 }
 
 fn device_profile_detail(profile: &DeviceProfile) -> String {
-    format!(
-        "shell={} · uboot={} · eol={} · echo={:?} · pacing={:?}/{:?}ms",
-        safe_inline(profile.shell_prompt.as_deref().unwrap_or("-")),
-        safe_inline(profile.uboot_prompt.as_deref().unwrap_or("-")),
-        match profile.write_eol.as_deref() {
-            Some("\r") => "CR",
-            Some("\n") => "LF",
-            Some("\r\n") => "CRLF",
-            Some("") => "none",
-            Some(_) => "custom",
-            None => "inherit",
-        },
-        profile.echo,
-        profile.write_chunk_size,
-        profile.write_chunk_delay_ms,
-    )
+    let unset = tr("menu.value.unbound");
+    let shell = trf(
+        "menu.detail.prompt.shell",
+        &[&safe_inline(
+            profile.shell_prompt.as_deref().unwrap_or(unset),
+        )],
+    );
+    let uboot = trf(
+        "menu.detail.prompt.uboot",
+        &[&safe_inline(
+            profile.uboot_prompt.as_deref().unwrap_or(unset),
+        )],
+    );
+    let eol_value = match profile.write_eol.as_deref() {
+        Some("\r") => "CR",
+        Some("\n") => "LF",
+        Some("\r\n") => "CRLF",
+        Some("") => tr("menu.detail.eol.none"),
+        Some(_) => tr("menu.detail.eol.custom"),
+        None => tr("menu.detail.eol.inherit"),
+    };
+    let eol = trf("menu.detail.eol", &[eol_value]);
+    let echo = match profile.echo {
+        Some(EchoMode::On) => tr("menu.detail.echo.on"),
+        Some(EchoMode::Off) => tr("menu.detail.echo.off"),
+        Some(EchoMode::Auto) => tr("menu.detail.echo.auto"),
+        None => tr("menu.detail.eol.inherit"),
+    };
+    let chunk_size = profile.write_chunk_size.map_or_else(
+        || tr("menu.detail.eol.inherit").into(),
+        |value| value.to_string(),
+    );
+    let delay = profile.write_chunk_delay_ms.map_or_else(
+        || tr("menu.detail.eol.inherit").into(),
+        |value| value.to_string(),
+    );
+    let pacing = trf("menu.detail.pacing", &[&chunk_size, &delay]);
+    trf("menu.detail.device", &[&shell, &uboot, &eol, echo, &pacing])
 }
 
-fn menu_help_lines() -> Vec<&'static str> {
+fn menu_help_lines() -> Vec<Option<(&'static str, bool)>> {
     vec![
-        tr("menu.help.menu"),
-        tr("menu.help.queue"),
-        tr("menu.help.enter"),
-        tr("menu.help.cooperative"),
-        tr("menu.help.takeover"),
-        tr("menu.help.echo"),
-        tr("menu.help.model"),
-        tr("menu.help.token"),
+        Some((tr("help.group.navigation"), true)),
+        Some((tr("menu.help.menu"), false)),
+        None,
+        Some((tr("help.group.control"), true)),
+        Some((tr("menu.help.enter"), false)),
+        Some((tr("menu.help.cooperative"), false)),
+        Some((tr("menu.help.takeover"), false)),
+        None,
+        Some((tr("help.group.queue"), true)),
+        Some((tr("menu.help.queue"), false)),
+        None,
+        Some((tr("help.group.safety"), true)),
+        Some((tr("menu.help.echo"), false)),
+        Some((tr("menu.help.model"), false)),
+        Some((tr("menu.help.token"), false)),
     ]
 }
 
@@ -6137,6 +6333,7 @@ mod tests {
             Uuid::new_v4(),
             PendingRequest::Acquire {
                 slot_id: slot_id.clone(),
+                mode: ControlMode::Queue,
             },
         );
         let (commands, _) = mpsc::channel(4);
@@ -6827,7 +7024,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(remaining, vec![b"first\r".to_vec(), b"third\r".to_vec()]);
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Acquire { slot_id } if slot_id == "slot-1")
+            |request| matches!(request, PendingRequest::Acquire { slot_id, .. } if slot_id == "slot-1")
         ));
     }
 
@@ -7089,6 +7286,7 @@ mod tests {
             Uuid::new_v4(),
             PendingRequest::Acquire {
                 slot_id: slot_id.clone(),
+                mode: ControlMode::Queue,
             },
         );
         let mut other = snapshot();
@@ -7117,6 +7315,7 @@ mod tests {
             Uuid::new_v4(),
             PendingRequest::Acquire {
                 slot_id: "slot-2".into(),
+                mode: ControlMode::Queue,
             },
         );
         let (commands, mut received) = mpsc::channel(4);
@@ -7136,7 +7335,7 @@ mod tests {
         assert!(!app.queued_controls.contains_key("slot-1"));
         assert!(app.queued_controls.contains_key("slot-2"));
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Acquire { slot_id } if slot_id == "slot-2")
+            |request| matches!(request, PendingRequest::Acquire { slot_id, .. } if slot_id == "slot-2")
         ));
     }
 
@@ -7662,6 +7861,165 @@ mod tests {
     }
 
     #[test]
+    fn grouped_help_uses_distinct_rows_and_scrolls_without_closing() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::Zh);
+        let mut app = App::new(vec![snapshot()], None);
+        let lines = help_lines(&app);
+        let plain = lines.iter().map(line_plain_text).collect::<Vec<_>>();
+        let navigation = plain
+            .iter()
+            .position(|line| line == "导航与显示")
+            .expect("navigation heading");
+        let control = plain
+            .iter()
+            .position(|line| line == "控制权与 Agent 协作")
+            .expect("control heading");
+        assert!(control > navigation + 1);
+        assert!(plain[navigation + 1].contains("Alt-1..9"));
+        assert!(plain[navigation..control].iter().any(String::is_empty));
+        assert!(plain.iter().any(|line| line.contains("强制人工接管")));
+
+        app.help = true;
+        app.layout = Some(ConsoleLayout {
+            output_area: Rect::new(0, 0, 60, 8),
+            output_inner: Rect::new(1, 1, 58, 6),
+            input_area: Rect::new(0, 9, 60, 3),
+        });
+        let (commands, _) = mpsc::channel(1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &commands,
+        );
+        assert!(app.help);
+        assert!(app.help_scroll > 0);
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &commands);
+        assert!(app.help);
+        assert_eq!(app.help_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commands);
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn explicit_takeover_is_tracked_separately_from_an_ordinary_queue_acquire() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::Zh);
+        let mut app = ready_app_with_foreign_control();
+        app.slots[0].snapshot.active_run = Some(agent_run("升级固件"));
+        let (commands, mut received) = mpsc::channel(2);
+
+        assert!(app.acquire_control(&commands, ControlMode::Takeover));
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("takeover command")
+        else {
+            panic!("expected outbound takeover request")
+        };
+        let ClientMessage::AcquireControl {
+            request_id, mode, ..
+        } = message
+        else {
+            panic!("expected acquire-control message")
+        };
+        assert_eq!(mode, ControlMode::Takeover);
+        assert!(matches!(
+            app.pending_requests.get(&request_id),
+            Some(PendingRequest::Acquire {
+                mode: ControlMode::Takeover,
+                ..
+            })
+        ));
+        assert!(app.status.contains("活动 Agent Run 将被中止"));
+
+        let lease = ControlLease {
+            id: Uuid::new_v4(),
+            owner: app.actor.clone().expect("human actor"),
+            epoch: app.slots[0].snapshot.daemon_epoch,
+            generation: app.slots[0].snapshot.generation,
+            fence: 2,
+            issued_wall_time_ns: 2,
+            expires_wall_time_ns: i64::MAX,
+        };
+        app.handle_result(
+            request_id,
+            CommandResult::ControlGranted { lease },
+            &commands,
+        );
+        assert!(app.status.contains("此前 Agent Run 已被中止"));
+    }
+
+    #[test]
+    fn run_aborted_event_surfaces_the_human_takeover_reason() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::Zh);
+        let mut app = ready_app_with_foreign_control();
+        let run = agent_run("检查启动日志");
+        app.slots[0].snapshot.active_run = Some(run.clone());
+        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let (commands, _) = mpsc::channel(2);
+        let mut aborted = event(EventKind::RunAborted, Direction::None, 2, &[]);
+        aborted.daemon_epoch = daemon_epoch;
+        aborted
+            .metadata
+            .insert("run".into(), serde_json::to_value(&run).unwrap());
+        aborted.metadata.insert(
+            "reason".into(),
+            serde_json::json!("human takeover requested from terminal"),
+        );
+
+        app.push_event(aborted, false, &commands);
+
+        assert!(app.slots[0].snapshot.active_run.is_none());
+        assert!(app.status.contains("Agent Run 已中止"));
+        assert!(app.status.contains("检查启动日志"));
+        assert!(app.status.contains("human takeover"));
+    }
+
+    #[test]
+    fn chinese_profile_details_are_readable_without_debug_enum_names() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::Zh);
+        let transport = TransportProfile {
+            name: "hardware-test".into(),
+            baud_rate: 230_400,
+            data_bits: DataBits::Seven,
+            parity: Parity::Even,
+            stop_bits: StopBits::Two,
+            flow_control: FlowControl::Hardware,
+            dtr: true,
+            rts: false,
+            auto_open: true,
+        };
+        let transport_text = transport_profile_detail(&transport);
+        assert!(transport_text.contains("波特率 230400"));
+        assert!(transport_text.contains("7 数据位"));
+        assert!(transport_text.contains("偶校验"));
+        assert!(transport_text.contains("2 停止位"));
+        assert!(transport_text.contains("硬件流控"));
+        assert!(transport_text.contains("DTR 开启"));
+        assert!(transport_text.contains("RTS 关闭"));
+        assert!(transport_text.contains("自动打开 启用"));
+        assert!(!transport_text.contains("Even"));
+        assert!(!transport_text.contains("Hardware"));
+        assert!(!transport_text.contains("true"));
+
+        let device = DeviceProfile {
+            name: "interaction-test".into(),
+            shell_prompt: Some("dut# ".into()),
+            uboot_prompt: Some("dut=> ".into()),
+            write_eol: Some("\r\n".into()),
+            echo: Some(EchoMode::Auto),
+            write_chunk_size: Some(8),
+            write_chunk_delay_ms: Some(10),
+        };
+        let device_text = device_profile_detail(&device);
+        assert!(device_text.contains("Shell 提示符 dut#"));
+        assert!(device_text.contains("U-Boot 提示符 dut=>"));
+        assert!(device_text.contains("换行 CRLF"));
+        assert!(device_text.contains("回显自动"));
+        assert!(device_text.contains("写入节奏 8 字节 / 10 毫秒"));
+        assert!(!device_text.contains("Auto"));
+    }
+
+    #[test]
     fn scrolled_viewport_stays_anchored_when_new_lines_arrive() {
         let mut view = SlotView::new(snapshot());
         for seq in 0..20 {
@@ -8159,6 +8517,7 @@ mod tests {
             acquire_request,
             PendingRequest::Acquire {
                 slot_id: "slot-1".into(),
+                mode: ControlMode::Queue,
             },
         );
         app.queued_controls.insert(
@@ -8206,14 +8565,14 @@ mod tests {
         assert_eq!(queue[0].operation_id, Some(queued_operation));
         assert!(matches!(
             app.pending_requests.get(&acquire_request),
-            Some(PendingRequest::Acquire { slot_id }) if slot_id == "slot-1"
+            Some(PendingRequest::Acquire { slot_id, .. }) if slot_id == "slot-1"
         ));
         assert_eq!(app.queued_controls["slot-1"].position, 2);
         assert!(!app.pending_requests.contains_key(&request_id));
     }
 
     #[test]
-    fn agent_run_hint_is_dimmed_dismissible_and_returns_for_the_next_run() {
+    fn agent_run_hint_tracks_empty_draft_and_active_run_without_sticky_dismissal() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
         app.slots[0].snapshot.active_run = Some(agent_run("FIRST_AGENT_TASK"));
@@ -8233,6 +8592,7 @@ mod tests {
         let layout = app.layout.expect("layout");
         let (commands, _) = mpsc::channel(1);
 
+        // Focusing an empty editor must not permanently dismiss the hint.
         app.handle_terminal_event(
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -8244,7 +8604,24 @@ mod tests {
         );
         terminal
             .draw(|frame| draw(frame, &mut app))
-            .expect("render dismissed Agent hint");
+            .expect("render focused empty Agent hint");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("FIRST_AGENT_TASK"));
+
+        // Draft content alone hides the placeholder.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &commands,
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render non-empty draft");
         let rendered = terminal
             .backend()
             .buffer()
@@ -8253,11 +8630,16 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("FIRST_AGENT_TASK"));
+        assert!(rendered.contains("> x"));
 
-        app.slots[0].snapshot.active_run = Some(agent_run("SECOND_AGENT_TASK"));
+        // Deleting the draft back to empty restores the same Run immediately.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &commands,
+        );
         terminal
             .draw(|frame| draw(frame, &mut app))
-            .expect("render next Agent hint");
+            .expect("render restored Agent hint");
         let rendered = terminal
             .backend()
             .buffer()
@@ -8265,7 +8647,22 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("SECOND_AGENT_TASK"));
+        assert!(app.current().draft.is_empty());
+        assert!(rendered.contains("FIRST_AGENT_TASK"));
+
+        // Once the Run is no longer active there is no placeholder to show.
+        app.slots[0].snapshot.active_run = None;
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render after Agent Run ended");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("FIRST_AGENT_TASK"));
     }
 
     #[test]
@@ -8351,6 +8748,67 @@ mod tests {
             .collect::<String>();
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("••••"));
+    }
+
+    #[test]
+    fn trusted_local_catalog_skips_the_administrator_prompt() {
+        let mut app = App::new(vec![snapshot()], None);
+        let (menu_commands, mut menu_received) = mpsc::channel(1);
+        app.menu_commands = Some(menu_commands);
+        let mut menu = MenuState::new();
+        menu.catalog = Some(MenuCatalog {
+            auth_required: false,
+            slots: vec![snapshot()],
+            transport_profiles: Vec::new(),
+            device_profiles: Vec::new(),
+            models: Vec::new(),
+            model_bindings: Vec::new(),
+            model_revision: 0,
+        });
+
+        app.begin_admin_prompt(
+            &mut menu,
+            MenuAdminMutation::BindDevice {
+                slot_id: "slot-1".into(),
+                profile_name: None,
+            },
+        );
+
+        assert!(menu.prompt.is_none());
+        assert!(menu.busy);
+        assert!(matches!(
+            menu_received.try_recv(),
+            Ok(MenuIoCommand::Admin {
+                token: None,
+                mutation: MenuAdminMutation::BindDevice { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn authenticated_catalog_still_requests_a_masked_one_time_token() {
+        let mut app = App::new(vec![snapshot()], None);
+        let mut menu = MenuState::new();
+        menu.catalog = Some(MenuCatalog {
+            auth_required: true,
+            slots: vec![snapshot()],
+            transport_profiles: Vec::new(),
+            device_profiles: Vec::new(),
+            models: Vec::new(),
+            model_bindings: Vec::new(),
+            model_revision: 0,
+        });
+
+        app.begin_admin_prompt(
+            &mut menu,
+            MenuAdminMutation::BindDevice {
+                slot_id: "slot-1".into(),
+                profile_name: None,
+            },
+        );
+
+        assert!(menu.prompt.as_ref().is_some_and(|prompt| prompt.secret));
+        assert!(!menu.busy);
     }
 
     #[test]

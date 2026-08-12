@@ -508,10 +508,16 @@ impl AppState {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
         let config = self.inner.config.read().await;
-        let principal = config
-            .auth
-            .authenticate_authorization(authorization)
-            .map_err(ApiError::Auth)?;
+        let principal = if config.auth_required {
+            config
+                .auth
+                .as_ref()
+                .ok_or(ApiError::Auth(AuthError::MissingAuthorization))?
+                .authenticate_authorization(authorization)
+                .map_err(ApiError::Auth)?
+        } else {
+            Principal::trusted_local_admin()
+        };
         principal.require_role(required).map_err(ApiError::Auth)?;
         Ok(principal)
     }
@@ -606,6 +612,7 @@ async fn health(
             .as_millis()
             .min(u64::MAX as u128) as u64,
         protocol_version: PROTOCOL_VERSION,
+        auth_required: config.auth_required,
     }))
 }
 
@@ -2735,12 +2742,6 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
         let loaded = store.load_or_create().unwrap();
-        let admin_token = loaded
-            .initial_credentials
-            .as_ref()
-            .unwrap()
-            .admin_token()
-            .to_owned();
         let started = Instant::now();
         let journal =
             JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
@@ -2764,11 +2765,7 @@ mod tests {
         );
         let handle = state.inner.registry.get("slot-1").await.unwrap();
         let before = handle.snapshot();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {admin_token}").parse().unwrap(),
-        );
+        let headers = HeaderMap::new();
 
         let daemon = diagnostics(State(state.clone()), headers.clone())
             .await

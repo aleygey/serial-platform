@@ -348,7 +348,7 @@ language:
 ```text
 arm live byte matchers
 -> optional one-time initial_write kickoff (not a fire)
--> optional start_contains gate
+-> action immediately, or optional explicit start_contains RX gate
 -> one bounded action write at a time
 -> max_fires stops further writes
 -> stop_contains match, timeout, cancellation, or invalidation ends observation
@@ -384,6 +384,14 @@ budget to settle and be audited before the Job reaches its authoritative
 terminal state. Partial or uncertain writes terminate the Job and are never
 retried automatically.
 
+For a routine Trigger, callers provide the optional kickoff and required
+action, and omit `start_contains`. A confirmed kickoff then makes the first
+action eligible immediately; without a kickoff, action is eligible as soon as
+the Trigger is armed. `start_contains` is an explicit advanced RX gate: when
+present, the daemon waits for that literal after kickoff confirmation before
+scheduling the first action. This is an omission semantic within the existing
+protocol-v3 `TriggerSpec`, not a new wire field or version change.
+
 `max_fires` is a confirmed-action send budget rather than an RX-observation
 boundary. Once it is exhausted, no further action write can be scheduled. With
 one or more `stop_contains` literals, the Trigger remains active until a
@@ -399,7 +407,7 @@ Trigger requests are rejected unless all of these hard limits hold:
 |---|---|
 | `initial_write` | Optional; 1–4,096 bytes when present |
 | `action` | 1–256 bytes |
-| `start_contains` | Optional; 1–256 bytes when present |
+| `start_contains` | Optional advanced first-action RX gate; 1–256 bytes when present; omit for normal kickoff-then-action |
 | `stop_contains` | 0–8 literals, each 1–256 bytes |
 | `interval_ms` | 5–1,000 ms; default 20 ms |
 | `timeout_ms` | 100–30,000 ms; default 5,000 ms |
@@ -678,7 +686,7 @@ control metadata therefore cannot bypass the ring's memory ceiling.
 
 ## Release construction
 
-Jenkins is the authoritative v0.6.0 release builder. Its ARM64 Linux worker first
+Jenkins is the authoritative v0.6.1 release builder. Its ARM64 Linux worker first
 runs the locked workspace tests, Clippy, native release smoke checks, and the
 exact 18-entry `serial-mcp --dump-tools` check. It then builds the two supported
 x86_64 targets independently:
@@ -724,10 +732,11 @@ dispatch.
 
 ## WebSocket protocol
 
-Endpoint: `GET /api/v1/ws`, authenticated by `Authorization: Bearer …`.
+Endpoint: `GET /api/v1/ws`. Default loopback-only installations omit
+Authorization; authenticated installations send `Authorization: Bearer …`.
 Incoming WebSocket messages and frames are capped at 64 KiB.
 
-v0.6.0 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
+v0.6.1 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
 are wire-compatible for the v3 realtime surface, while the additive Monitor
 HTTP APIs and MCP tools require v0.5 components. Protocol-v2 executables from
 0.3.x and protocol-v1 executables from 0.2.x are not wire-compatible with v3.
@@ -792,11 +801,17 @@ creates a `break` timeline event; unsupported drivers return the stable
 
 ## HTTP API
 
-All endpoints require a role token.
+Every route applies the role shown below. With the fresh loopback-only default
+(`auth_required=false`), requests omit Authorization and seriald grants the
+local connection the effective admin role. When authentication is enabled,
+clients must present an observer/operator/admin bearer token meeting the
+route's minimum role. `GET /api/v1/health` includes `auth_required` so clients
+can discover the mode; an older response without the field is treated as
+authentication-required.
 
 | Method/path | Minimum role | Purpose |
 |---|---|---|
-| `GET /api/v1/health` | observer | Process identity and uptime |
+| `GET /api/v1/health` | observer | Process identity, uptime, protocol version, and `auth_required` |
 | `GET /api/v1/status` | observer | Authoritative Slot snapshots |
 | `GET /api/v1/ports` | admin | Enumerate ports on the daemon host |
 | `PUT /api/v1/config/slots` | admin | Validate, persist, and replace Slots |
@@ -979,7 +994,16 @@ frames are later optimizations; neither may become the raw source of truth.
 
 ## Security boundary
 
-The first config creates independent observer/operator/admin 256-bit tokens.
+A fresh configuration sets `auth_required=false`, omits the `[auth]` table,
+and is valid only with a loopback bind. In that local personal mode requests
+omit Authorization and receive the effective admin role. Configuration
+validation and runtime bind overrides both reject non-loopback exposure while
+authentication is disabled.
+
+Existing configurations written before `auth_required` remain authenticated:
+the missing field defaults to `true`, and their independent
+observer/operator/admin 256-bit tokens remain unchanged. Explicitly enabling
+authentication on a fresh installation creates the same three credentials.
 They are redacted from `Debug` and errors, accepted only through the
 Authorization header/token file, and used by the server to issue a
 connection-bound actor identity. Clients cannot claim the system actor.

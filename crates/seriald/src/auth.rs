@@ -197,6 +197,16 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// Grants the full local role when seriald is explicitly running without
+    /// bearer authentication. Configuration validation guarantees that this
+    /// mode can only listen on a loopback address.
+    #[must_use]
+    pub const fn trusted_local_admin() -> Self {
+        Self {
+            credential: CredentialId::Admin,
+        }
+    }
+
     #[must_use]
     pub fn role(self) -> Role {
         match self.credential {

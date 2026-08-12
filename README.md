@@ -10,13 +10,13 @@ It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
-v0.6.0 adds in-terminal Profile, hierarchical DUT-model, and serial-setting
-menus; stable scrollback while live output continues; editable Human command
-queues and cooperative no-takeover writes during Agent Runs; explicit Human
-takeover diagnostics; and Agent-readable model inspection/binding. The current
-18-tool MCP registry also retains the persistent Monitor Jobs introduced in
-v0.5.0 and the ordinary serial/Run/Trigger operations. The unified launcher
-introduced in v0.4 remains: `serial serve` starts the backend,
+v0.6.1 makes fresh personal installations token-free on loopback, switches the
+terminal's default language to Chinese, reorganizes Help into scrollable task
+groups, and clarifies that ordinary Trigger kickoff/action calls omit the
+optional start gate. The current 18-tool MCP registry retains the persistent
+Monitor Jobs introduced in v0.5.0 and the ordinary serial/Run/Trigger
+operations. The unified launcher introduced in v0.4 remains: `serial serve`
+starts the backend,
 `serial console` opens the TUI, `serial setup` configures a station,
 `serial profile ...` manages reusable profiles, `serial model ...` manages the
 DUT identity tree, and `serial mcp` starts the MCP adapter. The component
@@ -31,6 +31,26 @@ Protocol and integration references:
 - [Complete MCP/HTTP/WebSocket protocol](./docs/PROTOCOL.md)
 - [All MCP tool schemas and result contracts](./docs/MCP_TOOLS.md); inspect the
   installed executable directly with `serial mcp --dump-tools`.
+
+## v0.6.1 release highlights
+
+- The console defaults to Chinese when no saved language exists; `Ctrl-] g`
+  still switches between Chinese and English and persists the choice.
+- Help is grouped by navigation/display, Control and Agent cooperation,
+  queued input, LINE mode, RAW mode, and safety/history. Its independent
+  PgUp/PgDn/Home/End scroll state keeps the full reference usable on small
+  terminals.
+- A normal Trigger supplies optional `kickoff` plus required `action` and
+  omits `start_contains`. Kickoff confirmation immediately enables actions;
+  the explicit start literal remains available only when live RX must gate the
+  first action.
+- Fresh configurations set `auth_required=false`, contain no credentials, and
+  are restricted to loopback. Older configurations without that field decode
+  it as `true` and retain their observer/operator/admin tokens unchanged.
+- Device Profile pacing is stated precisely: `write_chunk_size` bounds each
+  driver step and `write_chunk_delay_ms` is requested between steps, not after
+  the final chunk. It is neither a baud period nor an exact per-character
+  clock; driver blocking and OS timer granularity may add latency.
 
 ## v0.6.0 release highlights
 
@@ -80,7 +100,9 @@ Protocol and integration references:
 - Crash-recoverable binary journal, 64 MiB/1 hour segments, CRC validation,
   recovered gap-ledger tails, query-derived sequence-discontinuity gaps,
   bounded/concurrency-limited history queries, and a 10 GiB retention ceiling.
-- Observer, operator, and admin Bearer credentials.
+- Token-free loopback-only personal mode by default. Existing authenticated
+  installations retain observer/operator/admin Bearer credentials; a remote
+  bind is rejected unless authentication is enabled.
 - Layered `doctor` checks for connection/authentication, a physical port, the
   live WebSocket stream, journal storage, and full Slot state.
 - Windows daemon with a Windows or Linux/VM client over a trusted host-only
@@ -109,6 +131,21 @@ and `auto_open=true`. Generic device behavior uses command EOL `\r`, echo on,
 no guessed Shell/U-Boot prompt, automatic probe disabled, and one-byte/1-ms
 write pacing. Attach a Device Profile when a DUT needs different behavior.
 
+Fresh installations write `auth_required = false`, omit the `[auth]` table,
+and can listen only on `127.0.0.1` or `::1`. Existing configuration files lack
+that field, decode it as `true`, and keep their existing three credentials.
+To migrate an existing personal configuration, stop `seriald`, make sure its
+persisted bind is loopback, run `serial auth disable`, then start it again. The
+command atomically rewrites the configuration without an `[auth]` table; it
+refuses a non-loopback bind.
+Stop `seriald`, then run `seriald credentials` (or `serial credentials`) on a
+token-free install to generate and persist observer/operator/admin credentials.
+Do not run the command beside a live daemon: that process still owns its old
+configuration snapshot and a later configuration save could overwrite the
+change. Start it again before changing to a non-loopback bind. This explicit
+transition prevents a runtime bind override from accidentally exposing an
+unauthenticated daemon.
+
 On Windows, the daemon uses native bounded synchronous COM reads/writes on
 dedicated blocking workers. It does not route COM writes through Tokio's
 named-pipe/overlapped backend. A Slot is not allowed to reopen until both
@@ -136,7 +173,7 @@ Each release provides two x86_64 packages:
   and it does not support 32-bit i386/i686 Ubuntu.
 
 Use every executable from the same release across the Windows host and Linux
-VM. v0.6.0 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
+VM. v0.6.1 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
 peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
 and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
 protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
@@ -148,8 +185,8 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.6.0-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.6.0-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.6.1-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.6.1-linux-x86_64-ubuntu20.04
 chmod +x serial serialctl serial-mcp
 ./serial --version
 ```
@@ -193,11 +230,14 @@ On Windows:
 serial serve
 ```
 
-The first start creates the daemon configuration and prints three credentials
-once. `serial setup` uses an admin credential only for setup and stores an
-operator credential for normal interactive use. Use the observer credential
-for read-only monitoring. Tokens are not accepted as command-line arguments by
-the clients.
+The first start creates a token-free configuration bound to loopback. No
+credentials are generated or printed; local HTTP and WebSocket clients omit
+Authorization and receive the effective admin role. A non-loopback bind is
+rejected in this mode. Existing installations remain authenticated: a legacy
+configuration without `auth_required` decodes that field as `true` and keeps
+its observer/operator/admin credentials. Run `serial credentials` while the
+daemon is stopped to enable authentication and generate those credentials for
+a fresh installation before configuring a trusted host-only remote bind.
 
 For non-interactive setup, `--admin-token-file` and
 `--operator-token-file` are read-only credential inputs, while
@@ -232,10 +272,12 @@ serial profile device update my-dut --interactive
 serial profile attach --slot slot-1 --transport generic-115200 --device my-dut
 ```
 
-Profile mutations request the administrator credential interactively and never
-save it. For automation, use `--admin-token-file`; list/show/export remain
-read-only. Every mutation carries the revision it just read, so a second
-administrator cannot silently overwrite a newer catalog or Slot update.
+In default loopback mode, Profile mutations need no credential prompt. When
+authentication is enabled, mutations request the administrator credential
+interactively and never save it. For authenticated automation, use
+`--admin-token-file`; list/show/export remain read-only. Every mutation carries
+the revision it just read, so a second administrator cannot silently overwrite
+a newer catalog or Slot update.
 
 Start the console without naming a Slot:
 
@@ -472,8 +514,10 @@ different timeline and must not be treated as a continuation of the old one.
 ## OpenCode and Codex
 
 Install `serial-mcp` on the same Windows or Linux machine where the Agent
-platform runs. It reuses the endpoint and operator token written by
-`serial setup`, so Agent config contains no secret. Configure the MCP host to
+platform runs. A new loopback-only personal installation needs only the
+endpoint; `serial-mcp` sends no Authorization header. Existing authenticated
+or remotely bound installations continue to reuse the operator token written
+by `serial setup`, so Agent config contains no literal secret. Configure the MCP host to
 run `serial mcp` (or the component `serial-mcp` directly). Ready-to-copy
 OpenCode JSONC and Codex TOML examples and the expected Run workflow are in
 [adapters/README.md](./adapters/README.md). The current 18-tool registry and
@@ -514,7 +558,10 @@ adapter-owned Run and takes explicit UTF-8 text plus EOL for an optional
 one-time `kickoff` and the repeated `action`, along with an optional start
 literal, stop literals, interval, timeout, and maximum-fire bounds.
 `kickoff` is sent once after the RX matchers are armed; it does not increment
-the action fire count. The MCP surface is text-oriented, while
+the action fire count. For normal kickoff-then-action use, omit
+`start_contains`: successful kickoff confirmation enables the first action
+immediately. Set `start_contains` only when a specific live RX literal must
+explicitly gate that first action. The MCP surface is text-oriented, while
 seriald's lower WebSocket protocol keeps every Trigger payload and literal as
 raw bytes encoded with base64. Neither layer infers a Prompt or byte sequence
 from the device profile. For example,
@@ -601,7 +648,12 @@ Pacing belongs to the Device Profile because it compensates for how quickly a
 DUT consumes input, not for the COM endpoint. `write_chunk_size` is the maximum
 number of bytes passed to the driver in one paced step; the daemon waits
 `write_chunk_delay_ms` before the next step. The Generic fallback is one byte
-per 1 ms. A zero delay disables pacing. Existing Slot `settings` retain a full
+per 1 ms: an N-byte write has N driver chunks and N-1 requested 1-ms gaps,
+never a trailing gap. The value is an inter-chunk delay in milliseconds, not a
+baud period and not a guarantee of exact wall-clock cadence; driver blocking
+and OS timer granularity add latency. A partial driver write does not introduce
+an extra delay inside the same planned chunk. A zero delay removes the sleeps
+but still applies `write_chunk_size` to driver calls. Existing Slot `settings` retain a full
 compatibility snapshot, but current clients consume the daemon's published
 `effective_transport` and `effective_write_pacing`.
 

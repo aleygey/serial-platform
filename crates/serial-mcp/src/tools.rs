@@ -3109,6 +3109,22 @@ mod tests {
     }
 
     #[test]
+    fn normal_kickoff_trigger_omits_the_optional_start_gate() {
+        let args: TriggerArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "kickoff": {"text": "reboot", "eol": "\r"},
+            "action": {"text": "slp"},
+            "stop_contains": ["prompt>"]
+        }))
+        .unwrap();
+
+        let spec = trigger_spec(&args).unwrap();
+        assert_eq!(spec.initial_write.as_deref(), Some(b"reboot\r".as_slice()));
+        assert!(spec.start_contains.is_none());
+        assert_eq!(spec.action, b"slp");
+    }
+
+    #[test]
     fn trigger_allows_bounded_one_shot_without_a_stop_literal() {
         let args: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",

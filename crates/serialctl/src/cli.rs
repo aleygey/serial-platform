@@ -351,6 +351,7 @@ struct DoctorReport<'a> {
     config_path: String,
     endpoint: &'a str,
     token_configured: bool,
+    authentication_required: bool,
     daemon_status: &'a str,
     server_id: String,
     daemon_epoch: String,
@@ -396,6 +397,7 @@ async fn run_doctor_connection(
         config_path: loaded.path.display().to_string(),
         endpoint: &resolved.endpoint,
         token_configured: resolved.token.is_some(),
+        authentication_required: health.auth_required,
         daemon_status: &health.status,
         server_id: health.server_id.to_string(),
         daemon_epoch: health.daemon_epoch.to_string(),
@@ -425,6 +427,8 @@ async fn run_doctor_connection(
             pad_display(tr("m.doctor.token"), 12),
             if report.token_configured {
                 tr("m.token.configured")
+            } else if !report.authentication_required {
+                "not required (loopback personal mode)"
             } else {
                 tr("m.token.missing")
             }
@@ -641,29 +645,48 @@ async fn run_setup(
         .clone()
         .or_else(|| loaded.config.token_file.clone())
         .unwrap_or_else(|| loaded.default_token_path());
-    ensure_distinct_credential_paths(
-        args.admin_token_file.as_deref(),
-        args.operator_token_file.as_deref(),
-        &token_file,
-    )?;
-    let existing_operator_token = config::read_token_if_present(&token_file)?;
-    if existing_operator_token.is_some() && !args.json {
-        println!("{}", tr("i.token.notice"));
-    }
-    let admin_token = match args.admin_token_file.as_deref() {
-        Some(path) => config::read_token_if_present(path)?
-            .with_context(|| format!("administrator token file {} is empty", path.display()))?,
-        None if interactive => rpassword::prompt_password(tr("i.admin.prompt"))?
-            .trim()
-            .to_owned(),
-        None => bail!("--admin-token-file is required in non-interactive setup"),
+    // New personal installations intentionally have no token at all. Probe
+    // without a credential first; old authenticated daemons answer 401 and
+    // retain the existing one-time admin + daily operator setup flow.
+    let local_api = ApiClient::new(endpoint.clone(), None)?;
+    let (admin_api, admin_token, health, authentication_required) = match local_api.health().await {
+        Ok(health) if !health.auth_required => (local_api, None, health, false),
+        Ok(_) => bail!(
+            "seriald reports that authentication is required but accepted an unauthenticated health request"
+        ),
+        Err(error) if crate::api::is_unauthorized(&error) => {
+            ensure_distinct_credential_paths(
+                args.admin_token_file.as_deref(),
+                args.operator_token_file.as_deref(),
+                &token_file,
+            )?;
+            let admin_token = match args.admin_token_file.as_deref() {
+                Some(path) => config::read_token_if_present(path)?.with_context(|| {
+                    format!("administrator token file {} is empty", path.display())
+                })?,
+                None if interactive => rpassword::prompt_password(tr("i.admin.prompt"))?
+                    .trim()
+                    .to_owned(),
+                None => bail!("--admin-token-file is required in non-interactive setup"),
+            };
+            if admin_token.is_empty() {
+                bail!(tr("i.admin.required"));
+            }
+            let api = ApiClient::new(endpoint.clone(), Some(admin_token.clone()))?;
+            let health = api.health().await.context(tr("i.unreachable"))?;
+            (api, Some(admin_token), health, true)
+        }
+        Err(error) => return Err(error).context(tr("i.unreachable")),
     };
-    if admin_token.is_empty() {
-        bail!(tr("i.admin.required"));
-    }
-
-    let admin_api = ApiClient::new(endpoint.clone(), Some(admin_token.clone()))?;
-    let health = admin_api.health().await.context(tr("i.unreachable"))?;
+    let existing_operator_token = if authentication_required {
+        let token = config::read_token_if_present(&token_file)?;
+        if token.is_some() && !args.json {
+            println!("{}", tr("i.token.notice"));
+        }
+        token
+    } else {
+        None
+    };
     if health.protocol_version != PROTOCOL_VERSION {
         bail!(
             "seriald protocol {} is incompatible with this client (expected {}); install all \
@@ -936,35 +959,40 @@ async fn run_setup(
     // Validate the lower-privilege daily credential before the only daemon
     // mutation. A bad token must not leave setup reporting failure after the
     // Slot configuration has already changed.
-    let operator_token = match args.operator_token_file.as_deref() {
-        Some(path) => config::read_token_if_present(path)?
-            .with_context(|| format!("operator token file {} is empty", path.display()))?,
-        None if interactive => {
-            let operator_prompt = if existing_operator_token.is_some() {
-                tr("i.operator.keep")
-            } else {
-                tr("i.operator.required.prompt")
-            };
-            let entered = rpassword::prompt_password(operator_prompt)?;
-            let entered = entered.trim().to_owned();
-            if entered.is_empty() {
-                existing_operator_token.context(tr("i.operator.required"))?
-            } else {
-                entered
+    let operator_token = if authentication_required {
+        let token = match args.operator_token_file.as_deref() {
+            Some(path) => config::read_token_if_present(path)?
+                .with_context(|| format!("operator token file {} is empty", path.display()))?,
+            None if interactive => {
+                let operator_prompt = if existing_operator_token.is_some() {
+                    tr("i.operator.keep")
+                } else {
+                    tr("i.operator.required.prompt")
+                };
+                let entered = rpassword::prompt_password(operator_prompt)?;
+                let entered = entered.trim().to_owned();
+                if entered.is_empty() {
+                    existing_operator_token.context(tr("i.operator.required"))?
+                } else {
+                    entered
+                }
             }
+            None => existing_operator_token.context(
+                "an existing daily token or --operator-token-file is required in non-interactive setup",
+            )?,
+        };
+        let operator_api = ApiClient::new(endpoint.clone(), Some(token.clone()))?;
+        operator_api.status().await.context(tr("i.operator.fail"))?;
+        let daily_role = ws::probe_role(&endpoint, &token)
+            .await
+            .context(tr("i.role.fail"))?;
+        if daily_role != serial_protocol::Role::Operator {
+            bail!(trf("i.role.wrong", &[&format!("{daily_role:?}")]));
         }
-        None => existing_operator_token.context(
-            "an existing daily token or --operator-token-file is required in non-interactive setup",
-        )?,
+        Some(token)
+    } else {
+        None
     };
-    let operator_api = ApiClient::new(endpoint.clone(), Some(operator_token.clone()))?;
-    operator_api.status().await.context(tr("i.operator.fail"))?;
-    let daily_role = ws::probe_role(&endpoint, &operator_token)
-        .await
-        .context(tr("i.role.fail"))?;
-    if daily_role != serial_protocol::Role::Operator {
-        bail!(trf("i.role.wrong", &[&format!("{daily_role:?}")]));
-    }
 
     let configured = admin_api
         .configure_slots(slots, config_revision)
@@ -997,10 +1025,13 @@ async fn run_setup(
     // the already validated lower-privilege daily credential.
     drop(admin_api);
     drop(admin_token);
-    drop(operator_api);
 
-    config::write_token(&token_file, &operator_token)?;
-    loaded.config.token_file = Some(token_file);
+    if let Some(operator_token) = operator_token.as_deref() {
+        config::write_token(&token_file, operator_token)?;
+        loaded.config.token_file = Some(token_file);
+    } else {
+        loaded.config.token_file = None;
+    }
     loaded.config.endpoint = Some(endpoint.clone());
     loaded.config.last_slot = configured.slots.first().map(|slot| slot.config.id.clone());
     loaded.save()?;
@@ -1012,7 +1043,8 @@ async fn run_setup(
                 "endpoint": endpoint,
                 "config_revision": configured.config_revision,
                 "slots": configured.slots,
-                "operator_token_saved": true,
+                "operator_token_saved": authentication_required,
+                "authentication_required": authentication_required,
             }))?
         );
     } else {

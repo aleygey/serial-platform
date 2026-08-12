@@ -23,10 +23,21 @@ enum Command {
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
-    /// Explicitly display the three role credentials.
+    /// Display credentials, or enable auth while seriald is stopped.
     Credentials,
+    /// Manage authentication while seriald is stopped.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Print the resolved configuration and data paths.
     Paths,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Remove every seriald bearer token (loopback configurations only).
+    Disable,
 }
 
 #[tokio::main]
@@ -50,20 +61,51 @@ async fn main() -> anyhow::Result<()> {
                 .load_or_create()
                 .context("load seriald configuration")?;
             if let Some(credentials) = loaded.initial_credentials.as_ref() {
-                println!("seriald created its first configuration.");
+                println!("seriald created its first authenticated configuration.");
                 print_credentials(credentials);
-                println!(
-                    "Save the needed token with serial setup; it will not be printed again automatically."
-                );
             }
             seriald::serve(store, loaded, bind).await
         }
         Command::Credentials => {
+            let mut loaded = store
+                .load_or_create()
+                .context("load seriald configuration")?;
+            if let Some(auth) = loaded.config.auth.as_ref() {
+                print_credentials(&auth.credentials_for_explicit_display());
+            } else {
+                let (auth, credentials) = seriald::auth::AuthConfig::generate();
+                loaded.config.auth_required = true;
+                loaded.config.auth = Some(auth);
+                store
+                    .save(&loaded.config)
+                    .context("enable authentication in seriald configuration")?;
+                println!(
+                    "authentication=enabled; seriald must have been stopped before this command; start it again before using these tokens"
+                );
+                print_credentials(&credentials);
+            }
+            Ok(())
+        }
+        Command::Auth {
+            command: AuthCommand::Disable,
+        } => {
             let loaded = store
                 .load_or_create()
                 .context("load seriald configuration")?;
-            let credentials = loaded.config.auth.credentials_for_explicit_display();
-            print_credentials(&credentials);
+            if !loaded.config.auth_required {
+                println!("authentication=disabled (loopback only; no tokens exist)");
+                return Ok(());
+            }
+            let staged = loaded
+                .config
+                .staged_without_authentication()
+                .context("disable authentication; change bind to loopback first")?;
+            store
+                .save(&staged)
+                .context("remove credentials from seriald configuration")?;
+            println!(
+                "authentication=disabled; all seriald tokens were removed; seriald must have been stopped before this command; start it again on loopback"
+            );
             Ok(())
         }
         Command::Paths => {
@@ -95,5 +137,16 @@ mod tests {
             assert_eq!(parsed.root, Some(PathBuf::from("portable")));
             assert!(matches!(parsed.command, Some(Command::Serve { .. })));
         }
+    }
+
+    #[test]
+    fn auth_disable_is_a_daemon_subcommand() {
+        let parsed = Cli::try_parse_from(["seriald", "auth", "disable"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Auth {
+                command: AuthCommand::Disable
+            })
+        ));
     }
 }

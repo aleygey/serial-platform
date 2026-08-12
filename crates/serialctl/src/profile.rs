@@ -486,27 +486,37 @@ pub async fn run(api: &ApiClient, args: ProfileArgs) -> Result<()> {
     } = args;
     command.validate_local()?;
     let admin_api = if command.requires_admin() {
-        let token = match admin_token_file.as_deref() {
-            Some(path) => config::read_token_if_present(path)?
-                .with_context(|| format!("administrator token file {} is empty", path.display()))?,
-            None if !command.json_mode()
-                && io::stdin().is_terminal()
-                && io::stdout().is_terminal() =>
-            {
-                rpassword::prompt_password(tr("i.admin.prompt"))?
-                    .trim()
-                    .to_owned()
-            }
-            None => {
-                bail!(
-                    "--admin-token-file is required for non-interactive Profile changes; the administrator credential is never saved"
-                )
-            }
+        let authentication_required = match api.health().await {
+            Ok(health) => health.auth_required,
+            Err(error) if crate::api::is_unauthorized(&error) => true,
+            Err(error) => return Err(error),
         };
-        if token.is_empty() {
-            bail!(tr("i.admin.required"));
+        if !authentication_required {
+            Some(api.clone())
+        } else {
+            let token = match admin_token_file.as_deref() {
+                Some(path) => config::read_token_if_present(path)?.with_context(|| {
+                    format!("administrator token file {} is empty", path.display())
+                })?,
+                None if !command.json_mode()
+                    && io::stdin().is_terminal()
+                    && io::stdout().is_terminal() =>
+                {
+                    rpassword::prompt_password(tr("i.admin.prompt"))?
+                        .trim()
+                        .to_owned()
+                }
+                None => {
+                    bail!(
+                        "--admin-token-file is required for non-interactive Profile changes; the administrator credential is never saved"
+                    )
+                }
+            };
+            if token.is_empty() {
+                bail!(tr("i.admin.required"));
+            }
+            Some(ApiClient::new(api.endpoint().to_owned(), Some(token))?)
         }
-        Some(ApiClient::new(api.endpoint().to_owned(), Some(token))?)
     } else {
         None
     };

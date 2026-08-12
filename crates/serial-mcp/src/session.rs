@@ -124,7 +124,7 @@ enum SessionResponse {
 }
 
 impl SessionHandle {
-    pub fn spawn(endpoint: String, token: String, actor_label: String) -> Self {
+    pub fn spawn(endpoint: String, token: Option<String>, actor_label: String) -> Self {
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(run_session(
             SessionState::new(endpoint, token, actor_label),
@@ -367,7 +367,7 @@ async fn run_session(mut state: SessionState, mut rx: mpsc::Receiver<SessionRequ
 
 struct SessionState {
     endpoint: String,
-    token: String,
+    token: Option<String>,
     actor_label: String,
     socket: Option<Socket>,
     actor: Option<Actor>,
@@ -377,7 +377,7 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn new(endpoint: String, token: String, actor_label: String) -> Self {
+    fn new(endpoint: String, token: Option<String>, actor_label: String) -> Self {
         Self {
             endpoint,
             token,
@@ -540,12 +540,14 @@ impl SessionState {
         self.actor = None;
         self.role = None;
         let mut request = ws_url(&self.endpoint)?.into_client_request()?;
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {}", self.token)
-                .parse()
-                .context("operator token cannot be encoded as an HTTP header")?,
-        );
+        if let Some(token) = self.token.as_deref() {
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .context("operator token cannot be encoded as an HTTP header")?,
+            );
+        }
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
             .await
             .context("timed out connecting to seriald WebSocket")??;
@@ -566,7 +568,7 @@ impl SessionState {
                 }) => {
                     ensure_welcome_protocol(protocol_version)?;
                     if role < Role::Operator {
-                        bail!("serial-mcp requires an operator token; daemon granted {role:?}");
+                        bail!("serial-mcp requires operator permission; daemon granted {role:?}");
                     }
                     self.actor = Some(actor);
                     self.role = Some(role);
@@ -1649,8 +1651,11 @@ mod tests {
 
     #[test]
     fn renewal_targets_include_only_slots_with_owned_active_runs() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         state.leases.insert("run-slot".into(), test_lease());
         state.leases.insert("bare-lease".into(), test_lease());
         state.owned_runs.insert("run-slot".into(), Uuid::new_v4());
@@ -1667,8 +1672,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_without_an_owned_run_fails_before_connecting() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         let error = state
             .write(
                 "bench".into(),
@@ -1689,8 +1697,11 @@ mod tests {
 
     #[tokio::test]
     async fn break_without_an_owned_run_fails_before_connecting() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         let error = state
             .send_break("bench".into(), 250, Uuid::new_v4(), Uuid::new_v4())
             .await
@@ -1702,8 +1713,11 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_without_an_owned_run_fails_before_connecting() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         let error = state
             .trigger_start(
                 "bench".into(),
@@ -1722,8 +1736,11 @@ mod tests {
 
     #[test]
     fn trigger_ownership_loss_forgets_only_the_affected_slot() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         for slot in ["bench-a", "bench-b"] {
             state.leases.insert(slot.into(), test_lease());
             state.owned_runs.insert(slot.into(), Uuid::new_v4());
@@ -1738,8 +1755,11 @@ mod tests {
 
     #[tokio::test]
     async fn release_without_a_local_lease_is_idempotent_and_forgets_stale_run_state() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         state.owned_runs.insert("bench".into(), Uuid::new_v4());
 
         assert!(!state.release("bench".into(), false).await.unwrap());
@@ -1749,8 +1769,11 @@ mod tests {
 
     #[tokio::test]
     async fn lost_connection_clears_owned_runs_instead_of_reacquiring_control() {
-        let mut state =
-            SessionState::new("http://127.0.0.1:1".into(), "token".into(), "test".into());
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
         let run_id = Uuid::new_v4();
         state.owned_runs.insert("bench".into(), run_id);
         state.leases.insert("bench".into(), test_lease());

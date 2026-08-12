@@ -204,7 +204,16 @@ pub struct DaemonConfig {
     pub control: ControlConfig,
     #[serde(default)]
     pub monitor_event_sink: MonitorEventSinkConfig,
-    pub auth: AuthConfig,
+    /// Whether HTTP and WebSocket clients must present one of the configured
+    /// bearer credentials. This defaults to `true` while deserializing so all
+    /// v1 configuration files written before this field existed retain their
+    /// authenticated behavior.
+    #[serde(default = "default_auth_required")]
+    pub auth_required: bool,
+    /// Three role credentials used only when `auth_required` is true. New
+    /// loopback-only personal installations omit this table completely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub slots: Vec<SlotConfig>,
     #[serde(default)]
@@ -221,9 +230,12 @@ const fn default_config_revision() -> u64 {
     1
 }
 
+const fn default_auth_required() -> bool {
+    true
+}
+
 impl DaemonConfig {
-    fn generate() -> (Self, CredentialDisplay) {
-        let (auth, credentials) = AuthConfig::generate();
+    fn generate() -> (Self, Option<CredentialDisplay>) {
         (
             Self {
                 schema_version: CONFIG_SCHEMA_VERSION,
@@ -233,14 +245,15 @@ impl DaemonConfig {
                 logging: LoggingConfig::default(),
                 control: ControlConfig::default(),
                 monitor_event_sink: MonitorEventSinkConfig::default(),
-                auth,
+                auth_required: false,
+                auth: None,
                 slots: Vec::new(),
                 transport_profiles: Vec::new(),
                 device_profiles: Vec::new(),
                 device_models: Vec::new(),
                 slot_model_bindings: Vec::new(),
             },
-            credentials,
+            None,
         )
     }
 
@@ -259,7 +272,17 @@ impl DaemonConfig {
         validate_logging(&self.logging)?;
         validate_control(&self.control)?;
         validate_monitor_event_sink(&self.monitor_event_sink)?;
-        self.auth.validate()?;
+        match (self.auth_required, self.auth.as_ref()) {
+            (true, Some(auth)) => auth.validate()?,
+            (true, None) => return Err(ConfigValidationError::MissingAuthentication),
+            (false, Some(_)) => return Err(ConfigValidationError::UnexpectedAuthentication),
+            (false, None) if !self.bind.ip().is_loopback() => {
+                return Err(ConfigValidationError::UnauthenticatedNonLoopbackBind {
+                    bind: self.bind,
+                });
+            }
+            (false, None) => {}
+        }
         validate_transport_profiles(&self.transport_profiles)?;
         validate_device_profiles(&self.device_profiles)?;
         validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)?;
@@ -294,6 +317,17 @@ impl DaemonConfig {
         let mut staged = self.clone();
         staged.replace_slots(slots)?;
         staged.bump_revision()?;
+        Ok(staged)
+    }
+
+    /// Returns a validated migration candidate that removes all bearer
+    /// credentials. Persist this atomically while seriald is stopped.
+    pub fn staged_without_authentication(&self) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        staged.auth_required = false;
+        staged.auth = None;
+        staged.bump_revision()?;
+        staged.validate()?;
         Ok(staged)
     }
 
@@ -462,7 +496,7 @@ impl ConfigStore {
             let (config, credentials) = DaemonConfig::generate();
             config.validate()?;
             self.save(&config)?;
-            (config, Some(credentials))
+            (config, credentials)
         };
 
         Ok(LoadedConfig {
@@ -602,6 +636,12 @@ pub enum ConfigValidationError {
     NilServerId,
     #[error("bind port must be non-zero")]
     InvalidBindPort,
+    #[error("auth_required=true requires an [auth] credential table")]
+    MissingAuthentication,
+    #[error("auth_required=false requires the [auth] credential table to be removed")]
+    UnexpectedAuthentication,
+    #[error("authentication can be disabled only for a loopback bind, not {bind}")]
+    UnauthenticatedNonLoopbackBind { bind: SocketAddr },
     #[error("configuration revision is exhausted")]
     RevisionExhausted,
     #[error("max_total_bytes must be non-zero")]
@@ -1453,8 +1493,10 @@ mod tests {
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
 
         let first = store.load_or_create().unwrap();
-        let credentials = first.initial_credentials.as_ref().unwrap();
+        assert!(first.initial_credentials.is_none());
         assert_eq!(first.config.bind, "127.0.0.1:3210".parse().unwrap());
+        assert!(!first.config.auth_required);
+        assert!(first.config.auth.is_none());
         assert_eq!(first.config.logging.max_total_bytes, 10 * GIB);
         assert_eq!(first.config.logging.retention_target_percent, 90);
         assert_eq!(
@@ -1462,16 +1504,6 @@ mod tests {
             DEFAULT_SEGMENT_MAX_BYTES
         );
         assert!(first.config.slots.is_empty());
-        assert_eq!(
-            first
-                .config
-                .auth
-                .authenticate_bearer(credentials.admin_token())
-                .unwrap()
-                .role(),
-            serial_protocol::Role::Admin
-        );
-
         let first_server = first.config.server_id;
         let first_epoch = first.daemon_epoch;
         let second = store.load_or_create().unwrap();
@@ -1481,6 +1513,67 @@ mod tests {
 
         let persisted = fs::read_to_string(&store.paths().config_file).unwrap();
         assert!(!persisted.contains("daemon_epoch"));
+        assert!(persisted.contains("auth_required = false"));
+        assert!(!persisted.contains("[auth]"));
+    }
+
+    #[test]
+    fn legacy_config_without_auth_required_keeps_token_authentication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let (auth, credentials) = AuthConfig::generate();
+        let mut config = DaemonConfig::generate().0;
+        config.auth_required = true;
+        config.auth = Some(auth);
+        let mut serialized = toml::to_string_pretty(&config).unwrap();
+        serialized = serialized.replace("auth_required = true\n", "");
+        fs::create_dir_all(&store.paths().config_dir).unwrap();
+        fs::write(&store.paths().config_file, serialized).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert!(loaded.auth_required);
+        assert_eq!(
+            loaded
+                .auth
+                .as_ref()
+                .unwrap()
+                .authenticate_bearer(credentials.operator_token())
+                .unwrap()
+                .role(),
+            serial_protocol::Role::Operator
+        );
+    }
+
+    #[test]
+    fn unauthenticated_mode_rejects_credentials_and_non_loopback_bind() {
+        let mut config = DaemonConfig::generate().0;
+        config.bind = "0.0.0.0:3210".parse().unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::UnauthenticatedNonLoopbackBind { .. })
+        ));
+
+        config.bind = default_bind_address();
+        config.auth = Some(AuthConfig::generate().0);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigValidationError::UnexpectedAuthentication)
+        );
+    }
+
+    #[test]
+    fn authenticated_loopback_config_can_be_staged_without_tokens() {
+        let (auth, _) = AuthConfig::generate();
+        let mut config = DaemonConfig::generate().0;
+        config.auth_required = true;
+        config.auth = Some(auth);
+        let previous_revision = config.config_revision;
+        let staged = config.staged_without_authentication().unwrap();
+        assert!(!staged.auth_required);
+        assert!(staged.auth.is_none());
+        assert_eq!(staged.config_revision, previous_revision + 1);
+        assert!(config.auth_required);
+        assert!(config.auth.is_some());
     }
 
     #[cfg(unix)]
@@ -1655,15 +1748,15 @@ mod tests {
     fn loaded_debug_output_does_not_contain_credentials() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let (auth, credentials) = AuthConfig::generate();
+        let mut config = DaemonConfig::generate().0;
+        config.auth_required = true;
+        config.auth = Some(auth);
+        store.save(&config).unwrap();
         let loaded = store.load_or_create().unwrap();
-        let admin = loaded
-            .initial_credentials
-            .as_ref()
-            .unwrap()
-            .admin_token()
-            .to_owned();
+        let admin = credentials.admin_token().to_owned();
         let debug = format!("{loaded:?}");
-        assert!(debug.contains("REDACTED"));
+        assert!(debug.contains("BearerToken([REDACTED])"));
         assert!(!debug.contains(&admin));
     }
 

@@ -185,19 +185,21 @@ impl Completion {
 impl Capture {
     pub async fn attach(
         endpoint: &str,
-        token: &str,
+        token: Option<&str>,
         actor_label: &str,
         slot_id: String,
         cursor: Cursor,
         limits: CaptureLimits,
     ) -> Result<Self> {
         let mut request = ws_url(endpoint)?.into_client_request()?;
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {token}")
-                .parse()
-                .context("operator token cannot be encoded as an HTTP header")?,
-        );
+        if let Some(token) = token {
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {token}")
+                    .parse()
+                    .context("operator token cannot be encoded as an HTTP header")?,
+            );
+        }
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
             .await
             .context("timed out connecting capture stream to seriald")??;

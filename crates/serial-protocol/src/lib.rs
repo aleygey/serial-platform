@@ -256,7 +256,10 @@ pub struct TriggerSpec {
         with = "option_base64_bytes"
     )]
     pub initial_write: Option<Vec<u8>>,
-    /// Optional live RX literal that gates the first action write.
+    /// Optional advanced live-RX gate for the first action write. When this is
+    /// absent, the first action becomes eligible immediately after a confirmed
+    /// initial write, or immediately after arming when there is no initial
+    /// write.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1047,6 +1050,15 @@ pub struct HealthResponse {
     /// HTTP responses and decoded as zero by current clients.
     #[serde(default)]
     pub protocol_version: u16,
+    /// Whether clients must send a bearer credential. Missing on older HTTP
+    /// responses and therefore decoded as `true` to preserve their secure
+    /// behavior.
+    #[serde(default = "default_auth_required")]
+    pub auth_required: bool,
+}
+
+const fn default_auth_required() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1875,6 +1887,19 @@ mod tests {
         assert_eq!(settings.write_chunk_size, 1);
         assert_eq!(settings.write_chunk_delay_ms, 1);
         assert!(settings.probe.is_none());
+    }
+
+    #[test]
+    fn legacy_health_response_defaults_to_authentication_required() {
+        let health: HealthResponse = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "server_id": Uuid::nil(),
+            "daemon_epoch": Uuid::nil(),
+            "uptime_ms": 1,
+            "protocol_version": PROTOCOL_VERSION
+        }))
+        .unwrap();
+        assert!(health.auth_required);
     }
 
     fn device_profile() -> DeviceProfile {

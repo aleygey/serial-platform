@@ -308,6 +308,10 @@ pub fn is_forbidden(error: &anyhow::Error) -> bool {
     has_http_status(error, reqwest::StatusCode::FORBIDDEN)
 }
 
+pub fn is_unauthorized(error: &anyhow::Error) -> bool {
+    has_http_status(error, reqwest::StatusCode::UNAUTHORIZED)
+}
+
 fn has_http_status(error: &anyhow::Error, status: reqwest::StatusCode) -> bool {
     error
         .chain()

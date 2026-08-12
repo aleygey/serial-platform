@@ -168,11 +168,11 @@ pub async fn run(api: &ApiClient, args: ModelArgs) -> Result<()> {
         ModelCommand::List(args) => list(api, args).await,
         ModelCommand::Tree(args) => tree(api, args).await,
         ModelCommand::Add(args) => {
-            let admin = admin_api(api, admin_token_file.as_deref(), args.json)?;
+            let admin = admin_api(api, admin_token_file.as_deref(), args.json).await?;
             add(&admin, args).await
         }
         ModelCommand::Update(args) => {
-            let admin = admin_api(api, admin_token_file.as_deref(), args.json)?;
+            let admin = admin_api(api, admin_token_file.as_deref(), args.json).await?;
             update(&admin, args).await
         }
         ModelCommand::Attach(args) => attach(api, args).await,
@@ -180,11 +180,19 @@ pub async fn run(api: &ApiClient, args: ModelArgs) -> Result<()> {
     }
 }
 
-fn admin_api(
+async fn admin_api(
     api: &ApiClient,
     token_file: Option<&std::path::Path>,
     json: bool,
 ) -> Result<ApiClient> {
+    let authentication_required = match api.health().await {
+        Ok(health) => health.auth_required,
+        Err(error) if crate::api::is_unauthorized(&error) => true,
+        Err(error) => return Err(error),
+    };
+    if !authentication_required {
+        return Ok(api.clone());
+    }
     let token = match token_file {
         Some(path) => config::read_token_if_present(path)?
             .with_context(|| format!("administrator token file {} is empty", path.display()))?,
