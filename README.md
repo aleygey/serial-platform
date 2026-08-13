@@ -160,7 +160,8 @@ untouched, or use electrical isolation/reset gating.
 
 ## Install from a release
 
-Each release provides two x86_64 packages:
+Starting with the next release after v0.6.1, the Jenkins release pipeline can
+provide four platform packages:
 
 - `serial-platform-<version>-windows-x86_64.zip` contains the unified
   `serial.exe` plus `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe`. These
@@ -171,9 +172,16 @@ Each release provides two x86_64 packages:
   ceiling. It is intended for 64-bit x86 Ubuntu 20.04 or newer. It does not
   contain `seriald`, because the Windows host owns the workstation COM ports,
   and it does not support 32-bit i386/i686 Ubuntu.
+- `serial-platform-<version>-macos-aarch64.zip` contains native Apple Silicon
+  `serial`, `seriald`, `serialctl`, and `serial-mcp` binaries.
+- `serial-platform-<version>-macos-x86_64.zip` contains the same four programs
+  for Intel Macs and is tested through Rosetta 2 on the Apple Silicon Jenkins
+  worker. Both macOS packages declare a macOS 11.0 deployment target. Until a
+  Developer ID credential is configured, `BUILD-INFO.json` explicitly marks
+  these command-line packages as unsigned and not notarized.
 
-Use every executable from the same release across the Windows host and Linux
-VM. v0.6.1 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
+Use every executable from the same release across the Windows host, Linux VM,
+and Mac. v0.6.1 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
 peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
 and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
 protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
@@ -205,6 +213,21 @@ unless the binary was installed on `PATH`; from the extracted directory, run
 `./serial setup`. The launcher itself resolves only sibling executables from
 that same directory and never falls back to another `seriald`, `serialctl`, or
 `serial-mcp` found on `PATH`; a partial/mixed installation fails visibly.
+
+Jenkins exposes `BUILD_PROFILE=debug|release`. Debug builds are archived with
+`-debug-` in their names and are never eligible for GitHub Release publishing.
+`BUILD_MACOS` defaults on and enables both Mac architectures; disable it for a
+Linux/Windows-only validation build. `PUBLISH_GITHUB_RELEASE` is
+accepted only for a complete Release build with format, Clippy, tests, all four
+platform packages, an annotated `v<workspace-version>` tag pointing at the
+exact pinned build commit, and a Jenkins Secret Text credential named
+`github-release-token`. Publishing is draft-first and refuses to overwrite a
+same-named asset with different bytes.
+
+The published `v0.6.1` tag remains immutable and predates this four-platform
+pipeline. After changing CI or packaging code, increment the workspace version
+and create a new annotated tag at that exact commit; the publisher deliberately
+rejects attempts to attach newer bytes to an older tag.
 
 ## Build
 

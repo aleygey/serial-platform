@@ -686,10 +686,11 @@ control metadata therefore cannot bypass the ring's memory ceiling.
 
 ## Release construction
 
-Jenkins is the authoritative v0.6.1 release builder. Its ARM64 Linux worker first
-runs the locked workspace tests, Clippy, native release smoke checks, and the
-exact 18-entry `serial-mcp --dump-tools` check. It then builds the two supported
-x86_64 targets independently:
+Jenkins is the authoritative release builder. `BUILD_PROFILE` selects Debug or
+Release; both can be archived, but Debug packages are visibly named with
+`-debug-` and can never enter a GitHub Release. The ARM64 Linux worker first
+runs the locked workspace tests, Clippy, native smoke checks, and the exact
+18-entry `serial-mcp --dump-tools` check. It then builds two x86_64 targets:
 
 - `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31` produces `serial`,
   `serialctl`, and `serial-mcp` for Ubuntu 20.04 or newer. Every ELF is checked
@@ -698,14 +699,27 @@ x86_64 targets independently:
   `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe` for Windows x86_64. This
   is the GNU ABI, not an MSVC build; every executable is checked as PE32+
   x86-64 and rejected if it imports an unbundled MinGW runtime DLL.
+- when `BUILD_MACOS` is enabled, a native Apple Silicon worker builds separate
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` ZIPs. It runs the complete
+  workspace tests for both architectures (x86_64 through Rosetta 2), verifies
+  Mach-O architecture, deployment target 11.0, system-only dynamic libraries,
+  all four program versions, and the 18-tool MCP registry. Unsigned/unnotarized
+  status is recorded in each package until Apple release credentials exist.
 
-Both archives contain `README.md`, `DOCUMENTATION.md`, `ROADMAP.md`, `LICENSE`,
+All four archives in a complete publishable Release contain `README.md`,
+`DOCUMENTATION.md`, `ROADMAP.md`, `LICENSE`,
 the `docs/` and `adapters/` trees, `BUILD-INFO.json`, and an internal
 `MANIFEST.sha256`. Sorted, normalized-time archives make repeated builds from
 one commit reproducible where the underlying Rust toolchain is deterministic.
 Jenkins also emits archive-level `SHA256SUMS`. GitHub Actions may validate
 development builds manually or on `codex/**`, but tags do not invoke it and it
 does not publish releases, preventing a second publisher from racing Jenkins.
+With `PUBLISH_GITHUB_RELEASE=true`, Jenkins itself is the sole publisher. It
+requires every quality gate and all four platform archives, derives the tag
+from the workspace version, requires an annotated remote tag at the exact
+pinned source commit, and uses the scoped Secret Text credential
+`github-release-token`. It creates a draft, verifies every uploaded byte, and
+only then makes the Release public; published assets are immutable on reruns.
 
 ## Consumer protocol split
 
