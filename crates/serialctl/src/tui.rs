@@ -6349,6 +6349,10 @@ mod tests {
 
     #[test]
     fn trigger_lifecycle_projects_live_state_and_confirmed_fires() {
+        // The product defaults to Chinese, while this assertion deliberately
+        // verifies the stable English rendering. Serialize access to the
+        // process-global locale so parallel localization tests cannot race it.
+        let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
         let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
         let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Armed);
