@@ -2,7 +2,10 @@ use std::collections::VecDeque;
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use ratatui::style::{Color, Modifier, Style};
-use serial_protocol::{ActorKind, Direction, EventKind, TimelineEvent, TriggerStatus};
+use serial_protocol::{
+    ActorKind, Direction, ErrorCode, EventKind, GapReason, Role, SessionState, TargetActivity,
+    TimelineEvent, TriggerStatus,
+};
 use unicode_width::UnicodeWidthChar;
 
 use crate::i18n::{tr, trf};
@@ -1248,25 +1251,90 @@ fn event_kind_label(kind: EventKind) -> &'static str {
     }
 }
 
-/// Stable protocol spelling for one Trigger state in human-readable status
-/// output. Labels stay device-agnostic and intentionally do not infer a
-/// bootloader or flashing result from a matched literal.
+/// Localized, device-agnostic label for one Trigger state in human-readable
+/// output. It intentionally does not infer a bootloader or flashing result
+/// from a matched literal.
 pub fn trigger_status_label(status: TriggerStatus) -> &'static str {
     match status {
-        TriggerStatus::Armed => "armed",
-        TriggerStatus::WaitingForStart => "waiting_for_start",
-        TriggerStatus::Running => "running",
-        TriggerStatus::Stopping => "stopping",
-        TriggerStatus::Matched => "matched",
-        TriggerStatus::TimedOut => "timed_out",
-        TriggerStatus::MaxFiresReached => "max_fires_reached",
-        TriggerStatus::Cancelled => "cancelled",
-        TriggerStatus::ControlLost => "control_lost",
-        TriggerStatus::RunLost => "run_lost",
-        TriggerStatus::GenerationChanged => "generation_changed",
-        TriggerStatus::PortClosed => "port_closed",
-        TriggerStatus::WriteFailed => "write_failed",
-        TriggerStatus::RxGap => "rx_gap",
+        TriggerStatus::Armed => tr("trigger.status.armed"),
+        TriggerStatus::WaitingForStart => tr("trigger.status.waiting_for_start"),
+        TriggerStatus::Running => tr("trigger.status.running"),
+        TriggerStatus::Stopping => tr("trigger.status.stopping"),
+        TriggerStatus::Matched => tr("trigger.status.matched"),
+        TriggerStatus::TimedOut => tr("trigger.status.timed_out"),
+        TriggerStatus::MaxFiresReached => tr("trigger.status.max_fires_reached"),
+        TriggerStatus::Cancelled => tr("trigger.status.cancelled"),
+        TriggerStatus::ControlLost => tr("trigger.status.control_lost"),
+        TriggerStatus::RunLost => tr("trigger.status.run_lost"),
+        TriggerStatus::GenerationChanged => tr("trigger.status.generation_changed"),
+        TriggerStatus::PortClosed => tr("trigger.status.port_closed"),
+        TriggerStatus::WriteFailed => tr("trigger.status.write_failed"),
+        TriggerStatus::RxGap => tr("trigger.status.rx_gap"),
+    }
+}
+
+pub fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Observer => tr("role.observer"),
+        Role::Operator => tr("role.operator"),
+        Role::Admin => tr("role.admin"),
+    }
+}
+
+pub fn session_state_label(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Disabled => tr("state.disabled"),
+        SessionState::WaitingForPort => tr("state.waiting"),
+        SessionState::Opening => tr("state.opening"),
+        SessionState::Online => tr("state.online"),
+        SessionState::Backoff => tr("state.backoff"),
+        SessionState::Stopping => tr("state.stopping"),
+    }
+}
+
+pub fn target_activity_label(activity: TargetActivity) -> &'static str {
+    match activity {
+        TargetActivity::Active => tr("activity.active"),
+        TargetActivity::Silent => tr("activity.silent"),
+        TargetActivity::Unknown => tr("activity.unknown"),
+    }
+}
+
+pub fn gap_reason_label(reason: GapReason) -> &'static str {
+    match reason {
+        GapReason::EpochChanged => tr("gap.reason.epoch_changed"),
+        GapReason::RingEvicted => tr("gap.reason.ring_evicted"),
+        GapReason::Retention => tr("gap.reason.retention"),
+        GapReason::Corruption => tr("gap.reason.corruption"),
+        GapReason::LoggingFault => tr("gap.reason.logging_fault"),
+        GapReason::SequenceDiscontinuity => tr("gap.reason.sequence_discontinuity"),
+    }
+}
+
+pub fn error_code_label(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::BadRequest => tr("error.bad_request"),
+        ErrorCode::Unauthorized => tr("error.unauthorized"),
+        ErrorCode::Forbidden => tr("error.forbidden"),
+        ErrorCode::NotFound => tr("error.not_found"),
+        ErrorCode::Conflict => tr("error.conflict"),
+        ErrorCode::ControlRequired => tr("error.control_required"),
+        ErrorCode::StaleFence => tr("error.stale_fence"),
+        ErrorCode::PortOffline => tr("error.port_offline"),
+        ErrorCode::CursorAhead => tr("error.cursor_ahead"),
+        ErrorCode::ResourceExhausted => tr("error.resource_exhausted"),
+        ErrorCode::IdempotencyExpired => tr("error.idempotency_expired"),
+        ErrorCode::ConfigRevisionMismatch => tr("error.config_revision_mismatch"),
+        ErrorCode::ProfileChangeBusy => tr("error.profile_change_busy"),
+        ErrorCode::PortNotFound => tr("error.port_not_found"),
+        ErrorCode::PortBusy => tr("error.port_busy"),
+        ErrorCode::PortAccessDenied => tr("error.port_access_denied"),
+        ErrorCode::PortIo => tr("error.port_io"),
+        ErrorCode::BreakUnsupported => tr("error.break_unsupported"),
+        ErrorCode::RegexInvalid => tr("error.regex_invalid"),
+        ErrorCode::QueryBudgetExceeded => tr("error.query_budget_exceeded"),
+        ErrorCode::Unavailable => tr("error.unavailable"),
+        ErrorCode::Internal => tr("error.internal"),
     }
 }
 
@@ -1449,7 +1517,8 @@ fn system_event_text(event: &TimelineEvent) -> String {
         .get("message")
         .and_then(|value| value.as_str())
     {
-        return safe_inline(message);
+        let message = safe_inline(message);
+        return trf("d.event.detail", &[event_kind_label(event.kind), &message]);
     }
     if matches!(
         event.kind,
@@ -1476,7 +1545,8 @@ fn system_event_text(event: &TimelineEvent) -> String {
             .flatten()
             .and_then(|value| value.as_str())
             .map(safe_inline)
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .map(|value| trf("d.run.abort.reason", &[&value]));
         return [Some(title.to_string()), label, short_id, reason]
             .into_iter()
             .flatten()
@@ -1510,7 +1580,7 @@ fn system_event_text(event: &TimelineEvent) -> String {
                 |status| format!("{kind}: {}", trigger_status_label(status)),
             )
     } else {
-        format!("{:?}", event.kind)
+        event_kind_label(event.kind).to_string()
     }
 }
 
@@ -1713,7 +1783,8 @@ mod tests {
     }
 
     #[test]
-    fn trigger_status_uses_stable_protocol_spelling() {
+    fn trigger_status_is_localized() {
+        let _guard = crate::i18n::lang_test_lock();
         assert_eq!(
             trigger_status_label(TriggerStatus::WaitingForStart),
             "waiting_for_start"
@@ -1723,6 +1794,17 @@ mod tests {
             "max_fires_reached"
         );
         assert_eq!(trigger_status_label(TriggerStatus::RxGap), "rx_gap");
+
+        crate::i18n::set_lang(crate::i18n::Lang::Zh);
+        assert_eq!(
+            trigger_status_label(TriggerStatus::WaitingForStart),
+            "等待开始条件"
+        );
+        assert_eq!(
+            trigger_status_label(TriggerStatus::MaxFiresReached),
+            "已达到最大发送次数"
+        );
+        assert_eq!(trigger_status_label(TriggerStatus::RxGap), "接收历史缺失");
     }
 
     #[test]

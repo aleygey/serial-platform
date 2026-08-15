@@ -10,13 +10,13 @@ It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
-v0.6.1 makes fresh personal installations token-free on loopback, switches the
-terminal's default language to Chinese, reorganizes Help into scrollable task
-groups, and clarifies that ordinary Trigger kickoff/action calls omit the
-optional start gate. The current 18-tool MCP registry retains the persistent
-Monitor Jobs introduced in v0.5.0 and the ordinary serial/Run/Trigger
-operations. The unified launcher introduced in v0.4 remains: `serial serve`
-starts the backend,
+v0.6.2 isolates every MCP-owned Run with a private caller capability, records
+the human-readable purpose of confirmed Agent commands, and adds a bounded
+Run/command-purpose sidebar to the Chinese-first terminal. It also adds native
+macOS arm64/x86_64 packages to the Jenkins pipeline. The current 18-tool MCP
+registry retains the persistent Monitor Jobs introduced in v0.5.0 and the
+ordinary serial/Run/Trigger operations. The unified launcher introduced in
+v0.4 remains: `serial serve` starts the backend,
 `serial console` opens the TUI, `serial setup` configures a station,
 `serial profile ...` manages reusable profiles, `serial model ...` manages the
 DUT identity tree, and `serial mcp` starts the MCP adapter. The component
@@ -31,6 +31,27 @@ Protocol and integration references:
 - [Complete MCP/HTTP/WebSocket protocol](./docs/PROTOCOL.md)
 - [All MCP tool schemas and result contracts](./docs/MCP_TOOLS.md); inspect the
   installed executable directly with `serial mcp --dump-tools`.
+
+## v0.6.2 development highlights
+
+- `run_start` now returns a private `run_token` alongside the public audit
+  `run_id`. Every Run-scoped MCP action must present both, preventing another
+  LLM session sharing one long-lived adapter from accidentally adopting an old
+  visible Run. Active calls pin the Run; an abandoned Run is released after
+  the bounded idle period.
+- `command` requires a concise `description`. Confirmed or partially confirmed
+  TX events retain that purpose, while pre-write failures create no misleading
+  command-history record.
+- The terminal shows the current serial channel's recent Agent tasks and
+  command purposes in a right-hand panel. Operators can select a purpose and
+  expand only the bytes confirmed sent. The panel labels bounded/tail history
+  as recent rather than claiming completeness.
+- Profile selection is available directly through `Ctrl-] o`; left-drag
+  mouse-up copies immediately; the TUI and human-readable `doctor` output use
+  consistent Chinese terminology with an English switch.
+- Jenkins can build Debug or Release packages for Windows x86_64, Ubuntu 20.04
+  x86_64, macOS Apple Silicon, and macOS Intel. Debug archives are never
+  eligible for GitHub Release publishing.
 
 ## v0.6.1 release highlights
 
@@ -160,7 +181,7 @@ untouched, or use electrical isolation/reset gating.
 
 ## Install from a release
 
-Starting with the next release after v0.6.1, the Jenkins release pipeline can
+Starting with v0.6.2, the Jenkins release pipeline can
 provide four platform packages:
 
 - `serial-platform-<version>-windows-x86_64.zip` contains the unified
@@ -181,7 +202,7 @@ provide four platform packages:
   these command-line packages as unsigned and not notarized.
 
 Use every executable from the same release across the Windows host, Linux VM,
-and Mac. v0.6.1 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
+and Mac. v0.6.2 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
 peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
 and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
 protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
@@ -193,8 +214,8 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.6.1-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.6.1-linux-x86_64-ubuntu20.04
+tar -xzf serial-platform-v0.6.2-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.6.2-linux-x86_64-ubuntu20.04
 chmod +x serial serialctl serial-mcp
 ./serial --version
 ```
@@ -324,6 +345,8 @@ keys:
 | `Ctrl-] v` | Toggle compact/detailed timeline |
 | `Ctrl-] g` | Switch UI language and save it |
 | `Ctrl-] m` | Open the Profile / device-model / serial-settings / help menu |
+| `Ctrl-] o` | Open Profile selection directly; `Esc` returns to the extensible main menu |
+| `Ctrl-] h` | Focus/show Agent command-purpose history; press again while focused to hide it |
 | `Alt-Enter` | Send the current LINE command cooperatively without taking the Agent lease |
 | `Ctrl-] t` | Explicitly take over write control |
 | `Ctrl-] c` | Release control or cancel queued input |
@@ -345,11 +368,21 @@ view to live output. It does not quit `serialctl` or release Human Control.
 In RAW mode, Ctrl-D and Ctrl-Z are ordinary raw control bytes; they do not exit
 the local console or suspend its process.
 
+On terminals at least 110 columns wide, a bounded recent projection of the
+current Slot's Agent Run history appears on the right. It lists only Agent TX
+events carrying an explicit command purpose; ordinary Human/cooperative input
+and undescribed/raw writes are not guessed into the list. Initial attachment
+reads only a recent tail, and gaps or local eviction keep the panel marked as
+possibly incomplete. Use the persistent logs for complete history; historical
+sidebar backfill is not implemented yet. `Ctrl-] h` focuses the panel, Up/Down
+chooses a command purpose, and Enter/Right expands only that command's
+confirmed TX bytes. Narrow terminals show the same panel as an on-demand popup.
+
 Mouse capture is on by default. The wheel scrolls only the serial-output
 viewport; clicking the output or input pane changes focus; output left-drag
-selects without `Shift`; releasing the left button resumes live output while
-retaining the selected text; and output right-click copies that retained
-selection. A missing mouse-up event is finalized after five seconds, so a
+selects without `Shift`; mouse-up automatically copies the selected text and
+resumes live output; and output right-click repeats that retained copy.
+A missing mouse-up event is finalized after five seconds, so a
 selection can never silently pin the live viewport indefinitely.
 On Windows, input right-click pastes from the native Unicode clipboard.
 `Ctrl+Shift+V` remains the portable paste path, including Ubuntu. Linux output
@@ -552,9 +585,10 @@ shell commands around `serialctl`. OpenCode exposes the tools as
 `serial_devices`, `serial_command`, and so on. Codex exposes the same tools in
 the configured `serial` MCP namespace.
 
-Ordinary calls expose only task-level inputs; the adapter owns
-request/operation IDs, control fences, capture cursors, prompt selection,
-bounded rendering, and lease renewal. Compact results keep the main evidence
+Ordinary calls expose only task-level inputs plus the private Run capability
+returned by `run_start`; the adapter owns request/operation IDs, control
+fences, capture cursors, prompt selection, bounded rendering, and lease
+renewal. Compact results keep the main evidence
 (`text`, completion/confidence, warnings, and one continuation cursor) while
 internal audit identifiers remain in the authoritative timeline. Model names
 remain assertions: the Agent must confirm the physical DUT through serial,
@@ -607,20 +641,29 @@ expires. A confirmed Trigger TX therefore does not prove that the target
 action either succeeded or failed.
 
 `serial_command` requires a Run previously created by this `serial-mcp`
-process. Every Agent write carries that Run ID; inside the same serialized Slot
-actor that validates the control lease/fence, `seriald` rejects a missing,
-changed, or foreign-owned Run before pacing-budget calculation or physical
-write. Ordinary Human and legacy non-cooperative clients may omit this optional
-boundary and retain lease-only writes. A Run isolates only its log/event interval—it does not reset,
-initialize, or otherwise clean the device.
+process and a concise command-purpose description. `run_start` returns its
+public audit `run_id` plus an unpredictable private `run_token`; every
+Run-scoped MCP call must present both, and an Agent must not adopt a visible
+active Run from status. Inside the same serialized Slot actor that validates
+the control lease/fence, `seriald` rejects a missing, changed, or foreign-owned
+Run before pacing-budget calculation or physical write. Ordinary Human and
+legacy non-cooperative clients may omit this optional wire boundary and retain
+lease-only writes. A Run isolates only its log/event interval—it does not
+reset, initialize, or otherwise clean the device.
 
-The adapter renews control only for Runs it currently owns. A lost connection
-or failed renewal forgets all owned Run state and never reacquires control to
-continue writing outside the old boundary. Successful `run_end` stops renewal
-and immediately attempts a best-effort release; release failure cannot undo the
-ended Run, and an unacknowledged lease expires by its TTL. A later explicit
-`release` is idempotent when this adapter process has no local lease. None of
-these operations closes `seriald`'s physical port.
+The adapter renews control only for Runs it currently owns. A Run-scoped call
+pins its Run for that call's full lifetime; after the last call returns, 60
+seconds without activity causes the adapter to release control and abort the
+abandoned Run at its next renewal tick. A lost connection or failed renewal
+forgets all owned Run state and never reacquires control to continue writing
+outside the old boundary. Successful `run_end` stops renewal and immediately
+attempts a best-effort release; release failure cannot undo the ended Run, and
+an unacknowledged lease expires by its TTL. A later explicit `release` checks
+process-local lease ownership inside the per-Slot lock. With no local lease it
+is idempotent even if status shows another client's active Run; it never asks
+for that foreign Run's token or interferes with it. Only aborting this MCP's
+matching active Run requires its private pair. None of these operations closes
+`seriald`'s physical port.
 
 Agent searches remain Run-scoped while paging: a `truncated` `current_run`
 result returns the same `run_id` plus an exact `epoch`/`after_seq` continuation,
@@ -635,7 +678,12 @@ Ctrl-C (`0x03`), Ctrl-D (`0x04`), Ctrl-Z (`0x1a`), or a physical serial Break
 with a bounded duration. Break is a UART line condition rather than an encoded
 byte and is still fenced, Run-bound, and audited.
 
-MCP requests may run concurrently, but cancellation applies only to the
+MCP requests may run concurrently. Physical mutations targeting the same Slot
+are deliberately serialized in arrival order; independent Slots can progress
+concurrently. `command` therefore remains a single-command tool instead of
+embedding a partly-successful batch protocol. A future batch tool, if needed,
+must define per-item descriptions, timeouts, retry identities, stop-on-error,
+and partial-result semantics explicitly. Cancellation applies only to the
 read-only observations `devices`, `device_models`, `read`, `wait`, `search`,
 `monitor_list`, `monitor_status`, and `monitor_incidents`. Once a mutating
 tool may have crossed a serial/Run/Control side-effect boundary, the adapter

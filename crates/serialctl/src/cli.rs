@@ -15,7 +15,8 @@ use crate::{
     api::ApiClient,
     config::{self, LoadedConfig},
     display::{
-        format_event_plain, format_wall_time_local, pad_display, safe_inline, trigger_status_label,
+        format_event_plain, format_wall_time_local, gap_reason_label, pad_display, role_label,
+        safe_inline, session_state_label, target_activity_label, trigger_status_label,
     },
     i18n::{self, Lang, tr, trf},
     model,
@@ -318,10 +319,10 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
             .map(|lease| lease.owner.label.as_str())
             .unwrap_or("-");
         println!(
-            "{} {:<10?} {:<8?} {} {:>7} baud  {}",
+            "{} {:<10} {:<8} {} {:>7} baud  {}",
             pad_display(&safe_inline(&slot.config.display_name), 16),
-            slot.session_state,
-            slot.target_activity,
+            session_state_label(slot.session_state),
+            target_activity_label(slot.target_activity),
             pad_display(&safe_inline(&slot.config.port), 8),
             baud_rate,
             trf("m.status.control", &[&safe_inline(control)])
@@ -604,7 +605,7 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
                 &[
                     &gap.first_seq.to_string(),
                     &gap.last_seq.to_string(),
-                    &format!("{:?}", gap.reason),
+                    gap_reason_label(gap.reason),
                     &gap.epoch.to_string(),
                 ]
             )
@@ -987,7 +988,7 @@ async fn run_setup(
             .await
             .context(tr("i.role.fail"))?;
         if daily_role != serial_protocol::Role::Operator {
-            bail!(trf("i.role.wrong", &[&format!("{daily_role:?}")]));
+            bail!(trf("i.role.wrong", &[role_label(daily_role)]));
         }
         Some(token)
     } else {
@@ -1013,10 +1014,10 @@ async fn run_setup(
         );
         for slot in &configured.slots {
             println!(
-                "  {} → {} ({:?})",
+                "  {} → {} ({})",
                 safe_inline(&slot.config.display_name),
                 safe_inline(&slot.config.port),
-                slot.session_state
+                session_state_label(slot.session_state)
             );
         }
     }

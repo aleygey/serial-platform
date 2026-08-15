@@ -7,13 +7,14 @@ use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceProfile, Direction,
     ErrorCode, EventKind, FlowControl, LoggingState, MAX_BREAK_DURATION_MS,
-    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
-    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
-    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo, RunStatus, SerialSettings,
-    SessionState, SlotConfig, SlotSnapshot, StopBits, TargetActivity, TimelineEvent,
-    TransportProfile, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
-    apply_transport_profile, resolve_device_settings, resolve_transport_settings,
+    MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
+    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
+    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
+    MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS, MIN_TRIGGER_INTERVAL_MS,
+    MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo, RunStatus, SerialSettings, SessionState, SlotConfig,
+    SlotSnapshot, StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo,
+    TriggerSpec, TriggerStatus, WritePacing, apply_transport_profile, resolve_device_settings,
+    resolve_transport_settings,
 };
 #[cfg(windows)]
 use serialport::COMPort;
@@ -146,6 +147,10 @@ pub enum SlotError {
     WriteTooLarge,
     #[error("serial write must contain at least one byte")]
     EmptyWrite,
+    #[error(
+        "command description must be non-empty, trimmed, at most {MAX_COMMAND_DESCRIPTION_BYTES} UTF-8 bytes, and contain no control characters"
+    )]
+    InvalidCommandDescription,
     #[error(
         "serial write pacing requires an estimated {required_ms} ms, exceeding the {maximum_ms} ms request limit; increase chunk_size, reduce chunk_delay_ms, or split the write (no bytes were written)"
     )]
@@ -489,6 +494,7 @@ impl SlotHandle {
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        description: Option<String>,
         cooperative: bool,
     ) -> Result<CommandResult, SlotError> {
         if data.len() > MAX_WRITE_BYTES {
@@ -503,6 +509,7 @@ impl SlotHandle {
             operation_id,
             expected_run_id,
             pacing,
+            description,
             cooperative,
             reply,
         })
@@ -804,6 +811,7 @@ enum SlotCommand {
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        description: Option<String>,
         cooperative: bool,
         reply: Reply,
     },
@@ -1841,6 +1849,7 @@ impl SlotActor {
                 operation_id,
                 expected_run_id,
                 pacing,
+                description,
                 cooperative,
                 ..
             } => {
@@ -1910,10 +1919,8 @@ impl SlotActor {
                     message: "serial writer stopped before confirming the outcome; the physical write may have occurred".into(),
                 })?;
                 let event_seq = if outcome.written > 0 {
-                    let mut event_metadata = metadata([
-                        ("partial", json!(outcome.written != total)),
-                        ("cooperative", json!(cooperative)),
-                    ]);
+                    let mut event_metadata =
+                        write_event_metadata(outcome.written != total, cooperative, description);
                     if cooperative && let Some(run) = self.active_run.as_ref() {
                         event_metadata.insert("interfered_run_id".into(), json!(run.id));
                         event_metadata.insert(
@@ -3643,6 +3650,7 @@ enum SlotRequest {
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
+        description: Option<String>,
         cooperative: bool,
     },
     SendBreak {
@@ -3701,6 +3709,10 @@ enum SlotRequest {
 impl SlotRequest {
     fn validate_business_fields(&self) -> Result<(), SlotError> {
         match self {
+            Self::Write {
+                description: Some(description),
+                ..
+            } => validate_command_description(description),
             Self::StartRun {
                 label, metadata, ..
             } => {
@@ -3741,6 +3753,7 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 pacing,
+                description,
                 cooperative,
                 ..
             } => Some(
@@ -3750,6 +3763,7 @@ impl SlotRequest {
                     operation_id,
                     expected_run_id,
                     pacing,
+                    description,
                     cooperative,
                 ))
                 .expect("write request fields are serializable"),
@@ -3861,6 +3875,7 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 pacing,
+                description,
                 cooperative,
             } => serde_json::to_vec(&(
                 "write",
@@ -3871,6 +3886,7 @@ impl SlotRequest {
                 operation_id,
                 expected_run_id,
                 pacing,
+                description,
                 cooperative,
             )),
             Self::StartTrigger {
@@ -4026,6 +4042,33 @@ fn validate_label(label: &str) -> Result<(), SlotError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_command_description(description: &str) -> Result<(), SlotError> {
+    if description.is_empty()
+        || description != description.trim()
+        || description.len() > MAX_COMMAND_DESCRIPTION_BYTES
+        || description.chars().any(char::is_control)
+    {
+        Err(SlotError::InvalidCommandDescription)
+    } else {
+        Ok(())
+    }
+}
+
+fn write_event_metadata(
+    partial: bool,
+    cooperative: bool,
+    description: Option<String>,
+) -> BTreeMap<String, Value> {
+    let mut event_metadata = metadata([
+        ("partial", json!(partial)),
+        ("cooperative", json!(cooperative)),
+    ]);
+    if let Some(description) = description {
+        event_metadata.insert("command_description".into(), json!(description));
+    }
+    event_metadata
 }
 
 fn profile_change_requires_idle(
@@ -4293,6 +4336,7 @@ impl SlotCommand {
                 operation_id,
                 expected_run_id,
                 pacing,
+                description,
                 cooperative,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
@@ -4304,6 +4348,7 @@ impl SlotCommand {
                     operation_id,
                     expected_run_id,
                     pacing,
+                    description,
                     cooperative,
                 },
                 reply,
@@ -6159,6 +6204,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            description: None,
             cooperative: false,
         };
         let same = SlotRequest::Write {
@@ -6169,6 +6215,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            description: None,
             cooperative: false,
         };
         let different = SlotRequest::Write {
@@ -6179,6 +6226,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            description: None,
             cooperative: false,
         };
         assert_eq!(first.fingerprint(), same.fingerprint());
@@ -6201,6 +6249,7 @@ mod tests {
             operation_id: None,
             expected_run_id: None,
             pacing: None,
+            description: None,
             cooperative: false,
         };
         let paced = SlotRequest::Write {
@@ -6214,9 +6263,71 @@ mod tests {
                 chunk_size: 1,
                 chunk_delay_ms: 5,
             }),
+            description: None,
             cooperative: false,
         };
         assert_ne!(unpaced.write_fingerprint(), paced.write_fingerprint());
+    }
+
+    #[test]
+    fn command_description_is_validated_and_bound_to_write_idempotency() {
+        let actor = Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Agent,
+        };
+        let operation_id = Some(Uuid::new_v4());
+        let control_id = Uuid::new_v4();
+        let request = |description: Option<&str>| SlotRequest::Write {
+            actor: actor.clone(),
+            control_id,
+            fence: 7,
+            data: b"cat /proc/meminfo\r".to_vec(),
+            operation_id,
+            expected_run_id: None,
+            pacing: None,
+            description: description.map(str::to_string),
+            cooperative: false,
+        };
+
+        assert!(request(None).validate_business_fields().is_ok());
+        assert!(
+            request(Some("查看样机内存"))
+                .validate_business_fields()
+                .is_ok()
+        );
+        for invalid in ["", " 前导空格", "尾随空格 ", "包含\n换行"] {
+            assert_eq!(
+                request(Some(invalid)).validate_business_fields(),
+                Err(SlotError::InvalidCommandDescription)
+            );
+        }
+        let oversized = "界".repeat(MAX_COMMAND_DESCRIPTION_BYTES / "界".len() + 1);
+        assert_eq!(
+            request(Some(&oversized)).validate_business_fields(),
+            Err(SlotError::InvalidCommandDescription)
+        );
+
+        assert_ne!(
+            request(Some("查看样机内存")).write_fingerprint(),
+            request(Some("查看样机负载")).write_fingerprint()
+        );
+        assert_ne!(
+            request(Some("查看样机内存")).fingerprint(),
+            request(Some("查看样机负载")).fingerprint()
+        );
+    }
+
+    #[test]
+    fn confirmed_tx_metadata_retains_only_an_explicit_command_description() {
+        let described = write_event_metadata(false, false, Some("查看样机内存".into()));
+        assert_eq!(described["command_description"], json!("查看样机内存"));
+        assert_eq!(described["partial"], json!(false));
+        assert_eq!(described["cooperative"], json!(false));
+
+        let legacy = write_event_metadata(true, false, None);
+        assert!(!legacy.contains_key("command_description"));
+        assert_eq!(legacy["partial"], json!(true));
     }
 
     #[test]
@@ -6237,6 +6348,7 @@ mod tests {
             operation_id: None,
             expected_run_id,
             pacing: None,
+            description: None,
             cooperative: false,
         };
         assert_ne!(
@@ -6329,6 +6441,7 @@ mod tests {
             operation_id: Some(Uuid::new_v4()),
             expected_run_id: Some(run.id),
             pacing: None,
+            description: None,
             cooperative: true,
         };
         assert!(
@@ -6382,6 +6495,7 @@ mod tests {
             operation_id,
             expected_run_id: Some(expected_run_id),
             pacing: None,
+            description: None,
             cooperative: true,
         };
 
@@ -6411,6 +6525,7 @@ mod tests {
             operation_id,
             expected_run_id: None,
             pacing: None,
+            description: Some("重启样机".into()),
             cooperative: false,
         };
         let reconnected = SlotRequest::Write {
@@ -6425,6 +6540,7 @@ mod tests {
             operation_id,
             expected_run_id: None,
             pacing: None,
+            description: Some("重启样机".into()),
             cooperative: false,
         };
 

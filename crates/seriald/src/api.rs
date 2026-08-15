@@ -1380,6 +1380,7 @@ async fn dispatch_slot_command(
             operation_id,
             expected_run_id,
             pacing,
+            description,
             cooperative,
             ..
         } => {
@@ -1393,6 +1394,7 @@ async fn dispatch_slot_command(
                     operation_id,
                     expected_run_id,
                     pacing,
+                    description,
                     cooperative,
                 )
                 .await?
@@ -1718,6 +1720,7 @@ impl WsError {
                 SlotError::BreakFailed { .. } => (ErrorCode::PortIo, false),
                 SlotError::WriteTooLarge
                 | SlotError::EmptyWrite
+                | SlotError::InvalidCommandDescription
                 | SlotError::WriteDeadlineExceeded { .. }
                 | SlotError::InvalidBreakDuration
                 | SlotError::InvalidTriggerAction

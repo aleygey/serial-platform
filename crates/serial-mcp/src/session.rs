@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -17,8 +20,14 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type RenewalPlan = (Vec<String>, Vec<(String, ControlLease)>);
 const LEASE_TTL_MS: u64 = 60_000;
 const RENEW_INTERVAL: Duration = Duration::from_secs(20);
+/// An owned Run is not renewed forever merely because the MCP adapter process
+/// remains alive. Tool calls pin the Run while they are active; after the last
+/// pin is dropped, this deadline bounds how long an abandoned LLM session can
+/// continue occupying the physical Slot.
+const RUN_IDLE_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_SERVICE_MARGIN: Duration = Duration::from_secs(5);
 /// seriald caps one physical write at 15 seconds. The adapter must not call a
@@ -43,15 +52,70 @@ pub(crate) fn ensure_welcome_protocol(protocol_version: u16) -> Result<()> {
 #[derive(Clone)]
 pub struct SessionHandle {
     tx: mpsc::Sender<SessionRequest>,
+    lifecycle_tx: mpsc::UnboundedSender<RunLifecycle>,
+}
+
+/// Capability returned only to the caller that successfully started the Run.
+///
+/// `run_id` remains public audit identity in seriald snapshots. `run_token` is
+/// deliberately MCP-local and must never be copied into Run metadata, the
+/// serial timeline, or `devices` output.
+pub struct StartedRun {
+    pub run: RunInfo,
+    pub run_token: Uuid,
+}
+
+/// Process-local ownership known by the serialized MCP control session.
+///
+/// Public daemon snapshots cannot answer whether a lease belongs to this MCP
+/// connection, so release planning must use this state instead of inferring
+/// ownership from a visible Run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalControlState {
+    pub has_lease: bool,
+    pub owned_run_id: Option<Uuid>,
+}
+
+/// Keeps an authorized Run alive for the complete lifetime of one tool call.
+/// Dropping a cancelled or failed tool future releases the pin as well.
+pub struct RunUseGuard {
+    lifecycle_tx: mpsc::UnboundedSender<RunLifecycle>,
+    slot_id: String,
+    run_id: Uuid,
+}
+
+impl Drop for RunUseGuard {
+    fn drop(&mut self) {
+        let _ = self.lifecycle_tx.send(RunLifecycle::EndUse {
+            slot_id: self.slot_id.clone(),
+            run_id: self.run_id,
+        });
+    }
+}
+
+enum RunLifecycle {
+    EndUse { slot_id: String, run_id: Uuid },
 }
 
 enum SessionRequest {
+    LocalControlState {
+        slot_id: String,
+        reply: Reply,
+    },
+    BeginRunUse {
+        slot_id: String,
+        run_id: Uuid,
+        run_token: Uuid,
+        reply: Reply,
+    },
     Write {
         slot_id: String,
         data: Vec<u8>,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         effective_pacing: WritePacing,
+        description: Option<String>,
         reply: Reply,
     },
     SendBreak {
@@ -59,6 +123,7 @@ enum SessionRequest {
         duration_ms: u64,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         reply: Reply,
     },
     TriggerStart {
@@ -67,6 +132,7 @@ enum SessionRequest {
         generation: u64,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         spec: TriggerSpec,
         reply: Reply,
     },
@@ -83,11 +149,13 @@ enum SessionRequest {
         generation: u64,
         trigger_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         reply: Reply,
     },
     RunOwnership {
         slot_id: String,
         run_id: Uuid,
+        run_token: Uuid,
         reply: Reply,
     },
     StartRun {
@@ -100,11 +168,14 @@ enum SessionRequest {
     EndRun {
         slot_id: String,
         run_id: Uuid,
+        run_token: Uuid,
         reply: Reply,
     },
     Release {
         slot_id: String,
         abort_run: bool,
+        run_capability: Option<(Uuid, Uuid)>,
+        allow_stale_cleanup: bool,
         reply: Reply,
     },
 }
@@ -115,10 +186,12 @@ type Reply = oneshot::Sender<std::result::Result<SessionResponse, String>>;
 // protocol values inline avoids an allocation on every session RPC.
 #[allow(clippy::large_enum_variant)]
 enum SessionResponse {
+    LocalControlState(LocalControlState),
     Write { event_seq: u64 },
     Break { event_seq: u64 },
     Trigger(TriggerInfo),
     Run(RunInfo),
+    RunStarted(StartedRun),
     Released { had_lease: bool },
     RunOwnership { retained: bool },
 }
@@ -126,20 +199,72 @@ enum SessionResponse {
 impl SessionHandle {
     pub fn spawn(endpoint: String, token: Option<String>, actor_label: String) -> Self {
         let (tx, rx) = mpsc::channel(32);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_session(
             SessionState::new(endpoint, token, actor_label),
             rx,
+            lifecycle_rx,
         ));
-        Self { tx }
+        Self { tx, lifecycle_tx }
     }
 
+    pub async fn local_control_state(&self, slot_id: String) -> Result<LocalControlState> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::LocalControlState { slot_id, reply })
+            .await
+            .context("serial session task stopped")?;
+        match receive(response).await? {
+            SessionResponse::LocalControlState(state) => Ok(state),
+            _ => bail!("serial session returned the wrong response type"),
+        }
+    }
+
+    /// Validates the private Run capability before a caller waits on the
+    /// per-Slot write lock, then pins the Run until the returned guard drops.
+    /// Every physical action validates the same capability again inside the
+    /// serialized Session actor, closing validation/action races.
+    pub async fn authorize_run_use(
+        &self,
+        slot_id: String,
+        run_id: Uuid,
+        run_token: Uuid,
+    ) -> Result<RunUseGuard> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::BeginRunUse {
+                slot_id: slot_id.clone(),
+                run_id,
+                run_token,
+                reply,
+            })
+            .await
+            .context("serial session task stopped")?;
+        match receive(response).await? {
+            SessionResponse::RunOwnership { retained: true } => Ok(RunUseGuard {
+                lifecycle_tx: self.lifecycle_tx.clone(),
+                slot_id,
+                run_id,
+            }),
+            SessionResponse::RunOwnership { retained: false } => {
+                bail!("serial session rejected an invalid Run capability")
+            }
+            _ => bail!("serial session returned the wrong response type"),
+        }
+    }
+
+    // Mirrors the complete serial write boundary; grouping these values would
+    // obscure which capability and audit fields cross the Session actor.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write(
         &self,
         slot_id: String,
         data: Vec<u8>,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         effective_pacing: WritePacing,
+        description: Option<String>,
     ) -> Result<WriteResult> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -148,7 +273,9 @@ impl SessionHandle {
                 data,
                 operation_id,
                 expected_run_id,
+                run_token,
                 effective_pacing,
+                description,
                 reply,
             })
             .await
@@ -159,13 +286,13 @@ impl SessionHandle {
         }
     }
 
-    pub async fn start_run(
+    pub async fn start_run_with_token(
         &self,
         slot_id: String,
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
         control_wait: Duration,
-    ) -> Result<RunInfo> {
+    ) -> Result<StartedRun> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(SessionRequest::StartRun {
@@ -178,7 +305,7 @@ impl SessionHandle {
             .await
             .context("serial session task stopped")?;
         match receive(response).await? {
-            SessionResponse::Run(run) => Ok(run),
+            SessionResponse::RunStarted(started) => Ok(started),
             _ => bail!("serial session returned the wrong response type"),
         }
     }
@@ -189,6 +316,7 @@ impl SessionHandle {
         duration_ms: u64,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
     ) -> Result<WriteResult> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -197,6 +325,7 @@ impl SessionHandle {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                run_token,
                 reply,
             })
             .await
@@ -207,6 +336,7 @@ impl SessionHandle {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn trigger_start(
         &self,
         slot_id: String,
@@ -214,6 +344,7 @@ impl SessionHandle {
         generation: u64,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         spec: TriggerSpec,
     ) -> Result<TriggerInfo> {
         let (reply, response) = oneshot::channel();
@@ -224,6 +355,7 @@ impl SessionHandle {
                 generation,
                 operation_id,
                 expected_run_id,
+                run_token,
                 spec,
                 reply,
             })
@@ -266,6 +398,7 @@ impl SessionHandle {
         generation: u64,
         trigger_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
     ) -> Result<TriggerInfo> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -275,6 +408,7 @@ impl SessionHandle {
                 generation,
                 trigger_id,
                 expected_run_id,
+                run_token,
                 reply,
             })
             .await
@@ -285,12 +419,18 @@ impl SessionHandle {
         }
     }
 
-    pub async fn run_ownership_retained(&self, slot_id: String, run_id: Uuid) -> Result<bool> {
+    pub async fn run_ownership_retained(
+        &self,
+        slot_id: String,
+        run_id: Uuid,
+        run_token: Uuid,
+    ) -> Result<bool> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(SessionRequest::RunOwnership {
                 slot_id,
                 run_id,
+                run_token,
                 reply,
             })
             .await
@@ -301,12 +441,13 @@ impl SessionHandle {
         }
     }
 
-    pub async fn end_run(&self, slot_id: String, run_id: Uuid) -> Result<RunInfo> {
+    pub async fn end_run(&self, slot_id: String, run_id: Uuid, run_token: Uuid) -> Result<RunInfo> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(SessionRequest::EndRun {
                 slot_id,
                 run_id,
+                run_token,
                 reply,
             })
             .await
@@ -317,12 +458,20 @@ impl SessionHandle {
         }
     }
 
-    pub async fn release(&self, slot_id: String, abort_run: bool) -> Result<bool> {
+    pub async fn release(
+        &self,
+        slot_id: String,
+        abort_run: bool,
+        run_capability: Option<(Uuid, Uuid)>,
+        allow_stale_cleanup: bool,
+    ) -> Result<bool> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(SessionRequest::Release {
                 slot_id,
                 abort_run,
+                run_capability,
+                allow_stale_cleanup,
                 reply,
             })
             .await
@@ -347,7 +496,11 @@ async fn receive(
         .map_err(anyhow::Error::msg)
 }
 
-async fn run_session(mut state: SessionState, mut rx: mpsc::Receiver<SessionRequest>) {
+async fn run_session(
+    mut state: SessionState,
+    mut rx: mpsc::Receiver<SessionRequest>,
+    mut lifecycle_rx: mpsc::UnboundedReceiver<RunLifecycle>,
+) {
     let mut renew = tokio::time::interval(RENEW_INTERVAL);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -357,11 +510,36 @@ async fn run_session(mut state: SessionState, mut rx: mpsc::Receiver<SessionRequ
             // remaining lease lifetime.
             biased;
             _ = renew.tick() => state.renew_all().await,
+            Some(RunLifecycle::EndUse { slot_id, run_id }) = lifecycle_rx.recv() => {
+                state.end_run_use(&slot_id, run_id);
+            }
             request = rx.recv() => {
                 let Some(request) = request else { break; };
                 state.handle(request).await;
             }
         }
+    }
+}
+
+struct OwnedRun {
+    id: Uuid,
+    token: Uuid,
+    active_uses: u32,
+    idle_since: Instant,
+}
+
+impl OwnedRun {
+    fn new(id: Uuid, token: Uuid, now: Instant) -> Self {
+        Self {
+            id,
+            token,
+            active_uses: 0,
+            idle_since: now,
+        }
+    }
+
+    fn idle_expired(&self, now: Instant) -> bool {
+        self.active_uses == 0 && now.saturating_duration_since(self.idle_since) >= RUN_IDLE_TTL
     }
 }
 
@@ -373,7 +551,7 @@ struct SessionState {
     actor: Option<Actor>,
     role: Option<Role>,
     leases: HashMap<String, ControlLease>,
-    owned_runs: HashMap<String, Uuid>,
+    owned_runs: HashMap<String, OwnedRun>,
 }
 
 impl SessionState {
@@ -392,12 +570,30 @@ impl SessionState {
 
     async fn handle(&mut self, request: SessionRequest) {
         match request {
+            SessionRequest::LocalControlState { slot_id, reply } => {
+                let state = self.local_control_state(&slot_id);
+                send_reply(reply, Ok(SessionResponse::LocalControlState(state)));
+            }
+            SessionRequest::BeginRunUse {
+                slot_id,
+                run_id,
+                run_token,
+                reply,
+            } => {
+                let result = self
+                    .begin_run_use(&slot_id, run_id, run_token)
+                    .await
+                    .map(|()| SessionResponse::RunOwnership { retained: true });
+                send_reply(reply, result);
+            }
             SessionRequest::Write {
                 slot_id,
                 data,
                 operation_id,
                 expected_run_id,
+                run_token,
                 effective_pacing,
+                description,
                 reply,
             } => {
                 let result = self
@@ -406,7 +602,9 @@ impl SessionState {
                         data,
                         operation_id,
                         expected_run_id,
+                        run_token,
                         effective_pacing,
+                        description,
                     )
                     .await
                     .map(|event_seq| SessionResponse::Write { event_seq });
@@ -422,7 +620,7 @@ impl SessionState {
                 let result = self
                     .start_run(slot_id, label, metadata, control_wait)
                     .await
-                    .map(SessionResponse::Run);
+                    .map(SessionResponse::RunStarted);
                 send_reply(reply, result);
             }
             SessionRequest::SendBreak {
@@ -430,10 +628,17 @@ impl SessionState {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                run_token,
                 reply,
             } => {
                 let result = self
-                    .send_break(slot_id, duration_ms, operation_id, expected_run_id)
+                    .send_break(
+                        slot_id,
+                        duration_ms,
+                        operation_id,
+                        expected_run_id,
+                        run_token,
+                    )
                     .await
                     .map(|event_seq| SessionResponse::Break { event_seq });
                 send_reply(reply, result);
@@ -444,6 +649,7 @@ impl SessionState {
                 generation,
                 operation_id,
                 expected_run_id,
+                run_token,
                 spec,
                 reply,
             } => {
@@ -454,6 +660,7 @@ impl SessionState {
                         generation,
                         operation_id,
                         expected_run_id,
+                        run_token,
                         spec,
                     )
                     .await
@@ -479,6 +686,7 @@ impl SessionState {
                 generation,
                 trigger_id,
                 expected_run_id,
+                run_token,
                 reply,
             } => {
                 let result = self
@@ -488,6 +696,7 @@ impl SessionState {
                         generation,
                         trigger_id,
                         expected_run_id,
+                        run_token,
                     )
                     .await
                     .map(SessionResponse::Trigger);
@@ -496,23 +705,25 @@ impl SessionState {
             SessionRequest::RunOwnership {
                 slot_id,
                 run_id,
+                run_token,
                 reply,
             } => {
-                let retained = retains_run_ownership(
-                    self.socket.is_some(),
-                    self.owned_runs.get(&slot_id).copied(),
-                    self.leases.contains_key(&slot_id),
-                    run_id,
-                );
+                let retained = self.socket.is_some()
+                    && self.leases.contains_key(&slot_id)
+                    && self
+                        .owned_runs
+                        .get(&slot_id)
+                        .is_some_and(|owned| owned.id == run_id && owned.token == run_token);
                 send_reply(reply, Ok(SessionResponse::RunOwnership { retained }));
             }
             SessionRequest::EndRun {
                 slot_id,
                 run_id,
+                run_token,
                 reply,
             } => {
                 let result = self
-                    .end_run(slot_id, run_id)
+                    .end_run(slot_id, run_id, run_token)
                     .await
                     .map(SessionResponse::Run);
                 send_reply(reply, result);
@@ -520,15 +731,95 @@ impl SessionState {
             SessionRequest::Release {
                 slot_id,
                 abort_run,
+                run_capability,
+                allow_stale_cleanup,
                 reply,
             } => {
                 let result = self
-                    .release(slot_id, abort_run)
+                    .release(slot_id, abort_run, run_capability, allow_stale_cleanup)
                     .await
                     .map(|had_lease| SessionResponse::Released { had_lease });
                 send_reply(reply, result);
             }
         }
+    }
+
+    fn local_control_state(&self, slot_id: &str) -> LocalControlState {
+        LocalControlState {
+            has_lease: self.leases.contains_key(slot_id),
+            owned_run_id: self.owned_runs.get(slot_id).map(|run| run.id),
+        }
+    }
+
+    async fn begin_run_use(&mut self, slot_id: &str, run_id: Uuid, run_token: Uuid) -> Result<()> {
+        let now = Instant::now();
+        let Some(owned) = self.owned_runs.get(slot_id) else {
+            bail!(
+                "serial-mcp does not own an active Run on Slot {slot_id:?}; call run_start and \
+                 use the returned run_id/run_token"
+            );
+        };
+        if owned.id != run_id || owned.token != run_token {
+            bail!(
+                "invalid Run capability for Slot {slot_id:?}; run_id/run_token must come from \
+                 this caller's successful run_start response"
+            );
+        }
+        if owned.idle_expired(now) {
+            // Do not let a late caller resurrect an abandoned Run between the
+            // exact idle deadline and the next periodic renewal tick.
+            self.best_effort_release(slot_id).await;
+            bail!(
+                "Run {run_id} on Slot {slot_id:?} exceeded the {} second MCP idle limit and was \
+                 released; start a new Run",
+                RUN_IDLE_TTL.as_secs()
+            );
+        }
+        let owned = self
+            .owned_runs
+            .get_mut(slot_id)
+            .expect("validated owned Run remains present");
+        owned.active_uses = owned
+            .active_uses
+            .checked_add(1)
+            .context("too many concurrent tool calls pin this Run")?;
+        Ok(())
+    }
+
+    fn end_run_use(&mut self, slot_id: &str, run_id: Uuid) {
+        let Some(owned) = self.owned_runs.get_mut(slot_id) else {
+            return;
+        };
+        // A delayed guard from a terminal old Run must not mutate the idle
+        // state of a newly-started Run on the same Slot.
+        if owned.id != run_id || owned.active_uses == 0 {
+            return;
+        }
+        owned.active_uses -= 1;
+        if owned.active_uses == 0 {
+            owned.idle_since = Instant::now();
+        }
+    }
+
+    fn validate_run_capability(
+        &self,
+        slot_id: &str,
+        run_id: Uuid,
+        run_token: Uuid,
+    ) -> Result<&OwnedRun> {
+        let Some(owned) = self.owned_runs.get(slot_id) else {
+            bail!(
+                "serial-mcp does not own an active Run on Slot {slot_id:?}; call run_start and \
+                 use the returned run_id/run_token; no bytes were written"
+            );
+        };
+        if owned.id != run_id || owned.token != run_token {
+            bail!(
+                "invalid Run capability for Slot {slot_id:?}; run_id/run_token must come from \
+                 this caller's successful run_start response; no bytes were written"
+            );
+        }
+        Ok(owned)
     }
 
     async fn connect(&mut self) -> Result<()> {
@@ -700,18 +991,9 @@ impl SessionState {
         &mut self,
         slot_id: &str,
         expected_run_id: Uuid,
+        run_token: Uuid,
     ) -> Result<ControlLease> {
-        match self.owned_runs.get(slot_id) {
-            Some(run_id) if *run_id == expected_run_id => {}
-            Some(run_id) => bail!(
-                "serial-mcp owns Run {run_id} on Slot {slot_id:?}, not expected Run \
-                 {expected_run_id}; no bytes were written"
-            ),
-            None => bail!(
-                "serial-mcp does not own an active Run on Slot {slot_id:?}; call run_start before \
-                 command; no bytes were written"
-            ),
-        }
+        self.validate_run_capability(slot_id, expected_run_id, run_token)?;
         if self.socket.is_none() {
             self.disconnect();
             bail!(
@@ -765,6 +1047,7 @@ impl SessionState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn trigger_start(
         &mut self,
         slot_id: String,
@@ -772,10 +1055,11 @@ impl SessionState {
         generation: u64,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         spec: TriggerSpec,
     ) -> Result<TriggerInfo> {
         let lease = self
-            .renew_owned_run_control(&slot_id, expected_run_id)
+            .renew_owned_run_control(&slot_id, expected_run_id, run_token)
             .await?;
         let request_id = Uuid::new_v4();
         let request = ClientMessage::TriggerStart {
@@ -819,9 +1103,10 @@ impl SessionState {
         duration_ms: u64,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
     ) -> Result<u64> {
         let lease = self
-            .renew_owned_run_control(&slot_id, expected_run_id)
+            .renew_owned_run_control(&slot_id, expected_run_id, run_token)
             .await?;
         self.actor
             .as_ref()
@@ -916,9 +1201,10 @@ impl SessionState {
         generation: u64,
         trigger_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
     ) -> Result<TriggerInfo> {
         let lease = self
-            .renew_owned_run_control(&slot_id, expected_run_id)
+            .renew_owned_run_control(&slot_id, expected_run_id, run_token)
             .await?;
         let request = ClientMessage::TriggerCancel {
             request_id: Uuid::new_v4(),
@@ -950,16 +1236,19 @@ impl SessionState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write(
         &mut self,
         slot_id: String,
         data: Vec<u8>,
         operation_id: Uuid,
         expected_run_id: Uuid,
+        run_token: Uuid,
         effective_pacing: WritePacing,
+        description: Option<String>,
     ) -> Result<u64> {
         let lease = self
-            .renew_owned_run_control(&slot_id, expected_run_id)
+            .renew_owned_run_control(&slot_id, expected_run_id, run_token)
             .await?;
         self.actor
             .as_ref()
@@ -976,6 +1265,7 @@ impl SessionState {
             // Agent tools never override Slot/Device pacing. The effective
             // value is used only for the local RPC deadline below.
             pacing: None,
+            description,
             // Cooperative injection is Human-only. Agent writes always use
             // the ordinary fenced owner path.
             cooperative: false,
@@ -1025,9 +1315,12 @@ impl SessionState {
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
         control_wait: Duration,
-    ) -> Result<RunInfo> {
-        if let Some(run_id) = self.owned_runs.get(&slot_id) {
-            bail!("serial-mcp already owns active Run {run_id} on Slot {slot_id:?}");
+    ) -> Result<StartedRun> {
+        if let Some(run) = self.owned_runs.get(&slot_id) {
+            bail!(
+                "serial-mcp already owns active Run {} on Slot {slot_id:?}",
+                run.id
+            );
         }
         let lease = self.acquire_control(&slot_id, control_wait).await?;
         let request = ClientMessage::StartRun {
@@ -1040,8 +1333,10 @@ impl SessionState {
         };
         match self.call(request).await {
             Ok(CommandResult::RunStarted { run }) => {
-                self.owned_runs.insert(slot_id, run.id);
-                Ok(run)
+                let run_token = Uuid::new_v4();
+                self.owned_runs
+                    .insert(slot_id, OwnedRun::new(run.id, run_token, Instant::now()));
+                Ok(StartedRun { run, run_token })
             }
             Ok(other) => {
                 self.best_effort_release(&slot_id).await;
@@ -1054,18 +1349,11 @@ impl SessionState {
         }
     }
 
-    async fn end_run(&mut self, slot_id: String, run_id: Uuid) -> Result<RunInfo> {
-        match self.owned_runs.get(&slot_id) {
-            Some(owned_run_id) if *owned_run_id == run_id => {}
-            Some(owned_run_id) => bail!(
-                "serial-mcp owns Run {owned_run_id} on Slot {slot_id:?}, not requested Run {run_id}"
-            ),
-            None => bail!(
-                "serial-mcp does not own an active Run on Slot {slot_id:?}; it cannot end another \
-                 process's Run"
-            ),
-        }
-        let lease = self.renew_owned_run_control(&slot_id, run_id).await?;
+    async fn end_run(&mut self, slot_id: String, run_id: Uuid, run_token: Uuid) -> Result<RunInfo> {
+        self.validate_run_capability(&slot_id, run_id, run_token)?;
+        let lease = self
+            .renew_owned_run_control(&slot_id, run_id, run_token)
+            .await?;
         let request = ClientMessage::EndRun {
             request_id: Uuid::new_v4(),
             slot_id: slot_id.clone(),
@@ -1087,30 +1375,79 @@ impl SessionState {
         }
     }
 
-    async fn release(&mut self, slot_id: String, abort_run: bool) -> Result<bool> {
+    async fn release(
+        &mut self,
+        slot_id: String,
+        abort_run: bool,
+        run_capability: Option<(Uuid, Uuid)>,
+        allow_stale_cleanup: bool,
+    ) -> Result<bool> {
         let Some(lease) = self.leases.get(&slot_id).cloned() else {
             self.owned_runs.remove(&slot_id);
             return Ok(false);
         };
-        if let Some(run_id) = self.owned_runs.get(&slot_id)
-            && !abort_run
-        {
-            bail!("serial-mcp owns active Run {run_id}; call run_end first or pass abort_run=true");
-        }
+        self.prepare_release(&slot_id, abort_run, run_capability, allow_stale_cleanup)?;
         let request = ClientMessage::ReleaseControl {
             request_id: Uuid::new_v4(),
             slot_id: slot_id.clone(),
             control_id: lease.id,
             fence: lease.fence,
         };
-        match self.call(request).await? {
-            CommandResult::ControlReleased => {
+        match self.call(request).await {
+            Ok(CommandResult::ControlReleased) => {
                 self.leases.remove(&slot_id);
                 self.owned_runs.remove(&slot_id);
                 Ok(true)
             }
-            other => bail!("unexpected release result: {other:?}"),
+            Ok(other) => {
+                // An unexpected acknowledgement cannot justify retaining a
+                // capability that may already have crossed its release
+                // boundary. Stop renewal and force a fresh Run.
+                self.leases.remove(&slot_id);
+                self.owned_runs.remove(&slot_id);
+                bail!("unexpected release result: {other:?}")
+            }
+            Err(error) => {
+                // A lease can expire immediately before Release reaches
+                // seriald. The daemon has already aborted that Run, so stale
+                // local maps must never claim that ownership was retained.
+                self.leases.remove(&slot_id);
+                self.owned_runs.remove(&slot_id);
+                Err(error).context(
+                    "control release failed; local Run ownership was discarded and a fresh \
+                     run_start is required",
+                )
+            }
         }
+    }
+
+    fn prepare_release(
+        &mut self,
+        slot_id: &str,
+        abort_run: bool,
+        run_capability: Option<(Uuid, Uuid)>,
+        allow_stale_cleanup: bool,
+    ) -> Result<()> {
+        if allow_stale_cleanup {
+            // A fresh daemon snapshot proved that no Run is active. Local Run
+            // ownership is therefore stale bookkeeping, not authority to be
+            // protected by abort_run. Discard it before attempting to release
+            // the remaining local lease.
+            self.owned_runs.remove(slot_id);
+        } else if let Some(run) = self.owned_runs.get(slot_id) {
+            if !abort_run {
+                bail!(
+                    "serial-mcp owns active Run {}; call run_end first or pass abort_run=true",
+                    run.id
+                );
+            }
+            let (run_id, run_token) = run_capability.context(
+                "release would abort an active Run; pass the run_id/run_token returned by \
+                 this caller's run_start",
+            )?;
+            self.validate_run_capability(slot_id, run_id, run_token)?;
+        }
+        Ok(())
     }
 
     async fn best_effort_release(&mut self, slot_id: &str) {
@@ -1148,14 +1485,25 @@ impl SessionState {
             self.disconnect();
             return;
         }
-        let leases = match self.renewal_targets() {
-            Ok(leases) => leases,
+        let (idle_slots, leases) = match self.renewal_plan(Instant::now()) {
+            Ok(plan) => plan,
             Err(error) => {
                 eprintln!("serial-mcp: {error}; forgetting all active Runs");
                 self.disconnect();
                 return;
             }
         };
+        for slot_id in idle_slots {
+            eprintln!(
+                "serial-mcp: Run on Slot {slot_id:?} was idle for {} seconds; releasing control \
+                 and aborting the abandoned Run",
+                RUN_IDLE_TTL.as_secs()
+            );
+            self.best_effort_release(&slot_id).await;
+            if self.socket.is_none() {
+                return;
+            }
+        }
         for (slot_id, lease) in leases {
             let request = ClientMessage::RenewControl {
                 request_id: Uuid::new_v4(),
@@ -1179,11 +1527,19 @@ impl SessionState {
         }
     }
 
-    fn renewal_targets(&self) -> Result<Vec<(String, ControlLease)>> {
+    fn renewal_plan(&self, now: Instant) -> Result<RenewalPlan> {
+        let mut idle_slots = self
+            .owned_runs
+            .iter()
+            .filter(|entry| entry.1.idle_expired(now))
+            .map(|entry| entry.0.clone())
+            .collect::<Vec<_>>();
+        idle_slots.sort();
         let mut targets = self
             .owned_runs
-            .keys()
-            .map(|slot_id| {
+            .iter()
+            .filter(|(_, run)| !run.idle_expired(now))
+            .map(|(slot_id, _)| {
                 self.leases
                     .get(slot_id)
                     .cloned()
@@ -1197,7 +1553,7 @@ impl SessionState {
             })
             .collect::<Result<Vec<_>>>()?;
         targets.sort_by(|left, right| left.0.cmp(&right.0));
-        Ok(targets)
+        Ok((idle_slots, targets))
     }
 
     async fn call(&mut self, request: ClientMessage) -> Result<CommandResult> {
@@ -1274,6 +1630,7 @@ fn write_request_timeout(data_len: usize, pacing: WritePacing) -> Duration {
         .min(WRITE_RPC_TIMEOUT)
 }
 
+#[cfg(test)]
 fn retains_run_ownership(
     socket_connected: bool,
     owned_run_id: Option<Uuid>,
@@ -1487,6 +1844,7 @@ mod tests {
             operation_id: Some(Uuid::nil()),
             expected_run_id: Some(Uuid::nil()),
             pacing: None,
+            description: None,
             cooperative: false,
         };
         assert_eq!(request_timeout(&write, None), Duration::from_secs(20));
@@ -1636,6 +1994,10 @@ mod tests {
         }
     }
 
+    fn test_owned_run(run_id: Uuid) -> OwnedRun {
+        OwnedRun::new(run_id, Uuid::new_v4(), Instant::now())
+    }
+
     fn test_trigger_spec() -> TriggerSpec {
         TriggerSpec {
             initial_write: Some(b"reset\r".to_vec()),
@@ -1658,16 +2020,196 @@ mod tests {
         );
         state.leases.insert("run-slot".into(), test_lease());
         state.leases.insert("bare-lease".into(), test_lease());
-        state.owned_runs.insert("run-slot".into(), Uuid::new_v4());
+        state
+            .owned_runs
+            .insert("run-slot".into(), test_owned_run(Uuid::new_v4()));
 
-        let targets = state.renewal_targets().unwrap();
+        let (idle, targets) = state.renewal_plan(Instant::now()).unwrap();
+        assert!(idle.is_empty());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, "run-slot");
 
         state
             .owned_runs
-            .insert("missing-lease".into(), Uuid::new_v4());
-        assert!(state.renewal_targets().is_err());
+            .insert("missing-lease".into(), test_owned_run(Uuid::new_v4()));
+        assert!(state.renewal_plan(Instant::now()).is_err());
+    }
+
+    #[test]
+    fn local_control_state_distinguishes_lease_and_stale_run_bookkeeping() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        assert_eq!(
+            state.local_control_state("bench"),
+            LocalControlState {
+                has_lease: false,
+                owned_run_id: None,
+            }
+        );
+
+        let run_id = Uuid::new_v4();
+        state
+            .owned_runs
+            .insert("bench".into(), test_owned_run(run_id));
+        assert_eq!(
+            state.local_control_state("bench"),
+            LocalControlState {
+                has_lease: false,
+                owned_run_id: Some(run_id),
+            }
+        );
+
+        state.leases.insert("bench".into(), test_lease());
+        assert_eq!(
+            state.local_control_state("bench"),
+            LocalControlState {
+                has_lease: true,
+                owned_run_id: Some(run_id),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn private_run_capability_is_required_before_a_tool_can_pin_the_run() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        state.owned_runs.insert(
+            "bench".into(),
+            OwnedRun::new(run_id, run_token, Instant::now()),
+        );
+
+        let wrong_run = state
+            .begin_run_use("bench", Uuid::new_v4(), run_token)
+            .await
+            .unwrap_err();
+        assert!(wrong_run.to_string().contains("invalid Run capability"));
+        let wrong_token = state
+            .begin_run_use("bench", run_id, Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(wrong_token.to_string().contains("invalid Run capability"));
+        assert_eq!(state.owned_runs["bench"].active_uses, 0);
+
+        state
+            .begin_run_use("bench", run_id, run_token)
+            .await
+            .unwrap();
+        assert_eq!(state.owned_runs["bench"].active_uses, 1);
+        state.end_run_use("bench", run_id);
+        assert_eq!(state.owned_runs["bench"].active_uses, 0);
+    }
+
+    #[tokio::test]
+    async fn physical_action_revalidates_the_private_capability_before_connecting() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        state.owned_runs.insert(
+            "bench".into(),
+            OwnedRun::new(run_id, run_token, Instant::now()),
+        );
+        state.leases.insert("bench".into(), test_lease());
+
+        let error = state
+            .write(
+                "bench".into(),
+                b"help\r".to_vec(),
+                Uuid::new_v4(),
+                run_id,
+                Uuid::new_v4(),
+                WritePacing {
+                    chunk_size: 1,
+                    chunk_delay_ms: 1,
+                },
+                Some("查看帮助".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid Run capability"));
+        assert!(state.socket.is_none());
+        assert!(state.owned_runs.contains_key("bench"));
+        assert!(state.leases.contains_key("bench"));
+    }
+
+    #[test]
+    fn idle_runs_are_released_instead_of_renewed_but_active_tool_calls_stay_pinned() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let started = Instant::now();
+        let run_id = Uuid::new_v4();
+        state.leases.insert("bench".into(), test_lease());
+        state.owned_runs.insert(
+            "bench".into(),
+            OwnedRun::new(run_id, Uuid::new_v4(), started),
+        );
+
+        let before_deadline = state
+            .renewal_plan(started + RUN_IDLE_TTL - Duration::from_millis(1))
+            .unwrap();
+        assert!(before_deadline.0.is_empty());
+        assert_eq!(before_deadline.1.len(), 1);
+
+        let at_deadline = state.renewal_plan(started + RUN_IDLE_TTL).unwrap();
+        assert_eq!(at_deadline.0, vec!["bench"]);
+        assert!(at_deadline.1.is_empty());
+
+        state.owned_runs.get_mut("bench").unwrap().active_uses = 1;
+        let pinned = state
+            .renewal_plan(started + RUN_IDLE_TTL + Duration::from_secs(300))
+            .unwrap();
+        assert!(pinned.0.is_empty());
+        assert_eq!(pinned.1.len(), 1);
+    }
+
+    #[test]
+    fn delayed_guard_cannot_unpin_a_new_run_on_the_same_slot() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let old_run_id = Uuid::new_v4();
+        let new_run_id = Uuid::new_v4();
+        let mut new_run = test_owned_run(new_run_id);
+        new_run.active_uses = 1;
+        state.owned_runs.insert("bench".into(), new_run);
+
+        state.end_run_use("bench", old_run_id);
+        assert_eq!(state.owned_runs["bench"].active_uses, 1);
+    }
+
+    #[tokio::test]
+    async fn session_task_exits_when_request_and_guard_channels_close() {
+        let state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_session(state, request_rx, lifecycle_rx));
+
+        drop(lifecycle_tx);
+        drop(request_tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("closed lifecycle must not busy-loop or starve request shutdown")
+            .expect("session task must not panic");
     }
 
     #[tokio::test]
@@ -1683,10 +2225,12 @@ mod tests {
                 b"help\r".to_vec(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
+                Uuid::new_v4(),
                 WritePacing {
                     chunk_size: 1,
                     chunk_delay_ms: 1,
                 },
+                None,
             )
             .await
             .unwrap_err();
@@ -1703,7 +2247,13 @@ mod tests {
             "test".into(),
         );
         let error = state
-            .send_break("bench".into(), 250, Uuid::new_v4(), Uuid::new_v4())
+            .send_break(
+                "bench".into(),
+                250,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("call run_start"));
@@ -1725,6 +2275,7 @@ mod tests {
                 1,
                 Uuid::new_v4(),
                 Uuid::new_v4(),
+                Uuid::new_v4(),
                 test_trigger_spec(),
             )
             .await
@@ -1743,7 +2294,9 @@ mod tests {
         );
         for slot in ["bench-a", "bench-b"] {
             state.leases.insert(slot.into(), test_lease());
-            state.owned_runs.insert(slot.into(), Uuid::new_v4());
+            state
+                .owned_runs
+                .insert(slot.into(), test_owned_run(Uuid::new_v4()));
         }
 
         state.observe_trigger_terminal("bench-a", TriggerStatus::ControlLost);
@@ -1760,11 +2313,66 @@ mod tests {
             Some("token".into()),
             "test".into(),
         );
-        state.owned_runs.insert("bench".into(), Uuid::new_v4());
+        state
+            .owned_runs
+            .insert("bench".into(), test_owned_run(Uuid::new_v4()));
 
-        assert!(!state.release("bench".into(), false).await.unwrap());
+        assert!(
+            !state
+                .release("bench".into(), false, None, true)
+                .await
+                .unwrap()
+        );
         assert!(state.owned_runs.is_empty());
         assert!(state.socket.is_none());
+    }
+
+    #[tokio::test]
+    async fn release_cannot_abort_an_active_run_without_its_private_capability() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        state.owned_runs.insert(
+            "bench".into(),
+            OwnedRun::new(run_id, run_token, Instant::now()),
+        );
+        state.leases.insert("bench".into(), test_lease());
+
+        let missing = state
+            .release("bench".into(), true, None, false)
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("pass the run_id/run_token"));
+        let wrong = state
+            .release("bench".into(), true, Some((run_id, Uuid::new_v4())), false)
+            .await
+            .unwrap_err();
+        assert!(wrong.to_string().contains("invalid Run capability"));
+        assert!(state.socket.is_none());
+        assert!(state.owned_runs.contains_key("bench"));
+        assert!(state.leases.contains_key("bench"));
+    }
+
+    #[test]
+    fn authoritative_no_run_allows_default_release_to_discard_stale_owned_run() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        state
+            .owned_runs
+            .insert("bench".into(), test_owned_run(Uuid::new_v4()));
+        state.leases.insert("bench".into(), test_lease());
+
+        state
+            .prepare_release("bench", false, None, true)
+            .expect("authoritative no-active-Run snapshot permits stale cleanup");
+        assert!(!state.owned_runs.contains_key("bench"));
     }
 
     #[tokio::test]
@@ -1775,11 +2383,15 @@ mod tests {
             "test".into(),
         );
         let run_id = Uuid::new_v4();
-        state.owned_runs.insert("bench".into(), run_id);
+        let run_token = Uuid::new_v4();
+        state.owned_runs.insert(
+            "bench".into(),
+            OwnedRun::new(run_id, run_token, Instant::now()),
+        );
         state.leases.insert("bench".into(), test_lease());
 
         let error = state
-            .renew_owned_run_control("bench", run_id)
+            .renew_owned_run_control("bench", run_id, run_token)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("connection was lost"));

@@ -42,6 +42,9 @@ pub const MAX_BREAK_DURATION_MS: u64 = 5_000;
 /// A Trigger timeout stops new scheduling, but an already accepted write may
 /// need this long to settle and be audited before the Trigger becomes terminal.
 pub const MAX_PHYSICAL_WRITE_TIMEOUT_MS: u64 = 15_000;
+/// Maximum UTF-8 size of the human-readable purpose attached to one Agent
+/// command. The purpose is durable audit metadata, not serial payload.
+pub const MAX_COMMAND_DESCRIPTION_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -821,6 +824,12 @@ pub enum ClientMessage {
         /// using the Slot's configured pacing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pacing: Option<WritePacing>,
+        /// Optional human-readable purpose for this physical write. Agent
+        /// adapters attach this to command writes so operators can review a
+        /// Run by intent before expanding the exact serial payload. Older
+        /// clients omit it and retain the original wire behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         /// Explicit Human-only injection while an Agent owns control. This
         /// bypasses takeover but does not transfer or revoke the Agent lease.
         /// Daemons must reject the flag for non-Human actors, a missing or
@@ -2107,6 +2116,7 @@ mod tests {
                 chunk_size: 4,
                 chunk_delay_ms: 10,
             }),
+            description: Some("重启样机".into()),
             cooperative: false,
         };
         let frame = encode_client_control(&message).unwrap();
@@ -2168,6 +2178,7 @@ mod tests {
                 operation_id: None,
                 expected_run_id: None,
                 pacing: None,
+                description: None,
                 cooperative: false,
             }
         );
@@ -2204,6 +2215,7 @@ mod tests {
             operation_id: None,
             expected_run_id: Some(Uuid::new_v4()),
             pacing: None,
+            description: None,
             cooperative: true,
         };
         let encoded = serde_json::to_value(&cooperative).unwrap();

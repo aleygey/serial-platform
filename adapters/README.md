@@ -25,7 +25,7 @@ command argument. For authenticated setup automation, use
 `--token-file` and refuses input/output path aliases so it cannot overwrite a
 supplied credential.
 
-Use every component from the same release. v0.6.1 retains WebSocket protocol v3
+Use every component from the same release. v0.6.2 retains WebSocket protocol v3
 from v0.4.0; the existing realtime surface is wire-compatible with v0.4, while
 the Monitor HTTP APIs and MCP tools require v0.5 components. Protocol-v2 builds
 from 0.3.x and protocol-v1 builds from 0.2.x are not compatible with v3.
@@ -49,9 +49,11 @@ write/state-changing tools, including `input`, `signal`, `monitor_start`, and
 OpenCode prefixes names as `serial_devices`, `serial_command`, and so on.
 Codex exposes them under the configured `serial` MCP server.
 
-## Stable core and Monitor tool surface
+## Core and Monitor tool surface
 
-The original eleven tools keep their names and arguments. Five additive
+The original tool names remain stable. Run-scoped calls now require the
+private `run_id`/`run_token` pair returned by `run_start`, so one LLM session
+cannot adopt a status-visible Run left by another session. Five additive
 Monitor tools manage persistent observation Jobs owned by `seriald`; restarting
 or closing the stdio MCP process does not stop them.
 
@@ -59,11 +61,11 @@ or closing the stdio MCP process does not stop them.
 |---|---|---|---|
 | `devices` | — | `slot_id` | Authoritative Slot, Profile, state, ownership, Run, Trigger, and cursor head |
 | `read` | `slot_id` | `scope=tail|continue|archive`, archive `epoch`/`after_seq` | Bounded retained text and continuation cursor |
-| `command` | `slot_id`, `command` | one of `expect`/`regex`, `timeout_seconds` | Append effective EOL, write in the owned Run, capture post-TX RX |
-| `input` | `slot_id`, `text` | — | Exact UTF-8 bytes with no EOL |
-| `signal` | `slot_id`, `signal` | Break-only `duration_ms` | Ctrl-C/D/Z byte or physical serial Break |
-| `trigger` | `slot_id`, `action` | `kickoff`, `start_contains`, `stop_contains`, interval/timeout/fire bounds | One bounded daemon-side low-latency reaction |
-| `wait` | `slot_id` | one of `expect`/`regex`, `timeout_seconds` | Wait from the adapter's live cursor |
+| `command` | `slot_id`, `run_id`, `run_token`, `command`, `description` | one of `expect`/`regex`, `timeout_seconds` | Append effective EOL, write in the owned Run, capture post-TX RX, and retain its purpose |
+| `input` | `slot_id`, `run_id`, `run_token`, `text` | — | Exact UTF-8 bytes with no EOL |
+| `signal` | `slot_id`, `run_id`, `run_token`, `signal` | Break-only `duration_ms` | Ctrl-C/D/Z byte or physical serial Break |
+| `trigger` | `slot_id`, `run_id`, `run_token`, `action` | `kickoff`, `start_contains`, `stop_contains`, interval/timeout/fire bounds | One bounded daemon-side low-latency reaction |
+| `wait` | `slot_id`, `run_id`, `run_token` | one of `expect`/`regex`, `timeout_seconds` | Wait from the adapter's live cursor while pinning that Run |
 | `search` | `slot_id`, `query` | `regex`, scope, explicit continuation fields | Bounded search; current Run by default |
 | `monitor_start` | `slot_id`, exactly one of `contains`/`regex` | `description` | Create a persistent Monitor and return its ID immediately |
 | `monitor_list` | none | `slot_id` | List authoritative persistent Monitors |
@@ -71,8 +73,8 @@ or closing the stdio MCP process does not stop them.
 | `monitor_incidents` | `monitor_id` | opaque decimal `after` cursor | Read one bounded page of retained incidents and evidence references |
 | `monitor_stop` | `monitor_id` | none | Stop future detection without deleting retained incidents |
 | `run_start` | `slot_id`, `label` | — | Queue for Control and establish an evidence boundary |
-| `run_end` | `slot_id` | — | End the owned Run and best-effort release Control |
-| `release` | `slot_id` | `abort_run` | Release this adapter's lease without closing the port |
+| `run_end` | `slot_id`, `run_id`, `run_token` | — | End the authorized Run and best-effort release Control |
+| `release` | `slot_id` | `abort_run` and paired `run_id`/`run_token` | Release only this adapter's lease; no local lease is a no-op, while its matching active Run requires capability |
 
 The adapter intentionally hides routine protocol mechanics: request and
 Operation UUIDs, Control ID/fence, generation validation, pacing, effective
@@ -127,22 +129,31 @@ for audit and later queries.
 
 1. Call `devices`, choose a Slot explicitly, and inspect its online state and
    effective Profiles.
-2. Call `run_start`. A Run scopes evidence only; initialize the DUT state
-   explicitly.
+2. Call `run_start`, then retain its returned `run_id` and private `run_token`
+   in this LLM session. A Run scopes evidence only; initialize the DUT state
+   explicitly. Never adopt an active Run from `devices`.
 3. Use `command` for ordinary shell/bootloader commands. Use `input` or
    `signal` only when exact raw input is required. Use `trigger` for a bounded
    timing-critical reaction that must run beside the serial actor.
-4. Use `wait`, `read`, or `search` for additional evidence.
-5. Call `run_end`. `release` is optional/idempotent cleanup.
+4. Use `wait`, `read`, or `search` for additional evidence. `wait` also needs
+   the pair and pins the Run throughout its complete call.
+5. Call `run_end` with the pair. `release` is optional/idempotent cleanup;
+   aborting this MCP's active Run requires `abort_run=true` and the same pair.
+   With no local lease it ignores any foreign Run visible in status.
 
 The adapter queues for Control and cannot Takeover. A human can observe all
 Agent TX in `serial console` and may explicitly Takeover; that revokes the
 Agent's Control and aborts its Run. Agents cannot close the configured port.
 
-Only Runs started by this adapter process receive lease renewal. Disconnect or
-renewal failure clears local ownership; the adapter never silently reacquires
-Control and continues an old task. One Slot has at most one active Run, and
-per-Slot write locks prevent concurrent MCP calls from interleaving bytes.
+Only Runs started by this adapter process receive lease renewal. Each
+Run-scoped tool validates the private capability before waiting for the
+per-Slot write lock and the serialized session validates it again before any
+physical action. An active tool call pins the Run; after the last call returns,
+60 seconds of inactivity causes active release/abort at the next renewal tick.
+Disconnect or renewal failure clears local ownership; the adapter never
+silently reacquires Control and continues an old task. One Slot has at most one
+active Run, and per-Slot write locks prevent concurrent MCP calls from
+interleaving bytes.
 
 ## Command capture and compact results
 

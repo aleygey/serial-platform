@@ -10,10 +10,10 @@ use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS,
     DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, DeviceModelListResponse, Direction,
-    EchoMode, EventKind, EventQuery, MAX_BREAK_DURATION_MS, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
-    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
-    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    EchoMode, EventKind, EventQuery, MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
     MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelConfirmationMethod, PROTOCOL_VERSION,
     SessionState, SetSlotDeviceModelRequest, SlotSnapshot, StatusResponse, TriggerInfo,
     TriggerSpec, TriggerStatus, WritePacing,
@@ -27,7 +27,7 @@ use crate::{
     capture::{Capture, CaptureOptions, CommandBoundary, Completion, CompletionPattern},
     config::CaptureLimits,
     render::{MatchExcerptOptions, MatchExcerptPattern, RenderOptions, render_events},
-    session::SessionHandle,
+    session::{LocalControlState, SessionHandle},
 };
 
 const DEFAULT_TEXT_CHARS: usize = 16_000;
@@ -499,8 +499,13 @@ impl AgentTools {
     }
 
     async fn wait(&self, args: WaitArgs) -> Result<Value> {
+        let _run_use = self
+            .session
+            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         let slot = self.slot_online(&args.slot_id).await?;
-        let watched_run = slot.active_run.as_ref().map(|run| (run.id, run.start_seq));
+        let active_run = matching_active_run(&slot, args.run_id, "wait")?;
+        let watched_run = (active_run.id, active_run.start_seq);
         let (patterns, until_regex, completion_mode) =
             requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
         let complete_on_quiet = completion_mode == "quiet";
@@ -517,10 +522,7 @@ impl AgentTools {
             self.capture_limits,
         )
         .await?;
-        let capture = match watched_run {
-            Some((run_id, _)) => capture.watch_run(run_id),
-            None => capture,
-        };
+        let capture = capture.watch_run(watched_run.0);
         let result = capture
             .collect(CaptureOptions {
                 timeout: seconds(args.timeout_seconds, 10, 1, 120),
@@ -540,9 +542,11 @@ impl AgentTools {
                     after_seq: last_seq,
                 },
             );
-            let start_seq = watched_run
-                .filter(|(watched, _)| watched == run_id)
-                .map_or(started_after_seq, |(_, start_seq)| start_seq);
+            let start_seq = if watched_run.0 == *run_id {
+                watched_run.1
+            } else {
+                started_after_seq
+            };
             return Err(self
                 .run_abort_error(&slot, *run_id, start_seq, reason, true)
                 .await);
@@ -596,13 +600,15 @@ impl AgentTools {
     }
 
     async fn command(&self, args: CommandArgs) -> Result<Value> {
+        validate_command_description(&args.description)?;
+        let _run_use = self
+            .session
+            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
-        let active_run = slot
-            .active_run
-            .as_ref()
-            .context("no active Run; call run_start before command")?;
-        let expected_run_id = active_run.id;
+        let active_run = matching_active_run(&slot, args.run_id, "command")?;
+        let expected_run_id = args.run_id;
         let run_start_seq = active_run.start_seq;
         let operation_id = Uuid::new_v4();
         let capture_after_seq = slot.head_seq;
@@ -637,7 +643,9 @@ impl AgentTools {
                 bytes,
                 operation_id,
                 expected_run_id,
+                args.run_token,
                 effective_write_pacing(&slot),
+                Some(args.description.clone()),
             )
             .await
         {
@@ -733,6 +741,10 @@ impl AgentTools {
             "truncated": truncated,
             "gap": gap,
             "interfered": interfered,
+            "run_id": expected_run_id,
+            "operation_id": operation_id,
+            "event_seq": write.event_seq,
+            "description": args.description,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
         });
         attach_capture_warnings(
@@ -750,8 +762,13 @@ impl AgentTools {
     }
 
     async fn input(&self, args: InputArgs) -> Result<Value> {
+        let _run_use = self
+            .session
+            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
+        matching_active_run(&slot, args.run_id, "input")?;
         let bytes = args.text.into_bytes();
         if bytes.is_empty() {
             bail!("input text must not be empty");
@@ -759,12 +776,18 @@ impl AgentTools {
         if bytes.len() > MAX_WRITE_BYTES {
             bail!("input text exceeds {MAX_WRITE_BYTES} UTF-8 bytes");
         }
-        self.write_raw(&slot, bytes, "input").await
+        self.write_raw(&slot, bytes, "input", args.run_id, args.run_token)
+            .await
     }
 
     async fn signal(&self, args: SignalArgs) -> Result<Value> {
+        let _run_use = self
+            .session
+            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
+        matching_active_run(&slot, args.run_id, "signal")?;
         if args.signal == "break" {
             let duration_ms = args.duration_ms.unwrap_or(250);
             if !(MIN_BREAK_DURATION_MS..=MAX_BREAK_DURATION_MS).contains(&duration_ms) {
@@ -773,22 +796,27 @@ impl AgentTools {
                      {MAX_BREAK_DURATION_MS}"
                 );
             }
-            return self.send_break(&slot, duration_ms).await;
+            return self
+                .send_break(&slot, duration_ms, args.run_id, args.run_token)
+                .await;
         }
         if args.duration_ms.is_some() {
             bail!("duration_ms is valid only for signal=break");
         }
         let byte = control_signal_byte(&args.signal)
             .context("signal must be ctrl_c, ctrl_d, ctrl_z, or break")?;
-        self.write_raw(&slot, vec![byte], &args.signal).await
+        self.write_raw(&slot, vec![byte], &args.signal, args.run_id, args.run_token)
+            .await
     }
 
-    async fn send_break(&self, slot: &SlotSnapshot, duration_ms: u64) -> Result<Value> {
-        let active_run = slot
-            .active_run
-            .as_ref()
-            .context("no active Run; call run_start before signal")?;
-        let expected_run_id = active_run.id;
+    async fn send_break(
+        &self,
+        slot: &SlotSnapshot,
+        duration_ms: u64,
+        expected_run_id: Uuid,
+        run_token: Uuid,
+    ) -> Result<Value> {
+        let active_run = matching_active_run(slot, expected_run_id, "signal")?;
         let operation_id = Uuid::new_v4();
         let sent = match self
             .session
@@ -797,6 +825,7 @@ impl AgentTools {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                run_token,
             )
             .await
         {
@@ -822,12 +851,15 @@ impl AgentTools {
         }))
     }
 
-    async fn write_raw(&self, slot: &SlotSnapshot, bytes: Vec<u8>, label: &str) -> Result<Value> {
-        let active_run = slot
-            .active_run
-            .as_ref()
-            .context("no active Run; call run_start before input/signal")?;
-        let expected_run_id = active_run.id;
+    async fn write_raw(
+        &self,
+        slot: &SlotSnapshot,
+        bytes: Vec<u8>,
+        label: &str,
+        expected_run_id: Uuid,
+        run_token: Uuid,
+    ) -> Result<Value> {
+        let active_run = matching_active_run(slot, expected_run_id, "input/signal")?;
         let operation_id = Uuid::new_v4();
         let byte_count = bytes.len();
         let write = match self
@@ -837,7 +869,9 @@ impl AgentTools {
                 bytes,
                 operation_id,
                 expected_run_id,
+                run_token,
                 effective_write_pacing(slot),
+                None,
             )
             .await
         {
@@ -865,13 +899,14 @@ impl AgentTools {
     }
 
     async fn trigger(&self, args: TriggerArgs) -> Result<Value> {
+        let _run_use = self
+            .session
+            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot_online(&args.slot_id).await?;
-        let active_run = slot
-            .active_run
-            .as_ref()
-            .context("no active Run; call run_start before trigger")?;
-        let expected_run_id = active_run.id;
+        let active_run = matching_active_run(&slot, args.run_id, "trigger")?;
+        let expected_run_id = args.run_id;
         if let Some(active) = &slot.active_trigger {
             bail!(
                 "Slot already has Trigger {} in status {:?}; wait for it to finish or cancel it \
@@ -915,6 +950,7 @@ impl AgentTools {
                 slot.generation,
                 operation_id,
                 expected_run_id,
+                args.run_token,
                 spec,
             )
             .await
@@ -930,7 +966,13 @@ impl AgentTools {
         };
         let started_id = started.id;
         let terminal = match self
-            .wait_trigger_terminal(&slot, expected_run_id, operation_id, started)
+            .wait_trigger_terminal(
+                &slot,
+                expected_run_id,
+                args.run_token,
+                operation_id,
+                started,
+            )
             .await
         {
             Ok(trigger) => trigger,
@@ -943,6 +985,7 @@ impl AgentTools {
                         slot.generation,
                         started_id,
                         expected_run_id,
+                        args.run_token,
                     )
                     .await;
                 let _ = capture_stop.send(None);
@@ -987,7 +1030,7 @@ impl AgentTools {
             .context("trigger capture task stopped unexpectedly")?;
         let run_ownership_retained = self
             .session
-            .run_ownership_retained(slot.config.id.clone(), expected_run_id)
+            .run_ownership_retained(slot.config.id.clone(), expected_run_id, args.run_token)
             .await
             .unwrap_or(false);
 
@@ -1109,6 +1152,7 @@ impl AgentTools {
         &self,
         slot: &SlotSnapshot,
         expected_run_id: Uuid,
+        run_token: Uuid,
         operation_id: Uuid,
         mut trigger: TriggerInfo,
     ) -> Result<TriggerInfo> {
@@ -1146,6 +1190,7 @@ impl AgentTools {
                 slot.generation,
                 trigger_id,
                 expected_run_id,
+                run_token,
             )
             .await
             .context("Trigger exceeded its status deadline and cancellation failed")?;
@@ -1181,15 +1226,16 @@ impl AgentTools {
         if let Some(run) = slot.active_run {
             bail!("Slot already has active Run {} ({})", run.id, run.label);
         }
-        let run = self
+        let started = self
             .session
-            .start_run(
+            .start_run_with_token(
                 args.slot_id.clone(),
                 args.label,
                 BTreeMap::new(),
                 Duration::from_secs(15),
             )
             .await?;
+        let run = started.run;
         self.remember_live_cursor(
             &slot.config.id,
             Cursor {
@@ -1200,20 +1246,24 @@ impl AgentTools {
         Ok(json!({
             "slot_id": args.slot_id,
             "run_id": run.id,
+            "run_token": started.run_token,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
-            "warning": "Run scopes evidence only. Before commands, confirm the configured model matches the physical DUT using serial evidence, telnet, web UI, or a human, then initialize device state explicitly."
+            "warning": "Run scopes evidence only. Keep run_token private and pass this run_id/run_token to this Run's command, input, signal, trigger, wait, run_end, or aborting release calls. Before commands, confirm the physical DUT model and initialize device state explicitly."
         }))
     }
 
     async fn run_end(&self, args: RunEndArgs) -> Result<Value> {
+        let _run_use = self
+            .session
+            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         let _write_guard = self.write_guard(&args.slot_id).await;
         let slot = self.slot(&args.slot_id).await?;
-        let run_id = slot
-            .active_run
-            .as_ref()
-            .map(|run| run.id)
-            .context("no active Run for this Slot")?;
-        let ended = self.session.end_run(args.slot_id.clone(), run_id).await?;
+        matching_active_run(&slot, args.run_id, "run_end")?;
+        let ended = self
+            .session
+            .end_run(args.slot_id.clone(), args.run_id, args.run_token)
+            .await?;
         Ok(json!({
             "slot_id": args.slot_id,
             "ended": ended.id,
@@ -1222,17 +1272,55 @@ impl AgentTools {
     }
 
     async fn release(&self, args: ReleaseArgs) -> Result<Value> {
+        let run_capability = paired_release_capability(args.run_id, args.run_token)?;
         let _write_guard = self.write_guard(&args.slot_id).await;
+        let local = self
+            .session
+            .local_control_state(args.slot_id.clone())
+            .await?;
+        if !local.has_lease {
+            // Public status may show a foreign Run, but release controls only
+            // this MCP connection. Avoid consulting or modifying that Run;
+            // the local no-lease release also discards any stale owned_run.
+            let had_lease = self
+                .session
+                .release(args.slot_id.clone(), false, None, true)
+                .await?;
+            return Ok(release_output(args.slot_id, had_lease));
+        }
+
+        let current = self.slot(&args.slot_id).await?;
+        let decision = plan_release(
+            local,
+            current.active_run.as_ref().map(|run| run.id),
+            args.abort_run,
+            run_capability,
+        )?;
+        let ReleaseDecision::Release {
+            authorize,
+            allow_stale_cleanup,
+        } = decision
+        else {
+            unreachable!("a checked local lease cannot produce AlreadyReleased")
+        };
+        let _run_use = match authorize {
+            Some((run_id, run_token)) => Some(
+                self.session
+                    .authorize_run_use(args.slot_id.clone(), run_id, run_token)
+                    .await?,
+            ),
+            None => None,
+        };
         let had_lease = self
             .session
-            .release(args.slot_id.clone(), args.abort_run)
+            .release(
+                args.slot_id.clone(),
+                args.abort_run,
+                run_capability,
+                allow_stale_cleanup,
+            )
             .await?;
-        Ok(json!({
-            "slot_id": args.slot_id,
-            "released": had_lease,
-            "already_released": !had_lease,
-            "serial_port_closed": false
-        }))
+        Ok(release_output(args.slot_id, had_lease))
     }
 
     async fn slot(&self, slot_id: &str) -> Result<SlotSnapshot> {
@@ -1552,6 +1640,120 @@ fn remember_live_cursor(cursors: &mut BTreeMap<String, Cursor>, slot_id: &str, c
 
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
     serde_json::from_value(value).context("invalid tool arguments")
+}
+
+fn matching_active_run<'a>(
+    slot: &'a SlotSnapshot,
+    expected_run_id: Uuid,
+    operation: &str,
+) -> Result<&'a serial_protocol::RunInfo> {
+    let active = slot
+        .active_run
+        .as_ref()
+        .with_context(|| format!("no active Run; call run_start before {operation}"))?;
+    if active.id != expected_run_id {
+        bail!(
+            "{operation} expected Run {expected_run_id}, but Slot has active Run {}; refusing to \
+             adopt or modify another caller's Run",
+            active.id
+        );
+    }
+    Ok(active)
+}
+
+fn paired_release_capability(
+    run_id: Option<Uuid>,
+    run_token: Option<Uuid>,
+) -> Result<Option<(Uuid, Uuid)>> {
+    match (run_id, run_token) {
+        (Some(run_id), Some(run_token)) => Ok(Some((run_id, run_token))),
+        (None, None) => Ok(None),
+        _ => bail!("run_id and run_token must be provided together"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReleaseDecision {
+    AlreadyReleased,
+    Release {
+        authorize: Option<(Uuid, Uuid)>,
+        allow_stale_cleanup: bool,
+    },
+}
+
+fn plan_release(
+    local: LocalControlState,
+    daemon_active_run_id: Option<Uuid>,
+    abort_run: bool,
+    run_capability: Option<(Uuid, Uuid)>,
+) -> Result<ReleaseDecision> {
+    if !local.has_lease {
+        return Ok(ReleaseDecision::AlreadyReleased);
+    }
+    let Some(local_run_id) = local.owned_run_id else {
+        return Ok(ReleaseDecision::Release {
+            authorize: None,
+            allow_stale_cleanup: false,
+        });
+    };
+    let Some(active_run_id) = daemon_active_run_id else {
+        return Ok(ReleaseDecision::Release {
+            authorize: None,
+            allow_stale_cleanup: true,
+        });
+    };
+    if active_run_id != local_run_id {
+        bail!(
+            "local Run ownership changed: serial-mcp recorded Run {local_run_id}, but seriald \
+             reports active Run {active_run_id}; refusing to release across that Run boundary"
+        );
+    }
+    if !abort_run {
+        bail!(
+            "serial-mcp owns active Run {local_run_id}; use run_end, or set abort_run=true with \
+             its private run_id/run_token"
+        );
+    }
+    let capability = run_capability.context(
+        "release would abort this MCP's active Run; pass run_id/run_token from this caller's \
+         run_start response",
+    )?;
+    if capability.0 != local_run_id {
+        bail!(
+            "release capability names Run {}, but serial-mcp owns Run {local_run_id}; refusing \
+             to abort a different Run",
+            capability.0
+        );
+    }
+    Ok(ReleaseDecision::Release {
+        authorize: Some(capability),
+        allow_stale_cleanup: false,
+    })
+}
+
+fn release_output(slot_id: String, had_lease: bool) -> Value {
+    json!({
+        "slot_id": slot_id,
+        "released": had_lease,
+        "already_released": !had_lease,
+        "serial_port_closed": false
+    })
+}
+
+fn validate_command_description(description: &str) -> Result<()> {
+    if description.is_empty() {
+        bail!("description must not be empty");
+    }
+    if description != description.trim() {
+        bail!("description must be trimmed");
+    }
+    if description.len() > MAX_COMMAND_DESCRIPTION_BYTES {
+        bail!("description must not exceed {MAX_COMMAND_DESCRIPTION_BYTES} UTF-8 bytes");
+    }
+    if description.chars().any(char::is_control) {
+        bail!("description must not contain control characters");
+    }
+    Ok(())
 }
 
 fn validate_monitor_matcher(contains: Option<&str>, regex: Option<&str>) -> Result<()> {
@@ -2556,6 +2758,8 @@ struct MonitorIncidentsArgs {
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
     slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
     expect: Option<String>,
     regex: Option<String>,
     timeout_seconds: Option<u64>,
@@ -2564,7 +2768,10 @@ struct WaitArgs {
 #[serde(deny_unknown_fields)]
 struct CommandArgs {
     slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
     command: String,
+    description: String,
     expect: Option<String>,
     regex: Option<String>,
     timeout_seconds: Option<u64>,
@@ -2573,12 +2780,16 @@ struct CommandArgs {
 #[serde(deny_unknown_fields)]
 struct InputArgs {
     slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
     text: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignalArgs {
     slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
     signal: String,
     duration_ms: Option<u64>,
 }
@@ -2592,6 +2803,8 @@ struct TriggerWriteArgs {
 #[serde(deny_unknown_fields)]
 struct TriggerArgs {
     slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
     #[serde(rename = "kickoff")]
     initial_write: Option<TriggerWriteArgs>,
     start_contains: Option<String>,
@@ -2612,6 +2825,8 @@ struct RunStartArgs {
 #[serde(deny_unknown_fields)]
 struct RunEndArgs {
     slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2619,6 +2834,8 @@ struct ReleaseArgs {
     slot_id: String,
     #[serde(default)]
     abort_run: bool,
+    run_id: Option<Uuid>,
+    run_token: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -2839,8 +3056,13 @@ mod tests {
         assert_eq!(search.query, "ERROR.*1006");
         assert!(search.regex);
 
-        let wait: WaitArgs =
-            serde_json::from_value(json!({"slot_id": "bench", "expect": "ready"})).unwrap();
+        let wait: WaitArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
+            "expect": "ready"
+        }))
+        .unwrap();
         assert_eq!(wait.expect.as_deref(), Some("ready"));
     }
 
@@ -3050,9 +3272,128 @@ mod tests {
 
     #[test]
     fn command_args_accept_an_empty_command() {
-        let args: CommandArgs =
-            serde_json::from_value(json!({"slot_id": "bench", "command": ""})).unwrap();
+        let args: CommandArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
+            "command": "",
+            "description": "发送回车"
+        }))
+        .unwrap();
         assert!(args.command.is_empty());
+    }
+
+    #[test]
+    fn command_description_is_required_and_utf8_byte_bounded() {
+        assert!(
+            serde_json::from_value::<CommandArgs>(json!({
+                "slot_id": "bench",
+                "run_id": Uuid::nil(),
+                "run_token": Uuid::nil(),
+                "command": "cat /proc/meminfo"
+            }))
+            .is_err()
+        );
+        for invalid in ["", " 前导空格", "尾随空格 ", "包含\n换行"] {
+            assert!(validate_command_description(invalid).is_err());
+        }
+        assert!(validate_command_description("查看样机内存").is_ok());
+        let oversized = "界".repeat(MAX_COMMAND_DESCRIPTION_BYTES / "界".len() + 1);
+        assert!(validate_command_description(&oversized).is_err());
+    }
+
+    #[test]
+    fn release_capability_fields_are_all_or_nothing() {
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        assert_eq!(paired_release_capability(None, None).unwrap(), None);
+        assert_eq!(
+            paired_release_capability(Some(run_id), Some(run_token)).unwrap(),
+            Some((run_id, run_token))
+        );
+        assert!(paired_release_capability(Some(run_id), None).is_err());
+        assert!(paired_release_capability(None, Some(run_token)).is_err());
+    }
+
+    #[test]
+    fn release_planning_uses_local_lease_ownership_and_fails_closed_on_run_races() {
+        let local_run = Uuid::new_v4();
+        let foreign_run = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+
+        // A fresh MCP must not require a token for, or interfere with, a Run
+        // merely because that foreign Run is visible in daemon status.
+        assert_eq!(
+            plan_release(
+                LocalControlState {
+                    has_lease: false,
+                    owned_run_id: None,
+                },
+                Some(foreign_run),
+                false,
+                None,
+            )
+            .unwrap(),
+            ReleaseDecision::AlreadyReleased
+        );
+
+        // No authoritative active Run turns an old process-local Run entry
+        // into cleanup state; default release needs neither abort nor token.
+        assert_eq!(
+            plan_release(
+                LocalControlState {
+                    has_lease: true,
+                    owned_run_id: Some(local_run),
+                },
+                None,
+                false,
+                None,
+            )
+            .unwrap(),
+            ReleaseDecision::Release {
+                authorize: None,
+                allow_stale_cleanup: true,
+            }
+        );
+
+        let active_local = LocalControlState {
+            has_lease: true,
+            owned_run_id: Some(local_run),
+        };
+        assert!(plan_release(active_local, Some(local_run), false, None).is_err());
+        assert!(plan_release(active_local, Some(local_run), true, None).is_err());
+        assert_eq!(
+            plan_release(
+                active_local,
+                Some(local_run),
+                true,
+                Some((local_run, run_token)),
+            )
+            .unwrap(),
+            ReleaseDecision::Release {
+                authorize: Some((local_run, run_token)),
+                allow_stale_cleanup: false,
+            }
+        );
+
+        assert!(
+            plan_release(
+                active_local,
+                Some(local_run),
+                true,
+                Some((foreign_run, run_token)),
+            )
+            .is_err()
+        );
+        assert!(
+            plan_release(
+                active_local,
+                Some(foreign_run),
+                true,
+                Some((local_run, run_token)),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3067,7 +3408,10 @@ mod tests {
     fn agent_writes_reject_transport_pacing_overrides() {
         let command = serde_json::from_value::<CommandArgs>(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "command": "version",
+            "description": "查看版本",
             "chunk_size": 64
         }))
         .err()
@@ -3076,6 +3420,8 @@ mod tests {
 
         let trigger = serde_json::from_value::<TriggerArgs>(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "action": {"text": "slp"},
             "inter_char_delay_ms": 0
         }))
@@ -3088,6 +3434,8 @@ mod tests {
     fn trigger_uses_only_explicit_call_text_and_eol() {
         let args: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "kickoff": {"text": "reboot", "eol": "\r"},
             "start_contains": "Booting",
             "action": {"text": "slp"},
@@ -3112,6 +3460,8 @@ mod tests {
     fn normal_kickoff_trigger_omits_the_optional_start_gate() {
         let args: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "kickoff": {"text": "reboot", "eol": "\r"},
             "action": {"text": "slp"},
             "stop_contains": ["prompt>"]
@@ -3128,6 +3478,8 @@ mod tests {
     fn trigger_allows_bounded_one_shot_without_a_stop_literal() {
         let args: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "start_contains": "send ACK now",
             "action": {"text": "ACK", "eol": ""},
             "max_fires": 1
@@ -3174,6 +3526,8 @@ mod tests {
     fn trigger_rejects_empty_or_unbounded_payload_plans() {
         let empty: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "action": {"text": "", "eol": ""}
         }))
         .unwrap();
@@ -3186,6 +3540,8 @@ mod tests {
 
         let over_total: TriggerArgs = serde_json::from_value(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "kickoff": {"text": "x"},
             "action": {"text": "a".repeat(256)},
             "max_fires": 256
@@ -3641,14 +3997,18 @@ mod tests {
     fn command_args_parse_regex_and_lean_rendering_fields() {
         let args: CommandArgs = serde_json::from_value(json!({
             "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
             "command": "boot",
+            "description": "启动样机",
             "regex": "U-Boot \\d+",
         }))
         .unwrap();
         assert_eq!(args.regex.as_deref(), Some("U-Boot \\d+"));
         assert!(
             serde_json::from_value::<CommandArgs>(json!({
-                "slot_id":"bench", "command":"boot", "include_events":true
+                "slot_id":"bench", "run_id":Uuid::nil(), "run_token":Uuid::nil(),
+                "command":"boot", "description":"启动样机", "include_events":true
             }))
             .is_err()
         );
@@ -3698,7 +4058,7 @@ mod tests {
         );
 
         for legacy in ["completion", "until", "eol", "quiet_ms"] {
-            let mut value = json!({"slot_id":"bench","command":"boot"});
+            let mut value = json!({"slot_id":"bench","command":"boot","description":"启动样机"});
             value[legacy] = json!("legacy");
             assert!(serde_json::from_value::<CommandArgs>(value).is_err());
         }

@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serial_protocol::{
-    ActorKind, ClientMessage, Cursor, Direction, EventKind, EventQuery, LoggingState,
-    PROTOCOL_VERSION, ServerMessage, SessionState, SlotSnapshot, Subscription, WireFrame,
+    ActorKind, ClientMessage, Cursor, DataBits, Direction, EchoMode, EventKind, EventQuery,
+    FlowControl, LoggingState, PROTOCOL_VERSION, Parity, ResolvedTransportSettings, RunStatus,
+    ServerMessage, SessionState, SlotSnapshot, StopBits, Subscription, WireFrame, WritePacing,
     decode_wire_frame, encode_client_control,
 };
 use tokio_tungstenite::{
@@ -21,8 +22,157 @@ use uuid::Uuid;
 use crate::{
     api::{ApiClient, is_forbidden, is_not_found},
     cli::{DoctorSlotArgs, DoctorStreamArgs, OutputArgs},
-    display::safe_inline,
+    display::{
+        error_code_label, event_to_lines, pad_display, safe_inline, session_state_label,
+        target_activity_label, trigger_status_label,
+    },
+    i18n::{tr, trf},
 };
+
+const FIELD_WIDTH: usize = 18;
+
+fn print_field(key: &'static str, value: impl std::fmt::Display) {
+    println!("{} {}", pad_display(tr(key), FIELD_WIDTH), value);
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value {
+        tr("doctor.value.yes")
+    } else {
+        tr("doctor.value.no")
+    }
+}
+
+fn source_label(source: &str) -> String {
+    match source {
+        "daemon_port_enumeration" => tr("doctor.source.port.enumeration").into(),
+        "authoritative_slot_snapshot" => tr("doctor.source.slot.snapshot").into(),
+        "authoritative daemon diagnostics" => tr("doctor.source.storage.diagnostics").into(),
+        "archive_catalog_fallback" => tr("doctor.source.archive.fallback").into(),
+        "authoritative_slot_diagnostics" => tr("doctor.source.slot.diagnostics").into(),
+        "status_fallback" => tr("doctor.source.status.fallback").into(),
+        other => safe_inline(other),
+    }
+}
+
+fn assessment_label(assessment: &str) -> String {
+    let key = match assessment {
+        "slot_disabled" => "doctor.assessment.slot_disabled",
+        "port_not_present" => "doctor.assessment.port_not_present",
+        "online" => "doctor.assessment.online",
+        "opening" => "doctor.assessment.opening",
+        "open_failed_backoff" => "doctor.assessment.open_failed_backoff",
+        "waiting_for_port" => "doctor.assessment.waiting_for_port",
+        "stopping" => "doctor.assessment.stopping",
+        "inconclusive_session_changed" => "doctor.assessment.inconclusive_session_changed",
+        "live_subscription_not_ready" => "doctor.assessment.live_subscription_not_ready",
+        "subscriber_lagged" => "doctor.assessment.subscriber_lagged",
+        "stream_gap_detected" => "doctor.assessment.stream_gap_detected",
+        "target_silent_during_window" => "doctor.assessment.target_silent_during_window",
+        "healthy" => "doctor.assessment.healthy",
+        "live_delivery_fault" => "doctor.assessment.live_delivery_fault",
+        "journal_degraded" => "doctor.assessment.journal_degraded",
+        "ingestion_visibility_fault" => "doctor.assessment.ingestion_visibility_fault",
+        other => return trf("doctor.assessment.unknown", &[&safe_inline(other)]),
+    };
+    tr(key).into()
+}
+
+fn logging_label(state: LoggingState) -> &'static str {
+    match state {
+        LoggingState::Healthy => tr("doctor.logging.healthy"),
+        LoggingState::Degraded => tr("doctor.logging.degraded"),
+    }
+}
+
+fn run_status_label(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Active => tr("ui.run.status.active"),
+        RunStatus::Completed => tr("ui.run.status.completed"),
+        RunStatus::Aborted => tr("ui.run.status.aborted"),
+    }
+}
+
+fn transport_label(settings: Option<ResolvedTransportSettings>) -> String {
+    let Some(settings) = settings else {
+        return tr("doctor.value.unavailable").into();
+    };
+    let baud = settings.baud_rate.to_string();
+    let data_bits = match settings.data_bits {
+        DataBits::Five => "5",
+        DataBits::Six => "6",
+        DataBits::Seven => "7",
+        DataBits::Eight => "8",
+    };
+    let parity = match settings.parity {
+        Parity::None => tr("menu.detail.parity.none"),
+        Parity::Odd => tr("menu.detail.parity.odd"),
+        Parity::Even => tr("menu.detail.parity.even"),
+    };
+    let stop_bits = match settings.stop_bits {
+        StopBits::One => "1",
+        StopBits::Two => "2",
+    };
+    let flow = match settings.flow_control {
+        FlowControl::None => tr("menu.detail.flow.none"),
+        FlowControl::Software => tr("menu.detail.flow.software"),
+        FlowControl::Hardware => tr("menu.detail.flow.hardware"),
+    };
+    trf(
+        "doctor.value.transport",
+        &[
+            &baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow,
+            bool_label(settings.dtr),
+            bool_label(settings.rts),
+            bool_label(settings.auto_open),
+        ],
+    )
+}
+
+fn pacing_label(pacing: Option<WritePacing>) -> String {
+    pacing.map_or_else(
+        || tr("doctor.value.unavailable").into(),
+        |pacing| {
+            trf(
+                "doctor.value.pacing",
+                &[
+                    &pacing.chunk_size.to_string(),
+                    &pacing.chunk_delay_ms.to_string(),
+                ],
+            )
+        },
+    )
+}
+
+fn eol_label(eol: Option<&str>) -> String {
+    match eol {
+        None => tr("doctor.value.unavailable").into(),
+        Some("") => tr("doctor.value.eol.none").into(),
+        Some("\r") => "CR (\\r)".into(),
+        Some("\n") => "LF (\\n)".into(),
+        Some("\r\n") => "CRLF (\\r\\n)".into(),
+        Some(value) => trf(
+            "doctor.value.eol.custom",
+            &[&value
+                .chars()
+                .flat_map(char::escape_default)
+                .collect::<String>()],
+        ),
+    }
+}
+
+fn echo_label(echo: Option<EchoMode>) -> &'static str {
+    match echo {
+        Some(EchoMode::On) => tr("menu.detail.echo.on"),
+        Some(EchoMode::Off) => tr("menu.detail.echo.off"),
+        Some(EchoMode::Auto) => tr("menu.detail.echo.auto"),
+        None => tr("doctor.value.unavailable"),
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct PortReport {
@@ -117,50 +267,77 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Slot       {}", safe_inline(&report.slot_id));
-        println!("Port       {}", safe_inline(&report.port));
-        println!(
-            "Discovery  {} ({})",
-            if report.port_discovered {
-                "present"
-            } else {
-                "missing"
-            },
-            report.discovery_source
+        print_field("doctor.field.slot", safe_inline(&report.slot_id));
+        print_field("doctor.field.port", safe_inline(&report.port));
+        print_field(
+            "doctor.field.discovery",
+            trf(
+                "doctor.value.discovery",
+                &[
+                    if report.port_discovered {
+                        tr("doctor.value.present")
+                    } else {
+                        tr("doctor.value.missing")
+                    },
+                    &source_label(report.discovery_source),
+                ],
+            ),
         );
-        println!(
-            "Session    {:?} (generation {})",
-            report.session_state, report.generation
+        print_field(
+            "doctor.field.session",
+            trf(
+                "doctor.value.session",
+                &[
+                    session_state_label(report.session_state),
+                    &report.generation.to_string(),
+                ],
+            ),
         );
-        println!("Assessment {}", report.assessment);
+        print_field(
+            "doctor.field.assessment",
+            assessment_label(report.assessment),
+        );
         if let Some(code) = report.state_code {
-            println!("State code {code:?}");
+            print_field("doctor.field.state_code", error_code_label(code));
         }
         if let Some(reason) = &report.state_reason {
-            println!("Reason     {}", safe_inline(reason));
+            print_field("doctor.field.reason", safe_inline(reason));
         }
-        println!(
-            "Counters   rx={} tx={} overflow={}",
-            report.rx_offset, report.tx_offset, report.rx_overflow_bytes
+        print_field(
+            "doctor.field.counters",
+            trf(
+                "doctor.value.counters",
+                &[
+                    &report.rx_offset.to_string(),
+                    &report.tx_offset.to_string(),
+                    &report.rx_overflow_bytes.to_string(),
+                ],
+            ),
         );
         if let (Some(subscribers), Some(lag)) =
             (report.subscriber_count, report.subscriber_lag_events)
         {
-            println!("Consumers  {subscribers} attached, {lag} lagged event(s)");
+            print_field(
+                "doctor.field.consumers",
+                trf(
+                    "doctor.value.consumers",
+                    &[&subscribers.to_string(), &lag.to_string()],
+                ),
+            );
         }
         if !report.recent_control_events.is_empty() {
-            println!("Recent port lifecycle:");
+            println!("{}", tr("doctor.heading.port_lifecycle"));
             for event in report.recent_control_events.iter().rev().take(8).rev() {
-                println!(
-                    "  #{} {:?} {}",
-                    event.seq,
-                    event.kind,
-                    safe_inline(&format!("{:?}", event.metadata))
-                );
+                for line in event_to_lines(event) {
+                    println!("  #{} {}", event.seq, safe_inline(&line.text));
+                }
             }
         }
         if let Some(error) = &report.recent_events_error {
-            println!("History    unavailable ({})", safe_inline(error));
+            print_field(
+                "doctor.field.history",
+                trf("doctor.value.history_unavailable", &[&safe_inline(error)]),
+            );
         }
     }
     Ok(())
@@ -200,21 +377,42 @@ pub async fn storage(api: &ApiClient, args: OutputArgs) -> Result<()> {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Source     authoritative daemon diagnostics");
-                println!(
-                    "Usage      {} / {} bytes",
-                    report.usage_bytes, report.max_bytes
+                print_field(
+                    "doctor.field.source",
+                    source_label("authoritative daemon diagnostics"),
                 );
-                println!(
-                    "Retention  {} bytes (segment {} bytes)",
-                    report.retention_target_bytes, report.segment_max_bytes
+                print_field(
+                    "doctor.field.usage",
+                    trf(
+                        "doctor.value.usage",
+                        &[
+                            &report.usage_bytes.to_string(),
+                            &report.max_bytes.to_string(),
+                        ],
+                    ),
                 );
-                println!("Archives   {}", report.archive_count);
-                println!(
-                    "Writer     {}/{} queue entries free",
-                    report.writer_queue_remaining, report.writer_queue_capacity
+                print_field(
+                    "doctor.field.retention",
+                    trf(
+                        "doctor.value.retention",
+                        &[
+                            &report.retention_target_bytes.to_string(),
+                            &report.segment_max_bytes.to_string(),
+                        ],
+                    ),
                 );
-                println!("Logging    {:?}", report.logging);
+                print_field("doctor.field.archives", report.archive_count);
+                print_field(
+                    "doctor.field.writer",
+                    trf(
+                        "doctor.value.writer",
+                        &[
+                            &report.writer_queue_remaining.to_string(),
+                            &report.writer_queue_capacity.to_string(),
+                        ],
+                    ),
+                );
+                print_field("doctor.field.logging", logging_label(report.logging));
             }
             return Ok(());
         }
@@ -245,17 +443,26 @@ pub async fn storage(api: &ApiClient, args: OutputArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Source     {}", report.source);
-        println!("Usage      at least {} bytes", report.usage_bytes);
-        println!("Archives   {}", report.archive_count);
-        println!("Quota      unavailable on this seriald");
+        print_field("doctor.field.source", source_label(report.source));
+        print_field(
+            "doctor.field.usage",
+            trf(
+                "doctor.value.usage_at_least",
+                &[&report.usage_bytes.to_string()],
+            ),
+        );
+        print_field("doctor.field.archives", report.archive_count);
+        print_field("doctor.field.quota", tr("doctor.value.quota_unavailable"));
         if !report.degraded_slots.is_empty() {
-            println!(
-                "Degraded   {}",
-                safe_inline(&report.degraded_slots.join(", "))
+            print_field(
+                "doctor.field.degraded_slots",
+                safe_inline(&report.degraded_slots.join(", ")),
             );
         }
-        println!("Note       {}", report.note);
+        if report.catalog_truncated {
+            print_field("doctor.field.catalog", tr("doctor.value.catalog_truncated"));
+        }
+        print_field("doctor.field.note", tr("doctor.note.upgrade_storage"));
     }
     Ok(())
 }
@@ -291,77 +498,138 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let slot = &report.snapshot;
-        println!("Source     {}", report.source);
-        println!(
-            "Slot       {} ({})",
-            safe_inline(&slot.config.id),
-            safe_inline(&slot.config.display_name)
+        print_field("doctor.field.source", source_label(report.source));
+        print_field(
+            "doctor.field.slot",
+            trf(
+                "doctor.value.slot",
+                &[
+                    &safe_inline(&slot.config.id),
+                    &safe_inline(&slot.config.display_name),
+                ],
+            ),
         );
-        println!(
-            "Session    {:?}/{:?}, generation {}",
-            slot.session_state, slot.target_activity, slot.generation
+        print_field(
+            "doctor.field.session",
+            trf(
+                "doctor.value.session_activity",
+                &[
+                    session_state_label(slot.session_state),
+                    target_activity_label(slot.target_activity),
+                    &slot.generation.to_string(),
+                ],
+            ),
         );
-        println!(
-            "Stream     head={} rx={} tx={} overflow={}",
-            slot.head_seq, slot.rx_offset, slot.tx_offset, slot.rx_overflow_bytes
+        print_field(
+            "doctor.field.stream",
+            trf(
+                "doctor.value.stream",
+                &[
+                    &slot.head_seq.to_string(),
+                    &slot.rx_offset.to_string(),
+                    &slot.tx_offset.to_string(),
+                    &slot.rx_overflow_bytes.to_string(),
+                ],
+            ),
         );
-        println!(
-            "Control    {}",
-            safe_inline(
-                slot.control
-                    .as_ref()
-                    .map(|lease| lease.owner.label.as_str())
-                    .unwrap_or("none")
-            )
+        print_field(
+            "doctor.field.control",
+            slot.control.as_ref().map_or_else(
+                || tr("value.none").into(),
+                |lease| safe_inline(&lease.owner.label),
+            ),
         );
         let run = slot
             .active_run
             .as_ref()
-            .map(|run| format!("{} {:?} {}", run.id, run.status, safe_inline(&run.label)))
-            .unwrap_or_else(|| "none".into());
-        println!("Run        {run}");
-        println!(
-            "Trigger    {}",
-            slot.active_trigger
-                .as_ref()
-                .map(|trigger| format!("{} {:?}", trigger.id, trigger.status))
-                .unwrap_or_else(|| "none".into())
+            .map(|run| {
+                trf(
+                    "doctor.value.run",
+                    &[
+                        &run.id.to_string(),
+                        run_status_label(run.status),
+                        &safe_inline(&run.label),
+                    ],
+                )
+            })
+            .unwrap_or_else(|| tr("value.none").into());
+        print_field("doctor.field.run", run);
+        print_field(
+            "doctor.field.trigger",
+            slot.active_trigger.as_ref().map_or_else(
+                || tr("value.none").into(),
+                |trigger| {
+                    trf(
+                        "doctor.value.trigger",
+                        &[
+                            &trigger.id.to_string(),
+                            trigger_status_label(trigger.status),
+                        ],
+                    )
+                },
+            ),
         );
-        println!(
-            "Profiles   transport={} device={}",
-            safe_inline(&slot.config.profile),
-            safe_inline(slot.config.device_profile.as_deref().unwrap_or("Generic"))
+        print_field(
+            "doctor.field.profiles",
+            trf(
+                "doctor.value.profiles",
+                &[
+                    &safe_inline(&slot.config.profile),
+                    &slot.config.device_profile.as_ref().map_or_else(
+                        || tr("menu.value.generic").into(),
+                        |profile| safe_inline(profile),
+                    ),
+                ],
+            ),
         );
-        println!(
-            "Effective  transport={:?} pacing={:?} EOL={:?} echo={:?}",
-            slot.effective_transport,
-            slot.effective_write_pacing,
-            slot.effective_write_eol,
-            slot.effective_echo
+        print_field(
+            "doctor.field.transport",
+            transport_label(slot.effective_transport),
         );
-        println!(
-            "Prompts    shell={} uboot={}",
-            slot.effective_shell_prompt
-                .as_deref()
-                .map(safe_inline)
-                .unwrap_or_else(|| "none".into()),
-            slot.effective_uboot_prompt
-                .as_deref()
-                .map(safe_inline)
-                .unwrap_or_else(|| "none".into())
+        print_field(
+            "doctor.field.pacing",
+            pacing_label(slot.effective_write_pacing),
+        );
+        print_field(
+            "doctor.field.eol",
+            eol_label(slot.effective_write_eol.as_deref()),
+        );
+        print_field("doctor.field.echo", echo_label(slot.effective_echo));
+        print_field(
+            "doctor.field.prompts",
+            trf(
+                "doctor.value.prompts",
+                &[
+                    &slot
+                        .effective_shell_prompt
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("value.none").into()),
+                    &slot
+                        .effective_uboot_prompt
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("value.none").into()),
+                ],
+            ),
         );
         if let Some(count) = report.subscriber_count {
-            println!(
-                "Consumers  {} attached, {} lagged event(s)",
-                count,
-                report.subscriber_lag_events.unwrap_or(0)
+            print_field(
+                "doctor.field.consumers",
+                trf(
+                    "doctor.value.consumers",
+                    &[
+                        &count.to_string(),
+                        &report.subscriber_lag_events.unwrap_or(0).to_string(),
+                    ],
+                ),
             );
         }
         if let Some(reason) = &slot.state_reason {
-            println!("Reason     {}", safe_inline(reason));
+            print_field("doctor.field.reason", safe_inline(reason));
         }
         if let Some(code) = slot.state_code {
-            println!("State code {code:?}");
+            print_field("doctor.field.state_code", error_code_label(code));
         }
     }
     Ok(())
@@ -491,33 +759,63 @@ pub async fn stream(api: &ApiClient, args: DoctorStreamArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Slot       {}", safe_inline(&report.slot_id));
-        println!("Duration   {}s", report.duration_seconds);
-        println!(
-            "Offsets    rx {} -> {} (+{}), head {} -> {}",
-            report.rx_offset_before,
-            report.rx_offset_after,
-            report.rx_offset_delta,
-            report.head_seq_before,
-            report.head_seq_after
+        print_field("doctor.field.slot", safe_inline(&report.slot_id));
+        print_field(
+            "doctor.field.duration",
+            trf(
+                "doctor.value.duration",
+                &[&report.duration_seconds.to_string()],
+            ),
         );
-        println!(
-            "WebSocket  ready={} rx={} frame(s)/{} bytes tx={} frame(s)/{} bytes",
-            report.live.ready,
-            report.live.rx_frames,
-            report.live.rx_bytes,
-            report.live.tx_frames,
-            report.live.tx_bytes
+        print_field(
+            "doctor.field.offsets",
+            trf(
+                "doctor.value.offsets",
+                &[
+                    &report.rx_offset_before.to_string(),
+                    &report.rx_offset_after.to_string(),
+                    &report.rx_offset_delta.to_string(),
+                    &report.head_seq_before.to_string(),
+                    &report.head_seq_after.to_string(),
+                ],
+            ),
         );
-        println!(
-            "Journal    {} RX event(s)/{} bytes, gaps={}, truncated={}",
-            report.journal_rx_events,
-            report.journal_rx_bytes,
-            report.journal_gaps,
-            report.journal_truncated
+        print_field(
+            "doctor.field.websocket",
+            trf(
+                "doctor.value.websocket",
+                &[
+                    bool_label(report.live.ready),
+                    &report.live.rx_frames.to_string(),
+                    &report.live.rx_bytes.to_string(),
+                    &report.live.tx_frames.to_string(),
+                    &report.live.tx_bytes.to_string(),
+                ],
+            ),
         );
-        println!("Overflow   +{} bytes", report.rx_overflow_delta);
-        println!("Assessment {}", report.assessment);
+        print_field(
+            "doctor.field.journal",
+            trf(
+                "doctor.value.journal",
+                &[
+                    &report.journal_rx_events.to_string(),
+                    &report.journal_rx_bytes.to_string(),
+                    &report.journal_gaps.to_string(),
+                    bool_label(report.journal_truncated),
+                ],
+            ),
+        );
+        print_field(
+            "doctor.field.overflow",
+            trf(
+                "doctor.value.overflow",
+                &[&report.rx_overflow_delta.to_string()],
+            ),
+        );
+        print_field(
+            "doctor.field.assessment",
+            assessment_label(report.assessment),
+        );
     }
     Ok(())
 }
@@ -576,17 +874,18 @@ async fn observe_live(
         .expect("normalized endpoint always uses http");
     let mut request = format!("ws://{rest}/api/v1/ws")
         .into_client_request()
-        .context("invalid seriald WebSocket URL")?;
+        .context(tr("doctor.error.ws_url"))?;
     if let Some(token) = token {
         request.headers_mut().insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("token contains invalid HTTP header characters")?,
+                .context(tr("doctor.error.token_header"))?,
         );
     }
-    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
+    let connection = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
         .await
-        .context("independent WebSocket connection timed out")??;
+        .context(tr("doctor.error.ws_timeout"))?;
+    let (mut socket, _) = connection.context(tr("doctor.error.ws_connect"))?;
     send_control(
         &mut socket,
         &ClientMessage::Hello {
@@ -661,13 +960,19 @@ async fn observe_live(
                     ..
                 }) if lagged_slot == slot_id => observation.lagged_events += 1,
                 WireFrame::Control(ServerMessage::Error { message, .. }) => {
-                    bail!("seriald rejected the diagnostic subscription: {message}")
+                    bail!(
+                        "{}",
+                        trf(
+                            "doctor.error.subscription_rejected",
+                            &[&safe_inline(&message)]
+                        )
+                    )
                 }
                 _ => {}
             },
             Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
             Message::Close(_) => break,
-            Message::Text(_) => bail!("seriald sent unsupported text on the binary protocol"),
+            Message::Text(_) => bail!("{}", tr("doctor.error.ws_text")),
             _ => {}
         }
     }
@@ -690,7 +995,7 @@ fn find_slot<'a>(slots: &'a [SlotSnapshot], id: &str) -> Result<&'a SlotSnapshot
     slots
         .iter()
         .find(|slot| slot.config.id == id)
-        .with_context(|| format!("unknown Slot {id:?}"))
+        .with_context(|| trf("doctor.error.unknown_slot", &[&safe_inline(id)]))
 }
 
 fn same_serial_port(left: &str, right: &str) -> bool {
@@ -715,11 +1020,81 @@ fn windows_com_name(port: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{Lang, lang_test_lock, set_lang};
 
     #[test]
     fn windows_com_port_matching_is_case_insensitive_on_every_client_platform() {
         assert!(same_serial_port("COM3", "com3"));
         assert!(same_serial_port(r"\\.\COM3", "com3"));
         assert!(!same_serial_port("/dev/ttyUSB0", "/dev/ttyusb0"));
+    }
+
+    #[test]
+    fn human_assessments_localize_without_changing_json_machine_values() {
+        let _guard = lang_test_lock();
+        let report = PortReport {
+            slot_id: "dut-1".into(),
+            port: "COM3".into(),
+            port_discovered: true,
+            discovery_source: "daemon_port_enumeration",
+            enabled: true,
+            session_state: SessionState::Online,
+            endpoint_present: true,
+            state_code: None,
+            state_reason: None,
+            generation: 3,
+            rx_offset: 10,
+            tx_offset: 5,
+            rx_overflow_bytes: 0,
+            subscriber_count: Some(1),
+            subscriber_lag_events: Some(0),
+            assessment: "online",
+            recent_control_events: Vec::new(),
+            recent_events_error: None,
+        };
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(json["assessment"], "online");
+        assert_eq!(json["discovery_source"], "daemon_port_enumeration");
+
+        set_lang(Lang::Zh);
+        assert_eq!(
+            assessment_label(report.assessment),
+            "串口会话在线，未发现异常"
+        );
+        assert_eq!(source_label(report.discovery_source), "守护进程串口枚举");
+        set_lang(Lang::En);
+        assert_eq!(
+            assessment_label(report.assessment),
+            "the serial session is online"
+        );
+    }
+
+    #[test]
+    fn effective_serial_settings_use_natural_runtime_labels() {
+        let _guard = lang_test_lock();
+        let settings = ResolvedTransportSettings {
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+            dtr: false,
+            rts: false,
+            auto_open: true,
+        };
+
+        set_lang(Lang::Zh);
+        let chinese = transport_label(Some(settings));
+        assert!(chinese.contains("波特率 115200"));
+        assert!(chinese.contains("8 数据位"));
+        assert!(chinese.contains("无校验"));
+        assert_eq!(eol_label(Some("\r\n")), "CRLF (\\r\\n)");
+        assert_eq!(run_status_label(RunStatus::Active), "执行中");
+
+        set_lang(Lang::En);
+        let english = transport_label(Some(settings));
+        assert!(english.contains("115200 baud"));
+        assert!(english.contains("8 data bits"));
+        assert_eq!(run_status_label(RunStatus::Aborted), "aborted");
     }
 }

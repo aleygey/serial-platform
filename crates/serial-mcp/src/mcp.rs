@@ -9,9 +9,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
     DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
-    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
-    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
+    MAX_COMMAND_DESCRIPTION_BYTES, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -22,7 +22,7 @@ use crate::tools::AgentTools;
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records a confirmed assignment through the operator-only binding API; it does not prove identity. Start a Run before writes and initialize device state explicitly. Runs scope evidence only. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist in seriald after this MCP process exits; monitor_start returns immediately and monitor_incidents reads bounded retained results. End Runs and stop Monitors when they are no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes, keep its private run_token within the initiating LLM session, and pass its run_id/run_token to every Run-scoped tool. Never adopt an active Run from devices/status. Runs scope evidence only. Every command requires a concise purpose for durable Run history. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. End Runs and stop Monitors when no longer needed.";
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -392,16 +392,19 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "command",
-            "Write in the active Run and capture RX; uses Slot EOL, pacing, and prompts.",
+            "Write in the active Run and capture RX; include a concise purpose for the durable Run command history.",
             object(
                 json!({
                     "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"},
                     "command":{"type":"string","maxLength":4096,"description":"Empty sends Enter."},
+                    "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose, for example: 查看样机内存。"},
                     "expect":{"type":"string","minLength":1},
                     "regex":{"type":"string","minLength":1,"maxLength":4096},
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
-                &["slot_id", "command"],
+                &["slot_id", "run_id", "run_token", "command", "description"],
             ),
             false,
         ),
@@ -411,9 +414,11 @@ pub fn tool_definitions() -> Vec<Value> {
             object(
                 json!({
                     "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"},
                     "text":{"type":"string","minLength":1,"maxLength":4096}
                 }),
-                &["slot_id", "text"],
+                &["slot_id", "run_id", "run_token", "text"],
             ),
             false,
         ),
@@ -423,10 +428,12 @@ pub fn tool_definitions() -> Vec<Value> {
             object(
                 json!({
                     "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"},
                     "signal":{"type":"string","enum":["ctrl_c","ctrl_d","ctrl_z","break"]},
                     "duration_ms":{"type":"integer","minimum":1,"maximum":5000,"description":"Break only."}
                 }),
-                &["slot_id", "signal"],
+                &["slot_id", "run_id", "run_token", "signal"],
             ),
             false,
         ),
@@ -436,6 +443,8 @@ pub fn tool_definitions() -> Vec<Value> {
             object(
                 json!({
                     "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"},
                     "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
                     "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES,"description":"Advanced RX gate; omit for normal kickoff-then-action."},
                     "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
@@ -444,7 +453,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS},
                     "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":"Confirmed-action send budget, not an observation cutoff."}
                 }),
-                &["slot_id", "action"],
+                &["slot_id", "run_id", "run_token", "action"],
             ),
             false,
         ),
@@ -454,11 +463,13 @@ pub fn tool_definitions() -> Vec<Value> {
             object(
                 json!({
                     "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"},
                     "expect":{"type":"string","minLength":1},
                     "regex":{"type":"string","minLength":1,"maxLength":4096},
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
-                &["slot_id"],
+                &["slot_id", "run_id", "run_token"],
             ),
             true,
         ),
@@ -539,7 +550,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_start",
-            "Acquire write control and start an evidence Run only after confirming the physical DUT model by serial, telnet, web UI, or a human.",
+            "Confirm the physical DUT by serial, telnet, web UI, or a human, then acquire control and return a private run_id/run_token capability.",
             object(
                 json!({
                     "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
@@ -550,17 +561,36 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_end",
-            "End this MCP's Run and release control.",
-            object(json!({"slot_id":{"type":"string"}}), &["slot_id"]),
+            "End the Run authorized by the private capability and release control.",
+            object(
+                json!({
+                    "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"}
+                }),
+                &["slot_id", "run_id", "run_token"],
+            ),
             false,
         ),
         tool(
             "release",
-            "Release control without closing the serial port.",
-            object(
-                json!({"slot_id":{"type":"string"},"abort_run":{"type":"boolean"}}),
-                &["slot_id"],
-            ),
+            "Release only this MCP's control; no local lease is a no-op, while aborting its active Run requires the private capability.",
+            {
+                let mut schema = object(
+                    json!({
+                        "slot_id":{"type":"string"},
+                        "abort_run":{"type":"boolean"},
+                        "run_id":{"type":"string","format":"uuid"},
+                        "run_token":{"type":"string","format":"uuid"}
+                    }),
+                    &["slot_id"],
+                );
+                schema["dependentRequired"] = json!({
+                    "run_id": ["run_token"],
+                    "run_token": ["run_id"]
+                });
+                schema
+            },
             false,
         ),
     ]
@@ -625,6 +655,7 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("remain armed until match or timeout"));
         assert!(SERVER_INSTRUCTIONS.contains("not target success or failure"));
         assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
+        assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
 
         let tools = tool_definitions();
         for name in ["devices", "device_models", "device_model_set", "run_start"] {
@@ -744,7 +775,24 @@ mod tests {
         fields.sort_unstable();
         assert_eq!(
             fields,
-            ["command", "expect", "regex", "slot_id", "timeout_seconds"]
+            [
+                "command",
+                "description",
+                "expect",
+                "regex",
+                "run_id",
+                "run_token",
+                "slot_id",
+                "timeout_seconds"
+            ]
+        );
+        assert_eq!(
+            command["inputSchema"]["required"],
+            json!(["slot_id", "run_id", "run_token", "command", "description"])
+        );
+        assert_eq!(
+            command["inputSchema"]["properties"]["description"]["maxLength"],
+            MAX_COMMAND_DESCRIPTION_BYTES
         );
         for hidden in ["eol", "quiet_ms", "chunk_size", "inter_char_delay_ms"] {
             assert!(command["inputSchema"]["properties"].get(hidden).is_none());
@@ -930,7 +978,10 @@ mod tests {
             .find(|tool| tool["name"] == "trigger")
             .unwrap();
         let schema = &trigger["inputSchema"];
-        assert_eq!(schema["required"], json!(["slot_id", "action"]));
+        assert_eq!(
+            schema["required"],
+            json!(["slot_id", "run_id", "run_token", "action"])
+        );
         assert!(
             schema["properties"]["action"]["properties"]["eol"]
                 .get("default")
@@ -984,11 +1035,37 @@ mod tests {
     }
 
     #[test]
+    fn run_scoped_tools_require_private_capabilities_and_release_pairs_them() {
+        let tools = tool_definitions();
+        for name in ["command", "input", "signal", "trigger", "wait", "run_end"] {
+            let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+            let required = schema["required"].as_array().unwrap();
+            for field in ["run_id", "run_token"] {
+                assert!(
+                    required.iter().any(|item| item == field),
+                    "{name} must require {field}"
+                );
+                assert_eq!(schema["properties"][field]["type"], "string", "{name}");
+                assert_eq!(schema["properties"][field]["format"], "uuid", "{name}");
+            }
+        }
+
+        let release = tools.iter().find(|tool| tool["name"] == "release").unwrap();
+        assert_eq!(release["inputSchema"]["required"], json!(["slot_id"]));
+        assert_eq!(
+            release["inputSchema"]["dependentRequired"],
+            json!({"run_id":["run_token"], "run_token":["run_id"]})
+        );
+    }
+
+    #[test]
     fn report_tool_definition_json_size() {
         let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
         eprintln!("tool_definition_json_bytes={bytes}");
-        // Keep the complete 18-tool MCP surface below a bounded prompt cost.
-        assert!(bytes <= 10_000, "tool definitions grew to {bytes} bytes");
+        // The six Run-scoped tools intentionally repeat an explicit private
+        // capability schema so hosts cannot omit it. Keep that fail-closed
+        // contract while still bounding the complete 18-tool prompt cost.
+        assert!(bytes <= 11_500, "tool definitions grew to {bytes} bytes");
         for tool in tool_definitions() {
             assert!(
                 tool["description"].as_str().unwrap().len() <= 180,

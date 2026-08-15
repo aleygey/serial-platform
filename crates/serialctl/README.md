@@ -77,8 +77,8 @@ The interactive console captures mouse events by default:
 - the wheel scrolls only the serial-output viewport;
 - clicking the output or input pane changes the visible focus;
 - left-drag in the output pane selects text without `Shift`;
-- releasing left-drag resumes live output while retaining the selected text;
-- right-click in the output pane copies that retained selection;
+- mouse-up automatically copies the selected text and resumes live output;
+- right-click in the output pane repeats that retained copy;
 - right-click in the input pane pastes from the Windows clipboard;
 - `Ctrl+Shift+V` remains the portable paste path, including Ubuntu.
 
@@ -106,6 +106,14 @@ use `Ctrl-] c` to cancel their queue.
 Run start/end/abort events are rendered as full-width colored rules. They make
 an Agent task interval obvious to a human observer without implying that the
 DUT was reset or cleaned at either boundary.
+
+On terminals at least 110 columns wide, the right sidebar provides a bounded
+recent projection of Agent tasks and explicitly described Agent TX commands;
+`Ctrl-] h` focuses it, Up/Down selects a command purpose, and Enter/Right
+expands the confirmed bytes. Narrow terminals use an on-demand popup. Initial
+attachment reads only a recent tail, and gaps or local eviction keep the panel
+marked as possibly incomplete. Use persistent logs for complete history;
+historical sidebar backfill is not implemented yet.
 
 On non-Windows terminals, output copy uses OSC 52 so the terminal emulator can
 own the system clipboard without adding an X11 or Wayland runtime dependency.

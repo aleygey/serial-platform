@@ -370,7 +370,9 @@ async fn attach(api: &ApiClient, args: AttachArgs) -> Result<()> {
             bail!("--model is required when stdin/stdout is not a terminal");
         }
         if catalog.models.is_empty() {
-            bail!("no device models are configured; use `serial model add` or --create-if-missing");
+            bail!(
+                "no device models are configured; use `serialctl model add` or --create-if-missing"
+            );
         }
         interactive_select_model(&catalog.models, args.model.as_deref())?
     } else {
@@ -711,6 +713,8 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String> {
 }
 
 fn normalize_model_id(name: &str) -> String {
+    let trimmed = name.trim();
+    let mut contains_non_ascii_name_character = false;
     let normalized = name
         .trim()
         .chars()
@@ -718,16 +722,35 @@ fn normalize_model_id(name: &str) -> String {
             if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
                 character.to_ascii_lowercase()
             } else {
+                contains_non_ascii_name_character |=
+                    !character.is_ascii() && character.is_alphanumeric();
                 '-'
             }
         })
         .collect::<String>()
         .trim_matches('-')
         .to_owned();
+    if !contains_non_ascii_name_character {
+        return if normalized.is_empty() {
+            "model".into()
+        } else {
+            normalized
+        };
+    }
+
+    // Unicode names cannot be represented directly in the stable ASCII ID.
+    // Keep any readable ASCII prefix and append a deterministic FNV-1a digest
+    // so distinct Chinese model names do not all collapse to `model`.
+    let digest = trimmed
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
     if normalized.is_empty() {
-        "model".into()
+        format!("model-{digest:016x}")
     } else {
-        normalized
+        format!("{normalized}-{digest:016x}")
     }
 }
 
@@ -791,6 +814,13 @@ mod tests {
     #[test]
     fn model_id_normalization_is_stable() {
         assert_eq!(normalize_model_id(" TL-AS7230 W "), "tl-as7230-w");
-        assert_eq!(normalize_model_id("样机"), "model");
+        let chinese = normalize_model_id("样机");
+        assert_eq!(chinese, "model-b732c7b1f9c3983c");
+        assert_eq!(chinese, normalize_model_id("  样机  "));
+        assert_ne!(chinese, normalize_model_id("另一台样机"));
+        assert_ne!(
+            normalize_model_id("TL-样机"),
+            normalize_model_id("TL-样机二")
+        );
     }
 }

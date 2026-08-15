@@ -292,7 +292,7 @@ Every variant is tagged by `type` and carries `request_id`.
 | `renew_control` | operator | `slot_id`, `control_id`, `fence`, `ttl_ms`. |
 | `release_control` | operator | `slot_id`, `control_id`, `fence`. |
 | `cancel_acquire` | operator | `slot_id`, `control_id`; queued actors have no lease, so the daemon matches the authenticated actor and ignores this compatibility ID. |
-| `write` | operator | `slot_id`, `control_id`, `fence`, base64 `data`, optional `operation_id`, `expected_run_id`, `pacing`, and `cooperative=false`. `expected_run_id` is required when cooperative. |
+| `write` | operator | `slot_id`, `control_id`, `fence`, base64 `data`, optional `operation_id`, `expected_run_id`, `pacing`, human-readable `description`, and `cooperative=false`. `expected_run_id` is required when cooperative. |
 | `send_break` | operator | `slot_id`, `control_id`, `fence`, `duration_ms`, optional `operation_id` and `expected_run_id`. |
 | `trigger_start` | operator | `slot_id`, Control ID/fence, `daemon_epoch`, `generation`, optional Operation/expected Run, and `spec`. |
 | `trigger_status` | operator | `slot_id`, epoch, generation, `trigger_id`. |
@@ -310,8 +310,12 @@ gaps to N bytes; partial driver acceptance within one chunk adds no pacing gap,
 and there is never a delay after the final chunk. Driver latency and scheduler
 granularity are additional, so this is a minimum requested cadence rather than
 an exact per-character clock. Ordinary writes resolve an explicit override
-before the effective Slot/Device Profile pacing. Empty writes are rejected. One physical write is
-bounded to 4 KiB and a computed maximum 15-second physical-write deadline.
+before the effective Slot/Device Profile pacing. `description` is an additive
+optional wire field for legacy-client compatibility. When present it must be
+non-empty, trimmed, free of control characters, and at most 256 UTF-8 bytes.
+Current serial-mcp `command` calls require it. Empty writes are rejected. One
+physical write is bounded to 4 KiB and a computed maximum 15-second
+physical-write deadline.
 
 `send_break.duration_ms` is in `[1,5000]`. BREAK is a UART line condition, not
 a byte; Ctrl-C/D/Z are ordinary `write` payload bytes `03`, `04`, and `1a`.
@@ -470,6 +474,15 @@ change, Slot reconfiguration/removal, or shutdown aborts the Run and emits
 daemon verifies both the ID and the server-issued Run owner before pacing or
 physical write. Missing, changed, or foreign Runs fail without writing bytes.
 
+A described write that confirms at least one serial byte stores its purpose as
+TX event metadata `command_description`. The TX event's existing `run_id`,
+`operation_id`, sequence, timestamp, and `data` fields provide the Run grouping
+and exact confirmed command bytes; `partial=true` marks a confirmed prefix.
+This keeps command history queryable through the existing event API without a
+new event kind. A write rejected before any byte reaches the port creates no
+command-history event, and legacy writes without `description` keep their
+original event shape.
+
 ### TriggerSpec and lifecycle
 
 A Trigger is one daemon-owned, bounded, device-agnostic reaction job:
@@ -564,7 +577,7 @@ EOL, echo, pacing, port lifecycle, or Run state.
 - HTTP remains namespaced `/api/v1`; that route namespace is independent of
   the WebSocket protocol number.
 - Additive optional fields use Serde defaults where implemented, including
-  legacy writes defaulting `cooperative=false`.
+  legacy writes defaulting `description=null` and `cooperative=false`.
 - `0x04` is reserved only; clients must use the `write` control message.
 - Exact schema inspection should use the Rust DTOs for HTTP/WebSocket and
   `tools/list` or `serial mcp --dump-tools` for MCP.

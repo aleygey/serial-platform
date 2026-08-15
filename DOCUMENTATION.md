@@ -35,7 +35,11 @@ authoritative schemas are emitted by `tools/list` or
 [MCP_TOOLS.md](./docs/MCP_TOOLS.md). Internal request IDs, operation IDs,
 control/fencing, lease renewal, prompt selection, capture bounds, cursor
 bookkeeping, Monitor policy, and notification delivery stay inside the adapter
-or daemon instead of becoming routine Agent parameters.
+or daemon instead of becoming routine Agent parameters. The exception is the
+MCP-local Run capability: `run_start` returns a public audit `run_id` plus an
+unpredictable private `run_token`, and the initiating LLM session must pass the
+pair to each Run-scoped call. The token is never sent to `seriald`, placed in
+Run metadata/timeline events, or exposed by status.
 
 Agent `search` defaults to the active Run. Cross-Run or old-epoch history is
 never inferred from a text match: current-cursor and archive scopes require an
@@ -43,12 +47,16 @@ explicit cursor/epoch. A truncated active-Run search accepts its returned
 current-epoch `after_seq` while retaining the same `run_id` filter. The caller
 must page until `truncated=false` before treating an empty result as absence;
 continuation guidance takes precedence over archive guidance.
-`command` first requires a Run started by this `serial-mcp` process. It attaches
-before TX, creates an Operation UUID, sends that Run as `expected_run_id`, then
-uses the confirmed TX audit sequence as the authoritative lower bound of its
-bounded output window. The Slot actor checks the expected ID and server-issued
-Run owner together with the current control/fence before any pacing budget or
-physical write. The confirmed TX sequence is the hard lower bound: earlier RX
+`command` first requires a Run started by this `serial-mcp` process and the
+private `run_id`/`run_token` returned to that caller. The adapter validates the
+pair before the caller waits for the per-Slot write lock and revalidates it in
+the serialized control session immediately before the physical action. It
+attaches before TX, creates an Operation UUID, sends the Run ID as
+`expected_run_id`, then uses the confirmed TX audit sequence as the
+authoritative lower bound of its bounded output window. The Slot actor checks
+the expected ID and server-issued Run owner together with the current
+control/fence before any pacing budget or physical write. The confirmed TX
+sequence is the hard lower bound: earlier RX
 is excluded. With authoritative `echo=on`, a complete command plus EOL echo
 (including the target's `CR CR LF` hard wraps) is stripped and provides the
 strongest confidence. A requested literal, regex, or prompt observed after TX
@@ -81,19 +89,31 @@ never automatically retries an uncertain write.
 `input` sends exact UTF-8 bytes without Profile EOL. `signal` sends Ctrl-C,
 Ctrl-D, and Ctrl-Z as the exact single bytes `0x03`, `0x04`, and `0x1a`, or
 requests a bounded physical UART Break. All four require the adapter-owned Run
-and the same fenced Control as a command. Break is a line condition, not a
-character byte, and creates a normal audited timeline event.
+capability and the same fenced Control as a command. `trigger`, `wait`, and
+`run_end` require the same pair; an aborting `release` requires it while a Run
+is active. A caller cannot adopt a `run_id` learned from status because the
+private token is not published. Break is a line condition, not a character
+byte, and creates a normal audited timeline event.
 
 The MCP session uses operation-specific RPC limits: ordinary control requests
 remain bounded to five seconds, Run-start control queueing is capped at 15
 seconds with a five-second response margin, and a write waits 20 seconds so it
 cannot pre-empt seriald's legal 15-second physical-write deadline. Only Slots
 with Runs started by this adapter process receive periodic lease renewal.
-`command` renews that existing lease and fails closed instead of reacquiring
-control after Run/lease loss. Disconnect or renewal failure clears the adapter's
-owned-Run ledger. Successful `run_end` removes the Run from renewal before a
-best-effort release; a failed release leaves at most the server TTL and never
-closes the port. Explicit release is idempotent without a local lease.
+Each authorized Run-scoped call pins its Run for the complete call, including
+a `wait` or command capture lasting up to 120 seconds. After the final pin is
+dropped, 60 seconds of inactivity makes the next renewal tick actively release
+Control and abort the abandoned Run; if that release cannot reach the daemon,
+the 60-second fenced lease expires instead. `command` renews the existing lease
+and fails closed instead of reacquiring control after Run/lease loss.
+Disconnect or renewal failure clears the adapter's owned-Run ledger.
+Successful `run_end` removes the Run from renewal before a best-effort release;
+a failed release leaves at most the server TTL and never closes the port.
+Explicit release first checks the serialized MCP session's local lease state
+inside the per-Slot lock. Without a local lease it is idempotent and ignores a
+foreign Run visible in public status. With a stale local Run but no daemon
+active Run, default release discards that bookkeeping and releases the lease;
+only this MCP's matching active Run requires abort plus its capability pair.
 Seriald's explicit Run, pacing-budget, and lease-too-short rejections say that
 no bytes were written and are reported as safe to retry after correction;
 transport loss, timeout, and partial writes remain outcome-uncertain and are
@@ -294,6 +314,11 @@ bounds.
 - A client disconnect releases control immediately; it is not held until TTL.
 - Releasing/revoking control aborts an active Run.
 - One Slot has at most one active Run.
+- At the MCP boundary, `run_start` creates a private in-memory `run_token` for
+  that Run. `command`, `input`, `signal`, `trigger`, `wait`, and `run_end`
+  require the exact `run_id`/`run_token`; active-Run `release` requires it as
+  well. This capability isolates callers sharing one long-lived MCP process;
+  seriald continues to enforce the wire-level actor, fence, and Run owner.
 - Run boundaries do not reset or clean the target; they only define an exact
   event interval.
 - Agent writes set `expected_run_id`; the Slot actor requires that exact active
@@ -645,11 +670,12 @@ Control. In RAW mode Ctrl-D and Ctrl-Z likewise transmit `0x04` and `0x1a`;
 they do not terminate or suspend the local process.
 Mouse capture is enabled by default. The wheel changes only the serial-output
 viewport, clicking output/input changes focus, output left-drag performs
-Shift-free in-app selection, and output right-click copies. Only an active
-left-button drag renders the stable selection snapshot. Mouse-up immediately
-returns rendering to the authoritative live viewport while retaining the
-selected text for the next output-pane right-click; a five-second inactivity
-deadline also finalizes a drag if the terminal loses its mouse-up event.
+Shift-free in-app selection, and releasing the left button immediately copies
+the selected text. Only an active left-button drag renders the stable selection
+snapshot. Mouse-up returns rendering to the authoritative live viewport while
+retaining the selected text so output right-click can repeat or retry the copy;
+a five-second inactivity deadline also finalizes and copies a drag if the
+terminal loses its mouse-up event.
 Windows input
 right-click reads the native Unicode clipboard; portable paste remains
 `Ctrl+Shift+V`, including on Ubuntu. Non-Windows copy uses OSC 52 and can
@@ -750,7 +776,7 @@ Endpoint: `GET /api/v1/ws`. Default loopback-only installations omit
 Authorization; authenticated installations send `Authorization: Bearer …`.
 Incoming WebSocket messages and frames are capped at 64 KiB.
 
-v0.6.1 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
+v0.6.2 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
 are wire-compatible for the v3 realtime surface, while the additive Monitor
 HTTP APIs and MCP tools require v0.5 components. Protocol-v2 executables from
 0.3.x and protocol-v1 executables from 0.2.x are not wire-compatible with v3.
