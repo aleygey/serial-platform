@@ -107,13 +107,14 @@ Run start/end/abort events are rendered as full-width colored rules. They make
 an Agent task interval obvious to a human observer without implying that the
 DUT was reset or cleaned at either boundary.
 
-On terminals at least 110 columns wide, the right sidebar provides a bounded
-recent projection of Agent tasks and explicitly described Agent TX commands;
-`Ctrl-] h` focuses it, Up/Down selects a command purpose, and Enter/Right
-expands the confirmed bytes. Narrow terminals use an on-demand popup. Initial
-attachment reads only a recent tail, and gaps or local eviction keep the panel
+On terminals at least 22 rows tall, a full-width horizontal bar between serial
+output and command input provides a bounded recent projection of Agent tasks
+and explicitly described Agent TX commands. `Ctrl-] h` focuses it, Up/Down
+selects a command purpose, and Enter/Right expands the confirmed bytes. Short
+terminals use an on-demand popup so serial output retains enough rows. Initial
+attachment reads only a recent tail, and gaps or local eviction keep the bar
 marked as possibly incomplete. Use persistent logs for complete history;
-historical sidebar backfill is not implemented yet.
+historical backfill is not implemented yet.
 
 On non-Windows terminals, output copy uses OSC 52 so the terminal emulator can
 own the system clipboard without adding an X11 or Wayland runtime dependency.

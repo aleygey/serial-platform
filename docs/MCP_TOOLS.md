@@ -30,10 +30,11 @@ active. A caller must never discover an active `run_id` through `devices` or
 
 An authorized Run-scoped call pins its Run for that call's complete lifetime,
 including a `wait` or capture lasting up to 120 seconds. After the last pin is
-dropped, the adapter permits 60 seconds of inactivity. At the next renewal
-tick it actively releases control, which aborts an abandoned active Run; if
-that best-effort release cannot reach `seriald`, the fenced 60-second daemon
-lease still expires and aborts the Run. This prevents a long-lived shared MCP
+dropped, the adapter permits five minutes of inactivity. At the next 20-second
+renewal tick it actively releases control, which aborts an abandoned active Run;
+if that best-effort release cannot reach `seriald`, the separately renewed,
+fenced 60-second daemon lease still expires and aborts the Run. This prevents a
+long-lived shared MCP
 process from renewing a prior LLM session's abandoned Run indefinitely.
 
 A successful `tools/call` result has `isError=false`, the documented object in

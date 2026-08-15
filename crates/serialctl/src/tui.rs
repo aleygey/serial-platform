@@ -64,9 +64,11 @@ const MOUSE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RUN_HISTORY_PER_SLOT: usize = 20;
 const MAX_COMMANDS_PER_RUN: usize = 64;
 const MAX_RUN_COMMAND_BYTES: usize = 4 * 1024;
-const RUN_SIDEBAR_MIN_TERMINAL_WIDTH: u16 = 110;
-const RUN_SIDEBAR_MIN_WIDTH: u16 = 32;
-const RUN_SIDEBAR_MAX_WIDTH: u16 = 44;
+/// Keep the command-history bar useful without taking the serial output below
+/// its four-row minimum. Short terminals expose the same view as a focused
+/// popup instead of permanently consuming scarce vertical space.
+const RUN_HISTORY_BAR_MIN_TERMINAL_HEIGHT: u16 = 22;
+const RUN_HISTORY_BAR_HEIGHT: u16 = 7;
 
 type ClipboardCopyFn = fn(&str) -> Result<()>;
 
@@ -593,11 +595,11 @@ struct SlotView {
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
-    /// Bounded, structured Run projection for the operator sidebar. Timeline
+    /// Bounded, structured Run projection for the operator history bar. Timeline
     /// rows remain the durable audit source; this projection only groups their
     /// lifecycle and confirmed TX events for quick review.
     run_history: VecDeque<RunHistoryEntry>,
-    /// The sidebar is a bounded recent projection, not an assertion that the
+    /// The bar is a bounded recent projection, not an assertion that the
     /// durable journal has been read from sequence one. Initial attach uses a
     /// tail, and any gap or local eviction keeps this conservative marker set.
     run_history_limited: bool,
@@ -5110,24 +5112,25 @@ fn wrap_queue_text(value: &str, width: u16) -> Vec<String> {
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let wide_run_panel = app.run_panel_visible && area.width >= RUN_SIDEBAR_MIN_TERMINAL_WIDTH;
-    let (console_area, run_history_area) = if wide_run_panel {
-        let run_width = (area.width / 3).clamp(RUN_SIDEBAR_MIN_WIDTH, RUN_SIDEBAR_MAX_WIDTH);
-        let columns =
-            Layout::horizontal([Constraint::Min(60), Constraint::Length(run_width)]).split(area);
-        (columns[0], Some(columns[1]))
+    let show_run_history_bar =
+        app.run_panel_visible && area.height >= RUN_HISTORY_BAR_MIN_TERMINAL_HEIGHT;
+    let run_history_height = if show_run_history_bar {
+        RUN_HISTORY_BAR_HEIGHT
     } else {
-        (area, None)
+        0
     };
 
-    let queue_visual_rows = queue_cards(app, console_area.width.saturating_sub(2))
+    let queue_visual_rows = queue_cards(app, area.width.saturating_sub(2))
         .iter()
         .map(|card| card.body.len().saturating_add(1))
         .sum::<usize>();
     // Preserve the existing four-row minimum output pane. On a normal
     // terminal every queued operation gets one row; very short terminals use
     // a bounded queue viewport that follows the selected operation.
-    let max_queue_height = console_area.height.saturating_sub(12);
+    let max_queue_height = area
+        .height
+        .saturating_sub(12)
+        .saturating_sub(run_history_height);
     let queue_height = if queue_visual_rows == 0 {
         0
     } else {
@@ -5138,14 +5141,16 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
+        Constraint::Length(run_history_height),
         Constraint::Length(1),
         Constraint::Length(queue_height),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
-    .split(console_area);
+    .split(area);
     let output_area = chunks[1];
-    let input_area = chunks[4];
+    let run_history_area = show_run_history_bar.then_some(chunks[2]);
+    let input_area = chunks[5];
     app.layout = Some(ConsoleLayout {
         output_area,
         output_inner: inset_border(output_area),
@@ -5155,15 +5160,16 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_tabs(frame, app, chunks[0]);
     draw_output(frame, app, chunks[1]);
-    draw_status(frame, app, chunks[2]);
-    if queue_height > 0 {
-        draw_queue(frame, app, chunks[3]);
-    }
-    draw_input(frame, app, chunks[4]);
-    draw_help_line(frame, app, chunks[5]);
     if let Some(run_history_area) = run_history_area {
         draw_run_history(frame, app, run_history_area);
-    } else if app.run_panel_visible && app.focus == PaneFocus::RunHistory {
+    }
+    draw_status(frame, app, chunks[3]);
+    if queue_height > 0 {
+        draw_queue(frame, app, chunks[4]);
+    }
+    draw_input(frame, app, chunks[5]);
+    draw_help_line(frame, app, chunks[6]);
+    if run_history_area.is_none() && app.run_panel_visible && app.focus == PaneFocus::RunHistory {
         let popup = centered_rect(
             area.width.saturating_sub(4).clamp(1, 72),
             area.height.saturating_sub(4).max(1),
@@ -8887,7 +8893,7 @@ mod tests {
     }
 
     #[test]
-    fn run_sidebar_marks_tail_and_gap_history_as_recent_only() {
+    fn run_history_bar_marks_tail_and_gap_history_as_recent_only() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
         let mut app = App::new(vec![snapshot()], None);
@@ -8964,7 +8970,7 @@ mod tests {
     }
 
     #[test]
-    fn run_sidebar_selects_commands_and_expands_only_the_confirmed_tx() {
+    fn run_history_bar_selects_commands_and_expands_only_the_confirmed_tx() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
         let mut current = snapshot();
@@ -9026,22 +9032,40 @@ mod tests {
         let backend = TestBackend::new(90, 24);
         let mut narrow = Terminal::new(backend).expect("narrow test terminal");
         narrow.draw(|frame| draw(frame, &mut app)).unwrap();
-        let hidden = narrow
+        let horizontal = narrow
             .backend()
             .buffer()
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(!hidden.contains("read system version"));
-        assert!(
-            app.layout
-                .and_then(|layout| layout.run_history_area)
-                .is_none()
+        assert!(horizontal.contains("read system version"));
+        let layout = app.layout.expect("horizontal history layout");
+        let history_area = layout.run_history_area.expect("visible history bar");
+        assert_eq!(history_area.x, layout.output_area.x);
+        assert_eq!(history_area.width, layout.output_area.width);
+        assert_eq!(
+            history_area.y,
+            layout.output_area.y + layout.output_area.height
         );
+        assert!(history_area.y + history_area.height <= layout.input_area.y);
+
+        // Ctrl-] h focuses the bar first, then hides it when repeated while
+        // focused. The shortcut can show it again without changing history.
         app.toggle_run_history_panel();
+        assert_eq!(app.focus, PaneFocus::RunHistory);
+        app.toggle_run_history_panel();
+        assert!(!app.run_panel_visible);
         narrow.draw(|frame| draw(frame, &mut app)).unwrap();
-        let popup = narrow
+        assert!(app.layout.unwrap().run_history_area.is_none());
+
+        // A short terminal does not permanently sacrifice serial rows. Once
+        // focused, the same history view is available as an on-demand popup.
+        app.toggle_run_history_panel();
+        let backend = TestBackend::new(90, 18);
+        let mut short = Terminal::new(backend).expect("short test terminal");
+        short.draw(|frame| draw(frame, &mut app)).unwrap();
+        let popup = short
             .backend()
             .buffer()
             .content

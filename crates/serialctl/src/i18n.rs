@@ -166,16 +166,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
         " · SENDING (locked)",
         " · 发送中（已锁定）",
     ),
-    // ---- Run / described Agent command sidebar ----
+    // ---- Run / described Agent command history bar ----
     (
         "ui.run.title",
-        " Agent Runs / command purposes ",
-        " Agent 任务 / 命令用途 ",
+        " Agent task / command history ",
+        " Agent 任务与命令记录 ",
     ),
     (
         "ui.run.title.limited",
-        " Agent Runs / command purposes · recent ",
-        " Agent 任务 / 命令用途 · 最近记录 ",
+        " Agent task / command history · recent ",
+        " Agent 任务与命令记录 · 最近记录 ",
     ),
     (
         "ui.run.none",
@@ -901,8 +901,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.run.history",
-        "  Ctrl-] h                 focus/show command purposes; repeat while focused hides",
-        "  Ctrl-] h                 聚焦/显示命令用途；聚焦时再按可隐藏",
+        "  Ctrl-] h                 focus/show command-history bar; repeat while focused hides",
+        "  Ctrl-] h                 聚焦/显示命令记录横栏；聚焦时再按可隐藏",
     ),
     (
         "help.run.keys",
@@ -1378,17 +1378,17 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.run.panel.focused",
-        "command-purpose history focused; Up/Down selects, Enter expands, Ctrl-] h hides",
-        "已进入命令用途历史；上下选择，Enter 展开，Ctrl-] h 隐藏",
+        "command-history bar focused; Up/Down selects, Enter expands, Ctrl-] h hides",
+        "已聚焦命令记录横栏；上下选择，Enter 展开，Ctrl-] h 隐藏",
     ),
     (
         "st.run.panel.hidden",
-        "command-purpose history hidden",
-        "已隐藏命令用途历史",
+        "command-history bar hidden",
+        "已隐藏命令记录横栏",
     ),
     (
         "st.run.panel.left",
-        "left command-purpose history",
+        "left command-history bar",
         "已返回命令输入",
     ),
     (

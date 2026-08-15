@@ -149,9 +149,10 @@ Only Runs started by this adapter process receive lease renewal. Each
 Run-scoped tool validates the private capability before waiting for the
 per-Slot write lock and the serialized session validates it again before any
 physical action. An active tool call pins the Run; after the last call returns,
-60 seconds of inactivity causes active release/abort at the next renewal tick.
-Disconnect or renewal failure clears local ownership; the adapter never
-silently reacquires Control and continues an old task. One Slot has at most one
+five minutes of inactivity causes active release/abort at the next renewal tick.
+The underlying 60-second fenced lease continues to renew every 20 seconds
+during that window. Disconnect or renewal failure clears local ownership; the
+adapter never silently reacquires Control and continues an old task. One Slot has at most one
 active Run, and per-Slot write locks prevent concurrent MCP calls from
 interleaving bytes.
 

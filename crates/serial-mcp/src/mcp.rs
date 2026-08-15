@@ -22,7 +22,7 @@ use crate::tools::AgentTools;
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes, keep its private run_token within the initiating LLM session, and pass its run_id/run_token to every Run-scoped tool. Never adopt an active Run from devices/status. Runs scope evidence only. Every command requires a concise purpose for durable Run history. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. End Runs and stop Monitors when no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes, keep its private run_token within the initiating LLM session, and pass its run_id/run_token to every Run-scoped tool. Never adopt an active Run from devices/status. Runs scope evidence only. Run-scoped calls pin the Run while active; after the final call returns, five minutes of inactivity releases control and aborts the abandoned Run. Every command requires a concise purpose for durable Run history. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. End Runs and stop Monitors when no longer needed.";
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -655,6 +655,7 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("remain armed until match or timeout"));
         assert!(SERVER_INSTRUCTIONS.contains("not target success or failure"));
         assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
+        assert!(SERVER_INSTRUCTIONS.contains("five minutes of inactivity"));
         assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
 
         let tools = tool_definitions();

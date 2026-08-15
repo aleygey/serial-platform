@@ -102,9 +102,10 @@ cannot pre-empt seriald's legal 15-second physical-write deadline. Only Slots
 with Runs started by this adapter process receive periodic lease renewal.
 Each authorized Run-scoped call pins its Run for the complete call, including
 a `wait` or command capture lasting up to 120 seconds. After the final pin is
-dropped, 60 seconds of inactivity makes the next renewal tick actively release
+dropped, five minutes of inactivity makes the next renewal tick actively release
 Control and abort the abandoned Run; if that release cannot reach the daemon,
-the 60-second fenced lease expires instead. `command` renews the existing lease
+the separately renewed 60-second fenced lease expires instead. `command` renews
+the existing lease
 and fails closed instead of reacquiring control after Run/lease loss.
 Disconnect or renewal failure clears the adapter's owned-Run ledger.
 Successful `run_end` removes the Run from renewal before a best-effort release;
@@ -704,6 +705,15 @@ command history are maintained independently for every Slot.
 Run start, end, and abort events render as full-width colored boundary rules.
 They visually bracket a task interval but never imply a reboot, cleanup, or
 exclusive physical-device reservation.
+
+When the terminal is at least 22 rows tall, the current Slot's bounded recent
+Agent Run and described-command projection appears as a seven-row, full-width
+history bar between serial output and command input. `Ctrl-] h` focuses or
+hides it; Up/Down selects a command purpose and Enter/Right expands only the
+confirmed TX bytes. Short terminals preserve serial-output height and show the
+same view as an on-demand popup while focused. The bar remains explicitly
+marked as recent when initial tail attach, a journal gap, or local eviction
+means it cannot claim complete history.
 
 The in-memory replay ring is bounded by event count and an estimated resident
 byte size. Its accounting includes raw data, actor/Slot strings, Run and

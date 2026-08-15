@@ -27,7 +27,7 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(20);
 /// remains alive. Tool calls pin the Run while they are active; after the last
 /// pin is dropped, this deadline bounds how long an abandoned LLM session can
 /// continue occupying the physical Slot.
-const RUN_IDLE_TTL: Duration = Duration::from_secs(60);
+const RUN_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_SERVICE_MARGIN: Duration = Duration::from_secs(5);
 /// seriald caps one physical write at 15 seconds. The adapter must not call a
@@ -770,7 +770,7 @@ impl SessionState {
             // exact idle deadline and the next periodic renewal tick.
             self.best_effort_release(slot_id).await;
             bail!(
-                "Run {run_id} on Slot {slot_id:?} exceeded the {} second MCP idle limit and was \
+                "Run {run_id} on Slot {slot_id:?} exceeded the {}-second MCP idle limit and was \
                  released; start a new Run",
                 RUN_IDLE_TTL.as_secs()
             );
@@ -2108,6 +2108,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_run_error_reports_the_five_minute_idle_limit() {
+        let mut state = SessionState::new(
+            "http://127.0.0.1:1".into(),
+            Some("token".into()),
+            "test".into(),
+        );
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        state.owned_runs.insert(
+            "bench".into(),
+            OwnedRun::new(run_id, run_token, Instant::now() - RUN_IDLE_TTL),
+        );
+
+        let error = state
+            .begin_run_use("bench", run_id, run_token)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("300-second MCP idle limit"));
+        assert!(!state.owned_runs.contains_key("bench"));
+    }
+
+    #[tokio::test]
     async fn physical_action_revalidates_the_private_capability_before_connecting() {
         let mut state = SessionState::new(
             "http://127.0.0.1:1".into(),
@@ -2174,6 +2197,13 @@ mod tests {
             .unwrap();
         assert!(pinned.0.is_empty());
         assert_eq!(pinned.1.len(), 1);
+    }
+
+    #[test]
+    fn run_idle_window_does_not_change_the_lease_renewal_cadence() {
+        assert_eq!(RUN_IDLE_TTL, Duration::from_secs(5 * 60));
+        assert_eq!(LEASE_TTL_MS, 60_000);
+        assert_eq!(RENEW_INTERVAL, Duration::from_secs(20));
     }
 
     #[test]

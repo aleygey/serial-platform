@@ -12,7 +12,7 @@ MCP clients without making `seriald` Agent-specific.
 
 v0.6.2 isolates every MCP-owned Run with a private caller capability, records
 the human-readable purpose of confirmed Agent commands, and adds a bounded
-Run/command-purpose sidebar to the Chinese-first terminal. It also adds native
+full-width Run/command-history bar to the Chinese-first terminal. It also adds native
 macOS arm64/x86_64 packages to the Jenkins pipeline. The current 18-tool MCP
 registry retains the persistent Monitor Jobs introduced in v0.5.0 and the
 ordinary serial/Run/Trigger operations. The unified launcher introduced in
@@ -43,8 +43,9 @@ Protocol and integration references:
   TX events retain that purpose, while pre-write failures create no misleading
   command-history record.
 - The terminal shows the current serial channel's recent Agent tasks and
-  command purposes in a right-hand panel. Operators can select a purpose and
-  expand only the bytes confirmed sent. The panel labels bounded/tail history
+  command purposes in a full-width horizontal bar between serial output and
+  command input. Operators can select a purpose and expand only the bytes
+  confirmed sent. The bar labels bounded/tail history
   as recent rather than claiming completeness.
 - Profile selection is available directly through `Ctrl-] o`; left-drag
   mouse-up copies immediately; the TUI and human-readable `doctor` output use
@@ -346,7 +347,7 @@ keys:
 | `Ctrl-] g` | Switch UI language and save it |
 | `Ctrl-] m` | Open the Profile / device-model / serial-settings / help menu |
 | `Ctrl-] o` | Open Profile selection directly; `Esc` returns to the extensible main menu |
-| `Ctrl-] h` | Focus/show Agent command-purpose history; press again while focused to hide it |
+| `Ctrl-] h` | Focus/show the Agent command-history bar; press again while focused to hide it |
 | `Alt-Enter` | Send the current LINE command cooperatively without taking the Agent lease |
 | `Ctrl-] t` | Explicitly take over write control |
 | `Ctrl-] c` | Release control or cancel queued input |
@@ -368,15 +369,17 @@ view to live output. It does not quit `serialctl` or release Human Control.
 In RAW mode, Ctrl-D and Ctrl-Z are ordinary raw control bytes; they do not exit
 the local console or suspend its process.
 
-On terminals at least 110 columns wide, a bounded recent projection of the
-current Slot's Agent Run history appears on the right. It lists only Agent TX
+On terminals at least 22 rows tall, a bounded recent projection of the current
+Slot's Agent Run history appears as a full-width horizontal bar between serial
+output and command input. It lists only Agent TX
 events carrying an explicit command purpose; ordinary Human/cooperative input
 and undescribed/raw writes are not guessed into the list. Initial attachment
-reads only a recent tail, and gaps or local eviction keep the panel marked as
+reads only a recent tail, and gaps or local eviction keep the bar marked as
 possibly incomplete. Use the persistent logs for complete history; historical
-sidebar backfill is not implemented yet. `Ctrl-] h` focuses the panel, Up/Down
-chooses a command purpose, and Enter/Right expands only that command's
-confirmed TX bytes. Narrow terminals show the same panel as an on-demand popup.
+backfill is not implemented yet. `Ctrl-] h` focuses the bar, Up/Down chooses a
+command purpose, and Enter/Right expands only that command's confirmed TX
+bytes. Short terminals show the same history as an on-demand popup so serial
+output keeps enough rows.
 
 Mouse capture is on by default. The wheel scrolls only the serial-output
 viewport; clicking the output or input pane changes focus; output left-drag
@@ -652,9 +655,11 @@ lease-only writes. A Run isolates only its log/event interval—it does not
 reset, initialize, or otherwise clean the device.
 
 The adapter renews control only for Runs it currently owns. A Run-scoped call
-pins its Run for that call's full lifetime; after the last call returns, 60
-seconds without activity causes the adapter to release control and abort the
-abandoned Run at its next renewal tick. A lost connection or failed renewal
+pins its Run for that call's full lifetime; after the last call returns, five
+minutes without activity causes the adapter to release control and abort the
+abandoned Run at its next renewal tick. The underlying 60-second fenced lease
+continues to renew every 20 seconds while that Run remains eligible. A lost
+connection or failed renewal
 forgets all owned Run state and never reacquires control to continue writing
 outside the old boundary. Successful `run_end` stops renewal and immediately
 attempts a best-effort release; release failure cannot undo the ended Run, and
