@@ -750,7 +750,7 @@ Jenkins is the authoritative release builder. `BUILD_PROFILE` selects Debug or
 Release; both can be archived, but Debug packages are visibly named with
 `-debug-` and can never enter a GitHub Release. The ARM64 Linux worker first
 runs the locked workspace tests, Clippy, native smoke checks, and the exact
-18-entry `serial-mcp --dump-tools` check. It then builds two x86_64 targets:
+19-entry `serial-mcp --dump-tools` check. It then builds two x86_64 targets:
 
 - `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31` produces `serial`,
   `serialctl`, and `serial-mcp` for Ubuntu 20.04 or newer. Every ELF is checked
