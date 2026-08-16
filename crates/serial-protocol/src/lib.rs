@@ -232,6 +232,34 @@ pub struct WritePacing {
     pub chunk_delay_ms: u64,
 }
 
+/// Optional grouping metadata for one physical write that belongs to a known
+/// dependent command sequence. This is durable audit context only; it does
+/// not claim that the DUT executed either the step or the whole sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSequenceAuditContext {
+    pub sequence_id: Uuid,
+    /// Human-readable purpose of the complete sequence. Individual step
+    /// purpose remains in `ClientMessage::Write::description`.
+    pub description: String,
+    /// Zero-based index of this physical write within the sequence.
+    pub step_index: u8,
+    pub step_count: u8,
+}
+
+/// Optional fail-closed boundary for one `command_sequence` physical write.
+///
+/// The daemon validates this inside the Slot actor immediately before the
+/// write enters the port queue. RX and ordinary control events after `cursor`
+/// are allowed, but a changed serial generation, a changed TX offset, an
+/// explicit Gap event, or an evicted replay window rejects the write with a
+/// definite zero-byte outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceWritePrecondition {
+    pub cursor: Cursor,
+    pub expected_generation: u64,
+    pub expected_tx_offset: u64,
+}
+
 impl WritePacing {
     /// Resolves the effective pacing for one write request: an explicit
     /// per-request override wins over the Slot settings.
@@ -830,6 +858,15 @@ pub enum ClientMessage {
         /// clients omit it and retain the original wire behavior.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        /// Optional durable grouping metadata for `command_sequence` writes.
+        /// Ordinary command, Human, and legacy writes omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_sequence: Option<CommandSequenceAuditContext>,
+        /// Optional daemon-enforced, fail-closed boundary for a dependent
+        /// sequence write. Ordinary command, Human, and legacy writes omit
+        /// this field and retain their existing behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence_precondition: Option<SequenceWritePrecondition>,
         /// Explicit Human-only injection while an Agent owns control. This
         /// bypasses takeover but does not transfer or revoke the Agent lease.
         /// Daemons must reject the flag for non-Human actors, a missing or
@@ -1020,6 +1057,7 @@ pub enum ErrorCode {
     StaleFence,
     PortOffline,
     CursorAhead,
+    SequenceBoundaryChanged,
     ResourceExhausted,
     IdempotencyExpired,
     ConfigRevisionMismatch,
@@ -1079,6 +1117,11 @@ pub struct StatusResponse {
     pub protocol_version: u16,
     #[serde(default)]
     pub config_revision: u64,
+    /// True when guarded `command_sequence` writes are enforced atomically by
+    /// the Slot actor. Older daemons omit this additive capability and decode
+    /// as false, so a new MCP refuses the sequence before its first TX.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sequence_write_precondition_supported: bool,
     pub slots: Vec<SlotSnapshot>,
 }
 
@@ -2117,10 +2160,85 @@ mod tests {
                 chunk_delay_ms: 10,
             }),
             description: Some("重启样机".into()),
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         let frame = encode_client_control(&message).unwrap();
         assert_eq!(decode_client_control(&frame).unwrap(), message);
+    }
+
+    #[test]
+    fn command_sequence_context_and_precondition_round_trip_and_legacy_writes_omit_them() {
+        let sequence_id = Uuid::new_v4();
+        let message = ClientMessage::Write {
+            request_id: Uuid::new_v4(),
+            slot_id: "slot-1".into(),
+            control_id: Uuid::new_v4(),
+            fence: 7,
+            data: b"admin\r".to_vec(),
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(Uuid::new_v4()),
+            pacing: None,
+            description: Some("输入登录账号".into()),
+            command_sequence: Some(CommandSequenceAuditContext {
+                sequence_id,
+                description: "登录样机".into(),
+                step_index: 0,
+                step_count: 2,
+            }),
+            sequence_precondition: Some(SequenceWritePrecondition {
+                cursor: Cursor {
+                    epoch: Uuid::new_v4(),
+                    after_seq: 41,
+                },
+                expected_generation: 3,
+                expected_tx_offset: 17,
+            }),
+            cooperative: false,
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            encoded["command_sequence"]["sequence_id"],
+            serde_json::json!(sequence_id)
+        );
+        assert_eq!(encoded["command_sequence"]["step_index"], 0);
+        assert_eq!(encoded["sequence_precondition"]["expected_generation"], 3);
+        assert_eq!(encoded["sequence_precondition"]["expected_tx_offset"], 17);
+        assert_eq!(encoded["sequence_precondition"]["cursor"]["after_seq"], 41);
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(encoded).unwrap(),
+            message
+        );
+
+        let mut legacy = serde_json::to_value(&message).unwrap();
+        legacy.as_object_mut().unwrap().remove("command_sequence");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("sequence_precondition");
+        let ClientMessage::Write {
+            command_sequence,
+            sequence_precondition,
+            ..
+        } = serde_json::from_value(legacy).unwrap()
+        else {
+            panic!("expected write")
+        };
+        assert!(command_sequence.is_none());
+        assert!(sequence_precondition.is_none());
+    }
+
+    #[test]
+    fn legacy_status_defaults_sequence_precondition_capability_to_false() {
+        let status: StatusResponse = serde_json::from_value(serde_json::json!({
+            "server_id": Uuid::new_v4(),
+            "daemon_epoch": Uuid::new_v4(),
+            "protocol_version": PROTOCOL_VERSION,
+            "slots": []
+        }))
+        .unwrap();
+        assert!(!status.sequence_write_precondition_supported);
     }
 
     #[test]
@@ -2179,6 +2297,8 @@ mod tests {
                 expected_run_id: None,
                 pacing: None,
                 description: None,
+                command_sequence: None,
+                sequence_precondition: None,
                 cooperative: false,
             }
         );
@@ -2216,6 +2336,8 @@ mod tests {
             expected_run_id: Some(Uuid::new_v4()),
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: true,
         };
         let encoded = serde_json::to_value(&cooperative).unwrap();

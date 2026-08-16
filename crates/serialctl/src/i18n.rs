@@ -114,11 +114,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("ui.status.control", "control:", "控制权："),
     ("ui.paused", " · PAUSED", " · 已暂停"),
     // ---- Input box ----
-    (
-        "ui.input.title.line",
-        " command · Enter sends the interaction-profile line ending ",
-        " 命令 · 回车发送并附加样机交互方案换行符 ",
-    ),
+    ("ui.input.title.line", " command ", " 命令 "),
     (
         "ui.input.title.line.queued",
         " command · QUEUED {} · {} · Ctrl-] d/e/c/u delete/edit/cancel/select ",
@@ -147,8 +143,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "ui.queue.title",
-        " queued commands · Ctrl-] u then ↑/↓ cards, PgUp/PgDn text, d delete, e edit ",
-        " 待发送命令 · Ctrl-] u 后用 ↑/↓ 选择命令，PgUp/PgDn 查看全文，d 删除，e 编辑 ",
+        " queued commands · Ctrl-] u then ↑/↓, d delete, e edit ",
+        " 待发送命令 · Ctrl-] u 后用 ↑/↓ 选择，d 删除，e 编辑 ",
     ),
     (
         "ui.queue.more",
@@ -192,7 +188,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("ui.run.status.aborted", "aborted", "已中止"),
     ("ui.run.unknown", "unnamed Run", "未命名 Agent 任务"),
     ("ui.run.owner.unknown", "unknown owner", "未知执行者"),
-    ("ui.run.header", "{} · {} · {} · {}", "{} · {} · {} · {}"),
+    ("ui.run.header", "{} · {}", "{} · {}"),
     (
         "ui.run.no.described.commands",
         "No described Agent command yet",
@@ -816,6 +812,22 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "（反向历史搜索）`{}'：{}",
     ),
     ("ui.output.baud", "{} baud", "波特率 {}"),
+    (
+        "ui.output.model.unconfigured",
+        "device model not configured",
+        "未配置样机机型",
+    ),
+    (
+        "ui.separator.agent",
+        "Agent task and commands",
+        "Agent 任务与命令记录",
+    ),
+    (
+        "ui.separator.agent.recent",
+        "Agent task and commands · recent records",
+        "Agent 任务与命令记录 · 最近记录",
+    ),
+    ("ui.separator.input", "Human input", "用户输入"),
     // ---- Bottom help line ----
     (
         "ui.helpline",
@@ -906,8 +918,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.run.keys",
-        "  Up/Down · Enter/Right · Left   select command / expand confirmed TX / collapse",
-        "  上下 · Enter/右 · 左       选择记录 / 展开已确认发送的命令原文 / 收起",
+        "  Up/Down · Enter/Right · Left   select / expand commands / collapse; ✅/❌ means full/partial TX",
+        "  上下 · Enter/右 · 左       选择 / 展开命令 / 收起；✅/❌ 表示完整/部分发送",
     ),
     (
         "help.takeover",
@@ -988,6 +1000,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "help.line3",
         "  Up/Down · Ctrl-R · Tab   history / search / complete; empty Agent Enter follows",
         "  上/下 · Ctrl-R · Tab     历史 / 搜索 / 补全；Agent 任务中空回车只回到最新输出",
+    ),
+    (
+        "help.search.scope",
+        "  Ctrl-R searches LINE input history; serial output search uses `serialctl logs --contains`",
+        "  Ctrl-R 搜索 LINE 输入历史；搜索串口输出请使用 `serialctl logs --contains`",
     ),
     (
         "help.raw1",

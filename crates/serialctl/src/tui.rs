@@ -61,16 +61,26 @@ const CONTROL_TTL_MS: u64 = 30_000;
 const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
 const MOUSE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
+const MODEL_LABEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUN_HISTORY_PER_SLOT: usize = 20;
 const MAX_COMMANDS_PER_RUN: usize = 64;
 const MAX_RUN_COMMAND_BYTES: usize = 4 * 1024;
+const DEFAULT_AGENT_HISTORY_ROWS: u16 = 5;
+const MIN_AGENT_HISTORY_ROWS: u16 = 3;
+const MAX_AGENT_HISTORY_ROWS: u16 = 20;
 /// Keep the command-history bar useful without taking the serial output below
 /// its four-row minimum. Short terminals expose the same view as a focused
 /// popup instead of permanently consuming scarce vertical space.
 const RUN_HISTORY_BAR_MIN_TERMINAL_HEIGHT: u16 = 22;
-const RUN_HISTORY_BAR_HEIGHT: u16 = 7;
 
 type ClipboardCopyFn = fn(&str) -> Result<()>;
+
+fn configured_agent_history_rows(value: Option<u16>) -> u16 {
+    value
+        .unwrap_or(DEFAULT_AGENT_HISTORY_ROWS)
+        .clamp(MIN_AGENT_HISTORY_ROWS, MAX_AGENT_HISTORY_ROWS)
+}
 
 fn default_clipboard_copy(text: &str) -> Result<()> {
     crate::clipboard::copy_text(text)
@@ -96,6 +106,7 @@ struct ConsoleLayout {
     output_inner: Rect,
     input_area: Rect,
     run_history_area: Option<Rect>,
+    run_history_inner: Option<Rect>,
 }
 
 /// A paused viewport is an immutable set of already wrapped terminal rows.
@@ -436,15 +447,23 @@ impl LiteralProjectionMatcher {
 }
 
 #[derive(Debug, Clone)]
-struct RunCommandRecord {
+struct RunCommandStep {
     operation_id: Option<Uuid>,
+    step_index: Option<usize>,
     first_seq: u64,
     last_seq: u64,
-    description: Option<String>,
-    actor_label: Option<String>,
     data: Vec<u8>,
     partial: bool,
     truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RunCommandRecord {
+    sequence_id: Option<Uuid>,
+    first_seq: u64,
+    last_seq: u64,
+    description: Option<String>,
+    steps: Vec<RunCommandStep>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,15 +472,8 @@ struct RunCommandKey {
     first_seq: u64,
 }
 
-impl RunCommandRecord {
+impl RunCommandStep {
     fn from_event(event: &TimelineEvent) -> Self {
-        let description = event
-            .metadata
-            .get("command_description")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
         let mut data = event.data.clone();
         let partial = event
             .metadata
@@ -472,10 +484,13 @@ impl RunCommandRecord {
         data.truncate(MAX_RUN_COMMAND_BYTES);
         Self {
             operation_id: event.operation_id,
+            step_index: event
+                .metadata
+                .get("command_sequence_step_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()),
             first_seq: event.seq,
             last_seq: event.seq,
-            description,
-            actor_label: event.actor.as_ref().map(|actor| actor.label.clone()),
             data,
             partial,
             truncated,
@@ -483,16 +498,8 @@ impl RunCommandRecord {
     }
 
     fn append_event(&mut self, event: &TimelineEvent) {
+        self.first_seq = self.first_seq.min(event.seq);
         self.last_seq = self.last_seq.max(event.seq);
-        if self.description.is_none() {
-            self.description = event
-                .metadata
-                .get("command_description")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
-        }
         let available = MAX_RUN_COMMAND_BYTES.saturating_sub(self.data.len());
         let append = available.min(event.data.len());
         self.data.extend_from_slice(&event.data[..append]);
@@ -505,15 +512,79 @@ impl RunCommandRecord {
     }
 }
 
+impl RunCommandRecord {
+    fn sequence_id(event: &TimelineEvent) -> Option<Uuid> {
+        event.metadata.get("command_sequence_id").and_then(|value| {
+            value
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .or_else(|| serde_json::from_value::<Uuid>(value.clone()).ok())
+        })
+    }
+
+    fn description(event: &TimelineEvent) -> Option<String> {
+        event
+            .metadata
+            .get("command_sequence_description")
+            .or_else(|| event.metadata.get("command_description"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn from_event(event: &TimelineEvent) -> Self {
+        Self {
+            sequence_id: Self::sequence_id(event),
+            first_seq: event.seq,
+            last_seq: event.seq,
+            description: Self::description(event),
+            steps: vec![RunCommandStep::from_event(event)],
+        }
+    }
+
+    fn matches_event(&self, event: &TimelineEvent) -> bool {
+        match (self.sequence_id, Self::sequence_id(event)) {
+            (Some(existing), Some(incoming)) => existing == incoming,
+            (None, None) => event.operation_id.is_some_and(|operation_id| {
+                self.steps.first().and_then(|step| step.operation_id) == Some(operation_id)
+            }),
+            _ => false,
+        }
+    }
+
+    fn append_event(&mut self, event: &TimelineEvent) {
+        self.first_seq = self.first_seq.min(event.seq);
+        self.last_seq = self.last_seq.max(event.seq);
+        if self.description.is_none() {
+            self.description = Self::description(event);
+        }
+        let incoming_index = event
+            .metadata
+            .get("command_sequence_step_index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok());
+        let existing = self.steps.iter_mut().find(|step| {
+            event.operation_id.is_some() && step.operation_id == event.operation_id
+                || incoming_index.is_some() && step.step_index == incoming_index
+        });
+        if let Some(step) = existing {
+            step.append_event(event);
+        } else {
+            self.steps.push(RunCommandStep::from_event(event));
+            self.steps
+                .sort_by_key(|step| (step.step_index.unwrap_or(usize::MAX), step.first_seq));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RunHistoryEntry {
     id: Uuid,
     label: String,
-    owner_label: Option<String>,
     status: RunStatus,
     start_seq: u64,
     end_seq: Option<u64>,
-    abort_reason: Option<String>,
     commands: VecDeque<RunCommandRecord>,
 }
 
@@ -522,18 +593,15 @@ impl RunHistoryEntry {
         Self {
             id: run.id,
             label: run.label.clone(),
-            owner_label: Some(run.owner.label.clone()),
             status: run.status,
             start_seq: run.start_seq,
             end_seq: run.end_seq,
-            abort_reason: None,
             commands: VecDeque::new(),
         }
     }
 
     fn update_from_run(&mut self, run: &RunInfo) {
         self.label.clone_from(&run.label);
-        self.owner_label = Some(run.owner.label.clone());
         self.status = run.status;
         self.start_seq = run.start_seq;
         self.end_seq = run.end_seq;
@@ -541,11 +609,10 @@ impl RunHistoryEntry {
 
     /// Returns whether an older described command had to be evicted.
     fn append_command(&mut self, event: &TimelineEvent) -> bool {
-        if let Some(operation_id) = event.operation_id
-            && let Some(command) = self
-                .commands
-                .iter_mut()
-                .find(|command| command.operation_id == Some(operation_id))
+        if let Some(command) = self
+            .commands
+            .iter_mut()
+            .find(|command| command.matches_event(event))
         {
             command.append_event(event);
             return false;
@@ -734,11 +801,9 @@ impl SlotView {
         self.run_history.push_back(RunHistoryEntry {
             id: run_id,
             label: String::new(),
-            owner_label: event.actor.as_ref().map(|actor| actor.label.clone()),
             status: RunStatus::Active,
             start_seq: event.seq,
             end_seq: None,
-            abort_reason: None,
             commands: VecDeque::new(),
         });
         self.sort_and_trim_run_history();
@@ -794,12 +859,6 @@ impl SlotView {
                     EventKind::RunAborted => {
                         entry.status = RunStatus::Aborted;
                         entry.end_seq = Some(event.seq);
-                        entry.abort_reason = event
-                            .metadata
-                            .get("reason")
-                            .and_then(serde_json::Value::as_str)
-                            .map(safe_inline)
-                            .filter(|reason| !reason.is_empty());
                     }
                     _ => unreachable!("guarded by lifecycle match"),
                 }
@@ -1039,6 +1098,7 @@ impl SlotView {
         true
     }
 
+    #[cfg(test)]
     fn trigger_status_text(&self) -> Option<&'static str> {
         let trigger = self.snapshot.active_trigger.as_ref()?;
         if self
@@ -1211,7 +1271,7 @@ struct PendingPaste {
 
 #[derive(Debug, Clone, Copy)]
 struct QueuedControl {
-    position: usize,
+    _position: usize,
     since: Instant,
 }
 
@@ -1334,6 +1394,10 @@ enum MenuAdminMutation {
 }
 
 enum MenuIoCommand {
+    /// Lightweight startup refresh used only to resolve bound model IDs to
+    /// display names. It runs after the terminal opens and never delays the
+    /// first frame.
+    LoadModelLabels,
     Reload,
     Admin {
         token: Option<String>,
@@ -1367,6 +1431,8 @@ enum MenuSuccess {
 }
 
 enum MenuIoEvent {
+    ModelLabelsLoaded(DeviceModelListResponse),
+    ModelLabelsUnavailable,
     Completed {
         catalog: MenuCatalog,
         success: MenuSuccess,
@@ -1674,6 +1740,14 @@ fn menu_success_message(success: &MenuSuccess) -> String {
 
 struct App {
     slots: Vec<SlotView>,
+    /// Human-readable catalog model names keyed by bound Slot. Catalog IDs
+    /// are deliberately kept out of the serial-output title.
+    device_model_names: HashMap<String, String>,
+    /// At most one lightweight model-catalog refresh may be queued or in
+    /// flight. The daemon does not currently broadcast model-binding changes,
+    /// so a bounded periodic refresh keeps Agent/MCP edits visible without
+    /// polling on every render frame.
+    model_labels_refresh_pending: bool,
     selected: usize,
     prefix_pending: bool,
     /// The prefix key was pressed while dismissing the help overlay. The
@@ -1691,6 +1765,11 @@ struct App {
     connection_generation: Option<u64>,
     actor: Option<Actor>,
     status: String,
+    /// The old permanent status strip mixed control/trigger noise with useful
+    /// errors. Keep the existing status producers, but surface each changed
+    /// message only briefly in the ordinary one-line footer.
+    status_notice_source: String,
+    status_notice_until: Option<Instant>,
     pending_paste: Option<PendingPaste>,
     pending_writes: HashMap<String, VecDeque<PendingWrite>>,
     /// Current physical chunk within the first queued operation for each Slot.
@@ -1706,6 +1785,7 @@ struct App {
     human_idle_release: Duration,
     mouse_capture: bool,
     run_panel_visible: bool,
+    agent_history_rows: u16,
     focus: PaneFocus,
     layout: Option<ConsoleLayout>,
     /// Only the currently active left-button drag keeps a stable visual
@@ -1722,6 +1802,7 @@ struct App {
 impl App {
     fn new(slots: Vec<SlotSnapshot>, initial_slot: Option<&str>) -> Self {
         let slots = slots.into_iter().map(SlotView::new).collect::<Vec<_>>();
+        let initial_status = tr("st.connecting").to_string();
         let selected = initial_slot
             .and_then(|requested| {
                 slots.iter().position(|slot| {
@@ -1732,6 +1813,8 @@ impl App {
             .unwrap_or(0);
         Self {
             slots,
+            device_model_names: HashMap::new(),
+            model_labels_refresh_pending: false,
             selected,
             prefix_pending: false,
             help_dismiss_prefix: false,
@@ -1742,7 +1825,9 @@ impl App {
             authenticated: false,
             connection_generation: None,
             actor: None,
-            status: tr("st.connecting").into(),
+            status: initial_status.clone(),
+            status_notice_source: initial_status,
+            status_notice_until: None,
             pending_paste: None,
             pending_writes: HashMap::new(),
             inflight_writes: HashMap::new(),
@@ -1755,6 +1840,7 @@ impl App {
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
             mouse_capture: true,
             run_panel_visible: true,
+            agent_history_rows: DEFAULT_AGENT_HISTORY_ROWS,
             focus: PaneFocus::Input,
             layout: None,
             selection: None,
@@ -1776,6 +1862,63 @@ impl App {
 
     fn selected_slot_id(&self) -> String {
         self.current().snapshot.config.id.clone()
+    }
+
+    fn current_device_model_name(&self) -> String {
+        self.device_model_names
+            .get(&self.current().snapshot.config.id)
+            .cloned()
+            .unwrap_or_else(|| tr("ui.output.model.unconfigured").into())
+    }
+
+    fn update_device_model_names(&mut self, models: &[DeviceModel], bindings: &[SlotModelBinding]) {
+        self.device_model_names = bindings
+            .iter()
+            .filter_map(|binding| {
+                models
+                    .iter()
+                    .find(|model| model.id == binding.model_id)
+                    .map(|model| (binding.slot_id.clone(), model.name.clone()))
+            })
+            .collect();
+    }
+
+    fn request_model_labels_refresh(&mut self) {
+        if self.model_labels_refresh_pending {
+            return;
+        }
+        let Some(commands) = self.menu_commands.as_ref() else {
+            return;
+        };
+        if commands.try_send(MenuIoCommand::LoadModelLabels).is_ok() {
+            self.model_labels_refresh_pending = true;
+        }
+    }
+
+    fn sync_status_notice(&mut self, now: Instant) {
+        if self.status_notice_source != self.status {
+            self.status_notice_source.clone_from(&self.status);
+            self.status_notice_until =
+                (!self.status.is_empty()).then_some(now + STATUS_NOTICE_DURATION);
+        }
+    }
+
+    fn expire_status_notice(&mut self, now: Instant) -> bool {
+        if self
+            .status_notice_until
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.status_notice_until = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn active_status_notice(&self, now: Instant) -> Option<&str> {
+        self.status_notice_until
+            .is_some_and(|deadline| now < deadline)
+            .then_some(self.status_notice_source.as_str())
     }
 
     fn current_mode(&self) -> InputMode {
@@ -1806,6 +1949,7 @@ impl App {
                     slot.subscription = SubscriptionPhase::Attaching;
                 }
                 self.status = tr("st.transport").into();
+                self.request_model_labels_refresh();
             }
             NetworkEvent::Disconnected { reason } => {
                 let old_actor_id = self.actor.take().map(|actor| actor.id);
@@ -1919,6 +2063,7 @@ impl App {
                         self.slots[index].last_seq = 0;
                     }
                 }
+                self.request_model_labels_refresh();
             }
             ServerMessage::Timeline { event, replay } => self.push_event(event, replay, commands),
             ServerMessage::Result { request_id, result } => {
@@ -2038,6 +2183,7 @@ impl App {
                     }
                 }
                 self.status = trf("st.live", &[&slot_id, &head_seq.to_string()]);
+                self.request_model_labels_refresh();
             }
         }
     }
@@ -2066,7 +2212,7 @@ impl App {
                     self.queued_controls.insert(
                         slot_id.clone(),
                         QueuedControl {
-                            position,
+                            _position: position,
                             since: Instant::now(),
                         },
                     );
@@ -2536,6 +2682,8 @@ impl App {
                 expected_run_id: Some(expected_run_id),
                 pacing: None,
                 description: None,
+                command_sequence: None,
+                sequence_precondition: None,
                 cooperative: true,
             },
             Some(PendingRequest::Write {
@@ -2952,6 +3100,11 @@ impl App {
             KeyCode::Enter | KeyCode::Right if count > 0 => {
                 let selected_key = self.current().selected_run_command_key();
                 let view = self.current_mut();
+                // Expanding is an explicit operator selection. Pin it instead
+                // of retaining the `None == follow newest` sentinel, otherwise
+                // a newly arriving Agent command can move selection away and
+                // make the next wheel event collapse this detail.
+                view.selected_run_command = selected_key;
                 if view.expanded_run_command == selected_key && key.code == KeyCode::Enter {
                     view.expanded_run_command = None;
                 } else {
@@ -2964,11 +3117,22 @@ impl App {
                 self.current_mut().run_detail_scroll = 0;
             }
             KeyCode::PageUp => {
-                let scroll = self.current().run_detail_scroll.saturating_sub(5);
+                let maximum = self.max_run_detail_scroll();
+                let scroll = self
+                    .current()
+                    .run_detail_scroll
+                    .min(maximum)
+                    .saturating_sub(5);
                 self.current_mut().run_detail_scroll = scroll;
             }
             KeyCode::PageDown => {
-                let scroll = self.current().run_detail_scroll.saturating_add(5);
+                let maximum = self.max_run_detail_scroll();
+                let scroll = self
+                    .current()
+                    .run_detail_scroll
+                    .min(maximum)
+                    .saturating_add(5)
+                    .min(maximum);
                 self.current_mut().run_detail_scroll = scroll;
             }
             KeyCode::Esc => {
@@ -2977,6 +3141,34 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn max_run_detail_scroll(&self) -> usize {
+        let view = self.current();
+        let selected = view.selected_run_command_key();
+        if selected.is_none() || view.expanded_run_command != selected {
+            return 0;
+        }
+        let Some(inner) = self.layout.and_then(|layout| layout.run_history_inner) else {
+            return 0;
+        };
+        let height = usize::from(inner.height);
+        if height == 0 || inner.width == 0 {
+            return 0;
+        }
+        let rows = run_history_rows(self, inner.width);
+        let selected_row = rows
+            .iter()
+            .position(|row| row.command == selected)
+            .unwrap_or(0);
+        let max_start = rows.len().saturating_sub(height);
+        max_start.saturating_sub(selected_row.saturating_sub(2).min(max_start))
+    }
+
+    fn clamp_run_detail_scroll(&mut self) {
+        let maximum = self.max_run_detail_scroll();
+        let scroll = self.current().run_detail_scroll.min(maximum);
+        self.current_mut().run_detail_scroll = scroll;
     }
 
     fn has_queued_control(&self, slot_id: &str) -> bool {
@@ -3241,6 +3433,8 @@ impl App {
                 expected_run_id: None,
                 pacing: None,
                 description: None,
+                command_sequence: None,
+                sequence_precondition: None,
                 cooperative: false,
             },
             Some(PendingRequest::Write {
@@ -3380,12 +3574,28 @@ impl App {
         {
             self.clear_text_selection();
             self.focus = PaneFocus::RunHistory;
+            let detail_open =
+                self.current().expanded_run_command == self.current().selected_run_command_key();
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    self.handle_run_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                    self.handle_run_history_key(KeyEvent::new(
+                        if detail_open {
+                            KeyCode::PageUp
+                        } else {
+                            KeyCode::Up
+                        },
+                        KeyModifiers::NONE,
+                    ));
                 }
                 MouseEventKind::ScrollDown => {
-                    self.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    self.handle_run_history_key(KeyEvent::new(
+                        if detail_open {
+                            KeyCode::PageDown
+                        } else {
+                            KeyCode::Down
+                        },
+                        KeyModifiers::NONE,
+                    ));
                 }
                 _ => {}
             }
@@ -4438,7 +4648,18 @@ impl App {
 
     fn handle_menu_io_event(&mut self, event: MenuIoEvent) {
         match event {
+            MenuIoEvent::ModelLabelsLoaded(catalog) => {
+                self.model_labels_refresh_pending = false;
+                self.update_device_model_names(&catalog.models, &catalog.bindings);
+            }
+            // The model title is cosmetic. Older daemons or a transient API
+            // error keep the explicit "model not configured" fallback without
+            // replacing the operator's current status message.
+            MenuIoEvent::ModelLabelsUnavailable => {
+                self.model_labels_refresh_pending = false;
+            }
             MenuIoEvent::Completed { catalog, success } => {
+                self.update_device_model_names(&catalog.models, &catalog.model_bindings);
                 for fresh in &catalog.slots {
                     if let Some(view) = self
                         .slots
@@ -4589,6 +4810,16 @@ fn spawn_menu_io(api: ApiClient) -> MenuIo {
     let (event_tx, event_rx) = mpsc::channel(8);
     tokio::spawn(async move {
         while let Some(command) = command_rx.recv().await {
+            if matches!(&command, MenuIoCommand::LoadModelLabels) {
+                let event = match api.device_models().await {
+                    Ok(catalog) => MenuIoEvent::ModelLabelsLoaded(catalog),
+                    Err(_) => MenuIoEvent::ModelLabelsUnavailable,
+                };
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+                continue;
+            }
             let event = match execute_menu_io(&api, command).await {
                 Ok((catalog, success)) => MenuIoEvent::Completed { catalog, success },
                 Err(error) => MenuIoEvent::Failed(error.to_string()),
@@ -4609,6 +4840,7 @@ async fn execute_menu_io(
     command: MenuIoCommand,
 ) -> Result<(MenuCatalog, MenuSuccess)> {
     let success = match command {
+        MenuIoCommand::LoadModelLabels => unreachable!("handled by the menu I/O worker"),
         MenuIoCommand::Reload => MenuSuccess::Loaded,
         MenuIoCommand::Admin { token, mutation } => {
             // `None` is the explicit trusted-loopback path advertised by
@@ -4841,8 +5073,12 @@ pub async fn run(
         view.merge_echo = merge_echo;
     }
     app.mouse_capture = loaded.config.mouse_capture.unwrap_or(true);
+    app.agent_history_rows = configured_agent_history_rows(loaded.config.agent_history_rows);
     let mut menu_io = spawn_menu_io(api.clone());
     app.menu_commands = Some(menu_io.commands.clone());
+    // Resolve model IDs after the first frame instead of adding another
+    // blocking request to console startup.
+    app.request_model_labels_refresh();
     let mut network = ws::spawn(endpoint, token, slot_ids);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
@@ -4881,6 +5117,8 @@ async fn run_loop(
     renew_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut activity_tick = tokio::time::interval(Duration::from_secs(1));
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut model_label_tick = tokio::time::interval(MODEL_LABEL_REFRESH_INTERVAL);
+    model_label_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     terminal.draw(|frame| draw(frame, app))?;
     while !app.should_quit {
@@ -4902,17 +5140,19 @@ async fn run_loop(
             _ = activity_tick.tick() => {
                 let now = Instant::now();
                 let selection_changed = app.expire_mouse_selection(now);
+                let status_notice_changed = app.expire_status_notice(now);
                 let mut trigger_changed = false;
                 for slot in &mut app.slots {
                     trigger_changed |= slot.update_trigger_deadline(now);
                 }
-                if selection_changed || trigger_changed || app.slots.iter().any(|slot| {
+                if selection_changed || status_notice_changed || trigger_changed || app.slots.iter().any(|slot| {
                     slot.snapshot.target_activity == TargetActivity::Active
                         && slot.snapshot.session_state == SessionState::Online
                 }) {
                     app.dirty = true;
                 }
             },
+            _ = model_label_tick.tick() => app.request_model_labels_refresh(),
             _ = render_tick.tick() => {
                 if app.dirty {
                     terminal.draw(|frame| draw(frame, app))?;
@@ -5038,7 +5278,7 @@ struct QueueCard {
     operation_index: usize,
     sending: bool,
     header: String,
-    body: Vec<String>,
+    command: String,
 }
 
 fn queue_cards(app: &App, inner_width: u16) -> Vec<QueueCard> {
@@ -5071,16 +5311,12 @@ fn queue_cards(app: &App, inner_width: u16) -> Vec<QueueCard> {
             } else {
                 command
             };
-            let header = format!(
-                "{}.{}",
-                operation_index + 1,
-                if sending { tr("ui.queue.sending") } else { "" }
-            );
+            let header = format!("{}.", operation_index + 1);
             QueueCard {
                 operation_index,
                 sending,
                 header,
-                body: wrap_queue_text(&command, inner_width.saturating_sub(2).max(1)),
+                command: truncate_display(&command, inner_width.saturating_sub(5).max(1) as usize),
             }
         })
         .collect()
@@ -5111,25 +5347,27 @@ fn wrap_queue_text(value: &str, width: u16) -> Vec<String> {
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.sync_status_notice(Instant::now());
     let area = frame.area();
-    let show_run_history_bar =
-        app.run_panel_visible && area.height >= RUN_HISTORY_BAR_MIN_TERMINAL_HEIGHT;
+    let history_growth = app
+        .agent_history_rows
+        .saturating_sub(DEFAULT_AGENT_HISTORY_ROWS);
+    let show_run_history_bar = app.run_panel_visible
+        && area.height >= RUN_HISTORY_BAR_MIN_TERMINAL_HEIGHT.saturating_add(history_growth);
     let run_history_height = if show_run_history_bar {
-        RUN_HISTORY_BAR_HEIGHT
+        app.agent_history_rows
     } else {
         0
     };
+    let separator_height = u16::from(show_run_history_bar);
 
-    let queue_visual_rows = queue_cards(app, area.width.saturating_sub(2))
-        .iter()
-        .map(|card| card.body.len().saturating_add(1))
-        .sum::<usize>();
+    let queue_visual_rows = queue_cards(app, area.width.saturating_sub(2)).len();
     // Preserve the existing four-row minimum output pane. On a normal
     // terminal every queued operation gets one row; very short terminals use
     // a bounded queue viewport that follows the selected operation.
     let max_queue_height = area
         .height
-        .saturating_sub(12)
+        .saturating_sub(13)
         .saturating_sub(run_history_height);
     let queue_height = if queue_visual_rows == 0 {
         0
@@ -5141,34 +5379,47 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
+        Constraint::Length(separator_height),
         Constraint::Length(run_history_height),
-        Constraint::Length(1),
+        Constraint::Length(separator_height),
         Constraint::Length(queue_height),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(area);
     let output_area = chunks[1];
-    let run_history_area = show_run_history_bar.then_some(chunks[2]);
-    let input_area = chunks[5];
+    let run_history_area = show_run_history_bar.then_some(chunks[3]);
+    let input_area = chunks[6];
     app.layout = Some(ConsoleLayout {
         output_area,
         output_inner: inset_border(output_area),
         input_area,
         run_history_area,
+        run_history_inner: run_history_area,
     });
+    app.clamp_run_detail_scroll();
 
     draw_tabs(frame, app, chunks[0]);
     draw_output(frame, app, chunks[1]);
     if let Some(run_history_area) = run_history_area {
-        draw_run_history(frame, app, run_history_area);
+        draw_powerline_separator(
+            frame,
+            app,
+            chunks[2],
+            if app.current().run_history_limited {
+                "ui.separator.agent.recent"
+            } else {
+                "ui.separator.agent"
+            },
+        );
+        draw_run_history(frame, app, run_history_area, false);
+        draw_powerline_separator(frame, app, chunks[4], "ui.separator.input");
     }
-    draw_status(frame, app, chunks[3]);
     if queue_height > 0 {
-        draw_queue(frame, app, chunks[4]);
+        draw_queue(frame, app, chunks[5]);
     }
-    draw_input(frame, app, chunks[5]);
-    draw_help_line(frame, app, chunks[6]);
+    draw_input(frame, app, chunks[6]);
+    draw_help_line(frame, app, chunks[7]);
     if run_history_area.is_none() && app.run_panel_visible && app.focus == PaneFocus::RunHistory {
         let popup = centered_rect(
             area.width.saturating_sub(4).clamp(1, 72),
@@ -5176,10 +5427,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             area,
         );
         frame.render_widget(Clear, popup);
-        draw_run_history(frame, app, popup);
         if let Some(layout) = app.layout.as_mut() {
             layout.run_history_area = Some(popup);
+            layout.run_history_inner = Some(inset_border(popup));
         }
+        app.clamp_run_detail_scroll();
+        draw_run_history(frame, app, popup, true);
     }
     if app.help {
         draw_help(frame, app, area);
@@ -5259,28 +5512,7 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let view = app.current();
-    let baud_rate = view
-        .snapshot
-        .effective_transport
-        .map(|transport| transport.baud_rate)
-        .unwrap_or(view.snapshot.config.settings.baud_rate);
-    let title = format!(
-        " {} · {} · {}{}{} ",
-        safe_inline(&view.snapshot.config.display_name),
-        safe_inline(&view.snapshot.config.port),
-        trf("ui.output.baud", &[&baud_rate.to_string()]),
-        if view.is_paused() {
-            tr("ui.paused")
-        } else {
-            ""
-        },
-        if view.local_history_truncated {
-            local_history_truncated_title()
-        } else {
-            ""
-        }
-    );
+    let title = output_title(app);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -5303,6 +5535,25 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(visual_lines).block(block), area);
+}
+
+fn output_title(app: &App) -> String {
+    let view = app.current();
+    format!(
+        " {} · {}{}{} ",
+        safe_inline(&app.current_device_model_name()),
+        safe_inline(&view.snapshot.config.port),
+        if view.is_paused() {
+            tr("ui.paused")
+        } else {
+            ""
+        },
+        if view.local_history_truncated {
+            local_history_truncated_title()
+        } else {
+            ""
+        }
+    )
 }
 
 fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
@@ -5657,90 +5908,33 @@ fn detailed_source_width(inner_width: usize) -> usize {
     inner_width.saturating_sub(62).clamp(10, 28)
 }
 
-fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let control = app
-        .current()
-        .snapshot
-        .control
-        .as_ref()
-        .map(|lease| safe_inline(&lease.owner.label))
-        .unwrap_or_else(|| tr("ui.control.none").into());
-    let mode = match app.current_mode() {
-        InputMode::Line => "LINE",
-        InputMode::Raw => "RAW",
-    };
-    let prefix = if app.prefix_pending {
-        tr("ui.prefix")
+fn draw_powerline_separator(frame: &mut Frame<'_>, app: &App, area: Rect, label_key: &'static str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let accent = if app.focus == PaneFocus::RunHistory {
+        Color::Cyan
     } else {
-        ""
+        Color::DarkGray
     };
-    let uncertain = if app.uncertain_write_outcomes == 0 {
-        String::new()
-    } else {
-        trf("ui.uncertain", &[&app.uncertain_write_outcomes.to_string()])
-    };
-    let slot_id = &app.current().snapshot.config.id;
-    let queue = if let Some(queued) = app.queued_controls.get(slot_id) {
-        let writes = app.pending_writes.get(slot_id).map_or(0, VecDeque::len);
-        trf(
-            "ui.queued",
-            &[
-                &queued.position.to_string(),
-                &queued.since.elapsed().as_secs().to_string(),
-                &writes.to_string(),
-            ],
-        )
-    } else if app.pending_requests.values().any(
-        |request| matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == slot_id),
-    ) {
-        tr("ui.control.pending").into()
-    } else {
-        String::new()
-    };
-    let idle = if app.owns_control(app.selected) {
-        app.current()
-            .last_manual_activity
-            .map_or_else(String::new, |activity| {
-                let remaining = app
-                    .human_idle_release
-                    .saturating_sub(activity.elapsed())
-                    .as_secs();
-                trf("ui.idle.release", &[&remaining.to_string()])
-            })
-    } else {
-        String::new()
-    };
-    let trigger =
-        app.current()
-            .snapshot
-            .active_trigger
-            .as_ref()
-            .map_or_else(String::new, |trigger| {
-                let short_id = trigger.id.to_string().chars().take(8).collect::<String>();
-                trf(
-                    "ui.trigger",
-                    &[
-                        &short_id,
-                        app.current()
-                            .trigger_status_text()
-                            .unwrap_or_else(|| trigger_status_label(trigger.status)),
-                        &trigger.fires_confirmed.to_string(),
-                    ],
-                )
-            });
-    let content = format!(
-        " {} · {mode}{prefix} · {} {control}{idle}{queue}{trigger} · {}{}",
-        safe_inline(slot_id),
-        tr("ui.status.control"),
-        safe_inline(&app.status),
-        uncertain
+    let label = format!(" {} ", tr(label_key));
+    let occupied = UnicodeWidthStr::width(label.as_str()).saturating_add(2);
+    let fill = "─".repeat((area.width as usize).saturating_sub(occupied));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("", Style::default().fg(accent)),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("", Style::default().fg(accent)),
+            Span::styled(fill, Style::default().fg(Color::DarkGray)),
+        ])),
+        area,
     );
-    let style = if app.current_mode() == InputMode::Raw {
-        Style::default().fg(Color::Black).bg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::White).bg(Color::DarkGray)
-    };
-    frame.render_widget(Paragraph::new(content).style(style), area);
 }
 
 fn draw_queue(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -5775,100 +5969,35 @@ fn draw_queue(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(Color::White)
         }
     };
-    let card_rows = |card: &QueueCard, header: String, body: &[String]| {
-        let style = style_for(card);
-        std::iter::once(Line::from(Span::styled(header, style)))
-            .chain(
-                body.iter()
-                    .map(move |row| Line::from(Span::styled(format!("│ {row}"), style))),
-            )
-            .collect::<Vec<_>>()
+    let row = |card: &QueueCard, is_selected: bool| {
+        let marker = if is_selected { "▶ " } else { "" };
+        Line::from(Span::styled(
+            format!("{marker}{} {}", card.header, card.command),
+            style_for(card),
+        ))
     };
-
-    let rows = if let Some(selected_index) = selected {
-        let selected_card = &cards[selected_index];
-        let total_visual_rows = cards
-            .iter()
-            .map(|card| card.body.len().saturating_add(1))
-            .sum::<usize>();
-        if selected_card.body.len().saturating_add(1) > height {
-            let body_height = height.saturating_sub(1);
-            let max_scroll = selected_card.body.len().saturating_sub(body_height);
-            let scroll = app
-                .queue_selection
-                .as_ref()
-                .map_or(0, |selection| selection.detail_scroll.min(max_scroll));
-            let through = scroll
-                .saturating_add(body_height)
-                .min(selected_card.body.len());
-            let header = trf(
-                "ui.queue.page",
-                &[
-                    &selected_card.header,
-                    &(scroll + 1).to_string(),
-                    &through.to_string(),
-                    &selected_card.body.len().to_string(),
-                ],
-            );
-            card_rows(
-                selected_card,
-                format!("▶ {header}"),
-                &selected_card.body[scroll..through],
-            )
-        } else if total_visual_rows > height {
-            // In a short terminal, selection mode is an explicit detail view:
-            // show the chosen card in full instead of clipping neighboring
-            // commands mid-card. Up/Down changes which complete card is shown.
-            card_rows(
-                selected_card,
-                format!("▶ {}", selected_card.header),
-                &selected_card.body,
-            )
-        } else {
-            let flattened = cards
-                .iter()
-                .flat_map(|card| {
-                    let marker = if card.operation_index == selected_index {
-                        "▶"
-                    } else {
-                        " "
-                    };
-                    card_rows(card, format!("{marker} {}", card.header), &card.body)
-                })
-                .collect::<Vec<_>>();
-            let selected_start = cards
-                .iter()
-                .take(selected_index)
-                .map(|card| card.body.len().saturating_add(1))
-                .sum::<usize>();
-            let selected_end = selected_start
-                .saturating_add(selected_card.body.len())
-                .saturating_add(1);
-            let start = selected_end
+    let start = selected
+        .map(|selected| {
+            selected
+                .saturating_add(1)
                 .saturating_sub(height)
-                .min(flattened.len().saturating_sub(height));
-            flattened.into_iter().skip(start).take(height).collect()
-        }
-    } else {
-        let flattened = cards
-            .iter()
-            .flat_map(|card| card_rows(card, format!("  {}", card.header), &card.body))
-            .collect::<Vec<_>>();
-        if flattened.len() <= height {
-            flattened
-        } else {
-            let hidden = flattened.len().saturating_sub(height.saturating_sub(1));
-            let mut rows = flattened
-                .into_iter()
-                .take(height.saturating_sub(1))
-                .collect::<Vec<_>>();
-            rows.push(Line::from(Span::styled(
-                trf("ui.queue.more", &[&hidden.to_string()]),
-                Style::default().fg(Color::Yellow),
-            )));
-            rows
-        }
-    };
+                .min(cards.len().saturating_sub(height))
+        })
+        .unwrap_or(0);
+    let mut rows = cards
+        .iter()
+        .skip(start)
+        .take(height)
+        .map(|card| row(card, selected == Some(card.operation_index)))
+        .collect::<Vec<_>>();
+    if selected.is_none() && cards.len() > height && height > 0 {
+        let hidden = cards.len().saturating_sub(height.saturating_sub(1));
+        rows.truncate(height.saturating_sub(1));
+        rows.push(Line::from(Span::styled(
+            trf("ui.queue.more", &[&hidden.to_string()]),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     frame.render_widget(Paragraph::new(rows).block(block), area);
 }
 
@@ -5890,25 +6019,6 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
     let selected = view.selected_run_command_key();
     let available = width.saturating_sub(4).max(1);
     let mut rows = Vec::new();
-    if view.run_history_limited {
-        for text in wrap_queue_text(tr("ui.run.history.limited"), width.max(1)) {
-            rows.push(RunPanelRow {
-                line: Line::from(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                command: None,
-            });
-        }
-        if !view.run_history.is_empty() {
-            rows.push(RunPanelRow {
-                line: Line::default(),
-                command: None,
-            });
-        }
-    }
     if view.run_history.is_empty() {
         rows.push(RunPanelRow {
             line: Line::from(Span::styled(
@@ -5925,19 +6035,9 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
         } else {
             safe_inline(&run.label)
         };
-        let owner = run
-            .owner_label
-            .as_deref()
-            .map(safe_inline)
-            .filter(|owner| !owner.is_empty())
-            .unwrap_or_else(|| tr("ui.run.owner.unknown").into());
-        let short_id = run.id.to_string().chars().take(8).collect::<String>();
         rows.push(RunPanelRow {
             line: Line::from(Span::styled(
-                trf(
-                    "ui.run.header",
-                    &[run_status_text(run.status), &label, &owner, &short_id],
-                ),
+                trf("ui.run.header", &[run_status_text(run.status), &label]),
                 Style::default()
                     .fg(match run.status {
                         RunStatus::Active => Color::LightBlue,
@@ -5948,16 +6048,6 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
             )),
             command: None,
         });
-
-        if run.commands.is_empty() {
-            rows.push(RunPanelRow {
-                line: Line::from(Span::styled(
-                    format!("  {}", tr("ui.run.no.described.commands")),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                command: None,
-            });
-        }
 
         for command in run.commands.iter().rev() {
             let key = RunCommandKey {
@@ -6003,75 +6093,54 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
             if !expanded {
                 continue;
             }
-            let actor = command
-                .actor_label
-                .as_deref()
-                .map(safe_inline)
-                .filter(|actor| !actor.is_empty())
-                .unwrap_or_else(|| tr("ui.run.owner.unknown").into());
-            rows.push(RunPanelRow {
-                line: Line::from(Span::styled(
-                    format!(
-                        "    {}",
-                        trf(
-                            if command.partial {
-                                "ui.run.command.meta.partial"
-                            } else {
-                                "ui.run.command.meta"
-                            },
-                            &[
-                                &command.first_seq.to_string(),
-                                &command.last_seq.to_string(),
-                                &actor,
-                            ],
-                        )
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                command: Some(key),
-            });
-            let payload = safe_inline(&String::from_utf8_lossy(&command.data));
-            let payload = if payload.is_empty() {
-                tr("ui.run.command.empty").into()
-            } else {
-                payload
-            };
-            for text in wrap_queue_text(&payload, available).into_iter() {
-                rows.push(RunPanelRow {
-                    line: Line::from(Span::styled(
-                        format!("    │ {text}"),
-                        Style::default().fg(Color::Gray),
-                    )),
-                    command: Some(key),
+            for step in &command.steps {
+                let mut payload = safe_inline(&String::from_utf8_lossy(&step.data));
+                if payload.is_empty() {
+                    payload = tr("ui.run.command.empty").into();
+                }
+                if step.truncated {
+                    payload.push('…');
+                }
+                let icon = if step.partial { "❌" } else { "✅" };
+                let icon_style = Style::default().fg(if step.partial {
+                    Color::LightRed
+                } else {
+                    Color::LightGreen
                 });
+                let detail_width = usize::from(width);
+                let icon_width = UnicodeWidthStr::width(icon);
+                let gap = usize::from(detail_width > icon_width.saturating_add(1));
+                let indentation = detail_width
+                    .saturating_sub(icon_width.saturating_add(gap).saturating_add(1))
+                    .min(4);
+                let first_prefix = format!("{}{icon}{}", " ".repeat(indentation), " ".repeat(gap));
+                let prefix_width = UnicodeWidthStr::width(first_prefix.as_str());
+                let continuation_prefix = " ".repeat(prefix_width);
+                let payload_width = detail_width
+                    .saturating_sub(prefix_width)
+                    .max(1)
+                    .min(usize::from(u16::MAX)) as u16;
+                for (line_index, text) in wrap_queue_text(&payload, payload_width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let line = if line_index == 0 {
+                        Line::from(vec![
+                            Span::styled(first_prefix.clone(), icon_style),
+                            Span::styled(text, Style::default().fg(Color::Gray)),
+                        ])
+                    } else {
+                        Line::from(Span::styled(
+                            format!("{continuation_prefix}{text}"),
+                            Style::default().fg(Color::Gray),
+                        ))
+                    };
+                    rows.push(RunPanelRow {
+                        line,
+                        command: Some(key),
+                    });
+                }
             }
-            if command.partial {
-                rows.push(RunPanelRow {
-                    line: Line::from(Span::styled(
-                        format!("    {}", tr("ui.run.command.partial")),
-                        Style::default().fg(Color::Yellow),
-                    )),
-                    command: Some(key),
-                });
-            }
-            if command.truncated {
-                rows.push(RunPanelRow {
-                    line: Line::from(Span::styled(
-                        format!("    {}", tr("ui.run.command.truncated")),
-                        Style::default().fg(Color::Yellow),
-                    )),
-                    command: Some(key),
-                });
-            }
-        }
-        if let Some(reason) = run.abort_reason.as_deref() {
-            rows.push(RunPanelRow {
-                line: Line::from(Span::styled(
-                    format!("  {}", trf("ui.run.abort.reason", &[&safe_inline(reason)])),
-                    Style::default().fg(Color::LightRed),
-                )),
-                command: None,
-            });
         }
         rows.push(RunPanelRow {
             line: Line::default(),
@@ -6081,7 +6150,7 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
     rows
 }
 
-fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect, framed: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(if app.current().run_history_limited {
@@ -6094,14 +6163,20 @@ fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         });
-    let inner = block.inner(area);
+    let inner = if framed { block.inner(area) } else { area };
     if inner.height == 0 || inner.width == 0 {
-        frame.render_widget(block, area);
+        if framed {
+            frame.render_widget(block, area);
+        }
         return;
     }
     let rows = run_history_rows(app, inner.width);
     if rows.is_empty() {
-        frame.render_widget(Paragraph::new(tr("ui.run.none")).block(block), area);
+        if framed {
+            frame.render_widget(Paragraph::new(tr("ui.run.none")).block(block), area);
+        } else {
+            frame.render_widget(Paragraph::new(tr("ui.run.none")), area);
+        }
         return;
     }
     let height = inner.height as usize;
@@ -6114,17 +6189,18 @@ fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .saturating_sub(2)
         .saturating_add(app.current().run_detail_scroll)
         .min(max_start);
-    frame.render_widget(
-        Paragraph::new(
-            rows.into_iter()
-                .skip(start)
-                .take(height)
-                .map(|row| row.line)
-                .collect::<Vec<_>>(),
-        )
-        .block(block),
-        area,
+    let paragraph = Paragraph::new(
+        rows.into_iter()
+            .skip(start)
+            .take(height)
+            .map(|row| row.line)
+            .collect::<Vec<_>>(),
     );
+    if framed {
+        frame.render_widget(paragraph.block(block), area);
+    } else {
+        frame.render_widget(paragraph, area);
+    }
 }
 
 fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -6251,16 +6327,22 @@ fn input_title(app: &App, mode: InputMode) -> String {
 }
 
 fn truncate_display(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.trim().to_string();
+    }
     let mut output = String::new();
     let mut width = 0usize;
+    let content_width = max_width.saturating_sub(1);
     for character in value.chars() {
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width.saturating_add(character_width) > max_width {
-            output.push('…');
+        if width.saturating_add(character_width) > content_width {
             break;
         }
         output.push(character);
         width = width.saturating_add(character_width);
+    }
+    if max_width > 0 {
+        output.push('…');
     }
     output.trim().to_string()
 }
@@ -6309,6 +6391,15 @@ fn line_input_projection(draft: &[char], cursor: usize, inner_width: u16) -> (St
 }
 
 fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if let Some(status) = app.active_status_notice(Instant::now()) {
+        frame.render_widget(
+            Paragraph::new(safe_inline(status))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
     let scroll = if app.current_mode() == InputMode::Raw {
         tr("ui.scroll.prefix")
     } else {
@@ -6407,6 +6498,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         help_item("help.line1"),
         help_item("help.line2"),
         help_item("help.line3"),
+        help_item("help.search.scope"),
         help_item("help.follow"),
         help_item("help.echo"),
         Line::default(),
@@ -7923,6 +8015,85 @@ mod tests {
     }
 
     #[test]
+    fn output_title_uses_exact_bound_model_name_without_slot_or_baud() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::Zh);
+        let mut app = App::new(vec![snapshot()], None);
+        let slot_id = app.selected_slot_id();
+        let model = DeviceModel {
+            id: "tl-as7230-1-0".into(),
+            name: "TL-AS7230 1.0".into(),
+            parent_id: None,
+            aliases: Vec::new(),
+        };
+        let binding = SlotModelBinding {
+            slot_id,
+            model_id: model.id.clone(),
+            confirmation_method: ModelConfirmationMethod::Human,
+            note: None,
+            updated_wall_time_ns: 0,
+            source: "human:serialctl".into(),
+        };
+        app.update_device_model_names(&[model], &[binding]);
+
+        let title = output_title(&app);
+        assert!(title.contains("TL-AS7230 1.0"));
+        assert!(!title.contains("tl-as7230-1-0"));
+        assert!(!title.contains(&app.current().snapshot.config.display_name));
+        assert!(!title.contains("115200"));
+
+        app.device_model_names.clear();
+        let fallback = output_title(&app);
+        assert!(fallback.contains(tr("ui.output.model.unconfigured")));
+        assert!(!fallback.contains(&app.current().snapshot.config.display_name));
+    }
+
+    #[test]
+    fn model_label_refresh_is_deduplicated_and_applies_external_bindings() {
+        let mut app = App::new(vec![snapshot()], None);
+        let slot_id = app.selected_slot_id();
+        let (menu_commands, mut received) = mpsc::channel(4);
+        app.menu_commands = Some(menu_commands);
+
+        app.request_model_labels_refresh();
+        app.request_model_labels_refresh();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(MenuIoCommand::LoadModelLabels)
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let model = DeviceModel {
+            id: "external-model".into(),
+            name: "TL-AS7230 1.0".into(),
+            parent_id: None,
+            aliases: Vec::new(),
+        };
+        app.handle_menu_io_event(MenuIoEvent::ModelLabelsLoaded(DeviceModelListResponse {
+            models: vec![model.clone()],
+            bindings: vec![SlotModelBinding {
+                slot_id,
+                model_id: model.id,
+                confirmation_method: ModelConfirmationMethod::Serial,
+                note: None,
+                updated_wall_time_ns: 0,
+                source: "agent:mcp".into(),
+            }],
+            config_revision: 2,
+        }));
+        assert!(output_title(&app).contains("TL-AS7230 1.0"));
+
+        app.request_model_labels_refresh();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(MenuIoCommand::LoadModelLabels)
+        ));
+    }
+
+    #[test]
     fn live_profile_refresh_updates_effective_behavior_without_changing_config() {
         let mut app = App::new(vec![snapshot()], None);
         let (commands, _) = mpsc::channel(4);
@@ -8084,7 +8255,7 @@ mod tests {
         app.queued_controls.insert(
             slot_id.clone(),
             QueuedControl {
-                position: 1,
+                _position: 1,
                 since: Instant::now(),
             },
         );
@@ -8113,7 +8284,7 @@ mod tests {
         app.queued_controls.insert(
             "slot-2".into(),
             QueuedControl {
-                position: 2,
+                _position: 2,
                 since: Instant::now(),
             },
         );
@@ -8619,7 +8790,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_the_active_trigger_state_and_confirmed_fires() {
+    fn visual_separators_do_not_repeat_trigger_or_control_details() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
         let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
@@ -8640,8 +8811,40 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains(&format!("trigger {short_id} running")));
-        assert!(rendered.contains("7 fire(s)"));
+        assert!(rendered.contains(tr("ui.separator.agent")));
+        assert!(rendered.contains(tr("ui.separator.input")));
+        assert!(!rendered.contains(&short_id));
+        assert!(!rendered.contains("7 fire(s)"));
+    }
+
+    #[test]
+    fn footer_shows_changed_status_temporarily_then_restores_help() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.status = "CRITICAL_STATUS_NOTICE".into();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let notice = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(notice.contains("CRITICAL_STATUS_NOTICE"));
+
+        assert!(app.expire_status_notice(Instant::now() + STATUS_NOTICE_DURATION));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let restored = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!restored.contains("CRITICAL_STATUS_NOTICE"));
+        assert!(restored.contains("Ctrl-]"));
     }
 
     #[test]
@@ -8692,6 +8895,7 @@ mod tests {
             output_inner: Rect::new(1, 1, 58, 6),
             input_area: Rect::new(0, 9, 60, 3),
             run_history_area: None,
+            run_history_inner: None,
         });
         let (commands, _) = mpsc::channel(1);
         app.handle_key(
@@ -8861,16 +9065,17 @@ mod tests {
         let history = &view.run_history[0];
         assert_eq!(history.status, RunStatus::Completed);
         assert_eq!(history.commands.len(), 2);
-        assert_eq!(history.commands[0].data, b"show version\r");
+        assert_eq!(history.commands[0].steps.len(), 1);
+        assert_eq!(history.commands[0].steps[0].data, b"show version\r");
         assert!(
-            history.commands[0].partial,
+            history.commands[0].steps[0].partial,
             "operation chunks preserve any partial-write outcome"
         );
         assert_eq!(
             history.commands[0].description.as_deref(),
             Some("读取系统版本")
         );
-        assert_eq!(history.commands[1].data, b"uname -a\r");
+        assert_eq!(history.commands[1].steps[0].data, b"uname -a\r");
         assert_eq!(view.run_command_keys()[0].first_seq, 4);
         assert_eq!(view.run_command_keys()[1].first_seq, 2);
 
@@ -8893,9 +9098,71 @@ mod tests {
     }
 
     #[test]
-    fn run_history_bar_marks_tail_and_gap_history_as_recent_only() {
+    fn run_history_groups_command_sequence_steps_under_one_purpose() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
+        let mut current = snapshot();
+        let run = agent_run("登录样机");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        let sequence_id = Uuid::new_v4();
+        for (seq, index, purpose, command, partial) in [
+            (2, 0, "输入账号", b"admin\r".as_slice(), false),
+            (3, 1, "输入密码", b"password\r".as_slice(), true),
+        ] {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, command);
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata
+                .insert("command_description".into(), serde_json::json!(purpose));
+            tx.metadata.insert(
+                "command_sequence_id".into(),
+                serde_json::json!(sequence_id.to_string()),
+            );
+            tx.metadata.insert(
+                "command_sequence_description".into(),
+                serde_json::json!("登录样机控制台"),
+            );
+            tx.metadata.insert(
+                "command_sequence_step_index".into(),
+                serde_json::json!(index),
+            );
+            tx.metadata
+                .insert("command_sequence_step_count".into(), serde_json::json!(2));
+            tx.metadata
+                .insert("partial".into(), serde_json::json!(partial));
+            app.slots[0].push_event(tx, true);
+        }
+
+        let history = &app.current().run_history[0];
+        assert_eq!(history.commands.len(), 1);
+        assert_eq!(history.commands[0].sequence_id, Some(sequence_id));
+        assert_eq!(
+            history.commands[0].description.as_deref(),
+            Some("登录样机控制台")
+        );
+        assert_eq!(history.commands[0].steps.len(), 2);
+
+        let key = app.current().selected_run_command_key().unwrap();
+        app.current_mut().expanded_run_command = Some(key);
+        let rendered = run_history_rows(&app, 80)
+            .into_iter()
+            .flat_map(|row| row.line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert_eq!(rendered.matches("登录样机控制台").count(), 1);
+        assert!(rendered.contains("✅ admin"));
+        assert!(rendered.contains("❌ password"));
+        assert!(!rendered.contains("已确认发送"));
+    }
+
+    #[test]
+    fn run_history_bar_marks_tail_and_gap_history_as_recent_only() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::En);
         let mut app = App::new(vec![snapshot()], None);
 
         assert!(
@@ -8907,12 +9174,56 @@ mod tests {
             .flat_map(|row| row.line.spans)
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(row_text.contains("这里只显示最近记录"));
+        assert!(!row_text.contains("Recent records only"));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(tr("ui.separator.agent.recent")));
 
         app.current_mut().run_history_limited = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let complete = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(complete.contains(tr("ui.separator.agent")));
+        assert!(!complete.contains(tr("ui.separator.agent.recent")));
+
         app.current_mut()
             .push_gap(10, "test durable journal gap", true);
         assert!(app.current().run_history_limited);
+    }
+
+    #[test]
+    fn agent_history_content_rows_are_configurable_and_bounded() {
+        assert_eq!(configured_agent_history_rows(None), 5);
+        assert_eq!(configured_agent_history_rows(Some(1)), 3);
+        assert_eq!(configured_agent_history_rows(Some(12)), 12);
+        assert_eq!(configured_agent_history_rows(Some(99)), 20);
+
+        let mut app = App::new(vec![snapshot()], None);
+        app.agent_history_rows = 12;
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.layout
+                .and_then(|layout| layout.run_history_area)
+                .expect("inline Agent history")
+                .height,
+            12
+        );
     }
 
     #[test]
@@ -9025,7 +9336,8 @@ mod tests {
             .flat_map(|row| row.line.spans)
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(row_text.contains("仅部分字节确认发送"));
+        assert!(row_text.contains("❌ show version"));
+        assert!(!row_text.contains("已确认发送"));
 
         app.focus = PaneFocus::Input;
         app.current_mut().expanded_run_command = None;
@@ -9046,7 +9358,7 @@ mod tests {
         assert_eq!(history_area.width, layout.output_area.width);
         assert_eq!(
             history_area.y,
-            layout.output_area.y + layout.output_area.height
+            layout.output_area.y + layout.output_area.height + 1
         );
         assert!(history_area.y + history_area.height <= layout.input_area.y);
 
@@ -9077,6 +9389,194 @@ mod tests {
             app.layout
                 .and_then(|layout| layout.run_history_area)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn expanding_the_followed_command_pins_it_when_new_agent_commands_arrive() {
+        let mut current = snapshot();
+        let run = agent_run("持续巡检");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+
+        let described_tx = |seq: u64, description: &str, data: &[u8]| {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, data);
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata
+                .insert("command_description".into(), serde_json::json!(description));
+            tx
+        };
+        app.slots[0].push_event(described_tx(2, "第一条命令", b"first command"), true);
+        assert!(app.current().selected_run_command.is_none());
+
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let pinned = RunCommandKey {
+            run_id: run.id,
+            first_seq: 2,
+        };
+        assert_eq!(app.current().selected_run_command, Some(pinned));
+        assert_eq!(app.current().expanded_run_command, Some(pinned));
+
+        app.slots[0].push_event(described_tx(3, "第二条命令", b"second command"), true);
+        assert_eq!(app.current().selected_run_command_key(), Some(pinned));
+        assert_eq!(app.current().expanded_run_command, Some(pinned));
+
+        let backend = TestBackend::new(80, 28);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.layout.unwrap().run_history_area.unwrap();
+        let (commands, _) = mpsc::channel(1);
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &commands,
+        );
+        assert_eq!(app.current().selected_run_command_key(), Some(pinned));
+        assert_eq!(app.current().expanded_run_command, Some(pinned));
+    }
+
+    #[test]
+    fn expanded_command_payload_wraps_without_clipping_ascii_cjk_or_emoji() {
+        for payload in [
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "中文样机命令参数甲乙丙丁戊己庚辛",
+            "login-🔐-step-✅-password-完成",
+        ] {
+            let mut current = snapshot();
+            let run = agent_run("查看详情");
+            current.active_run = Some(run.clone());
+            let epoch = current.daemon_epoch;
+            let mut app = App::new(vec![current], None);
+            let mut tx = event(EventKind::Tx, Direction::Tx, 2, payload.as_bytes());
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata
+                .insert("command_description".into(), serde_json::json!("用途"));
+            app.slots[0].push_event(tx, true);
+            app.focus = PaneFocus::RunHistory;
+            app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+            let width = 18;
+            let key = app.current().selected_run_command_key().unwrap();
+            let command_rows = run_history_rows(&app, width)
+                .into_iter()
+                .filter(|row| row.command == Some(key))
+                .map(|row| {
+                    row.line
+                        .spans
+                        .into_iter()
+                        .map(|span| span.content.into_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert!(command_rows.len() > 2, "payload should wrap: {payload}");
+            assert!(
+                command_rows
+                    .iter()
+                    .all(|row| { UnicodeWidthStr::width(row.as_str()) <= usize::from(width) })
+            );
+            let reconstructed = command_rows
+                .iter()
+                .skip(1)
+                .map(|row| {
+                    let row = row.trim_start();
+                    let row = row
+                        .strip_prefix('✅')
+                        .or_else(|| row.strip_prefix('❌'))
+                        .unwrap_or(row);
+                    row.strip_prefix(' ').unwrap_or(row)
+                })
+                .collect::<String>();
+            assert_eq!(reconstructed, payload);
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_expanded_run_detail_without_collapsing_it() {
+        let mut current = snapshot();
+        let run = agent_run("读取长配置");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, &vec![b'x'; 512]);
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata.insert(
+            "command_description".into(),
+            serde_json::json!("读取完整配置"),
+        );
+        app.slots[0].push_event(tx, true);
+        app.focus = PaneFocus::RunHistory;
+        let key = app.current().selected_run_command_key().unwrap();
+        app.current_mut().expanded_run_command = Some(key);
+        assert!(
+            run_history_rows(&app, 20)
+                .iter()
+                .filter(|row| row.command == Some(key))
+                .count()
+                > 20,
+            "expanded command bytes wrap into independently scrollable detail rows"
+        );
+
+        let backend = TestBackend::new(80, 28);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let area = app.layout.unwrap().run_history_area.unwrap();
+        let (commands, _) = mpsc::channel(1);
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &commands,
+        );
+
+        assert_eq!(app.current().expanded_run_command, Some(key));
+        assert_eq!(app.current().selected_run_command_key(), Some(key));
+        assert_eq!(app.current().run_detail_scroll, 5);
+
+        let maximum = app.max_run_detail_scroll();
+        assert!(maximum > 5);
+        for _ in 0..100 {
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &commands,
+            );
+        }
+        assert_eq!(app.current().run_detail_scroll, maximum);
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &commands,
+        );
+        assert_eq!(
+            app.current().run_detail_scroll,
+            maximum.saturating_sub(5),
+            "scrolling beyond the bottom must not create offset debt"
         );
     }
 
@@ -9634,7 +10134,7 @@ mod tests {
         app.queued_controls.insert(
             "slot-1".into(),
             QueuedControl {
-                position: 2,
+                _position: 2,
                 since: Instant::now(),
             },
         );
@@ -9678,7 +10178,7 @@ mod tests {
             app.pending_requests.get(&acquire_request),
             Some(PendingRequest::Acquire { slot_id, .. }) if slot_id == "slot-1"
         ));
-        assert_eq!(app.queued_controls["slot-1"].position, 2);
+        assert_eq!(app.queued_controls["slot-1"]._position, 2);
         assert!(!app.pending_requests.contains_key(&request_id));
     }
 
@@ -10210,7 +10710,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("REAL_INFLIGHT"));
-        assert!(rendered.contains("SENDING (locked)"));
+        assert!(!rendered.contains("SENDING (locked)"));
+        assert!(queue_cards(&app, 98)[0].sending);
 
         app.handle_result(
             request_id,
@@ -10280,7 +10781,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_cards_wrap_long_ascii_without_losing_command_text() {
+    fn queue_cards_keep_long_ascii_on_one_numbered_summary_row() {
         let mut app = App::new(vec![snapshot()], None);
         let command = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         append_pending_write(
@@ -10293,18 +10794,17 @@ mod tests {
         let cards = queue_cards(&app, 14);
 
         assert_eq!(cards.len(), 1);
-        assert!(cards[0].body.len() > 1);
-        assert_eq!(cards[0].body.concat(), command);
-        assert!(
-            cards[0]
-                .body
-                .iter()
-                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 12)
+        assert_eq!(cards[0].header, "1.");
+        assert!(cards[0].command.ends_with('…'));
+        assert!(UnicodeWidthStr::width(cards[0].command.as_str()) <= 9);
+        assert_eq!(
+            queued_line_operations(&app.pending_writes["slot-1"])[0].data,
+            format!("{command}\r").as_bytes()
         );
     }
 
     #[test]
-    fn queue_cards_wrap_cjk_by_display_width_without_losing_text() {
+    fn queue_cards_truncate_cjk_by_display_width() {
         let mut app = App::new(vec![snapshot()], None);
         let command = "中文样机命令参数甲乙丙丁戊己庚辛";
         append_pending_write(
@@ -10316,17 +10816,12 @@ mod tests {
 
         let cards = queue_cards(&app, 12);
 
-        assert_eq!(cards[0].body.concat(), command);
-        assert!(
-            cards[0]
-                .body
-                .iter()
-                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 10)
-        );
+        assert!(cards[0].command.ends_with('…'));
+        assert!(UnicodeWidthStr::width(cards[0].command.as_str()) <= 7);
     }
 
     #[test]
-    fn short_queue_viewport_pages_selected_command_without_silent_truncation() {
+    fn short_queue_viewport_keeps_selected_command_on_one_row() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
         let command = ["A"; 30]
@@ -10357,22 +10852,23 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(first_page.contains("AAAAAAAA"));
-        assert!(first_page.contains("text rows 1-"));
+        assert!(first_page.contains("▶ 1."));
+        assert!(!first_page.contains("text rows"));
 
         app.handle_queue_key(
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
             &commands,
         );
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let later_page = terminal
+        let unchanged = terminal
             .backend()
             .buffer()
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(!later_page.contains("text rows 1-"));
-        assert!(later_page.contains("EEEE") || later_page.contains("FFFF"));
+        assert!(unchanged.contains("AAAAAAAA"));
+        assert!(!unchanged.contains("text rows"));
     }
 
     #[test]

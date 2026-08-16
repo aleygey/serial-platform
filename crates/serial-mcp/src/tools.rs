@@ -15,8 +15,8 @@ use serial_protocol::{
     MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
     MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
     MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelConfirmationMethod, PROTOCOL_VERSION,
-    SessionState, SetSlotDeviceModelRequest, SlotSnapshot, StatusResponse, TriggerInfo,
-    TriggerSpec, TriggerStatus, WritePacing,
+    SequenceWritePrecondition, SessionState, SetSlotDeviceModelRequest, SlotSnapshot,
+    StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -27,12 +27,15 @@ use crate::{
     capture::{Capture, CaptureOptions, CommandBoundary, Completion, CompletionPattern},
     config::CaptureLimits,
     render::{MatchExcerptOptions, MatchExcerptPattern, RenderOptions, render_events},
-    session::{LocalControlState, SessionHandle},
+    session::{LocalControlState, SequenceBoundaryRejected, SessionHandle},
 };
 
 const DEFAULT_TEXT_CHARS: usize = 16_000;
 const MAX_WRITE_BYTES: usize = 4096;
 const MAX_REGEX_BYTES: usize = 4096;
+const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
+const MAX_COMMAND_SEQUENCE_TOTAL_WRITE_BYTES: usize = MAX_COMMAND_SEQUENCE_STEPS * MAX_WRITE_BYTES;
+const MAX_COMMAND_SEQUENCE_TIMEOUT_SECONDS: u64 = 300;
 const MAX_MONITOR_DESCRIPTION_BYTES: usize = 1024;
 const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
 const TRIGGER_STATUS_MARGIN: Duration =
@@ -40,6 +43,45 @@ const TRIGGER_STATUS_MARGIN: Duration =
 const TRIGGER_CANCEL_MARGIN: Duration = Duration::from_secs(5);
 const MODEL_BINDING_SOURCE: &str = "agent:serial-mcp";
 const MODEL_IDENTITY_WARNING: &str = "A configured model name is an assignment, not evidence of the connected hardware. On first connection or whenever the identity is uncertain, confirm it via serial evidence, telnet, the device web UI, or a human.";
+
+struct PreparedCommandStep {
+    bytes: Vec<u8>,
+    description: String,
+    timeout: Duration,
+    patterns: Vec<CompletionPattern>,
+    until_regex: Option<regex::Regex>,
+    complete_on_quiet: bool,
+    expected_echo: Option<Vec<u8>>,
+}
+
+struct ExecutedCommandStep {
+    output: Value,
+    completion: Completion,
+    cursor: Cursor,
+    truncated: bool,
+    gap: bool,
+    interfered: bool,
+    echo_missing: bool,
+    no_rx: bool,
+}
+
+struct CommandStepFailure {
+    phase: &'static str,
+    error: anyhow::Error,
+}
+
+impl CommandStepFailure {
+    fn is_sequence_boundary_rejection(&self) -> bool {
+        self.error
+            .downcast_ref::<SequenceBoundaryRejected>()
+            .is_some()
+    }
+}
+
+struct SequenceStop {
+    code: &'static str,
+    message: String,
+}
 
 #[derive(Clone)]
 pub struct AgentTools {
@@ -75,6 +117,7 @@ impl AgentTools {
             "device_model_set" => self.device_model_set(parse(arguments)?).await,
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,
+            "command_sequence" => self.command_sequence(parse(arguments)?).await,
             "input" => self.input(parse(arguments)?).await,
             "signal" => self.signal(parse(arguments)?).await,
             "trigger" => self.trigger(parse(arguments)?).await,
@@ -610,8 +653,208 @@ impl AgentTools {
         let active_run = matching_active_run(&slot, args.run_id, "command")?;
         let expected_run_id = args.run_id;
         let run_start_seq = active_run.start_seq;
+        let prepared = prepare_command_step(
+            &args.command,
+            args.description,
+            args.expect.as_deref(),
+            args.regex.as_deref(),
+            seconds(args.timeout_seconds, 10, 1, 120),
+            &slot,
+        )?;
+        let executed = self
+            .execute_command_step(
+                &slot,
+                expected_run_id,
+                args.run_token,
+                run_start_seq,
+                slot.head_seq,
+                prepared,
+                None,
+                None,
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        if let Completion::RunAborted { run_id, reason } = &executed.completion {
+            return Err(self
+                .run_abort_error(&slot, *run_id, run_start_seq, reason, false)
+                .await);
+        }
+        Ok(executed.output)
+    }
+
+    async fn command_sequence(&self, args: CommandSequenceArgs) -> Result<Value> {
+        let CommandSequenceArgs {
+            slot_id,
+            run_id,
+            run_token,
+            description,
+            steps,
+        } = args;
+        validate_command_description(&description)?;
+        validate_command_sequence_shape(&steps)?;
+
+        // One Run pin and one process-local Slot write lock cover the entire
+        // dependent interaction. No other call through this MCP can insert a
+        // write between two sequence steps.
+        let _run_use = self
+            .session
+            .authorize_run_use(slot_id.clone(), run_id, run_token)
+            .await?;
+        let _write_guard = self.write_guard(&slot_id).await;
+        let status = self.status().await?;
+        ensure_sequence_write_precondition_supported(&status)?;
+        let slot = status
+            .slots
+            .into_iter()
+            .find(|slot| slot.config.id == slot_id)
+            .with_context(|| format!("unknown Slot {slot_id:?}"))?;
+        if slot.session_state != SessionState::Online {
+            bail!(
+                "Slot {slot_id:?} is {:?}: {}",
+                slot.session_state,
+                slot.state_reason.as_deref().unwrap_or("no reason reported")
+            );
+        }
+        let active_run = matching_active_run(&slot, run_id, "command_sequence")?;
+        let run_start_seq = active_run.start_seq;
+
+        // This completes every validation that depends on the effective Slot
+        // profile (notably the physical EOL byte count) before step 1 writes.
+        let prepared_steps = prepare_command_sequence_steps(steps, &slot)?;
+        let requested_steps = prepared_steps.len();
+        let sequence_id = Uuid::new_v4();
+        let mut capture_after_seq = slot.head_seq;
+        let mut expected_tx_offset = slot.tx_offset;
+        let mut completed_steps = 0usize;
+        let mut step_outputs = Vec::with_capacity(requested_steps);
+
+        for (step_index, prepared) in prepared_steps.into_iter().enumerate() {
+            let has_next = step_index + 1 < requested_steps;
+            let audit = serial_protocol::CommandSequenceAuditContext {
+                sequence_id,
+                description: description.clone(),
+                step_index: step_index as u8,
+                step_count: requested_steps as u8,
+            };
+            let precondition = SequenceWritePrecondition {
+                cursor: Cursor {
+                    epoch: slot.daemon_epoch,
+                    after_seq: capture_after_seq,
+                },
+                expected_generation: slot.generation,
+                expected_tx_offset,
+            };
+            let planned_write_bytes = prepared.bytes.len() as u64;
+            let executed = match self
+                .execute_command_step(
+                    &slot,
+                    run_id,
+                    run_token,
+                    run_start_seq,
+                    capture_after_seq,
+                    prepared,
+                    Some(audit),
+                    Some(precondition),
+                )
+                .await
+            {
+                Ok(executed) => executed,
+                Err(failure) => {
+                    let boundary_changed = failure.is_sequence_boundary_rejection();
+                    if step_outputs.is_empty() && !boundary_changed {
+                        return Err(failure.error);
+                    }
+                    return Ok(command_sequence_output(
+                        &slot,
+                        run_id,
+                        sequence_id,
+                        description,
+                        requested_steps,
+                        completed_steps,
+                        step_outputs,
+                        Some(json!({
+                            "step_index": step_index,
+                            "phase": failure.phase,
+                            "code": if boundary_changed { "sequence_boundary_changed" } else { "step_error" },
+                            "message": failure.error.to_string(),
+                            "next_step_sent": false,
+                        })),
+                    ));
+                }
+            };
+            expected_tx_offset = expected_tx_offset
+                .checked_add(planned_write_bytes)
+                .context("command_sequence TX offset overflowed")?;
+            capture_after_seq = executed.cursor.after_seq;
+            let mut stop = command_sequence_stop(&executed, has_next);
+            if let Completion::RunAborted { run_id, reason } = &executed.completion {
+                stop = Some(SequenceStop {
+                    code: "run_aborted",
+                    message: self
+                        .run_abort_error(&slot, *run_id, run_start_seq, reason, false)
+                        .await
+                        .to_string(),
+                });
+            }
+
+            let mut output = executed.output;
+            output["sequence_id"] = json!(sequence_id);
+            output["step_index"] = json!(step_index);
+            output["step_count"] = json!(requested_steps);
+            output["status"] = json!(if stop.is_none() {
+                "completed"
+            } else {
+                "partial"
+            });
+            output["safe_to_advance"] = json!(has_next && stop.is_none());
+            step_outputs.push(output);
+
+            if let Some(stop) = stop {
+                return Ok(command_sequence_output(
+                    &slot,
+                    run_id,
+                    sequence_id,
+                    description,
+                    requested_steps,
+                    completed_steps,
+                    step_outputs,
+                    Some(json!({
+                        "step_index": step_index,
+                        "phase": "capture",
+                        "code": stop.code,
+                        "message": stop.message,
+                        "next_step_sent": false,
+                    })),
+                ));
+            }
+            completed_steps += 1;
+        }
+
+        Ok(command_sequence_output(
+            &slot,
+            run_id,
+            sequence_id,
+            description,
+            requested_steps,
+            completed_steps,
+            step_outputs,
+            None,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_command_step(
+        &self,
+        slot: &SlotSnapshot,
+        expected_run_id: Uuid,
+        run_token: Uuid,
+        run_start_seq: u64,
+        capture_after_seq: u64,
+        prepared: PreparedCommandStep,
+        sequence: Option<serial_protocol::CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
+    ) -> std::result::Result<ExecutedCommandStep, CommandStepFailure> {
         let operation_id = Uuid::new_v4();
-        let capture_after_seq = slot.head_seq;
         let cursor = Cursor {
             epoch: slot.daemon_epoch,
             after_seq: capture_after_seq,
@@ -620,50 +863,53 @@ impl AgentTools {
             self.api.endpoint(),
             self.api.token(),
             &self.actor_label,
-            args.slot_id.clone(),
+            slot.config.id.clone(),
             cursor,
             self.capture_limits,
         )
-        .await?
+        .await
+        .map_err(|error| CommandStepFailure {
+            phase: "attach",
+            error,
+        })?
         .watch_run(expected_run_id);
-        let bytes = compose_write_bytes(&args.command, effective_write_eol(&slot))?;
 
-        let (patterns, until_regex, completion_mode) =
-            requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
-        // requested_completion makes an explicit regex the sole authoritative
-        // boundary, so neither a configured prompt nor quiet can pre-empt it.
-        let complete_on_quiet = completion_mode == "quiet";
-        let echo_mode = effective_echo_mode(&slot);
-        let expected_echo =
-            (matches!(echo_mode, EchoMode::On) && !args.command.is_empty()).then(|| bytes.clone());
-        let write = match self
+        let write = self
             .session
             .write(
-                args.slot_id.clone(),
-                bytes,
+                slot.config.id.clone(),
+                prepared.bytes,
                 operation_id,
                 expected_run_id,
-                args.run_token,
-                effective_write_pacing(&slot),
-                Some(args.description.clone()),
+                run_token,
+                effective_write_pacing(slot),
+                Some(prepared.description.clone()),
+                sequence,
+                sequence_precondition,
             )
             .await
-        {
+            .map_err(|error| CommandStepFailure {
+                phase: "write",
+                error,
+            });
+        let write = match write {
             Ok(write) => write,
-            Err(error) => {
-                return Err(self
-                    .session_run_error(&slot, expected_run_id, run_start_seq, error, true)
-                    .await);
+            Err(mut failure) => {
+                failure.error = self
+                    .session_run_error(slot, expected_run_id, run_start_seq, failure.error, true)
+                    .await;
+                return Err(failure);
             }
         };
+
         let result = capture
             .collect_after_write(
                 CaptureOptions {
-                    timeout: seconds(args.timeout_seconds, 10, 1, 120),
+                    timeout: prepared.timeout,
                     quiet: Duration::from_millis(1_000),
-                    patterns,
-                    until_regex,
-                    complete_on_quiet,
+                    patterns: prepared.patterns,
+                    until_regex: prepared.until_regex,
+                    complete_on_quiet: prepared.complete_on_quiet,
                     // A quiet boundary needs post-TX RX evidence. In
                     // particular, an empty command window must not return
                     // "complete" merely because the timer elapsed.
@@ -672,23 +918,10 @@ impl AgentTools {
                 CommandBoundary {
                     tx_event_seq: write.event_seq,
                     operation_id,
-                    expected_echo,
+                    expected_echo: prepared.expected_echo,
                 },
             )
             .await;
-        if let Completion::RunAborted { run_id, reason } = &result.completion {
-            let last_seq = result.through_seq.unwrap_or(write.event_seq);
-            self.remember_live_cursor(
-                &slot.config.id,
-                Cursor {
-                    epoch: slot.daemon_epoch,
-                    after_seq: last_seq,
-                },
-            );
-            return Err(self
-                .run_abort_error(&slot, *run_id, run_start_seq, reason, false)
-                .await);
-        }
         let rendered = render_events(
             &result.events,
             RenderOptions {
@@ -705,7 +938,10 @@ impl AgentTools {
         let boundary = result
             .command_boundary
             .as_ref()
-            .context("command capture lost its authoritative write boundary")?;
+            .ok_or_else(|| CommandStepFailure {
+                phase: "capture",
+                error: anyhow!("command capture lost its authoritative write boundary"),
+            })?;
         let interfered = boundary.interfered;
         let echo_missing = boundary.echo_required && !boundary.echo_observed;
         let last_seq = result.through_seq.unwrap_or(write.event_seq);
@@ -724,13 +960,11 @@ impl AgentTools {
             echo_missing,
             rx_event_count,
         );
-        self.remember_live_cursor(
-            &slot.config.id,
-            Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: last_seq,
-            },
-        );
+        let cursor = Cursor {
+            epoch: slot.daemon_epoch,
+            after_seq: last_seq,
+        };
+        self.remember_live_cursor(&slot.config.id, cursor.clone());
         let mut output = json!({
             "slot_id": slot.config.id,
             "write": if echo_missing { "uncertain" } else { "confirmed" },
@@ -744,9 +978,10 @@ impl AgentTools {
             "run_id": expected_run_id,
             "operation_id": operation_id,
             "event_seq": write.event_seq,
-            "description": args.description,
+            "description": prepared.description,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
         });
+        let no_rx = command_has_no_rx(rx_event_count, boundary.echo_observed);
         attach_capture_warnings(
             &mut output,
             &result.completion,
@@ -755,10 +990,19 @@ impl AgentTools {
             gap,
             interfered,
             echo_missing,
-            rx_event_count == 0,
+            no_rx,
         );
         attach_omission(&mut output, &rendered);
-        Ok(output)
+        Ok(ExecutedCommandStep {
+            output,
+            completion: result.completion,
+            cursor,
+            truncated,
+            gap,
+            interfered,
+            echo_missing,
+            no_rx,
+        })
     }
 
     async fn input(&self, args: InputArgs) -> Result<Value> {
@@ -871,6 +1115,8 @@ impl AgentTools {
                 expected_run_id,
                 run_token,
                 effective_write_pacing(slot),
+                None,
+                None,
                 None,
             )
             .await
@@ -1248,7 +1494,7 @@ impl AgentTools {
             "run_id": run.id,
             "run_token": started.run_token,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
-            "warning": "Run scopes evidence only. Keep run_token private and pass this run_id/run_token to this Run's command, input, signal, trigger, wait, run_end, or aborting release calls. Before commands, confirm the physical DUT model and initialize device state explicitly."
+            "warning": "Run scopes evidence only. Keep run_token private and pass this run_id/run_token to this Run's command, command_sequence, input, signal, trigger, wait, run_end, or aborting release calls. Before commands, confirm the physical DUT model and initialize device state explicitly."
         }))
     }
 
@@ -1754,6 +2000,216 @@ fn validate_command_description(description: &str) -> Result<()> {
         bail!("description must not contain control characters");
     }
     Ok(())
+}
+
+fn validate_command_sequence_shape(steps: &[CommandSequenceStepArgs]) -> Result<()> {
+    if steps.is_empty() || steps.len() > MAX_COMMAND_SEQUENCE_STEPS {
+        bail!("steps must contain between 1 and {MAX_COMMAND_SEQUENCE_STEPS} commands");
+    }
+
+    let mut total_timeout_seconds = 0u64;
+    for (index, step) in steps.iter().enumerate() {
+        validate_command_description(&step.description)
+            .with_context(|| format!("steps[{index}].description is invalid"))?;
+        if step.command.len() > MAX_WRITE_BYTES {
+            bail!("steps[{index}].command exceeds {MAX_WRITE_BYTES} UTF-8 bytes before adding EOL");
+        }
+        match (step.expect.as_deref(), step.regex.as_deref()) {
+            (Some(_), Some(_)) => {
+                bail!("steps[{index}].expect and steps[{index}].regex are alternatives; choose one")
+            }
+            (None, None) if index + 1 < steps.len() => {
+                bail!("steps[{index}] is not final and must provide exactly one of expect or regex")
+            }
+            (Some(expect), None) => {
+                if expect.is_empty() {
+                    bail!("steps[{index}].expect must not be empty");
+                }
+                if expect.len() > MAX_REGEX_BYTES {
+                    bail!("steps[{index}].expect must not exceed {MAX_REGEX_BYTES} UTF-8 bytes");
+                }
+            }
+            (None, Some(pattern)) => {
+                let compiled = compile_regex(pattern, &format!("steps[{index}].regex"))?;
+                if compiled.is_match("") {
+                    bail!("steps[{index}].regex must not match an empty serial stream");
+                }
+            }
+            (None, None) => {}
+        }
+
+        let timeout_seconds = step.timeout_seconds.unwrap_or(10);
+        if !(1..=120).contains(&timeout_seconds) {
+            bail!("steps[{index}].timeout_seconds must be between 1 and 120");
+        }
+        total_timeout_seconds = total_timeout_seconds
+            .checked_add(timeout_seconds)
+            .context("command_sequence timeout total overflowed")?;
+    }
+    if total_timeout_seconds > MAX_COMMAND_SEQUENCE_TIMEOUT_SECONDS {
+        bail!(
+            "steps request {total_timeout_seconds}s of capture time; command_sequence allows at most {MAX_COMMAND_SEQUENCE_TIMEOUT_SECONDS}s"
+        );
+    }
+    Ok(())
+}
+
+fn prepare_command_step(
+    command: &str,
+    description: String,
+    expect: Option<&str>,
+    regex: Option<&str>,
+    timeout: Duration,
+    slot: &SlotSnapshot,
+) -> Result<PreparedCommandStep> {
+    validate_command_description(&description)?;
+    let bytes = compose_write_bytes(command, effective_write_eol(slot))?;
+    let (patterns, until_regex, completion_mode) = requested_completion(expect, regex, slot, true)?;
+    // An explicit matcher is the sole authoritative boundary. A configured
+    // prompt or a brief quiet period must never pre-empt it.
+    let complete_on_quiet = completion_mode == "quiet";
+    let expected_echo = (matches!(effective_echo_mode(slot), EchoMode::On) && !command.is_empty())
+        .then(|| bytes.clone());
+    Ok(PreparedCommandStep {
+        bytes,
+        description,
+        timeout,
+        patterns,
+        until_regex,
+        complete_on_quiet,
+        expected_echo,
+    })
+}
+
+fn prepare_command_sequence_steps(
+    steps: Vec<CommandSequenceStepArgs>,
+    slot: &SlotSnapshot,
+) -> Result<Vec<PreparedCommandStep>> {
+    validate_command_sequence_shape(&steps)?;
+    let mut total_write_bytes = 0usize;
+    let mut prepared = Vec::with_capacity(steps.len());
+    for (index, step) in steps.into_iter().enumerate() {
+        let timeout_seconds = step.timeout_seconds.unwrap_or(10);
+        let command = prepare_command_step(
+            &step.command,
+            step.description,
+            step.expect.as_deref(),
+            step.regex.as_deref(),
+            Duration::from_secs(timeout_seconds),
+            slot,
+        )
+        .with_context(|| format!("steps[{index}] is invalid"))?;
+        total_write_bytes = total_write_bytes
+            .checked_add(command.bytes.len())
+            .context("command_sequence write byte total overflowed")?;
+        prepared.push(command);
+    }
+    if total_write_bytes > MAX_COMMAND_SEQUENCE_TOTAL_WRITE_BYTES {
+        bail!(
+            "steps plan {total_write_bytes} physical bytes; command_sequence allows at most {MAX_COMMAND_SEQUENCE_TOTAL_WRITE_BYTES}"
+        );
+    }
+    Ok(prepared)
+}
+
+fn command_sequence_stop(
+    executed: &ExecutedCommandStep,
+    requires_next_step: bool,
+) -> Option<SequenceStop> {
+    let stop = |code, message: &str| {
+        Some(SequenceStop {
+            code,
+            message: message.into(),
+        })
+    };
+    match &executed.completion {
+        Completion::RunAborted { .. } => {
+            return stop("run_aborted", "the active Run was aborted during this step");
+        }
+        Completion::Timeout => {
+            return stop(
+                "timeout",
+                "the requested completion boundary was not observed before timeout",
+            );
+        }
+        Completion::Disconnected(reason) => {
+            return Some(SequenceStop {
+                code: "disconnected",
+                message: format!("capture disconnected before completion: {reason}"),
+            });
+        }
+        _ => {}
+    }
+    if executed.gap {
+        return stop("rx_gap", "RX evidence has a gap");
+    }
+    if executed.truncated {
+        return stop("capture_truncated", "capture evidence was truncated");
+    }
+    if executed.interfered {
+        return stop("interfered", "another actor wrote during this step");
+    }
+    if executed.echo_missing {
+        return stop(
+            "echo_uncertain",
+            "the configured command echo was not observed completely",
+        );
+    }
+    if executed.no_rx {
+        return stop("no_rx", "no post-write RX was observed");
+    }
+    if requires_next_step
+        && !matches!(
+            executed.completion,
+            Completion::Pattern(_) | Completion::Regex(_)
+        )
+    {
+        return stop(
+            "boundary_not_matched",
+            "the explicit intermediate expect/regex boundary was not matched",
+        );
+    }
+    None
+}
+
+fn command_has_no_rx(rx_event_count: usize, echo_observed: bool) -> bool {
+    rx_event_count == 0 && !echo_observed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_sequence_output(
+    slot: &SlotSnapshot,
+    run_id: Uuid,
+    sequence_id: Uuid,
+    description: String,
+    requested_steps: usize,
+    completed_steps: usize,
+    steps: Vec<Value>,
+    failure: Option<Value>,
+) -> Value {
+    let cursor = steps
+        .last()
+        .and_then(|step| step.get("cursor"))
+        .cloned()
+        .unwrap_or_else(|| json!({"epoch": slot.daemon_epoch, "after_seq": slot.head_seq}));
+    let sent_steps = steps.len();
+    let mut output = json!({
+        "slot_id": slot.config.id,
+        "run_id": run_id,
+        "sequence_id": sequence_id,
+        "description": description,
+        "status": if failure.is_some() { "partial" } else { "completed" },
+        "execution": "unknown",
+        "requested_steps": requested_steps,
+        "sent_steps": sent_steps,
+        "completed_steps": completed_steps,
+        "steps": steps,
+        "cursor": cursor,
+    });
+    if let Some(failure) = failure {
+        output["failure"] = failure;
+    }
+    output
 }
 
 fn validate_monitor_matcher(contains: Option<&str>, regex: Option<&str>) -> Result<()> {
@@ -2455,6 +2911,15 @@ fn ensure_protocol_compatible(status: &StatusResponse) -> Result<()> {
     Ok(())
 }
 
+fn ensure_sequence_write_precondition_supported(status: &StatusResponse) -> Result<()> {
+    if !status.sequence_write_precondition_supported {
+        bail!(
+            "seriald does not advertise atomic command_sequence write boundaries; no bytes were written. Install seriald and serial-mcp from the same v0.6.2-or-newer build"
+        );
+    }
+    Ok(())
+}
+
 fn slot_summary(slot: &SlotSnapshot) -> Value {
     let effective_transport = slot.effective_transport.unwrap_or_else(|| {
         serial_protocol::resolve_transport_settings(&slot.config.settings, None)
@@ -2770,6 +3235,24 @@ struct CommandArgs {
     slot_id: String,
     run_id: Uuid,
     run_token: Uuid,
+    command: String,
+    description: String,
+    expect: Option<String>,
+    regex: Option<String>,
+    timeout_seconds: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandSequenceArgs {
+    slot_id: String,
+    run_id: Uuid,
+    run_token: Uuid,
+    description: String,
+    steps: Vec<CommandSequenceStepArgs>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandSequenceStepArgs {
     command: String,
     description: String,
     expect: Option<String>,
@@ -3300,6 +3783,223 @@ mod tests {
         assert!(validate_command_description("查看样机内存").is_ok());
         let oversized = "界".repeat(MAX_COMMAND_DESCRIPTION_BYTES / "界".len() + 1);
         assert!(validate_command_description(&oversized).is_err());
+    }
+
+    fn sequence_step(value: Value) -> CommandSequenceStepArgs {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn command_sequence_args_are_strict_and_require_an_overall_description() {
+        let args: CommandSequenceArgs = serde_json::from_value(json!({
+            "slot_id": "bench",
+            "run_id": Uuid::nil(),
+            "run_token": Uuid::nil(),
+            "description": "登录样机",
+            "steps": [
+                {"command":"admin", "description":"输入账号", "expect":"Password:"},
+                {"command":"secret", "description":"输入密码", "regex":"[#>$]\\s*$"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(args.description, "登录样机");
+        assert_eq!(args.steps.len(), 2);
+
+        assert!(
+            serde_json::from_value::<CommandSequenceArgs>(json!({
+                "slot_id":"bench", "run_id":Uuid::nil(), "run_token":Uuid::nil(),
+                "steps":[{"command":"admin","description":"输入账号"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CommandSequenceArgs>(json!({
+                "slot_id":"bench", "run_id":Uuid::nil(), "run_token":Uuid::nil(),
+                "description":"登录样机",
+                "steps":[{"command":"admin","description":"输入账号","sensitive":true}]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_sequence_prevalidates_every_dependent_boundary_and_timeout() {
+        let valid = vec![
+            sequence_step(json!({
+                "command":"admin", "description":"输入账号", "expect":"Password:"
+            })),
+            sequence_step(json!({
+                "command":"secret", "description":"输入密码", "regex":"[#>$]\\s*$",
+                "timeout_seconds":120
+            })),
+        ];
+        validate_command_sequence_shape(&valid).unwrap();
+
+        for invalid in [
+            vec![],
+            vec![
+                sequence_step(json!({"command":"admin","description":"输入账号"})),
+                sequence_step(json!({"command":"secret","description":"输入密码"})),
+            ],
+            vec![
+                sequence_step(json!({
+                    "command":"admin", "description":"输入账号",
+                    "expect":"Password:", "regex":"Password:"
+                })),
+                sequence_step(json!({"command":"secret","description":"输入密码"})),
+            ],
+            vec![sequence_step(json!({
+                "command":"admin", "description":"输入账号", "regex":"("
+            }))],
+            vec![sequence_step(json!({
+                "command":"admin", "description":"输入账号", "regex":".*"
+            }))],
+            vec![sequence_step(json!({
+                "command":"admin", "description":"输入账号", "timeout_seconds":0
+            }))],
+            vec![sequence_step(json!({
+                "command":"admin", "description":"输入账号", "timeout_seconds":121
+            }))],
+            vec![
+                sequence_step(json!({
+                    "command":"one", "description":"第一步", "expect":"1",
+                    "timeout_seconds":120
+                })),
+                sequence_step(json!({
+                    "command":"two", "description":"第二步", "expect":"2",
+                    "timeout_seconds":120
+                })),
+                sequence_step(json!({
+                    "command":"three", "description":"第三步", "timeout_seconds":61
+                })),
+            ],
+        ] {
+            assert!(validate_command_sequence_shape(&invalid).is_err());
+        }
+
+        let too_many = (0..=MAX_COMMAND_SEQUENCE_STEPS)
+            .map(|index| {
+                sequence_step(json!({
+                    "command":format!("step-{index}"),
+                    "description":format!("第{}步", index + 1),
+                    "expect":"ready"
+                }))
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_command_sequence_shape(&too_many).is_err());
+    }
+
+    #[test]
+    fn command_sequence_physical_byte_budget_uses_each_effective_eol() {
+        let mut slot = test_slot();
+        slot.effective_write_eol = Some("\r".into());
+        slot.effective_echo = Some(EchoMode::On);
+        let max_command = "x".repeat(MAX_WRITE_BYTES - 1);
+        let steps = (0..MAX_COMMAND_SEQUENCE_STEPS)
+            .map(|index| CommandSequenceStepArgs {
+                command: max_command.clone(),
+                description: format!("第{}步", index + 1),
+                expect: (index + 1 < MAX_COMMAND_SEQUENCE_STEPS).then(|| "ready".into()),
+                regex: None,
+                timeout_seconds: Some(1),
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_command_sequence_steps(steps, &slot).unwrap();
+        assert_eq!(
+            prepared.iter().map(|step| step.bytes.len()).sum::<usize>(),
+            MAX_COMMAND_SEQUENCE_TOTAL_WRITE_BYTES
+        );
+
+        let oversized = vec![CommandSequenceStepArgs {
+            command: "x".repeat(MAX_WRITE_BYTES),
+            description: "超过物理写上限".into(),
+            expect: None,
+            regex: None,
+            timeout_seconds: Some(1),
+        }];
+        assert!(prepare_command_sequence_steps(oversized, &slot).is_err());
+    }
+
+    #[test]
+    fn command_sequence_advances_only_on_unambiguous_explicit_evidence() {
+        let execution = |completion| ExecutedCommandStep {
+            output: json!({}),
+            completion,
+            cursor: Cursor {
+                epoch: Uuid::nil(),
+                after_seq: 1,
+            },
+            truncated: false,
+            gap: false,
+            interfered: false,
+            echo_missing: false,
+            no_rx: false,
+        };
+        assert!(
+            command_sequence_stop(&execution(Completion::Pattern("Password:".into())), true)
+                .is_none()
+        );
+        assert!(
+            command_sequence_stop(&execution(Completion::Regex("prompt".into())), true).is_none()
+        );
+        for completion in [
+            Completion::Quiet,
+            Completion::Prompt("# ".into()),
+            Completion::Timeout,
+            Completion::Disconnected("closed".into()),
+        ] {
+            assert!(command_sequence_stop(&execution(completion), true).is_some());
+        }
+
+        for mutate in ["gap", "truncated", "interfered", "echo_missing", "no_rx"] {
+            let mut unsafe_step = execution(Completion::Pattern("Password:".into()));
+            match mutate {
+                "gap" => unsafe_step.gap = true,
+                "truncated" => unsafe_step.truncated = true,
+                "interfered" => unsafe_step.interfered = true,
+                "echo_missing" => unsafe_step.echo_missing = true,
+                "no_rx" => unsafe_step.no_rx = true,
+                _ => unreachable!(),
+            }
+            assert!(command_sequence_stop(&unsafe_step, true).is_some());
+        }
+    }
+
+    #[test]
+    fn complete_echo_counts_as_post_write_rx_after_echo_bytes_are_stripped() {
+        assert!(!command_has_no_rx(0, true));
+        assert!(command_has_no_rx(0, false));
+        assert!(!command_has_no_rx(1, false));
+    }
+
+    #[test]
+    fn sequence_boundary_failure_is_a_zero_next_step_partial_result() {
+        let slot = test_slot();
+        let run_id = Uuid::new_v4();
+        let output = command_sequence_output(
+            &slot,
+            run_id,
+            Uuid::new_v4(),
+            "登录样机".into(),
+            2,
+            1,
+            vec![json!({
+                "step_index": 0,
+                "status": "completed",
+                "cursor": {"epoch": slot.daemon_epoch, "after_seq": 50}
+            })],
+            Some(json!({
+                "step_index": 1,
+                "phase": "write",
+                "code": "sequence_boundary_changed",
+                "next_step_sent": false
+            })),
+        );
+        assert_eq!(output["status"], "partial");
+        assert_eq!(output["sent_steps"], 1);
+        assert_eq!(output["completed_steps"], 1);
+        assert_eq!(output["failure"]["next_step_sent"], false);
+        assert_eq!(output["failure"]["code"], "sequence_boundary_changed");
     }
 
     #[test]
@@ -3858,14 +4558,24 @@ mod tests {
             daemon_epoch: Uuid::from_u128(11),
             protocol_version: PROTOCOL_VERSION,
             config_revision: 1,
+            sequence_write_precondition_supported: true,
             slots: vec![test_slot()],
         };
         ensure_protocol_compatible(&status).unwrap();
+        ensure_sequence_write_precondition_supported(&status).unwrap();
 
         status.protocol_version = 0;
         let error = ensure_protocol_compatible(&status).unwrap_err().to_string();
         assert!(error.contains("protocol version 0"));
         assert!(error.contains("same release"));
+
+        status.protocol_version = PROTOCOL_VERSION;
+        status.sequence_write_precondition_supported = false;
+        let error = ensure_sequence_write_precondition_supported(&status)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("atomic command_sequence"));
+        assert!(error.contains("no bytes were written"));
     }
 
     fn test_slot() -> SlotSnapshot {

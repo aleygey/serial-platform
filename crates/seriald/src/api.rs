@@ -627,6 +627,7 @@ async fn status(
         daemon_epoch: state.inner.daemon_epoch,
         protocol_version: PROTOCOL_VERSION,
         config_revision: config.config_revision,
+        sequence_write_precondition_supported: true,
         slots: state.inner.registry.snapshots().await,
     }))
 }
@@ -1381,6 +1382,8 @@ async fn dispatch_slot_command(
             expected_run_id,
             pacing,
             description,
+            command_sequence,
+            sequence_precondition,
             cooperative,
             ..
         } => {
@@ -1395,6 +1398,8 @@ async fn dispatch_slot_command(
                     expected_run_id,
                     pacing,
                     description,
+                    command_sequence,
+                    sequence_precondition,
                     cooperative,
                 )
                 .await?
@@ -1710,6 +1715,9 @@ impl WsError {
                 | SlotError::TriggerEpochMismatch
                 | SlotError::TriggerGenerationMismatch
                 | SlotError::RequestIdReused => (ErrorCode::Conflict, false),
+                SlotError::SequenceBoundaryChanged { .. } => {
+                    (ErrorCode::SequenceBoundaryChanged, false)
+                }
                 SlotError::ProfileChangeBusy => (ErrorCode::ProfileChangeBusy, false),
                 SlotError::WriteLeaseTooShort { .. } => (ErrorCode::Conflict, true),
                 SlotError::WriteResultExpired => (ErrorCode::IdempotencyExpired, false),
@@ -1721,6 +1729,8 @@ impl WsError {
                 SlotError::WriteTooLarge
                 | SlotError::EmptyWrite
                 | SlotError::InvalidCommandDescription
+                | SlotError::InvalidCommandSequenceAudit
+                | SlotError::InvalidSequenceWritePrecondition
                 | SlotError::WriteDeadlineExceeded { .. }
                 | SlotError::InvalidBreakDuration
                 | SlotError::InvalidTriggerAction

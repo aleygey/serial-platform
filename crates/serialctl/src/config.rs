@@ -31,6 +31,11 @@ pub struct ClientConfig {
     /// Defaults to true. Set false to return all mouse handling to the
     /// terminal emulator (which also disables serialctl wheel scrolling).
     pub mouse_capture: Option<bool>,
+    /// Number of content rows reserved for the Agent task/command-history
+    /// pane on terminals tall enough to show it inline. Values are clamped to
+    /// 3..=20; the default of 5 preserves the existing seven-row footprint
+    /// once the two visual separators are included.
+    pub agent_history_rows: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +219,17 @@ mod tests {
     #[test]
     fn config_rejects_unknown_fields() {
         assert!(toml::from_str::<ClientConfig>("mystery = true").is_err());
+    }
+
+    #[test]
+    fn agent_history_rows_round_trips() {
+        let config = toml::from_str::<ClientConfig>("agent_history_rows = 12").unwrap();
+        assert_eq!(config.agent_history_rows, Some(12));
+        assert!(
+            toml::to_string(&config)
+                .unwrap()
+                .contains("agent_history_rows = 12")
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ consume the same platform protocol.
 and journals over HTTP, observes realtime events over WebSocket, and keeps one
 Agent control connection with bounded lease renewal. It can queue for control
 but cannot request takeover, configure/remove a Slot, suspend/close a serial
-handle, or flash a target. Its current registry has 18 tools spanning serial,
+handle, or flash a target. Its current registry has 19 tools spanning serial,
 Run, Trigger, Monitor, and independent device-model operations. The
 authoritative schemas are emitted by `tools/list` or
 `serial mcp --dump-tools` and documented in
@@ -86,6 +86,28 @@ Literal search renders matching lines with bounded context by default while
 leaving returned event/raw evidence and cursor semantics unchanged. The adapter
 never automatically retries an uncertain write.
 
+`command_sequence` builds on that same command/capture path for one known,
+dependent interaction. Its top-level description names the complete exchange;
+its 1–8 ordered steps each carry a command, a separate required description,
+an optional literal or regex, and an optional 1..120-second timeout. Every
+non-final step must have exactly one explicit matcher, and the next write is
+eligible only after that matcher is observed. The final step may omit a matcher
+and use the same configured-prompt/quiet fallback as `command`. The adapter
+validates the complete plan before TX: command plus effective EOL is at most
+4096 bytes per step, all planned writes total at most 32768 bytes, and effective
+timeouts total at most 300 seconds.
+
+The per-Slot mutation lock remains held across the complete sequence, preventing
+another MCP mutation from inserting bytes between dependent steps. Any step
+timeout, disconnect, evidence gap, uncertain write, Human takeover, or
+Run/Control loss stops before all remaining writes. There are no branches,
+loops, or automatic retries. The result's `sequence_id` groups the overall
+purpose and per-step statuses. Each confirmed or partially confirmed step still
+creates an independent Operation/TX audit event with its own description and
+exact plaintext command bytes; the terminal history groups those events and can
+expand each step. A matched boundary remains evidence of completion, not proof
+of application-level success.
+
 `input` sends exact UTF-8 bytes without Profile EOL. `signal` sends Ctrl-C,
 Ctrl-D, and Ctrl-Z as the exact single bytes `0x03`, `0x04`, and `0x1a`, or
 requests a bounded physical UART Break. All four require the adapter-owned Run
@@ -101,12 +123,13 @@ seconds with a five-second response margin, and a write waits 20 seconds so it
 cannot pre-empt seriald's legal 15-second physical-write deadline. Only Slots
 with Runs started by this adapter process receive periodic lease renewal.
 Each authorized Run-scoped call pins its Run for the complete call, including
-a `wait` or command capture lasting up to 120 seconds. After the final pin is
+a `wait`/command capture lasting up to 120 seconds or a validated command
+sequence whose capture deadlines total up to 300 seconds. After the final pin is
 dropped, five minutes of inactivity makes the next renewal tick actively release
 Control and abort the abandoned Run; if that release cannot reach the daemon,
-the separately renewed 60-second fenced lease expires instead. `command` renews
-the existing lease
-and fails closed instead of reacquiring control after Run/lease loss.
+the separately renewed 60-second fenced lease expires instead. `command` and
+`command_sequence` renew the existing lease and fail closed instead of
+reacquiring control after Run/lease loss.
 Disconnect or renewal failure clears the adapter's owned-Run ledger.
 Successful `run_end` removes the Run from renewal before a best-effort release;
 a failed release leaves at most the server TTL and never closes the port.
@@ -123,19 +146,20 @@ never retried automatically.
 The stdio dispatcher runs independent MCP requests concurrently and serializes
 stdout frames through one writer. MCP/JSON-RPC cancellation applies only to
 the pure observations `devices`, `device_models`, `read`, `wait`, `search`,
-`monitor_list`, `monitor_status`, and `monitor_incidents`. A command, signal,
-Trigger, Monitor mutation, Run transition, or release may already have crossed
+`monitor_list`, `monitor_status`, and `monitor_incidents`. A command, command
+sequence, signal, Trigger, Monitor mutation, Run transition, or release may already have crossed
 a side-effect boundary, so its task is allowed to converge to an authoritative
 result even when the host cancels or closes stdin; hiding that result could
-invite an unsafe retry. Per-Slot write locks still serialize `command`, `input`,
-`signal`, and `trigger`, so concurrency cannot interleave physical bytes. A long
+invite an unsafe retry. Per-Slot write locks still serialize `command`,
+`command_sequence`, `input`, `signal`, and `trigger`, so concurrency cannot
+interleave physical bytes. A long
 observation on one Slot therefore does not prevent another request or lease
 renewal from making progress.
 
 `serial-mcp` also keeps a process-local, per-Slot live cursor so a delayed RX
 event cannot fall into the gap between one tool response and the next `wait`
-attachment. A successful `run_start` records the Run's `start_seq`; `command`
-and `wait` record the highest sequence actually observed. Filtered `read` and
+attachment. A successful `run_start` records the Run's `start_seq`; `command`,
+`command_sequence`, and `wait` record the highest sequence actually observed. Filtered `read` and
 `search` calls deliberately do not advance it because their returned cursor can
 skip unmatched RX. The cursor advances monotonically within one daemon epoch.
 When `wait` receives an explicit `(epoch, after_seq)` pair,
@@ -316,9 +340,9 @@ bounds.
 - Releasing/revoking control aborts an active Run.
 - One Slot has at most one active Run.
 - At the MCP boundary, `run_start` creates a private in-memory `run_token` for
-  that Run. `command`, `input`, `signal`, `trigger`, `wait`, and `run_end`
-  require the exact `run_id`/`run_token`; active-Run `release` requires it as
-  well. This capability isolates callers sharing one long-lived MCP process;
+  that Run. `command`, `command_sequence`, `input`, `signal`, `trigger`, `wait`,
+  and `run_end` require the exact `run_id`/`run_token`; active-Run `release`
+  requires it as well. This capability isolates callers sharing one long-lived MCP process;
   seriald continues to enforce the wire-level actor, fence, and Run owner.
 - Run boundaries do not reset or clean the target; they only define an exact
   event interval.
@@ -547,7 +571,7 @@ one compatible consumer, not a seriald dependency: routing to an AgentInstance,
 choosing `reuse_or_create`, resolving a return route, and starting an Agent turn
 remain message-center/adapter responsibilities.
 
-The current 18-tool MCP registry includes five persistent-Monitor operations
+The current 19-tool MCP registry includes five persistent-Monitor operations
 alongside the serial, Run, Trigger, and device-model operations.
 `monitor_start` returns immediately, `monitor_list`/`monitor_status` show
 authoritative state, `monitor_incidents` returns a 20-item recent tail, starts
@@ -739,7 +763,7 @@ runs the locked workspace tests, Clippy, native smoke checks, and the exact
   `aarch64-apple-darwin` and `x86_64-apple-darwin` ZIPs. It runs the complete
   workspace tests for both architectures (x86_64 through Rosetta 2), verifies
   Mach-O architecture, deployment target 11.0, system-only dynamic libraries,
-  all four program versions, and the 18-tool MCP registry. Unsigned/unnotarized
+  all four program versions, and the 19-tool MCP registry. Unsigned/unnotarized
   status is recorded in each package until Apple release credentials exist.
 
 All four archives in a complete publishable Release contain `README.md`,

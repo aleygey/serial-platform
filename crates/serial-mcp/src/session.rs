@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use serial_protocol::{
-    Actor, ActorKind, ClientMessage, CommandResult, ControlLease, ControlMode, ErrorCode,
-    PROTOCOL_VERSION, Role, RunInfo, ServerMessage, TriggerInfo, TriggerSpec, TriggerStatus,
-    WireFrame, WritePacing, decode_wire_frame, encode_client_control,
+    Actor, ActorKind, ClientMessage, CommandResult, CommandSequenceAuditContext, ControlLease,
+    ControlMode, ErrorCode, PROTOCOL_VERSION, Role, RunInfo, SequenceWritePrecondition,
+    ServerMessage, TriggerInfo, TriggerSpec, TriggerStatus, WireFrame, WritePacing,
+    decode_wire_frame, encode_client_control,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -116,6 +117,8 @@ enum SessionRequest {
         run_token: Uuid,
         effective_pacing: WritePacing,
         description: Option<String>,
+        command_sequence: Option<CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         reply: Reply,
     },
     SendBreak {
@@ -180,7 +183,7 @@ enum SessionRequest {
     },
 }
 
-type Reply = oneshot::Sender<std::result::Result<SessionResponse, String>>;
+type Reply = oneshot::Sender<Result<SessionResponse>>;
 
 // Responses cross a single oneshot and are consumed immediately. Keeping the
 // protocol values inline avoids an allocation on every session RPC.
@@ -265,6 +268,8 @@ impl SessionHandle {
         run_token: Uuid,
         effective_pacing: WritePacing,
         description: Option<String>,
+        command_sequence: Option<CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
     ) -> Result<WriteResult> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -276,6 +281,8 @@ impl SessionHandle {
                 run_token,
                 effective_pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 reply,
             })
             .await
@@ -487,13 +494,10 @@ pub struct WriteResult {
     pub event_seq: u64,
 }
 
-async fn receive(
-    response: oneshot::Receiver<std::result::Result<SessionResponse, String>>,
-) -> Result<SessionResponse> {
+async fn receive(response: oneshot::Receiver<Result<SessionResponse>>) -> Result<SessionResponse> {
     response
         .await
         .context("serial session task dropped its response")?
-        .map_err(anyhow::Error::msg)
 }
 
 async fn run_session(
@@ -594,6 +598,8 @@ impl SessionState {
                 run_token,
                 effective_pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 reply,
             } => {
                 let result = self
@@ -605,6 +611,8 @@ impl SessionState {
                         run_token,
                         effective_pacing,
                         description,
+                        command_sequence,
+                        sequence_precondition,
                     )
                     .await
                     .map(|event_seq| SessionResponse::Write { event_seq });
@@ -1246,6 +1254,8 @@ impl SessionState {
         run_token: Uuid,
         effective_pacing: WritePacing,
         description: Option<String>,
+        command_sequence: Option<CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
     ) -> Result<u64> {
         let lease = self
             .renew_owned_run_control(&slot_id, expected_run_id, run_token)
@@ -1266,6 +1276,8 @@ impl SessionState {
             // value is used only for the local RPC deadline below.
             pacing: None,
             description,
+            command_sequence,
+            sequence_precondition,
             // Cooperative injection is Human-only. Agent writes always use
             // the ordinary fenced owner path.
             cooperative: false,
@@ -1280,6 +1292,11 @@ impl SessionState {
         match self.call_with_timeout(request, rpc_timeout).await {
             Ok(CommandResult::WriteAccepted { event_seq }) => Ok(event_seq),
             Ok(other) => bail!("unexpected write result: {other:?}"),
+            Err(error) if is_sequence_boundary_rejection(&error) => {
+                Err(anyhow::Error::new(SequenceBoundaryRejected {
+                    message: error.to_string(),
+                }))
+            }
             Err(error) if is_expected_run_rejection(&error) => {
                 self.disconnect();
                 bail!(
@@ -1656,7 +1673,7 @@ fn trigger_status_request(
 }
 
 fn send_reply(reply: Reply, result: Result<SessionResponse>) {
-    let _ = reply.send(result.map_err(|error| error.to_string()));
+    let _ = reply.send(result);
 }
 
 async fn wait_result(socket: &mut Socket, request_id: Uuid) -> Result<CommandResult> {
@@ -1706,6 +1723,32 @@ impl std::fmt::Display for DaemonRequestError {
 
 impl std::error::Error for DaemonRequestError {}
 
+/// A daemon-enforced sequence boundary failed before the physical writer was
+/// reached. Keeping a concrete marker lets the MCP return a stable structured
+/// partial result instead of parsing daemon prose.
+#[derive(Debug)]
+pub(crate) struct SequenceBoundaryRejected {
+    message: String,
+}
+
+impl std::fmt::Display for SequenceBoundaryRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "command sequence boundary changed before the next write; no bytes were written: {}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for SequenceBoundaryRejected {}
+
+fn is_sequence_boundary_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DaemonRequestError>()
+        .is_some_and(|error| error.code == ErrorCode::SequenceBoundaryChanged)
+}
+
 fn is_definite_prewrite_rejection(error: &anyhow::Error) -> bool {
     let Some(error) = error.downcast_ref::<DaemonRequestError>() else {
         return false;
@@ -1714,7 +1757,7 @@ fn is_definite_prewrite_rejection(error: &anyhow::Error) -> bool {
     // writer, so their retry safety does not depend on daemon prose.
     if matches!(
         error.code,
-        ErrorCode::ControlRequired | ErrorCode::StaleFence
+        ErrorCode::ControlRequired | ErrorCode::StaleFence | ErrorCode::SequenceBoundaryChanged
     ) {
         return true;
     }
@@ -1845,6 +1888,8 @@ mod tests {
             expected_run_id: Some(Uuid::nil()),
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         assert_eq!(request_timeout(&write, None), Duration::from_secs(20));
@@ -1963,6 +2008,14 @@ mod tests {
             assert!(is_definite_prewrite_rejection(&revoked));
         }
 
+        let sequence_boundary = daemon_error(
+            ErrorCode::SequenceBoundaryChanged,
+            false,
+            "command sequence boundary changed before write: TX offset changed from 7 to 8 (no bytes were written)".into(),
+        );
+        assert!(is_sequence_boundary_rejection(&sequence_boundary));
+        assert!(is_definite_prewrite_rejection(&sequence_boundary));
+
         let partial = daemon_error(
             ErrorCode::Conflict,
             false,
@@ -1972,6 +2025,22 @@ mod tests {
         assert!(!is_definite_prewrite_rejection(&anyhow::anyhow!(
             "transport timeout"
         )));
+    }
+
+    #[tokio::test]
+    async fn session_reply_preserves_typed_sequence_boundary_rejection() {
+        let (reply, response) = oneshot::channel();
+        send_reply(
+            reply,
+            Err(anyhow::Error::new(SequenceBoundaryRejected {
+                message: "cooperative TX crossed the cursor".into(),
+            })),
+        );
+        let error = match receive(response).await {
+            Ok(_) => panic!("expected sequence boundary rejection"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<SequenceBoundaryRejected>().is_some());
     }
 
     fn test_actor() -> Actor {
@@ -2157,6 +2226,8 @@ mod tests {
                     chunk_delay_ms: 1,
                 },
                 Some("查看帮助".into()),
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -2260,6 +2331,8 @@ mod tests {
                     chunk_size: 1,
                     chunk_delay_ms: 1,
                 },
+                None,
+                None,
                 None,
             )
             .await

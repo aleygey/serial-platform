@@ -107,14 +107,29 @@ Run start/end/abort events are rendered as full-width colored rules. They make
 an Agent task interval obvious to a human observer without implying that the
 DUT was reset or cleaned at either boundary.
 
-On terminals at least 22 rows tall, a full-width horizontal bar between serial
-output and command input provides a bounded recent projection of Agent tasks
-and explicitly described Agent TX commands. `Ctrl-] h` focuses it, Up/Down
-selects a command purpose, and Enter/Right expands the confirmed bytes. Short
-terminals use an on-demand popup so serial output retains enough rows. Initial
-attachment reads only a recent tail, and gaps or local eviction keep the bar
-marked as possibly incomplete. Use persistent logs for complete history;
-historical backfill is not implemented yet.
+On terminals at least 22 rows tall, powerline-style separators frame a
+full-width recent Agent task/command pane. Run rows show only state and task;
+`command_sequence` steps are grouped under one purpose. Expanded steps show
+`✅` for complete TX and `❌` for partial TX (not DUT execution success). The
+wheel scrolls expanded detail without collapsing it. Configure the inline
+content height with `agent_history_rows = 3..20` in `serialctl.toml` (default
+`5`); short terminals use an on-demand popup. The serial-output title shows the
+bound Device Model's exact catalog name and port, never its internal ID, Slot
+name, or baud rate. Model bindings changed by another Human or an MCP Agent are
+refreshed asynchronously (at most one catalog request is in flight) and appear
+without restarting the console.
+
+The powerline separator caps require a Powerline or Nerd Font. Without one,
+only those decorative cap glyphs may appear as missing-character boxes; the
+pane layout and controls continue to work.
+
+The former permanent status strip is not shown. Connection/control/write and
+clipboard feedback instead temporarily replaces the one-line shortcut footer
+for four seconds, then the normal help text returns.
+
+Queued LINE commands use one oldest-first row each (`1. command`). `Ctrl-R`
+searches LINE input history; use `serialctl logs --contains TEXT` to search
+durable serial output because the TUI has no output-search pane yet.
 
 On non-Windows terminals, output copy uses OSC 52 so the terminal emulator can
 own the system clipboard without adding an X11 or Wayland runtime dependency.

@@ -9,7 +9,7 @@ readonly PACKAGE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${PROJECT_ROOT}
 readonly GIT_COMMIT="$(git -C "${PROJECT_ROOT}" rev-parse HEAD)"
 readonly SOURCE_DATE_EPOCH="$(git -C "${PROJECT_ROOT}" show -s --format=%ct HEAD)"
 readonly DEPLOYMENT_TARGET="11.0"
-readonly MCP_TOOL_COUNT=18
+readonly MCP_TOOL_COUNT=19
 readonly ARM_TARGET="aarch64-apple-darwin"
 readonly X86_TARGET="x86_64-apple-darwin"
 readonly -a REQUIRED_BINARIES=(serial seriald serialctl serial-mcp)

@@ -13,7 +13,7 @@ MCP clients without making `seriald` Agent-specific.
 v0.6.2 isolates every MCP-owned Run with a private caller capability, records
 the human-readable purpose of confirmed Agent commands, and adds a bounded
 full-width Run/command-history bar to the Chinese-first terminal. It also adds native
-macOS arm64/x86_64 packages to the Jenkins pipeline. The current 18-tool MCP
+macOS arm64/x86_64 packages to the Jenkins pipeline. The current 19-tool MCP
 registry retains the persistent Monitor Jobs introduced in v0.5.0 and the
 ordinary serial/Run/Trigger operations. The unified launcher introduced in
 v0.4 remains: `serial serve` starts the backend,
@@ -42,6 +42,10 @@ Protocol and integration references:
 - `command` requires a concise `description`. Confirmed or partially confirmed
   TX events retain that purpose, while pre-write failures create no misleading
   command-history record.
+- `command_sequence` performs a known 1–8-step dependent interaction in one MCP
+  call. Each non-final command must reach its explicit literal/regex boundary
+  before the next write; failure stops all later steps. The sequence and each
+  step carry separate purposes and are grouped by `sequence_id` in history.
 - The terminal shows the current serial channel's recent Agent tasks and
   command purposes in a full-width horizontal bar between serial output and
   command input. Operators can select a purpose and expand only the bytes
@@ -224,7 +228,7 @@ chmod +x serial serialctl serial-mcp
 Release checksums are published in `SHA256SUMS`. Each package also contains
 `BUILD-INFO.json`, an internal `MANIFEST.sha256`, the complete `docs/` and
 `adapters/` trees, and the top-level product documentation. Jenkins verifies
-the target architecture, application version, exact 18-tool MCP registry,
+the target architecture, application version, exact 19-tool MCP registry,
 Linux glibc ceiling, absence of unbundled MinGW runtime imports, archive
 integrity, and both checksum layers before the artifacts are published. The
 command examples below assume the executables are on `PATH`. From an extracted
@@ -369,17 +373,21 @@ view to live output. It does not quit `serialctl` or release Human Control.
 In RAW mode, Ctrl-D and Ctrl-Z are ordinary raw control bytes; they do not exit
 the local console or suspend its process.
 
-On terminals at least 22 rows tall, a bounded recent projection of the current
-Slot's Agent Run history appears as a full-width horizontal bar between serial
-output and command input. It lists only Agent TX
-events carrying an explicit command purpose; ordinary Human/cooperative input
-and undescribed/raw writes are not guessed into the list. Initial attachment
-reads only a recent tail, and gaps or local eviction keep the bar marked as
-possibly incomplete. Use the persistent logs for complete history; historical
-backfill is not implemented yet. `Ctrl-] h` focuses the bar, Up/Down chooses a
-command purpose, and Enter/Right expands only that command's confirmed TX
-bytes. Short terminals show the same history as an on-demand popup so serial
-output keeps enough rows.
+On terminals at least 22 rows tall, powerline-style separators frame a
+full-width recent Agent task/command projection between serial output and
+command input. Run rows contain only state and task; purpose rows expand to the
+actual commands, and `command_sequence` steps stay grouped under one sequence
+purpose. In detail view, `✅` means complete TX and `❌` means partial TX; these
+icons do not claim DUT execution success. `Ctrl-] h` focuses the pane,
+Up/Down selects a purpose, Enter/Right expands it, and PageUp/PageDown or the
+wheel scrolls expanded detail without collapsing it. Set
+`agent_history_rows = 3..20` in `serialctl.toml` (default `5`). Short terminals
+use an on-demand popup.
+
+The serial-output title resolves the bound Device Model in the background and
+shows its exact catalog name (spaces and casing preserved) plus the serial port.
+It never substitutes the internal model ID or Slot name; an unavailable binding
+is shown as “device model not configured”. The baud rate is not repeated there.
 
 Mouse capture is on by default. The wheel scrolls only the serial-output
 viewport; clicking the output or input pane changes focus; output left-drag
@@ -404,15 +412,16 @@ Opening the console only subscribes. The first ordinary `Enter` asks for Human
 Control. If another actor owns it, the request queues; only `Takeover` revokes
 it. While an Agent Run is active, an empty `Enter` queues no bytes and simply
 returns the output to its live tail. A non-empty command appears above the input
-as its own oldest-first numbered card with the complete command text. Before a
+as its own oldest-first single row (`1. command`). Before a
 queued LINE command starts sending, `Ctrl-] d` removes the newest command and
 `Ctrl-] e` returns it to the editor; `Ctrl-] u` opens the queue selector so any
-card can be deleted or returned for modification. Card text wraps by terminal
-display width, including double-width CJK characters. A short terminal exposes
-an explicit selected-card detail viewport; PageUp/PageDown scrolls that text
-instead of silently truncating it. Bytes already in a physical write are locked
-and cannot be recalled. Submitting a restored command places the edited version
-at the queue tail.
+row can be deleted or returned for modification. Long summaries are truncated
+by display width, including double-width CJK; editing restores the complete
+bytes. Bytes already in a physical write are locked and cannot be recalled.
+Submitting a restored command places the edited version at the queue tail.
+
+`Ctrl-R` searches LINE input history. Serial output does not yet have an
+in-pane search; use `serialctl logs --contains TEXT` for durable RX/TX history.
 
 `Alt-Enter` is a separate, explicit cooperative path available only while the
 same Agent owns both the current lease and active Run. It writes immediately
@@ -579,7 +588,7 @@ or remotely bound installations continue to reuse the operator token written
 by `serial setup`, so Agent config contains no literal secret. Configure the MCP host to
 run `serial mcp` (or the component `serial-mcp` directly). Ready-to-copy
 OpenCode JSONC and Codex TOML examples and the expected Run workflow are in
-[adapters/README.md](./adapters/README.md). The current 18-tool registry and
+[adapters/README.md](./adapters/README.md). The current 19-tool registry and
 result contracts are documented in [MCP_TOOLS.md](./docs/MCP_TOOLS.md) and can
 be inspected as authoritative JSON with `serial mcp --dump-tools`.
 
@@ -654,6 +663,25 @@ legacy non-cooperative clients may omit this optional wire boundary and retain
 lease-only writes. A Run isolates only its log/event interval—it does not
 reset, initialize, or otherwise clean the device.
 
+`serial_command_sequence` is for a known dependent serial exchange, not
+parallel work: for example, send a username, wait for `Password:`, then send the
+already-known password without another Agent/tool round trip. One call carries
+a required overall purpose and 1–8 ordered steps, each with its own required
+command purpose and optional 1..120-second timeout. Every non-final step must
+provide exactly one `expect` or `regex`; the final step may use the same
+configured-prompt/quiet fallback as `serial_command`. Effective timeouts may
+total at most 300 seconds, each command plus effective EOL is limited to 4096
+bytes, and the whole planned write is limited to 32768 bytes.
+
+The complete plan is validated before its first write and holds the Slot's
+serialized mutation path until it finishes. A timeout, disconnect, evidence
+gap, uncertain write, Human takeover, or Run/Control loss prevents every later
+step from being sent; there is no branch, loop, or automatic retry. The result
+uses one `sequence_id` to group the overall purpose and per-step statuses. Each
+confirmed or partially confirmed step is still an ordinary plaintext TX audit
+event carrying its own description and exact command bytes, which the terminal
+history can expand.
+
 The adapter renews control only for Runs it currently owns. A Run-scoped call
 pins its Run for that call's full lifetime; after the last call returns, five
 minutes without activity causes the adapter to release control and abort the
@@ -685,11 +713,11 @@ byte and is still fenced, Run-bound, and audited.
 
 MCP requests may run concurrently. Physical mutations targeting the same Slot
 are deliberately serialized in arrival order; independent Slots can progress
-concurrently. `command` therefore remains a single-command tool instead of
-embedding a partly-successful batch protocol. A future batch tool, if needed,
-must define per-item descriptions, timeouts, retry identities, stop-on-error,
-and partial-result semantics explicitly. Cancellation applies only to the
-read-only observations `devices`, `device_models`, `read`, `wait`, `search`,
+concurrently. Use `command` for one ordinary command and `command_sequence` for
+one bounded, dependency-gated interaction whose stop-on-failure and partial
+results are explicit. The sequence is ordered rather than parallel and does
+not replace concurrent calls targeting independent Slots. Cancellation applies
+only to the read-only observations `devices`, `device_models`, `read`, `wait`, `search`,
 `monitor_list`, `monitor_status`, and `monitor_incidents`. Once a mutating
 tool may have crossed a serial/Run/Control side-effect boundary, the adapter
 waits for its authoritative result instead of hiding the outcome and inviting

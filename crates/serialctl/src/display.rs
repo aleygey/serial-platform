@@ -1322,6 +1322,7 @@ pub fn error_code_label(code: ErrorCode) -> &'static str {
         ErrorCode::StaleFence => tr("error.stale_fence"),
         ErrorCode::PortOffline => tr("error.port_offline"),
         ErrorCode::CursorAhead => tr("error.cursor_ahead"),
+        ErrorCode::SequenceBoundaryChanged => tr("error.conflict"),
         ErrorCode::ResourceExhausted => tr("error.resource_exhausted"),
         ErrorCode::IdempotencyExpired => tr("error.idempotency_expired"),
         ErrorCode::ConfigRevisionMismatch => tr("error.config_revision_mismatch"),

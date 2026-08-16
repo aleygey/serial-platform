@@ -5,16 +5,16 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandResult, ControlMode, Cursor, DataBits, DeviceProfile, Direction,
-    ErrorCode, EventKind, FlowControl, LoggingState, MAX_BREAK_DURATION_MS,
-    MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
-    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
-    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
-    MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS, MIN_TRIGGER_INTERVAL_MS,
-    MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo, RunStatus, SerialSettings, SessionState, SlotConfig,
-    SlotSnapshot, StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo,
-    TriggerSpec, TriggerStatus, WritePacing, apply_transport_profile, resolve_device_settings,
-    resolve_transport_settings,
+    Actor, ActorKind, CommandResult, CommandSequenceAuditContext, ControlMode, Cursor, DataBits,
+    DeviceProfile, Direction, ErrorCode, EventKind, FlowControl, LoggingState,
+    MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
+    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
+    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
+    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo, RunStatus,
+    SequenceWritePrecondition, SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits,
+    TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerSpec, TriggerStatus,
+    WritePacing, apply_transport_profile, resolve_device_settings, resolve_transport_settings,
 };
 #[cfg(windows)]
 use serialport::COMPort;
@@ -151,6 +151,14 @@ pub enum SlotError {
         "command description must be non-empty, trimmed, at most {MAX_COMMAND_DESCRIPTION_BYTES} UTF-8 bytes, and contain no control characters"
     )]
     InvalidCommandDescription,
+    #[error(
+        "command sequence audit requires a non-nil sequence id, a valid overall description, 1-8 steps, a zero-based step index within that count, and a per-step command description"
+    )]
+    InvalidCommandSequenceAudit,
+    #[error("a sequence write precondition requires command sequence audit context")]
+    InvalidSequenceWritePrecondition,
+    #[error("command sequence boundary changed before write: {reason} (no bytes were written)")]
+    SequenceBoundaryChanged { reason: String },
     #[error(
         "serial write pacing requires an estimated {required_ms} ms, exceeding the {maximum_ms} ms request limit; increase chunk_size, reduce chunk_delay_ms, or split the write (no bytes were written)"
     )]
@@ -495,6 +503,8 @@ impl SlotHandle {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
         description: Option<String>,
+        command_sequence: Option<CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         cooperative: bool,
     ) -> Result<CommandResult, SlotError> {
         if data.len() > MAX_WRITE_BYTES {
@@ -510,6 +520,8 @@ impl SlotHandle {
             expected_run_id,
             pacing,
             description,
+            command_sequence,
+            sequence_precondition,
             cooperative,
             reply,
         })
@@ -812,6 +824,8 @@ enum SlotCommand {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
         description: Option<String>,
+        command_sequence: Option<CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         cooperative: bool,
         reply: Reply,
     },
@@ -1850,6 +1864,8 @@ impl SlotActor {
                 expected_run_id,
                 pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 cooperative,
                 ..
             } => {
@@ -1892,6 +1908,17 @@ impl SlotActor {
                         .remaining_ttl(&actor.id, control_id, fence, authorization_now)?
                 };
                 ensure_lease_covers_write(lease_remaining, write_timeout)?;
+                if let Some(precondition) = sequence_precondition.as_ref() {
+                    let ring = self.ring.lock().await;
+                    validate_sequence_write_precondition(
+                        precondition,
+                        self.daemon_epoch,
+                        self.generation,
+                        self.tx_offset,
+                        self.seq,
+                        &ring,
+                    )?;
+                }
                 let Some(port) = &self.port else {
                     return Err(SlotError::PortOffline);
                 };
@@ -1919,8 +1946,12 @@ impl SlotActor {
                     message: "serial writer stopped before confirming the outcome; the physical write may have occurred".into(),
                 })?;
                 let event_seq = if outcome.written > 0 {
-                    let mut event_metadata =
-                        write_event_metadata(outcome.written != total, cooperative, description);
+                    let mut event_metadata = write_event_metadata(
+                        outcome.written != total,
+                        cooperative,
+                        description,
+                        command_sequence,
+                    );
                     if cooperative && let Some(run) = self.active_run.as_ref() {
                         event_metadata.insert("interfered_run_id".into(), json!(run.id));
                         event_metadata.insert(
@@ -3651,6 +3682,8 @@ enum SlotRequest {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
         description: Option<String>,
+        command_sequence: Option<CommandSequenceAuditContext>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         cooperative: bool,
     },
     SendBreak {
@@ -3710,9 +3743,25 @@ impl SlotRequest {
     fn validate_business_fields(&self) -> Result<(), SlotError> {
         match self {
             Self::Write {
-                description: Some(description),
+                description,
+                command_sequence,
+                sequence_precondition,
                 ..
-            } => validate_command_description(description),
+            } => {
+                if let Some(description) = description {
+                    validate_command_description(description)?;
+                }
+                if let Some(command_sequence) = command_sequence {
+                    if description.is_none() {
+                        return Err(SlotError::InvalidCommandSequenceAudit);
+                    }
+                    validate_command_sequence_audit(command_sequence)?;
+                }
+                if sequence_precondition.is_some() && command_sequence.is_none() {
+                    return Err(SlotError::InvalidSequenceWritePrecondition);
+                }
+                Ok(())
+            }
             Self::StartRun {
                 label, metadata, ..
             } => {
@@ -3754,6 +3803,8 @@ impl SlotRequest {
                 expected_run_id,
                 pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 cooperative,
                 ..
             } => Some(
@@ -3764,6 +3815,8 @@ impl SlotRequest {
                     expected_run_id,
                     pacing,
                     description,
+                    command_sequence,
+                    sequence_precondition,
                     cooperative,
                 ))
                 .expect("write request fields are serializable"),
@@ -3876,6 +3929,8 @@ impl SlotRequest {
                 expected_run_id,
                 pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 cooperative,
             } => serde_json::to_vec(&(
                 "write",
@@ -3887,6 +3942,8 @@ impl SlotRequest {
                 expected_run_id,
                 pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 cooperative,
             )),
             Self::StartTrigger {
@@ -4056,10 +4113,78 @@ fn validate_command_description(description: &str) -> Result<(), SlotError> {
     }
 }
 
+fn validate_command_sequence_audit(audit: &CommandSequenceAuditContext) -> Result<(), SlotError> {
+    if audit.sequence_id.is_nil()
+        || validate_command_description(&audit.description).is_err()
+        || !(1..=8).contains(&audit.step_count)
+        || audit.step_index >= audit.step_count
+    {
+        Err(SlotError::InvalidCommandSequenceAudit)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks a dependent-write boundary against the authoritative Slot state.
+///
+/// This is called by the Slot actor after authorization and immediately before
+/// the port command is enqueued. The actor cannot process another write while
+/// this check and enqueue are in progress. RX is intentionally allowed: it may
+/// arrive between a prompt match and the planned reply without changing the
+/// dependent TX history. Any TX or any kind of evidence gap fails closed.
+fn validate_sequence_write_precondition(
+    precondition: &SequenceWritePrecondition,
+    daemon_epoch: Uuid,
+    generation: u64,
+    tx_offset: u64,
+    head_seq: u64,
+    ring: &EventRing,
+) -> Result<(), SlotError> {
+    let changed = |reason: String| SlotError::SequenceBoundaryChanged { reason };
+    if precondition.cursor.epoch != daemon_epoch {
+        return Err(changed("daemon epoch changed".into()));
+    }
+    if precondition.expected_generation != generation {
+        return Err(changed(format!(
+            "serial generation changed from {} to {generation}",
+            precondition.expected_generation
+        )));
+    }
+    if precondition.expected_tx_offset != tx_offset {
+        return Err(changed(format!(
+            "TX offset changed from {} to {tx_offset}",
+            precondition.expected_tx_offset
+        )));
+    }
+    let replay = ring
+        .replay(
+            daemon_epoch,
+            Some(&precondition.cursor),
+            head_seq,
+            RING_EVENTS,
+        )
+        .map_err(|error| changed(error.to_string()))?;
+    if let Some(gap) = replay.gap {
+        return Err(changed(format!("timeline replay gap: {:?}", gap.reason)));
+    }
+    if let Some(event) = replay
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::Gap || event.direction == Direction::Tx)
+    {
+        return Err(changed(format!(
+            "timeline {:?} event at sequence {} crossed the boundary",
+            event.kind, event.seq
+        )));
+    }
+    Ok(())
+}
+
 fn write_event_metadata(
     partial: bool,
     cooperative: bool,
     description: Option<String>,
+    command_sequence: Option<CommandSequenceAuditContext>,
 ) -> BTreeMap<String, Value> {
     let mut event_metadata = metadata([
         ("partial", json!(partial)),
@@ -4067,6 +4192,24 @@ fn write_event_metadata(
     ]);
     if let Some(description) = description {
         event_metadata.insert("command_description".into(), json!(description));
+    }
+    if let Some(command_sequence) = command_sequence {
+        event_metadata.insert(
+            "command_sequence_id".into(),
+            json!(command_sequence.sequence_id),
+        );
+        event_metadata.insert(
+            "command_sequence_description".into(),
+            json!(command_sequence.description),
+        );
+        event_metadata.insert(
+            "command_sequence_step_index".into(),
+            json!(command_sequence.step_index),
+        );
+        event_metadata.insert(
+            "command_sequence_step_count".into(),
+            json!(command_sequence.step_count),
+        );
     }
     event_metadata
 }
@@ -4337,6 +4480,8 @@ impl SlotCommand {
                 expected_run_id,
                 pacing,
                 description,
+                command_sequence,
+                sequence_precondition,
                 cooperative,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
@@ -4349,6 +4494,8 @@ impl SlotCommand {
                     expected_run_id,
                     pacing,
                     description,
+                    command_sequence,
+                    sequence_precondition,
                     cooperative,
                 },
                 reply,
@@ -6205,6 +6352,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         let same = SlotRequest::Write {
@@ -6216,6 +6365,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         let different = SlotRequest::Write {
@@ -6227,6 +6378,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         assert_eq!(first.fingerprint(), same.fingerprint());
@@ -6250,6 +6403,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         let paced = SlotRequest::Write {
@@ -6264,6 +6419,8 @@ mod tests {
                 chunk_delay_ms: 5,
             }),
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         assert_ne!(unpaced.write_fingerprint(), paced.write_fingerprint());
@@ -6287,6 +6444,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: description.map(str::to_string),
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
 
@@ -6319,15 +6478,288 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_tx_metadata_retains_only_an_explicit_command_description() {
-        let described = write_event_metadata(false, false, Some("查看样机内存".into()));
+    fn command_sequence_audit_is_validated_and_bound_to_write_idempotency() {
+        let sequence_id = Uuid::new_v4();
+        let audit = CommandSequenceAuditContext {
+            sequence_id,
+            description: "登录样机".into(),
+            step_index: 0,
+            step_count: 2,
+        };
+        let control_id = Uuid::new_v4();
+        let operation_id = Some(Uuid::new_v4());
+        let request = |command_sequence| SlotRequest::Write {
+            actor: Actor {
+                id: "agent:test".into(),
+                label: "test".into(),
+                kind: ActorKind::Agent,
+            },
+            control_id,
+            fence: 7,
+            data: b"admin\r".to_vec(),
+            operation_id,
+            expected_run_id: None,
+            pacing: None,
+            description: Some("输入账号".into()),
+            command_sequence,
+            sequence_precondition: None,
+            cooperative: false,
+        };
+        assert!(
+            request(Some(audit.clone()))
+                .validate_business_fields()
+                .is_ok()
+        );
+        let mut missing_step_description = request(Some(audit.clone()));
+        if let SlotRequest::Write { description, .. } = &mut missing_step_description {
+            *description = None;
+        }
+        assert_eq!(
+            missing_step_description.validate_business_fields(),
+            Err(SlotError::InvalidCommandSequenceAudit)
+        );
+        for invalid in [
+            CommandSequenceAuditContext {
+                sequence_id: Uuid::nil(),
+                ..audit.clone()
+            },
+            CommandSequenceAuditContext {
+                step_count: 0,
+                ..audit.clone()
+            },
+            CommandSequenceAuditContext {
+                step_index: 2,
+                ..audit.clone()
+            },
+            CommandSequenceAuditContext {
+                description: " 未修剪".into(),
+                ..audit.clone()
+            },
+        ] {
+            assert_eq!(
+                request(Some(invalid)).validate_business_fields(),
+                Err(SlotError::InvalidCommandSequenceAudit)
+            );
+        }
+        let first = request(Some(audit.clone()));
+        let precondition = SequenceWritePrecondition {
+            cursor: Cursor {
+                epoch: Uuid::new_v4(),
+                after_seq: 41,
+            },
+            expected_generation: 3,
+            expected_tx_offset: 17,
+        };
+        let mut guarded = request(Some(audit.clone()));
+        if let SlotRequest::Write {
+            sequence_precondition,
+            ..
+        } = &mut guarded
+        {
+            *sequence_precondition = Some(precondition.clone());
+        }
+        assert!(guarded.validate_business_fields().is_ok());
+        assert_ne!(first.write_fingerprint(), guarded.write_fingerprint());
+        assert_ne!(first.fingerprint(), guarded.fingerprint());
+
+        let mut missing_audit = request(None);
+        if let SlotRequest::Write {
+            sequence_precondition,
+            ..
+        } = &mut missing_audit
+        {
+            *sequence_precondition = Some(precondition);
+        }
+        assert_eq!(
+            missing_audit.validate_business_fields(),
+            Err(SlotError::InvalidSequenceWritePrecondition)
+        );
+
+        let different_sequence = request(Some(CommandSequenceAuditContext {
+            sequence_id: Uuid::new_v4(),
+            ..audit
+        }));
+        assert_ne!(
+            first.write_fingerprint(),
+            different_sequence.write_fingerprint()
+        );
+    }
+
+    fn sequence_boundary_event(
+        epoch: Uuid,
+        seq: u64,
+        kind: EventKind,
+        direction: Direction,
+        data: &[u8],
+        actor: Option<Actor>,
+    ) -> TimelineEvent {
+        TimelineEvent {
+            slot_id: "bench".into(),
+            daemon_epoch: epoch,
+            seq,
+            generation: 3,
+            wall_time_ns: seq as i64,
+            monotonic_time_ns: seq,
+            kind,
+            direction,
+            actor,
+            run_id: None,
+            operation_id: None,
+            stream_offset_start: Some(0),
+            stream_offset_end: Some(data.len() as u64),
+            data: data.to_vec(),
+            metadata: BTreeMap::new(),
+            durable: true,
+        }
+    }
+
+    #[test]
+    fn sequence_boundary_allows_pure_rx_but_rejects_gap_or_eviction() {
+        let epoch = Uuid::new_v4();
+        let precondition = SequenceWritePrecondition {
+            cursor: Cursor {
+                epoch,
+                after_seq: 0,
+            },
+            expected_generation: 3,
+            expected_tx_offset: 11,
+        };
+        let mut rx_ring = EventRing::new(8, 64 * 1024);
+        rx_ring.push(sequence_boundary_event(
+            epoch,
+            1,
+            EventKind::Rx,
+            Direction::Rx,
+            b"late output",
+            None,
+        ));
+        assert!(
+            validate_sequence_write_precondition(&precondition, epoch, 3, 11, 1, &rx_ring).is_ok(),
+            "RX after the cursor is permitted and cannot itself interleave TX"
+        );
+
+        let mut gap_ring = EventRing::new(8, 64 * 1024);
+        gap_ring.push(sequence_boundary_event(
+            epoch,
+            1,
+            EventKind::Gap,
+            Direction::Rx,
+            &[],
+            None,
+        ));
+        assert!(matches!(
+            validate_sequence_write_precondition(&precondition, epoch, 3, 11, 1, &gap_ring),
+            Err(SlotError::SequenceBoundaryChanged { .. })
+        ));
+
+        let mut evicted_ring = EventRing::new(1, 64 * 1024);
+        evicted_ring.push(sequence_boundary_event(
+            epoch,
+            1,
+            EventKind::Rx,
+            Direction::Rx,
+            b"old",
+            None,
+        ));
+        evicted_ring.push(sequence_boundary_event(
+            epoch,
+            2,
+            EventKind::Rx,
+            Direction::Rx,
+            b"new",
+            None,
+        ));
+        assert!(matches!(
+            validate_sequence_write_precondition(&precondition, epoch, 3, 11, 2, &evicted_ring),
+            Err(SlotError::SequenceBoundaryChanged { .. })
+        ));
+
+        assert!(matches!(
+            validate_sequence_write_precondition(&precondition, epoch, 4, 11, 1, &rx_ring),
+            Err(SlotError::SequenceBoundaryChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn foreign_or_cooperative_tx_rejects_next_step_before_zero_byte_enqueue() {
+        let epoch = Uuid::new_v4();
+        let precondition = SequenceWritePrecondition {
+            cursor: Cursor {
+                epoch,
+                after_seq: 0,
+            },
+            expected_generation: 3,
+            expected_tx_offset: 11,
+        };
+        let human = Actor {
+            id: "human:operator".into(),
+            label: "operator".into(),
+            kind: ActorKind::Human,
+        };
+        let mut ring = EventRing::new(8, 64 * 1024);
+        let mut cooperative = sequence_boundary_event(
+            epoch,
+            1,
+            EventKind::Tx,
+            Direction::Tx,
+            b"status\r",
+            Some(human),
+        );
+        cooperative
+            .metadata
+            .insert("cooperative".into(), json!(true));
+        ring.push(cooperative);
+
+        let mut physical_write = Vec::new();
+        let authorized =
+            validate_sequence_write_precondition(&precondition, epoch, 3, 18, 1, &ring);
+        if authorized.is_ok() {
+            physical_write.extend_from_slice(b"password\r");
+        }
+        let error = authorized.unwrap_err();
+        assert!(matches!(&error, SlotError::SequenceBoundaryChanged { .. }));
+        assert!(error.to_string().contains("no bytes were written"));
+        assert!(
+            physical_write.is_empty(),
+            "the next step must enqueue 0 bytes"
+        );
+
+        // The event replay check independently rejects a TX even if an
+        // inconsistent caller claims that the offset did not move.
+        assert!(matches!(
+            validate_sequence_write_precondition(&precondition, epoch, 3, 11, 1, &ring),
+            Err(SlotError::SequenceBoundaryChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn confirmed_tx_metadata_retains_command_and_sequence_descriptions() {
+        let described = write_event_metadata(false, false, Some("查看样机内存".into()), None);
         assert_eq!(described["command_description"], json!("查看样机内存"));
         assert_eq!(described["partial"], json!(false));
         assert_eq!(described["cooperative"], json!(false));
 
-        let legacy = write_event_metadata(true, false, None);
+        let legacy = write_event_metadata(true, false, None, None);
         assert!(!legacy.contains_key("command_description"));
         assert_eq!(legacy["partial"], json!(true));
+
+        let sequence_id = Uuid::new_v4();
+        let grouped = write_event_metadata(
+            false,
+            false,
+            Some("输入账号".into()),
+            Some(CommandSequenceAuditContext {
+                sequence_id,
+                description: "登录样机".into(),
+                step_index: 0,
+                step_count: 2,
+            }),
+        );
+        assert_eq!(grouped["command_description"], json!("输入账号"));
+        assert_eq!(grouped["command_sequence_id"], json!(sequence_id));
+        assert_eq!(grouped["command_sequence_description"], json!("登录样机"));
+        assert_eq!(grouped["command_sequence_step_index"], json!(0));
+        assert_eq!(grouped["command_sequence_step_count"], json!(2));
     }
 
     #[test]
@@ -6349,6 +6781,8 @@ mod tests {
             expected_run_id,
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         assert_ne!(
@@ -6442,6 +6876,8 @@ mod tests {
             expected_run_id: Some(run.id),
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: true,
         };
         assert!(
@@ -6496,6 +6932,8 @@ mod tests {
             expected_run_id: Some(expected_run_id),
             pacing: None,
             description: None,
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: true,
         };
 
@@ -6526,6 +6964,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: Some("重启样机".into()),
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
         let reconnected = SlotRequest::Write {
@@ -6541,6 +6981,8 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: Some("重启样机".into()),
+            command_sequence: None,
+            sequence_precondition: None,
             cooperative: false,
         };
 

@@ -44,8 +44,8 @@ directory. It never falls back to a different executable on `PATH`.
 When an OpenCode configuration explicitly lists permissions, allow the
 read-only tools (`devices`, `read`, `wait`, `search`, `monitor_list`,
 `monitor_status`, and `monitor_incidents`) and require confirmation for
-write/state-changing tools, including `input`, `signal`, `monitor_start`, and
-`monitor_stop`.
+write/state-changing tools, including `command_sequence`, `input`, `signal`,
+`monitor_start`, and `monitor_stop`.
 OpenCode prefixes names as `serial_devices`, `serial_command`, and so on.
 Codex exposes them under the configured `serial` MCP server.
 
@@ -62,6 +62,7 @@ or closing the stdio MCP process does not stop them.
 | `devices` | — | `slot_id` | Authoritative Slot, Profile, state, ownership, Run, Trigger, and cursor head |
 | `read` | `slot_id` | `scope=tail|continue|archive`, archive `epoch`/`after_seq` | Bounded retained text and continuation cursor |
 | `command` | `slot_id`, `run_id`, `run_token`, `command`, `description` | one of `expect`/`regex`, `timeout_seconds` | Append effective EOL, write in the owned Run, capture post-TX RX, and retain its purpose |
+| `command_sequence` | `slot_id`, `run_id`, `run_token`, `description`, `steps` (1..8); each step has `command`/`description`, and every non-final step has `expect` or `regex` | Final-step matcher; per-step `timeout_seconds` | Execute a known dependent interaction in order; a failed step prevents all later writes |
 | `input` | `slot_id`, `run_id`, `run_token`, `text` | — | Exact UTF-8 bytes with no EOL |
 | `signal` | `slot_id`, `run_id`, `run_token`, `signal` | Break-only `duration_ms` | Ctrl-C/D/Z byte or physical serial Break |
 | `trigger` | `slot_id`, `run_id`, `run_token`, `action` | `kickoff`, `start_contains`, `stop_contains`, interval/timeout/fire bounds | One bounded daemon-side low-latency reaction |
@@ -132,9 +133,11 @@ for audit and later queries.
 2. Call `run_start`, then retain its returned `run_id` and private `run_token`
    in this LLM session. A Run scopes evidence only; initialize the DUT state
    explicitly. Never adopt an active Run from `devices`.
-3. Use `command` for ordinary shell/bootloader commands. Use `input` or
-   `signal` only when exact raw input is required. Use `trigger` for a bounded
-   timing-critical reaction that must run beside the serial actor.
+3. Use `command` for an ordinary shell/bootloader command. Use
+   `command_sequence` when the next known command depends on an explicit RX
+   boundary from the previous one, such as username then password. Use `input`
+   or `signal` only when exact raw input is required. Use `trigger` for a
+   bounded timing-critical reaction that must run beside the serial actor.
 4. Use `wait`, `read`, or `search` for additional evidence. `wait` also needs
    the pair and pins the Run throughout its complete call.
 5. Call `run_end` with the pair. `release` is optional/idempotent cleanup;
@@ -207,6 +210,24 @@ Rendered text is ANSI-cleaned, bounded, and folds only adjacent byte-identical
 lines. A differing timestamp or payload keeps a row distinct. Folding saves
 context but never changes cursor, gap, or durable event semantics.
 
+`command_sequence` reuses that capture contract for 1–8 commands whose order
+depends on device output. Every non-final step requires exactly one explicit
+`expect` or `regex`; only a matching boundary permits the next write. The final
+step may instead use the ordinary configured-prompt/quiet fallback. Each step
+has its own required description, the sequence has a required overall purpose,
+and each step has an optional 1..120-second timeout (10 seconds by default);
+effective timeouts may total at most 300 seconds. A step including effective
+EOL is at most 4096 bytes, and the complete planned write is at most 32768 bytes.
+
+The adapter validates the complete plan before writing, holds the Slot's
+serialized mutation path for the whole sequence, and stops before every
+remaining command when a step fails, times out, disconnects, loses evidence,
+or loses Run/Control. It does not branch, loop, or retry. Every confirmed or
+partially confirmed step remains an independent plaintext TX audit event with
+its description and exact command bytes. The result's `sequence_id` groups
+those steps beneath the overall purpose, and the terminal command-history bar
+can expand the individual bytes exactly as it does for `command`.
+
 ## Read, wait, search, cursor, and epoch
 
 An epoch is the UUID for one `seriald` process lifetime. Restarting the daemon
@@ -215,9 +236,9 @@ sequence number.
 
 - `read` defaults to a recent tail. `scope=continue` resumes the adapter's
   process-local cursor; `scope=archive` requires an explicit epoch.
-- `wait` begins at the cursor remembered by `run_start`, `command`, or the
-  previous `wait`, avoiding a loss window between calls. If no compatible
-  cursor exists it begins at the current head.
+- `wait` begins at the cursor remembered by `run_start`, `command`,
+  `command_sequence`, or the previous `wait`, avoiding a loss window between
+  calls. If no compatible cursor exists it begins at the current head.
 - `search` defaults to `current_run`, so an old boot/test match cannot be
   mistaken for current evidence. `current_cursor` or `archive` must be
   explicit; archive requires an epoch.
@@ -298,8 +319,8 @@ reserved for MCP frames; diagnostics go to stderr. Independent requests run
 concurrently and completed frames are serialized through one writer.
 `notifications/cancelled`/`$/cancelRequest` cancel only pure observations:
 `devices`, `read`, `wait`, `search`, `monitor_list`, `monitor_status`, and
-`monitor_incidents`. A command, input, signal, Trigger, Monitor mutation, Run
-transition, or release may already have crossed a side-effect boundary, so it
+`monitor_incidents`. A command, command sequence, input, signal, Trigger,
+Monitor mutation, Run transition, or release may already have crossed a side-effect boundary, so it
 is allowed to reach an authoritative result rather than hiding the outcome and
 encouraging an unsafe retry. Per-Slot write serialization prevents physical
 byte interleaving.

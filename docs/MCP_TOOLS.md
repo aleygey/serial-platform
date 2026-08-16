@@ -23,13 +23,15 @@ require an active Run owned by this MCP process.
 `run_token`. The token exists only in `serial-mcp` memory and in that one tool
 result; it is never copied into Run metadata, timeline events, `devices`, or
 daemon status. The initiating LLM session must retain the pair and pass it to
-every Run-scoped call: `command`, `input`, `signal`, `trigger`, `wait`, and
-`run_end`. An aborting `release` also requires the pair while that Run remains
-active. A caller must never discover an active `run_id` through `devices` or
-`search` and adopt it: the matching private token is deliberately unavailable.
+every Run-scoped call: `command`, `command_sequence`, `input`, `signal`,
+`trigger`, `wait`, and `run_end`. An aborting `release` also requires the pair
+while that Run remains active. A caller must never discover an active `run_id`
+through `devices` or `search` and adopt it: the matching private token is
+deliberately unavailable.
 
 An authorized Run-scoped call pins its Run for that call's complete lifetime,
-including a `wait` or capture lasting up to 120 seconds. After the last pin is
+including a `wait`/command capture lasting up to 120 seconds or a validated
+command sequence whose capture deadlines total up to 300 seconds. After the last pin is
 dropped, the adapter permits five minutes of inactivity. At the next 20-second
 renewal tick it actively releases control, which aborts an abandoned active Run;
 if that best-effort release cannot reach `seriald`, the separately renewed,
@@ -46,10 +48,11 @@ JSON-RPC errors instead.
 
 The adapter accepts multiple outstanding `tools/call` requests, but serial
 mutations for one Slot are serialized. Independent Slots can progress
-concurrently. `command` intentionally accepts one command: an ordered batch
-would need separate descriptions, completion boundaries, timeouts,
-idempotency identities, stop-on-error policy, and partial results for every
-item rather than hiding those outcomes inside one ambiguous call.
+concurrently. `command` remains the ordinary one-command primitive.
+`command_sequence` is the bounded alternative for a known dependent exchange,
+such as waiting for `Password:` after a username before sending a password. It
+defines a purpose, completion boundary, timeout, and result for each ordered
+step and always stops before the first step whose predecessor did not complete.
 
 Before connecting to or operating a DUT, an Agent must confirm that the model
 assigned to the Slot matches the physical device. A saved model name is an
@@ -57,7 +60,7 @@ assignment, not evidence. Valid confirmation sources include serial evidence,
 telnet, the device Web UI, and a human. A Run scopes evidence; it does not reset
 or initialize the device.
 
-The server currently exposes 18 tools:
+The server currently exposes 19 tools:
 
 | Tool | External mutation | Cancellable | Purpose |
 |---|---:|---:|---|
@@ -66,6 +69,7 @@ The server currently exposes 18 tools:
 | `device_model_set` | Yes | No | Assign/create a confirmed model, or guarded-update the Slot's current model node |
 | `read` | No | Yes | Read a bounded live or archived serial window |
 | `command` | Yes | No | Write a line and capture its bounded RX result |
+| `command_sequence` | Yes | No | Execute 1–8 matcher-gated dependent commands in order |
 | `input` | Yes | No | Write exact UTF-8 bytes without adding EOL |
 | `signal` | Yes | No | Send Ctrl-C/D/Z or physical serial BREAK |
 | `trigger` | Yes | No | Run a bounded daemon-side repeated-write matcher |
@@ -86,11 +90,12 @@ JSON-RPC error `-32800`. Mutation-capable calls deliberately ignore
 cancellation once dispatched, and stdin shutdown waits for them to converge so
 an unknown side-effect outcome is not hidden. In `tools/list`, only those eight
 tools have `readOnlyHint=true` and `idempotentHint=true`. The physical-write
-tools (`command`, `input`, `signal`, and `trigger`), model-binding mutation, and
-`monitor_stop` declare `destructiveHint=true`. Tools that observe or affect the
-physical DUT (`devices`, `read`, `command`, `input`, `signal`, `trigger`, `wait`,
-and `search`) declare `openWorldHint=true`; catalog and daemon-local bookkeeping
-tools keep it false.
+tools (`command`, `command_sequence`, `input`, `signal`, and `trigger`),
+model-binding mutation, and `monitor_stop` declare `destructiveHint=true`.
+Tools that observe or affect the
+physical DUT (`devices`, `read`, `command`, `command_sequence`, `input`,
+`signal`, `trigger`, `wait`, and `search`) declare `openWorldHint=true`; catalog
+and daemon-local bookkeeping tools keep it false.
 
 ## Tool definitions
 
@@ -271,6 +276,124 @@ the exact confirmed serial bytes in `data`; partial writes retain the
 description together with `partial=true`. Pre-write failures produce no command
 history entry. Legacy writes without a description remain valid at the wire
 level and simply omit this metadata.
+
+### `command_sequence`
+
+Executes one known, dependent serial interaction inside a single MCP call. It
+is intended for exchanges where the Agent already knows the next input but
+must wait for device evidence before sending it—for example, username →
+`Password:` → password → shell prompt. It is not a parallel command facility,
+does not branch or loop, and never retries a step automatically.
+
+Input:
+
+| Field | Required | Type / bound | Meaning |
+|---|---:|---|---|
+| `slot_id` | Yes | string | Online Slot |
+| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
+| `run_token` | Yes | UUID | Matching private Run capability |
+| `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | Human-readable purpose of the complete dependent interaction |
+| `steps` | Yes | array of 1..8 strict step objects | Commands executed in array order; unknown step fields are rejected |
+
+Each step is:
+
+| Field | Required | Type / bound | Meaning |
+|---|---:|---|---|
+| `command` | Yes | string, max 4096 schema characters | Command text; empty sends only effective EOL; command plus EOL is bounded to 4096 UTF-8 bytes |
+| `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | This step's human-readable purpose in Run/TX history |
+| `expect` | Every non-final step needs one matcher | string, 1..4096 schema characters and UTF-8 bytes | Literal boundary that must be observed before the next step may write |
+| `regex` | Every non-final step needs one matcher | string, 1..4096 schema characters and UTF-8 bytes | Non-empty-stream regex boundary; mutually exclusive with `expect` |
+| `timeout_seconds` | No | integer 1..120, default 10 | This step's capture deadline |
+
+All steps are validated before the first write. Their effective EOL-inclusive
+writes must total no more than 32768 bytes, and the sum of their effective
+timeouts must not exceed 300 seconds. Every non-final step must supply exactly
+one of `expect` or `regex`; the final step may omit both and then uses the same
+configured-prompt/quiet fallback as `command`. An explicit matcher remains the
+sole completion boundary for its step.
+
+For example:
+
+```json
+{
+  "slot_id": "slot-1",
+  "run_id": "00000000-0000-0000-0000-000000000001",
+  "run_token": "00000000-0000-0000-0000-000000000002",
+  "description": "登录样机管理终端",
+  "steps": [
+    {
+      "command": "admin",
+      "description": "输入登录账号",
+      "expect": "Password:",
+      "timeout_seconds": 10
+    },
+    {
+      "command": "example-password",
+      "description": "输入登录密码",
+      "regex": "[#$>]\\s*$",
+      "timeout_seconds": 10
+    }
+  ]
+}
+```
+
+The adapter holds its process-local Slot mutation path across the sequence.
+Additionally, every step carries a daemon-enforced precondition derived from
+the initial Slot snapshot or preceding capture cursor. The seriald Slot actor
+atomically checks the epoch, generation, TX offset, and replay window before
+the write enters the physical port queue. Pure RX is allowed; any intervening
+TX, explicit Gap, or evicted replay window rejects that step with zero bytes
+written. This closes the cross-client/cooperative Human race that a local MCP
+lock cannot cover. A current adapter refuses the sequence before step 1 if the
+daemon does not advertise this capability. Timeout, disconnect, evidence gap,
+Run/Control loss, Human takeover, write uncertainty, or any other failed step
+stops the sequence before every remaining write. A reported match is still
+completion evidence rather than proof of higher-level command success.
+
+The result is:
+
+| Field | Meaning |
+|---|---|
+| `slot_id`, `run_id` | Authoritative Slot and Run |
+| `sequence_id` | UUID grouping this interaction's TX events and terminal history |
+| `description` | Overall sequence purpose supplied by the caller |
+| `status` | `completed` when every step completed safely; otherwise `partial` |
+| `execution` | Always `unknown`; serial boundaries do not prove application success |
+| `requested_steps` | Validated plan length |
+| `sent_steps` | Steps whose TX was accepted far enough to produce a step result |
+| `completed_steps` | Leading steps that completed without a stop condition |
+| `steps` | Ordered results for sent steps |
+| `failure` | Present only for `partial`; `{step_index,phase,code,message,next_step_sent:false}` |
+| `cursor` | Cursor from the last sent step, or the pre-write Slot head when none was sent |
+
+Each entry in `steps` contains the ordinary `command` result plus
+`sequence_id`, zero-based `step_index`, `step_count`, `status`, and
+`safe_to_advance`. `safe_to_advance=true` occurs only on a completed non-final
+step whose matcher made its following write eligible; the final step therefore
+reports it as false even when the sequence completed. A capture-level stop
+includes that sent step with `status=partial`. A daemon boundary rejection is
+always a structured top-level `partial`, even before step 1, with
+`code=sequence_boundary_changed` and `next_step_sent=false`. Other first-step
+failures before a step result use the ordinary MCP error envelope. If a later
+non-boundary failure occurs before TX/capture can yield a result, prior steps
+are returned with top-level `status=partial` and failure `code=step_error`.
+
+Capture stop codes are `timeout`, `disconnected`, `rx_gap`,
+`capture_truncated`, `interfered`, `echo_uncertain`, `no_rx`,
+`boundary_not_matched`, and `run_aborted`. `failure.phase` is `capture` for
+those outcomes; a lower-level later-step failure reports its originating phase
+such as `attach` or `write` with `code=step_error`. A write-phase atomic guard
+failure uses `sequence_boundary_changed`. In every failure form,
+`next_step_sent=false` is the explicit stop-before-next-write guarantee.
+
+Every confirmed or partially confirmed step is a normal independent TX audit
+event with its own Operation UUID and `command_description`. Its exact command
+bytes are persisted in plaintext in the existing TX timeline, just like
+`command`. Sequence audit metadata carries the `sequence_id`, overall purpose,
+zero-based step index, and step count as `command_sequence_id`,
+`command_sequence_description`, `command_sequence_step_index`, and
+`command_sequence_step_count`, allowing the terminal command-history bar to
+group the sequence and expand each step.
 
 ### `input`
 
@@ -588,9 +711,9 @@ write or Trigger from crossing a reopened physical serial session.
 ## Human takeover and control-loss diagnostics
 
 A Human takeover authoritatively aborts the Agent Run, emits `RunAborted` with
-reason `human takeover`, and revokes fenced control. `command` and `wait`
-subscribe to the current Run and stop promptly on that timeline event rather
-than waiting for their ordinary boundary/timeout. Write-like tools also
+reason `human takeover`, and revokes fenced control. `command`,
+`command_sequence`, and `wait` subscribe to the current Run and stop promptly
+on that timeline event rather than waiting for their ordinary boundary/timeout. Write-like tools also
 diagnose renewal/write rejection by querying the Run and following
 `ControlRevoked` event when available.
 

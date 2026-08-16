@@ -22,7 +22,8 @@ use crate::tools::AgentTools;
 
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes, keep its private run_token within the initiating LLM session, and pass its run_id/run_token to every Run-scoped tool. Never adopt an active Run from devices/status. Runs scope evidence only. Run-scoped calls pin the Run while active; after the final call returns, five minutes of inactivity releases control and aborts the abandoned Run. Every command requires a concise purpose for durable Run history. command inherits Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. End Runs and stop Monitors when no longer needed.";
+const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes, keep its private run_token within the initiating LLM session, and pass its run_id/run_token to every Run-scoped tool. Never adopt an active Run from devices/status. Runs scope evidence only. Run-scoped calls pin the Run while active; after the final call returns, five minutes of inactivity releases control and aborts the abandoned Run. Every command requires a concise purpose for durable Run history. Use command_sequence for a known, dependent interaction such as username then password; give the sequence an overall purpose and every step its own purpose. Every non-final step needs an explicit expect or regex boundary, and any failed step prevents all later writes. Its command bytes are retained in the same plaintext TX audit as command. command and command_sequence inherit Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. End Runs and stop Monitors when no longer needed.";
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -146,8 +147,8 @@ pub async fn serve(tools: AgentTools) -> Result<()> {
         });
     }
 
-    // Closing stdin cancels only read-only observations. A command, signal,
-    // Run transition, release, or Trigger may already have crossed its
+    // Closing stdin cancels only read-only observations. A command, command
+    // sequence, signal, Run transition, release, or Trigger may have crossed its
     // physical side-effect boundary, so dropping that future could hide the
     // authoritative outcome and invite an unsafe retry. Let those calls
     // converge before the adapter exits.
@@ -322,11 +323,25 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
     // harmless merely because the adapter itself keeps an audit trail.
     let destructive = matches!(
         name,
-        "device_model_set" | "command" | "input" | "signal" | "trigger" | "monitor_stop"
+        "device_model_set"
+            | "command"
+            | "command_sequence"
+            | "input"
+            | "signal"
+            | "trigger"
+            | "monitor_stop"
     );
     let open_world = matches!(
         name,
-        "devices" | "read" | "command" | "input" | "signal" | "trigger" | "wait" | "search"
+        "devices"
+            | "read"
+            | "command"
+            | "command_sequence"
+            | "input"
+            | "signal"
+            | "trigger"
+            | "wait"
+            | "search"
     );
     json!({
         "name": name, "description": description, "inputSchema": input_schema,
@@ -405,6 +420,38 @@ pub fn tool_definitions() -> Vec<Value> {
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
                 &["slot_id", "run_id", "run_token", "command", "description"],
+            ),
+            false,
+        ),
+        tool(
+            "command_sequence",
+            "Run 1-8 dependent commands in order; each non-final step needs a matcher, and failure stops before every later write.",
+            object(
+                json!({
+                    "slot_id":{"type":"string"},
+                    "run_id":{"type":"string","format":"uuid"},
+                    "run_token":{"type":"string","format":"uuid"},
+                    "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose for the complete dependent interaction."},
+                    "steps":{
+                        "type":"array",
+                        "minItems":1,
+                        "maxItems":MAX_COMMAND_SEQUENCE_STEPS,
+                        "description":"Ordered dependent steps. Every non-final step requires expect or regex. Planned writes are limited to 32768 bytes and effective timeouts to 300 seconds.",
+                        "items":{
+                            "type":"object",
+                            "properties":{
+                                "command":{"type":"string","maxLength":4096,"description":"Empty sends Enter; command plus effective EOL is limited to 4096 UTF-8 bytes."},
+                                "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose retained with this step's TX audit."},
+                                "expect":{"type":"string","minLength":1,"maxLength":4096},
+                                "regex":{"type":"string","minLength":1,"maxLength":4096},
+                                "timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"description":"Per-step deadline; defaults to 10 seconds."}
+                            },
+                            "required":["command","description"],
+                            "additionalProperties":false
+                        }
+                    }
+                }),
+                &["slot_id", "run_id", "run_token", "description", "steps"],
             ),
             false,
         ),
@@ -626,6 +673,7 @@ mod tests {
                 "device_model_set",
                 "read",
                 "command",
+                "command_sequence",
                 "input",
                 "signal",
                 "trigger",
@@ -657,6 +705,11 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
         assert!(SERVER_INSTRUCTIONS.contains("five minutes of inactivity"));
         assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
+        assert!(SERVER_INSTRUCTIONS.contains("Use command_sequence"));
+        assert!(SERVER_INSTRUCTIONS.contains("overall purpose"));
+        assert!(SERVER_INSTRUCTIONS.contains("Every non-final step"));
+        assert!(SERVER_INSTRUCTIONS.contains("failed step prevents all later writes"));
+        assert!(SERVER_INSTRUCTIONS.contains("same plaintext TX audit"));
 
         let tools = tool_definitions();
         for name in ["devices", "device_models", "device_model_set", "run_start"] {
@@ -687,6 +740,7 @@ mod tests {
         for name in [
             "device_model_set",
             "command",
+            "command_sequence",
             "input",
             "signal",
             "trigger",
@@ -696,7 +750,15 @@ mod tests {
             assert_eq!(tool["annotations"]["destructiveHint"], true, "{name}");
         }
         for name in [
-            "devices", "read", "command", "input", "signal", "trigger", "wait", "search",
+            "devices",
+            "read",
+            "command",
+            "command_sequence",
+            "input",
+            "signal",
+            "trigger",
+            "wait",
+            "search",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["openWorldHint"], true, "{name}");
@@ -850,6 +912,65 @@ mod tests {
     }
 
     #[test]
+    fn command_sequence_schema_is_bounded_strict_and_step_described() {
+        let sequence = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "command_sequence")
+            .unwrap();
+        let schema = &sequence["inputSchema"];
+        assert_eq!(
+            schema["required"],
+            json!(["slot_id", "run_id", "run_token", "description", "steps"])
+        );
+        assert_eq!(
+            schema["properties"]["description"]["maxLength"],
+            MAX_COMMAND_DESCRIPTION_BYTES
+        );
+        let steps = &schema["properties"]["steps"];
+        assert_eq!(steps["minItems"], 1);
+        assert_eq!(steps["maxItems"], MAX_COMMAND_SEQUENCE_STEPS);
+        let steps_description = steps["description"].as_str().unwrap();
+        for constraint in ["non-final", "32768", "300"] {
+            assert!(steps_description.contains(constraint));
+        }
+        let item = &steps["items"];
+        assert_eq!(item["additionalProperties"], false);
+        assert_eq!(item["required"], json!(["command", "description"]));
+        let mut fields: Vec<_> = item["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "command",
+                "description",
+                "expect",
+                "regex",
+                "timeout_seconds"
+            ]
+        );
+        assert_eq!(item["properties"]["command"]["maxLength"], 4096);
+        assert_eq!(
+            item["properties"]["description"]["maxLength"],
+            MAX_COMMAND_DESCRIPTION_BYTES
+        );
+        assert_eq!(item["properties"]["regex"]["maxLength"], 4096);
+        assert_eq!(item["properties"]["expect"]["maxLength"], 4096);
+        assert_eq!(item["properties"]["timeout_seconds"]["minimum"], 1);
+        assert_eq!(item["properties"]["timeout_seconds"]["maximum"], 120);
+        assert!(
+            sequence["description"]
+                .as_str()
+                .unwrap()
+                .contains("failure stops")
+        );
+    }
+
+    #[test]
     fn monitor_schemas_keep_daemon_policy_out_of_agent_arguments() {
         let tools = tool_definitions();
         let start = tools
@@ -954,6 +1075,7 @@ mod tests {
         for name in [
             "device_model_set",
             "command",
+            "command_sequence",
             "input",
             "signal",
             "trigger",
@@ -1038,7 +1160,15 @@ mod tests {
     #[test]
     fn run_scoped_tools_require_private_capabilities_and_release_pairs_them() {
         let tools = tool_definitions();
-        for name in ["command", "input", "signal", "trigger", "wait", "run_end"] {
+        for name in [
+            "command",
+            "command_sequence",
+            "input",
+            "signal",
+            "trigger",
+            "wait",
+            "run_end",
+        ] {
             let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
             let required = schema["required"].as_array().unwrap();
             for field in ["run_id", "run_token"] {
@@ -1063,10 +1193,10 @@ mod tests {
     fn report_tool_definition_json_size() {
         let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
         eprintln!("tool_definition_json_bytes={bytes}");
-        // The six Run-scoped tools intentionally repeat an explicit private
+        // The eight Run-scoped tools intentionally repeat an explicit private
         // capability schema so hosts cannot omit it. Keep that fail-closed
-        // contract while still bounding the complete 18-tool prompt cost.
-        assert!(bytes <= 11_500, "tool definitions grew to {bytes} bytes");
+        // contract while still bounding the complete 19-tool prompt cost.
+        assert!(bytes <= 13_000, "tool definitions grew to {bytes} bytes");
         for tool in tool_definitions() {
             assert!(
                 tool["description"].as_str().unwrap().len() <= 180,

@@ -116,7 +116,7 @@ it.
 | Method and path | Minimum role | Request/query and result |
 |---|---|---|
 | `GET /api/v1/health` | observer | Process status, `server_id`, `daemon_epoch`, uptime, protocol version, and `auth_required`. |
-| `GET /api/v1/status` | observer | All authoritative `SlotSnapshot`s plus identities and `config_revision`. |
+| `GET /api/v1/status` | observer | All authoritative `SlotSnapshot`s plus identities, `config_revision`, and the additive `sequence_write_precondition_supported` capability. |
 | `GET /api/v1/ports` | admin | Enumerates serial ports on the daemon host. |
 | `PUT /api/v1/config/slots` | admin | Body `{slots, expected_revision?}`; full validated Slot replacement and resulting snapshots. |
 | `GET /api/v1/config/transport-profiles` | observer | `{profiles, config_revision}`. |
@@ -292,7 +292,7 @@ Every variant is tagged by `type` and carries `request_id`.
 | `renew_control` | operator | `slot_id`, `control_id`, `fence`, `ttl_ms`. |
 | `release_control` | operator | `slot_id`, `control_id`, `fence`. |
 | `cancel_acquire` | operator | `slot_id`, `control_id`; queued actors have no lease, so the daemon matches the authenticated actor and ignores this compatibility ID. |
-| `write` | operator | `slot_id`, `control_id`, `fence`, base64 `data`, optional `operation_id`, `expected_run_id`, `pacing`, human-readable `description`, and `cooperative=false`. `expected_run_id` is required when cooperative. |
+| `write` | operator | `slot_id`, `control_id`, `fence`, base64 `data`, optional `operation_id`, `expected_run_id`, `pacing`, human-readable `description`, `command_sequence`, `sequence_precondition`, and `cooperative=false`. `expected_run_id` is required when cooperative. |
 | `send_break` | operator | `slot_id`, `control_id`, `fence`, `duration_ms`, optional `operation_id` and `expected_run_id`. |
 | `trigger_start` | operator | `slot_id`, Control ID/fence, `daemon_epoch`, `generation`, optional Operation/expected Run, and `spec`. |
 | `trigger_status` | operator | `slot_id`, epoch, generation, `trigger_id`. |
@@ -316,6 +316,35 @@ non-empty, trimmed, free of control characters, and at most 256 UTF-8 bytes.
 Current serial-mcp `command` calls require it. Empty writes are rejected. One
 physical write is bounded to 4 KiB and a computed maximum 15-second
 physical-write deadline.
+
+`command_sequence` is optional additive audit context for one physical write:
+`{sequence_id, description, step_index, step_count}`. Its `description` is the
+overall sequence purpose; the write's ordinary `description` remains the
+individual step purpose. The sequence UUID must be non-nil, `step_index` is
+zero-based, `step_count` is in `[1,8]`, and `step_index < step_count`. A
+sequence-tagged write must also have a valid per-step write description. This
+context groups confirmed TX only and does not assert that the DUT executed a
+step or completed the sequence.
+
+`sequence_precondition` is an optional additive, daemon-enforced write guard:
+`{cursor:{epoch,after_seq}, expected_generation, expected_tx_offset}`. It is
+valid only alongside `command_sequence`. serial-mcp sends it on every sequence
+step, including the first step using the initial status snapshot. Inside the
+Slot actor, after lease/Run authorization and immediately before the write is
+put in the physical port queue, seriald atomically verifies the daemon epoch,
+serial generation, and TX offset. It also replays the timeline strictly after
+the cursor and rejects an evicted replay window, an explicit `gap` event, or
+any additional TX. Ordinary RX and non-TX control events are allowed and the
+post-write command matcher still ignores replayed pre-write RX. A rejected
+guard returns `sequence_boundary_changed`, is a definite zero-byte outcome,
+creates no TX event, and causes MCP `command_sequence` to return `partial` with
+`failure.next_step_sent=false`. The precondition participates in both
+request-id fingerprints.
+
+The HTTP status capability defaults to false when omitted by an older daemon.
+A current serial-mcp refuses `command_sequence` before step 1 unless
+`sequence_write_precondition_supported=true`; ordinary `command`, Human, and
+legacy writes omit the precondition and retain their previous behavior.
 
 `send_break.duration_ms` is in `[1,5000]`. BREAK is a UART line condition, not
 a byte; Ctrl-C/D/Z are ordinary `write` payload bytes `03`, `04`, and `1a`.
@@ -362,7 +391,7 @@ The exhaustive stable `ErrorCode` values are:
 
 `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
 `control_required`, `stale_fence`, `port_offline`, `cursor_ahead`,
-`resource_exhausted`, `idempotency_expired`, `config_revision_mismatch`,
+`sequence_boundary_changed`, `resource_exhausted`, `idempotency_expired`, `config_revision_mismatch`,
 `profile_change_busy`, `port_not_found`, `port_busy`, `port_access_denied`,
 `port_io`, `break_unsupported`, `regex_invalid`, `query_budget_exceeded`,
 `unavailable`, and `internal`.
@@ -478,6 +507,11 @@ A described write that confirms at least one serial byte stores its purpose as
 TX event metadata `command_description`. The TX event's existing `run_id`,
 `operation_id`, sequence, timestamp, and `data` fields provide the Run grouping
 and exact confirmed command bytes; `partial=true` marks a confirmed prefix.
+For a sequence-tagged write, the same TX metadata additionally stores
+`command_sequence_id`, `command_sequence_description`,
+`command_sequence_step_index`, and `command_sequence_step_count`. Every sent
+step has its own Operation ID and TX event. A step stopped before any byte is
+written has no TX event; later sequence steps are not synthesized in history.
 This keeps command history queryable through the existing event API without a
 new event kind. A write rejected before any byte reaches the port creates no
 command-history event, and legacy writes without `description` keep their
@@ -577,7 +611,9 @@ EOL, echo, pacing, port lifecycle, or Run state.
 - HTTP remains namespaced `/api/v1`; that route namespace is independent of
   the WebSocket protocol number.
 - Additive optional fields use Serde defaults where implemented, including
-  legacy writes defaulting `description=null` and `cooperative=false`.
+  legacy writes defaulting `description=null`, `command_sequence=null`,
+  `sequence_precondition=null`, and `cooperative=false`; legacy HTTP status
+  defaults `sequence_write_precondition_supported=false`.
 - `0x04` is reserved only; clients must use the `write` control message.
 - Exact schema inspection should use the Rust DTOs for HTTP/WebSocket and
   `tools/list` or `serial mcp --dump-tools` for MCP.

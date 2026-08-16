@@ -8,7 +8,7 @@ readonly ARTIFACT_DIR="${PROJECT_ROOT}/target/artifacts"
 readonly PACKAGE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${PROJECT_ROOT}/Cargo.toml" | head -n 1)"
 readonly GIT_COMMIT="$(git -C "${PROJECT_ROOT}" rev-parse HEAD)"
 readonly SOURCE_DATE_EPOCH="$(git -C "${PROJECT_ROOT}" show -s --format=%ct HEAD)"
-readonly MCP_TOOL_COUNT=18
+readonly MCP_TOOL_COUNT=19
 
 CURRENT_PHASE="startup"
 BUILD_PROFILE="release"
@@ -559,7 +559,7 @@ Commands:
   checksums
            Recreate SHA256SUMS for already-collected archives
   smoke [release|debug]
-           Check native versions and the exact 18-tool MCP registry
+           Check native versions and the exact 19-tool MCP registry
   all      Run every native CI command in order (default)
 EOF
 }
