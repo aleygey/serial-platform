@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use crossterm::{
     cursor::Show,
     event::{
@@ -27,12 +27,13 @@ use ratatui::{
 #[cfg(test)]
 use serial_protocol::WritePacing;
 use serial_protocol::{
-    Actor, ClientMessage, CommandResult, ControlLease, ControlMode, DataBits, DeviceModel,
-    DeviceModelListResponse, DeviceProfile, EchoMode, EventKind, FlowControl, LoggingState,
-    ModelConfirmationMethod, Parity, ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo,
-    RunStatus, ServerMessage, SessionState, SetSlotDeviceModelRequest, SlotModelBinding,
-    SlotSnapshot, StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo,
-    TriggerStatus, WireFrame, apply_transport_profile,
+    Actor, ArchiveSummary, ClientMessage, CommandResult, ControlLease, ControlMode, Cursor,
+    DataBits, DeviceModel, DeviceModelListResponse, DeviceProfile, Direction, EchoMode, EventKind,
+    EventQuery, FlowControl, GapRange, LoggingState, ModelConfirmationMethod, Parity,
+    ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo, RunStatus, ServerMessage,
+    SessionState, SetSlotDeviceModelRequest, SlotModelBinding, SlotSnapshot, StopBits,
+    TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerStatus, WireFrame,
+    apply_transport_profile,
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -40,12 +41,13 @@ use uuid::Uuid;
 
 use crate::{
     api::ApiClient,
-    config::LoadedConfig,
+    config::{DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS, LoadedConfig, MIN_ORPHAN_RUN_TIMEOUT_SECONDS},
     display::{
-        DisplayLine, RunBoundary, TerminalStreamParser, error_code_label, gap_line,
-        gap_reason_label, highlight_spans, pad_display, role_label, safe_inline,
-        trigger_status_label,
+        DisplayLine, RunBoundary, TerminalStreamParser, error_code_label, format_event_plain,
+        format_wall_time_local, gap_line, gap_reason_label, highlight_spans, pad_display,
+        role_label, safe_inline, trigger_status_label,
     },
+    history::{StartupHistory, StartupHistoryTarget, load_startup_histories},
     i18n::{self, tr, trf},
     ws::{self, NetworkCommand, NetworkEvent},
 };
@@ -61,6 +63,8 @@ const CONTROL_TTL_MS: u64 = 30_000;
 const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
 const MOUSE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const SOFTWARE_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
 const MODEL_LABEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUN_HISTORY_PER_SLOT: usize = 20;
@@ -73,6 +77,14 @@ const MAX_AGENT_HISTORY_ROWS: u16 = 20;
 /// its four-row minimum. Short terminals expose the same view as a focused
 /// popup instead of permanently consuming scarce vertical space.
 const RUN_HISTORY_BAR_MIN_TERMINAL_HEIGHT: u16 = 22;
+const OUTPUT_SEARCH_LIMIT_EVENTS: usize = 200;
+const OUTPUT_SEARCH_PAGE_EVENTS: usize = 10_000;
+const OUTPUT_SEARCH_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const OUTPUT_SEARCH_EVENT_WINDOW: u64 = 10_000;
+const OUTPUT_SEARCH_ARCHIVE_LIMIT: usize = 4;
+const OUTPUT_SEARCH_QUERY_BYTES: usize = 4_096;
+const OUTPUT_SEARCH_HTTP_QUERY_LIMIT: usize = 8;
+const OUTPUT_SEARCH_DEADLINE: Duration = Duration::from_secs(10);
 
 type ClipboardCopyFn = fn(&str) -> Result<()>;
 
@@ -80,6 +92,10 @@ fn configured_agent_history_rows(value: Option<u16>) -> u16 {
     value
         .unwrap_or(DEFAULT_AGENT_HISTORY_ROWS)
         .clamp(MIN_AGENT_HISTORY_ROWS, MAX_AGENT_HISTORY_ROWS)
+}
+
+fn configured_orphan_run_timeout_seconds(value: Option<u64>) -> u64 {
+    value.unwrap_or(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS)
 }
 
 fn default_clipboard_copy(text: &str) -> Result<()> {
@@ -130,6 +146,9 @@ struct TextSelection {
     plain_rows: Vec<String>,
     anchor: SelectionPoint,
     head: SelectionPoint,
+    /// A double-click selects the lexical token even when it occupies one
+    /// terminal cell, so completion must not depend on pointer movement.
+    word_selected: bool,
     last_activity: Instant,
 }
 
@@ -143,7 +162,7 @@ impl TextSelection {
     }
 
     fn is_dragged(&self) -> bool {
-        self.anchor != self.head
+        self.word_selected || self.anchor != self.head
     }
 
     fn selected_text(&self) -> String {
@@ -158,6 +177,12 @@ impl TextSelection {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputClick {
+    point: SelectionPoint,
+    at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,7 +478,6 @@ struct RunCommandStep {
     first_seq: u64,
     last_seq: u64,
     data: Vec<u8>,
-    partial: bool,
     truncated: bool,
 }
 
@@ -475,11 +499,6 @@ struct RunCommandKey {
 impl RunCommandStep {
     fn from_event(event: &TimelineEvent) -> Self {
         let mut data = event.data.clone();
-        let partial = event
-            .metadata
-            .get("partial")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let truncated = data.len() > MAX_RUN_COMMAND_BYTES;
         data.truncate(MAX_RUN_COMMAND_BYTES);
         Self {
@@ -492,7 +511,6 @@ impl RunCommandStep {
             first_seq: event.seq,
             last_seq: event.seq,
             data,
-            partial,
             truncated,
         }
     }
@@ -503,11 +521,6 @@ impl RunCommandStep {
         let available = MAX_RUN_COMMAND_BYTES.saturating_sub(self.data.len());
         let append = available.min(event.data.len());
         self.data.extend_from_slice(&event.data[..append]);
-        self.partial |= event
-            .metadata
-            .get("partial")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         self.truncated |= append < event.data.len();
     }
 }
@@ -685,6 +698,112 @@ struct HistorySearch {
     saved_cursor: usize,
     /// Index into `SlotView::history` of the current match.
     match_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSearchMatcher {
+    Literal,
+    Regex,
+}
+
+impl OutputSearchMatcher {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Literal => Self::Regex,
+            Self::Regex => Self::Literal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSearchDirection {
+    Both,
+    Rx,
+    Tx,
+}
+
+impl OutputSearchDirection {
+    fn next(self) -> Self {
+        match self {
+            Self::Both => Self::Rx,
+            Self::Rx => Self::Tx,
+            Self::Tx => Self::Both,
+        }
+    }
+
+    fn query_directions(self) -> &'static [Direction] {
+        match self {
+            Self::Both => &[Direction::Rx, Direction::Tx],
+            Self::Rx => &[Direction::Rx],
+            Self::Tx => &[Direction::Tx],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSearchScope {
+    CurrentEpoch,
+    Retained,
+    CurrentRun,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputSearchRun {
+    id: Uuid,
+    start_seq: u64,
+    through_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSearchPhase {
+    Editing,
+    Loading(Uuid),
+    Results,
+}
+
+#[derive(Debug)]
+struct OutputSearchState {
+    slot_id: String,
+    current_epoch: Uuid,
+    head_seq: u64,
+    current_run: Option<OutputSearchRun>,
+    previous_focus: PaneFocus,
+    query: Vec<char>,
+    cursor: usize,
+    matcher: OutputSearchMatcher,
+    case_sensitive: bool,
+    direction: OutputSearchDirection,
+    scope: OutputSearchScope,
+    phase: OutputSearchPhase,
+    results: Vec<TimelineEvent>,
+    selected: usize,
+    detail_scroll: usize,
+    gaps: Vec<GapRange>,
+    partial: bool,
+    scanned_archives: usize,
+    error: Option<String>,
+}
+
+impl OutputSearchState {
+    fn query_text(&self) -> String {
+        self.query.iter().collect()
+    }
+
+    fn cycle_scope(&mut self) {
+        self.scope = match (self.scope, self.current_run.is_some()) {
+            (OutputSearchScope::CurrentEpoch, _) => OutputSearchScope::Retained,
+            (OutputSearchScope::Retained, true) => OutputSearchScope::CurrentRun,
+            (OutputSearchScope::Retained, false) | (OutputSearchScope::CurrentRun, _) => {
+                OutputSearchScope::CurrentEpoch
+            }
+        };
+    }
+
+    fn begin_editing(&mut self) {
+        self.phase = OutputSearchPhase::Editing;
+        self.error = None;
+        self.cursor = self.cursor.min(self.query.len());
+    }
 }
 
 /// Tab completion state (LINE mode): newest-first deduplicated candidates.
@@ -1182,6 +1301,66 @@ impl SlotView {
         }
     }
 
+    fn seed_startup_history(&mut self, history: StartupHistory, selected: bool) {
+        if history.epoch != self.snapshot.daemon_epoch || history.slot_id != self.snapshot.config.id
+        {
+            return;
+        }
+
+        self.local_history_truncated |= history.limited || history.error.is_some();
+        self.run_history_limited |= history.limited || history.error.is_some();
+        if let Some(error) = history.error.as_deref() {
+            let marker_seq = history
+                .events
+                .first()
+                .map_or(history.head_seq, |event| event.seq)
+                .saturating_sub(1);
+            self.push_line(
+                gap_line(
+                    marker_seq,
+                    trf("history.startup.failed", &[&safe_inline(error)]),
+                ),
+                selected,
+            );
+        }
+
+        let mut gaps = history.gaps.into_iter().peekable();
+        for event in history.events {
+            while gaps.peek().is_some_and(|gap| gap.first_seq <= event.seq) {
+                let gap = gaps.next().expect("gap was just checked");
+                self.push_gap(
+                    gap.last_seq,
+                    trf(
+                        "m.logs.gap",
+                        &[
+                            &gap.first_seq.to_string(),
+                            &gap.last_seq.to_string(),
+                            gap_reason_label(gap.reason),
+                            &gap.epoch.to_string(),
+                        ],
+                    ),
+                    selected,
+                );
+            }
+            self.push_event(event, selected);
+        }
+        for gap in gaps {
+            self.push_gap(
+                gap.last_seq,
+                trf(
+                    "m.logs.gap",
+                    &[
+                        &gap.first_seq.to_string(),
+                        &gap.last_seq.to_string(),
+                        gap_reason_label(gap.reason),
+                        &gap.epoch.to_string(),
+                    ],
+                ),
+                selected,
+            );
+        }
+    }
+
     fn push_gap(&mut self, seq: u64, message: impl Into<String>, selected: bool) {
         self.run_history_limited = true;
         self.reset_stream();
@@ -1286,11 +1465,139 @@ struct QueueSelection {
 struct MenuCatalog {
     auth_required: bool,
     slots: Vec<SlotSnapshot>,
+    config_revision: Option<u64>,
     transport_profiles: Vec<TransportProfile>,
+    transport_revision: Option<u64>,
     device_profiles: Vec<DeviceProfile>,
+    device_revision: Option<u64>,
     models: Vec<DeviceModel>,
     model_bindings: Vec<SlotModelBinding>,
     model_revision: u64,
+}
+
+#[derive(Clone)]
+struct CurrentProfileEditor {
+    original_port: String,
+    port: String,
+    original_transport: Option<TransportProfile>,
+    transport: TransportProfile,
+    original_device: Option<DeviceProfile>,
+    device: DeviceProfile,
+}
+
+impl CurrentProfileEditor {
+    fn new(view: &SlotView, catalog: &MenuCatalog) -> Self {
+        let original_port = view.snapshot.config.port.clone();
+        let port = original_port.clone();
+        let original_transport = catalog
+            .transport_profiles
+            .iter()
+            .find(|profile| profile.name == view.snapshot.config.profile)
+            .cloned();
+        let transport = original_transport
+            .clone()
+            .unwrap_or_else(|| current_transport_template(view, catalog));
+        let original_device = view
+            .snapshot
+            .config
+            .device_profile
+            .as_deref()
+            .and_then(|name| {
+                catalog
+                    .device_profiles
+                    .iter()
+                    .find(|profile| profile.name == name)
+            })
+            .cloned();
+        let device = original_device
+            .clone()
+            .unwrap_or_else(|| current_device_template(view));
+        Self {
+            original_port,
+            port,
+            original_transport,
+            transport,
+            original_device,
+            device,
+        }
+    }
+
+    fn port_update(&self) -> Option<String> {
+        (self.port != self.original_port).then(|| self.port.clone())
+    }
+
+    fn transport_update(&self) -> Option<TransportProfile> {
+        self.original_transport
+            .as_ref()
+            .filter(|original| *original != &self.transport)
+            .map(|_| self.transport.clone())
+    }
+
+    fn device_update(&self) -> Option<DeviceProfile> {
+        self.original_device
+            .as_ref()
+            .filter(|original| *original != &self.device)
+            .map(|_| self.device.clone())
+    }
+
+    fn device_is_bound(&self) -> bool {
+        self.original_device.is_some()
+    }
+}
+
+fn shared_profile_impacts(
+    catalog: &MenuCatalog,
+    transport: Option<&TransportProfile>,
+    device: Option<&DeviceProfile>,
+) -> SharedProfileImpacts {
+    fn matching_slots(
+        catalog: &MenuCatalog,
+        mut matches: impl FnMut(&SlotSnapshot) -> bool,
+    ) -> Vec<(String, String)> {
+        let mut slots = catalog
+            .slots
+            .iter()
+            .filter(|slot| matches(slot))
+            .map(|slot| (slot.config.id.clone(), slot.config.display_name.clone()))
+            .collect::<Vec<_>>();
+        slots.sort_by(|left, right| left.0.cmp(&right.0));
+        slots
+    }
+
+    SharedProfileImpacts {
+        transport: transport.map(|profile| SharedProfileImpact {
+            profile_name: profile.name.clone(),
+            slots: matching_slots(catalog, |slot| slot.config.profile == profile.name),
+        }),
+        device: device.map(|profile| SharedProfileImpact {
+            profile_name: profile.name.clone(),
+            slots: matching_slots(catalog, |slot| {
+                slot.config.device_profile.as_deref() == Some(profile.name.as_str())
+            }),
+        }),
+    }
+}
+
+fn shared_model_affected_slots(catalog: &MenuCatalog, model_id: &str) -> Vec<(String, String)> {
+    let mut slots = catalog
+        .model_bindings
+        .iter()
+        .filter(|binding| binding.model_id == model_id)
+        .map(|binding| {
+            let display_name = catalog
+                .slots
+                .iter()
+                .find(|slot| slot.config.id == binding.slot_id)
+                .map_or_else(
+                    || binding.slot_id.clone(),
+                    |slot| slot.config.display_name.clone(),
+                );
+            (binding.slot_id.clone(), display_name)
+        })
+        .collect::<Vec<_>>();
+    slots.sort_by(|left, right| left.0.cmp(&right.0));
+    slots.dedup_by(|left, right| left.0 == right.0);
+    slots
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1302,6 +1609,8 @@ enum MenuPage {
     Models,
     ModelParents,
     SerialSettings,
+    DisplaySettings,
+    RunSettings,
     Help,
 }
 
@@ -1310,8 +1619,10 @@ struct MenuState {
     selected: usize,
     stack: Vec<(MenuPage, usize)>,
     catalog: Option<MenuCatalog>,
+    profile_editor: Option<CurrentProfileEditor>,
     expanded_models: HashSet<String>,
     prompt: Option<MenuPrompt>,
+    confirmation: Option<MenuConfirmation>,
     help_scroll: usize,
     busy: bool,
     message: String,
@@ -1324,8 +1635,10 @@ impl MenuState {
             selected: 0,
             stack: Vec::new(),
             catalog: None,
+            profile_editor: None,
             expanded_models: HashSet::new(),
             prompt: None,
+            confirmation: None,
             help_scroll: 0,
             busy: false,
             message: tr("menu.loading").into(),
@@ -1350,6 +1663,31 @@ impl MenuState {
     }
 }
 
+struct MenuConfirmation {
+    title: String,
+    lines: Vec<String>,
+    scroll: usize,
+    cancelled_message: String,
+    action: MenuConfirmationAction,
+}
+
+enum MenuConfirmationAction {
+    Admin(MenuAdminMutation),
+    Command(MenuIoCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedProfileImpact {
+    profile_name: String,
+    slots: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedProfileImpacts {
+    transport: Option<SharedProfileImpact>,
+    device: Option<SharedProfileImpact>,
+}
+
 struct MenuPrompt {
     title: String,
     value: Vec<char>,
@@ -1372,6 +1710,25 @@ enum MenuPromptPurpose {
         slot_id: String,
         parent_id: Option<String>,
     },
+    RenameBoundModel {
+        slot_id: String,
+        model_id: String,
+        expected_revision: u64,
+        expected_current: Option<String>,
+    },
+    CurrentProfile(CurrentProfilePromptField),
+    AgentHistoryRows,
+    OrphanRunTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentProfilePromptField {
+    Port,
+    BaudRate,
+    ShellPrompt,
+    UbootPrompt,
+    ChunkSize,
+    ChunkDelay,
 }
 
 enum MenuAdminMutation {
@@ -1391,6 +1748,22 @@ enum MenuAdminMutation {
         slot_id: String,
         profile: DeviceProfile,
     },
+    UpdateCurrentProfiles {
+        slot_id: String,
+        port: Option<String>,
+        transport: Option<TransportProfile>,
+        device: Option<DeviceProfile>,
+        expected_config_revision: Option<u64>,
+        expected_transport_revision: Option<u64>,
+        expected_device_revision: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentProfileRevisions {
+    config: Option<u64>,
+    transport: Option<u64>,
+    device: Option<u64>,
 }
 
 enum MenuIoCommand {
@@ -1417,6 +1790,13 @@ enum MenuIoCommand {
         expected_revision: u64,
         expected_current: Option<String>,
     },
+    RenameBoundModel {
+        slot_id: String,
+        model_id: String,
+        name: String,
+        expected_revision: u64,
+        expected_current: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -1428,6 +1808,11 @@ enum MenuSuccess {
     DeviceCreated(String),
     ModelBound(String),
     ModelCreated(String),
+    ModelRenamed {
+        name: String,
+        affected_slots: Vec<String>,
+    },
+    ProfilesUpdated,
 }
 
 enum MenuIoEvent {
@@ -1485,6 +1870,60 @@ const DEVICE_PRESETS: &[DevicePreset] = &[
     DevicePreset::Eol("\n"),
     DevicePreset::Eol("\r\n"),
 ];
+
+const CURRENT_PROFILE_ROW_COUNT: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentProfileRow {
+    Port,
+    TransportProfile,
+    BaudRate,
+    DataBits,
+    Parity,
+    StopBits,
+    FlowControl,
+    Dtr,
+    Rts,
+    AutoOpen,
+    DeviceProfile,
+    WriteEol,
+    Echo,
+    ShellPrompt,
+    UbootPrompt,
+    ChunkSize,
+    ChunkDelay,
+    ModelBinding,
+    ModelName,
+    Apply,
+}
+
+impl CurrentProfileRow {
+    fn from_index(index: usize) -> Option<Self> {
+        Some(match index {
+            0 => Self::Port,
+            1 => Self::TransportProfile,
+            2 => Self::BaudRate,
+            3 => Self::DataBits,
+            4 => Self::Parity,
+            5 => Self::StopBits,
+            6 => Self::FlowControl,
+            7 => Self::Dtr,
+            8 => Self::Rts,
+            9 => Self::AutoOpen,
+            10 => Self::DeviceProfile,
+            11 => Self::WriteEol,
+            12 => Self::Echo,
+            13 => Self::ShellPrompt,
+            14 => Self::UbootPrompt,
+            15 => Self::ChunkSize,
+            16 => Self::ChunkDelay,
+            17 => Self::ModelBinding,
+            18 => Self::ModelName,
+            19 => Self::Apply,
+            _ => return None,
+        })
+    }
+}
 
 impl DevicePreset {
     fn apply(self, profile: &mut DeviceProfile) {
@@ -1552,6 +1991,57 @@ impl TransportPreset {
             Self::ToggleRts => tr("menu.serial.rts").into(),
             Self::ToggleAutoOpen => tr("menu.serial.auto").into(),
         }
+    }
+}
+
+fn next_data_bits(value: DataBits) -> DataBits {
+    match value {
+        DataBits::Five => DataBits::Six,
+        DataBits::Six => DataBits::Seven,
+        DataBits::Seven => DataBits::Eight,
+        DataBits::Eight => DataBits::Five,
+    }
+}
+
+fn next_parity(value: Parity) -> Parity {
+    match value {
+        Parity::None => Parity::Even,
+        Parity::Even => Parity::Odd,
+        Parity::Odd => Parity::None,
+    }
+}
+
+fn next_stop_bits(value: StopBits) -> StopBits {
+    match value {
+        StopBits::One => StopBits::Two,
+        StopBits::Two => StopBits::One,
+    }
+}
+
+fn next_flow_control(value: FlowControl) -> FlowControl {
+    match value {
+        FlowControl::None => FlowControl::Software,
+        FlowControl::Software => FlowControl::Hardware,
+        FlowControl::Hardware => FlowControl::None,
+    }
+}
+
+fn next_eol(value: Option<&str>) -> Option<String> {
+    match value {
+        None => Some("\r".into()),
+        Some("\r") => Some("\n".into()),
+        Some("\n") => Some("\r\n".into()),
+        Some("\r\n") => Some(String::new()),
+        Some("") | Some(_) => None,
+    }
+}
+
+fn next_echo(value: Option<EchoMode>) -> Option<EchoMode> {
+    match value {
+        None => Some(EchoMode::On),
+        Some(EchoMode::On) => Some(EchoMode::Off),
+        Some(EchoMode::Off) => Some(EchoMode::Auto),
+        Some(EchoMode::Auto) => None,
     }
 }
 
@@ -1704,8 +2194,8 @@ fn valid_menu_name(value: &str) -> bool {
 
 fn menu_item_count(menu: &MenuState) -> usize {
     match menu.page {
-        MenuPage::Root => 4,
-        MenuPage::Profiles => 2,
+        MenuPage::Root => 6,
+        MenuPage::Profiles => CURRENT_PROFILE_ROW_COUNT,
         MenuPage::TransportProfiles => menu
             .catalog
             .as_ref()
@@ -1721,6 +2211,8 @@ fn menu_item_count(menu: &MenuState) -> usize {
             .as_ref()
             .map_or(0, |catalog| all_model_rows(&catalog.models).len()),
         MenuPage::SerialSettings => TRANSPORT_PRESETS.len(),
+        MenuPage::DisplaySettings => 1,
+        MenuPage::RunSettings => 1,
         MenuPage::Help => 0,
     }
 }
@@ -1735,7 +2227,58 @@ fn menu_success_message(success: &MenuSuccess) -> String {
         MenuSuccess::DeviceCreated(name) => trf("menu.device.created", &[name]),
         MenuSuccess::ModelBound(name) => trf("menu.model.bound", &[name]),
         MenuSuccess::ModelCreated(name) => trf("menu.model.created", &[name]),
+        MenuSuccess::ModelRenamed {
+            name,
+            affected_slots,
+        } => trf(
+            "menu.model.renamed",
+            &[
+                name,
+                &affected_slots.len().to_string(),
+                &affected_slots.join(", "),
+            ],
+        ),
+        MenuSuccess::ProfilesUpdated => tr("menu.profile.updated").into(),
     }
+}
+
+#[derive(Debug)]
+struct OutputSearchRequest {
+    request_id: Uuid,
+    slot_id: String,
+    current_epoch: Uuid,
+    head_seq: u64,
+    current_run: Option<OutputSearchRun>,
+    scope: OutputSearchScope,
+    direction: OutputSearchDirection,
+    contains: Option<String>,
+    regex: Option<String>,
+}
+
+#[derive(Debug)]
+enum OutputSearchIoCommand {
+    Query(OutputSearchRequest),
+    Cancel { request_id: Uuid },
+}
+
+#[derive(Debug)]
+struct OutputSearchResponse {
+    events: Vec<TimelineEvent>,
+    gaps: Vec<GapRange>,
+    partial: bool,
+    scanned_archives: usize,
+}
+
+#[derive(Debug)]
+enum OutputSearchIoEvent {
+    Completed {
+        request_id: Uuid,
+        response: OutputSearchResponse,
+    },
+    Failed {
+        request_id: Uuid,
+        message: String,
+    },
 }
 
 struct App {
@@ -1781,11 +2324,14 @@ struct App {
     queue_selection: Option<QueueSelection>,
     menu: Option<MenuState>,
     menu_commands: Option<mpsc::Sender<MenuIoCommand>>,
+    output_search: Option<OutputSearchState>,
+    output_search_commands: Option<mpsc::Sender<OutputSearchIoCommand>>,
     uncertain_write_outcomes: usize,
     human_idle_release: Duration,
     mouse_capture: bool,
     run_panel_visible: bool,
     agent_history_rows: u16,
+    orphan_run_timeout_seconds: u64,
     focus: PaneFocus,
     layout: Option<ConsoleLayout>,
     /// Only the currently active left-button drag keeps a stable visual
@@ -1793,8 +2339,14 @@ struct App {
     /// `selection_copy` so live output resumes immediately.
     selection: Option<TextSelection>,
     selection_copy: Option<String>,
+    last_output_click: Option<OutputClick>,
     clipboard_copy: ClipboardCopyFn,
     config: Option<LoadedConfig>,
+    /// Software cursor timing is independent of serial repaint frequency.
+    /// Input resets the phase to visible; only the 600 ms phase transition
+    /// requests another frame.
+    software_cursor_blink_started: Instant,
+    software_cursor_visible: bool,
     should_quit: bool,
     dirty: bool,
 }
@@ -1836,20 +2388,75 @@ impl App {
             queue_selection: None,
             menu: None,
             menu_commands: None,
+            output_search: None,
+            output_search_commands: None,
             uncertain_write_outcomes: 0,
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
             mouse_capture: true,
             run_panel_visible: true,
             agent_history_rows: DEFAULT_AGENT_HISTORY_ROWS,
+            orphan_run_timeout_seconds: DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS,
             focus: PaneFocus::Input,
             layout: None,
             selection: None,
             selection_copy: None,
+            last_output_click: None,
             clipboard_copy: default_clipboard_copy,
             config: None,
+            software_cursor_blink_started: Instant::now(),
+            software_cursor_visible: true,
             should_quit: false,
             dirty: true,
         }
+    }
+
+    fn software_cursor_active(&self) -> bool {
+        if let Some(menu) = self.menu.as_ref() {
+            return menu.confirmation.is_none() && menu.prompt.is_some();
+        }
+        if let Some(search) = self.output_search.as_ref() {
+            return search.phase == OutputSearchPhase::Editing;
+        }
+        !self.help
+            && self.queue_selection.is_none()
+            && self.focus == PaneFocus::Input
+            && self.current_mode() == InputMode::Line
+            && self.current().history_search.is_none()
+            && !(self.current().draft.is_empty() && self.current().active_agent_run().is_some())
+    }
+
+    fn reset_software_cursor_blink(&mut self, now: Instant) {
+        self.software_cursor_blink_started = now;
+        self.software_cursor_visible = true;
+        self.dirty = true;
+    }
+
+    fn update_software_cursor_blink(&mut self, now: Instant) -> bool {
+        if !self.software_cursor_active() {
+            self.software_cursor_blink_started = now;
+            let changed = !self.software_cursor_visible;
+            self.software_cursor_visible = true;
+            return changed;
+        }
+        let elapsed = now
+            .checked_duration_since(self.software_cursor_blink_started)
+            .unwrap_or_default();
+        let interval = SOFTWARE_CURSOR_BLINK_INTERVAL.as_millis().max(1);
+        let visible = (elapsed.as_millis() / interval).is_multiple_of(2);
+        let changed = visible != self.software_cursor_visible;
+        self.software_cursor_visible = visible;
+        changed
+    }
+
+    fn apply_startup_history(&mut self, history: StartupHistory) -> Option<(String, Cursor)> {
+        let resume = history
+            .resume_cursor
+            .clone()
+            .map(|cursor| (history.slot_id.clone(), cursor));
+        let index = self.slot_index(&history.slot_id)?;
+        let selected = index == self.selected;
+        self.slots[index].seed_startup_history(history, selected);
+        resume
     }
 
     fn current(&self) -> &SlotView {
@@ -1869,6 +2476,275 @@ impl App {
             .get(&self.current().snapshot.config.id)
             .cloned()
             .unwrap_or_else(|| tr("ui.output.model.unconfigured").into())
+    }
+
+    fn open_output_search(&mut self) {
+        let view = self.current();
+        let current_run = view.active_agent_run().map(|run| OutputSearchRun {
+            id: run.id,
+            start_seq: run.start_seq,
+            through_seq: view.snapshot.head_seq,
+        });
+        self.output_search = Some(OutputSearchState {
+            slot_id: view.snapshot.config.id.clone(),
+            current_epoch: view.snapshot.daemon_epoch,
+            head_seq: view.snapshot.head_seq,
+            current_run,
+            previous_focus: self.focus,
+            query: Vec::new(),
+            cursor: 0,
+            matcher: OutputSearchMatcher::Literal,
+            case_sensitive: false,
+            direction: OutputSearchDirection::Both,
+            scope: OutputSearchScope::CurrentEpoch,
+            phase: OutputSearchPhase::Editing,
+            results: Vec::new(),
+            selected: 0,
+            detail_scroll: 0,
+            gaps: Vec::new(),
+            partial: false,
+            scanned_archives: 0,
+            error: None,
+        });
+        self.status = tr("st.output.search.open").into();
+    }
+
+    fn submit_output_search(&mut self, search: &mut OutputSearchState) {
+        let query = search.query_text();
+        if query.is_empty() {
+            search.error = Some(tr("ui.output.search.empty").into());
+            return;
+        }
+        let Some(view) = self
+            .slots
+            .iter()
+            .find(|view| view.snapshot.config.id == search.slot_id)
+        else {
+            search.error = Some(tr("ui.output.search.slot.missing").into());
+            return;
+        };
+        // The popup may remain open while live Snapshot/events continue to
+        // advance. Bind every actual query (including retry) to the latest
+        // authoritative Slot view, never to the state captured when `/` was
+        // first pressed.
+        search.current_epoch = view.snapshot.daemon_epoch;
+        search.head_seq = view.snapshot.head_seq;
+        search.current_run = view.active_agent_run().map(|run| OutputSearchRun {
+            id: run.id,
+            start_seq: run.start_seq,
+            through_seq: view.snapshot.head_seq,
+        });
+        let (contains, regex) = output_search_filter(&query, search.matcher, search.case_sensitive);
+        if contains
+            .as_ref()
+            .or(regex.as_ref())
+            .is_some_and(|filter| filter.len() > OUTPUT_SEARCH_QUERY_BYTES)
+        {
+            search.error = Some(trf(
+                "ui.output.search.too.long",
+                &[&OUTPUT_SEARCH_QUERY_BYTES.to_string()],
+            ));
+            return;
+        }
+        if search.scope == OutputSearchScope::CurrentRun && search.current_run.is_none() {
+            search.error = Some(tr("ui.output.search.no.run").into());
+            return;
+        }
+        let Some(commands) = self.output_search_commands.as_ref() else {
+            search.error = Some(tr("ui.output.search.unavailable").into());
+            return;
+        };
+        let request_id = Uuid::new_v4();
+        let request = OutputSearchRequest {
+            request_id,
+            slot_id: search.slot_id.clone(),
+            current_epoch: search.current_epoch,
+            head_seq: search.head_seq,
+            current_run: search.current_run,
+            scope: search.scope,
+            direction: search.direction,
+            contains,
+            regex,
+        };
+        match commands.try_send(OutputSearchIoCommand::Query(request)) {
+            Ok(()) => {
+                search.phase = OutputSearchPhase::Loading(request_id);
+                search.error = None;
+            }
+            Err(_) => search.error = Some(tr("ui.output.search.busy").into()),
+        }
+    }
+
+    fn handle_output_search_key(&mut self, key: KeyEvent) {
+        let Some(mut search) = self.output_search.take() else {
+            return;
+        };
+        let mut keep_open = true;
+        match search.phase {
+            OutputSearchPhase::Editing => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Enter => self.submit_output_search(&mut search),
+                KeyCode::F(2) | KeyCode::Tab => {
+                    search.matcher = search.matcher.toggled();
+                    search.error = None;
+                }
+                KeyCode::F(3) => {
+                    search.case_sensitive = !search.case_sensitive;
+                    search.error = None;
+                }
+                KeyCode::F(4) => {
+                    search.direction = search.direction.next();
+                    search.error = None;
+                }
+                KeyCode::F(5) => {
+                    search.cycle_scope();
+                    search.error = None;
+                }
+                KeyCode::Left => search.cursor = search.cursor.saturating_sub(1),
+                KeyCode::Right => search.cursor = (search.cursor + 1).min(search.query.len()),
+                KeyCode::Home => search.cursor = 0,
+                KeyCode::End => search.cursor = search.query.len(),
+                KeyCode::Backspace => {
+                    if search.cursor > 0 {
+                        search.cursor -= 1;
+                        search.query.remove(search.cursor);
+                    }
+                    search.error = None;
+                }
+                KeyCode::Delete => {
+                    if search.cursor < search.query.len() {
+                        search.query.remove(search.cursor);
+                    }
+                    search.error = None;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    keep_open = false;
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !character.is_control() =>
+                {
+                    let mut candidate = search.query.clone();
+                    candidate.insert(search.cursor, character);
+                    if candidate.iter().collect::<String>().len() <= OUTPUT_SEARCH_QUERY_BYTES {
+                        search.query = candidate;
+                        search.cursor += 1;
+                        search.error = None;
+                    }
+                }
+                _ => {}
+            },
+            OutputSearchPhase::Loading(_) => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    keep_open = false
+                }
+                _ => {}
+            },
+            OutputSearchPhase::Results => match key.code {
+                KeyCode::Esc => keep_open = false,
+                KeyCode::Char('/') | KeyCode::Char('e' | 'E') => search.begin_editing(),
+                KeyCode::Char('r' | 'R') => self.submit_output_search(&mut search),
+                KeyCode::F(2) | KeyCode::Tab => {
+                    search.matcher = search.matcher.toggled();
+                    search.begin_editing();
+                }
+                KeyCode::F(3) => {
+                    search.case_sensitive = !search.case_sensitive;
+                    search.begin_editing();
+                }
+                KeyCode::F(4) => {
+                    search.direction = search.direction.next();
+                    search.begin_editing();
+                }
+                KeyCode::F(5) => {
+                    search.cycle_scope();
+                    search.begin_editing();
+                }
+                KeyCode::Up | KeyCode::Char('N') => {
+                    search.selected = search.selected.saturating_sub(1);
+                    search.detail_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('n') => {
+                    search.selected =
+                        (search.selected + 1).min(search.results.len().saturating_sub(1));
+                    search.detail_scroll = 0;
+                }
+                KeyCode::PageUp => search.detail_scroll = search.detail_scroll.saturating_sub(5),
+                KeyCode::PageDown => search.detail_scroll = search.detail_scroll.saturating_add(5),
+                KeyCode::Home => {
+                    search.selected = 0;
+                    search.detail_scroll = 0;
+                }
+                KeyCode::End => {
+                    search.selected = search.results.len().saturating_sub(1);
+                    search.detail_scroll = 0;
+                }
+                _ => {}
+            },
+        }
+        if keep_open {
+            self.output_search = Some(search);
+        } else {
+            if let OutputSearchPhase::Loading(request_id) = search.phase
+                && let Some(commands) = self.output_search_commands.as_ref()
+            {
+                let _ = commands.try_send(OutputSearchIoCommand::Cancel { request_id });
+            }
+            self.focus = search.previous_focus;
+            self.status = tr("st.output.search.closed").into();
+        }
+    }
+
+    fn handle_output_search_paste(&mut self, value: String) {
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        if search.phase != OutputSearchPhase::Editing {
+            return;
+        }
+        for character in value.chars().filter(|character| !character.is_control()) {
+            let mut candidate = search.query.clone();
+            candidate.insert(search.cursor, character);
+            if candidate.iter().collect::<String>().len() > OUTPUT_SEARCH_QUERY_BYTES {
+                break;
+            }
+            search.query = candidate;
+            search.cursor += 1;
+        }
+        search.error = None;
+    }
+
+    fn handle_output_search_io_event(&mut self, event: OutputSearchIoEvent) {
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        match event {
+            OutputSearchIoEvent::Completed {
+                request_id,
+                response,
+            } if search.phase == OutputSearchPhase::Loading(request_id) => {
+                search.results = response.events;
+                search.gaps = response.gaps;
+                search.partial = response.partial;
+                search.scanned_archives = response.scanned_archives;
+                search.selected = 0;
+                search.detail_scroll = 0;
+                search.error = None;
+                search.phase = OutputSearchPhase::Results;
+            }
+            OutputSearchIoEvent::Failed {
+                request_id,
+                message,
+            } if search.phase == OutputSearchPhase::Loading(request_id) => {
+                search.phase = OutputSearchPhase::Editing;
+                search.error = Some(trf("ui.output.search.failed", &[&safe_inline(&message)]));
+            }
+            _ => return,
+        }
+        self.dirty = true;
     }
 
     fn update_device_model_names(&mut self, models: &[DeviceModel], bindings: &[SlotModelBinding]) {
@@ -3099,18 +3975,25 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right if count > 0 => {
                 let selected_key = self.current().selected_run_command_key();
-                let view = self.current_mut();
-                // Expanding is an explicit operator selection. Pin it instead
-                // of retaining the `None == follow newest` sentinel, otherwise
-                // a newly arriving Agent command can move selection away and
-                // make the next wheel event collapse this detail.
-                view.selected_run_command = selected_key;
-                if view.expanded_run_command == selected_key && key.code == KeyCode::Enter {
-                    view.expanded_run_command = None;
-                } else {
-                    view.expanded_run_command = selected_key;
+                let expanded = {
+                    let view = self.current_mut();
+                    // Expanding is an explicit operator selection. Pin it
+                    // instead of retaining the `None == follow newest`
+                    // sentinel, otherwise a newly arriving Agent command can
+                    // move selection away from the operator.
+                    view.selected_run_command = selected_key;
+                    if view.expanded_run_command == selected_key && key.code == KeyCode::Enter {
+                        view.expanded_run_command = None;
+                        false
+                    } else {
+                        view.expanded_run_command = selected_key;
+                        true
+                    }
+                };
+                self.current_mut().run_detail_scroll = 0;
+                if expanded && let Some(key) = selected_key {
+                    self.jump_output_to_run_command(key);
                 }
-                view.run_detail_scroll = 0;
             }
             KeyCode::Left if count > 0 => {
                 self.current_mut().expanded_run_command = None;
@@ -3169,6 +4052,55 @@ impl App {
         let maximum = self.max_run_detail_scroll();
         let scroll = self.current().run_detail_scroll.min(maximum);
         self.current_mut().run_detail_scroll = scroll;
+    }
+
+    fn jump_output_to_run_command(&mut self, key: RunCommandKey) -> bool {
+        let target = self
+            .current()
+            .run_history
+            .iter()
+            .find(|run| run.id == key.run_id)
+            .and_then(|run| {
+                run.commands
+                    .iter()
+                    .find(|command| command.first_seq == key.first_seq)
+            })
+            .map(|command| {
+                (
+                    command.steps.iter().find_map(|step| step.operation_id),
+                    command.first_seq,
+                )
+            });
+        let Some((operation_id, sequence)) = target else {
+            return false;
+        };
+        let Some(inner) = self.layout.map(|layout| layout.output_inner) else {
+            return false;
+        };
+        let rows = all_output_visual_rows(self, inner.width);
+        let target_index = operation_id
+            .and_then(|operation_id| {
+                rows.iter()
+                    .position(|row| row.operation_id == Some(operation_id))
+            })
+            .or_else(|| rows.iter().position(|row| row.seq >= sequence));
+        let Some(target_index) = target_index else {
+            self.status = trf("st.run.jump.missing", &[&sequence.to_string()]);
+            return false;
+        };
+        let height = usize::from(inner.height).max(1);
+        let start = target_index.saturating_sub(height / 3);
+        let end = start.saturating_add(height).min(rows.len());
+        let scroll_from_bottom = rows.len().saturating_sub(end);
+        let snapshot = ScrollSnapshot {
+            rows: rows.into_iter().map(|row| row.line).collect(),
+        };
+        let view = self.current_mut();
+        view.scroll_snapshot = Some(snapshot);
+        view.scroll_from_bottom = scroll_from_bottom;
+        view.unseen = 0;
+        self.status = trf("st.run.jump", &[&sequence.to_string()]);
+        true
     }
 
     fn has_queued_control(&self, slot_id: &str) -> bool {
@@ -3448,11 +4380,15 @@ impl App {
     fn handle_terminal_event(&mut self, event: Event, commands: &mpsc::Sender<NetworkCommand>) {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                self.reset_software_cursor_blink(Instant::now());
                 self.handle_key(key, commands)
             }
             Event::Paste(value) => {
+                self.reset_software_cursor_blink(Instant::now());
                 self.clear_text_selection();
-                if self.menu.is_some() {
+                if self.output_search.is_some() {
+                    self.handle_output_search_paste(value);
+                } else if self.menu.is_some() {
                     self.handle_menu_paste(value);
                 } else {
                     self.handle_paste(value, commands);
@@ -3478,6 +4414,11 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         self.clear_text_selection();
+        if self.output_search.is_some() {
+            self.handle_output_search_key(key);
+            self.dirty = true;
+            return;
+        }
         if self.menu.is_some() {
             self.handle_menu_key(key);
             self.dirty = true;
@@ -3604,10 +4545,12 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                self.last_output_click = None;
                 self.clear_text_selection();
                 self.scroll_up(3);
             }
             MouseEventKind::ScrollDown => {
+                self.last_output_click = None;
                 self.clear_text_selection();
                 self.scroll_down(3);
             }
@@ -3633,12 +4576,15 @@ impl App {
         };
         let position = Position::new(mouse.column, mouse.row);
         if rect_contains(layout.input_area, position) {
+            self.reset_software_cursor_blink(Instant::now());
+            self.last_output_click = None;
             self.queue_selection = None;
             self.focus = PaneFocus::Input;
             self.clear_text_selection();
             return;
         }
         if !rect_contains(layout.output_area, position) {
+            self.last_output_click = None;
             return;
         }
         self.focus = PaneFocus::Output;
@@ -3650,14 +4596,29 @@ impl App {
         let Some(point) = selection_point(layout.output_inner, position, rows.len()) else {
             return;
         };
-        let plain_rows = rows.iter().map(line_plain_text).collect();
+        let plain_rows = rows.iter().map(line_plain_text).collect::<Vec<_>>();
+        let now = Instant::now();
+        let double_click = self.last_output_click.is_some_and(|previous| {
+            output_clicks_form_double_click(previous, point, &plain_rows, now)
+        });
+        self.last_output_click = (!double_click).then_some(OutputClick { point, at: now });
+        let (anchor, head, word_selected) = if double_click {
+            word_selection_points(&plain_rows, point)
+                .map_or((point, point, false), |(anchor, head)| (anchor, head, true))
+        } else {
+            (point, point, false)
+        };
         self.selection = Some(TextSelection {
             rows,
             plain_rows,
-            anchor: point,
-            head: point,
-            last_activity: Instant::now(),
+            anchor,
+            head,
+            word_selected,
+            last_activity: now,
         });
+        if word_selected {
+            self.complete_mouse_selection();
+        }
     }
 
     fn update_mouse_selection(&mut self, mouse: MouseEvent) {
@@ -3670,6 +4631,9 @@ impl App {
         {
             selection.head = point;
             selection.last_activity = Instant::now();
+            if selection.anchor != point {
+                self.last_output_click = None;
+            }
         }
     }
 
@@ -3723,6 +4687,7 @@ impl App {
     }
 
     fn handle_right_click(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        self.last_output_click = None;
         let Some(layout) = self.layout else {
             return;
         };
@@ -3797,7 +4762,7 @@ impl App {
             KeyCode::Char('u' | 'U') => self.open_queue_selection(),
             KeyCode::Char('p' | 'P') => self.confirm_paste(commands),
             KeyCode::Char('/') => {
-                self.status = tr("st.logs.hint").into();
+                self.open_output_search();
             }
             KeyCode::Char('?') => {
                 self.help = true;
@@ -4153,6 +5118,11 @@ impl App {
         let Some(mut menu) = self.menu.take() else {
             return;
         };
+        if let Some(confirmation) = menu.confirmation.take() {
+            self.handle_menu_confirmation_key(&mut menu, confirmation, key);
+            self.menu = Some(menu);
+            return;
+        }
         if let Some(prompt) = menu.prompt.take() {
             self.handle_menu_prompt_key(&mut menu, prompt, key);
             self.menu = Some(menu);
@@ -4206,6 +5176,54 @@ impl App {
         }
     }
 
+    fn handle_menu_confirmation_key(
+        &mut self,
+        menu: &mut MenuState,
+        mut confirmation: MenuConfirmation,
+        key: KeyEvent,
+    ) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                menu.message = confirmation.cancelled_message;
+            }
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => match confirmation.action {
+                MenuConfirmationAction::Admin(mutation) => {
+                    self.begin_admin_prompt(menu, mutation);
+                }
+                MenuConfirmationAction::Command(command) => {
+                    self.submit_menu_command(menu, command);
+                }
+            },
+            KeyCode::Up => {
+                confirmation.scroll = confirmation.scroll.saturating_sub(1);
+                menu.confirmation = Some(confirmation);
+            }
+            KeyCode::Down => {
+                confirmation.scroll =
+                    (confirmation.scroll + 1).min(confirmation.lines.len().saturating_sub(1));
+                menu.confirmation = Some(confirmation);
+            }
+            KeyCode::PageUp => {
+                confirmation.scroll = confirmation.scroll.saturating_sub(8);
+                menu.confirmation = Some(confirmation);
+            }
+            KeyCode::PageDown => {
+                confirmation.scroll =
+                    (confirmation.scroll + 8).min(confirmation.lines.len().saturating_sub(1));
+                menu.confirmation = Some(confirmation);
+            }
+            KeyCode::Home => {
+                confirmation.scroll = 0;
+                menu.confirmation = Some(confirmation);
+            }
+            KeyCode::End => {
+                confirmation.scroll = confirmation.lines.len().saturating_sub(1);
+                menu.confirmation = Some(confirmation);
+            }
+            _ => menu.confirmation = Some(confirmation),
+        }
+    }
+
     fn handle_menu_prompt_key(
         &mut self,
         menu: &mut MenuState,
@@ -4245,6 +5263,101 @@ impl App {
             }
             KeyCode::Enter => {
                 let value = prompt.value.iter().collect::<String>();
+                if matches!(&prompt.purpose, MenuPromptPurpose::AgentHistoryRows) {
+                    let parsed = value.trim().parse::<u16>().ok().filter(|rows| {
+                        (MIN_AGENT_HISTORY_ROWS..=MAX_AGENT_HISTORY_ROWS).contains(rows)
+                    });
+                    let Some(rows) = parsed else {
+                        menu.message = trf(
+                            "menu.display.history.invalid",
+                            &[
+                                &MIN_AGENT_HISTORY_ROWS.to_string(),
+                                &MAX_AGENT_HISTORY_ROWS.to_string(),
+                            ],
+                        );
+                        menu.prompt = Some(prompt);
+                        return;
+                    };
+                    self.save_agent_history_rows(menu, rows);
+                    return;
+                }
+                if matches!(&prompt.purpose, MenuPromptPurpose::OrphanRunTimeout) {
+                    let parsed = value.trim().parse::<u64>().ok().filter(|seconds| {
+                        *seconds == 0 || *seconds >= MIN_ORPHAN_RUN_TIMEOUT_SECONDS
+                    });
+                    let Some(seconds) = parsed else {
+                        menu.message = trf(
+                            "menu.run.timeout.invalid",
+                            &[&MIN_ORPHAN_RUN_TIMEOUT_SECONDS.to_string()],
+                        );
+                        menu.prompt = Some(prompt);
+                        return;
+                    };
+                    self.save_orphan_run_timeout(menu, seconds);
+                    return;
+                }
+                if let MenuPromptPurpose::CurrentProfile(field) = &prompt.purpose {
+                    let Some(editor) = menu.profile_editor.as_mut() else {
+                        menu.message = tr("menu.catalog.unavailable").into();
+                        return;
+                    };
+                    let valid = match field {
+                        CurrentProfilePromptField::Port => valid_menu_name(&value)
+                            .then(|| editor.port = value.clone())
+                            .is_some(),
+                        CurrentProfilePromptField::BaudRate => value
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .map(|value| editor.transport.baud_rate = value)
+                            .is_some(),
+                        CurrentProfilePromptField::ShellPrompt => {
+                            editor.device.shell_prompt =
+                                (!value.is_empty()).then_some(value.clone());
+                            true
+                        }
+                        CurrentProfilePromptField::UbootPrompt => {
+                            editor.device.uboot_prompt =
+                                (!value.is_empty()).then_some(value.clone());
+                            true
+                        }
+                        CurrentProfilePromptField::ChunkSize => {
+                            if value.trim().is_empty() {
+                                editor.device.write_chunk_size = None;
+                                true
+                            } else {
+                                value
+                                    .trim()
+                                    .parse::<u32>()
+                                    .ok()
+                                    .filter(|value| *value > 0)
+                                    .map(|value| editor.device.write_chunk_size = Some(value))
+                                    .is_some()
+                            }
+                        }
+                        CurrentProfilePromptField::ChunkDelay => {
+                            if value.trim().is_empty() {
+                                editor.device.write_chunk_delay_ms = None;
+                                true
+                            } else {
+                                value
+                                    .trim()
+                                    .parse::<u64>()
+                                    .ok()
+                                    .map(|value| editor.device.write_chunk_delay_ms = Some(value))
+                                    .is_some()
+                            }
+                        }
+                    };
+                    if valid {
+                        menu.message = tr("menu.current.modified").into();
+                        return;
+                    }
+                    menu.message = tr("menu.current.value.invalid").into();
+                    menu.prompt = Some(prompt);
+                    return;
+                }
                 if prompt.secret {
                     if value.trim().is_empty() {
                         menu.message = tr("menu.admin.required").into();
@@ -4311,6 +5424,45 @@ impl App {
                                 expected_current,
                             },
                         );
+                    }
+                    MenuPromptPurpose::RenameBoundModel {
+                        slot_id,
+                        model_id,
+                        expected_revision,
+                        expected_current,
+                    } => {
+                        let Some((model_name, affected_slots)) =
+                            menu.catalog.as_ref().and_then(|catalog| {
+                                let model =
+                                    catalog.models.iter().find(|model| model.id == model_id)?;
+                                Some((
+                                    model.name.clone(),
+                                    shared_model_affected_slots(catalog, &model_id),
+                                ))
+                            })
+                        else {
+                            menu.message = tr("menu.catalog.unavailable").into();
+                            return;
+                        };
+                        let command = MenuIoCommand::RenameBoundModel {
+                            slot_id,
+                            model_id: model_id.clone(),
+                            name: value,
+                            expected_revision,
+                            expected_current,
+                        };
+                        self.begin_shared_model_confirmation(
+                            menu,
+                            &model_id,
+                            &model_name,
+                            affected_slots,
+                            command,
+                        );
+                    }
+                    MenuPromptPurpose::CurrentProfile(_)
+                    | MenuPromptPurpose::AgentHistoryRows
+                    | MenuPromptPurpose::OrphanRunTimeout => {
+                        unreachable!("special configuration prompt handled before name validation")
                     }
                 }
                 return;
@@ -4418,24 +5570,409 @@ impl App {
         });
     }
 
+    fn begin_orphan_run_timeout_prompt(&self, menu: &mut MenuState) {
+        let value = self.orphan_run_timeout_seconds.to_string();
+        menu.prompt = Some(MenuPrompt {
+            title: trf(
+                "menu.run.timeout.prompt",
+                &[&MIN_ORPHAN_RUN_TIMEOUT_SECONDS.to_string()],
+            ),
+            cursor: value.len(),
+            value: value.chars().collect(),
+            secret: false,
+            purpose: MenuPromptPurpose::OrphanRunTimeout,
+        });
+    }
+
+    fn save_orphan_run_timeout(&mut self, menu: &mut MenuState, seconds: u64) {
+        self.orphan_run_timeout_seconds = seconds;
+        let label = orphan_run_timeout_label(seconds);
+        if let Some(loaded) = &mut self.config {
+            loaded.config.orphan_run_timeout_seconds = Some(self.orphan_run_timeout_seconds);
+            match loaded.save() {
+                Ok(()) => menu.message = trf("menu.run.timeout.saved", &[&label]),
+                Err(error) => {
+                    menu.message = trf(
+                        "menu.run.timeout.save.failed",
+                        &[&safe_inline(&error.to_string())],
+                    );
+                }
+            }
+        } else {
+            menu.message = trf("menu.run.timeout.saved.session", &[&label]);
+        }
+        self.status = menu.message.clone();
+    }
+
+    fn save_agent_history_rows(&mut self, menu: &mut MenuState, rows: u16) {
+        self.agent_history_rows = configured_agent_history_rows(Some(rows));
+        let rows = self.agent_history_rows.to_string();
+        if let Some(loaded) = &mut self.config {
+            loaded.config.agent_history_rows = Some(self.agent_history_rows);
+            match loaded.save() {
+                Ok(()) => menu.message = trf("menu.display.saved", &[&rows]),
+                Err(error) => {
+                    menu.message = trf(
+                        "menu.display.save.failed",
+                        &[&safe_inline(&error.to_string())],
+                    );
+                }
+            }
+        } else {
+            menu.message = trf("menu.display.saved.session", &[&rows]);
+        }
+        self.status = menu.message.clone();
+    }
+
+    fn refresh_current_profile_editor(&self, menu: &mut MenuState) {
+        menu.profile_editor = menu
+            .catalog
+            .as_ref()
+            .map(|catalog| CurrentProfileEditor::new(self.current(), catalog));
+    }
+
+    fn begin_current_profile_prompt(
+        menu: &mut MenuState,
+        field: CurrentProfilePromptField,
+        title: &'static str,
+        value: String,
+    ) {
+        let value = value.chars().collect::<Vec<_>>();
+        menu.prompt = Some(MenuPrompt {
+            title: title.into(),
+            cursor: value.len(),
+            value,
+            secret: false,
+            purpose: MenuPromptPurpose::CurrentProfile(field),
+        });
+    }
+
+    fn profile_editable(menu: &mut MenuState, transport: bool) -> bool {
+        let editable = menu.profile_editor.as_ref().is_some_and(|editor| {
+            if transport {
+                editor.original_transport.is_some()
+            } else {
+                editor.device_is_bound()
+            }
+        });
+        if !editable {
+            menu.message = if transport {
+                tr("menu.current.transport.missing").into()
+            } else {
+                tr("menu.current.device.unbound").into()
+            };
+        }
+        editable
+    }
+
+    fn activate_current_profile_row(&mut self, menu: &mut MenuState) {
+        let Some(row) = CurrentProfileRow::from_index(menu.selected) else {
+            return;
+        };
+        if menu.profile_editor.is_none() {
+            self.refresh_current_profile_editor(menu);
+        }
+        match row {
+            CurrentProfileRow::Port => {
+                let value = menu
+                    .profile_editor
+                    .as_ref()
+                    .expect("checked editor")
+                    .port
+                    .clone();
+                Self::begin_current_profile_prompt(
+                    menu,
+                    CurrentProfilePromptField::Port,
+                    tr("menu.current.prompt.port"),
+                    value,
+                );
+            }
+            CurrentProfileRow::TransportProfile => menu.push(MenuPage::TransportProfiles),
+            CurrentProfileRow::BaudRate => {
+                if !Self::profile_editable(menu, true) {
+                    return;
+                }
+                let value = menu
+                    .profile_editor
+                    .as_ref()
+                    .expect("checked editor")
+                    .transport
+                    .baud_rate
+                    .to_string();
+                Self::begin_current_profile_prompt(
+                    menu,
+                    CurrentProfilePromptField::BaudRate,
+                    tr("menu.current.prompt.baud"),
+                    value,
+                );
+            }
+            CurrentProfileRow::DataBits
+            | CurrentProfileRow::Parity
+            | CurrentProfileRow::StopBits
+            | CurrentProfileRow::FlowControl
+            | CurrentProfileRow::Dtr
+            | CurrentProfileRow::Rts
+            | CurrentProfileRow::AutoOpen => {
+                if !Self::profile_editable(menu, true) {
+                    return;
+                }
+                let transport = &mut menu
+                    .profile_editor
+                    .as_mut()
+                    .expect("checked editor")
+                    .transport;
+                match row {
+                    CurrentProfileRow::DataBits => {
+                        transport.data_bits = next_data_bits(transport.data_bits)
+                    }
+                    CurrentProfileRow::Parity => transport.parity = next_parity(transport.parity),
+                    CurrentProfileRow::StopBits => {
+                        transport.stop_bits = next_stop_bits(transport.stop_bits)
+                    }
+                    CurrentProfileRow::FlowControl => {
+                        transport.flow_control = next_flow_control(transport.flow_control)
+                    }
+                    CurrentProfileRow::Dtr => transport.dtr = !transport.dtr,
+                    CurrentProfileRow::Rts => transport.rts = !transport.rts,
+                    CurrentProfileRow::AutoOpen => transport.auto_open = !transport.auto_open,
+                    _ => unreachable!("grouped transport editor row"),
+                }
+                menu.message = tr("menu.current.modified").into();
+            }
+            CurrentProfileRow::DeviceProfile => menu.push(MenuPage::DeviceProfiles),
+            CurrentProfileRow::WriteEol | CurrentProfileRow::Echo => {
+                if !Self::profile_editable(menu, false) {
+                    return;
+                }
+                let device = &mut menu.profile_editor.as_mut().expect("checked editor").device;
+                match row {
+                    CurrentProfileRow::WriteEol => {
+                        device.write_eol = next_eol(device.write_eol.as_deref())
+                    }
+                    CurrentProfileRow::Echo => device.echo = next_echo(device.echo),
+                    _ => unreachable!("grouped device editor row"),
+                }
+                menu.message = tr("menu.current.modified").into();
+            }
+            CurrentProfileRow::ShellPrompt
+            | CurrentProfileRow::UbootPrompt
+            | CurrentProfileRow::ChunkSize
+            | CurrentProfileRow::ChunkDelay => {
+                if !Self::profile_editable(menu, false) {
+                    return;
+                }
+                let editor = menu.profile_editor.as_ref().expect("checked editor");
+                let (field, title, value) = match row {
+                    CurrentProfileRow::ShellPrompt => (
+                        CurrentProfilePromptField::ShellPrompt,
+                        tr("menu.current.prompt.shell"),
+                        editor.device.shell_prompt.clone().unwrap_or_default(),
+                    ),
+                    CurrentProfileRow::UbootPrompt => (
+                        CurrentProfilePromptField::UbootPrompt,
+                        tr("menu.current.prompt.uboot"),
+                        editor.device.uboot_prompt.clone().unwrap_or_default(),
+                    ),
+                    CurrentProfileRow::ChunkSize => (
+                        CurrentProfilePromptField::ChunkSize,
+                        tr("menu.current.prompt.chunk"),
+                        editor
+                            .device
+                            .write_chunk_size
+                            .map_or_else(String::new, |value| value.to_string()),
+                    ),
+                    CurrentProfileRow::ChunkDelay => (
+                        CurrentProfilePromptField::ChunkDelay,
+                        tr("menu.current.prompt.delay"),
+                        editor
+                            .device
+                            .write_chunk_delay_ms
+                            .map_or_else(String::new, |value| value.to_string()),
+                    ),
+                    _ => unreachable!("grouped device prompt row"),
+                };
+                Self::begin_current_profile_prompt(menu, field, title, value);
+            }
+            CurrentProfileRow::ModelBinding => menu.push(MenuPage::Models),
+            CurrentProfileRow::ModelName => self.begin_bound_model_rename(menu),
+            CurrentProfileRow::Apply => self.submit_current_profile_updates(menu),
+        }
+    }
+
+    fn begin_bound_model_rename(&self, menu: &mut MenuState) {
+        let slot_id = self.selected_slot_id();
+        let Some((binding, model)) = menu.catalog.as_ref().and_then(|catalog| {
+            let binding = slot_model_binding(catalog, &slot_id)?;
+            let model = catalog
+                .models
+                .iter()
+                .find(|model| model.id == binding.model_id)?;
+            Some((binding.clone(), model.clone()))
+        }) else {
+            menu.message = tr("menu.current.model.unbound").into();
+            return;
+        };
+        let value = model.name.chars().collect::<Vec<_>>();
+        menu.prompt = Some(MenuPrompt {
+            title: tr("menu.current.prompt.model.name").into(),
+            cursor: value.len(),
+            value,
+            secret: false,
+            purpose: MenuPromptPurpose::RenameBoundModel {
+                slot_id,
+                model_id: model.id,
+                expected_revision: menu
+                    .catalog
+                    .as_ref()
+                    .expect("catalog used above")
+                    .model_revision,
+                expected_current: Some(binding.model_id),
+            },
+        });
+    }
+
+    fn begin_shared_profile_confirmation(
+        &self,
+        menu: &mut MenuState,
+        impacts: SharedProfileImpacts,
+        mutation: MenuAdminMutation,
+    ) {
+        let mut lines = vec![tr("menu.profile.shared.warning").into()];
+        if let Some(impact) = impacts.transport {
+            lines.push(trf(
+                "menu.profile.shared.transport",
+                &[
+                    &safe_inline(&impact.profile_name),
+                    &impact.slots.len().to_string(),
+                ],
+            ));
+            lines.extend(impact.slots.into_iter().map(|(slot_id, display_name)| {
+                trf(
+                    "menu.profile.shared.slot",
+                    &[&safe_inline(&slot_id), &safe_inline(&display_name)],
+                )
+            }));
+        }
+        if let Some(impact) = impacts.device {
+            lines.push(trf(
+                "menu.profile.shared.device",
+                &[
+                    &safe_inline(&impact.profile_name),
+                    &impact.slots.len().to_string(),
+                ],
+            ));
+            lines.extend(impact.slots.into_iter().map(|(slot_id, display_name)| {
+                trf(
+                    "menu.profile.shared.slot",
+                    &[&safe_inline(&slot_id), &safe_inline(&display_name)],
+                )
+            }));
+        }
+        lines.push(tr("menu.profile.shared.revision").into());
+        menu.confirmation = Some(MenuConfirmation {
+            title: tr("menu.profile.shared.title").into(),
+            lines,
+            scroll: 0,
+            cancelled_message: tr("menu.profile.shared.cancelled").into(),
+            action: MenuConfirmationAction::Admin(mutation),
+        });
+        menu.message = tr("menu.profile.shared.pending").into();
+    }
+
+    fn begin_shared_model_confirmation(
+        &self,
+        menu: &mut MenuState,
+        model_id: &str,
+        model_name: &str,
+        affected_slots: Vec<(String, String)>,
+        command: MenuIoCommand,
+    ) {
+        let mut lines = vec![tr("menu.model.shared.warning").into()];
+        lines.push(trf(
+            "menu.model.shared.impact",
+            &[
+                &safe_inline(model_name),
+                &safe_inline(model_id),
+                &affected_slots.len().to_string(),
+            ],
+        ));
+        lines.extend(affected_slots.into_iter().map(|(slot_id, display_name)| {
+            trf(
+                "menu.profile.shared.slot",
+                &[&safe_inline(&slot_id), &safe_inline(&display_name)],
+            )
+        }));
+        lines.push(tr("menu.model.shared.revision").into());
+        menu.confirmation = Some(MenuConfirmation {
+            title: tr("menu.model.shared.title").into(),
+            lines,
+            scroll: 0,
+            cancelled_message: tr("menu.model.shared.cancelled").into(),
+            action: MenuConfirmationAction::Command(command),
+        });
+        menu.message = tr("menu.model.shared.pending").into();
+    }
+
+    fn submit_current_profile_updates(&mut self, menu: &mut MenuState) {
+        let Some(editor) = menu.profile_editor.as_ref() else {
+            menu.message = tr("menu.catalog.unavailable").into();
+            return;
+        };
+        let port = editor.port_update();
+        let transport = editor.transport_update();
+        let device = editor.device_update();
+        if port.is_none() && transport.is_none() && device.is_none() {
+            menu.message = tr("menu.current.no.changes").into();
+            return;
+        }
+        let Some(catalog) = menu.catalog.as_ref() else {
+            menu.message = tr("menu.catalog.unavailable").into();
+            return;
+        };
+        let impacts = shared_profile_impacts(catalog, transport.as_ref(), device.as_ref());
+        let has_shared_profile_update = transport.is_some() || device.is_some();
+        let mutation = MenuAdminMutation::UpdateCurrentProfiles {
+            slot_id: self.selected_slot_id(),
+            port,
+            transport,
+            device,
+            expected_config_revision: catalog.config_revision,
+            expected_transport_revision: catalog.transport_revision,
+            expected_device_revision: catalog.device_revision,
+        };
+        if has_shared_profile_update {
+            self.begin_shared_profile_confirmation(menu, impacts, mutation);
+        } else {
+            self.begin_admin_prompt(menu, mutation);
+        }
+    }
+
     fn activate_menu_item(&mut self, menu: &mut MenuState) {
-        if menu.busy && menu.page != MenuPage::Root {
+        if menu.busy
+            && !matches!(
+                menu.page,
+                MenuPage::Root | MenuPage::DisplaySettings | MenuPage::RunSettings
+            )
+        {
             menu.message = tr("menu.busy").into();
             return;
         }
         match menu.page {
             MenuPage::Root => match menu.selected {
-                0 => menu.push(MenuPage::Profiles),
+                0 => {
+                    menu.push(MenuPage::Profiles);
+                    self.refresh_current_profile_editor(menu);
+                }
                 1 => menu.push(MenuPage::Models),
                 2 => menu.push(MenuPage::SerialSettings),
-                3 => menu.push(MenuPage::Help),
+                3 => {
+                    menu.push(MenuPage::DisplaySettings);
+                }
+                4 => menu.push(MenuPage::RunSettings),
+                5 => menu.push(MenuPage::Help),
                 _ => {}
             },
-            MenuPage::Profiles => match menu.selected {
-                0 => menu.push(MenuPage::TransportProfiles),
-                1 => menu.push(MenuPage::DeviceProfiles),
-                _ => {}
-            },
+            MenuPage::Profiles => self.activate_current_profile_row(menu),
             MenuPage::TransportProfiles => {
                 let Some((profiles_len, profile_name)) = menu.catalog.as_ref().map(|catalog| {
                     (
@@ -4549,6 +6086,23 @@ impl App {
                     suggested_name,
                 );
             }
+            MenuPage::DisplaySettings => {
+                let value = self.agent_history_rows.to_string();
+                menu.prompt = Some(MenuPrompt {
+                    title: trf(
+                        "menu.display.history.prompt",
+                        &[
+                            &MIN_AGENT_HISTORY_ROWS.to_string(),
+                            &MAX_AGENT_HISTORY_ROWS.to_string(),
+                        ],
+                    ),
+                    cursor: value.len(),
+                    value: value.chars().collect(),
+                    secret: false,
+                    purpose: MenuPromptPurpose::AgentHistoryRows,
+                });
+            }
+            MenuPage::RunSettings => self.begin_orphan_run_timeout_prompt(menu),
             MenuPage::Help => {}
         }
     }
@@ -4675,9 +6229,11 @@ impl App {
                         }
                     }
                 }
+                let profile_editor = CurrentProfileEditor::new(self.current(), &catalog);
                 let message = menu_success_message(&success);
                 if let Some(menu) = self.menu.as_mut() {
                     menu.catalog = Some(catalog);
+                    menu.profile_editor = Some(profile_editor);
                     menu.busy = false;
                     menu.message = message.clone();
                     let count = menu_item_count(menu);
@@ -4805,6 +6361,325 @@ struct MenuIo {
     events: mpsc::Receiver<MenuIoEvent>,
 }
 
+struct OutputSearchIo {
+    commands: mpsc::Sender<OutputSearchIoCommand>,
+    events: mpsc::Receiver<OutputSearchIoEvent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputSearchArchive {
+    epoch: Uuid,
+    first_seq: u64,
+    last_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSearchPageProgress {
+    Complete,
+    Continue(u64),
+    Incomplete,
+}
+
+fn output_search_page_progress(
+    truncated: bool,
+    next_cursor: Option<&Cursor>,
+    epoch: Uuid,
+    after_seq: u64,
+    through_seq: u64,
+) -> OutputSearchPageProgress {
+    let Some(cursor) =
+        next_cursor.filter(|cursor| cursor.epoch == epoch && cursor.after_seq > after_seq)
+    else {
+        return OutputSearchPageProgress::Incomplete;
+    };
+    if cursor.after_seq >= through_seq {
+        OutputSearchPageProgress::Complete
+    } else if truncated {
+        OutputSearchPageProgress::Continue(cursor.after_seq)
+    } else {
+        // A clean page ending before the requested Snapshot/archive head means
+        // that tail is not currently queryable (for example H is live while
+        // only K is durable, or an archive changed during discovery). Do not
+        // poll the same empty tail; expose the result as partial instead.
+        OutputSearchPageProgress::Incomplete
+    }
+}
+
+fn begin_output_search_archive(query_count: usize, scanned_archives: &mut usize) -> bool {
+    if query_count >= OUTPUT_SEARCH_HTTP_QUERY_LIMIT {
+        return false;
+    }
+    *scanned_archives += 1;
+    true
+}
+
+fn retain_newest_output_search_events(
+    events: &mut Vec<TimelineEvent>,
+    epoch_ranks: &HashMap<Uuid, usize>,
+) -> bool {
+    events.sort_by(|left, right| {
+        let left_rank = epoch_ranks
+            .get(&left.daemon_epoch)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let right_rank = epoch_ranks
+            .get(&right.daemon_epoch)
+            .copied()
+            .unwrap_or(usize::MAX);
+        left_rank.cmp(&right_rank).then_with(|| {
+            if left.daemon_epoch == right.daemon_epoch {
+                right.seq.cmp(&left.seq)
+            } else {
+                left.daemon_epoch.cmp(&right.daemon_epoch)
+            }
+        })
+    });
+    events.dedup_by(|left, right| left.daemon_epoch == right.daemon_epoch && left.seq == right.seq);
+    let limited = events.len() > OUTPUT_SEARCH_LIMIT_EVENTS;
+    events.truncate(OUTPUT_SEARCH_LIMIT_EVENTS);
+    limited
+}
+
+impl From<&ArchiveSummary> for OutputSearchArchive {
+    fn from(archive: &ArchiveSummary) -> Self {
+        Self {
+            epoch: archive.epoch,
+            first_seq: archive.first_seq,
+            last_seq: archive.last_seq,
+        }
+    }
+}
+
+fn spawn_output_search_io(api: ApiClient) -> OutputSearchIo {
+    let (command_tx, mut command_rx) = mpsc::channel(4);
+    let (event_tx, event_rx) = mpsc::channel(2);
+    tokio::spawn(async move {
+        let mut active: Option<(Uuid, tokio::task::JoinHandle<OutputSearchIoEvent>)> = None;
+        loop {
+            if let Some((active_id, mut task)) = active.take() {
+                tokio::select! {
+                    result = &mut task => {
+                        let event = result.unwrap_or_else(|error| OutputSearchIoEvent::Failed {
+                            request_id: active_id,
+                            message: format!("history-search worker stopped: {error}"),
+                        });
+                        if event_tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    command = command_rx.recv() => match command {
+                        Some(OutputSearchIoCommand::Query(request)) => {
+                            task.abort();
+                            let request_id = request.request_id;
+                            active = Some((request_id, spawn_output_search_task(api.clone(), request)));
+                        }
+                        Some(OutputSearchIoCommand::Cancel { request_id }) if request_id == active_id => {
+                            task.abort();
+                        }
+                        Some(OutputSearchIoCommand::Cancel { .. }) => {
+                            active = Some((active_id, task));
+                        }
+                        None => {
+                            task.abort();
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            match command_rx.recv().await {
+                Some(OutputSearchIoCommand::Query(request)) => {
+                    let request_id = request.request_id;
+                    active = Some((request_id, spawn_output_search_task(api.clone(), request)));
+                }
+                Some(OutputSearchIoCommand::Cancel { .. }) => {}
+                None => break,
+            }
+        }
+    });
+    OutputSearchIo {
+        commands: command_tx,
+        events: event_rx,
+    }
+}
+
+fn spawn_output_search_task(
+    api: ApiClient,
+    request: OutputSearchRequest,
+) -> tokio::task::JoinHandle<OutputSearchIoEvent> {
+    tokio::spawn(async move {
+        let request_id = request.request_id;
+        match tokio::time::timeout(OUTPUT_SEARCH_DEADLINE, execute_output_search(&api, request))
+            .await
+        {
+            Ok(Ok(response)) => OutputSearchIoEvent::Completed {
+                request_id,
+                response,
+            },
+            Ok(Err(error)) => OutputSearchIoEvent::Failed {
+                request_id,
+                message: error.to_string(),
+            },
+            Err(_) => OutputSearchIoEvent::Failed {
+                request_id,
+                message: trf(
+                    "ui.output.search.timeout",
+                    &[&OUTPUT_SEARCH_DEADLINE.as_secs().to_string()],
+                ),
+            },
+        }
+    })
+}
+
+async fn execute_output_search(
+    api: &ApiClient,
+    request: OutputSearchRequest,
+) -> Result<OutputSearchResponse> {
+    let mut partial = false;
+    let mut archives = match request.scope {
+        OutputSearchScope::CurrentEpoch => vec![OutputSearchArchive {
+            epoch: request.current_epoch,
+            first_seq: 1,
+            last_seq: request.head_seq,
+        }],
+        OutputSearchScope::CurrentRun => {
+            let run = request
+                .current_run
+                .context("the selected Slot no longer has an active Agent Run")?;
+            vec![OutputSearchArchive {
+                epoch: request.current_epoch,
+                first_seq: run.start_seq,
+                last_seq: run.through_seq,
+            }]
+        }
+        OutputSearchScope::Retained => {
+            let catalog = api.archives(Some(&request.slot_id)).await?;
+            partial |= catalog.truncated;
+            let mut retained = catalog.archives;
+            if retained.len() > OUTPUT_SEARCH_ARCHIVE_LIMIT {
+                retained.truncate(OUTPUT_SEARCH_ARCHIVE_LIMIT);
+                partial = true;
+            }
+            retained.iter().map(OutputSearchArchive::from).collect()
+        }
+    };
+    // Synthetic current-epoch ranges have no records when the head is zero.
+    archives.retain(|archive| archive.last_seq > 0 && archive.first_seq <= archive.last_seq);
+    // Wall clocks can jump backwards. Archive catalog order establishes the
+    // cross-epoch recency relation for this query; sequence number establishes
+    // recency within one epoch.
+    let epoch_ranks = archives
+        .iter()
+        .enumerate()
+        .map(|(rank, archive)| (archive.epoch, rank))
+        .collect::<HashMap<_, _>>();
+
+    let mut events = Vec::new();
+    let mut gaps = Vec::new();
+    let archive_count = archives.len();
+    let mut scanned_archives = 0usize;
+    let mut query_count = 0usize;
+    'archives: for (archive_index, archive) in archives.into_iter().enumerate() {
+        // An archive is "scanned" only once its first HTTP request can
+        // actually be issued. Reaching the global request cap between
+        // archives must not count the untouched next archive.
+        if !begin_output_search_archive(query_count, &mut scanned_archives) {
+            partial = true;
+            break;
+        }
+        let window_first = archive.first_seq.max(
+            archive
+                .last_seq
+                .saturating_sub(OUTPUT_SEARCH_EVENT_WINDOW - 1),
+        );
+        partial |= window_first > archive.first_seq;
+        // The journal API is forward-only. Page every selected direction to
+        // the end of this bounded tail, then keep only the newest matches.
+        // Round-robin paging prevents a chatty RX stream from starving TX.
+        let mut directions = request
+            .direction
+            .query_directions()
+            .iter()
+            .copied()
+            .map(|direction| (direction, window_first.saturating_sub(1), false))
+            .collect::<Vec<_>>();
+        while directions.iter().any(|(_, _, done)| !done) {
+            for (direction, after_seq, done) in &mut directions {
+                if *done {
+                    continue;
+                }
+                if query_count >= OUTPUT_SEARCH_HTTP_QUERY_LIMIT {
+                    partial = true;
+                    break 'archives;
+                }
+                query_count += 1;
+                let response = api
+                    .events(
+                        &request.slot_id,
+                        &EventQuery {
+                            epoch: Some(archive.epoch),
+                            after_seq: Some(*after_seq),
+                            through_seq: Some(archive.last_seq),
+                            before_wall_time_ns: None,
+                            after_wall_time_ns: None,
+                            direction: Some(*direction),
+                            kind: None,
+                            actor_id: None,
+                            run_id: if request.scope == OutputSearchScope::CurrentRun {
+                                request.current_run.map(|run| run.id)
+                            } else {
+                                None
+                            },
+                            operation_id: None,
+                            contains: request.contains.clone(),
+                            regex: request.regex.clone(),
+                            limit_events: Some(OUTPUT_SEARCH_PAGE_EVENTS),
+                            limit_bytes: Some(OUTPUT_SEARCH_LIMIT_BYTES),
+                        },
+                    )
+                    .await?;
+                for gap in response.gaps {
+                    if !gaps.contains(&gap) {
+                        gaps.push(gap);
+                    }
+                }
+                events.extend(response.events);
+                partial |= retain_newest_output_search_events(&mut events, &epoch_ranks);
+                match output_search_page_progress(
+                    response.truncated,
+                    response.next_cursor.as_ref(),
+                    archive.epoch,
+                    *after_seq,
+                    archive.last_seq,
+                ) {
+                    OutputSearchPageProgress::Complete => *done = true,
+                    OutputSearchPageProgress::Continue(next) => *after_seq = next,
+                    OutputSearchPageProgress::Incomplete => {
+                        partial = true;
+                        *done = true;
+                    }
+                }
+            }
+        }
+        if events.len() >= OUTPUT_SEARCH_LIMIT_EVENTS {
+            partial |= archive_index + 1 < archive_count;
+            break;
+        }
+    }
+
+    partial |= retain_newest_output_search_events(&mut events, &epoch_ranks);
+    if gaps.len() > 32 {
+        gaps.truncate(32);
+        partial = true;
+    }
+    Ok(OutputSearchResponse {
+        events,
+        gaps,
+        partial,
+        scanned_archives,
+    })
+}
+
 fn spawn_menu_io(api: ApiClient) -> MenuIo {
     let (command_tx, mut command_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8);
@@ -4908,6 +6783,41 @@ async fn execute_menu_io(
             .await?;
             MenuSuccess::ModelCreated(model_id)
         }
+        MenuIoCommand::RenameBoundModel {
+            slot_id,
+            model_id,
+            name,
+            expected_revision,
+            expected_current,
+        } => {
+            let response = api
+                .set_slot_device_model(
+                    &slot_id,
+                    &SetSlotDeviceModelRequest {
+                        model_id: Some(model_id),
+                        create_if_missing: false,
+                        update_existing: true,
+                        name: Some(name.clone()),
+                        parent_id: None,
+                        clear_parent: false,
+                        aliases: Vec::new(),
+                        clear_aliases: false,
+                        confirmation_method: Some(ModelConfirmationMethod::Human),
+                        note: Some(tr("menu.model.confirm.note").into()),
+                        source: "human:serialctl-tui".into(),
+                        expected_revision: Some(expected_revision),
+                        expected_current: Some(expected_current),
+                    },
+                )
+                .await?;
+            let mut affected_slots = response.affected_slots;
+            affected_slots.sort();
+            affected_slots.dedup();
+            MenuSuccess::ModelRenamed {
+                name,
+                affected_slots,
+            }
+        }
     };
     Ok((load_menu_catalog(api).await?, success))
 }
@@ -4965,7 +6875,146 @@ async fn execute_admin_menu_mutation(
             bind_device_profile(admin, &slot_id, Some(&profile_name)).await?;
             Ok(MenuSuccess::DeviceCreated(profile_name))
         }
+        MenuAdminMutation::UpdateCurrentProfiles {
+            slot_id,
+            port,
+            transport,
+            device,
+            expected_config_revision,
+            expected_transport_revision,
+            expected_device_revision,
+        } => {
+            update_current_profiles(
+                admin,
+                &slot_id,
+                port,
+                transport,
+                device,
+                CurrentProfileRevisions {
+                    config: expected_config_revision,
+                    transport: expected_transport_revision,
+                    device: expected_device_revision,
+                },
+            )
+            .await?;
+            Ok(MenuSuccess::ProfilesUpdated)
+        }
     }
+}
+
+async fn update_current_profiles(
+    admin: &ApiClient,
+    slot_id: &str,
+    port: Option<String>,
+    transport: Option<TransportProfile>,
+    device: Option<DeviceProfile>,
+    revisions: CurrentProfileRevisions,
+) -> Result<()> {
+    if transport.is_some() {
+        ensure!(
+            revisions.transport == revisions.config,
+            "{}",
+            tr("menu.profile.revision.conflict")
+        );
+    }
+    if device.is_some() {
+        ensure!(
+            revisions.device == revisions.config,
+            "{}",
+            tr("menu.profile.revision.conflict")
+        );
+    }
+    let status = admin.configuration_status().await?;
+    ensure!(
+        status.config_revision == revisions.config,
+        "{}",
+        tr("menu.profile.revision.conflict")
+    );
+    let slot = status
+        .slots
+        .iter()
+        .find(|slot| slot.config.id == slot_id)
+        .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
+    if let Some(profile) = transport.as_ref() {
+        ensure!(
+            slot.config.profile == profile.name,
+            "{}",
+            tr("menu.profile.binding.changed")
+        );
+    }
+    if let Some(profile) = device.as_ref() {
+        ensure!(
+            slot.config.device_profile.as_deref() == Some(profile.name.as_str()),
+            "{}",
+            tr("menu.profile.binding.changed")
+        );
+    }
+
+    let mut known_revision = revisions.config;
+    if let Some(profile) = transport.as_ref() {
+        let mut catalog = admin.transport_profiles().await?;
+        ensure!(
+            catalog.config_revision == revisions.transport
+                && catalog.config_revision == known_revision,
+            "{}",
+            tr("menu.profile.revision.conflict")
+        );
+        let existing = catalog
+            .profiles
+            .iter_mut()
+            .find(|existing| existing.name == profile.name)
+            .with_context(|| trf("menu.transport.missing", &[&profile.name]))?;
+        *existing = profile.clone();
+        let updated = admin
+            .configure_transport_profiles(catalog.profiles, catalog.config_revision)
+            .await?;
+        known_revision = updated.config_revision;
+    }
+    if let Some(profile) = device.as_ref() {
+        let mut catalog = admin.device_profiles().await?;
+        ensure!(
+            catalog.config_revision == known_revision,
+            "{}",
+            tr("menu.profile.revision.conflict")
+        );
+        let existing = catalog
+            .profiles
+            .iter_mut()
+            .find(|existing| existing.name == profile.name)
+            .with_context(|| trf("menu.device.missing", &[&profile.name]))?;
+        *existing = profile.clone();
+        let updated = admin
+            .configure_device_profiles(catalog.profiles, catalog.config_revision)
+            .await?;
+        known_revision = updated.config_revision;
+    }
+    if let Some(port) = port {
+        let status = admin.configuration_status().await?;
+        ensure!(
+            status.config_revision == known_revision,
+            "{}",
+            tr("menu.profile.revision.conflict")
+        );
+        let mut slots = status
+            .slots
+            .into_iter()
+            .map(|slot| slot.config)
+            .collect::<Vec<_>>();
+        let slot = slots
+            .iter_mut()
+            .find(|slot| slot.id == slot_id)
+            .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
+        slot.port = port;
+        admin.configure_slots(slots, status.config_revision).await?;
+    }
+    // Both catalog endpoints are transactional seriald configuration paths.
+    // A transport-profile PUT stages every affected Slot and observes the
+    // daemon's ordinary busy/reopen safety boundary; a device-profile PUT
+    // stages prompt/EOL/pacing changes. Profile-only edits deliberately avoid
+    // a redundant Slot reconfiguration. A changed port is submitted once via
+    // the Slot endpoint at the latest revision. `load_menu_catalog` refreshes
+    // authoritative Snapshots before the UI reports success.
+    Ok(())
 }
 
 async fn bind_transport_profile(api: &ApiClient, slot_id: &str, profile_name: &str) -> Result<()> {
@@ -5032,8 +7081,11 @@ async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
     Ok(MenuCatalog {
         auth_required: health.auth_required,
         slots: status.slots,
+        config_revision: status.config_revision,
         transport_profiles: transport.profiles,
+        transport_revision: transport.config_revision,
         device_profiles: device.profiles,
+        device_revision: device.config_revision,
         models: models.models,
         model_bindings: models.bindings,
         model_revision: models.config_revision,
@@ -5042,7 +7094,7 @@ async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
 
 pub async fn run(
     api: ApiClient,
-    mut loaded: LoadedConfig,
+    loaded: LoadedConfig,
     initial_slot: Option<String>,
     endpoint: String,
     token: Option<String>,
@@ -5059,6 +7111,11 @@ pub async fn run(
         .iter()
         .map(|slot| slot.config.id.clone())
         .collect::<Vec<_>>();
+    let history_targets = status
+        .slots
+        .iter()
+        .map(StartupHistoryTarget::from)
+        .collect::<Vec<_>>();
     let mut app = App::new(status.slots, initial_slot.as_deref());
     app.human_idle_release = Duration::from_secs(
         loaded
@@ -5074,12 +7131,23 @@ pub async fn run(
     }
     app.mouse_capture = loaded.config.mouse_capture.unwrap_or(true);
     app.agent_history_rows = configured_agent_history_rows(loaded.config.agent_history_rows);
+    app.orphan_run_timeout_seconds =
+        configured_orphan_run_timeout_seconds(loaded.config.orphan_run_timeout_seconds);
+    let mut initial_cursors = HashMap::new();
+    load_startup_histories(api.clone(), history_targets, |history| {
+        if let Some((slot_id, cursor)) = app.apply_startup_history(history) {
+            initial_cursors.insert(slot_id, cursor);
+        }
+    })
+    .await;
     let mut menu_io = spawn_menu_io(api.clone());
     app.menu_commands = Some(menu_io.commands.clone());
+    let mut output_search_io = spawn_output_search_io(api.clone());
+    app.output_search_commands = Some(output_search_io.commands.clone());
     // Resolve model IDs after the first frame instead of adding another
     // blocking request to console startup.
     app.request_model_labels_refresh();
-    let mut network = ws::spawn(endpoint, token, slot_ids);
+    let mut network = ws::spawn(endpoint, token, slot_ids, initial_cursors);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
     let _guard = TerminalGuard {
@@ -5091,12 +7159,17 @@ pub async fn run(
         &network.commands,
         &mut network.events,
         &mut menu_io.events,
+        &mut output_search_io.events,
     )
     .await;
     let _ = network.commands.try_send(NetworkCommand::Shutdown);
 
-    loaded.config.last_slot = Some(app.selected_slot_id());
-    if let Err(error) = loaded.save() {
+    // Runtime preferences are saved through `app.config`. Persist the last
+    // selected Slot using that latest copy so the startup snapshot cannot
+    // overwrite a language or display change when the console exits.
+    let mut latest_config = app.config.take().unwrap_or(loaded);
+    latest_config.config.last_slot = Some(app.selected_slot_id());
+    if let Err(error) = latest_config.save() {
         tracing::warn!(%error, "failed to persist the last selected Slot");
     }
     result
@@ -5108,9 +7181,11 @@ async fn run_loop(
     commands: &mpsc::Sender<NetworkCommand>,
     network_events: &mut mpsc::Receiver<NetworkEvent>,
     menu_events: &mut mpsc::Receiver<MenuIoEvent>,
+    output_search_events: &mut mpsc::Receiver<OutputSearchIoEvent>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut network_events_open = true;
+    let mut output_search_events_open = true;
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renew_tick = tokio::time::interval(Duration::from_secs(10));
@@ -5136,6 +7211,20 @@ async fn run_loop(
                     app.handle_menu_io_event(event);
                 }
             },
+            event = output_search_events.recv(), if output_search_events_open => {
+                if let Some(event) = event {
+                    app.handle_output_search_io_event(event);
+                } else {
+                    output_search_events_open = false;
+                    if let Some(search) = app.output_search.as_mut()
+                        && matches!(search.phase, OutputSearchPhase::Loading(_))
+                    {
+                        search.phase = OutputSearchPhase::Editing;
+                        search.error = Some(tr("ui.output.search.unavailable").into());
+                        app.dirty = true;
+                    }
+                }
+            },
             _ = renew_tick.tick() => app.maintain_controls(commands),
             _ = activity_tick.tick() => {
                 let now = Instant::now();
@@ -5154,6 +7243,9 @@ async fn run_loop(
             },
             _ = model_label_tick.tick() => app.request_model_labels_refresh(),
             _ = render_tick.tick() => {
+                if app.update_software_cursor_blink(Instant::now()) {
+                    app.dirty = true;
+                }
                 if app.dirty {
                     terminal.draw(|frame| draw(frame, app))?;
                     app.dirty = false;
@@ -5440,6 +7532,359 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(menu) = app.menu.as_ref() {
         draw_menu(frame, app, menu, area);
     }
+    if let Some(search) = app.output_search.as_ref() {
+        draw_output_search(frame, search, area, app.software_cursor_visible);
+    }
+}
+
+fn output_search_matcher_label(matcher: OutputSearchMatcher) -> &'static str {
+    match matcher {
+        OutputSearchMatcher::Literal => tr("ui.output.search.matcher.literal"),
+        OutputSearchMatcher::Regex => tr("ui.output.search.matcher.regex"),
+    }
+}
+
+fn output_search_case_label(case_sensitive: bool) -> &'static str {
+    if case_sensitive {
+        tr("ui.output.search.case.sensitive")
+    } else {
+        tr("ui.output.search.case.insensitive")
+    }
+}
+
+fn output_search_direction_label(direction: OutputSearchDirection) -> &'static str {
+    match direction {
+        OutputSearchDirection::Both => tr("ui.output.search.direction.both"),
+        OutputSearchDirection::Rx => tr("ui.output.search.direction.rx"),
+        OutputSearchDirection::Tx => tr("ui.output.search.direction.tx"),
+    }
+}
+
+fn output_search_scope_label(scope: OutputSearchScope) -> &'static str {
+    match scope {
+        OutputSearchScope::CurrentEpoch => tr("ui.output.search.scope.epoch"),
+        OutputSearchScope::Retained => tr("ui.output.search.scope.retained"),
+        OutputSearchScope::CurrentRun => tr("ui.output.search.scope.run"),
+    }
+}
+
+fn output_search_filters(search: &OutputSearchState) -> String {
+    trf(
+        "ui.output.search.filters",
+        &[
+            output_search_matcher_label(search.matcher),
+            output_search_case_label(search.case_sensitive),
+            output_search_direction_label(search.direction),
+            output_search_scope_label(search.scope),
+        ],
+    )
+}
+
+fn output_search_target(search: &OutputSearchState) -> String {
+    let epoch = search.current_epoch.to_string();
+    let epoch = &epoch[..8];
+    match search.scope {
+        OutputSearchScope::Retained => tr("ui.output.search.target.retained").into(),
+        OutputSearchScope::CurrentRun => search.current_run.map_or_else(
+            || {
+                trf(
+                    "ui.output.search.target.epoch",
+                    &[epoch, &search.head_seq.to_string()],
+                )
+            },
+            |run| {
+                let run_id = run.id.to_string();
+                trf(
+                    "ui.output.search.target.run",
+                    &[epoch, &search.head_seq.to_string(), &run_id[..8]],
+                )
+            },
+        ),
+        OutputSearchScope::CurrentEpoch => trf(
+            "ui.output.search.target.epoch",
+            &[epoch, &search.head_seq.to_string()],
+        ),
+    }
+}
+
+fn output_search_event_summary(event: &TimelineEvent, width: u16) -> String {
+    let direction = match event.direction {
+        Direction::Rx => "RX",
+        Direction::Tx => "TX",
+        Direction::None => "-",
+    };
+    let epoch = event.daemon_epoch.to_string();
+    let epoch = &epoch[..8];
+    let payload = safe_inline(&String::from_utf8_lossy(&event.data));
+    let payload = if payload.is_empty() {
+        tr("ui.output.search.empty.event").into()
+    } else {
+        payload
+    };
+    truncate_display(
+        &trf(
+            "ui.output.search.row",
+            &[
+                &format_wall_time_local(event.wall_time_ns),
+                direction,
+                &event.seq.to_string(),
+                epoch,
+                &payload,
+            ],
+        ),
+        width.max(1) as usize,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OutputSearchResultFooter {
+    integrity: String,
+    navigation: String,
+    limits: Option<String>,
+}
+
+fn trim_output_search_footer_separator(value: String) -> String {
+    value
+        .trim_start_matches(|character: char| character.is_whitespace() || character == '·')
+        .to_owned()
+}
+
+fn output_search_result_footer(search: &OutputSearchState) -> OutputSearchResultFooter {
+    let position = if search.results.is_empty() {
+        "0".to_owned()
+    } else {
+        (search.selected + 1).to_string()
+    };
+    let navigation = trf(
+        "ui.output.search.position",
+        &[
+            &position,
+            &search.results.len().to_string(),
+            &search.scanned_archives.to_string(),
+        ],
+    );
+    let mut warnings = Vec::new();
+    if search.partial {
+        warnings.push(tr("ui.output.search.integrity.partial").to_owned());
+    }
+    if !search.gaps.is_empty() {
+        warnings.push(trim_output_search_footer_separator(trf(
+            "ui.output.search.gaps",
+            &[&search.gaps.len().to_string()],
+        )));
+    }
+    let integrity = if warnings.is_empty() {
+        tr("ui.output.search.integrity.complete").to_owned()
+    } else {
+        warnings.join(" · ")
+    };
+    let limits = search.partial.then(|| {
+        // Keep the detailed bounded-query contract visible without making it
+        // compete with the compact first-line integrity warning.
+        trim_output_search_footer_separator(tr("ui.output.search.partial").to_owned())
+    });
+    OutputSearchResultFooter {
+        integrity,
+        navigation,
+        limits,
+    }
+}
+
+fn draw_output_search(
+    frame: &mut Frame<'_>,
+    search: &OutputSearchState,
+    area: Rect,
+    cursor_visible: bool,
+) {
+    let width = area.width.saturating_sub(4).clamp(1, 110);
+    let height = area.height.saturating_sub(2).clamp(1, 34);
+    let popup = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tr("ui.output.search.title"))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    match search.phase {
+        OutputSearchPhase::Editing | OutputSearchPhase::Loading(_) => {
+            let chunks = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Length(4),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+            let (query, cursor_column) = line_input_projection(
+                &search.query,
+                search.cursor,
+                chunks[0].width.saturating_sub(2),
+            );
+            frame.render_widget(
+                Paragraph::new(if search.phase == OutputSearchPhase::Editing {
+                    line_with_software_cursor(query, cursor_column, cursor_visible)
+                } else {
+                    Line::from(query)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(tr("ui.output.search.query")),
+                ),
+                chunks[0],
+            );
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(output_search_filters(search)),
+                    Line::from(output_search_target(search)),
+                    Line::from(tr("ui.output.search.filter.keys")),
+                ])
+                .style(Style::default().fg(Color::LightCyan)),
+                chunks[1],
+            );
+            let message = if let Some(error) = search.error.as_deref() {
+                Line::from(Span::styled(
+                    safe_inline(error),
+                    Style::default().fg(Color::LightRed),
+                ))
+            } else if matches!(search.phase, OutputSearchPhase::Loading(_)) {
+                Line::from(Span::styled(
+                    tr("ui.output.search.loading"),
+                    Style::default().fg(Color::Yellow),
+                ))
+            } else {
+                Line::from(tr("ui.output.search.boundary.note"))
+            };
+            frame.render_widget(
+                Paragraph::new(message).wrap(Wrap { trim: false }),
+                chunks[2],
+            );
+            frame.render_widget(
+                Paragraph::new(tr("ui.output.search.edit.footer"))
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                chunks[3],
+            );
+        }
+        OutputSearchPhase::Results => {
+            let detail_height = inner.height.saturating_div(3).clamp(3, 8);
+            let desired_footer_height = if search.partial { 5 } else { 2 };
+            // On short terminals retain room for the result list and detail;
+            // the compact integrity warning always remains the first row.
+            let footer_height = desired_footer_height.min(inner.height.saturating_sub(9).max(2));
+            let chunks = Layout::vertical([
+                Constraint::Length(4),
+                Constraint::Min(2),
+                Constraint::Length(detail_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(inner);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(trf(
+                        "ui.output.search.result.query",
+                        &[&safe_inline(&search.query_text())],
+                    )),
+                    Line::from(output_search_filters(search)),
+                    Line::from(output_search_target(search)),
+                    Line::from(Span::styled(
+                        tr("ui.output.search.completion.block"),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]),
+                chunks[0],
+            );
+            let visible = chunks[1].height as usize;
+            let start = search
+                .selected
+                .saturating_sub(visible.saturating_sub(1))
+                .min(search.results.len().saturating_sub(visible));
+            let rows = if search.results.is_empty() {
+                vec![Line::from(Span::styled(
+                    tr("ui.output.search.none"),
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                search
+                    .results
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(visible)
+                    .map(|(index, event)| {
+                        let marker = if index == search.selected {
+                            "› "
+                        } else {
+                            "  "
+                        };
+                        Line::from(Span::styled(
+                            format!(
+                                "{marker}{}",
+                                output_search_event_summary(
+                                    event,
+                                    chunks[1].width.saturating_sub(2)
+                                )
+                            ),
+                            if index == search.selected {
+                                Style::default()
+                                    .fg(Color::LightCyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            },
+                        ))
+                    })
+                    .collect()
+            };
+            frame.render_widget(Paragraph::new(rows), chunks[1]);
+            let detail = search.results.get(search.selected).map_or_else(
+                || tr("ui.output.search.no.detail").to_owned(),
+                format_event_plain,
+            );
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(
+                        Block::default()
+                            .borders(Borders::TOP)
+                            .title(tr("ui.output.search.detail")),
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((search.detail_scroll.min(u16::MAX as usize) as u16, 0)),
+                chunks[2],
+            );
+            let footer = output_search_result_footer(search);
+            let integrity_style = if search.partial || !search.gaps.is_empty() {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mut footer_lines = vec![
+                Line::from(Span::styled(footer.integrity, integrity_style)),
+                Line::from(Span::styled(
+                    footer.navigation,
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            if let Some(limits) = footer.limits {
+                footer_lines.push(Line::from(Span::styled(
+                    limits,
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(footer_lines)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false }),
+                chunks[3],
+            );
+        }
+    }
 }
 
 fn session_state_label(state: SessionState) -> &'static str {
@@ -5616,7 +8061,14 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
 /// intentionally runs only when the operator first pauses output. The frozen
 /// rows make subsequent live appends O(1) for viewport stability and avoid
 /// mixing logical-row offsets with post-wrap visual-row offsets.
-fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+#[derive(Debug)]
+struct OutputVisualRow {
+    line: Line<'static>,
+    seq: u64,
+    operation_id: Option<Uuid>,
+}
+
+fn all_output_visual_rows(app: &App, width: u16) -> Vec<OutputVisualRow> {
     if width == 0 {
         return Vec::new();
     }
@@ -5629,6 +8081,8 @@ fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .iter()
         .chain(view.lines.iter().chain(view.pending_line.iter()))
         .flat_map(|entry| {
+            let seq = entry.seq;
+            let operation_id = entry.operation_id;
             wrap_timeline_line(
                 timeline_line(
                     entry,
@@ -5640,7 +8094,20 @@ fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 ),
                 width,
             )
+            .into_iter()
+            .map(move |line| OutputVisualRow {
+                line,
+                seq,
+                operation_id,
+            })
         })
+        .collect()
+}
+
+fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    all_output_visual_rows(app, width)
+        .into_iter()
+        .map(|row| row.line)
         .collect()
 }
 
@@ -5756,6 +8223,90 @@ fn selection_columns(start: SelectionPoint, end: SelectionPoint, row: usize) -> 
         if row == start.row { start.column } else { 0 },
         if row == end.row { end.column } else { u16::MAX },
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionTokenKind {
+    Word,
+    Whitespace,
+    Punctuation(char),
+}
+
+fn selection_token_kind(character: char) -> SelectionTokenKind {
+    if character.is_alphanumeric()
+        || matches!(character, '_' | '-' | '.' | ':' | '/' | '\\' | '@' | '~')
+    {
+        SelectionTokenKind::Word
+    } else if character.is_whitespace() {
+        SelectionTokenKind::Whitespace
+    } else {
+        SelectionTokenKind::Punctuation(character)
+    }
+}
+
+fn word_selection_points(
+    rows: &[String],
+    point: SelectionPoint,
+) -> Option<(SelectionPoint, SelectionPoint)> {
+    let text = rows.get(point.row)?;
+    let mut column = 0u16;
+    let cells = text
+        .chars()
+        .map(|character| {
+            let start = column;
+            let width = UnicodeWidthChar::width(character).unwrap_or(0).max(1) as u16;
+            column = column.saturating_add(width);
+            (
+                start,
+                column.saturating_sub(1),
+                selection_token_kind(character),
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected = cells
+        .iter()
+        .position(|(start, end, _)| *start <= point.column && point.column <= *end)?;
+    let kind = cells[selected].2;
+    let first = (0..=selected)
+        .rev()
+        .take_while(|index| cells[*index].2 == kind)
+        .last()
+        .unwrap_or(selected);
+    let last = (selected..cells.len())
+        .take_while(|index| cells[*index].2 == kind)
+        .last()
+        .unwrap_or(selected);
+    Some((
+        SelectionPoint {
+            row: point.row,
+            column: cells[first].0,
+        },
+        SelectionPoint {
+            row: point.row,
+            column: cells[last].1,
+        },
+    ))
+}
+
+fn output_clicks_form_double_click(
+    previous: OutputClick,
+    current: SelectionPoint,
+    rows: &[String],
+    now: Instant,
+) -> bool {
+    if previous.point.row != current.row
+        || now.saturating_duration_since(previous.at) > DOUBLE_CLICK_INTERVAL
+    {
+        return false;
+    }
+    let same_token = word_selection_points(rows, previous.point)
+        .zip(word_selection_points(rows, current))
+        .is_some_and(|(previous, current)| previous == current);
+    // Terminal mouse reports cell coordinates rather than pixel coordinates.
+    // Keep the conventional double-click feel if two rapid clicks straddle a
+    // cell boundary, while the same-token check above permits larger movement
+    // anywhere inside one word.
+    same_token || previous.point.column.abs_diff(current.column) <= 1
 }
 
 fn line_plain_text(line: &Line<'_>) -> String {
@@ -6101,19 +8652,9 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
                 if step.truncated {
                     payload.push('…');
                 }
-                let icon = if step.partial { "❌" } else { "✅" };
-                let icon_style = Style::default().fg(if step.partial {
-                    Color::LightRed
-                } else {
-                    Color::LightGreen
-                });
                 let detail_width = usize::from(width);
-                let icon_width = UnicodeWidthStr::width(icon);
-                let gap = usize::from(detail_width > icon_width.saturating_add(1));
-                let indentation = detail_width
-                    .saturating_sub(icon_width.saturating_add(gap).saturating_add(1))
-                    .min(4);
-                let first_prefix = format!("{}{icon}{}", " ".repeat(indentation), " ".repeat(gap));
+                let indentation = detail_width.saturating_sub(1).min(4);
+                let first_prefix = " ".repeat(indentation);
                 let prefix_width = UnicodeWidthStr::width(first_prefix.as_str());
                 let continuation_prefix = " ".repeat(prefix_width);
                 let payload_width = detail_width
@@ -6125,10 +8666,10 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
                     .enumerate()
                 {
                     let line = if line_index == 0 {
-                        Line::from(vec![
-                            Span::styled(first_prefix.clone(), icon_style),
-                            Span::styled(text, Style::default().fg(Color::Gray)),
-                        ])
+                        Line::from(Span::styled(
+                            format!("{first_prefix}{text}"),
+                            Style::default().fg(Color::Gray),
+                        ))
                     } else {
                         Line::from(Span::styled(
                             format!("{continuation_prefix}{text}"),
@@ -6278,15 +8819,13 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
             }
         }
     };
+    let text = match (app.focus == PaneFocus::Input, cursor_column) {
+        (true, Some(cursor)) => {
+            line_with_software_cursor(line_plain_text(&text), cursor, app.software_cursor_visible)
+        }
+        _ => text,
+    };
     frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
-    if let Some(cursor_column) = cursor_column
-        && app.focus == PaneFocus::Input
-    {
-        frame.set_cursor_position(Position::new(
-            inner.x.saturating_add(cursor_column),
-            inner.y,
-        ));
-    }
 }
 
 fn input_title(app: &App, mode: InputMode) -> String {
@@ -6388,6 +8927,43 @@ fn line_input_projection(draft: &[char], cursor: usize, inner_width: u16) -> (St
         format!("{PREFIX}{}", safe_inline(&visible)),
         prefix_width.saturating_add(before_width as u16),
     )
+}
+
+/// Render the slow-blinking block cursor in the Ratatui buffer instead of
+/// repeatedly moving the terminal emulator's hardware cursor. Live serial RX
+/// can redraw at up to 30 FPS without restarting this independently scheduled
+/// phase, which avoids the emulator's high-frequency blink/flicker artifact.
+fn line_with_software_cursor(
+    text: String,
+    cursor_column: u16,
+    cursor_visible: bool,
+) -> Line<'static> {
+    let mut before = String::new();
+    let mut after = String::new();
+    let mut cursor = None;
+    let mut column = 0u16;
+    for character in text.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0).max(1) as u16;
+        if cursor.is_none() && column == cursor_column {
+            cursor = Some(character.to_string());
+        } else if cursor.is_some() {
+            after.push(character);
+        } else {
+            before.push(character);
+        }
+        column = column.saturating_add(width);
+    }
+    let cursor = cursor.unwrap_or_else(|| " ".into());
+    let cursor_style = if cursor_visible {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(cursor, cursor_style),
+        Span::raw(after),
+    ])
 }
 
 fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -6499,6 +9075,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         help_item("help.line2"),
         help_item("help.line3"),
         help_item("help.search.scope"),
+        help_item("help.output.search"),
         help_item("help.follow"),
         help_item("help.echo"),
         Line::default(),
@@ -6613,12 +9190,59 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
         chunks[4],
     );
 
-    if let Some(prompt) = menu.prompt.as_ref() {
-        draw_menu_prompt(frame, prompt, popup);
+    if let Some(confirmation) = menu.confirmation.as_ref() {
+        draw_menu_confirmation(frame, confirmation, popup);
+    } else if let Some(prompt) = menu.prompt.as_ref() {
+        draw_menu_prompt(frame, prompt, popup, app.software_cursor_visible);
     }
 }
 
-fn draw_menu_prompt(frame: &mut Frame<'_>, prompt: &MenuPrompt, parent: Rect) {
+fn draw_menu_confirmation(frame: &mut Frame<'_>, confirmation: &MenuConfirmation, parent: Rect) {
+    let width = parent.width.saturating_sub(4).clamp(1, 92);
+    let desired_height = u16::try_from(confirmation.lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4);
+    let height = desired_height.min(parent.height.saturating_sub(2)).max(1);
+    let popup = centered_rect(width, height, parent);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", confirmation.title))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let viewport = chunks[0].height as usize;
+    let scroll = confirmation
+        .scroll
+        .min(confirmation.lines.len().saturating_sub(viewport));
+    let lines = confirmation
+        .lines
+        .iter()
+        .skip(scroll)
+        .cloned()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(tr("menu.profile.shared.footer"))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Yellow)),
+        chunks[1],
+    );
+}
+
+fn draw_menu_prompt(
+    frame: &mut Frame<'_>,
+    prompt: &MenuPrompt,
+    parent: Rect,
+    cursor_visible: bool,
+) {
     let width = parent.width.saturating_sub(6).clamp(1, 76);
     let popup = centered_rect(width, 5.min(parent.height).max(1), parent);
     frame.render_widget(Clear, popup);
@@ -6633,15 +9257,10 @@ fn draw_menu_prompt(frame: &mut Frame<'_>, prompt: &MenuPrompt, parent: Rect) {
         prompt.value.clone()
     };
     let (text, cursor) = line_input_projection(&visible, prompt.cursor, inner.width);
-    frame.render_widget(Paragraph::new(text).block(block), popup);
-    if inner.width > 0 && inner.height > 0 {
-        frame.set_cursor_position(Position::new(
-            inner
-                .x
-                .saturating_add(cursor.min(inner.width.saturating_sub(1))),
-            inner.y,
-        ));
-    }
+    frame.render_widget(
+        Paragraph::new(line_with_software_cursor(text, cursor, cursor_visible)).block(block),
+        popup,
+    );
 }
 
 fn menu_page_title(page: MenuPage) -> &'static str {
@@ -6653,13 +9272,18 @@ fn menu_page_title(page: MenuPage) -> &'static str {
         MenuPage::Models => tr("menu.model.title"),
         MenuPage::ModelParents => tr("menu.model.parent.title"),
         MenuPage::SerialSettings => tr("menu.serial.title"),
+        MenuPage::DisplaySettings => tr("menu.display.title"),
+        MenuPage::RunSettings => tr("menu.run.title"),
         MenuPage::Help => tr("menu.help.title"),
     }
 }
 
 fn menu_footer(page: MenuPage) -> &'static str {
     match page {
+        MenuPage::Profiles => tr("menu.footer.current"),
         MenuPage::Models => tr("menu.footer.models"),
+        MenuPage::DisplaySettings => tr("menu.footer.display"),
+        MenuPage::RunSettings => tr("menu.footer.run"),
         MenuPage::Help => tr("menu.footer.help"),
         _ => tr("menu.footer"),
     }
@@ -6681,23 +9305,214 @@ fn selected_menu_line(index: usize, selected: usize, text: String) -> Line<'stat
     ))
 }
 
+fn data_bits_label(value: DataBits) -> &'static str {
+    match value {
+        DataBits::Five => "5",
+        DataBits::Six => "6",
+        DataBits::Seven => "7",
+        DataBits::Eight => "8",
+    }
+}
+
+fn parity_label(value: Parity) -> &'static str {
+    match value {
+        Parity::None => tr("menu.detail.parity.none"),
+        Parity::Odd => tr("menu.detail.parity.odd"),
+        Parity::Even => tr("menu.detail.parity.even"),
+    }
+}
+
+fn stop_bits_label(value: StopBits) -> &'static str {
+    match value {
+        StopBits::One => "1",
+        StopBits::Two => "2",
+    }
+}
+
+fn flow_control_label(value: FlowControl) -> &'static str {
+    match value {
+        FlowControl::None => tr("menu.detail.flow.none"),
+        FlowControl::Software => tr("menu.detail.flow.software"),
+        FlowControl::Hardware => tr("menu.detail.flow.hardware"),
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        tr("menu.value.on")
+    } else {
+        tr("menu.value.off")
+    }
+}
+
+fn enabled_disabled(value: bool) -> &'static str {
+    if value {
+        tr("menu.value.enabled")
+    } else {
+        tr("menu.value.disabled")
+    }
+}
+
+fn eol_label(value: Option<&str>) -> String {
+    match value {
+        Some("\r") => "CR".into(),
+        Some("\n") => "LF".into(),
+        Some("\r\n") => "CRLF".into(),
+        Some("") => tr("menu.detail.eol.none").into(),
+        Some(value) => safe_inline(value),
+        None => tr("menu.detail.eol.inherit").into(),
+    }
+}
+
+fn echo_label(value: Option<EchoMode>) -> &'static str {
+    match value {
+        Some(EchoMode::On) => tr("menu.detail.echo.on"),
+        Some(EchoMode::Off) => tr("menu.detail.echo.off"),
+        Some(EchoMode::Auto) => tr("menu.detail.echo.auto"),
+        None => tr("menu.detail.eol.inherit"),
+    }
+}
+
+fn optional_profile_value(value: Option<&str>) -> String {
+    value
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("menu.value.unbound").into())
+}
+
+fn optional_number<T: ToString>(value: Option<T>) -> String {
+    value.map_or_else(
+        || tr("menu.detail.eol.inherit").into(),
+        |value| value.to_string(),
+    )
+}
+
+fn orphan_run_timeout_label(seconds: u64) -> String {
+    if seconds == 0 {
+        tr("menu.run.timeout.unlimited").into()
+    } else {
+        trf("menu.run.timeout.seconds", &[&seconds.to_string()])
+    }
+}
+
 fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
     match menu.page {
         MenuPage::Root => [
             tr("menu.root.profile"),
             tr("menu.root.model"),
             tr("menu.root.serial"),
+            tr("menu.root.display"),
+            tr("menu.root.run"),
             tr("menu.root.help"),
         ]
         .into_iter()
         .enumerate()
         .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
         .collect(),
-        MenuPage::Profiles => [tr("menu.profile.transport"), tr("menu.profile.device")]
+        MenuPage::Profiles => {
+            let (Some(editor), Some(catalog)) =
+                (menu.profile_editor.as_ref(), menu.catalog.as_ref())
+            else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let slot_id = app.selected_slot_id();
+            let binding = slot_model_binding(catalog, &slot_id);
+            let model = binding.and_then(|binding| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.id == binding.model_id)
+            });
+            let changed = editor.port_update().is_some()
+                || editor.transport_update().is_some()
+                || editor.device_update().is_some();
+            [
+                trf("menu.current.row.port", &[&safe_inline(&editor.port)]),
+                trf(
+                    "menu.current.row.transport",
+                    &[&safe_inline(&editor.transport.name)],
+                ),
+                trf(
+                    "menu.current.row.baud",
+                    &[&editor.transport.baud_rate.to_string()],
+                ),
+                trf(
+                    "menu.current.row.data",
+                    &[data_bits_label(editor.transport.data_bits)],
+                ),
+                trf(
+                    "menu.current.row.parity",
+                    &[parity_label(editor.transport.parity)],
+                ),
+                trf(
+                    "menu.current.row.stop",
+                    &[stop_bits_label(editor.transport.stop_bits)],
+                ),
+                trf(
+                    "menu.current.row.flow",
+                    &[flow_control_label(editor.transport.flow_control)],
+                ),
+                trf("menu.current.row.dtr", &[on_off(editor.transport.dtr)]),
+                trf("menu.current.row.rts", &[on_off(editor.transport.rts)]),
+                trf(
+                    "menu.current.row.auto",
+                    &[enabled_disabled(editor.transport.auto_open)],
+                ),
+                trf(
+                    "menu.current.row.device",
+                    &[&editor
+                        .original_device
+                        .as_ref()
+                        .map(|profile| safe_inline(&profile.name))
+                        .unwrap_or_else(|| tr("menu.value.generic").into())],
+                ),
+                trf(
+                    "menu.current.row.eol",
+                    &[&eol_label(editor.device.write_eol.as_deref())],
+                ),
+                trf("menu.current.row.echo", &[echo_label(editor.device.echo)]),
+                trf(
+                    "menu.current.row.shell",
+                    &[&optional_profile_value(
+                        editor.device.shell_prompt.as_deref(),
+                    )],
+                ),
+                trf(
+                    "menu.current.row.uboot",
+                    &[&optional_profile_value(
+                        editor.device.uboot_prompt.as_deref(),
+                    )],
+                ),
+                trf(
+                    "menu.current.row.chunk",
+                    &[&optional_number(editor.device.write_chunk_size)],
+                ),
+                trf(
+                    "menu.current.row.delay",
+                    &[&optional_number(editor.device.write_chunk_delay_ms)],
+                ),
+                trf(
+                    "menu.current.row.model.binding",
+                    &[&binding
+                        .map(|binding| safe_inline(&binding.model_id))
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
+                ),
+                trf(
+                    "menu.current.row.model.name",
+                    &[&model
+                        .map(|model| safe_inline(&model.name))
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
+                ),
+                if changed {
+                    tr("menu.current.row.apply.changed").into()
+                } else {
+                    tr("menu.current.row.apply.clean").into()
+                },
+            ]
             .into_iter()
             .enumerate()
-            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
-            .collect(),
+            .map(|(index, text)| selected_menu_line(index, menu.selected, text))
+            .collect()
+        }
         MenuPage::TransportProfiles => {
             let Some(catalog) = menu.catalog.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
@@ -6815,6 +9630,22 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
             .enumerate()
             .map(|(index, preset)| selected_menu_line(index, menu.selected, preset.label()))
             .collect(),
+        MenuPage::DisplaySettings => vec![selected_menu_line(
+            0,
+            menu.selected,
+            trf(
+                "menu.display.history.rows",
+                &[&app.agent_history_rows.to_string()],
+            ),
+        )],
+        MenuPage::RunSettings => vec![selected_menu_line(
+            0,
+            menu.selected,
+            trf(
+                "menu.run.timeout.row",
+                &[&orphan_run_timeout_label(app.orphan_run_timeout_seconds)],
+            ),
+        )],
         MenuPage::Help => menu_help_lines()
             .into_iter()
             .map(|line| match line {
@@ -6861,7 +9692,13 @@ fn menu_detail(app: &App, menu: &MenuState) -> String {
             }
         }
         MenuPage::Models | MenuPage::ModelParents => tr("menu.model.verify").into(),
-        MenuPage::Profiles => tr("menu.profile.detail").into(),
+        MenuPage::Profiles => match CurrentProfileRow::from_index(menu.selected) {
+            Some(CurrentProfileRow::ModelBinding | CurrentProfileRow::ModelName) => {
+                tr("menu.current.model.detail").into()
+            }
+            Some(CurrentProfileRow::Apply) => tr("menu.current.apply.detail").into(),
+            _ => tr("menu.current.detail").into(),
+        },
         MenuPage::SerialSettings => {
             let Some(catalog) = menu.catalog.as_ref() else {
                 return tr("menu.loading").into();
@@ -6874,6 +9711,17 @@ fn menu_detail(app: &App, menu: &MenuState) -> String {
                 ))],
             )
         }
+        MenuPage::DisplaySettings => trf(
+            "menu.display.detail",
+            &[&app.agent_history_rows.to_string()],
+        ),
+        MenuPage::RunSettings => trf(
+            "menu.run.detail",
+            &[
+                &orphan_run_timeout_label(app.orphan_run_timeout_seconds),
+                &orphan_run_timeout_label(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS),
+            ],
+        ),
         MenuPage::Help => String::new(),
         _ => tr("menu.root.detail").into(),
     }
@@ -7019,6 +9867,21 @@ fn find_history_match(history: &[String], query: &str, before: Option<usize>) ->
         .rposition(|entry| entry.contains(query))
 }
 
+fn output_search_filter(
+    query: &str,
+    matcher: OutputSearchMatcher,
+    case_sensitive: bool,
+) -> (Option<String>, Option<String>) {
+    match (matcher, case_sensitive) {
+        (OutputSearchMatcher::Literal, true) => (Some(query.to_owned()), None),
+        (OutputSearchMatcher::Literal, false) => {
+            (None, Some(format!("(?i:{})", regex::escape(query))))
+        }
+        (OutputSearchMatcher::Regex, true) => (None, Some(query.to_owned())),
+        (OutputSearchMatcher::Regex, false) => (None, Some(format!("(?i:{query})"))),
+    }
+}
+
 fn raw_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     match key.code {
         KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -7083,6 +9946,10 @@ mod tests {
             .lock()
             .expect("test clipboard lock")
             .push(text.to_owned());
+        Ok(())
+    }
+
+    fn accept_clipboard_copy(_text: &str) -> Result<()> {
         Ok(())
     }
 
@@ -7186,6 +10053,49 @@ mod tests {
         );
         assert_eq!(app.slots[0].snapshot.last_rx_wall_time_ns, Some(1));
         assert!(!app.slots[0].lines.is_empty());
+    }
+
+    #[test]
+    fn startup_history_is_seeded_before_ring_replay_and_deduplicates_the_boundary() {
+        let mut snapshot = snapshot();
+        snapshot.head_seq = 3;
+        let epoch = snapshot.daemon_epoch;
+        let mut old = event(EventKind::Rx, Direction::Rx, 1, b"old\r\n");
+        old.daemon_epoch = epoch;
+        let mut persisted_tail = event(EventKind::Rx, Direction::Rx, 2, b"persisted\r\n");
+        persisted_tail.daemon_epoch = epoch;
+        let history = StartupHistory {
+            slot_id: "slot-1".into(),
+            epoch,
+            head_seq: 3,
+            events: vec![old, persisted_tail.clone()],
+            gaps: Vec::new(),
+            resume_cursor: Some(Cursor {
+                epoch,
+                after_seq: 2,
+            }),
+            limited: false,
+            error: None,
+        };
+        let mut app = App::new(vec![snapshot], None);
+
+        let (_, cursor) = app
+            .apply_startup_history(history)
+            .expect("verified startup cursor");
+        assert_eq!(cursor.after_seq, 2);
+        assert_eq!(app.slots[0].last_seq, 2);
+        assert_eq!(app.slots[0].lines.len(), 2);
+
+        let (commands, _) = mpsc::channel(4);
+        app.push_event(persisted_tail, true, &commands);
+        assert_eq!(app.slots[0].lines.len(), 2);
+        let mut non_durable_live_tail = event(EventKind::Rx, Direction::Rx, 3, b"live\r\n");
+        non_durable_live_tail.daemon_epoch = epoch;
+        non_durable_live_tail.durable = false;
+        app.push_event(non_durable_live_tail, true, &commands);
+
+        assert_eq!(app.slots[0].last_seq, 3);
+        assert_eq!(app.slots[0].lines.len(), 3);
     }
 
     #[test]
@@ -8438,6 +11348,458 @@ mod tests {
     }
 
     #[test]
+    fn output_search_filters_escape_literals_and_bound_case_mode() {
+        assert_eq!(
+            output_search_filter("a.b[0]", OutputSearchMatcher::Literal, true),
+            (Some("a.b[0]".into()), None)
+        );
+        assert_eq!(
+            output_search_filter("a.b[0]", OutputSearchMatcher::Literal, false),
+            (None, Some(r"(?i:a\.b\[0\])".into()))
+        );
+        assert_eq!(
+            output_search_filter("error|panic", OutputSearchMatcher::Regex, false),
+            (None, Some("(?i:error|panic)".into()))
+        );
+    }
+
+    #[test]
+    fn output_search_footer_puts_integrity_before_navigation_and_keeps_limits() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        app.open_output_search();
+        let search = app.output_search.as_mut().expect("search");
+        search.results = vec![event(EventKind::Rx, Direction::Rx, 1, b"match")];
+        search.partial = true;
+        search.scanned_archives = 4;
+        search.gaps.push(GapRange {
+            epoch: search.current_epoch,
+            first_seq: 10,
+            last_seq: 12,
+            reason: serial_protocol::GapReason::Retention,
+        });
+
+        let footer = output_search_result_footer(search);
+        assert_eq!(footer.integrity, "⚠ PARTIAL · 1 journal gap(s)");
+        assert!(footer.navigation.starts_with("1/1 · 4 archives"));
+        assert!(!footer.navigation.contains("PARTIAL"));
+        assert!(
+            footer
+                .limits
+                .as_deref()
+                .is_some_and(|limits| limits.contains("10,000-sequence window/archive"))
+        );
+    }
+
+    #[test]
+    fn output_search_integrity_warning_is_visible_before_navigation_at_80_columns() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        app.open_output_search();
+        let search = app.output_search.as_mut().expect("search");
+        search.query = "boot failure".chars().collect();
+        search.phase = OutputSearchPhase::Results;
+        search.results = vec![event(EventKind::Rx, Direction::Rx, 1, b"boot failure")];
+        search.partial = true;
+        search.scanned_archives = 4;
+        search.gaps.push(GapRange {
+            epoch: search.current_epoch,
+            first_seq: 10,
+            last_seq: 12,
+            reason: serial_protocol::GapReason::Retention,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let integrity = rendered
+            .find("PARTIAL · 1 journal gap(s)")
+            .expect("compact partial/gap warning remains visible at 80 columns");
+        let navigation = rendered
+            .find("1/1 · 4 archives")
+            .expect("navigation is rendered on its own following line");
+        assert!(integrity < navigation);
+    }
+
+    #[test]
+    fn output_search_archive_count_only_advances_when_a_request_can_start() {
+        let mut scanned = 3;
+        assert!(!begin_output_search_archive(
+            OUTPUT_SEARCH_HTTP_QUERY_LIMIT,
+            &mut scanned
+        ));
+        assert_eq!(scanned, 3);
+
+        assert!(begin_output_search_archive(
+            OUTPUT_SEARCH_HTTP_QUERY_LIMIT - 1,
+            &mut scanned
+        ));
+        assert_eq!(scanned, 4);
+    }
+
+    #[test]
+    fn output_search_pagination_must_advance_within_the_same_epoch() {
+        let epoch = Uuid::new_v4();
+        assert_eq!(
+            output_search_page_progress(
+                true,
+                Some(&Cursor {
+                    epoch,
+                    after_seq: 120,
+                }),
+                epoch,
+                100,
+                200,
+            ),
+            OutputSearchPageProgress::Continue(120)
+        );
+        assert_eq!(
+            output_search_page_progress(
+                true,
+                Some(&Cursor {
+                    epoch,
+                    after_seq: 200,
+                }),
+                epoch,
+                120,
+                200,
+            ),
+            OutputSearchPageProgress::Complete
+        );
+        assert_eq!(
+            output_search_page_progress(
+                true,
+                Some(&Cursor {
+                    epoch: Uuid::new_v4(),
+                    after_seq: 150,
+                }),
+                epoch,
+                120,
+                200,
+            ),
+            OutputSearchPageProgress::Incomplete
+        );
+        assert_eq!(
+            output_search_page_progress(true, None, epoch, 120, 200),
+            OutputSearchPageProgress::Incomplete
+        );
+        // Snapshot head H=12 can lead durable journal head K=10. A clean page
+        // at K is still incomplete and must not silently claim a full search.
+        assert_eq!(
+            output_search_page_progress(
+                false,
+                Some(&Cursor {
+                    epoch,
+                    after_seq: 10,
+                }),
+                epoch,
+                0,
+                12,
+            ),
+            OutputSearchPageProgress::Incomplete
+        );
+        // A disappeared/empty archive with no authoritative scan cursor is
+        // likewise partial, not a complete zero-match result.
+        assert_eq!(
+            output_search_page_progress(false, None, epoch, 0, 12),
+            OutputSearchPageProgress::Incomplete
+        );
+        // No matching events is complete when the scan cursor still proves
+        // the requested head was examined.
+        assert_eq!(
+            output_search_page_progress(
+                false,
+                Some(&Cursor {
+                    epoch,
+                    after_seq: 12,
+                }),
+                epoch,
+                0,
+                12,
+            ),
+            OutputSearchPageProgress::Complete
+        );
+    }
+
+    #[test]
+    fn output_search_keeps_the_newest_matches_while_forward_pages_arrive() {
+        let epoch = Uuid::new_v4();
+        let epoch_ranks = HashMap::from([(epoch, 0)]);
+        let mut events = (1..=250)
+            .map(|seq| {
+                let mut event = event(EventKind::Rx, Direction::Rx, seq, b"match");
+                event.daemon_epoch = epoch;
+                // A backwards wall-clock jump must never make a higher
+                // sequence look older within one daemon epoch.
+                event.wall_time_ns = 1_000 - seq as i64;
+                event
+            })
+            .collect::<Vec<_>>();
+        assert!(retain_newest_output_search_events(
+            &mut events,
+            &epoch_ranks
+        ));
+        assert_eq!(events.len(), OUTPUT_SEARCH_LIMIT_EVENTS);
+        assert_eq!(events.first().map(|event| event.seq), Some(250));
+        assert_eq!(events.last().map(|event| event.seq), Some(51));
+
+        events.extend((251..=275).map(|seq| {
+            let mut event = event(EventKind::Rx, Direction::Rx, seq, b"later match");
+            event.daemon_epoch = epoch;
+            event.wall_time_ns = 1_000 - seq as i64;
+            event
+        }));
+        assert!(retain_newest_output_search_events(
+            &mut events,
+            &epoch_ranks
+        ));
+        assert_eq!(events.first().map(|event| event.seq), Some(275));
+        assert_eq!(events.last().map(|event| event.seq), Some(76));
+    }
+
+    #[test]
+    fn output_search_cross_epoch_order_uses_archive_rank_not_wall_clock() {
+        let newer_epoch = Uuid::new_v4();
+        let older_epoch = Uuid::new_v4();
+        let epoch_ranks = HashMap::from([(newer_epoch, 0), (older_epoch, 1)]);
+        let mut events = Vec::new();
+        events.extend((1..=150).map(|seq| {
+            let mut event = event(EventKind::Rx, Direction::Rx, seq, b"new archive");
+            event.daemon_epoch = newer_epoch;
+            // Deliberately older-looking wall time.
+            event.wall_time_ns = -10_000 - seq as i64;
+            event
+        }));
+        events.extend((1_000..=1_149).map(|seq| {
+            let mut event = event(EventKind::Rx, Direction::Rx, seq, b"old archive");
+            event.daemon_epoch = older_epoch;
+            event.wall_time_ns = 10_000 + seq as i64;
+            event
+        }));
+
+        assert!(retain_newest_output_search_events(
+            &mut events,
+            &epoch_ranks
+        ));
+        assert_eq!(events.len(), OUTPUT_SEARCH_LIMIT_EVENTS);
+        assert_eq!(
+            events.first().map(|event| event.daemon_epoch),
+            Some(newer_epoch)
+        );
+        assert_eq!(events.first().map(|event| event.seq), Some(150));
+        assert_eq!(events.get(149).map(|event| event.seq), Some(1));
+        assert_eq!(
+            events.get(150).map(|event| event.daemon_epoch),
+            Some(older_epoch)
+        );
+        assert_eq!(events.get(150).map(|event| event.seq), Some(1_149));
+        assert_eq!(events.last().map(|event| event.seq), Some(1_100));
+    }
+
+    #[test]
+    fn output_search_prefix_builds_run_scoped_query_and_plain_escape_cancels_loading() {
+        let mut current = snapshot();
+        current.head_seq = 80;
+        let mut run = agent_run("inspect boot");
+        run.start_seq = 20;
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        let (search_commands, mut received) = mpsc::channel(4);
+        app.output_search_commands = Some(search_commands);
+        let (network_commands, _network_rx) = mpsc::channel(1);
+
+        app.handle_prefix_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &network_commands,
+        );
+        for character in "Error".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        app.handle_output_search_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        app.handle_output_search_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+        app.handle_output_search_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("journal query")
+        else {
+            panic!("expected a search query");
+        };
+        assert_eq!(request.scope, OutputSearchScope::CurrentRun);
+        assert_eq!(request.direction, OutputSearchDirection::Rx);
+        assert_eq!(request.current_run.map(|scope| scope.id), Some(run.id));
+        assert_eq!(request.contains, None);
+        assert_eq!(request.regex.as_deref(), Some("(?i:Error)"));
+        assert!(matches!(
+            app.output_search.as_ref().map(|search| search.phase),
+            Some(OutputSearchPhase::Loading(id)) if id == request.request_id
+        ));
+
+        // The Esc arm must not inherit the Ctrl-C guard.
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.output_search.is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(OutputSearchIoCommand::Cancel { request_id }) if request_id == request.request_id
+        ));
+    }
+
+    #[test]
+    fn output_search_submit_refreshes_the_current_epoch_head() {
+        let mut current = snapshot();
+        current.head_seq = 100;
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        app.open_output_search();
+        let (commands, mut received) = mpsc::channel(2);
+        app.output_search_commands = Some(commands);
+        {
+            let search = app.output_search.as_mut().expect("search");
+            search.query = "needle".chars().collect();
+            search.cursor = search.query.len();
+        }
+        app.slots[0].snapshot.head_seq = 101;
+
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("query") else {
+            panic!("expected query");
+        };
+        assert_eq!(request.current_epoch, epoch);
+        assert_eq!(request.head_seq, 101);
+        let search = app.output_search.as_ref().expect("loading search");
+        assert_eq!(search.head_seq, 101);
+        assert!(output_search_target(search).contains("#101"));
+    }
+
+    #[test]
+    fn output_search_submit_switches_to_the_new_authoritative_epoch() {
+        let mut current = snapshot();
+        current.head_seq = 100;
+        let old_epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        app.open_output_search();
+        let (commands, mut received) = mpsc::channel(2);
+        app.output_search_commands = Some(commands);
+        {
+            let search = app.output_search.as_mut().expect("search");
+            search.query = "boot".chars().collect();
+            search.cursor = search.query.len();
+        }
+        let new_epoch = Uuid::new_v4();
+        app.slots[0].snapshot.daemon_epoch = new_epoch;
+        app.slots[0].snapshot.head_seq = 7;
+
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("query") else {
+            panic!("expected query");
+        };
+        assert_ne!(request.current_epoch, old_epoch);
+        assert_eq!(request.current_epoch, new_epoch);
+        assert_eq!(request.head_seq, 7);
+        let search = app.output_search.as_ref().expect("loading search");
+        assert_eq!(search.current_epoch, new_epoch);
+        assert!(output_search_target(search).contains(&new_epoch.to_string()[..8]));
+    }
+
+    #[test]
+    fn output_search_run_scope_rebinds_to_the_active_run_on_every_submit() {
+        let mut current = snapshot();
+        current.head_seq = 100;
+        let mut first_run = agent_run("first");
+        first_run.start_seq = 10;
+        current.active_run = Some(first_run.clone());
+        let mut app = App::new(vec![current], None);
+        app.open_output_search();
+        let (commands, mut received) = mpsc::channel(2);
+        app.output_search_commands = Some(commands);
+        {
+            let search = app.output_search.as_mut().expect("search");
+            search.scope = OutputSearchScope::CurrentRun;
+            search.query = "login".chars().collect();
+            search.cursor = search.query.len();
+        }
+        let mut replacement = agent_run("replacement");
+        replacement.start_seq = 105;
+        app.slots[0].snapshot.active_run = Some(replacement.clone());
+        app.slots[0].snapshot.head_seq = 120;
+
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("query") else {
+            panic!("expected query");
+        };
+        assert_ne!(replacement.id, first_run.id);
+        assert_eq!(request.current_run.map(|run| run.id), Some(replacement.id));
+        assert_eq!(request.current_run.map(|run| run.start_seq), Some(105));
+        assert_eq!(request.current_run.map(|run| run.through_seq), Some(120));
+
+        let mut without_run = snapshot();
+        without_run.head_seq = 121;
+        let mut app = App::new(vec![without_run], None);
+        app.open_output_search();
+        let (commands, mut no_query) = mpsc::channel(1);
+        app.output_search_commands = Some(commands);
+        {
+            let search = app.output_search.as_mut().expect("search");
+            search.scope = OutputSearchScope::CurrentRun;
+            search.query = "login".chars().collect();
+            search.cursor = search.query.len();
+        }
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(no_query.try_recv().is_err());
+        assert!(
+            app.output_search
+                .as_ref()
+                .and_then(|search| search.error.as_deref())
+                .is_some_and(|error| error == tr("ui.output.search.no.run"))
+        );
+    }
+
+    #[test]
+    fn output_search_results_navigate_records_and_scroll_selected_detail() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.open_output_search();
+        let request_id = Uuid::new_v4();
+        app.output_search.as_mut().expect("search").phase = OutputSearchPhase::Loading(request_id);
+        let first = event(EventKind::Rx, Direction::Rx, 2, b"newest match");
+        let second = event(EventKind::Tx, Direction::Tx, 1, b"older match");
+        app.handle_output_search_io_event(OutputSearchIoEvent::Completed {
+            request_id,
+            response: OutputSearchResponse {
+                events: vec![first, second],
+                gaps: Vec::new(),
+                partial: true,
+                scanned_archives: 2,
+            },
+        });
+
+        app.handle_output_search_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(
+            app.output_search
+                .as_ref()
+                .map(|search| search.detail_scroll),
+            Some(5)
+        );
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let search = app.output_search.as_ref().expect("results remain open");
+        assert_eq!(search.selected, 1);
+        assert_eq!(search.detail_scroll, 0);
+        assert!(search.partial);
+        assert_eq!(search.scanned_archives, 2);
+    }
+
+    #[test]
     fn tab_completion_cycles_deduplicated_newest_first_candidates() {
         let mut app = App::new(vec![snapshot()], None);
         {
@@ -8592,6 +11954,44 @@ mod tests {
         }
     }
 
+    fn editable_profile_fixture() -> (SlotSnapshot, MenuCatalog) {
+        let mut current = snapshot();
+        current.config.device_profile = Some("dut-console".into());
+        let transport = TransportProfile {
+            name: current.config.profile.clone(),
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+            dtr: false,
+            rts: false,
+            auto_open: true,
+        };
+        let device = DeviceProfile {
+            name: "dut-console".into(),
+            shell_prompt: Some("dut# ".into()),
+            uboot_prompt: Some("dut=> ".into()),
+            write_eol: Some("\r".into()),
+            echo: Some(EchoMode::On),
+            write_chunk_size: Some(1),
+            write_chunk_delay_ms: Some(1),
+        };
+        let catalog = MenuCatalog {
+            auth_required: false,
+            slots: vec![current.clone()],
+            config_revision: Some(41),
+            transport_profiles: vec![transport],
+            transport_revision: Some(41),
+            device_profiles: vec![device],
+            device_revision: Some(41),
+            models: Vec::new(),
+            model_bindings: Vec::new(),
+            model_revision: 41,
+        };
+        (current, catalog)
+    }
+
     fn trigger_info(snapshot: &SlotSnapshot, status: TriggerStatus) -> TriggerInfo {
         TriggerInfo {
             id: Uuid::new_v4(),
@@ -8726,6 +12126,7 @@ mod tests {
     fn stream_row(seq: u64, direction: Direction, text: &str) -> DisplayLine {
         DisplayLine {
             seq,
+            operation_id: None,
             source: if direction == Direction::Tx {
                 "HUMAN:test[abcd1234]>".into()
             } else {
@@ -9067,10 +12468,6 @@ mod tests {
         assert_eq!(history.commands.len(), 2);
         assert_eq!(history.commands[0].steps.len(), 1);
         assert_eq!(history.commands[0].steps[0].data, b"show version\r");
-        assert!(
-            history.commands[0].steps[0].partial,
-            "operation chunks preserve any partial-write outcome"
-        );
         assert_eq!(
             history.commands[0].description.as_deref(),
             Some("读取系统版本")
@@ -9154,8 +12551,10 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<String>();
         assert_eq!(rendered.matches("登录样机控制台").count(), 1);
-        assert!(rendered.contains("✅ admin"));
-        assert!(rendered.contains("❌ password"));
+        assert!(rendered.contains("admin"));
+        assert!(rendered.contains("password"));
+        assert!(!rendered.contains('\u{2705}'));
+        assert!(!rendered.contains('\u{274c}'));
         assert!(!rendered.contains("已确认发送"));
     }
 
@@ -9224,6 +12623,372 @@ mod tests {
                 .height,
             12
         );
+    }
+
+    #[test]
+    fn orphan_run_timeout_defaults_and_preserves_valid_configuration() {
+        assert_eq!(configured_orphan_run_timeout_seconds(None), 1800);
+        assert_eq!(configured_orphan_run_timeout_seconds(Some(0)), 0);
+        assert_eq!(configured_orphan_run_timeout_seconds(Some(3600)), 3600);
+        assert_eq!(
+            configured_orphan_run_timeout_seconds(Some(u64::MAX)),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn display_menu_selects_and_persists_agent_history_height() {
+        let temporary = std::env::temp_dir().join(format!(
+            "serialctl-display-settings-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = temporary.join("serialctl.toml");
+        let mut app = App::new(vec![snapshot()], None);
+        app.config = Some(LoadedConfig {
+            path: path.clone(),
+            config: crate::config::ClientConfig::default(),
+        });
+        let mut menu = MenuState::new();
+        menu.busy = true;
+        menu.selected = 3;
+
+        app.activate_menu_item(&mut menu);
+        assert_eq!(menu.page, MenuPage::DisplaySettings);
+        assert_eq!(menu.selected, 0);
+
+        app.activate_menu_item(&mut menu);
+        let mut prompt = menu.prompt.take().expect("exact row-count prompt");
+        prompt.value = "12".chars().collect();
+        prompt.cursor = prompt.value.len();
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(app.agent_history_rows, 12);
+        assert!(menu.message.contains("12"));
+
+        let saved = LoadedConfig::load(Some(path)).expect("saved display settings");
+        assert_eq!(saved.config.agent_history_rows, Some(12));
+        std::fs::remove_dir_all(temporary).expect("remove display settings fixture");
+    }
+
+    #[test]
+    fn current_profile_page_edits_fields_and_submits_observed_revisions() {
+        let (current, mut catalog) = editable_profile_fixture();
+        let mut transport_peer = current.clone();
+        transport_peer.config.id = "slot-2".into();
+        transport_peer.config.display_name = "Peer UART".into();
+        transport_peer.config.device_profile = None;
+        let mut device_peer = current.clone();
+        device_peer.config.id = "slot-3".into();
+        device_peer.config.display_name = "Peer DUT".into();
+        device_peer.config.profile = "other-uart".into();
+        catalog
+            .slots
+            .extend([transport_peer.clone(), device_peer.clone()]);
+        let mut app = App::new(vec![current], None);
+        let (menu_commands, mut received) = mpsc::channel(2);
+        app.menu_commands = Some(menu_commands);
+        let mut menu = MenuState::new();
+        menu.page = MenuPage::Profiles;
+        menu.catalog = Some(catalog);
+        menu.busy = false;
+        app.refresh_current_profile_editor(&mut menu);
+
+        let rows = menu_rows(&app, &menu)
+            .into_iter()
+            .map(|line| line_plain_text(&line))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT);
+        for expected in [
+            "COM3",
+            "115200",
+            "DTR",
+            "RTS",
+            "dut-console",
+            "dut#",
+            "dut=>",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.contains(expected)),
+                "complete current profile should show {expected}: {rows:?}"
+            );
+        }
+
+        menu.selected = CurrentProfileRow::Port as usize;
+        app.activate_current_profile_row(&mut menu);
+        let mut prompt = menu.prompt.take().expect("serial-port editor");
+        prompt.value = "/dev/ttyUSB7".chars().collect();
+        prompt.cursor = prompt.value.len();
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        menu.selected = CurrentProfileRow::BaudRate as usize;
+        app.activate_current_profile_row(&mut menu);
+        let mut prompt = menu.prompt.take().expect("baud-rate editor");
+        prompt.value = "921600".chars().collect();
+        prompt.cursor = prompt.value.len();
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        menu.selected = CurrentProfileRow::DataBits as usize;
+        app.activate_current_profile_row(&mut menu);
+        menu.selected = CurrentProfileRow::Echo as usize;
+        app.activate_current_profile_row(&mut menu);
+        menu.selected = CurrentProfileRow::Apply as usize;
+        app.activate_current_profile_row(&mut menu);
+
+        assert!(
+            received.try_recv().is_err(),
+            "shared profile updates must not submit before explicit confirmation"
+        );
+        let confirmation = menu
+            .confirmation
+            .take()
+            .expect("shared profile impact confirmation");
+        let confirmation_text = confirmation.lines.join("\n");
+        for expected in ["slot-1", "slot-2", "slot-3", "Peer UART", "Peer DUT"] {
+            assert!(
+                confirmation_text.contains(expected),
+                "confirmation must list every affected Slot: {confirmation_text}"
+            );
+        }
+        app.handle_menu_confirmation_key(
+            &mut menu,
+            confirmation,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let MenuIoCommand::Admin {
+            token: None,
+            mutation:
+                MenuAdminMutation::UpdateCurrentProfiles {
+                    slot_id,
+                    port: Some(port),
+                    transport: Some(transport),
+                    device: Some(device),
+                    expected_config_revision,
+                    expected_transport_revision,
+                    expected_device_revision,
+                },
+        } = received.try_recv().expect("profile update command")
+        else {
+            panic!("expected a trusted current-profile update")
+        };
+        assert_eq!(slot_id, "slot-1");
+        assert_eq!(port, "/dev/ttyUSB7");
+        assert_eq!(expected_config_revision, Some(41));
+        assert_eq!(expected_transport_revision, Some(41));
+        assert_eq!(expected_device_revision, Some(41));
+        assert_eq!(transport.baud_rate, 921_600);
+        assert_eq!(transport.data_bits, DataBits::Five);
+        assert_eq!(device.echo, Some(EchoMode::Off));
+    }
+
+    #[test]
+    fn shared_profile_impact_scans_transport_and_device_bindings_separately() {
+        let (current, mut catalog) = editable_profile_fixture();
+        let mut transport_peer = current.clone();
+        transport_peer.config.id = "a-transport-peer".into();
+        transport_peer.config.display_name = "Transport peer".into();
+        transport_peer.config.device_profile = None;
+        let mut device_peer = current.clone();
+        device_peer.config.id = "z-device-peer".into();
+        device_peer.config.display_name = "Device peer".into();
+        device_peer.config.profile = "other-uart".into();
+        catalog.slots.extend([transport_peer, device_peer]);
+
+        let editor = CurrentProfileEditor::new(&SlotView::new(current), &catalog);
+        let impacts =
+            shared_profile_impacts(&catalog, Some(&editor.transport), Some(&editor.device));
+        assert_eq!(
+            impacts
+                .transport
+                .expect("transport impact")
+                .slots
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["a-transport-peer", "slot-1"]
+        );
+        assert_eq!(
+            impacts
+                .device
+                .expect("device impact")
+                .slots
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["slot-1", "z-device-peer"]
+        );
+    }
+
+    #[test]
+    fn bound_model_rename_lists_every_affected_slot_before_revision_guarded_command() {
+        let _guard = crate::i18n::lang_test_lock();
+        let (current, mut catalog) = editable_profile_fixture();
+        let model = DeviceModel {
+            id: "tl-as7230-1-0".into(),
+            name: "TL-AS7230 1.0".into(),
+            parent_id: None,
+            aliases: Vec::new(),
+        };
+        catalog.model_bindings.push(SlotModelBinding {
+            slot_id: current.config.id.clone(),
+            model_id: model.id.clone(),
+            confirmation_method: ModelConfirmationMethod::Human,
+            note: None,
+            updated_wall_time_ns: 0,
+            source: "human:test".into(),
+        });
+        let mut peer = current.clone();
+        peer.config.id = "slot-model-peer".into();
+        peer.config.display_name = "Peer DUT".into();
+        catalog.slots.push(peer.clone());
+        catalog.model_bindings.push(SlotModelBinding {
+            slot_id: peer.config.id.clone(),
+            model_id: model.id.clone(),
+            confirmation_method: ModelConfirmationMethod::Human,
+            note: None,
+            updated_wall_time_ns: 0,
+            source: "human:test".into(),
+        });
+        catalog.models.push(model);
+        catalog.model_revision = 77;
+        let mut app = App::new(vec![current], None);
+        let (menu_commands, mut received) = mpsc::channel(1);
+        app.menu_commands = Some(menu_commands);
+        let mut menu = MenuState::new();
+        menu.page = MenuPage::Profiles;
+        menu.catalog = Some(catalog);
+        menu.busy = false;
+        app.refresh_current_profile_editor(&mut menu);
+        menu.selected = CurrentProfileRow::ModelName as usize;
+
+        app.activate_current_profile_row(&mut menu);
+        let mut prompt = menu.prompt.take().expect("model-name editor");
+        prompt.value = "TL-AS7230 1.1".chars().collect();
+        prompt.cursor = prompt.value.len();
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(
+            received.try_recv().is_err(),
+            "a shared model rename must not submit before explicit confirmation"
+        );
+        let confirmation = menu
+            .confirmation
+            .take()
+            .expect("shared model impact confirmation");
+        let confirmation_text = confirmation.lines.join("\n");
+        for expected in ["slot-1", "slot-model-peer", "Peer DUT", "tl-as7230-1-0"] {
+            assert!(
+                confirmation_text.contains(expected),
+                "confirmation must list every affected Slot: {confirmation_text}"
+            );
+        }
+        app.handle_menu_confirmation_key(
+            &mut menu,
+            confirmation,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(MenuIoCommand::RenameBoundModel {
+                slot_id,
+                model_id,
+                name,
+                expected_revision: 77,
+                expected_current: Some(current),
+            }) if slot_id == "slot-1"
+                && model_id == "tl-as7230-1-0"
+                && name == "TL-AS7230 1.1"
+                && current == "tl-as7230-1-0"
+        ));
+
+        let message = menu_success_message(&MenuSuccess::ModelRenamed {
+            name: "TL-AS7230 1.1".into(),
+            affected_slots: vec!["slot-1".into(), "slot-model-peer".into()],
+        });
+        assert!(message.contains("2"));
+        assert!(message.contains("slot-1"));
+        assert!(message.contains("slot-model-peer"));
+    }
+
+    #[test]
+    fn run_settings_menu_validates_and_persists_the_orphan_timeout() {
+        let _guard = crate::i18n::lang_test_lock();
+        let temporary = std::env::temp_dir().join(format!(
+            "serialctl-run-settings-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = temporary.join("serialctl.toml");
+        let mut app = App::new(vec![snapshot()], None);
+        app.config = Some(LoadedConfig {
+            path: path.clone(),
+            config: crate::config::ClientConfig {
+                capture_max_events: Some(8192),
+                ..crate::config::ClientConfig::default()
+            },
+        });
+        let mut menu = MenuState::new();
+        menu.busy = true;
+        menu.selected = 4;
+
+        app.activate_menu_item(&mut menu);
+        assert_eq!(menu.page, MenuPage::RunSettings);
+        app.activate_menu_item(&mut menu);
+        let mut prompt = menu.prompt.take().expect("timeout prompt");
+        prompt.value = "299".chars().collect();
+        prompt.cursor = prompt.value.len();
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(menu.prompt.is_some());
+        assert_eq!(app.orphan_run_timeout_seconds, 1800);
+
+        let mut prompt = menu.prompt.take().expect("retry timeout prompt");
+        prompt.value = "3600".chars().collect();
+        prompt.cursor = prompt.value.len();
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(menu.prompt.is_none());
+        assert_eq!(app.orphan_run_timeout_seconds, 3600);
+        assert!(menu.message.contains("3600"));
+
+        app.begin_orphan_run_timeout_prompt(&mut menu);
+        let mut prompt = menu.prompt.take().expect("unlimited timeout prompt");
+        prompt.value = "0".chars().collect();
+        prompt.cursor = 1;
+        app.handle_menu_prompt_key(
+            &mut menu,
+            prompt,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(app.orphan_run_timeout_seconds, 0);
+        assert!(menu.message.contains(tr("menu.run.timeout.unlimited")));
+        let detail = menu_detail(&app, &menu);
+        assert!(detail.contains(tr("menu.run.timeout.unlimited")));
+        assert!(detail.contains("run_end"));
+
+        let saved = LoadedConfig::load(Some(path)).expect("saved Run settings");
+        assert_eq!(saved.config.orphan_run_timeout_seconds, Some(0));
+        assert_eq!(saved.config.capture_max_events, Some(8192));
+        std::fs::remove_dir_all(temporary).expect("remove Run settings fixture");
     }
 
     #[test]
@@ -9336,7 +13101,9 @@ mod tests {
             .flat_map(|row| row.line.spans)
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(row_text.contains("❌ show version"));
+        assert!(row_text.contains("show version"));
+        assert!(!row_text.contains('\u{2705}'));
+        assert!(!row_text.contains('\u{274c}'));
         assert!(!row_text.contains("已确认发送"));
 
         app.focus = PaneFocus::Input;
@@ -9389,6 +13156,61 @@ mod tests {
             app.layout
                 .and_then(|layout| layout.run_history_area)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn expanding_command_history_jumps_serial_output_to_its_operation() {
+        let mut current = snapshot();
+        let run = agent_run("定位历史命令");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for seq in 1..30 {
+            app.slots[0].push_line(
+                stream_row(seq, Direction::Rx, &format!("before-{seq}")),
+                true,
+            );
+        }
+        let operation_id = Uuid::new_v4();
+        let mut tx = event(EventKind::Tx, Direction::Tx, 30, b"show version\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(operation_id);
+        tx.metadata.insert(
+            "command_description".into(),
+            serde_json::json!("读取系统版本"),
+        );
+        app.slots[0].push_event(tx, true);
+        let mut echo = event(EventKind::Rx, Direction::Rx, 31, b"show version\r\n");
+        echo.daemon_epoch = epoch;
+        app.slots[0].push_event(echo, true);
+        for seq in 32..70 {
+            app.slots[0].push_line(
+                stream_row(seq, Direction::Rx, &format!("after-{seq}")),
+                true,
+            );
+        }
+
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.current().scroll_snapshot.is_some());
+        assert!(app.current().scroll_from_bottom > 0);
+        let inner = app.layout.expect("console layout").output_inner;
+        let visible = visible_output_lines(&app, inner)
+            .iter()
+            .map(line_plain_text)
+            .collect::<String>();
+        assert!(visible.contains("show version"), "jumped page: {visible}");
+        assert!(
+            all_output_visual_rows(&app, inner.width)
+                .iter()
+                .any(|row| row.operation_id == Some(operation_id))
         );
     }
 
@@ -9449,7 +13271,7 @@ mod tests {
         for payload in [
             "abcdefghijklmnopqrstuvwxyz0123456789",
             "中文样机命令参数甲乙丙丁戊己庚辛",
-            "login-🔐-step-✅-password-完成",
+            "login-🔐-step-🔧-password-完成",
         ] {
             let mut current = snapshot();
             let run = agent_run("查看详情");
@@ -9489,14 +13311,7 @@ mod tests {
             let reconstructed = command_rows
                 .iter()
                 .skip(1)
-                .map(|row| {
-                    let row = row.trim_start();
-                    let row = row
-                        .strip_prefix('✅')
-                        .or_else(|| row.strip_prefix('❌'))
-                        .unwrap_or(row);
-                    row.strip_prefix(' ').unwrap_or(row)
-                })
+                .map(|row| row.trim_start())
                 .collect::<String>();
             assert_eq!(reconstructed, payload);
         }
@@ -9509,7 +13324,7 @@ mod tests {
         current.active_run = Some(run.clone());
         let epoch = current.daemon_epoch;
         let mut app = App::new(vec![current], None);
-        let mut tx = event(EventKind::Tx, Direction::Tx, 2, &vec![b'x'; 512]);
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, &vec![b'x'; 2048]);
         tx.daemon_epoch = epoch;
         tx.actor = Some(run.owner.clone());
         tx.run_id = Some(run.id);
@@ -9999,6 +13814,58 @@ mod tests {
     }
 
     #[test]
+    fn software_cursor_marks_one_stable_display_cell() {
+        let line = line_with_software_cursor("a中b".into(), 1, true);
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content, "a");
+        assert_eq!(line.spans[1].content, "中");
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(line.spans[2].content, "b");
+
+        let end = line_with_software_cursor("a中b".into(), 4, true);
+        assert_eq!(end.spans[1].content, " ");
+        assert!(end.spans[1].style.add_modifier.contains(Modifier::REVERSED));
+
+        let hidden = line_with_software_cursor("a中b".into(), 1, false);
+        assert_eq!(hidden.spans[1].content, "中");
+        assert!(
+            !hidden.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn software_cursor_uses_a_slow_phase_and_input_resets_it_visible() {
+        let mut app = App::new(vec![snapshot()], None);
+        let start = Instant::now();
+        app.reset_software_cursor_blink(start);
+
+        assert!(app.software_cursor_visible);
+        assert!(!app.update_software_cursor_blink(
+            start + SOFTWARE_CURSOR_BLINK_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(app.update_software_cursor_blink(start + SOFTWARE_CURSOR_BLINK_INTERVAL));
+        assert!(!app.software_cursor_visible);
+        assert!(app.update_software_cursor_blink(start + SOFTWARE_CURSOR_BLINK_INTERVAL * 2));
+        assert!(app.software_cursor_visible);
+
+        let reset = start + SOFTWARE_CURSOR_BLINK_INTERVAL * 2 + Duration::from_millis(10);
+        app.software_cursor_visible = false;
+        app.reset_software_cursor_blink(reset);
+        assert!(app.software_cursor_visible);
+        assert!(!app.update_software_cursor_blink(
+            reset + SOFTWARE_CURSOR_BLINK_INTERVAL - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
     fn long_line_input_scrolls_horizontally_with_the_cursor() {
         let draft = "abcdef".chars().collect::<Vec<_>>();
         assert_eq!(line_input_projection(&draft, 6, 6), ("> def".into(), 5));
@@ -10352,7 +14219,7 @@ mod tests {
         let menu = app.menu.as_ref().expect("profile menu");
         assert_eq!(menu.page, MenuPage::Profiles);
         assert_eq!(menu.stack, vec![(MenuPage::Root, 0)]);
-        assert!(menu_detail(&app, menu).contains("上下键选择已有方案"));
+        assert!(menu_detail(&app, menu).contains("按 Enter 可编辑"));
         let help = help_lines(&app)
             .iter()
             .map(line_plain_text)
@@ -10404,8 +14271,11 @@ mod tests {
         menu.catalog = Some(MenuCatalog {
             auth_required: false,
             slots: vec![snapshot()],
+            config_revision: None,
             transport_profiles: Vec::new(),
             device_profiles: Vec::new(),
+            transport_revision: None,
+            device_revision: None,
             models: Vec::new(),
             model_bindings: Vec::new(),
             model_revision: 0,
@@ -10437,8 +14307,11 @@ mod tests {
         menu.catalog = Some(MenuCatalog {
             auth_required: true,
             slots: vec![snapshot()],
+            config_revision: None,
             transport_profiles: Vec::new(),
             device_profiles: Vec::new(),
+            transport_revision: None,
+            device_revision: None,
             models: Vec::new(),
             model_bindings: Vec::new(),
             model_revision: 0,
@@ -10878,6 +14751,7 @@ mod tests {
             plain_rows: vec!["  abc".into(), "中def".into()],
             anchor: SelectionPoint { row: 0, column: 2 },
             head: SelectionPoint { row: 1, column: 2 },
+            word_selected: false,
             last_activity: Instant::now(),
         };
         assert_eq!(selection.selected_text(), "abc\n中d");
@@ -10888,6 +14762,70 @@ mod tests {
             ..selection
         };
         assert_eq!(reversed.selected_text(), "abc\n中d");
+    }
+
+    #[test]
+    fn double_click_accepts_different_cells_inside_the_same_word() {
+        let now = Instant::now();
+        let rows = vec!["  serial-platform ready".to_owned()];
+        let previous = OutputClick {
+            point: SelectionPoint { row: 0, column: 3 },
+            at: now - Duration::from_millis(100),
+        };
+        let current = SelectionPoint { row: 0, column: 12 };
+
+        assert!(output_clicks_form_double_click(
+            previous, current, &rows, now
+        ));
+        assert_eq!(
+            word_selection_points(&rows, current),
+            Some((
+                SelectionPoint { row: 0, column: 2 },
+                SelectionPoint { row: 0, column: 16 },
+            ))
+        );
+        assert!(!output_clicks_form_double_click(
+            previous,
+            SelectionPoint { row: 0, column: 19 },
+            &rows,
+            now
+        ));
+    }
+
+    #[test]
+    fn double_click_word_selection_copies_the_whole_token() {
+        let mut app = App::new(vec![snapshot()], None);
+        app.clipboard_copy = accept_clipboard_copy;
+        app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let layout = app.layout.expect("draw records console layout");
+        let (commands, _) = mpsc::channel(1);
+
+        for column in [layout.output_inner.x + 2, layout.output_inner.x + 5] {
+            app.handle_terminal_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row: layout.output_inner.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                &commands,
+            );
+            app.handle_terminal_event(
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column,
+                    row: layout.output_inner.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                &commands,
+            );
+        }
+
+        assert!(app.selection.is_none());
+        assert_eq!(app.selection_copy.as_deref(), Some("abcdef"));
     }
 
     #[test]

@@ -1,12 +1,95 @@
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
+use serde_json::{Map, Value, json};
 use serial_protocol::{
-    ArchiveListResponse, CreateMonitorRequest, DeviceModelListResponse, EventQuery,
+    ArchiveListResponse, CreateMonitorRequest, Cursor, DeviceModelListResponse, EventQuery,
     EventQueryResponse, MonitorIncidentListResponse, MonitorListResponse, MonitorResponse,
     SetSlotDeviceModelRequest, SetSlotDeviceModelResponse, StatusResponse,
 };
 
 const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
+
+#[derive(Debug)]
+struct ApiHttpError {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+    message: String,
+    fields: Map<String, Value>,
+}
+
+impl std::fmt::Display for ApiHttpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code.as_deref() {
+            Some(code) => write!(
+                formatter,
+                "seriald returned {} ({code}): {}",
+                self.status, self.message
+            ),
+            None => write!(
+                formatter,
+                "seriald returned {}: {}",
+                self.status, self.message
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApiHttpError {}
+
+fn api_http_error(status: reqwest::StatusCode, body: String) -> ApiHttpError {
+    let fields = match serde_json::from_str::<Value>(&body) {
+        Ok(Value::Object(fields)) => fields,
+        _ => Map::new(),
+    };
+    let code = fields
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let message = fields
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "response body unavailable".to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        });
+    ApiHttpError {
+        status,
+        code,
+        message,
+        fields,
+    }
+}
+
+/// Converts a seriald HTTP failure anywhere in an anyhow context chain into a
+/// bounded, stable MCP error object. The raw JSON body is deliberately not
+/// nested as a string, which avoids the escaped `{"code":...}` failure that
+/// previously obscured query-budget diagnostics from Agents.
+pub(crate) fn structured_http_error(error: &anyhow::Error) -> Option<Value> {
+    let error = error.downcast_ref::<ApiHttpError>()?;
+    let retryable = error
+        .fields
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| error.status.is_server_error());
+    let mut structured = json!({
+        "source": "seriald",
+        "http_status": error.status.as_u16(),
+        "code": error.code.as_deref().unwrap_or("http_error"),
+        "message": error.message,
+        "retryable": retryable,
+    });
+    for field in ["phase", "scanned_bytes", "elapsed_ms", "retry_hint"] {
+        if let Some(value) = error.fields.get(field) {
+            structured[field] = value.clone();
+        }
+    }
+    Some(json!({"error": structured}))
+}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -88,6 +171,55 @@ impl ApiClient {
             .send()
             .await
             .context("seriald event query failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn live_tail(
+        &self,
+        slot_id: &str,
+        tail_events: usize,
+        cursor: Option<&Cursor>,
+    ) -> Result<EventQueryResponse> {
+        let encoded_slot = encode_path_segment(slot_id);
+        let mut query = vec![("tail_events", tail_events.clamp(1, 2_000).to_string())];
+        if let Some(cursor) = cursor {
+            query.push(("epoch", cursor.epoch.to_string()));
+            query.push(("after_seq", cursor.after_seq.to_string()));
+        }
+        let response = self
+            .authorize(
+                self.client
+                    .get(self.url(&format!("/api/v1/slots/{encoded_slot}/tail")))
+                    .query(&query),
+            )
+            .send()
+            .await
+            .context("seriald live-tail request failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn recent_activity(
+        &self,
+        slot_id: &str,
+        epoch: uuid::Uuid,
+        after_seq: u64,
+        through_seq: u64,
+    ) -> Result<EventQueryResponse> {
+        let encoded_slot = encode_path_segment(slot_id);
+        let query = [
+            ("epoch", epoch.to_string()),
+            ("after_seq", after_seq.to_string()),
+            ("through_seq", through_seq.to_string()),
+        ];
+        let response = self
+            .authorize(
+                self.client
+                    .get(self.url(&format!("/api/v1/slots/{encoded_slot}/recent-activity")))
+                    .query(&query),
+            )
+            .send()
+            .await
+            .context("seriald recent-activity request failed")?;
         decode_response(response).await
     }
 
@@ -240,7 +372,7 @@ async fn decode_response<T: serde::de::DeserializeOwned>(response: reqwest::Resp
             .text()
             .await
             .unwrap_or_else(|_| "response body unavailable".into());
-        bail!("seriald returned {status}: {}", body.trim());
+        return Err(api_http_error(status, body).into());
     }
     response
         .json::<T>()
@@ -270,7 +402,7 @@ async fn decode_monitor_collection_response<T: serde::de::DeserializeOwned>(
                         .is_some()
             });
         if is_seriald_error {
-            bail!("seriald returned {status}: {}", body.trim());
+            return Err(api_http_error(status, body).into());
         }
         bail!(
             "seriald does not expose the Monitor API; Monitor tools require seriald 0.5 or newer: {}",
@@ -355,6 +487,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_budget_error_is_structured_without_nested_escaped_json() {
+        let body = r#"{"code":"query_budget_exceeded","message":"journal query budget was exceeded during segment discovery after 104134 bytes and 5130 ms","retryable":true,"phase":"segment discovery","scanned_bytes":104134,"elapsed_ms":5130,"retry_hint":"retry from the last cursor"}"#;
+        let (client, server) = api_client_with_response("429 Too Many Requests", body).await;
+
+        let error = client.status().await.unwrap_err();
+        server.await.expect("test server completed");
+        let display = error.to_string();
+        assert!(display.contains("query_budget_exceeded"));
+        assert!(display.contains("segment discovery"));
+        assert!(!display.contains(r#"\{"code\""#));
+
+        let structured = structured_http_error(&error).expect("typed seriald HTTP error");
+        assert_eq!(structured["error"]["http_status"], 429);
+        assert_eq!(structured["error"]["code"], "query_budget_exceeded");
+        assert_eq!(structured["error"]["phase"], "segment discovery");
+        assert_eq!(structured["error"]["scanned_bytes"], 104134);
+        assert_eq!(structured["error"]["elapsed_ms"], 5130);
+        assert_eq!(
+            structured["error"]["retry_hint"],
+            "retry from the last cursor"
+        );
+        assert_eq!(structured["error"]["retryable"], true);
+    }
+
+    #[tokio::test]
     async fn monitor_collection_structured_404_preserves_seriald_error() {
         let body = r#"{"code":"not_found","message":"unknown Slot missing-slot"}"#;
         let (client, server) = api_client_with_response("404 Not Found", body).await;
@@ -371,7 +528,6 @@ mod tests {
                 debounce_ms: 250,
                 cooldown_ms: 30_000,
                 duration_ms: None,
-                event_ttl_ms: 600_000,
             },
         };
         let error = client

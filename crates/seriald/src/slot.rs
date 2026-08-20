@@ -155,8 +155,6 @@ pub enum SlotError {
         "command sequence audit requires a non-nil sequence id, a valid overall description, 1-8 steps, a zero-based step index within that count, and a per-step command description"
     )]
     InvalidCommandSequenceAudit,
-    #[error("a sequence write precondition requires command sequence audit context")]
-    InvalidSequenceWritePrecondition,
     #[error("command sequence boundary changed before write: {reason} (no bytes were written)")]
     SequenceBoundaryChanged { reason: String },
     #[error(
@@ -538,6 +536,7 @@ impl SlotHandle {
         duration_ms: u64,
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
     ) -> Result<CommandResult, SlotError> {
         self.request(|reply| SlotCommand::SendBreak {
             request_id,
@@ -547,6 +546,7 @@ impl SlotHandle {
             duration_ms,
             operation_id,
             expected_run_id,
+            sequence_precondition,
             reply,
         })
         .await
@@ -563,6 +563,7 @@ impl SlotHandle {
         generation: u64,
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         spec: TriggerSpec,
     ) -> Result<CommandResult, SlotError> {
         self.request(|reply| SlotCommand::StartTrigger {
@@ -574,6 +575,7 @@ impl SlotHandle {
             generation,
             operation_id,
             expected_run_id,
+            sequence_precondition,
             spec,
             reply,
         })
@@ -837,6 +839,7 @@ enum SlotCommand {
         duration_ms: u64,
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         reply: Reply,
     },
     StartTrigger {
@@ -848,6 +851,7 @@ enum SlotCommand {
         generation: u64,
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         spec: TriggerSpec,
         reply: Reply,
     },
@@ -1994,6 +1998,7 @@ impl SlotActor {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
             } => {
                 if self.active_trigger.is_some() {
                     return Err(SlotError::TriggerActive);
@@ -2008,6 +2013,17 @@ impl SlotActor {
                     self.control
                         .remaining_ttl(&actor.id, control_id, fence, authorization_now)?;
                 ensure_lease_covers_write(lease_remaining, signal_duration)?;
+                if let Some(precondition) = sequence_precondition.as_ref() {
+                    let ring = self.ring.lock().await;
+                    validate_sequence_write_precondition(
+                        precondition,
+                        self.daemon_epoch,
+                        self.generation,
+                        self.tx_offset,
+                        self.seq,
+                        &ring,
+                    )?;
+                }
                 let Some(port) = &self.port else {
                     return Err(SlotError::PortOffline);
                 };
@@ -2049,6 +2065,7 @@ impl SlotActor {
                 generation,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 spec,
             } => {
                 if self.active_trigger.is_some() {
@@ -2084,6 +2101,17 @@ impl SlotActor {
                 self.control
                     .validate(&actor.id, control_id, fence, Instant::now())?;
                 validate_expected_write_run(expected_run_id, &actor, self.active_run.as_ref())?;
+                if let Some(precondition) = sequence_precondition.as_ref() {
+                    let ring = self.ring.lock().await;
+                    validate_sequence_write_precondition(
+                        precondition,
+                        self.daemon_epoch,
+                        self.generation,
+                        self.tx_offset,
+                        self.seq,
+                        &ring,
+                    )?;
+                }
 
                 let bound_run_id =
                     expected_run_id.or_else(|| self.active_run.as_ref().map(|run| run.id));
@@ -3693,6 +3721,7 @@ enum SlotRequest {
         duration_ms: u64,
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
     },
     StartTrigger {
         actor: Actor,
@@ -3702,6 +3731,7 @@ enum SlotRequest {
         generation: u64,
         operation_id: Option<Uuid>,
         expected_run_id: Option<Uuid>,
+        sequence_precondition: Option<SequenceWritePrecondition>,
         spec: TriggerSpec,
     },
     TriggerStatus {
@@ -3745,7 +3775,6 @@ impl SlotRequest {
             Self::Write {
                 description,
                 command_sequence,
-                sequence_precondition,
                 ..
             } => {
                 if let Some(description) = description {
@@ -3756,9 +3785,6 @@ impl SlotRequest {
                         return Err(SlotError::InvalidCommandSequenceAudit);
                     }
                     validate_command_sequence_audit(command_sequence)?;
-                }
-                if sequence_precondition.is_some() && command_sequence.is_none() {
-                    return Err(SlotError::InvalidSequenceWritePrecondition);
                 }
                 Ok(())
             }
@@ -3826,6 +3852,7 @@ impl SlotRequest {
                 generation,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 spec,
                 ..
             } => Some(
@@ -3835,6 +3862,7 @@ impl SlotRequest {
                     generation,
                     operation_id,
                     expected_run_id,
+                    sequence_precondition,
                     spec,
                 ))
                 .expect("Trigger request fields are serializable"),
@@ -3843,10 +3871,17 @@ impl SlotRequest {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 ..
             } => Some(
-                serde_json::to_vec(&("send_break", duration_ms, operation_id, expected_run_id))
-                    .expect("BREAK request fields are serializable"),
+                serde_json::to_vec(&(
+                    "send_break",
+                    duration_ms,
+                    operation_id,
+                    expected_run_id,
+                    sequence_precondition,
+                ))
+                .expect("BREAK request fields are serializable"),
             ),
             _ => None,
         }
@@ -3954,6 +3989,7 @@ impl SlotRequest {
                 generation,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 spec,
             } => serde_json::to_vec(&(
                 "trigger_start",
@@ -3964,6 +4000,7 @@ impl SlotRequest {
                 generation,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 spec,
             )),
             Self::SendBreak {
@@ -3973,6 +4010,7 @@ impl SlotRequest {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
             } => serde_json::to_vec(&(
                 "send_break",
                 &actor.id,
@@ -3981,6 +4019,7 @@ impl SlotRequest {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
             )),
             Self::TriggerStatus {
                 actor,
@@ -4508,6 +4547,7 @@ impl SlotCommand {
                 duration_ms,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 reply,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
@@ -4518,6 +4558,7 @@ impl SlotCommand {
                     duration_ms,
                     operation_id,
                     expected_run_id,
+                    sequence_precondition,
                 },
                 reply,
             },
@@ -4530,6 +4571,7 @@ impl SlotCommand {
                 generation,
                 operation_id,
                 expected_run_id,
+                sequence_precondition,
                 spec,
                 reply,
             } => CommandDisposition::Request {
@@ -4542,6 +4584,7 @@ impl SlotCommand {
                     generation,
                     operation_id,
                     expected_run_id,
+                    sequence_precondition,
                     spec,
                 },
                 reply,
@@ -6238,6 +6281,7 @@ mod tests {
             duration_ms,
             operation_id: Some(Uuid::new_v4()),
             expected_run_id: Some(Uuid::new_v4()),
+            sequence_precondition: None,
         };
         assert_eq!(
             request(MIN_BREAK_DURATION_MS).validate_business_fields(),
@@ -6261,8 +6305,26 @@ mod tests {
             duration_ms,
             operation_id,
             expected_run_id,
+            sequence_precondition: None,
         };
         assert_ne!(make(100).write_fingerprint(), make(200).write_fingerprint());
+        let unguarded = make(100);
+        let mut guarded = make(100);
+        if let SlotRequest::SendBreak {
+            sequence_precondition,
+            ..
+        } = &mut guarded
+        {
+            *sequence_precondition = Some(SequenceWritePrecondition {
+                cursor: Cursor {
+                    epoch: Uuid::new_v4(),
+                    after_seq: 5,
+                },
+                expected_generation: 1,
+                expected_tx_offset: 3,
+            });
+        }
+        assert_ne!(unguarded.write_fingerprint(), guarded.write_fingerprint());
         assert!(matches!(
             classify_break_failure("assert BREAK", "operation not supported"),
             PortBreakFailure::Unsupported(_)
@@ -6570,10 +6632,7 @@ mod tests {
         {
             *sequence_precondition = Some(precondition);
         }
-        assert_eq!(
-            missing_audit.validate_business_fields(),
-            Err(SlotError::InvalidSequenceWritePrecondition)
-        );
+        assert!(missing_audit.validate_business_fields().is_ok());
 
         let different_sequence = request(Some(CommandSequenceAuditContext {
             sequence_id: Uuid::new_v4(),

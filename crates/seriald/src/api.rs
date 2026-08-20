@@ -16,14 +16,13 @@ use serial_protocol::{
     Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceModelsRequest,
     ConfigureDeviceModelsResponse, ConfigureDeviceProfilesRequest, ConfigureDeviceProfilesResponse,
     ConfigureSlotsRequest, ConfigureSlotsResponse, ConfigureTransportProfilesRequest,
-    ConfigureTransportProfilesResponse, CreateMonitorRequest, DaemonDiagnosticsResponse,
+    ConfigureTransportProfilesResponse, CreateMonitorRequest, Cursor, DaemonDiagnosticsResponse,
     DeviceModel, DeviceModelListResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
-    EventQueryResponse, HealthResponse, MonitorIncidentListResponse, MonitorIncidentResponse,
-    MonitorListResponse, MonitorOutboxEventResponse, MonitorOutboxListResponse, MonitorResponse,
-    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, Role, ServerMessage,
-    SetSlotDeviceModelRequest, SetSlotDeviceModelResponse, SlotDiagnostics, SlotModelBinding,
-    StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse, UpdateMonitorRequest,
-    encode_control, encode_event,
+    EventQueryResponse, GapRange, HealthResponse, MonitorIncidentListResponse,
+    MonitorIncidentResponse, MonitorListResponse, MonitorResponse, MonitorStatus, PROTOCOL_VERSION,
+    PortDescriptor, Role, ServerMessage, SetSlotDeviceModelRequest, SetSlotDeviceModelResponse,
+    SlotDiagnostics, SlotModelBinding, StatusResponse, StorageDiagnosticsResponse,
+    TransportProfileListResponse, UpdateMonitorRequest, encode_control, encode_event,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,18 +80,11 @@ impl AppState {
         daemon_epoch: Uuid,
         started: Instant,
     ) -> Result<Self, MonitorError> {
-        let mut sink = config.monitor_event_sink.clone();
-        if let Some(path) = sink.token_file.as_mut()
-            && path.is_relative()
-        {
-            *path = config_store.paths().config_dir.join(&*path);
-        }
         let monitors = MonitorManager::open(
             config_store.paths().monitor_state_file.clone(),
             registry.clone(),
             daemon_epoch,
             config.server_id,
-            sink,
         )?;
         Ok(Self {
             inner: Arc::new(AppStateInner {
@@ -572,6 +564,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/diagnostics/storage", get(storage_diagnostics))
         .route("/api/v1/slots/{slot_id}/diagnostics", get(slot_diagnostics))
+        .route("/api/v1/slots/{slot_id}/tail", get(live_tail))
+        .route(
+            "/api/v1/slots/{slot_id}/recent-activity",
+            get(recent_activity),
+        )
         .route("/api/v1/slots/{slot_id}/events", get(events))
         .route("/api/v1/monitors", get(list_monitors).post(create_monitor))
         .route(
@@ -585,11 +582,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack",
             post(acknowledge_monitor_incident),
-        )
-        .route("/api/v1/monitor-events", get(list_monitor_outbox))
-        .route(
-            "/api/v1/monitor-events/{outbox_seq}/ack",
-            post(acknowledge_monitor_outbox),
         )
         .route("/api/v1/ws", get(websocket))
         .with_state(state)
@@ -628,6 +620,7 @@ async fn status(
         protocol_version: PROTOCOL_VERSION,
         config_revision: config.config_revision,
         sequence_write_precondition_supported: true,
+        serial_context_precondition_supported: true,
         slots: state.inner.registry.snapshots().await,
     }))
 }
@@ -920,6 +913,178 @@ async fn events(
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct LiveTailQuery {
+    tail_events: Option<usize>,
+    epoch: Option<Uuid>,
+    after_seq: Option<u64>,
+}
+
+/// Returns a bounded snapshot from the Slot's in-memory replay ring. This is
+/// the low-latency current-tail path; unlike `/events`, its work is independent
+/// of retained journal epochs and the size of the active `.open` segment.
+async fn live_tail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slot_id): Path<String>,
+    Query(query): Query<LiveTailQuery>,
+) -> Result<Json<EventQueryResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    let cursor = match (query.epoch, query.after_seq) {
+        (Some(epoch), Some(after_seq)) => Some(Cursor { epoch, after_seq }),
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "live tail cursor requires both epoch and after_seq".into(),
+            ));
+        }
+    };
+    let tail_events = query.tail_events.unwrap_or(200).clamp(1, 2_000);
+    let handle = state
+        .inner
+        .registry
+        .get(&slot_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id}")))?;
+    // Cursor pagination must begin at the oldest still-retained event after
+    // the cursor. If EventRing received only `tail_events` here, RingEvicted
+    // recovery would select the newest N events and silently skip an older,
+    // still-retained portion. The ring is independently bounded to 20k
+    // events / 4 MiB; clone that bounded window and page it below.
+    let replay_events = if cursor.is_some() {
+        usize::MAX
+    } else {
+        tail_events
+    };
+    let attach = handle.attach(cursor.as_ref(), replay_events).await?;
+    Ok(Json(bounded_live_response(
+        attach,
+        cursor.as_ref(),
+        tail_events,
+    )))
+}
+
+fn bounded_live_response(
+    attach: AttachState,
+    cursor: Option<&Cursor>,
+    tail_events: usize,
+) -> EventQueryResponse {
+    let mut events = attach.replay.events;
+    let window_limited = cursor.is_some() && events.len() > tail_events;
+    if window_limited {
+        events.truncate(tail_events);
+    }
+    let next_after_seq = if window_limited {
+        events
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or(attach.snapshot.head_seq)
+    } else {
+        attach.snapshot.head_seq
+    };
+    let gaps = attach
+        .replay
+        .gap
+        .as_ref()
+        .map(|gap| {
+            let first_seq = gap.requested_after_seq.unwrap_or(0).saturating_add(1);
+            let last_seq = gap
+                .first_available_seq
+                .map(|first_available| first_available.saturating_sub(1))
+                .unwrap_or(attach.snapshot.head_seq)
+                .max(first_seq);
+            GapRange {
+                epoch: cursor
+                    .as_ref()
+                    .map_or(attach.snapshot.daemon_epoch, |cursor| cursor.epoch),
+                first_seq,
+                last_seq,
+                reason: gap.reason,
+            }
+        })
+        .into_iter()
+        .collect();
+    let first_available_seq = attach.snapshot.ring_oldest_seq;
+    EventQueryResponse {
+        events,
+        next_cursor: Some(Cursor {
+            epoch: attach.snapshot.daemon_epoch,
+            after_seq: next_after_seq,
+        }),
+        truncated: window_limited || attach.replay.gap.is_some(),
+        first_available_seq,
+        gaps,
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RecentActivityQuery {
+    epoch: Uuid,
+    after_seq: u64,
+    through_seq: u64,
+}
+
+/// Returns only serial ownership/interference evidence from the bounded live
+/// ring. It is used between two MCP operations and intentionally excludes RX,
+/// so a noisy target cannot inflate normal tool results or force a disk scan.
+async fn recent_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(slot_id): Path<String>,
+    Query(query): Query<RecentActivityQuery>,
+) -> Result<Json<EventQueryResponse>, ApiError> {
+    state.authenticate(&headers, Role::Observer).await?;
+    if query.after_seq > query.through_seq {
+        return Err(ApiError::BadRequest(
+            "after_seq must not exceed through_seq".into(),
+        ));
+    }
+    let handle = state
+        .inner
+        .registry
+        .get(&slot_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id}")))?;
+    let attach = handle
+        .attach(
+            Some(&serial_protocol::Cursor {
+                epoch: query.epoch,
+                after_seq: query.after_seq,
+            }),
+            2_000,
+        )
+        .await?;
+    let mut relevant = attach
+        .replay
+        .events
+        .into_iter()
+        .filter(|event| {
+            event.seq <= query.through_seq
+                && (event.direction == serial_protocol::Direction::Tx
+                    || matches!(
+                        event.kind,
+                        serial_protocol::EventKind::ControlRevoked
+                            | serial_protocol::EventKind::ControlExpired
+                            | serial_protocol::EventKind::RunAborted
+                    ))
+        })
+        .collect::<Vec<_>>();
+    let truncated = relevant.len() > 32 || attach.replay.gap.is_some();
+    if relevant.len() > 32 {
+        relevant.drain(..relevant.len() - 32);
+    }
+    Ok(Json(EventQueryResponse {
+        events: relevant,
+        next_cursor: Some(serial_protocol::Cursor {
+            epoch: attach.snapshot.daemon_epoch,
+            after_seq: query.through_seq.min(attach.snapshot.head_seq),
+        }),
+        truncated,
+        first_available_seq: attach.snapshot.ring_oldest_seq,
+        gaps: Vec::new(),
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct MonitorListQuery {
     slot_id: Option<String>,
     status: Option<MonitorStatus>,
@@ -1032,38 +1197,6 @@ async fn acknowledge_monitor_incident(
             .monitors
             .acknowledge_incident(monitor_id, incident_id)
             .await?,
-    }))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MonitorOutboxQuery {
-    after_outbox_seq: Option<u64>,
-    limit: Option<usize>,
-}
-
-async fn list_monitor_outbox(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<MonitorOutboxQuery>,
-) -> Result<Json<MonitorOutboxListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
-    Ok(Json(
-        state
-            .inner
-            .monitors
-            .outbox(query.after_outbox_seq, query.limit)
-            .await,
-    ))
-}
-
-async fn acknowledge_monitor_outbox(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(outbox_seq): Path<u64>,
-) -> Result<Json<MonitorOutboxEventResponse>, ApiError> {
-    state.authenticate(&headers, Role::Operator).await?;
-    Ok(Json(MonitorOutboxEventResponse {
-        event: state.inner.monitors.acknowledge_outbox(outbox_seq).await?,
     }))
 }
 
@@ -1410,6 +1543,7 @@ async fn dispatch_slot_command(
             duration_ms,
             operation_id,
             expected_run_id,
+            sequence_precondition,
             ..
         } => {
             handle
@@ -1421,6 +1555,7 @@ async fn dispatch_slot_command(
                     duration_ms,
                     operation_id,
                     expected_run_id,
+                    sequence_precondition,
                 )
                 .await?
         }
@@ -1431,6 +1566,7 @@ async fn dispatch_slot_command(
             generation,
             operation_id,
             expected_run_id,
+            sequence_precondition,
             spec,
             ..
         } => {
@@ -1444,6 +1580,7 @@ async fn dispatch_slot_command(
                     generation,
                     operation_id,
                     expected_run_id,
+                    sequence_precondition,
                     spec,
                 )
                 .await?
@@ -1730,7 +1867,6 @@ impl WsError {
                 | SlotError::EmptyWrite
                 | SlotError::InvalidCommandDescription
                 | SlotError::InvalidCommandSequenceAudit
-                | SlotError::InvalidSequenceWritePrecondition
                 | SlotError::WriteDeadlineExceeded { .. }
                 | SlotError::InvalidBreakDuration
                 | SlotError::InvalidTriggerAction
@@ -1796,6 +1932,26 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Self::Journal(JournalError::QueryBudgetExceeded {
+            phase,
+            scanned_bytes,
+            elapsed_ms,
+        }) = &self
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "code": ErrorCode::QueryBudgetExceeded,
+                    "message": self.to_string(),
+                    "retryable": true,
+                    "phase": phase,
+                    "scanned_bytes": scanned_bytes,
+                    "elapsed_ms": elapsed_ms,
+                    "retry_hint": "Retry from the last returned epoch/cursor with a smaller window or narrower filter; do not restart from sequence zero."
+                })),
+            )
+                .into_response();
+        }
         let (status, code) = match &self {
             Self::Auth(AuthError::Forbidden) => (StatusCode::FORBIDDEN, ErrorCode::Forbidden),
             Self::Auth(_) => (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized),
@@ -1821,11 +1977,9 @@ impl IntoResponse for ApiError {
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorCode::QueryBudgetExceeded,
             ),
-            Self::Monitor(
-                MonitorError::NotFound(_)
-                | MonitorError::OutboxNotFound(_)
-                | MonitorError::UnknownSlot(_),
-            ) => (StatusCode::NOT_FOUND, ErrorCode::NotFound),
+            Self::Monitor(MonitorError::NotFound(_) | MonitorError::UnknownSlot(_)) => {
+                (StatusCode::NOT_FOUND, ErrorCode::NotFound)
+            }
             Self::Monitor(
                 MonitorError::RequestIdReused(_) | MonitorError::RevisionMismatch { .. },
             ) => (StatusCode::CONFLICT, ErrorCode::Conflict),
@@ -1877,7 +2031,11 @@ mod tests {
     use crate::config::{ConfigPaths, ConfigStore};
     use crate::control::ControlLimits;
     use crate::journal::{JournalConfig, JournalManager};
-    use serial_protocol::{ModelConfirmationMethod, SerialSettings, SlotConfig, TransportProfile};
+    use crate::ring::{ReplayGap, ReplayWindow};
+    use serial_protocol::{
+        Direction, EventKind, GapReason, ModelConfirmationMethod, SerialSettings, SlotConfig,
+        SlotSnapshot, TimelineEvent, TransportProfile,
+    };
 
     fn disabled_slot(id: &str, display_name: &str, port: &str) -> SlotConfig {
         SlotConfig {
@@ -1892,6 +2050,196 @@ mod tests {
                 ..SerialSettings::default()
             },
         }
+    }
+
+    fn live_snapshot(epoch: Uuid, head_seq: u64, oldest_seq: u64) -> SlotSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "config": disabled_slot("slot-1", "Slot 1", "COM3"),
+            "daemon_epoch": epoch,
+            "head_seq": head_seq,
+            "ring_oldest_seq": oldest_seq,
+            "generation": 1,
+            "endpoint_present": true,
+            "session_state": "online",
+            "state_reason": null,
+            "target_activity": "active",
+            "last_rx_wall_time_ns": null,
+            "rx_offset": head_seq,
+            "tx_offset": 0,
+            "control": null,
+            "active_run": null,
+            "logging": "healthy"
+        }))
+        .unwrap()
+    }
+
+    fn live_event(epoch: Uuid, seq: u64) -> TimelineEvent {
+        TimelineEvent {
+            slot_id: "slot-1".into(),
+            daemon_epoch: epoch,
+            seq,
+            generation: 1,
+            wall_time_ns: seq as i64,
+            monotonic_time_ns: seq,
+            kind: EventKind::Rx,
+            direction: Direction::Rx,
+            actor: None,
+            run_id: None,
+            operation_id: None,
+            stream_offset_start: Some(seq - 1),
+            stream_offset_end: Some(seq),
+            data: vec![b'x'],
+            metadata: Default::default(),
+            durable: true,
+        }
+    }
+
+    fn attach_state(
+        snapshot: SlotSnapshot,
+        events: Vec<TimelineEvent>,
+        gap: Option<ReplayGap>,
+    ) -> AttachState {
+        let (_live_tx, live) = broadcast::channel(1);
+        AttachState {
+            snapshot,
+            replay: ReplayWindow { events, gap },
+            live,
+        }
+    }
+
+    #[test]
+    fn live_tail_keeps_the_intentional_newest_window_distinct_from_retention_loss() {
+        let epoch = Uuid::new_v4();
+        // EventRing already selected the requested newest window before this
+        // response helper is called.
+        let response = bounded_live_response(
+            attach_state(
+                live_snapshot(epoch, 5, 1),
+                vec![live_event(epoch, 4), live_event(epoch, 5)],
+                None,
+            ),
+            None,
+            2,
+        );
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(response.first_available_seq, Some(1));
+        assert_eq!(response.next_cursor.unwrap().after_seq, 5);
+        assert!(!response.truncated);
+        assert!(response.gaps.is_empty());
+    }
+
+    #[test]
+    fn live_continue_returns_the_oldest_bounded_page_and_resumable_cursor() {
+        let epoch = Uuid::new_v4();
+        let cursor = Cursor {
+            epoch,
+            after_seq: 0,
+        };
+        let response = bounded_live_response(
+            attach_state(
+                live_snapshot(epoch, 5, 1),
+                (1..=5).map(|seq| live_event(epoch, seq)).collect(),
+                None,
+            ),
+            Some(&cursor),
+            2,
+        );
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(response.next_cursor.unwrap().after_seq, 2);
+        assert!(response.truncated);
+        assert!(response.gaps.is_empty());
+    }
+
+    #[test]
+    fn live_continue_surfaces_ring_eviction_as_a_gap_and_partial_result() {
+        let epoch = Uuid::new_v4();
+        let cursor = Cursor {
+            epoch,
+            after_seq: 1,
+        };
+        let response = bounded_live_response(
+            attach_state(
+                live_snapshot(epoch, 7, 4),
+                (4..=7).map(|seq| live_event(epoch, seq)).collect(),
+                Some(ReplayGap {
+                    reason: GapReason::RingEvicted,
+                    requested_after_seq: Some(1),
+                    first_available_seq: Some(4),
+                }),
+            ),
+            Some(&cursor),
+            2,
+        );
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(response.next_cursor.unwrap().after_seq, 5);
+        assert!(response.truncated);
+        assert_eq!(response.gaps.len(), 1);
+        assert_eq!(response.gaps[0].first_seq, 2);
+        assert_eq!(response.gaps[0].last_seq, 3);
+        assert_eq!(response.gaps[0].reason, GapReason::RingEvicted);
+    }
+
+    #[test]
+    fn live_continue_keeps_daemon_restart_as_an_explicit_epoch_gap() {
+        let old_epoch = Uuid::new_v4();
+        let new_epoch = Uuid::new_v4();
+        let cursor = Cursor {
+            epoch: old_epoch,
+            after_seq: 80,
+        };
+        let response = bounded_live_response(
+            attach_state(
+                live_snapshot(new_epoch, 3, 1),
+                (1..=3).map(|seq| live_event(new_epoch, seq)).collect(),
+                Some(ReplayGap {
+                    reason: GapReason::EpochChanged,
+                    requested_after_seq: Some(80),
+                    first_available_seq: Some(1),
+                }),
+            ),
+            Some(&cursor),
+            2,
+        );
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            response.next_cursor.unwrap(),
+            Cursor {
+                epoch: new_epoch,
+                after_seq: 2,
+            }
+        );
+        assert!(response.truncated);
+        assert_eq!(response.gaps.len(), 1);
+        assert_eq!(response.gaps[0].epoch, old_epoch);
+        assert_eq!(response.gaps[0].reason, GapReason::EpochChanged);
     }
 
     fn transport_profile(name: &str, baud_rate: u32) -> TransportProfile {

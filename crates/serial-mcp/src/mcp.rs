@@ -23,7 +23,7 @@ use crate::tools::AgentTools;
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes, keep its private run_token within the initiating LLM session, and pass its run_id/run_token to every Run-scoped tool. Never adopt an active Run from devices/status. Runs scope evidence only. Run-scoped calls pin the Run while active; after the final call returns, five minutes of inactivity releases control and aborts the abandoned Run. Every command requires a concise purpose for durable Run history. Use command_sequence for a known, dependent interaction such as username then password; give the sequence an overall purpose and every step its own purpose. Every non-final step needs an explicit expect or regex boundary, and any failed step prevents all later writes. Its command bytes are retained in the same plaintext TX audit as command. command and command_sequence inherit Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. End Runs and stop Monitors when no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. Never copy a public run_id from devices/status into a tool call. Runs scope evidence only. Run-scoped calls pin the Run while active; an orphan timeout is only a crash/abandonment fallback. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. Every command requires a concise purpose for durable Run history. Use command_sequence for a known, dependent interaction such as username then password; give the sequence an overall purpose and every step its own purpose. Every non-final step needs an explicit expect or regex boundary, and any failed step prevents all later writes. Its command bytes are retained in the same plaintext TX audit as command. command and command_sequence inherit Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. Stop Monitors when no longer needed.";
 
 pub async fn serve(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -273,9 +273,15 @@ async fn dispatch_request(tools: &AgentTools, request: RpcRequest, id: Value) ->
                 .await
             {
                 Ok(value) => rpc_result(id, tool_result(value, false)),
-                Err(error) => {
-                    rpc_result(id, tool_result(json!({"error": error.to_string()}), true))
-                }
+                Err(error) => rpc_result(
+                    id,
+                    tool_result(
+                        crate::api::structured_http_error(&error)
+                            .or_else(|| crate::tools::structured_tool_error(&error))
+                            .unwrap_or_else(|| json!({"error": {"code": "tool_error", "message": error.to_string()}})),
+                        true,
+                    ),
+                ),
             }
         }
         _ => rpc_error(id, -32601, format!("method {:?} not found", request.method)),
@@ -286,7 +292,15 @@ fn tool_result(value: Value, is_error: bool) -> Value {
     // Keep the compatibility text for hosts that do not read
     // structuredContent, but avoid charging the Agent for pretty-print
     // whitespace on a duplicated representation.
-    let text = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+    let text = if is_error {
+        value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| serde_json::to_string(&value).unwrap_or_else(|_| value.to_string()))
+    } else {
+        serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+    };
     json!({"content": [{"type": "text", "text": text}], "structuredContent": value, "isError": is_error})
 }
 
@@ -410,16 +424,14 @@ pub fn tool_definitions() -> Vec<Value> {
             "Write in the active Run and capture RX; include a concise purpose for the durable Run command history.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"},
+                    "run_handle":run_handle_schema(),
                     "command":{"type":"string","maxLength":4096,"description":"Empty sends Enter."},
                     "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose, for example: 查看样机内存。"},
                     "expect":{"type":"string","minLength":1},
                     "regex":{"type":"string","minLength":1,"maxLength":4096},
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
-                &["slot_id", "run_id", "run_token", "command", "description"],
+                &["run_handle", "command", "description"],
             ),
             false,
         ),
@@ -428,9 +440,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Run 1-8 dependent commands in order; each non-final step needs a matcher, and failure stops before every later write.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"},
+                    "run_handle":run_handle_schema(),
                     "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose for the complete dependent interaction."},
                     "steps":{
                         "type":"array",
@@ -451,7 +461,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         }
                     }
                 }),
-                &["slot_id", "run_id", "run_token", "description", "steps"],
+                &["run_handle", "description", "steps"],
             ),
             false,
         ),
@@ -460,12 +470,10 @@ pub fn tool_definitions() -> Vec<Value> {
             "Write exact UTF-8 bytes without EOL in the active Run.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"},
+                    "run_handle":run_handle_schema(),
                     "text":{"type":"string","minLength":1,"maxLength":4096}
                 }),
-                &["slot_id", "run_id", "run_token", "text"],
+                &["run_handle", "text"],
             ),
             false,
         ),
@@ -474,13 +482,11 @@ pub fn tool_definitions() -> Vec<Value> {
             "Send Ctrl-C/D/Z or serial Break in the active Run.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"},
+                    "run_handle":run_handle_schema(),
                     "signal":{"type":"string","enum":["ctrl_c","ctrl_d","ctrl_z","break"]},
                     "duration_ms":{"type":"integer","minimum":1,"maximum":5000,"description":"Break only."}
                 }),
-                &["slot_id", "run_id", "run_token", "signal"],
+                &["run_handle", "signal"],
             ),
             false,
         ),
@@ -489,9 +495,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Optional kickoff, then bounded actions. Omit start_contains normally; set it only to gate the first action on live RX.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"},
+                    "run_handle":run_handle_schema(),
                     "kickoff": trigger_write_schema(MAX_TRIGGER_INITIAL_WRITE_BYTES),
                     "start_contains":{"type":"string","minLength":1,"maxLength":MAX_TRIGGER_PATTERN_BYTES,"description":"Advanced RX gate; omit for normal kickoff-then-action."},
                     "action": trigger_write_schema(MAX_TRIGGER_ACTION_BYTES),
@@ -500,7 +504,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "timeout_ms":{"type":"integer","minimum":MIN_TRIGGER_TIMEOUT_MS,"maximum":MAX_TRIGGER_TIMEOUT_MS,"default":DEFAULT_TRIGGER_TIMEOUT_MS},
                     "max_fires":{"type":"integer","minimum":1,"maximum":MAX_TRIGGER_FIRES,"default":DEFAULT_TRIGGER_MAX_FIRES,"description":"Confirmed-action send budget, not an observation cutoff."}
                 }),
-                &["slot_id", "run_id", "run_token", "action"],
+                &["run_handle", "action"],
             ),
             false,
         ),
@@ -509,14 +513,12 @@ pub fn tool_definitions() -> Vec<Value> {
             "Wait for RX using a literal, regex, prompt, or quiet boundary.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"},
+                    "run_handle":run_handle_schema(),
                     "expect":{"type":"string","minLength":1},
                     "regex":{"type":"string","minLength":1,"maxLength":4096},
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
-                &["slot_id", "run_id", "run_token"],
+                &["run_handle"],
             ),
             true,
         ),
@@ -597,7 +599,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_start",
-            "Confirm the physical DUT by serial, telnet, web UI, or a human, then acquire control and return a private run_id/run_token capability.",
+            "Confirm the physical DUT by serial, telnet, web UI, or a human, then acquire control and return one opaque run_handle.",
             object(
                 json!({
                     "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
@@ -608,34 +610,39 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_end",
-            "End the Run authorized by the private capability and release control.",
+            "End the Run authorized by run_handle and release control; call before the final reply unless deliberately handing off.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
-                    "run_id":{"type":"string","format":"uuid"},
-                    "run_token":{"type":"string","format":"uuid"}
+                    "run_handle":run_handle_schema()
                 }),
-                &["slot_id", "run_id", "run_token"],
+                &["run_handle"],
             ),
             false,
         ),
         tool(
             "release",
-            "Release only this MCP's control; no local lease is a no-op, while aborting its active Run requires the private capability.",
+            "Release only this MCP's control; no local lease is a no-op, while aborting its active Run requires run_handle.",
             {
                 let mut schema = object(
                     json!({
                         "slot_id":{"type":"string"},
                         "abort_run":{"type":"boolean"},
-                        "run_id":{"type":"string","format":"uuid"},
-                        "run_token":{"type":"string","format":"uuid"}
+                        "run_handle":run_handle_schema()
                     }),
-                    &["slot_id"],
+                    &[],
                 );
-                schema["dependentRequired"] = json!({
-                    "run_id": ["run_token"],
-                    "run_token": ["run_id"]
-                });
+                schema["oneOf"] = json!([
+                    {
+                        "required":["slot_id"],
+                        "properties":{"abort_run":{"const":false}},
+                        "not":{"required":["run_handle"]}
+                    },
+                    {
+                        "required":["run_handle","abort_run"],
+                        "properties":{"abort_run":{"const":true}},
+                        "not":{"required":["slot_id"]}
+                    }
+                ]);
                 schema
             },
             false,
@@ -652,6 +659,15 @@ fn trigger_write_schema(max_length: usize) -> Value {
         },
         "required":["text"],
         "additionalProperties":false
+    })
+}
+
+fn run_handle_schema() -> Value {
+    json!({
+        "type":"string",
+        "minLength":22,
+        "maxLength":22,
+        "pattern":"^[A-Za-z0-9_-]{22}$"
     })
 }
 
@@ -703,7 +719,8 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("remain armed until match or timeout"));
         assert!(SERVER_INSTRUCTIONS.contains("not target success or failure"));
         assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
-        assert!(SERVER_INSTRUCTIONS.contains("five minutes of inactivity"));
+        assert!(SERVER_INSTRUCTIONS.contains("orphan timeout"));
+        assert!(SERVER_INSTRUCTIONS.contains("Before the final reply, call run_end"));
         assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
         assert!(SERVER_INSTRUCTIONS.contains("Use command_sequence"));
         assert!(SERVER_INSTRUCTIONS.contains("overall purpose"));
@@ -843,15 +860,13 @@ mod tests {
                 "description",
                 "expect",
                 "regex",
-                "run_id",
-                "run_token",
-                "slot_id",
+                "run_handle",
                 "timeout_seconds"
             ]
         );
         assert_eq!(
             command["inputSchema"]["required"],
-            json!(["slot_id", "run_id", "run_token", "command", "description"])
+            json!(["run_handle", "command", "description"])
         );
         assert_eq!(
             command["inputSchema"]["properties"]["description"]["maxLength"],
@@ -920,7 +935,7 @@ mod tests {
         let schema = &sequence["inputSchema"];
         assert_eq!(
             schema["required"],
-            json!(["slot_id", "run_id", "run_token", "description", "steps"])
+            json!(["run_handle", "description", "steps"])
         );
         assert_eq!(
             schema["properties"]["description"]["maxLength"],
@@ -990,7 +1005,6 @@ mod tests {
         }
         assert_eq!(start["inputSchema"]["oneOf"].as_array().unwrap().len(), 2);
         for hidden in [
-            "message_center",
             "delivery_mode",
             "cooldown_seconds",
             "max_incidents",
@@ -1026,6 +1040,32 @@ mod tests {
         );
         assert_eq!(result["structuredContent"], value);
         assert_eq!(result["isError"], false);
+    }
+
+    #[test]
+    fn structured_error_text_is_plain_message_not_nested_json() {
+        let value = json!({
+            "error": {
+                "source": "seriald",
+                "http_status": 429,
+                "code": "query_budget_exceeded",
+                "message": "journal query budget was exceeded",
+                "phase": "segment discovery"
+            }
+        });
+        let result = tool_result(value.clone(), true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "journal query budget was exceeded"
+        );
+        assert_eq!(result["structuredContent"], value);
+        assert_eq!(result["isError"], true);
+        assert!(
+            !result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(r#"\{"#)
+        );
     }
 
     #[test]
@@ -1101,10 +1141,7 @@ mod tests {
             .find(|tool| tool["name"] == "trigger")
             .unwrap();
         let schema = &trigger["inputSchema"];
-        assert_eq!(
-            schema["required"],
-            json!(["slot_id", "run_id", "run_token", "action"])
-        );
+        assert_eq!(schema["required"], json!(["run_handle", "action"]));
         assert!(
             schema["properties"]["action"]["properties"]["eol"]
                 .get("default")
@@ -1158,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn run_scoped_tools_require_private_capabilities_and_release_pairs_them() {
+    fn run_scoped_tools_require_only_one_opaque_run_handle() {
         let tools = tool_definitions();
         for name in [
             "command",
@@ -1171,21 +1208,50 @@ mod tests {
         ] {
             let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
             let required = schema["required"].as_array().unwrap();
-            for field in ["run_id", "run_token"] {
+            assert_eq!(
+                required.iter().filter(|item| *item == "run_handle").count(),
+                1
+            );
+            assert_eq!(
+                schema["properties"]["run_handle"]["type"], "string",
+                "{name}"
+            );
+            assert_eq!(
+                schema["properties"]["run_handle"]["minLength"], 22,
+                "{name}"
+            );
+            assert_eq!(
+                schema["properties"]["run_handle"]["maxLength"], 22,
+                "{name}"
+            );
+            for legacy in ["slot_id", "run_id", "run_token"] {
                 assert!(
-                    required.iter().any(|item| item == field),
-                    "{name} must require {field}"
+                    schema["properties"].get(legacy).is_none(),
+                    "{name} exposes {legacy}"
                 );
-                assert_eq!(schema["properties"][field]["type"], "string", "{name}");
-                assert_eq!(schema["properties"][field]["format"], "uuid", "{name}");
             }
         }
 
         let release = tools.iter().find(|tool| tool["name"] == "release").unwrap();
-        assert_eq!(release["inputSchema"]["required"], json!(["slot_id"]));
-        assert_eq!(
-            release["inputSchema"]["dependentRequired"],
-            json!({"run_id":["run_token"], "run_token":["run_id"]})
+        assert_eq!(release["inputSchema"]["required"], json!([]));
+        let modes = release["inputSchema"]["oneOf"].as_array().unwrap();
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0]["required"], json!(["slot_id"]));
+        assert_eq!(modes[0]["properties"]["abort_run"]["const"], false);
+        assert_eq!(modes[0]["not"]["required"], json!(["run_handle"]));
+        assert_eq!(modes[1]["required"], json!(["run_handle", "abort_run"]));
+        assert_eq!(modes[1]["properties"]["abort_run"]["const"], true);
+        assert_eq!(modes[1]["not"]["required"], json!(["slot_id"]));
+        assert!(
+            release["inputSchema"]["properties"]
+                .get("run_handle")
+                .is_some()
+        );
+        assert!(release["inputSchema"]["properties"].get("run_id").is_none());
+        assert!(
+            release["inputSchema"]["properties"]
+                .get("run_token")
+                .is_none()
         );
     }
 
@@ -1193,9 +1259,8 @@ mod tests {
     fn report_tool_definition_json_size() {
         let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
         eprintln!("tool_definition_json_bytes={bytes}");
-        // The eight Run-scoped tools intentionally repeat an explicit private
-        // capability schema so hosts cannot omit it. Keep that fail-closed
-        // contract while still bounding the complete 19-tool prompt cost.
+        // The eight Run-scoped tools intentionally repeat one compact opaque
+        // capability schema so hosts cannot omit it while prompt cost stays bounded.
         assert!(bytes <= 13_000, "tool definitions grew to {bytes} bytes");
         for tool in tool_definitions() {
             assert!(

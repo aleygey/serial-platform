@@ -12,8 +12,10 @@ readonly DEPLOYMENT_TARGET="11.0"
 readonly MCP_TOOL_COUNT=19
 readonly ARM_TARGET="aarch64-apple-darwin"
 readonly X86_TARGET="x86_64-apple-darwin"
-readonly -a REQUIRED_BINARIES=(serial seriald serialctl serial-mcp)
-readonly -a BUILD_PACKAGES=(serial-cli seriald serialctl serial-mcp)
+readonly APP_BUNDLE_NAME="Serial Platform.app"
+readonly -a REQUIRED_BINARIES=(serial seriald serialctl serial-mcp serial-desktop)
+readonly -a APP_BINARIES=(serial-desktop serial seriald)
+readonly -a BUILD_PACKAGES=(serial-cli seriald serialctl serial-mcp serial-desktop)
 
 export MACOSX_DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}"
 export COPYFILE_DISABLE=1
@@ -70,7 +72,7 @@ ensure_build_environment() {
     local command
     for command in \
         git rustc cargo rustup cc jq file strings shasum \
-        zip unzip xcrun arch codesign; do
+        zip unzip xcrun arch codesign plutil cmp; do
         require_command "${command}"
     done
 
@@ -344,22 +346,100 @@ smoke_package_binaries() {
     esac
     [[ "${tool_count}" == "${MCP_TOOL_COUNT}" ]] \
         || fail "${architecture} serial-mcp exposes ${tool_count} tools; expected ${MCP_TOOL_COUNT}"
+
+    local app_desktop="${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/serial-desktop"
+    smoke_binary "${app_desktop}" "${architecture}"
+    case "${architecture}" in
+        aarch64)
+            "${app_desktop}" --help >/dev/null
+            ;;
+        x86_64)
+            arch -x86_64 "${app_desktop}" --help >/dev/null
+            ;;
+    esac
 }
 
 assert_no_distribution_signature() {
     local package_dir="$1"
+    local -a binaries=()
     local binary
 
     for binary in "${REQUIRED_BINARIES[@]}"; do
+        binaries+=("${package_dir}/${binary}")
+    done
+    for binary in "${APP_BINARIES[@]}"; do
+        binaries+=("${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/${binary}")
+    done
+
+    for binary in "${binaries[@]}"; do
         local signature_info
-        if ! codesign -dv "${package_dir}/${binary}" >/dev/null 2>&1; then
+        if ! codesign -dv "${binary}" >/dev/null 2>&1; then
             continue
         fi
-        signature_info="$(codesign -dv "${package_dir}/${binary}" 2>&1)"
+        signature_info="$(codesign -dv "${binary}" 2>&1)"
         if grep -Eiq 'Signature=adhoc|flags=.*adhoc' <<<"${signature_info}"; then
             continue
         fi
-        fail "unexpected distribution signature; BUILD-INFO would be inaccurate: ${package_dir}/${binary}"
+        fail "unexpected distribution signature; BUILD-INFO would be inaccurate: ${binary}"
+    done
+}
+
+create_desktop_app_bundle() {
+    local package_dir="$1"
+    local architecture="$2"
+    local app_dir="${package_dir}/${APP_BUNDLE_NAME}"
+    local contents_dir="${app_dir}/Contents"
+    local executable_dir="${contents_dir}/MacOS"
+
+    mkdir -p "${executable_dir}"
+    local binary
+    for binary in "${APP_BINARIES[@]}"; do
+        install -m 0755 "${package_dir}/${binary}" "${executable_dir}/${binary}"
+    done
+
+    cat >"${contents_dir}/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>Serial Platform</string>
+    <key>CFBundleExecutable</key>
+    <string>serial-desktop</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.aleygey.serial-platform</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Serial Platform</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${PACKAGE_VERSION}</string>
+    <key>CFBundleVersion</key>
+    <string>${PACKAGE_VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>${DEPLOYMENT_TARGET}</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+    plutil -lint "${contents_dir}/Info.plist" >/dev/null
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${contents_dir}/Info.plist")" == "serial-desktop" ]] \
+        || fail "macOS App CFBundleExecutable is not serial-desktop"
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "${contents_dir}/Info.plist")" == "false" ]] \
+        || fail "macOS App must be a regular Dock application (LSUIElement=false)"
+
+    for binary in "${APP_BINARIES[@]}"; do
+        cmp "${package_dir}/${binary}" "${executable_dir}/${binary}" \
+            || fail "macOS App helper differs from packaged binary: ${binary}"
+        assert_macho "${executable_dir}/${binary}" "${architecture}"
     done
 }
 
@@ -403,6 +483,13 @@ write_build_info() {
             macos_sdk: $macos_sdk,
             rustc: $rustc,
             mcp_tool_count: $mcp_tool_count,
+            desktop: {
+                included: true,
+                executable: "serial-desktop",
+                app_bundle: "Serial Platform.app",
+                app_executables: ["serial-desktop", "serial", "seriald"],
+                local_service: "serial and seriald are bundled beside the App executable"
+            },
             build_system: "Jenkins-compatible native macOS builder",
             distribution: {
                 signing_status: "unsigned (Mach-O ad-hoc signatures may be present)",
@@ -444,6 +531,9 @@ normalize_package_metadata() {
     for binary in "${REQUIRED_BINARIES[@]}"; do
         chmod 0755 "${package_dir}/${binary}"
     done
+    for binary in "${APP_BINARIES[@]}"; do
+        chmod 0755 "${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/${binary}"
+    done
 
     # BSD touch lacks GNU's -d @epoch form. Perl is shipped by macOS and lets
     # us set both atime and mtime exactly without depending on the local zone.
@@ -471,6 +561,12 @@ create_zip_archive() {
     for binary in "${REQUIRED_BINARIES[@]}"; do
         grep -Fx "${package_name}/${binary}" <<<"${archive_entries}" >/dev/null
     done
+    grep -Fx "${package_name}/${APP_BUNDLE_NAME}/Contents/Info.plist" \
+        <<<"${archive_entries}" >/dev/null
+    for binary in "${APP_BINARIES[@]}"; do
+        grep -Fx "${package_name}/${APP_BUNDLE_NAME}/Contents/MacOS/${binary}" \
+            <<<"${archive_entries}" >/dev/null
+    done
     grep -Fx "${package_name}/BUILD-INFO.json" <<<"${archive_entries}" >/dev/null
     grep -Fx "${package_name}/MANIFEST.sha256" <<<"${archive_entries}" >/dev/null
 }
@@ -496,6 +592,7 @@ package_target() {
         assert_macho "${package_dir}/${binary}" "${architecture}"
     done
 
+    create_desktop_app_bundle "${package_dir}" "${architecture}"
     smoke_package_binaries "${package_dir}" "${architecture}"
     assert_no_distribution_signature "${package_dir}"
     copy_release_materials "${package_dir}"
@@ -505,6 +602,14 @@ package_target() {
         "${architecture}" \
         "${profile}"
     write_package_manifest "${package_dir}"
+    grep -F "  ${APP_BUNDLE_NAME}/Contents/Info.plist" \
+        "${package_dir}/MANIFEST.sha256" >/dev/null \
+        || fail "macOS package manifest does not cover the App Info.plist"
+    for binary in "${APP_BINARIES[@]}"; do
+        grep -F "  ${APP_BUNDLE_NAME}/Contents/MacOS/${binary}" \
+            "${package_dir}/MANIFEST.sha256" >/dev/null \
+            || fail "macOS package manifest does not cover App executable ${binary}"
+    done
     normalize_package_metadata "${package_dir}"
     create_zip_archive "${package_name}"
     rm -rf "${package_dir}"

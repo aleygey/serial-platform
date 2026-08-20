@@ -49,7 +49,10 @@ configure_profile() {
         debug)
             BUILD_PROFILE="debug"
             PROFILE_DIR="debug"
-            CARGO_PROFILE_ARGS=()
+            # Keep the array non-empty for Bash 3.2 + `set -u` (the default
+            # shell on macOS Jenkins helpers). Cargo's built-in `dev` profile
+            # writes to the conventional target/debug directory.
+            CARGO_PROFILE_ARGS=(--profile dev)
             ;;
         *)
             fail "unsupported build profile: ${requested_profile}; expected release or debug"
@@ -159,7 +162,8 @@ run_build() {
         -p serial-cli \
         -p seriald \
         -p serialctl \
-        -p serial-mcp
+        -p serial-mcp \
+        -p serial-desktop
 }
 
 run_smoke() {
@@ -170,7 +174,7 @@ run_smoke() {
     output_dir="$(host_output_dir)"
 
     local binary
-    for binary in serial seriald serialctl serial-mcp; do
+    for binary in serial seriald serialctl serial-mcp serial-desktop; do
         [[ -x "${output_dir}/${binary}" ]] \
             || fail "${BUILD_PROFILE} binary is missing or not executable: ${output_dir}/${binary}"
         "${output_dir}/${binary}" --version | grep -F "${PACKAGE_VERSION}" >/dev/null \
@@ -178,6 +182,7 @@ run_smoke() {
     done
 
     "${output_dir}/serial" --help >/dev/null
+    "${output_dir}/serial-desktop" --help >/dev/null
     local tool_count
     tool_count="$(dump_tool_count)"
     [[ "${tool_count}" == "${MCP_TOOL_COUNT}" ]] \
@@ -239,6 +244,10 @@ assert_linux_binary() {
         case "${library}" in
             libc.so.6|libm.so.6|libgcc_s.so.1|libpthread.so.0|libdl.so.2|librt.so.1|libutil.so.1|ld-linux-x86-64.so.2)
                 ;;
+            libX11.so.6|libX11-xcb.so.1|libXcursor.so.1|libXfixes.so.3|libXi.so.6|libXinerama.so.1|libXrandr.so.2|libXrender.so.1|libxcb.so.1|libEGL.so.1|libGL.so.1|libxkbcommon.so.0)
+                [[ "$(basename "${binary}")" == "serial-desktop" ]] \
+                    || fail "non-desktop Linux binary unexpectedly links GUI library ${library}: ${binary}"
+                ;;
             *)
                 fail "Linux package has an unexpected dynamic dependency ${library}: ${binary}"
                 ;;
@@ -272,12 +281,16 @@ write_build_info() {
     local rust_target="$2"
     local compatibility="$3"
     local tool_count="$4"
+    local desktop_runtime="$5"
+    local desktop_local_service="$6"
 
     jq -n \
         --arg version "${PACKAGE_VERSION}" \
         --arg git_commit "${GIT_COMMIT}" \
         --arg rust_target "${rust_target}" \
         --arg compatibility "${compatibility}" \
+        --arg desktop_runtime "${desktop_runtime}" \
+        --arg desktop_local_service "${desktop_local_service}" \
         --arg cargo_profile "${BUILD_PROFILE}" \
         --arg rustc "$(rustc --version)" \
         --arg zig "$(zig version)" \
@@ -293,6 +306,12 @@ write_build_info() {
             rustc: $rustc,
             zig: $zig,
             mcp_tool_count: $mcp_tool_count,
+            desktop: {
+                included: true,
+                executable: (if $rust_target | startswith("x86_64-pc-windows") then "serial-desktop.exe" else "serial-desktop" end),
+                runtime: $desktop_runtime,
+                local_service: $desktop_local_service
+            },
             build_system: "Jenkins"
         }' >"${destination}"
 }
@@ -328,8 +347,8 @@ normalize_package_metadata() {
     # ZIP records Unix mode bits, so normalize modes as well as timestamps.
     find "${package_dir}" -type d -exec chmod 0755 {} +
     find "${package_dir}" -type f -exec chmod 0644 {} +
-    for binary in serial seriald serialctl serial-mcp \
-        serial.exe seriald.exe serialctl.exe serial-mcp.exe; do
+    for binary in serial seriald serialctl serial-mcp serial-desktop \
+        serial.exe seriald.exe serialctl.exe serial-mcp.exe serial-desktop.exe; do
         if [[ -f "${package_dir}/${binary}" ]]; then
             chmod 0755 "${package_dir}/${binary}"
         fi
@@ -355,6 +374,10 @@ create_tar_archive() {
     gzip -t "${archive}"
     tar -tzf "${archive}" \
         | grep -Fx "${package_name}/docs/MCP_TOOLS.md" >/dev/null
+    tar -tzf "${archive}" \
+        | grep -Fx "${package_name}/serial-desktop" >/dev/null
+    tar -tzf "${archive}" \
+        | grep -Fx "${package_name}/seriald" >/dev/null
 }
 
 create_zip_archive() {
@@ -369,6 +392,8 @@ create_zip_archive() {
     unzip -tq "${archive}"
     unzip -Z1 "${archive}" \
         | grep -Fx "${package_name}/docs/MCP_TOOLS.md" >/dev/null
+    unzip -Z1 "${archive}" \
+        | grep -Fx "${package_name}/serial-desktop.exe" >/dev/null
 }
 
 run_package_target() {
@@ -378,6 +403,8 @@ run_package_target() {
     local package_dir
     local compatibility
     local build_target
+    local desktop_runtime
+    local desktop_local_service
     local -a binaries
 
     case "${target}" in
@@ -390,13 +417,17 @@ run_package_target() {
                 --locked \
                 --target "${zig_target}" \
                 -p serial-cli \
+                -p seriald \
                 -p serialctl \
-                -p serial-mcp
+                -p serial-mcp \
+                -p serial-desktop
             profile_dir="$(resolve_profile_dir "${target}" "${zig_target}")"
             package_name="serial-platform-v${PACKAGE_VERSION}$(profile_suffix)-linux-x86_64-ubuntu20.04"
             compatibility="Ubuntu 20.04+ x86_64; GNU/Linux glibc <= 2.31"
             build_target="${zig_target}"
-            binaries=(serial serialctl serial-mcp)
+            desktop_runtime="X11 display plus system X11/OpenGL runtime libraries"
+            desktop_local_service="sibling serial and seriald executables are included"
+            binaries=(serial seriald serialctl serial-mcp serial-desktop)
             ;;
         x86_64-pc-windows-gnu)
             log "Building ${target} with the GNU/MinGW-w64 ABI"
@@ -409,12 +440,15 @@ run_package_target() {
                     -p serial-cli \
                     -p seriald \
                     -p serialctl \
-                    -p serial-mcp
+                    -p serial-mcp \
+                    -p serial-desktop
             profile_dir="$(resolve_profile_dir "${target}")"
             package_name="serial-platform-v${PACKAGE_VERSION}$(profile_suffix)-windows-x86_64"
             compatibility="Windows x86_64; GNU/MinGW-w64 ABI (not MSVC)"
             build_target="${target}"
-            binaries=(serial.exe seriald.exe serialctl.exe serial-mcp.exe)
+            desktop_runtime="Windows x86_64 desktop environment; MinGW runtime is statically linked"
+            desktop_local_service="sibling seriald.exe is included"
+            binaries=(serial.exe seriald.exe serialctl.exe serial-mcp.exe serial-desktop.exe)
             ;;
         *)
             fail "unsupported release target: ${target}"
@@ -449,8 +483,22 @@ run_package_target() {
         "${package_dir}/BUILD-INFO.json" \
         "${build_target}" \
         "${compatibility}" \
-        "${tool_count}"
+        "${tool_count}" \
+        "${desktop_runtime}" \
+        "${desktop_local_service}"
     write_package_manifest "${package_dir}"
+    case "${target}" in
+        x86_64-unknown-linux-gnu)
+            grep -F "  ./serial-desktop" "${package_dir}/MANIFEST.sha256" >/dev/null \
+                || fail "Linux package manifest does not cover serial-desktop"
+            grep -F "  ./seriald" "${package_dir}/MANIFEST.sha256" >/dev/null \
+                || fail "Linux package manifest does not cover the local daemon"
+            ;;
+        x86_64-pc-windows-gnu)
+            grep -F "  ./serial-desktop.exe" "${package_dir}/MANIFEST.sha256" >/dev/null \
+                || fail "Windows package manifest does not cover serial-desktop.exe"
+            ;;
+    esac
     normalize_package_metadata "${package_dir}"
 
     case "${target}" in

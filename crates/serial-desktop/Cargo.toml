@@ -1,29 +1,33 @@
 [package]
-name = "serialctl"
-description = "Interactive multi-session client for seriald"
+name = "serial-desktop"
+description = "Native desktop client and local service manager for serial-platform"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "serial-desktop"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-clap.workspace = true
-crossterm.workspace = true
 directories.workspace = true
+eframe.workspace = true
 futures-util.workspace = true
-ratatui.workspace = true
-regex = "1"
+libc = "0.2"
 reqwest.workspace = true
-rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 serial-protocol = { path = "../serial-protocol" }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-unicode-width = "0.2"
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"

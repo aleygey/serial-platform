@@ -36,13 +36,13 @@ pipeline {
         booleanParam(
             name: 'BUILD_PACKAGES',
             defaultValue: true,
-            description: '打包并归档当前档位的可下载产物'
+            description: '打包并归档当前档位的 CLI、daemon、MCP 与 serial-desktop GUI 可下载产物'
         )
 
         booleanParam(
             name: 'BUILD_MACOS',
             defaultValue: true,
-            description: '在原生 Apple Silicon Jenkins Agent 上构建 macOS arm64 与 x86_64；需要 rust-macos && arm64 节点'
+            description: '在原生 Apple Silicon Jenkins Agent 上构建 macOS arm64 与 x86_64，并为各架构生成可双击的 Serial Platform.app；需要 rust-macos && arm64 节点'
         )
 
         booleanParam(

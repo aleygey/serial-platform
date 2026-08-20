@@ -18,6 +18,8 @@ This directory is a standalone Rust workspace:
 - `seriald`: configuration, authentication, serial actors, control/Run state,
   journal, HTTP APIs, and WebSocket subscriptions.
 - `serialctl`: remote setup, diagnostics, log query, and the human terminal.
+- `serial-desktop`: native Human client and local-process manager over the same
+  HTTP/WebSocket APIs; it never opens a physical serial handle directly.
 - `serial-mcp`: thin Agent-facing MCP transport and bounded operation adapter.
 
 No crate imports OpenChamber or an Agent SDK. OpenCode and Codex both consume
@@ -34,12 +36,14 @@ authoritative schemas are emitted by `tools/list` or
 `serial mcp --dump-tools` and documented in
 [MCP_TOOLS.md](./docs/MCP_TOOLS.md). Internal request IDs, operation IDs,
 control/fencing, lease renewal, prompt selection, capture bounds, cursor
-bookkeeping, Monitor policy, and notification delivery stay inside the adapter
+bookkeeping, and Monitor policy stay inside the adapter
 or daemon instead of becoming routine Agent parameters. The exception is the
-MCP-local Run capability: `run_start` returns a public audit `run_id` plus an
-unpredictable private `run_token`, and the initiating LLM session must pass the
-pair to each Run-scoped call. The token is never sent to `seriald`, placed in
-Run metadata/timeline events, or exposed by status.
+MCP-local Run capability: `run_start` returns a public audit `run_id` plus one
+opaque 22-character `run_handle`, and the initiating LLM session passes only
+that handle to each Run-scoped call. The handle carries 128 bits from the OS
+CSPRNG and resolves process-locally to the Slot, public Run ID, and a separate
+private capability. Neither secret is sent to `seriald`, placed in Run
+metadata/timeline events, or exposed by status.
 
 Agent `search` defaults to the active Run. Cross-Run or old-epoch history is
 never inferred from a text match: current-cursor and archive scopes require an
@@ -47,10 +51,10 @@ explicit cursor/epoch. A truncated active-Run search accepts its returned
 current-epoch `after_seq` while retaining the same `run_id` filter. The caller
 must page until `truncated=false` before treating an empty result as absence;
 continuation guidance takes precedence over archive guidance.
-`command` first requires a Run started by this `serial-mcp` process and the
-private `run_id`/`run_token` returned to that caller. The adapter validates the
-pair before the caller waits for the per-Slot write lock and revalidates it in
-the serialized control session immediately before the physical action. It
+`command` first requires the opaque `run_handle` returned for a Run started by
+this `serial-mcp` process. The adapter resolves and validates the handle before
+the caller waits for the per-Slot write lock, then revalidates the resolved
+private capability in the serialized control session immediately before the physical action. It
 attaches before TX, creates an Operation UUID, sends the Run ID as
 `expected_run_id`, then uses the confirmed TX audit sequence as the
 authoritative lower bound of its bounded output window. The Slot actor checks
@@ -111,10 +115,10 @@ of application-level success.
 `input` sends exact UTF-8 bytes without Profile EOL. `signal` sends Ctrl-C,
 Ctrl-D, and Ctrl-Z as the exact single bytes `0x03`, `0x04`, and `0x1a`, or
 requests a bounded physical UART Break. All four require the adapter-owned Run
-capability and the same fenced Control as a command. `trigger`, `wait`, and
-`run_end` require the same pair; an aborting `release` requires it while a Run
-is active. A caller cannot adopt a `run_id` learned from status because the
-private token is not published. Break is a line condition, not a character
+handle and the same fenced Control as a command. `trigger`, `wait`, and
+`run_end` require the same handle; an aborting `release` requires it while a
+Run is active. A caller cannot adopt a `run_id` learned from status because no
+handle is published. Break is a line condition, not a character
 byte, and creates a normal audited timeline event.
 
 The MCP session uses operation-specific RPC limits: ordinary control requests
@@ -124,10 +128,11 @@ cannot pre-empt seriald's legal 15-second physical-write deadline. Only Slots
 with Runs started by this adapter process receive periodic lease renewal.
 Each authorized Run-scoped call pins its Run for the complete call, including
 a `wait`/command capture lasting up to 120 seconds or a validated command
-sequence whose capture deadlines total up to 300 seconds. After the final pin is
-dropped, five minutes of inactivity makes the next renewal tick actively release
-Control and abort the abandoned Run; if that release cannot reach the daemon,
-the separately renewed 60-second fenced lease expires instead. `command` and
+sequence whose capture deadlines total up to 300 seconds. Normal completion
+uses `run_end` before the Agent's final reply. After the final pin is dropped,
+the configurable orphan timeout (default 1,800 seconds) makes the next renewal
+tick actively release Control and abort an abandoned Run; if that release
+cannot reach the daemon, the separately renewed 60-second fenced lease expires instead. `command` and
 `command_sequence` renew the existing lease and fail closed instead of
 reacquiring control after Run/lease loss.
 Disconnect or renewal failure clears the adapter's owned-Run ledger.
@@ -137,7 +142,7 @@ Explicit release first checks the serialized MCP session's local lease state
 inside the per-Slot lock. Without a local lease it is idempotent and ignores a
 foreign Run visible in public status. With a stale local Run but no daemon
 active Run, default release discards that bookkeeping and releases the lease;
-only this MCP's matching active Run requires abort plus its capability pair.
+only this MCP's matching active Run requires abort plus its exact handle.
 Seriald's explicit Run, pacing-budget, and lease-too-short rejections say that
 no bytes were written and are reported as safe to retry after correction;
 transport loss, timeout, and partial writes remain outcome-uncertain and are
@@ -273,6 +278,24 @@ continues with `durable=false`, logging becomes explicitly degraded, and later
 journal sequence jumps become persisted gaps. Historical scans run on bounded
 blocking workers and cannot occupy the journal writer or serial reader.
 
+The MCP default `read(scope=tail)` does not enter that historical-scan path.
+It takes an atomic, at-most-200-event snapshot from the Slot's bounded live
+replay ring and reports `source=live_ring,bounded_tail=true`. Its latency is
+therefore independent of retained epoch/segment count and the size of an active
+`.open` segment. `read(scope=continue)` uses the same endpoint with the MCP's
+process-local cursor and pages at most 1,000 oldest-next ring events; replay
+eviction and daemon-epoch changes are explicit gaps. Journal queries remain the
+path only for archive evidence and search.
+
+Between Agent operations, serial-mcp queries only bounded live-ring ownership
+and TX evidence. It filters its own activity by the server-issued actor ID, not
+the caller-selected label, and adds `recent_context` only for third-party
+activity or an incomplete/gapped answer. Physical-action tools fail closed
+with `context_changed,no_bytes_written=true` until a live `read(scope=tail)` or
+`wait` acknowledges the changed state. An epoch/generation/TX-offset
+precondition is then checked inside the Slot actor immediately before a write,
+BREAK, or Trigger reaches the physical action boundary.
+
 ## Serial and liveness state
 
 The OS-handle state is independent from target activity:
@@ -339,10 +362,12 @@ bounds.
 - A client disconnect releases control immediately; it is not held until TTL.
 - Releasing/revoking control aborts an active Run.
 - One Slot has at most one active Run.
-- At the MCP boundary, `run_start` creates a private in-memory `run_token` for
-  that Run. `command`, `command_sequence`, `input`, `signal`, `trigger`, `wait`,
-  and `run_end` require the exact `run_id`/`run_token`; active-Run `release`
-  requires it as well. This capability isolates callers sharing one long-lived MCP process;
+- At the MCP boundary, `run_start` creates one opaque in-memory `run_handle`
+  for that Run. `command`, `command_sequence`, `input`, `signal`, `trigger`,
+  `wait`, and `run_end` require that exact handle; active-Run `release`
+  requires it as well. The mapping retains a separate internal capability, so
+  the serialized physical-write boundary still performs a second validation.
+  This isolates callers sharing one long-lived MCP process;
   seriald continues to enforce the wire-level actor, fence, and Run owner.
 - Run boundaries do not reset or clean the target; they only define an exact
   event interval.
@@ -502,12 +527,11 @@ existing Job; reusing the ID with another spec fails. Exactly one non-empty
 literal `contains` or bounded byte-regex is required. When no `start_cursor` is
 provided, the daemon resolves it to the current Slot head, so pre-existing
 history cannot become a new incident. The public platform DTO also carries
-severity, description, debounce, cooldown, optional duration, and event TTL.
+severity, description, debounce, cooldown, and optional duration.
 The MCP surface intentionally exposes only Slot, matcher, description, and an
 optional UUID `idempotency_key`; reuse that key after an uncertain
 `monitor_start` response to obtain the same Job. It otherwise uses fixed safe
-policy defaults and never asks the model to select a webhook, Agent session,
-retry policy, or event freshness deadline.
+policy defaults and never asks the model to tune persistence or retention.
 
 Matching runs on an independent broadcast receiver and cannot block the Slot
 actor or serial reader. Literals and regular expressions may span adjacent RX
@@ -532,13 +556,12 @@ its first match so a restart can replay it rather than lose it. Bounds are enfor
 untrusted work reaches hot paths: 4,096-byte patterns, 1,024-byte descriptions,
 a 64-KiB match window, a 2-MiB compiled-regex budget, a 1,024-byte preview, 128
 retained Jobs, 64 active Jobs, 512 incidents per Monitor, 1,024 incidents
-globally, 512 outbox events, and 200 results per HTTP page. These limits have a
+globally, and 200 results per HTTP page. These limits have a
 conservative encoded-size envelope below the 64-MiB atomic state-file bound, so
 reaching a legal retention maximum cannot itself make persistence fail.
-`event_ttl_ms` expires only the notification/outbox entry; it never removes an
-Incident merely because notification freshness elapsed. At a hard retention
-bound, the oldest Incident is pruned regardless of ACK state so a consumer that
-does not expose ACK cannot permanently block newer evidence. `gap_count`,
+At a hard retention bound, the oldest Incident is pruned regardless of ACK
+state so a consumer that does not acknowledge incidents cannot permanently
+block newer evidence. `gap_count`,
 `first_available_incident_seq`, and `retention_gap` make that loss explicit.
 The oldest stopped Monitor may likewise be pruned when the 128-Job catalog is
 full (fully acknowledged Jobs are preferred), while exact serial evidence
@@ -557,19 +580,11 @@ The HTTP management and pull surface is additive under `/api/v1`:
 | `DELETE /api/v1/monitors/{id}?expected_revision=N` | operator | Conditionally stop future matching; retain incidents |
 | `GET /api/v1/monitors/{id}/incidents` | observer | Recent tail or cursor-forward bounded page |
 | `POST /api/v1/monitors/{id}/incidents/{incident_id}/ack` | operator | Acknowledge one retained incident |
-| `GET /api/v1/monitor-events` | observer | Read the generic notification outbox |
-| `POST /api/v1/monitor-events/{outbox_seq}/ack` | operator | Acknowledge one outbox entry |
 
-With no `[monitor_event_sink]` endpoint, incidents and CloudEvents-shaped outbox
-entries stay locally pullable; this is the complete standalone mode. When an
-HTTP endpoint is configured, seriald loads its bearer credential from
-`token_file` and delivers the same persisted CloudEvents 1.0-shaped event with
-bounded exponential backoff until delivery or TTL expiry. Serial bytes are
-referenced rather than copied without bound. The event type is
-`io.openchamber.serial.monitor.incident.detected.v1`. Agent Message Center is
-one compatible consumer, not a seriald dependency: routing to an AgentInstance,
-choosing `reuse_or_create`, resolving a return route, and starting an Agent turn
-remain message-center/adapter responsibilities.
+This pull surface is the complete Monitor integration. Serial bytes are
+referenced by exact cursor/range rather than copied without bound, and the
+journal remains the source of truth. Core seriald intentionally has no external
+delivery, credential, retry, Agent-session, or return-route adapter.
 
 The current 19-tool MCP registry includes five persistent-Monitor operations
 alongside the serial, Run, Trigger, and device-model operations.
@@ -578,9 +593,7 @@ authoritative state, `monitor_incidents` returns a 20-item recent tail, starts
 from the oldest retained incident with `after="0"`, or continues cursor-forward,
 and `monitor_stop` stops future detection without deleting
 incidents. The decimal `next_after` value is deliberately opaque to the model.
-If no message center exists, an Agent or user can poll these tools later; if a
-message center exists, the push path can start a new turn while the same pull
-tools remain the recovery and audit path. See
+An Agent or user can poll these tools in a later turn. See
 [MCP_TOOLS.md](./docs/MCP_TOOLS.md) for the complete generated surface.
 
 ## Timeline events
@@ -687,6 +700,20 @@ move the inspected page. A history shorter than the viewport cannot scroll;
 follow, resize, language, or timeline-detail changes release and rebuild the
 snapshot.
 
+At console startup, serialctl queries the durable journal only for each Slot's
+current daemon epoch and a snapshot-bounded head. It pages forward through a
+bounded 20,000-sequence / 8 MiB window, with at most two journal scans in flight
+and a ten-second deadline across all Slots. The long-lived WebSocket then
+attaches at the last cursor the journal actually returned, not blindly at the
+status head: if a live event is still awaiting its durability acknowledgement,
+the replay ring supplies that tail. Both layers are deduplicated by
+`(daemon_epoch, seq)`, and explicit query/ring gaps reset the terminal parser.
+A freshly opened console never loads an old epoch into the current device
+view; old epochs remain discoverable through archives and persistent search.
+If the daemon restarts while the console is already open, existing rows remain
+visible above an explicit daemon-restart boundary and the new epoch continues
+below that boundary.
+
 `Ctrl-C` is the one asynchronous interrupt available
 directly in both input modes: LINE discards its unsent draft and sends only ETX
 (`0x03`) through the normal fenced write path, without Profile EOL, then
@@ -750,27 +777,36 @@ Jenkins is the authoritative release builder. `BUILD_PROFILE` selects Debug or
 Release; both can be archived, but Debug packages are visibly named with
 `-debug-` and can never enter a GitHub Release. The ARM64 Linux worker first
 runs the locked workspace tests, Clippy, native smoke checks, and the exact
-19-entry `serial-mcp --dump-tools` check. It then builds two x86_64 targets:
+19-entry `serial-mcp --dump-tools` check. The inventory below is the v0.7
+package contract; published v0.6.2 archives remain immutable historical assets
+and are not retroactively repackaged. Jenkins then builds two x86_64 targets:
 
 - `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31` produces `serial`,
-  `serialctl`, and `serial-mcp` for Ubuntu 20.04 or newer. Every ELF is checked
-  for x86-64, the expected interpreter, and no GLIBC symbol newer than 2.31.
+  `seriald`, `serialctl`, `serial-mcp`, and `serial-desktop` for Ubuntu 20.04
+  or newer. Every ELF is checked for x86-64, the expected interpreter, and no
+  GLIBC symbol newer than 2.31. The GUI needs an X11 display and the normal
+  X11/XKB/OpenGL runtime libraries; the sibling daemon permits local startup.
 - ordinary Cargo plus the MinGW-w64 linker produces `serial.exe`,
-  `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe` for Windows x86_64. This
-  is the GNU ABI, not an MSVC build; every executable is checked as PE32+
-  x86-64 and rejected if it imports an unbundled MinGW runtime DLL.
+  `seriald.exe`, `serialctl.exe`, `serial-mcp.exe`, and `serial-desktop.exe` for
+  Windows x86_64. This is the GNU ABI, not an MSVC build; every executable is
+  checked as PE32+ x86-64 and rejected if it imports an unbundled MinGW runtime
+  DLL.
 - when `BUILD_MACOS` is enabled, a native Apple Silicon worker builds separate
   `aarch64-apple-darwin` and `x86_64-apple-darwin` ZIPs. It runs the complete
   workspace tests for both architectures (x86_64 through Rosetta 2), verifies
   Mach-O architecture, deployment target 11.0, system-only dynamic libraries,
-  all four program versions, and the 19-tool MCP registry. Unsigned/unnotarized
-  status is recorded in each package until Apple release credentials exist.
+  all five root program versions, and the 19-tool MCP registry. Each ZIP also
+  contains a double-clickable `Serial Platform.app` whose `Contents/MacOS`
+  directory includes `serial-desktop`, `serial`, and `seriald` for local
+  startup. Unsigned/unnotarized status is recorded in each package until Apple
+  release credentials exist.
 
 All four archives in a complete publishable Release contain `README.md`,
 `DOCUMENTATION.md`, `ROADMAP.md`, `LICENSE`,
 the `docs/` and `adapters/` trees, `BUILD-INFO.json`, and an internal
-`MANIFEST.sha256`. Sorted, normalized-time archives make repeated builds from
-one commit reproducible where the underlying Rust toolchain is deterministic.
+`MANIFEST.sha256`; the macOS manifest also covers the App plist and all three
+embedded executables. Sorted, normalized-time archives make repeated builds
+from one commit reproducible where the underlying Rust toolchain is deterministic.
 Jenkins also emits archive-level `SHA256SUMS`. GitHub Actions may validate
 development builds manually or on `codex/**`, but tags do not invoke it and it
 does not publish releases, preventing a second publisher from racing Jenkins.
@@ -787,8 +823,8 @@ Consumers use two complementary network planes:
 
 - HTTP request/response is the low-frequency query and administration plane:
   health, authoritative snapshots, port discovery, Profile/Slot configuration,
-  diagnostics, archives, bounded history, persistent Monitor management,
-  incident pages, and the notification outbox.
+  diagnostics, archives, bounded history, persistent Monitor management, and
+  incident pages.
 - One long-lived WebSocket is the realtime plane: attach/replay/live RX/TX,
   Control, Run, Trigger, write, signal, and lifecycle events. One connection
   may attach several Slots.
@@ -810,12 +846,20 @@ Endpoint: `GET /api/v1/ws`. Default loopback-only installations omit
 Authorization; authenticated installations send `Authorization: Bearer …`.
 Incoming WebSocket messages and frames are capped at 64 KiB.
 
-v0.6.2 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
+v0.7.0 retains WebSocket protocol v3 introduced in v0.4.0. Existing v0.4 peers
 are wire-compatible for the v3 realtime surface, while the additive Monitor
 HTTP APIs and MCP tools require v0.5 components. Protocol-v2 executables from
 0.3.x and protocol-v1 executables from 0.2.x are not wire-compatible with v3.
 The HTTP endpoints remain under `/api/v1`; that stable route namespace does not
-imply a WebSocket protocol version.
+imply a WebSocket protocol version. v0.7 removes the retired
+`/api/v1/monitor-events` delivery routes and `MonitorSpec.event_ttl_ms`; the
+core Monitor/Incident HTTP routes remain. A legacy `[monitor_event_sink]`
+table is accepted only for migration, ignored, and omitted on the next save.
+Status also carries the additive
+`serial_context_precondition_supported` capability. It defaults to false when
+absent from an older v3 daemon, so a v0.7 MCP rejects every guarded physical
+command/input/signal/sequence/Trigger action before any byte or BREAK rather
+than assuming that the daemon enforces an unknown optional field.
 
 Binary envelope:
 
@@ -886,7 +930,7 @@ authentication-required.
 | Method/path | Minimum role | Purpose |
 |---|---|---|
 | `GET /api/v1/health` | observer | Process identity, uptime, protocol version, and `auth_required` |
-| `GET /api/v1/status` | observer | Authoritative Slot snapshots |
+| `GET /api/v1/status` | observer | Authoritative Slot snapshots and additive atomic-write-boundary capabilities |
 | `GET /api/v1/ports` | admin | Enumerate ports on the daemon host |
 | `PUT /api/v1/config/slots` | admin | Validate, persist, and replace Slots |
 | `GET /api/v1/config/transport-profiles` | observer | List physical UART profiles |
@@ -901,13 +945,13 @@ authentication-required.
 | `GET /api/v1/diagnostics/storage` | observer | Journal quota, usage, queue, and logging health |
 | `GET /api/v1/slots/{id}/diagnostics` | observer | One authoritative Slot plus subscriber metrics |
 | `GET /api/v1/slots/{id}/events` | observer | Bounded durable query; `after_seq` is exclusive and `through_seq` is inclusive |
+| `GET /api/v1/slots/{id}/tail` | observer | Bounded atomic live-ring snapshot or cursor page; optional `tail_events` in `[1,2000]`, and cursor requires both `epoch` and `after_seq` |
+| `GET /api/v1/slots/{id}/recent-activity` | observer | Bounded TX/ownership evidence between `epoch`, exclusive `after_seq`, and inclusive `through_seq`; used by MCP context checks |
 | `POST /api/v1/monitors` | operator | Idempotently create a persistent live-RX Monitor |
 | `GET /api/v1/monitors[/{id}]` | observer | List or inspect persistent Monitors |
 | `PUT/DELETE /api/v1/monitors/{id}` | operator | Replace or stop a Monitor |
 | `GET /api/v1/monitors/{id}/incidents` | observer | Read retained incidents with bounded cursor pagination |
 | `POST /api/v1/monitors/{id}/incidents/{incident_id}/ack` | operator | Idempotently acknowledge one incident |
-| `GET /api/v1/monitor-events` | observer | Read the CloudEvents-shaped notification outbox |
-| `POST /api/v1/monitor-events/{outbox_seq}/ack` | operator | Idempotently acknowledge one outbox event |
 | `GET /api/v1/ws` | observer | Realtime protocol; writes require operator |
 
 Config writes run under one mutation gate: validate the full replacement,
@@ -1039,6 +1083,12 @@ use `.open`; sealed files use `.slog`.
   that advertises the configuration-revision capability introduced in v0.4; against an older
   daemon they fail closed instead of attempting an unbounded client-side regex
   fallback. Returned payload remains exact bytes.
+- An explicit epoch query traverses only that Slot's epoch directory. Sealed
+  segment sequence ranges are parsed from validated filenames so segments
+  wholly before an exclusive cursor can be skipped without opening their
+  headers. This bounds current-epoch tail-adjacent queries independently of the
+  number of older retained epochs; MCP `scope=tail` still uses the live ring so
+  even a large active `.open` segment is not scanned.
 - Queries independently compare adjacent retained records after the requested
   cursor. Any unexplained sequence jump becomes a conservative
   `sequence_discontinuity` gap, including the interval from `after_seq` to the

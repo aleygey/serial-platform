@@ -36,8 +36,6 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * GIB;
 pub const DEFAULT_RETENTION_TARGET_PERCENT: u8 = 90;
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_MONITOR_SINK_RETRY_MIN_MS: u64 = 1_000;
-pub const DEFAULT_MONITOR_SINK_RETRY_MAX_MS: u64 = 60_000;
 /// Hard bound for both one active configuration and the number of distinct
 /// Slot identities retained during one daemon epoch.
 pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
@@ -136,30 +134,6 @@ pub struct ControlConfig {
     pub max_waiters: usize,
 }
 
-/// Optional generic CloudEvents HTTP sink for durable Monitor notifications.
-/// The bearer secret is loaded from `token_file` and never persisted inline.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MonitorEventSinkConfig {
-    /// Exact HTTP endpoint, for example the message center Event API. `None`
-    /// keeps events in the pullable outbox without attempting delivery.
-    pub endpoint: Option<String>,
-    pub token_file: Option<PathBuf>,
-    pub retry_min_ms: u64,
-    pub retry_max_ms: u64,
-}
-
-impl Default for MonitorEventSinkConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: None,
-            token_file: None,
-            retry_min_ms: DEFAULT_MONITOR_SINK_RETRY_MIN_MS,
-            retry_max_ms: DEFAULT_MONITOR_SINK_RETRY_MAX_MS,
-        }
-    }
-}
-
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
@@ -202,8 +176,12 @@ pub struct DaemonConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub control: ControlConfig,
-    #[serde(default)]
-    pub monitor_event_sink: MonitorEventSinkConfig,
+    /// Parse-only compatibility for older configurations. The retired
+    /// external delivery adapter is ignored and omitted on the next save;
+    /// Monitor Incidents remain available through the core API/MCP.
+    #[allow(dead_code)]
+    #[serde(default, rename = "monitor_event_sink", skip_serializing)]
+    legacy_monitor_event_sink: Option<toml::Value>,
     /// Whether HTTP and WebSocket clients must present one of the configured
     /// bearer credentials. This defaults to `true` while deserializing so all
     /// v1 configuration files written before this field existed retain their
@@ -244,7 +222,7 @@ impl DaemonConfig {
                 bind: default_bind_address(),
                 logging: LoggingConfig::default(),
                 control: ControlConfig::default(),
-                monitor_event_sink: MonitorEventSinkConfig::default(),
+                legacy_monitor_event_sink: None,
                 auth_required: false,
                 auth: None,
                 slots: Vec::new(),
@@ -271,7 +249,6 @@ impl DaemonConfig {
         }
         validate_logging(&self.logging)?;
         validate_control(&self.control)?;
-        validate_monitor_event_sink(&self.monitor_event_sink)?;
         match (self.auth_required, self.auth.as_ref()) {
             (true, Some(auth)) => auth.validate()?,
             (true, None) => return Err(ConfigValidationError::MissingAuthentication),
@@ -656,12 +633,6 @@ pub enum ConfigValidationError {
         "control.wait_timeout_ms is {actual}, exceeding the queued-acquire ceiling of {limit} ms"
     )]
     ControlWaitTimeoutTooLarge { actual: u64, limit: u64 },
-    #[error("monitor_event_sink endpoint must be an http:// URL no longer than 2048 bytes")]
-    InvalidMonitorSinkEndpoint,
-    #[error("monitor_event_sink token_file must be non-empty and no longer than 4096 bytes")]
-    InvalidMonitorSinkTokenFile,
-    #[error("monitor_event_sink retry bounds must satisfy 100 <= min <= max <= 3600000 ms")]
-    InvalidMonitorSinkRetry,
     #[error("authentication configuration is invalid: {0}")]
     Authentication(#[from] AuthError),
     #[error("Slot at index {index} has invalid field {field}: {reason}")]
@@ -774,27 +745,6 @@ fn validate_control(control: &ControlConfig) -> Result<(), ConfigValidationError
             actual: control.wait_timeout_ms,
             limit: wait_limit_ms,
         });
-    }
-    Ok(())
-}
-
-fn validate_monitor_event_sink(sink: &MonitorEventSinkConfig) -> Result<(), ConfigValidationError> {
-    if let Some(endpoint) = sink.endpoint.as_deref()
-        && (endpoint.is_empty() || endpoint.len() > 2_048 || !endpoint.starts_with("http://"))
-    {
-        return Err(ConfigValidationError::InvalidMonitorSinkEndpoint);
-    }
-    if let Some(path) = sink.token_file.as_ref() {
-        let text = path.as_os_str().to_string_lossy();
-        if text.is_empty() || text.len() > 4_096 {
-            return Err(ConfigValidationError::InvalidMonitorSinkTokenFile);
-        }
-    }
-    if sink.retry_min_ms < 100
-        || sink.retry_min_ms > sink.retry_max_ms
-        || sink.retry_max_ms > 3_600_000
-    {
-        return Err(ConfigValidationError::InvalidMonitorSinkRetry);
     }
     Ok(())
 }
@@ -1689,22 +1639,18 @@ mod tests {
     }
 
     #[test]
-    fn monitor_sink_accepts_http_but_rejects_unsupported_schemes() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.monitor_event_sink.endpoint = Some("http://127.0.0.1:3000/api/v1/events".into());
-        config.validate().unwrap();
-
-        config.monitor_event_sink.endpoint =
-            Some("https://message-center.example/api/v1/events".into());
-        assert_eq!(
-            config.validate().unwrap_err(),
-            ConfigValidationError::InvalidMonitorSinkEndpoint
+    fn legacy_monitor_sink_is_accepted_but_ignored_and_not_reserialized() {
+        let (config, _) = DaemonConfig::generate();
+        let legacy = format!(
+            "{}\n[monitor_event_sink]\nendpoint = \"http://127.0.0.1:3000/events\"\n",
+            toml::to_string(&config).unwrap()
         );
-
-        config.monitor_event_sink.endpoint = Some("file:///tmp/events".into());
-        assert_eq!(
-            config.validate().unwrap_err(),
-            ConfigValidationError::InvalidMonitorSinkEndpoint
+        let parsed: DaemonConfig = toml::from_str(&legacy).unwrap();
+        parsed.validate().unwrap();
+        assert!(
+            !toml::to_string(&parsed)
+                .unwrap()
+                .contains("monitor_event_sink")
         );
     }
 

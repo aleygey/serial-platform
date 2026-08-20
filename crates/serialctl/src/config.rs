@@ -4,13 +4,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use uuid::Uuid;
 
 use crate::DEFAULT_ENDPOINT;
+
+pub const DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS: u64 = 30 * 60;
+pub const MIN_ORPHAN_RUN_TIMEOUT_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -36,6 +39,16 @@ pub struct ClientConfig {
     /// 3..=20; the default of 5 preserves the existing seven-row footprint
     /// once the two visual separators are included.
     pub agent_history_rows: Option<u16>,
+    /// Seconds an unpinned Agent Run may remain idle before a newly started
+    /// serial-mcp process treats it as orphaned and aborts it. Zero disables
+    /// idle cleanup; in that mode only explicit `run_end`, adapter exit, or a
+    /// takeover ends ownership. Existing MCP processes read configuration only
+    /// at startup.
+    pub orphan_run_timeout_seconds: Option<u64>,
+    /// serial-mcp capture preferences share this file. serialctl preserves
+    /// them when saving its own console preferences.
+    pub capture_max_events: Option<usize>,
+    pub capture_max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +90,8 @@ impl LoadedConfig {
                     .with_context(|| format!("cannot read client config {}", path.display()));
             }
         };
+        validate_client_config(&config)
+            .with_context(|| format!("invalid client config {}", path.display()))?;
         Ok(Self { path, config })
     }
 
@@ -115,6 +130,17 @@ impl LoadedConfig {
         fs::write(&self.path, encoded)
             .with_context(|| format!("cannot write client config {}", self.path.display()))
     }
+}
+
+fn validate_client_config(config: &ClientConfig) -> Result<()> {
+    if let Some(timeout) = config.orphan_run_timeout_seconds {
+        ensure!(
+            timeout == 0 || timeout >= MIN_ORPHAN_RUN_TIMEOUT_SECONDS,
+            "orphan Run timeout must be 0 (unlimited) or at least \
+             {MIN_ORPHAN_RUN_TIMEOUT_SECONDS} seconds"
+        );
+    }
+    Ok(())
 }
 
 pub fn read_token_if_present(path: &std::path::Path) -> Result<Option<String>> {
@@ -230,6 +256,41 @@ mod tests {
                 .unwrap()
                 .contains("agent_history_rows = 12")
         );
+    }
+
+    #[test]
+    fn shared_mcp_preferences_survive_a_console_save() {
+        let mut config = toml::from_str::<ClientConfig>(
+            "orphan_run_timeout_seconds = 3600\ncapture_max_events = 8192\n\
+             capture_max_bytes = 2097152\n",
+        )
+        .unwrap();
+        config.agent_history_rows = Some(12);
+
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("orphan_run_timeout_seconds = 3600"));
+        assert!(encoded.contains("capture_max_events = 8192"));
+        assert!(encoded.contains("capture_max_bytes = 2097152"));
+        assert!(encoded.contains("agent_history_rows = 12"));
+    }
+
+    #[test]
+    fn orphan_run_timeout_uses_the_same_strict_bounds_as_serial_mcp() {
+        for invalid in [1, 299] {
+            let config = ClientConfig {
+                orphan_run_timeout_seconds: Some(invalid),
+                ..ClientConfig::default()
+            };
+            assert!(validate_client_config(&config).is_err());
+        }
+
+        for valid in [0, 300, 1_800, 86_401, u64::MAX] {
+            let config = ClientConfig {
+                orphan_run_timeout_seconds: Some(valid),
+                ..ClientConfig::default()
+            };
+            validate_client_config(&config).unwrap();
+        }
     }
 
     #[test]

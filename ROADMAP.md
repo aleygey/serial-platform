@@ -1,9 +1,9 @@
 # serial-platform roadmap
 
 This roadmap separates shipped behavior from possible future work for
-`seriald`, the human `serialctl`/`serial console`, and `serial-mcp`. Items under
-**Later / candidate** are ideas, not commitments; station feedback decides
-whether they are promoted, changed, or removed.
+`seriald`, the Human `serialctl`/`serial console` and `serial-desktop` clients,
+and `serial-mcp`. Items under **Later / candidate** are ideas, not commitments;
+station feedback decides whether they are promoted, changed, or removed.
 
 ## Product boundary
 
@@ -12,15 +12,18 @@ physical port, fans one byte stream out to multiple observers, serializes
 writes, records authoritative events, and provides bounded realtime
 primitives.
 
-`serialctl` is the human setup, diagnosis, history, and terminal client.
-`serial-mcp` is the thin Agent adapter. The `serial` executable is only a
-unified launcher for those separate roles:
+`serialctl` is the Human setup, diagnosis, history, and terminal client.
+`serial-desktop` is another Human client and an explicitly bounded local
+`seriald` process manager; it never owns a serial handle. `serial-mcp` is the
+thin Agent adapter. The `serial` executable is only a unified launcher for
+those separate roles:
 
 ```text
 serial serve    -> seriald
 serial console  -> serialctl TUI
 serial setup/profile/status/doctor/logs -> serialctl management
 serial mcp      -> serial-mcp
+serial-desktop  -> native Human desktop client
 ```
 
 Flashing recipes, board reset policy, Linux command semantics, and
@@ -35,10 +38,15 @@ primitives.
 - **Released in v0.4.0**: the Profile/diagnostic/Agent-tool consolidation
   retained by v0.5.
 - **Released in v0.5.0**: persistent serial Monitor Jobs and their additive
-  MCP/notification surfaces.
+  MCP/incident-query surfaces.
 - **Released in v0.6.0**: in-terminal Profile/model/serial configuration,
   stable scrollback and Human/Agent command coexistence, plus independent
   Agent-visible model binding and a verified Jenkins release matrix.
+- **Implemented for v0.7.0**: opaque Run handles, explicit normal Run cleanup
+  with configurable orphan fallback, bounded live-ring Agent reads and context
+  guards, durable TUI restore/search, direct TUI/Desktop configuration, and a
+  native desktop client in every platform package. This remains development
+  work until a v0.7.0 release is published.
 - **Next**: practical validation or refinement work, not yet complete.
 - **Later / candidate**: retained options with no delivery promise.
 
@@ -100,15 +108,10 @@ primitives.
 - Idempotent Monitor creation keyed by `request_id`, authoritative status and
   cursor, retained incident acknowledgement, and recent-tail/cursor-forward
   pagination under additive `/api/v1/monitors` routes.
-- Bounded local Monitor state and notification outbox with explicit capacity
-  errors/gaps. Incident evidence remains in the serial journal rather than
-  being copied without bound into notification payloads. Oldest summaries
-  yield to newer evidence at hard bounds without requiring every Agent adapter
-  to expose acknowledgement, and cursor pages surface the resulting gap.
-- Optional station-configured HTTP CloudEvents 1.0-shaped sink. With no sink,
-  Monitor incidents and outbox events remain available through pull APIs; with
-  a sink, delivery retries with bounded exponential backoff until success or
-  freshness-TTL expiry. Agent/session routing remains outside seriald.
+- Bounded local Monitor state with explicit capacity errors/gaps. Incident
+  evidence remains in the serial journal rather than being copied without
+  bound into incident summaries. Oldest summaries yield to newer evidence at
+  hard bounds, and cursor pages surface the resulting gap.
 - WebSocket protocol remains v3. The Monitor surface is additive HTTP/MCP, so
   protocol-v3 v0.4 peers remain wire-compatible for existing realtime features;
   Monitor use requires v0.5 seriald and adapter components.
@@ -127,11 +130,22 @@ primitives.
   Run aborts caused by Human takeover carry an explicit reason so an Agent can
   distinguish takeover from transport or generic cancellation failure.
 
+### Implemented for v0.7.0
+
+- Additive atomic serial-context preconditions cover Agent Write, Break,
+  Trigger start, and every command-sequence step. Old protocol-v3 daemons that
+  do not advertise the capability are rejected before any physical action.
+- Live-ring tail and cursor continuation provide bounded realtime context
+  independent of retained journal size. Ring eviction and daemon restart are
+  explicit gaps; archive/history search continues to use bounded journal
+  queries.
+- Retired Monitor delivery/outbox routes and event TTL policy are removed while
+  durable Monitor Jobs, incident pull, and acknowledgement remain core.
+
 ### Next
 
-- Exercise Monitor restart, replay-gap, burst grouping, regex-boundary,
-  incident/outbox-capacity, sink outage/recovery, duplicate delivery, and TTL
-  expiry paths against sustained real 115200-baud output.
+- Exercise Monitor restart, replay-gap, burst grouping, regex-boundary, and
+  incident-capacity paths against sustained real 115200-baud output.
 - Run the two-Slot 115200-baud station matrix continuously: sustained RX,
   slow subscriber, repeated unplug/replug, daemon restart, disk pressure,
   Profile mutation conflicts, and Break support/unsupported drivers.
@@ -213,7 +227,7 @@ primitives.
 
 - The Windows and Ubuntu client packages track the v0.5 daemon/MCP release
   while preserving the existing console workflow. The first Monitor release
-  does not add Monitor policy or message-center routing to the human TUI.
+  does not add Monitor policy to the human TUI.
 
 ### Released in v0.6.0
 
@@ -232,6 +246,27 @@ primitives.
   cargo-zigbuild enforces the Ubuntu 20.04/glibc-2.31 ceiling and MinGW-w64
   produces the Windows GNU-ABI archive. Architecture, version, MCP tool count,
   manifests, and archive checksums are verified before publication.
+
+### Implemented for v0.7.0
+
+- Current-epoch terminal output is restored from the durable journal before
+  live WebSocket attachment. A bounded in-terminal search supports literal or
+  regex matching, case sensitivity, RX/TX direction, current Run/current
+  epoch, and retained epochs with visible truncation/gap state.
+- The full configuration page edits port, Transport and Device parameters with
+  optimistic revisions. Shared Profile and model mutations list every affected
+  Slot and require confirmation. Agent-history height and orphan-Run fallback
+  are configurable from the same terminal menu.
+- Agent history stays newest-first, expands dependent sequence steps, and can
+  jump the serial pane to the corresponding TX. Conventional slow cursor blink,
+  double-click word selection, lexical severity boundaries, and IP/MAC styling
+  improve day-to-day terminal use.
+- `serial-desktop` supplies the same current-epoch console, Human input, Agent
+  history, direct Slot settings, explicit local-daemon lifecycle, shortcuts,
+  and system/dark/light themes without duplicating serial ownership.
+- Windows and Ubuntu archives contain five programs including `seriald` and
+  `serial-desktop`; each macOS architecture also contains a double-clickable,
+  currently unsigned and unnotarized `Serial Platform.app`.
 
 ### Next
 
@@ -303,14 +338,13 @@ primitives.
   `monitor_stop`.
 - `monitor_start` exposes only Slot, exactly one literal/regex matcher, and an
   optional description. The adapter owns the idempotency UUID and safe
-  debounce/cooldown/TTL defaults; message-center and delivery policy never
-  become routine Agent arguments.
+  debounce/cooldown defaults; persistence policy never becomes a routine Agent
+  argument.
 - Monitor calls return immediately and leave the Job in seriald. Incident reads
   are capped at 20 compact entries and carry an opaque decimal continuation,
   exact serial range, bounded preview, and evidence reference/cursor.
-- The same tools work without a message center by pull polling. When seriald's
-  optional CloudEvents sink is configured, an external message center can
-  initiate a new Agent turn while MCP remains the recovery/audit path.
+- The same tools provide the complete bounded pull and audit path without an
+  external delivery dependency.
 
 ### Released in v0.6.0
 
@@ -324,11 +358,26 @@ primitives.
 - Human takeover is surfaced as a distinct Run-abort reason instead of an
   unexplained generic tool cancellation, reducing unsafe automatic retries.
 
+### Implemented for v0.7.0
+
+- Every Run-scoped tool accepts one 22-character opaque `run_handle`; public
+  Slot and Run IDs remain audit identity and cannot be used to adopt a Run.
+  Normal workflows must call `run_end`; the configurable orphan fallback
+  defaults to 1,800 seconds, accepts `0` for unlimited, and does not change the
+  renewable 60-second control lease.
+- `command_sequence` and the 19-tool registry remain bounded. Results surface
+  compact `recent_context` only after third-party activity or incomplete
+  evidence, and subsequent physical actions fail closed until that context is
+  observed.
+- `read(scope=tail)` and `read(scope=continue)` use the bounded live ring, so a
+  long-running journal cannot turn routine context reads into segment-discovery
+  budget failures. Historical search remains explicit and bounded.
+
 ### Next
 
 - Add real OpenCode/Codex regression scenarios where a Monitor outlives the
-  initiating turn, then verify pull-only recovery and Agent Message Center push
-  delivery produce the same incident/evidence identity.
+  initiating turn, then verify later pull recovery preserves the exact
+  incident/evidence identity.
 - Keep real-device regression fixtures for sustained output, delayed prompts,
   partial echo, target wrapping, foreign Human writes, reconnects, cancellation,
   raw signals, Break, and Trigger-based boot interruption.

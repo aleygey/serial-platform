@@ -10,13 +10,14 @@ use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS,
     DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, DeviceModelListResponse, Direction,
-    EchoMode, EventKind, EventQuery, MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES,
-    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
-    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
-    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelConfirmationMethod, PROTOCOL_VERSION,
-    SequenceWritePrecondition, SessionState, SetSlotDeviceModelRequest, SlotSnapshot,
-    StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
+    EchoMode, EventKind, EventQuery, EventQueryResponse, MAX_BREAK_DURATION_MS,
+    MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
+    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
+    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
+    MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS, MIN_TRIGGER_INTERVAL_MS,
+    MIN_TRIGGER_TIMEOUT_MS, ModelConfirmationMethod, PROTOCOL_VERSION, SequenceWritePrecondition,
+    SessionState, SetSlotDeviceModelRequest, SlotSnapshot, StatusResponse, TriggerInfo,
+    TriggerSpec, TriggerStatus, WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -83,6 +84,35 @@ struct SequenceStop {
     message: String,
 }
 
+#[derive(Debug)]
+struct ContextChanged {
+    recent_context: Value,
+}
+
+impl std::fmt::Display for ContextChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "serial context changed since the previous Agent operation; no bytes were written; inspect recent_context with read(scope=tail) or wait, then retry"
+        )
+    }
+}
+
+impl std::error::Error for ContextChanged {}
+
+pub(crate) fn structured_tool_error(error: &anyhow::Error) -> Option<Value> {
+    let changed = error.downcast_ref::<ContextChanged>()?;
+    Some(json!({
+        "error": {
+            "code": "context_changed",
+            "message": changed.to_string(),
+            "no_bytes_written": true,
+            "recent_context": changed.recent_context,
+            "retry_hint": "Call read(scope=tail) or wait to confirm the new serial state, then retry the operation."
+        }
+    }))
+}
+
 #[derive(Clone)]
 pub struct AgentTools {
     api: ApiClient,
@@ -90,6 +120,8 @@ pub struct AgentTools {
     actor_label: String,
     capture_limits: CaptureLimits,
     live_cursors: Arc<StdMutex<BTreeMap<String, Cursor>>>,
+    operation_cursors: Arc<StdMutex<BTreeMap<String, Cursor>>>,
+    pending_context: Arc<StdMutex<BTreeMap<String, Value>>>,
     write_locks: Arc<StdMutex<BTreeMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
@@ -106,12 +138,14 @@ impl AgentTools {
             actor_label,
             capture_limits,
             live_cursors: Arc::new(StdMutex::new(BTreeMap::new())),
+            operation_cursors: Arc::new(StdMutex::new(BTreeMap::new())),
+            pending_context: Arc::new(StdMutex::new(BTreeMap::new())),
             write_locks: Arc::new(StdMutex::new(BTreeMap::new())),
         }
     }
 
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
-        match name {
+        let mut output = match name {
             "devices" => self.devices(parse(arguments)?).await,
             "device_models" => self.device_models(parse(arguments)?).await,
             "device_model_set" => self.device_model_set(parse(arguments)?).await,
@@ -132,7 +166,229 @@ impl AgentTools {
             "run_end" => self.run_end(parse(arguments)?).await,
             "release" => self.release(parse(arguments)?).await,
             _ => bail!("unknown serial tool {name:?}"),
+        }?;
+        self.attach_recent_context(name, &mut output).await;
+        Ok(output)
+    }
+
+    /// Adds a compact activity summary only when another serial actor acted
+    /// after this MCP's previous successful operation and before the current
+    /// one completed. An incomplete bounded-ring answer is surfaced even when
+    /// it contains no matching event: only a complete empty answer proves that
+    /// no third party changed the serial context.
+    async fn attach_recent_context(&self, tool_name: &str, output: &mut Value) {
+        if !matches!(
+            tool_name,
+            "read"
+                | "command"
+                | "command_sequence"
+                | "input"
+                | "signal"
+                | "trigger"
+                | "wait"
+                | "run_start"
+        ) {
+            return;
         }
+        // Archived evidence can describe another daemon epoch and therefore
+        // cannot acknowledge a pending change on the live physical session.
+        if tool_name == "read" && output.get("scope").and_then(Value::as_str) == Some("archive") {
+            return;
+        }
+        let Some(slot_id) = output.get("slot_id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(after_seq) = output.pointer("/cursor/after_seq").and_then(Value::as_u64) else {
+            return;
+        };
+        let Some(epoch) = output
+            .pointer("/cursor/epoch")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Uuid>(value).ok())
+        else {
+            return;
+        };
+        let current = Cursor { epoch, after_seq };
+        let is_observation = matches!(tool_name, "read" | "wait");
+        let previous = self
+            .operation_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(slot_id.to_owned(), current.clone());
+        if tool_name == "run_start" {
+            return;
+        }
+        let Some(previous) = previous else {
+            if is_observation {
+                self.clear_pending_context(slot_id);
+            }
+            return;
+        };
+        if previous.epoch != current.epoch || previous.after_seq >= current.after_seq {
+            if is_observation {
+                self.clear_pending_context(slot_id);
+            }
+            return;
+        }
+        let context = self
+            .recent_context_between(slot_id, &previous, &current)
+            .await;
+        if is_observation {
+            self.clear_pending_context(slot_id);
+        } else if let Some(context) = context.as_ref() {
+            self.pending_context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(slot_id.to_owned(), context.clone());
+        }
+        if let Some(context) = context {
+            output["recent_context"] = context;
+        }
+    }
+
+    async fn recent_context_between(
+        &self,
+        slot_id: &str,
+        previous: &Cursor,
+        current: &Cursor,
+    ) -> Option<Value> {
+        if previous.epoch != current.epoch || previous.after_seq >= current.after_seq {
+            return None;
+        }
+        let own_actor_id = self.session.actor_id().await.ok().flatten();
+        match self
+            .api
+            .recent_activity(
+                slot_id,
+                current.epoch,
+                previous.after_seq,
+                current.after_seq,
+            )
+            .await
+        {
+            Ok(activity) => {
+                summarize_recent_context(activity, own_actor_id.as_deref(), previous, current)
+            }
+            Err(error) => Some(json!({
+                "interference": false,
+                "complete": false,
+                "after_seq": previous.after_seq,
+                "through_seq": current.after_seq,
+                "events": [],
+                "truncated": true,
+                "warning": format!("could not prove the serial context was unchanged: {error}"),
+            })),
+        }
+    }
+
+    /// Fails before a physical action whenever the bounded live history shows
+    /// a third-party action, or cannot prove that none occurred. The caller
+    /// deliberately does not advance the operation cursor on failure: a
+    /// subsequent read/wait is the explicit acknowledgement boundary.
+    async fn ensure_serial_context_unchanged(&self, slot: &SlotSnapshot) -> Result<()> {
+        if let Some(recent_context) = self
+            .pending_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&slot.config.id)
+            .cloned()
+        {
+            return Err(ContextChanged { recent_context }.into());
+        }
+        let previous = self
+            .operation_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&slot.config.id)
+            .cloned();
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        let current = Cursor {
+            epoch: slot.daemon_epoch,
+            after_seq: slot.head_seq,
+        };
+        if previous.epoch != current.epoch {
+            let recent_context = json!({
+                "interference": false,
+                "complete": false,
+                "after_seq": previous.after_seq,
+                "through_seq": current.after_seq,
+                "events": [],
+                "truncated": true,
+                "warning": "daemon epoch changed since the previous Agent operation",
+            });
+            self.pending_context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(slot.config.id.clone(), recent_context.clone());
+            return Err(ContextChanged { recent_context }.into());
+        }
+        if let Some(recent_context) = self
+            .recent_context_between(&slot.config.id, &previous, &current)
+            .await
+        {
+            self.pending_context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(slot.config.id.clone(), recent_context.clone());
+            return Err(ContextChanged { recent_context }.into());
+        }
+        Ok(())
+    }
+
+    fn clear_pending_context(&self, slot_id: &str) {
+        self.pending_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(slot_id);
+    }
+
+    async fn context_changed_after_boundary(
+        &self,
+        slot: &SlotSnapshot,
+        boundary_error: &anyhow::Error,
+    ) -> anyhow::Error {
+        let current_slot = self
+            .slot(&slot.config.id)
+            .await
+            .unwrap_or_else(|_| slot.clone());
+        let current = Cursor {
+            epoch: current_slot.daemon_epoch,
+            after_seq: current_slot.head_seq,
+        };
+        let previous = self
+            .operation_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&slot.config.id)
+            .cloned()
+            .unwrap_or(Cursor {
+                epoch: slot.daemon_epoch,
+                after_seq: slot.head_seq,
+            });
+        let recent_context = if previous.epoch == current.epoch {
+            self.recent_context_between(&slot.config.id, &previous, &current)
+                .await
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            json!({
+                "interference": false,
+                "complete": false,
+                "after_seq": previous.after_seq,
+                "through_seq": current.after_seq,
+                "events": [],
+                "truncated": true,
+                "warning": format!("daemon rejected the serial-context boundary: {boundary_error}"),
+            })
+        });
+        self.pending_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(slot.config.id.clone(), recent_context.clone());
+        ContextChanged { recent_context }.into()
     }
 
     async fn devices(&self, args: DevicesArgs) -> Result<Value> {
@@ -230,49 +486,62 @@ impl AgentTools {
         if args.through_seq.is_some() && scope != "archive" {
             bail!("through_seq is only valid with scope=archive");
         }
-        let (epoch, after_seq) = match scope {
-            "tail" => read_window(None, None, Some(200), &slot)?,
+        let (epoch, response) = match scope {
+            "tail" => {
+                let response = self.api.live_tail(&args.slot_id, 200, None).await?;
+                let epoch = response
+                    .next_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.epoch)
+                    .unwrap_or(slot.daemon_epoch);
+                (epoch, response)
+            }
             "continue" => {
                 let cursor = self.live_cursor(&slot.config.id).unwrap_or(Cursor {
                     epoch: slot.daemon_epoch,
                     after_seq: slot.head_seq,
                 });
-                if cursor.epoch != slot.daemon_epoch {
-                    (slot.daemon_epoch, Some(slot.head_seq))
-                } else {
-                    (cursor.epoch, Some(cursor.after_seq.min(slot.head_seq)))
-                }
+                let response = self
+                    .api
+                    .live_tail(&args.slot_id, 1_000, Some(&cursor))
+                    .await?;
+                let response_epoch = response
+                    .next_cursor
+                    .as_ref()
+                    .map_or(slot.daemon_epoch, |next| next.epoch);
+                (response_epoch, response)
             }
-            "archive" => (
-                args.epoch
-                    .context("scope=archive requires an explicit epoch")?,
-                args.after_seq,
-            ),
+            "archive" => {
+                let epoch = args
+                    .epoch
+                    .context("scope=archive requires an explicit epoch")?;
+                let response = self
+                    .api
+                    .events(
+                        &args.slot_id,
+                        &EventQuery {
+                            epoch: Some(epoch),
+                            after_seq: args.after_seq,
+                            through_seq: args.through_seq,
+                            before_wall_time_ns: None,
+                            after_wall_time_ns: None,
+                            direction: None,
+                            kind: None,
+                            actor_id: None,
+                            run_id: None,
+                            operation_id: None,
+                            contains: None,
+                            regex: None,
+                            limit_events: Some(1000),
+                            limit_bytes: Some(512 * 1024),
+                        },
+                    )
+                    .await?;
+                (epoch, response)
+            }
             _ => bail!("scope must be tail, continue, or archive"),
         };
-        let response = self
-            .api
-            .events(
-                &args.slot_id,
-                &EventQuery {
-                    epoch: Some(epoch),
-                    after_seq,
-                    through_seq: args.through_seq,
-                    before_wall_time_ns: None,
-                    after_wall_time_ns: None,
-                    direction: None,
-                    kind: None,
-                    actor_id: None,
-                    run_id: None,
-                    operation_id: None,
-                    contains: None,
-                    regex: None,
-                    limit_events: Some(1000),
-                    limit_bytes: Some(512 * 1024),
-                },
-            )
-            .await?;
-        let output = render_response(
+        let mut output = render_response(
             &slot,
             epoch,
             response,
@@ -286,6 +555,15 @@ impl AgentTools {
             },
             scope,
         );
+        if scope == "tail" {
+            output["source"] = json!("live_ring");
+            output["bounded_tail"] = json!(true);
+            output["tail_events"] = json!(200);
+        } else if scope == "continue" {
+            output["source"] = json!("live_ring");
+            output["bounded_continue"] = json!(true);
+            output["limit_events"] = json!(1_000);
+        }
         if output["cursor"]["epoch"] == json!(slot.daemon_epoch)
             && let Some(after_seq) = output["cursor"]["after_seq"].as_u64()
         {
@@ -542,12 +820,12 @@ impl AgentTools {
     }
 
     async fn wait(&self, args: WaitArgs) -> Result<Value> {
-        let _run_use = self
+        let run_use = self
             .session
-            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .authorize_run_use(args.run_handle.clone())
             .await?;
-        let slot = self.slot_online(&args.slot_id).await?;
-        let active_run = matching_active_run(&slot, args.run_id, "wait")?;
+        let slot = self.slot_online(&run_use.slot_id).await?;
+        let active_run = matching_active_run(&slot, run_use.run_id, "wait")?;
         let watched_run = (active_run.id, active_run.start_seq);
         let (patterns, until_regex, completion_mode) =
             requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
@@ -560,7 +838,7 @@ impl AgentTools {
             self.api.endpoint(),
             self.api.token(),
             &self.actor_label,
-            args.slot_id,
+            run_use.slot_id.clone(),
             cursor,
             self.capture_limits,
         )
@@ -618,6 +896,8 @@ impl AgentTools {
         let confidence = capture_confidence(&result.completion, truncated, gap);
         let mut output = json!({
             "slot_id": slot.config.id,
+            "run_handle": args.run_handle,
+            "run_open": true,
             "capture": completion_kind(&result.completion),
             "confidence": confidence,
             "text": rendered.text,
@@ -644,14 +924,17 @@ impl AgentTools {
 
     async fn command(&self, args: CommandArgs) -> Result<Value> {
         validate_command_description(&args.description)?;
-        let _run_use = self
+        let run_use = self
             .session
-            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let slot = self.slot_online(&args.slot_id).await?;
-        let active_run = matching_active_run(&slot, args.run_id, "command")?;
-        let expected_run_id = args.run_id;
+        let _write_guard = self.write_guard(&run_use.slot_id).await;
+        let slot = self
+            .slot_online_for_physical_action(&run_use.slot_id)
+            .await?;
+        let active_run = matching_active_run(&slot, run_use.run_id, "command")?;
+        self.ensure_serial_context_unchanged(&slot).await?;
+        let expected_run_id = run_use.run_id;
         let run_start_seq = active_run.start_seq;
         let prepared = prepare_command_step(
             &args.command,
@@ -661,32 +944,40 @@ impl AgentTools {
             seconds(args.timeout_seconds, 10, 1, 120),
             &slot,
         )?;
-        let executed = self
+        let executed = match self
             .execute_command_step(
                 &slot,
                 expected_run_id,
-                args.run_token,
+                run_use.run_token,
                 run_start_seq,
                 slot.head_seq,
                 prepared,
                 None,
-                None,
+                Some(serial_context_precondition(&slot)),
             )
             .await
-            .map_err(|failure| failure.error)?;
+        {
+            Ok(executed) => executed,
+            Err(failure) if failure.is_sequence_boundary_rejection() => {
+                return Err(self
+                    .context_changed_after_boundary(&slot, &failure.error)
+                    .await);
+            }
+            Err(failure) => return Err(failure.error),
+        };
         if let Completion::RunAborted { run_id, reason } = &executed.completion {
             return Err(self
                 .run_abort_error(&slot, *run_id, run_start_seq, reason, false)
                 .await);
         }
-        Ok(executed.output)
+        let mut output = executed.output;
+        attach_run_state(&mut output, &args.run_handle, true);
+        Ok(output)
     }
 
     async fn command_sequence(&self, args: CommandSequenceArgs) -> Result<Value> {
         let CommandSequenceArgs {
-            slot_id,
-            run_id,
-            run_token,
+            run_handle,
             description,
             steps,
         } = args;
@@ -696,13 +987,14 @@ impl AgentTools {
         // One Run pin and one process-local Slot write lock cover the entire
         // dependent interaction. No other call through this MCP can insert a
         // write between two sequence steps.
-        let _run_use = self
-            .session
-            .authorize_run_use(slot_id.clone(), run_id, run_token)
-            .await?;
+        let run_use = self.session.authorize_run_use(run_handle.clone()).await?;
+        let slot_id = run_use.slot_id.clone();
+        let run_id = run_use.run_id;
+        let run_token = run_use.run_token;
         let _write_guard = self.write_guard(&slot_id).await;
         let status = self.status().await?;
         ensure_sequence_write_precondition_supported(&status)?;
+        ensure_serial_context_precondition_supported(&status)?;
         let slot = status
             .slots
             .into_iter()
@@ -716,6 +1008,7 @@ impl AgentTools {
             );
         }
         let active_run = matching_active_run(&slot, run_id, "command_sequence")?;
+        self.ensure_serial_context_unchanged(&slot).await?;
         let run_start_seq = active_run.start_seq;
 
         // This completes every validation that depends on the effective Slot
@@ -761,10 +1054,15 @@ impl AgentTools {
                 Ok(executed) => executed,
                 Err(failure) => {
                     let boundary_changed = failure.is_sequence_boundary_rejection();
-                    if step_outputs.is_empty() && !boundary_changed {
+                    if step_outputs.is_empty() {
+                        if boundary_changed {
+                            return Err(self
+                                .context_changed_after_boundary(&slot, &failure.error)
+                                .await);
+                        }
                         return Err(failure.error);
                     }
-                    return Ok(command_sequence_output(
+                    let mut output = command_sequence_output(
                         &slot,
                         run_id,
                         sequence_id,
@@ -779,7 +1077,14 @@ impl AgentTools {
                             "message": failure.error.to_string(),
                             "next_step_sent": false,
                         })),
-                    ));
+                    );
+                    let run_open = self
+                        .session
+                        .run_ownership_retained(slot_id.clone(), run_id, run_token)
+                        .await
+                        .unwrap_or(false);
+                    attach_run_state(&mut output, &run_handle, run_open);
+                    return Ok(output);
                 }
             };
             expected_tx_offset = expected_tx_offset
@@ -810,7 +1115,15 @@ impl AgentTools {
             step_outputs.push(output);
 
             if let Some(stop) = stop {
-                return Ok(command_sequence_output(
+                let run_open = if sequence_stop_forces_closed(&stop) {
+                    false
+                } else {
+                    self.session
+                        .run_ownership_retained(slot_id.clone(), run_id, run_token)
+                        .await
+                        .unwrap_or(false)
+                };
+                let mut output = command_sequence_output(
                     &slot,
                     run_id,
                     sequence_id,
@@ -825,12 +1138,14 @@ impl AgentTools {
                         "message": stop.message,
                         "next_step_sent": false,
                     })),
-                ));
+                );
+                attach_run_state(&mut output, &run_handle, run_open);
+                return Ok(output);
             }
             completed_steps += 1;
         }
 
-        Ok(command_sequence_output(
+        let mut output = command_sequence_output(
             &slot,
             run_id,
             sequence_id,
@@ -839,7 +1154,14 @@ impl AgentTools {
             completed_steps,
             step_outputs,
             None,
-        ))
+        );
+        let run_open = self
+            .session
+            .run_ownership_retained(slot_id, run_id, run_token)
+            .await
+            .unwrap_or(false);
+        attach_run_state(&mut output, &run_handle, run_open);
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1006,13 +1328,16 @@ impl AgentTools {
     }
 
     async fn input(&self, args: InputArgs) -> Result<Value> {
-        let _run_use = self
+        let run_use = self
             .session
-            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let slot = self.slot_online(&args.slot_id).await?;
-        matching_active_run(&slot, args.run_id, "input")?;
+        let _write_guard = self.write_guard(&run_use.slot_id).await;
+        let slot = self
+            .slot_online_for_physical_action(&run_use.slot_id)
+            .await?;
+        matching_active_run(&slot, run_use.run_id, "input")?;
+        self.ensure_serial_context_unchanged(&slot).await?;
         let bytes = args.text.into_bytes();
         if bytes.is_empty() {
             bail!("input text must not be empty");
@@ -1020,18 +1345,24 @@ impl AgentTools {
         if bytes.len() > MAX_WRITE_BYTES {
             bail!("input text exceeds {MAX_WRITE_BYTES} UTF-8 bytes");
         }
-        self.write_raw(&slot, bytes, "input", args.run_id, args.run_token)
-            .await
+        let mut output = self
+            .write_raw(&slot, bytes, "input", run_use.run_id, run_use.run_token)
+            .await?;
+        attach_run_state(&mut output, &args.run_handle, true);
+        Ok(output)
     }
 
     async fn signal(&self, args: SignalArgs) -> Result<Value> {
-        let _run_use = self
+        let run_use = self
             .session
-            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let slot = self.slot_online(&args.slot_id).await?;
-        matching_active_run(&slot, args.run_id, "signal")?;
+        let _write_guard = self.write_guard(&run_use.slot_id).await;
+        let slot = self
+            .slot_online_for_physical_action(&run_use.slot_id)
+            .await?;
+        matching_active_run(&slot, run_use.run_id, "signal")?;
+        self.ensure_serial_context_unchanged(&slot).await?;
         if args.signal == "break" {
             let duration_ms = args.duration_ms.unwrap_or(250);
             if !(MIN_BREAK_DURATION_MS..=MAX_BREAK_DURATION_MS).contains(&duration_ms) {
@@ -1040,17 +1371,28 @@ impl AgentTools {
                      {MAX_BREAK_DURATION_MS}"
                 );
             }
-            return self
-                .send_break(&slot, duration_ms, args.run_id, args.run_token)
-                .await;
+            let mut output = self
+                .send_break(&slot, duration_ms, run_use.run_id, run_use.run_token)
+                .await?;
+            attach_run_state(&mut output, &args.run_handle, true);
+            return Ok(output);
         }
         if args.duration_ms.is_some() {
             bail!("duration_ms is valid only for signal=break");
         }
         let byte = control_signal_byte(&args.signal)
             .context("signal must be ctrl_c, ctrl_d, ctrl_z, or break")?;
-        self.write_raw(&slot, vec![byte], &args.signal, args.run_id, args.run_token)
-            .await
+        let mut output = self
+            .write_raw(
+                &slot,
+                vec![byte],
+                &args.signal,
+                run_use.run_id,
+                run_use.run_token,
+            )
+            .await?;
+        attach_run_state(&mut output, &args.run_handle, true);
+        Ok(output)
     }
 
     async fn send_break(
@@ -1070,10 +1412,14 @@ impl AgentTools {
                 operation_id,
                 expected_run_id,
                 run_token,
+                serial_context_precondition(slot),
             )
             .await
         {
             Ok(sent) => sent,
+            Err(error) if error.downcast_ref::<SequenceBoundaryRejected>().is_some() => {
+                return Err(self.context_changed_after_boundary(slot, &error).await);
+            }
             Err(error) => {
                 return Err(self
                     .session_run_error(slot, expected_run_id, active_run.start_seq, error, true)
@@ -1117,11 +1463,14 @@ impl AgentTools {
                 effective_write_pacing(slot),
                 None,
                 None,
-                None,
+                Some(serial_context_precondition(slot)),
             )
             .await
         {
             Ok(write) => write,
+            Err(error) if error.downcast_ref::<SequenceBoundaryRejected>().is_some() => {
+                return Err(self.context_changed_after_boundary(slot, &error).await);
+            }
             Err(error) => {
                 return Err(self
                     .session_run_error(slot, expected_run_id, active_run.start_seq, error, true)
@@ -1145,14 +1494,17 @@ impl AgentTools {
     }
 
     async fn trigger(&self, args: TriggerArgs) -> Result<Value> {
-        let _run_use = self
+        let run_use = self
             .session
-            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let slot = self.slot_online(&args.slot_id).await?;
-        let active_run = matching_active_run(&slot, args.run_id, "trigger")?;
-        let expected_run_id = args.run_id;
+        let _write_guard = self.write_guard(&run_use.slot_id).await;
+        let slot = self
+            .slot_online_for_physical_action(&run_use.slot_id)
+            .await?;
+        let active_run = matching_active_run(&slot, run_use.run_id, "trigger")?;
+        self.ensure_serial_context_unchanged(&slot).await?;
+        let expected_run_id = run_use.run_id;
         if let Some(active) = &slot.active_trigger {
             bail!(
                 "Slot already has Trigger {} in status {:?}; wait for it to finish or cancel it \
@@ -1169,7 +1521,7 @@ impl AgentTools {
             self.api.endpoint(),
             self.api.token(),
             &self.actor_label,
-            args.slot_id.clone(),
+            run_use.slot_id.clone(),
             Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: attached_after_seq,
@@ -1191,17 +1543,23 @@ impl AgentTools {
         let started = match self
             .session
             .trigger_start(
-                args.slot_id.clone(),
+                run_use.slot_id.clone(),
                 slot.daemon_epoch,
                 slot.generation,
                 operation_id,
                 expected_run_id,
-                args.run_token,
+                run_use.run_token,
+                serial_context_precondition(&slot),
                 spec,
             )
             .await
         {
             Ok(trigger) => trigger,
+            Err(error) if error.downcast_ref::<SequenceBoundaryRejected>().is_some() => {
+                let _ = capture_stop.send(None);
+                let _ = capture_task.await;
+                return Err(self.context_changed_after_boundary(&slot, &error).await);
+            }
             Err(error) => {
                 let _ = capture_stop.send(None);
                 let _ = capture_task.await;
@@ -1215,7 +1573,7 @@ impl AgentTools {
             .wait_trigger_terminal(
                 &slot,
                 expected_run_id,
-                args.run_token,
+                run_use.run_token,
                 operation_id,
                 started,
             )
@@ -1226,12 +1584,12 @@ impl AgentTools {
                 let cancel = self
                     .session
                     .trigger_cancel(
-                        args.slot_id.clone(),
+                        run_use.slot_id.clone(),
                         slot.daemon_epoch,
                         slot.generation,
                         started_id,
                         expected_run_id,
-                        args.run_token,
+                        run_use.run_token,
                     )
                     .await;
                 let _ = capture_stop.send(None);
@@ -1276,7 +1634,7 @@ impl AgentTools {
             .context("trigger capture task stopped unexpectedly")?;
         let run_ownership_retained = self
             .session
-            .run_ownership_retained(slot.config.id.clone(), expected_run_id, args.run_token)
+            .run_ownership_retained(slot.config.id.clone(), expected_run_id, run_use.run_token)
             .await
             .unwrap_or(false);
 
@@ -1338,6 +1696,8 @@ impl AgentTools {
         };
         let mut output = json!({
             "slot_id": slot.config.id,
+            "run_handle": args.run_handle,
+            "run_open": run_ownership_retained,
             "outcome": outcome,
             "matched": terminal.status.is_matched(),
             "fires": terminal.fires_confirmed,
@@ -1474,7 +1834,7 @@ impl AgentTools {
         }
         let started = self
             .session
-            .start_run_with_token(
+            .start_run_with_handle(
                 args.slot_id.clone(),
                 args.label,
                 BTreeMap::new(),
@@ -1492,50 +1852,74 @@ impl AgentTools {
         Ok(json!({
             "slot_id": args.slot_id,
             "run_id": run.id,
-            "run_token": started.run_token,
+            "run_handle": started.run_handle,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
-            "warning": "Run scopes evidence only. Keep run_token private and pass this run_id/run_token to this Run's command, command_sequence, input, signal, trigger, wait, run_end, or aborting release calls. Before commands, confirm the physical DUT model and initialize device state explicitly."
+            "cleanup_required": "Call run_end before the final reply unless deliberately handing this live Run to a continuing agent workflow."
         }))
     }
 
     async fn run_end(&self, args: RunEndArgs) -> Result<Value> {
-        let _run_use = self
+        let run_use = self
             .session
-            .authorize_run_use(args.slot_id.clone(), args.run_id, args.run_token)
+            .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let slot = self.slot(&args.slot_id).await?;
-        matching_active_run(&slot, args.run_id, "run_end")?;
+        let _write_guard = self.write_guard(&run_use.slot_id).await;
+        let slot = self.slot(&run_use.slot_id).await?;
+        matching_active_run(&slot, run_use.run_id, "run_end")?;
         let ended = self
             .session
-            .end_run(args.slot_id.clone(), args.run_id, args.run_token)
+            .end_run(run_use.slot_id.clone(), run_use.run_id, run_use.run_token)
             .await?;
         Ok(json!({
-            "slot_id": args.slot_id,
-            "ended": ended.id,
+            "slot_id": run_use.slot_id,
+            "run_id": ended.id,
+            "run_handle": args.run_handle,
+            "run_open": false,
             "control_release": "best_effort"
         }))
     }
 
     async fn release(&self, args: ReleaseArgs) -> Result<Value> {
-        let run_capability = paired_release_capability(args.run_id, args.run_token)?;
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let local = self
-            .session
-            .local_control_state(args.slot_id.clone())
-            .await?;
+        let (slot_id, run_use) = match args.run_handle.as_ref() {
+            Some(handle) => {
+                if !args.abort_run {
+                    bail!(
+                        "run_handle is valid for release only with abort_run=true; use run_end for normal completion"
+                    );
+                }
+                if args.slot_id.is_some() {
+                    bail!(
+                        "aborting release needs only run_handle and abort_run=true; omit slot_id"
+                    );
+                }
+                let authorized = self.session.authorize_run_use(handle.clone()).await?;
+                (authorized.slot_id.clone(), Some(authorized))
+            }
+            None => {
+                if args.abort_run {
+                    bail!("abort_run=true requires run_handle from run_start");
+                }
+                let slot_id = args
+                    .slot_id
+                    .context("release requires slot_id, or run_handle with abort_run=true")?;
+                (slot_id, None)
+            }
+        };
+        let run_capability = run_use.as_ref().map(|run| (run.run_id, run.run_token));
+        let _write_guard = self.write_guard(&slot_id).await;
+        let local = self.session.local_control_state(slot_id.clone()).await?;
         if !local.has_lease {
             // Public status may show a foreign Run, but release controls only
             // this MCP connection. Avoid consulting or modifying that Run;
             // the local no-lease release also discards any stale owned_run.
             let had_lease = self
                 .session
-                .release(args.slot_id.clone(), false, None, true)
+                .release(slot_id.clone(), false, None, true)
                 .await?;
-            return Ok(release_output(args.slot_id, had_lease));
+            return Ok(release_output(slot_id, had_lease));
         }
 
-        let current = self.slot(&args.slot_id).await?;
+        let current = self.slot(&slot_id).await?;
         let decision = plan_release(
             local,
             current.active_run.as_ref().map(|run| run.id),
@@ -1549,24 +1933,16 @@ impl AgentTools {
         else {
             unreachable!("a checked local lease cannot produce AlreadyReleased")
         };
-        let _run_use = match authorize {
-            Some((run_id, run_token)) => Some(
-                self.session
-                    .authorize_run_use(args.slot_id.clone(), run_id, run_token)
-                    .await?,
-            ),
-            None => None,
-        };
         let had_lease = self
             .session
             .release(
-                args.slot_id.clone(),
+                slot_id.clone(),
                 args.abort_run,
-                run_capability,
+                authorize,
                 allow_stale_cleanup,
             )
             .await?;
-        Ok(release_output(args.slot_id, had_lease))
+        Ok(release_output(slot_id, had_lease))
     }
 
     async fn slot(&self, slot_id: &str) -> Result<SlotSnapshot> {
@@ -1586,6 +1962,24 @@ impl AgentTools {
 
     async fn slot_online(&self, slot_id: &str) -> Result<SlotSnapshot> {
         let slot = self.slot(slot_id).await?;
+        if slot.session_state != SessionState::Online {
+            bail!(
+                "Slot {slot_id:?} is {:?}: {}",
+                slot.session_state,
+                slot.state_reason.as_deref().unwrap_or("no reason reported")
+            );
+        }
+        Ok(slot)
+    }
+
+    async fn slot_online_for_physical_action(&self, slot_id: &str) -> Result<SlotSnapshot> {
+        let status = self.status().await?;
+        ensure_serial_context_precondition_supported(&status)?;
+        let slot = status
+            .slots
+            .into_iter()
+            .find(|slot| slot.config.id == slot_id)
+            .with_context(|| format!("unknown Slot {slot_id:?}"))?;
         if slot.session_state != SessionState::Online {
             bail!(
                 "Slot {slot_id:?} is {:?}: {}",
@@ -1760,6 +2154,73 @@ impl AgentTools {
     }
 }
 
+fn summarize_recent_context(
+    activity: EventQueryResponse,
+    own_actor_id: Option<&str>,
+    previous: &Cursor,
+    current: &Cursor,
+) -> Option<Value> {
+    let activity_truncated = activity.truncated || !activity.gaps.is_empty();
+    let events = activity
+        .events
+        .into_iter()
+        // Actor labels are intentionally not identities: two MCP processes
+        // commonly use the same label. Only the server-issued actor ID for
+        // this exact WebSocket can identify our own writes.
+        .filter(|event| {
+            event
+                .actor
+                .as_ref()
+                .is_none_or(|actor| Some(actor.id.as_str()) != own_actor_id)
+        })
+        .map(|event| {
+            let actor = event.actor.map(|actor| {
+                json!({
+                    "kind": actor.kind,
+                    "label": actor.label,
+                })
+            });
+            let mut summary = json!({
+                "seq": event.seq,
+                "kind": event.kind,
+                "actor": actor,
+            });
+            if event.direction == Direction::Tx {
+                summary["tx_bytes"] = json!(event.data.len());
+                if let Some(description) = event
+                    .metadata
+                    .get("command_description")
+                    .and_then(Value::as_str)
+                {
+                    summary["description"] = json!(description);
+                }
+                if let Some(description) = event
+                    .metadata
+                    .get("command_sequence_description")
+                    .and_then(Value::as_str)
+                {
+                    summary["sequence_description"] = json!(description);
+                }
+            }
+            if let Some(reason) = event.metadata.get("reason").and_then(Value::as_str) {
+                summary["reason"] = json!(reason);
+            }
+            summary
+        })
+        .collect::<Vec<_>>();
+    if events.is_empty() && !activity_truncated {
+        return None;
+    }
+    Some(json!({
+        "interference": !events.is_empty(),
+        "complete": !activity_truncated,
+        "after_seq": previous.after_seq,
+        "through_seq": current.after_seq,
+        "events": events,
+        "truncated": activity_truncated,
+    }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunAbortDiagnosis {
     reason: String,
@@ -1872,6 +2333,17 @@ fn select_wait_cursor(
     )
 }
 
+fn serial_context_precondition(slot: &SlotSnapshot) -> SequenceWritePrecondition {
+    SequenceWritePrecondition {
+        cursor: Cursor {
+            epoch: slot.daemon_epoch,
+            after_seq: slot.head_seq,
+        },
+        expected_generation: slot.generation,
+        expected_tx_offset: slot.tx_offset,
+    }
+}
+
 fn remember_live_cursor(cursors: &mut BTreeMap<String, Cursor>, slot_id: &str, cursor: Cursor) {
     match cursors.get_mut(slot_id) {
         Some(current) if current.epoch == cursor.epoch => {
@@ -1905,17 +2377,6 @@ fn matching_active_run<'a>(
         );
     }
     Ok(active)
-}
-
-fn paired_release_capability(
-    run_id: Option<Uuid>,
-    run_token: Option<Uuid>,
-) -> Result<Option<(Uuid, Uuid)>> {
-    match (run_id, run_token) {
-        (Some(run_id), Some(run_token)) => Ok(Some((run_id, run_token))),
-        (None, None) => Ok(None),
-        _ => bail!("run_id and run_token must be provided together"),
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1957,11 +2418,11 @@ fn plan_release(
     if !abort_run {
         bail!(
             "serial-mcp owns active Run {local_run_id}; use run_end, or set abort_run=true with \
-             its private run_id/run_token"
+             its run_handle"
         );
     }
     let capability = run_capability.context(
-        "release would abort this MCP's active Run; pass run_id/run_token from this caller's \
+        "release would abort this MCP's active Run; pass run_handle from this caller's \
          run_start response",
     )?;
     if capability.0 != local_run_id {
@@ -1984,6 +2445,11 @@ fn release_output(slot_id: String, had_lease: bool) -> Value {
         "already_released": !had_lease,
         "serial_port_closed": false
     })
+}
+
+fn attach_run_state(output: &mut Value, run_handle: &str, run_open: bool) {
+    output["run_handle"] = json!(run_handle);
+    output["run_open"] = json!(run_open);
 }
 
 fn validate_command_description(description: &str) -> Result<()> {
@@ -2172,6 +2638,10 @@ fn command_sequence_stop(
     None
 }
 
+fn sequence_stop_forces_closed(stop: &SequenceStop) -> bool {
+    stop.code == "run_aborted"
+}
+
 fn command_has_no_rx(rx_event_count: usize, echo_observed: bool) -> bool {
     rx_event_count == 0 && !echo_observed
 }
@@ -2315,7 +2785,6 @@ fn compact_monitor_incident(incident: &Value) -> Value {
         "wall_time_start_ns": incident.get("wall_time_start_ns").cloned().unwrap_or(Value::Null),
         "wall_time_end_ns": incident.get("wall_time_end_ns").cloned().unwrap_or(Value::Null),
         "created_wall_time_ns": incident.get("created_wall_time_ns").cloned().unwrap_or(Value::Null),
-        "expires_wall_time_ns": incident.get("expires_wall_time_ns").cloned().unwrap_or(Value::Null),
         "acked": incident.get("acked_wall_time_ns").is_some_and(|value| !value.is_null())
     })
 }
@@ -2375,31 +2844,6 @@ fn current_run_id(
     }
 }
 
-/// Resolve the epoch and window for a read. An explicit epoch is honored
-/// as-is so archived history stays reachable; only a cursor on the current
-/// daemon epoch is validated against the live head.
-fn read_window(
-    epoch: Option<Uuid>,
-    after_seq: Option<u64>,
-    tail_events: Option<usize>,
-    slot: &SlotSnapshot,
-) -> Result<(Uuid, Option<u64>)> {
-    match (epoch, after_seq) {
-        (None, None) => {
-            let tail = tail_events.unwrap_or(200).clamp(1, 2000) as u64;
-            Ok((slot.daemon_epoch, Some(slot.head_seq.saturating_sub(tail))))
-        }
-        (Some(epoch), Some(after_seq)) => {
-            if epoch == slot.daemon_epoch && after_seq > slot.head_seq {
-                bail!("cursor is ahead of Slot head_seq {}", slot.head_seq);
-            }
-            Ok((epoch, Some(after_seq)))
-        }
-        (Some(epoch), None) => Ok((epoch, None)),
-        (None, Some(_)) => bail!("after_seq requires an explicit epoch"),
-    }
-}
-
 fn render_response(
     slot: &SlotSnapshot,
     query_epoch: Uuid,
@@ -2435,13 +2879,23 @@ fn render_response(
     }
     let mut warnings = Vec::new();
     if gap {
-        warnings.push("journal gap; returned text is incomplete".to_string());
+        warnings.push(
+            if matches!(scope, "tail" | "continue") {
+                "live replay gap; returned text is incomplete"
+            } else {
+                "journal gap; returned text is incomplete"
+            }
+            .to_string(),
+        );
     }
     if response.truncated {
         warnings.push("event page hit its hard limit; continue from cursor".to_string());
     }
     if !warnings.is_empty() {
         output["warnings"] = json!(warnings);
+    }
+    if gap {
+        output["gaps"] = json!(response.gaps);
     }
     attach_omission(&mut output, &rendered);
     output
@@ -2914,7 +3368,16 @@ fn ensure_protocol_compatible(status: &StatusResponse) -> Result<()> {
 fn ensure_sequence_write_precondition_supported(status: &StatusResponse) -> Result<()> {
     if !status.sequence_write_precondition_supported {
         bail!(
-            "seriald does not advertise atomic command_sequence write boundaries; no bytes were written. Install seriald and serial-mcp from the same v0.6.2-or-newer build"
+            "seriald does not advertise atomic command_sequence write boundaries; no bytes were written. Install seriald and serial-mcp from the same v0.7.0-or-newer build"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_serial_context_precondition_supported(status: &StatusResponse) -> Result<()> {
+    if !status.serial_context_precondition_supported {
+        bail!(
+            "seriald does not advertise atomic serial-context boundaries for Write, BREAK, and Trigger; no bytes were written. Install seriald and serial-mcp from the same v0.7.0-or-newer build"
         );
     }
     Ok(())
@@ -3222,9 +3685,7 @@ struct MonitorIncidentsArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
     expect: Option<String>,
     regex: Option<String>,
     timeout_seconds: Option<u64>,
@@ -3232,9 +3693,7 @@ struct WaitArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
     command: String,
     description: String,
     expect: Option<String>,
@@ -3244,9 +3703,7 @@ struct CommandArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandSequenceArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
     description: String,
     steps: Vec<CommandSequenceStepArgs>,
 }
@@ -3262,17 +3719,13 @@ struct CommandSequenceStepArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
     text: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignalArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
     signal: String,
     duration_ms: Option<u64>,
 }
@@ -3285,9 +3738,7 @@ struct TriggerWriteArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TriggerArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
     #[serde(rename = "kickoff")]
     initial_write: Option<TriggerWriteArgs>,
     start_contains: Option<String>,
@@ -3307,23 +3758,179 @@ struct RunStartArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunEndArgs {
-    slot_id: String,
-    run_id: Uuid,
-    run_token: Uuid,
+    run_handle: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseArgs {
-    slot_id: String,
+    slot_id: Option<String>,
     #[serde(default)]
     abort_run: bool,
-    run_id: Option<Uuid>,
-    run_token: Option<Uuid>,
+    run_handle: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_protocol::{GapRange, GapReason, TimelineEvent};
+
+    const TEST_RUN_HANDLE: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+    fn activity_event(
+        epoch: Uuid,
+        seq: u64,
+        actor_id: &str,
+        actor_label: &str,
+        metadata: BTreeMap<String, Value>,
+    ) -> TimelineEvent {
+        TimelineEvent {
+            slot_id: "bench".into(),
+            daemon_epoch: epoch,
+            seq,
+            generation: 1,
+            wall_time_ns: seq as i64,
+            monotonic_time_ns: seq,
+            kind: EventKind::Tx,
+            direction: Direction::Tx,
+            actor: Some(Actor {
+                id: actor_id.into(),
+                label: actor_label.into(),
+                kind: ActorKind::Agent,
+            }),
+            run_id: None,
+            operation_id: None,
+            stream_offset_start: Some(0),
+            stream_offset_end: Some(4),
+            data: b"test".to_vec(),
+            metadata,
+            durable: true,
+        }
+    }
+
+    #[test]
+    fn recent_context_filters_by_server_actor_id_not_shared_label_and_keeps_descriptions() {
+        let epoch = Uuid::new_v4();
+        let previous = Cursor {
+            epoch,
+            after_seq: 1,
+        };
+        let current = Cursor {
+            epoch,
+            after_seq: 3,
+        };
+        let own = activity_event(epoch, 2, "own-id", "serial-mcp", BTreeMap::new());
+        let foreign = activity_event(
+            epoch,
+            3,
+            "foreign-id",
+            // Deliberately identical: labels are audit text, not identity.
+            "serial-mcp",
+            BTreeMap::from([
+                ("command_description".into(), json!("查看样机内存")),
+                (
+                    "command_sequence_description".into(),
+                    json!("登录并检查内存"),
+                ),
+            ]),
+        );
+        let context = summarize_recent_context(
+            EventQueryResponse {
+                events: vec![own, foreign],
+                next_cursor: Some(current.clone()),
+                truncated: false,
+                first_available_seq: Some(1),
+                gaps: Vec::new(),
+            },
+            Some("own-id"),
+            &previous,
+            &current,
+        )
+        .expect("foreign same-label actor must remain visible");
+
+        assert_eq!(context["interference"], true);
+        assert_eq!(context["complete"], true);
+        assert_eq!(context["events"].as_array().unwrap().len(), 1);
+        assert_eq!(context["events"][0]["actor"]["label"], "serial-mcp");
+        assert_eq!(context["events"][0]["description"], "查看样机内存");
+        assert_eq!(
+            context["events"][0]["sequence_description"],
+            "登录并检查内存"
+        );
+    }
+
+    #[test]
+    fn recent_context_surfaces_gap_even_when_no_relevant_event_survives() {
+        let epoch = Uuid::new_v4();
+        let previous = Cursor {
+            epoch,
+            after_seq: 1,
+        };
+        let current = Cursor {
+            epoch,
+            after_seq: 50,
+        };
+        let context = summarize_recent_context(
+            EventQueryResponse {
+                events: Vec::new(),
+                next_cursor: Some(current.clone()),
+                truncated: false,
+                first_available_seq: Some(40),
+                gaps: vec![GapRange {
+                    epoch,
+                    first_seq: 2,
+                    last_seq: 39,
+                    reason: GapReason::RingEvicted,
+                }],
+            },
+            Some("own-id"),
+            &previous,
+            &current,
+        )
+        .expect("a gap must not be mistaken for proof of no interference");
+
+        assert_eq!(context["interference"], false);
+        assert_eq!(context["complete"], false);
+        assert_eq!(context["truncated"], true);
+        assert_eq!(context["events"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn pending_context_fails_closed_before_any_side_effect() {
+        let api = ApiClient::new("http://127.0.0.1:1".into(), None).unwrap();
+        let session = SessionHandle::spawn(
+            "http://127.0.0.1:1".into(),
+            None,
+            "serial-mcp".into(),
+            Some(Duration::from_secs(1_800)),
+        );
+        let tools = AgentTools::new(api, session, "serial-mcp".into(), CaptureLimits::default());
+        tools.pending_context.lock().unwrap().insert(
+            "bench".into(),
+            json!({
+                "interference": true,
+                "complete": true,
+                "after_seq": 40,
+                "through_seq": 42,
+                "events": [{"seq": 41, "kind": "tx"}],
+                "truncated": false,
+            }),
+        );
+
+        let error = tools
+            .ensure_serial_context_unchanged(&test_slot())
+            .await
+            .unwrap_err();
+        let structured = structured_tool_error(&error).expect("typed context_changed error");
+        assert_eq!(structured["error"]["code"], "context_changed");
+        assert_eq!(structured["error"]["no_bytes_written"], true);
+        assert_eq!(structured["error"]["recent_context"]["interference"], true);
+        assert!(
+            structured["error"]["retry_hint"]
+                .as_str()
+                .unwrap()
+                .contains("read(scope=tail)")
+        );
+    }
 
     fn device_model_catalog() -> DeviceModelListResponse {
         DeviceModelListResponse {
@@ -3528,6 +4135,273 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn legacy_v3_status_fails_the_common_physical_action_gate_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut legacy_status = serde_json::to_value(StatusResponse {
+            server_id: Uuid::from_u128(10),
+            daemon_epoch: Uuid::from_u128(11),
+            protocol_version: PROTOCOL_VERSION,
+            config_revision: 1,
+            sequence_write_precondition_supported: true,
+            serial_context_precondition_supported: true,
+            slots: vec![test_slot()],
+        })
+        .unwrap();
+        legacy_status
+            .as_object_mut()
+            .unwrap()
+            .remove("serial_context_precondition_supported");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /api/v1/status HTTP/1.1"));
+            let body = serde_json::to_string(&legacy_status).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let endpoint = format!("http://{address}");
+        let tools = AgentTools::new(
+            ApiClient::new(endpoint.clone(), None).unwrap(),
+            SessionHandle::spawn(
+                endpoint,
+                None,
+                "test".into(),
+                Some(Duration::from_secs(1_800)),
+            ),
+            "test".into(),
+            CaptureLimits::default(),
+        );
+        let error = tools
+            .slot_online_for_physical_action("bench")
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+
+        assert!(error.contains("Write, BREAK, and Trigger"));
+        assert!(error.contains("no bytes were written"));
+    }
+
+    #[tokio::test]
+    async fn read_tail_uses_bounded_live_ring_endpoint_instead_of_journal_events() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let slot = test_slot();
+        let status = StatusResponse {
+            server_id: Uuid::from_u128(10),
+            daemon_epoch: slot.daemon_epoch,
+            protocol_version: PROTOCOL_VERSION,
+            config_revision: 1,
+            sequence_write_precondition_supported: true,
+            serial_context_precondition_supported: true,
+            slots: vec![slot.clone()],
+        };
+        let timeline_event = serial_protocol::TimelineEvent {
+            slot_id: "bench".into(),
+            daemon_epoch: slot.daemon_epoch,
+            seq: 42,
+            generation: 1,
+            wall_time_ns: 42,
+            monotonic_time_ns: 42,
+            kind: EventKind::Rx,
+            direction: Direction::Rx,
+            actor: None,
+            run_id: None,
+            operation_id: None,
+            stream_offset_start: Some(0),
+            stream_offset_end: Some(5),
+            data: b"ready".to_vec(),
+            metadata: BTreeMap::new(),
+            durable: true,
+        };
+        let tail = serial_protocol::EventQueryResponse {
+            events: vec![timeline_event],
+            next_cursor: Some(Cursor {
+                epoch: slot.daemon_epoch,
+                after_seq: 42,
+            }),
+            truncated: false,
+            first_available_seq: Some(42),
+            gaps: Vec::new(),
+        };
+        let server = tokio::spawn(async move {
+            for expected_path in ["/api/v1/status", "/api/v1/slots/bench/tail?tail_events=200"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request.starts_with(&format!("GET {expected_path} HTTP/1.1")),
+                    "unexpected request: {request}"
+                );
+                assert!(!request.starts_with("GET /api/v1/slots/bench/events"));
+                let body = if expected_path == "/api/v1/status" {
+                    serde_json::to_string(&status).unwrap()
+                } else {
+                    serde_json::to_string(&tail).unwrap()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let endpoint = format!("http://{address}");
+        let tools = AgentTools::new(
+            ApiClient::new(endpoint.clone(), None).unwrap(),
+            SessionHandle::spawn(
+                endpoint,
+                None,
+                "test".into(),
+                Some(Duration::from_secs(1_800)),
+            ),
+            "test".into(),
+            CaptureLimits::default(),
+        );
+        let output = tools
+            .read(ReadArgs {
+                slot_id: "bench".into(),
+                scope: Some("tail".into()),
+                epoch: None,
+                after_seq: None,
+                through_seq: None,
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output["text"], "ready");
+        assert_eq!(output["cursor"]["after_seq"], 42);
+    }
+
+    #[tokio::test]
+    async fn read_continue_uses_cursor_bounded_live_ring_and_surfaces_eviction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let slot = test_slot();
+        let status = StatusResponse {
+            server_id: Uuid::from_u128(10),
+            daemon_epoch: slot.daemon_epoch,
+            protocol_version: PROTOCOL_VERSION,
+            config_revision: 1,
+            sequence_write_precondition_supported: true,
+            serial_context_precondition_supported: true,
+            slots: vec![slot.clone()],
+        };
+        let event = activity_event(slot.daemon_epoch, 42, "target", "target", BTreeMap::new());
+        let live = EventQueryResponse {
+            events: vec![serial_protocol::TimelineEvent {
+                actor: None,
+                kind: EventKind::Rx,
+                direction: Direction::Rx,
+                data: b"latest".to_vec(),
+                ..event
+            }],
+            next_cursor: Some(Cursor {
+                epoch: slot.daemon_epoch,
+                after_seq: 42,
+            }),
+            truncated: true,
+            first_available_seq: Some(42),
+            gaps: vec![GapRange {
+                epoch: slot.daemon_epoch,
+                first_seq: 41,
+                last_seq: 41,
+                reason: GapReason::RingEvicted,
+            }],
+        };
+        let expected_continue = format!(
+            "/api/v1/slots/bench/tail?tail_events=1000&epoch={}&after_seq=40",
+            slot.daemon_epoch
+        );
+        let server = tokio::spawn(async move {
+            for expected_path in ["/api/v1/status".to_owned(), expected_continue] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request.starts_with(&format!("GET {expected_path} HTTP/1.1")),
+                    "unexpected request: {request}"
+                );
+                assert!(!request.starts_with("GET /api/v1/slots/bench/events"));
+                let body = if expected_path == "/api/v1/status" {
+                    serde_json::to_string(&status).unwrap()
+                } else {
+                    serde_json::to_string(&live).unwrap()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let endpoint = format!("http://{address}");
+        let tools = AgentTools::new(
+            ApiClient::new(endpoint.clone(), None).unwrap(),
+            SessionHandle::spawn(
+                endpoint,
+                None,
+                "test".into(),
+                Some(Duration::from_secs(1_800)),
+            ),
+            "test".into(),
+            CaptureLimits::default(),
+        );
+        tools.remember_live_cursor(
+            "bench",
+            Cursor {
+                epoch: slot.daemon_epoch,
+                after_seq: 40,
+            },
+        );
+        let output = tools
+            .read(ReadArgs {
+                slot_id: "bench".into(),
+                scope: Some("continue".into()),
+                epoch: None,
+                after_seq: None,
+                through_seq: None,
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(output["source"], "live_ring");
+        assert_eq!(output["bounded_continue"], true);
+        assert_eq!(output["text"], "latest");
+        assert_eq!(output["cursor"]["after_seq"], 42);
+        assert_eq!(output["gap"], true);
+        assert_eq!(output["truncated"], true);
+        assert_eq!(output["gaps"][0]["reason"], "ring_evicted");
+        assert_eq!(output["gaps"][0]["first_seq"], 41);
+        assert_eq!(output["gaps"][0]["last_seq"], 41);
+        assert!(
+            output["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("live replay gap")
+        );
+    }
+
     #[test]
     fn search_and_wait_args_parse_new_optional_fields() {
         let search: SearchArgs = serde_json::from_value(json!({
@@ -3540,9 +4414,7 @@ mod tests {
         assert!(search.regex);
 
         let wait: WaitArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "expect": "ready"
         }))
         .unwrap();
@@ -3568,7 +4440,6 @@ mod tests {
         );
         assert_eq!(request.spec.debounce_ms, 250);
         assert_eq!(request.spec.cooldown_ms, 30_000);
-        assert_eq!(request.spec.event_ttl_ms, 10 * 60 * 1_000);
 
         let idempotency_key = Uuid::new_v4();
         let retry: MonitorStartArgs = serde_json::from_value(json!({
@@ -3652,16 +4523,15 @@ mod tests {
             "wall_time_start_ns": 10,
             "wall_time_end_ns": 20,
             "created_wall_time_ns": 21,
-            "expires_wall_time_ns": 30,
             "acked_wall_time_ns": null,
-            "internal_outbox_attempt": 8
+            "internal_worker_token": "omit"
         });
         let compact = compact_monitor_incident(&incident);
         assert_eq!(compact["incident_id"], json!(Uuid::from_u128(1)));
         assert_eq!(compact["serial_range"]["seq_start"], 40);
         assert_eq!(compact["evidence_cursor"]["after_seq"], 39);
         assert_eq!(compact["acked"], false);
-        assert!(compact.get("internal_outbox_attempt").is_none());
+        assert!(compact.get("internal_worker_token").is_none());
     }
 
     #[test]
@@ -3756,9 +4626,7 @@ mod tests {
     #[test]
     fn command_args_accept_an_empty_command() {
         let args: CommandArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "command": "",
             "description": "发送回车"
         }))
@@ -3770,9 +4638,7 @@ mod tests {
     fn command_description_is_required_and_utf8_byte_bounded() {
         assert!(
             serde_json::from_value::<CommandArgs>(json!({
-                "slot_id": "bench",
-                "run_id": Uuid::nil(),
-                "run_token": Uuid::nil(),
+                "run_handle": TEST_RUN_HANDLE,
                 "command": "cat /proc/meminfo"
             }))
             .is_err()
@@ -3792,9 +4658,7 @@ mod tests {
     #[test]
     fn command_sequence_args_are_strict_and_require_an_overall_description() {
         let args: CommandSequenceArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "description": "登录样机",
             "steps": [
                 {"command":"admin", "description":"输入账号", "expect":"Password:"},
@@ -3807,14 +4671,14 @@ mod tests {
 
         assert!(
             serde_json::from_value::<CommandSequenceArgs>(json!({
-                "slot_id":"bench", "run_id":Uuid::nil(), "run_token":Uuid::nil(),
+                "run_handle":TEST_RUN_HANDLE,
                 "steps":[{"command":"admin","description":"输入账号"}]
             }))
             .is_err()
         );
         assert!(
             serde_json::from_value::<CommandSequenceArgs>(json!({
-                "slot_id":"bench", "run_id":Uuid::nil(), "run_token":Uuid::nil(),
+                "run_handle":TEST_RUN_HANDLE,
                 "description":"登录样机",
                 "steps":[{"command":"admin","description":"输入账号","sensitive":true}]
             }))
@@ -3963,6 +4827,14 @@ mod tests {
             }
             assert!(command_sequence_stop(&unsafe_step, true).is_some());
         }
+
+        let aborted = execution(Completion::RunAborted {
+            run_id: Uuid::new_v4(),
+            reason: "human takeover".into(),
+        });
+        let stop = command_sequence_stop(&aborted, true).expect("abort stops sequence");
+        assert_eq!(stop.code, "run_aborted");
+        assert!(sequence_stop_forces_closed(&stop));
     }
 
     #[test]
@@ -4003,19 +4875,6 @@ mod tests {
     }
 
     #[test]
-    fn release_capability_fields_are_all_or_nothing() {
-        let run_id = Uuid::new_v4();
-        let run_token = Uuid::new_v4();
-        assert_eq!(paired_release_capability(None, None).unwrap(), None);
-        assert_eq!(
-            paired_release_capability(Some(run_id), Some(run_token)).unwrap(),
-            Some((run_id, run_token))
-        );
-        assert!(paired_release_capability(Some(run_id), None).is_err());
-        assert!(paired_release_capability(None, Some(run_token)).is_err());
-    }
-
-    #[test]
     fn release_planning_uses_local_lease_ownership_and_fails_closed_on_run_races() {
         let local_run = Uuid::new_v4();
         let foreign_run = Uuid::new_v4();
@@ -4048,6 +4907,26 @@ mod tests {
                 None,
                 false,
                 None,
+            )
+            .unwrap(),
+            ReleaseDecision::Release {
+                authorize: None,
+                allow_stale_cleanup: true,
+            }
+        );
+        // A caller can race with an already-authoritative external abort after
+        // resolving its handle. The fresh daemon snapshot wins: stale cleanup
+        // must discard that now-obsolete capability instead of panicking or
+        // trying to authorize an abort of a Run that no longer exists.
+        assert_eq!(
+            plan_release(
+                LocalControlState {
+                    has_lease: true,
+                    owned_run_id: Some(local_run),
+                },
+                None,
+                true,
+                Some((local_run, run_token)),
             )
             .unwrap(),
             ReleaseDecision::Release {
@@ -4107,9 +4986,7 @@ mod tests {
     #[test]
     fn agent_writes_reject_transport_pacing_overrides() {
         let command = serde_json::from_value::<CommandArgs>(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "command": "version",
             "description": "查看版本",
             "chunk_size": 64
@@ -4119,9 +4996,7 @@ mod tests {
         assert!(command.to_string().contains("unknown field"));
 
         let trigger = serde_json::from_value::<TriggerArgs>(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "action": {"text": "slp"},
             "inter_char_delay_ms": 0
         }))
@@ -4133,9 +5008,7 @@ mod tests {
     #[test]
     fn trigger_uses_only_explicit_call_text_and_eol() {
         let args: TriggerArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "kickoff": {"text": "reboot", "eol": "\r"},
             "start_contains": "Booting",
             "action": {"text": "slp"},
@@ -4159,9 +5032,7 @@ mod tests {
     #[test]
     fn normal_kickoff_trigger_omits_the_optional_start_gate() {
         let args: TriggerArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "kickoff": {"text": "reboot", "eol": "\r"},
             "action": {"text": "slp"},
             "stop_contains": ["prompt>"]
@@ -4177,9 +5048,7 @@ mod tests {
     #[test]
     fn trigger_allows_bounded_one_shot_without_a_stop_literal() {
         let args: TriggerArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "start_contains": "send ACK now",
             "action": {"text": "ACK", "eol": ""},
             "max_fires": 1
@@ -4225,9 +5094,7 @@ mod tests {
     #[test]
     fn trigger_rejects_empty_or_unbounded_payload_plans() {
         let empty: TriggerArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "action": {"text": "", "eol": ""}
         }))
         .unwrap();
@@ -4239,9 +5106,7 @@ mod tests {
         );
 
         let over_total: TriggerArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "kickoff": {"text": "x"},
             "action": {"text": "a".repeat(256)},
             "max_fires": 256
@@ -4559,10 +5424,12 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             config_revision: 1,
             sequence_write_precondition_supported: true,
+            serial_context_precondition_supported: true,
             slots: vec![test_slot()],
         };
         ensure_protocol_compatible(&status).unwrap();
         ensure_sequence_write_precondition_supported(&status).unwrap();
+        ensure_serial_context_precondition_supported(&status).unwrap();
 
         status.protocol_version = 0;
         let error = ensure_protocol_compatible(&status).unwrap_err().to_string();
@@ -4575,6 +5442,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("atomic command_sequence"));
+        assert!(error.contains("no bytes were written"));
+
+        status.sequence_write_precondition_supported = true;
+        status.serial_context_precondition_supported = false;
+        let error = ensure_serial_context_precondition_supported(&status)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Write, BREAK, and Trigger"));
         assert!(error.contains("no bytes were written"));
     }
 
@@ -4706,9 +5581,7 @@ mod tests {
     #[test]
     fn command_args_parse_regex_and_lean_rendering_fields() {
         let args: CommandArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "run_id": Uuid::nil(),
-            "run_token": Uuid::nil(),
+            "run_handle": TEST_RUN_HANDLE,
             "command": "boot",
             "description": "启动样机",
             "regex": "U-Boot \\d+",
@@ -4717,7 +5590,7 @@ mod tests {
         assert_eq!(args.regex.as_deref(), Some("U-Boot \\d+"));
         assert!(
             serde_json::from_value::<CommandArgs>(json!({
-                "slot_id":"bench", "run_id":Uuid::nil(), "run_token":Uuid::nil(),
+                "run_handle":TEST_RUN_HANDLE,
                 "command":"boot", "description":"启动样机", "include_events":true
             }))
             .is_err()

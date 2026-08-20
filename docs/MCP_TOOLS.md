@@ -1,7 +1,7 @@
 # serial-mcp tool reference
 
 This document describes the complete Agent-facing tool surface implemented by
-`serial-mcp` 0.6.2. The executable is the schema authority: run
+`serial-mcp` 0.7.0. The executable is the schema authority: run
 
 ```console
 serial mcp --dump-tools
@@ -19,25 +19,44 @@ string characters; where bytes cross the UART or enter daemon configuration,
 the runtime also enforces the stated UTF-8 byte bound. All serial writes
 require an active Run owned by this MCP process.
 
-`run_start` returns a public audit `run_id` and a private, unpredictable
-`run_token`. The token exists only in `serial-mcp` memory and in that one tool
-result; it is never copied into Run metadata, timeline events, `devices`, or
-daemon status. The initiating LLM session must retain the pair and pass it to
-every Run-scoped call: `command`, `command_sequence`, `input`, `signal`,
-`trigger`, `wait`, and `run_end`. An aborting `release` also requires the pair
-while that Run remains active. A caller must never discover an active `run_id`
-through `devices` or `search` and adopt it: the matching private token is
-deliberately unavailable.
+`run_start` returns a public audit `run_id` and one opaque `run_handle`. The
+22-character base64url handle contains 128 bits drawn directly from the OS
+CSPRNG. It exists only in `serial-mcp` memory and in tool results; it is never
+copied into Run metadata, timeline events, `devices`, daemon status, or the
+seriald WebSocket protocol. Internally it resolves to the Slot, public Run ID,
+and a separate private capability. The initiating LLM session passes only this
+one handle to every Run-scoped call: `command`, `command_sequence`, `input`,
+`signal`, `trigger`, `wait`, and `run_end`. An aborting `release` also requires
+it while that Run remains active. A caller must never discover an active
+`run_id` through `devices` or `search` and adopt it; a public ID cannot be
+converted into a handle.
+
+This is an intentional v0.7.0 migration from the v0.6.2 Run-scoped
+`slot_id`/`run_id`/`run_token` inputs. Restart `serial-mcp` and refresh the
+host's tool registry after upgrading. Old argument objects are rejected by the
+strict schemas, and process-local capabilities from an old adapter cannot be
+resumed in a new one. Run authorization changes only the MCP tool surface;
+seriald continues to use WebSocket protocol v3 and public Run UUIDs. The v0.7
+HTTP status adds `serial_context_precondition_supported`; an older protocol-v3
+daemon omits it and therefore decodes as false. Before any command, raw input,
+control-byte/BREAK signal, command sequence, or Trigger can reach the UART, a
+v0.7 MCP requires this capability and otherwise fails closed with a definite
+zero-byte result. Separately, v0.7 removes the retired
+`/api/v1/monitor-events` HTTP delivery routes and `MonitorSpec.event_ttl_ms`;
+the core Monitor/Incident HTTP APIs remain.
 
 An authorized Run-scoped call pins its Run for that call's complete lifetime,
 including a `wait`/command capture lasting up to 120 seconds or a validated
-command sequence whose capture deadlines total up to 300 seconds. After the last pin is
-dropped, the adapter permits five minutes of inactivity. At the next 20-second
-renewal tick it actively releases control, which aborts an abandoned active Run;
-if that best-effort release cannot reach `seriald`, the separately renewed,
-fenced 60-second daemon lease still expires and aborts the Run. This prevents a
-long-lived shared MCP
-process from renewing a prior LLM session's abandoned Run indefinitely.
+command sequence whose capture deadlines total up to 300 seconds. Normal
+completion is explicit: the Agent calls `run_end` before its final reply unless
+it deliberately hands the live Run to a continuing Agent workflow. The
+configurable orphan timeout is only a crash/abandonment fallback. It defaults
+to 1,800 seconds; `orphan_run_timeout_seconds` accepts 0 for unlimited or any
+finite value of at least 300 seconds, with no artificial maximum, and takes
+effect after restarting `serial-mcp`. At the next 20-second renewal tick after
+that deadline the adapter releases control, aborting the abandoned active Run.
+If that release cannot reach `seriald`, the separately renewed, fenced
+60-second daemon lease still expires and aborts the Run.
 
 A successful `tools/call` result has `isError=false`, the documented object in
 `structuredContent`, and the same object serialized as compact JSON in its
@@ -45,6 +64,12 @@ single text content item. A known tool's validation or execution failure uses
 the same envelope with `isError=true` and `{error}` as structured content.
 Malformed JSON-RPC, invalid `tools/call` framing, and unknown tool names use
 JSON-RPC errors instead.
+
+HTTP failures from seriald are decoded rather than embedded as a second escaped
+JSON string. `structuredContent.error` preserves stable fields such as
+`http_status`, `code`, `retryable`, and, for a journal query-budget failure,
+`phase`, `scanned_bytes`, `elapsed_ms`, and `retry_hint`; the text content is a
+plain human-readable message.
 
 The adapter accepts multiple outstanding `tools/call` requests, but serial
 mutations for one Slot are serialized. Independent Slots can progress
@@ -222,15 +247,26 @@ Input:
 | `after_seq` | No | integer >= 0 | Optional exclusive archive lower boundary; ignored by `tail` and `continue` |
 | `through_seq` | No | integer >= 1 | Optional inclusive archive upper boundary; rejected outside `archive` |
 
-`tail` queries after `head_seq - 200`. `continue` resumes this MCP process's
-per-Slot cursor, or starts at the current head when none exists; a daemon-epoch
-change also resets it to the current head. Those two scopes do not consume
-caller-supplied `epoch`/`after_seq`. `archive` requires an explicit epoch and
-is the only scope that accepts `through_seq`; omitting `after_seq` starts at the
-archive beginning. One query is capped at 1,000 events and 512 KiB before
-rendering. The result includes `slot_id`, `scope`, `confidence`, `text`,
-`truncated`, `gap`, and `cursor`, plus optional `warnings` and
-`omitted:{chars,lines}`.
+`tail` takes an atomic, at-most-200-event snapshot from seriald's bounded live
+replay ring. It never discovers or scans journal segments, so its latency does
+not grow with retained epochs, segment count, or a large active `.open` file.
+Its result additionally reports `source="live_ring"`, `bounded_tail=true`, and
+`tail_events=200`; the underlying live endpoint retains the actual oldest ring
+sequence as its retention boundary rather than treating the selected window's
+first event as a gap. `continue` resumes this MCP process's per-Slot cursor
+through the same live-ring endpoint, returns the oldest next page of at most
+1,000 events, and never scans the journal. With no remembered cursor it starts
+at the current head. Ring eviction or a daemon-epoch change is returned as an
+explicit gap and a partial page; the returned cursor resumes the retained
+current-epoch events without silently joining epochs. Those two scopes do not
+consume caller-supplied `epoch`/`after_seq`. `archive`
+requires an explicit epoch and is the only scope that accepts `through_seq`;
+omitting `after_seq` starts at the archive beginning. Journal-backed pages are
+capped at 1,000 events and 512 KiB before rendering. Every result includes
+`slot_id`, `scope`, `confidence`, `text`, `truncated`, `gap`, and `cursor`, plus
+optional `gaps`, `warnings`, and `omitted:{chars,lines}`. Live results identify
+their source; `continue` reports `source="live_ring"`,
+`bounded_continue=true`, and `limit_events=1000`.
 
 ### `command`
 
@@ -241,9 +277,7 @@ Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Private capability returned with that `run_id`; never obtain it from status |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
 | `command` | Yes | string, max 4096 schema characters | Command text; empty sends only EOL (Enter); command plus effective EOL must be at most 4096 UTF-8 bytes |
 | `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | Concise human-readable purpose, for example `查看样机内存`; retained in the Run's confirmed TX audit history |
 | `expect` | No | non-empty string | Literal completion boundary |
@@ -258,7 +292,7 @@ tool rejects the no-op write. The capture begins from the pre-attached current
 head, discards pre-write RX from command output, and uses the accepted TX event
 as its authoritative lower bound.
 
-The result fields are `slot_id`, `write`, `capture`, `execution`, `confidence`,
+The result fields are `slot_id`, `run_handle`, `run_open`, `write`, `capture`, `execution`, `confidence`,
 `text`, `truncated`, `gap`, `interfered`, `run_id`, `operation_id`, `event_seq`,
 `description`, and `cursor`, plus optional `warnings` and
 `omitted:{chars,lines}`. `execution` is always `"unknown"`: seeing a prompt or
@@ -289,9 +323,7 @@ Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Matching private Run capability |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
 | `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | Human-readable purpose of the complete dependent interaction |
 | `steps` | Yes | array of 1..8 strict step objects | Commands executed in array order; unknown step fields are rejected |
 
@@ -316,9 +348,7 @@ For example:
 
 ```json
 {
-  "slot_id": "slot-1",
-  "run_id": "00000000-0000-0000-0000-000000000001",
-  "run_token": "00000000-0000-0000-0000-000000000002",
+  "run_handle": "5L7VnrmuNeSfHz0O5pH9xw",
   "description": "登录样机管理终端",
   "steps": [
     {
@@ -354,7 +384,8 @@ The result is:
 
 | Field | Meaning |
 |---|---|
-| `slot_id`, `run_id` | Authoritative Slot and Run |
+| `slot_id`, `run_id` | Authoritative public audit identities resolved from the handle |
+| `run_handle`, `run_open` | Opaque continuation capability and whether this result retained the Run |
 | `sequence_id` | UUID grouping this interaction's TX events and terminal history |
 | `description` | Overall sequence purpose supplied by the caller |
 | `status` | `completed` when every step completed safely; otherwise `partial` |
@@ -403,12 +434,10 @@ Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Matching private Run capability |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
 | `text` | Yes | string, 1..4096 schema characters and UTF-8 bytes | Exact UTF-8 payload |
 
-The result is `{slot_id, write:"confirmed", kind:"input", bytes, cursor}`.
+The result is `{slot_id, run_handle, run_open:true, write:"confirmed", kind:"input", bytes, cursor}`.
 This confirms the physical write audit, not target-side execution.
 
 ### `signal`
@@ -419,15 +448,14 @@ Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Matching private Run capability |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
 | `signal` | Yes | `ctrl_c`, `ctrl_d`, `ctrl_z`, `break` | Signal kind |
 | `duration_ms` | BREAK only | integer 1..5000, default 250 | Physical BREAK duration; providing it for Ctrl-C/D/Z is an error |
 
 Ctrl-C/D/Z are ordinary one-byte writes. BREAK is a driver line condition and
-has an independent confirmed event. Ctrl results are `{slot_id,
-write:"confirmed", kind, bytes:1, cursor}`. A BREAK result is `{slot_id,
+has an independent confirmed event. Results include `run_handle` and
+`run_open:true`; Ctrl results otherwise contain `{slot_id, write:"confirmed",
+kind, bytes:1, cursor}`. A BREAK result otherwise contains `{slot_id,
 write:"confirmed", kind:"break", cursor}`; it does not echo `duration_ms` or a
 byte count. These results confirm the write/signal audit, not target-side
 execution.
@@ -446,9 +474,7 @@ Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Matching private Run capability |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
 | `kickoff` | No | `{text, eol?}`; each string max 4096 schema characters, combined max 4096 UTF-8 bytes | One write after matchers are armed; confirmation immediately enables action unless an explicit start gate is present |
 | `start_contains` | No | string, 1..256 schema characters and UTF-8 bytes | Advanced live-RX gate for the first action; omit for normal kickoff-then-action use |
 | `action` | Yes | `{text, eol?}`; each string max 256 schema characters, combined max 256 UTF-8 bytes | Repeated non-empty write |
@@ -467,9 +493,7 @@ Typical call shape:
 
 ```json
 {
-  "slot_id": "bench",
-  "run_id": "<run_start 返回的 UUID>",
-  "run_token": "<同一次 run_start 返回的私有 UUID>",
+  "run_handle": "<run_start 返回的 run_handle>",
   "kickoff": {"text": "reboot", "eol": "\r"},
   "action": {"text": "slp"},
   "stop_contains": ["prompt>"]
@@ -479,7 +503,7 @@ Typical call shape:
 This does not wait for a separate start literal. Add `start_contains` only
 when target output must explicitly authorize the first `action`.
 
-The result fields are `slot_id`, terminal `outcome`, `matched`, confirmed
+The result fields are `slot_id`, `run_handle`, `run_open`, terminal `outcome`, `matched`, confirmed
 `fires`, configured `fire_budget`, boolean `send_budget_exhausted`,
 `confidence`, evidence `text`, `truncated`, `gap`, and `cursor`, plus optional
 `matched_pattern`, `warnings`, `omitted:{chars,lines}`, and `abort_diagnosis`.
@@ -518,9 +542,7 @@ Input:
 
 | Field | Required | Type / bound | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `run_id` | Yes | UUID | Public Run ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Matching private Run capability; pins the Run for the entire wait |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; selects and pins its Slot and Run for the entire wait |
 | `expect` | No | non-empty string | Literal boundary |
 | `regex` | No | string, 1..4096 schema characters and UTF-8 bytes | Regex boundary |
 | `timeout_seconds` | No | integer 1..120, default 10 | Deadline |
@@ -530,9 +552,9 @@ configured prompts are used; if none exist, completion requires observed RX
 followed by one second of quiet, so an entirely empty stream times out rather
 than claiming quiet completion. The start cursor is the valid remembered
 per-Slot cursor, otherwise the current head. The result fields are `slot_id`,
-`capture`, `confidence`, `text`, `truncated`, `gap`, and `cursor`, plus optional
+`run_handle`, `run_open:true`, `capture`, `confidence`, `text`, `truncated`, `gap`, and `cursor`, plus optional
 `warnings` and `omitted:{chars,lines}`. `wait` requires the exact active Run
-capability even though it never writes. A matching `RunAborted` immediately
+handle even though it never writes. A matching `RunAborted` immediately
 ends the wait and exposes the reason/takeover diagnostic rather than timing
 out. The capability pin lasts for the complete wait, so a legal 120-second
 wait is not mistaken for adapter inactivity.
@@ -585,8 +607,7 @@ Omitting `idempotency_key` generates a UUID. The adapter automatically reuses
 the same request ID for its one bounded transport retry. Other Monitor policy
 is adapter-owned: observation starts strictly after the Slot head resolved at
 creation, severity defaults to `warning`, debounce is 250 ms, cooldown is
-30,000 ms, there is no duration limit, and notification freshness TTL is
-600,000 ms.
+30,000 ms, and there is no duration limit.
 
 The result is the compact Monitor record (`monitor_id`, `slot_id`, `status`,
 `severity`, `description`, `matcher`, `current_cursor`, `incident_count`,
@@ -647,23 +668,22 @@ Acquires queued fenced control without takeover and starts an evidence Run.
 
 The adapter waits at most 15 seconds in the control queue; this fixed policy is
 not a tool argument. An already-active Run is an error. The result is
-`{slot_id, run_id, run_token, cursor, warning}`. `run_token` is returned only
-to this caller, is not recorded by the daemon, and must be kept with `run_id`
-for this Run's scoped calls. The warning repeats that the physical model must
-be confirmed through serial/telnet/Web/human evidence and device state
-initialized before commands.
+`{slot_id, run_id, run_handle, cursor, cleanup_required}`. `run_id` remains the
+public audit identity. `run_handle` is the sole continuation capability for
+Run-scoped tools and cannot be reconstructed from public state.
+`cleanup_required` concisely requires `run_end` before the Agent's final reply,
+unless the workflow deliberately hands the live Run to a continuing Agent.
 
 ### `run_end`
 
 | Field | Required | Type | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Slot containing the Run |
-| `run_id` | Yes | UUID | Public ID returned by this caller's `run_start` |
-| `run_token` | Yes | UUID | Matching private Run capability |
+| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; selects its Slot and Run |
 
-Ends only that capability's active Run, then best-effort releases its lease;
-it refuses to end or adopt another caller's Run. The result is `{slot_id,
-ended, control_release:"best_effort"}`; `ended` is the completed Run UUID.
+Ends only that handle's active Run, then best-effort releases its lease; it
+refuses an expired, unknown, or foreign-process handle. The result is
+`{slot_id, run_id, run_handle, run_open:false,
+control_release:"best_effort"}`.
 
 ### `release`
 
@@ -671,20 +691,20 @@ Releases this MCP's control without closing the daemon-owned serial port.
 
 | Field | Required | Type | Meaning |
 |---|---:|---|---|
-| `slot_id` | Yes | string | Slot whose lease should be released |
-| `abort_run` | No | boolean, default `false` | Permit release to abort this MCP's active Run; otherwise the caller must use `run_end` first |
-| `run_id` | With `run_token` | UUID | Required with `abort_run=true` when a Run is active; must match this caller's Run |
-| `run_token` | With `run_id` | UUID | Matching private capability; one field without the other is rejected |
+| `slot_id` | No-Run release only | string | Slot whose lease should be released; omit when using `run_handle` |
+| `abort_run` | Aborting release only | boolean, must be `true` | Explicitly permit release to abort this MCP's active Run; normal completion uses `run_end` |
+| `run_handle` | Aborting release only | 22-character base64url string | Exact handle for this MCP's active Run; it selects the Slot, so do not also pass `slot_id` |
 
-Inside the per-Slot lock, the tool first asks its serialized control session
+Provide either `slot_id`, or `{run_handle, abort_run:true}`, never both.
+Inside the resolved per-Slot lock, the tool first asks its serialized control session
 whether this MCP actually holds a local lease. With no local lease, the call is
 an immediate idempotent no-op (`already_released=true`) and does not inspect,
-require a token for, or interfere with a foreign Run visible in daemon status.
+require a handle for, or interfere with a foreign Run visible in daemon status.
 When this MCP has a lease but authoritative status has no active Run, both
-capability fields may be omitted: stale local Run bookkeeping is discarded and
+`run_handle` may be omitted: stale local Run bookkeeping is discarded and
 the remaining lease is released with the default `abort_run=false`. Only this
-MCP's matching active Run requires `abort_run=true` and the exact capability
-pair. A mismatch between the local owned Run and the daemon's active Run fails
+MCP's matching active Run requires `abort_run=true` and its exact handle. A
+mismatch between the local owned Run and the daemon's active Run fails
 closed rather than releasing across the changed boundary. The result is
 `{slot_id, released, already_released, serial_port_closed:false}`. Releasing
 control never closes the daemon-owned serial port.
@@ -707,6 +727,51 @@ with proof:
 All returned cursors are `{epoch, after_seq}`. The epoch prevents a cursor from
 silently crossing a daemon restart, while sequence/generation checks prevent a
 write or Trigger from crossing a reopened physical serial session.
+
+## Cross-actor recent context
+
+Successful `read`, `wait`, `command`, `command_sequence`, `input`, `signal`,
+and `trigger` results may add `recent_context`, but only when another actor
+changed the relevant serial interval or the bounded live ring cannot prove
+that no change occurred. A complete interval with no third-party event omits
+the field. The adapter compares the server-issued actor ID for its exact
+WebSocket connection; a shared actor label never causes a foreign Agent to be
+mistaken for this adapter.
+
+`recent_context` contains `interference`, `complete`, `truncated`, exclusive
+`after_seq`, inclusive `through_seq`, and up to 32 compact `events`. Each event
+contains sequence, kind, and actor kind/label. A TX summary adds byte count and
+the durable `command_description` / `command_sequence_description` purposes
+when present, not the serial payload. A replay gap or 32-event truncation is
+returned as `complete=false,truncated=true` even if no matching event survives;
+only a complete empty interval proves absence of interference.
+
+Before `command`, the first `command_sequence` step, `input`, `signal`, or
+`trigger` can perform a physical action, the adapter checks the interval after
+its previous operation. Third-party activity or incomplete evidence fails
+closed with `error.code="context_changed"`, `no_bytes_written=true`, and the
+same `recent_context`. Call `read(scope=tail)` or `wait` to observe and
+acknowledge the new state, then retry. If interference is first discovered
+while a successful mutation call is completing, that result includes
+`recent_context` and the next mutation is blocked until this observation step.
+An archive read cannot acknowledge a changed live session.
+
+The daemon closes the check-to-action race with `sequence_precondition` on
+ordinary command/input/control-byte writes, BREAK, Trigger start, and every
+sequence step. It atomically rejects epoch/generation changes, TX-offset
+changes, replay gaps/eviction, or intervening TX before enqueuing the physical
+action. A later sequence step can still return a partial sequence because
+earlier steps were already confirmed; the rejected step itself writes zero
+bytes. MCP requires the additive
+`serial_context_precondition_supported=true` HTTP status capability before it
+uses that boundary; a protocol-v3 daemon from an older release omits the field
+and is rejected before the first physical byte or line action.
+
+After Trigger start is accepted, the daemon owns its complete bounded Job.
+While it is active, ordinary external writes and BREAK are rejected; a Control
+takeover first terminalizes the Trigger and aborts its bound Run before the new
+owner can write. Trigger action fires therefore cannot silently continue across
+a third-party takeover.
 
 ## Human takeover and control-loss diagnostics
 

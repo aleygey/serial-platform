@@ -32,9 +32,6 @@ cleanup() {
     fi
 }
 
-trap on_error ERR
-trap cleanup EXIT
-
 require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
@@ -68,6 +65,65 @@ assert_same_asset() {
         || fail "GitHub Release already has a different asset: $(basename "${local_path}")"
 }
 
+assert_exact_release_asset_set() {
+    local release_json="$1"
+    local expected_assets_file="$2"
+    local actual_assets_file="$3"
+    local context="$4"
+
+    jq -er '
+        .assets
+        | if type == "array" then .[].name
+          else error("release assets are not an array")
+          end
+        | if type == "string" and length > 0 then .
+          else error("release asset has an invalid name")
+          end
+    ' "${release_json}" | LC_ALL=C sort >"${actual_assets_file}"
+
+    if ! cmp -s "${expected_assets_file}" "${actual_assets_file}"; then
+        comm -23 "${expected_assets_file}" "${actual_assets_file}" \
+            | sed 's/^/missing remote asset: /' >&2
+        comm -13 "${expected_assets_file}" "${actual_assets_file}" \
+            | sed 's/^/unexpected remote asset: /' >&2
+        LC_ALL=C uniq -d "${actual_assets_file}" \
+            | sed 's/^/duplicate remote asset: /' >&2
+        fail "${context} does not contain the exact Release asset set"
+    fi
+}
+
+verify_release_api_digests() {
+    local release_json="$1"
+    local artifact_dir="$2"
+    local name
+    local api_digest
+
+    # GitHub's REST API does not guarantee that the optional digest field is
+    # populated. Treat a sha256 digest as an additional assertion when it is
+    # present, while retaining the downloaded byte-for-byte check as the
+    # authoritative verification path.
+    while IFS=$'\t' read -r name api_digest; do
+        [[ -n "${name}" && -n "${api_digest}" ]] || continue
+        if [[ "${api_digest}" =~ ^sha256:([0-9A-Fa-f]{64})$ ]]; then
+            local expected_digest="${BASH_REMATCH[1]}"
+            expected_digest="$(printf '%s' "${expected_digest}" | tr '[:upper:]' '[:lower:]')"
+            [[ "$(asset_sha256 "${artifact_dir}/${name}")" == "${expected_digest}" ]] \
+                || fail "GitHub API digest differs from the local asset: ${name}"
+        elif [[ "${api_digest}" == sha256:* ]]; then
+            fail "GitHub API returned a malformed sha256 digest for ${name}"
+        fi
+        # Ignore unknown algorithms so publication does not depend on a
+        # non-stable API field or a future digest format.
+    done < <(
+        jq -r '
+            .assets[]
+            | select((.digest? // "") != "")
+            | [.name, .digest]
+            | @tsv
+        ' "${release_json}"
+    )
+}
+
 main() {
     CURRENT_PHASE="validation"
 
@@ -82,6 +138,7 @@ main() {
     require_command sha256sum
     require_command awk
     require_command sort
+    require_command uniq
     require_command comm
     require_command cmp
     require_command sed
@@ -261,7 +318,26 @@ main() {
             "${asset_dir}/${name}"
     done
 
+    # Close the upload-to-publish race with a fresh REST snapshot. The draft
+    # may only be published if it is still a draft and its complete asset set
+    # is exactly the four platform packages plus SHA256SUMS. Rechecking here
+    # prevents an asset added, removed, or duplicated after discovery from
+    # being made public accidentally.
+    CURRENT_PHASE="pre-publish-guard"
+    local final_release_json="${TEMP_DIR}/release-before-publish.json"
+    gh api --method GET \
+        "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+        >"${final_release_json}"
+    assert_exact_release_asset_set \
+        "${final_release_json}" \
+        "${expected_assets_file}" \
+        "${TEMP_DIR}/remote-assets-before-publish" \
+        "GitHub Release ${tag} immediately before publication"
+    verify_release_api_digests "${final_release_json}" "${ARTIFACT_DIR}"
+
     if [[ "${is_draft}" == "true" ]]; then
+        jq -e '.draft == true' "${final_release_json}" >/dev/null \
+            || fail "GitHub Release ${tag} is no longer a draft; refusing to publish"
         CURRENT_PHASE="publish"
         log "Publishing verified GitHub Release ${tag}"
         gh release edit "${tag}" \
@@ -269,8 +345,14 @@ main() {
             --draft=false \
             --latest
     else
+        jq -e '.draft == false' "${final_release_json}" >/dev/null \
+            || fail "GitHub Release ${tag} unexpectedly became a draft"
         log "GitHub Release ${tag} is already published with identical assets"
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap on_error ERR
+    trap cleanup EXIT
+    main "$@"
+fi

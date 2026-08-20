@@ -30,6 +30,10 @@ struct Args {
     /// Stable audit label for this agent adapter process.
     #[arg(long, env = "SERIAL_MCP_ACTOR_LABEL", default_value = "agent")]
     actor_label: String,
+    /// Seconds an unpinned Run may remain idle before abort; 0 is unlimited
+    /// and requires every workflow to call run_end explicitly.
+    #[arg(long, env = "SERIAL_MCP_ORPHAN_RUN_TIMEOUT_SECONDS")]
+    orphan_run_timeout_seconds: Option<u64>,
 }
 
 #[tokio::main]
@@ -56,10 +60,25 @@ async fn run() -> Result<()> {
     {
         bail!("actor label must contain 1-128 non-control UTF-8 bytes");
     }
-    let resolved = config::resolve(args.config, args.endpoint, args.token_file)?;
+    let resolved = config::resolve(
+        args.config,
+        args.endpoint,
+        args.token_file,
+        args.orphan_run_timeout_seconds,
+    )?;
+    if resolved.orphan_run_timeout.is_none() {
+        eprintln!(
+            "serial-mcp: warning: orphan Run timeout is unlimited; every workflow must call \
+             run_end, or this process will keep renewing its 60-second control lease"
+        );
+    }
     let api = api::ApiClient::new(resolved.endpoint.clone(), resolved.token.clone())?;
-    let session =
-        session::SessionHandle::spawn(resolved.endpoint, resolved.token, actor_label.clone());
+    let session = session::SessionHandle::spawn(
+        resolved.endpoint,
+        resolved.token,
+        actor_label.clone(),
+        resolved.orphan_run_timeout,
+    );
     mcp::serve(tools::AgentTools::new(
         api,
         session,
@@ -80,5 +99,6 @@ mod tests {
         assert!(args.config.is_none());
         assert!(args.endpoint.is_none());
         assert!(args.token_file.is_none());
+        assert!(args.orphan_run_timeout_seconds.is_none());
     }
 }

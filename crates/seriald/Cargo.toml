@@ -17,7 +17,6 @@ directories.workspace = true
 futures-util.workspace = true
 rand.workspace = true
 regex = "1"
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }

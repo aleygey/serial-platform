@@ -33,6 +33,11 @@ pub fn pad_display(value: &str, width: usize) -> String {
 #[derive(Debug, Clone)]
 pub struct DisplayLine {
     pub seq: u64,
+    /// Operation identity of the TX that owns this projected row, when any.
+    /// Keeping it in the presentation model lets the TUI jump from a grouped
+    /// Agent command back to the exact local scrollback row even when later
+    /// RX bytes advanced the row's display sequence.
+    pub operation_id: Option<uuid::Uuid>,
     pub source: String,
     pub text: String,
     pub source_style: Style,
@@ -608,6 +613,7 @@ struct StreamIdentity {
 struct LineContext {
     identity: StreamIdentity,
     seq: u64,
+    operation_id: Option<uuid::Uuid>,
     source: String,
     source_style: Style,
     direction: Direction,
@@ -624,6 +630,7 @@ impl LineContext {
                 generation: event.generation,
             },
             seq: event.seq,
+            operation_id: event.operation_id,
             source: source_label(event),
             source_style: source_style(event),
             direction: event.direction,
@@ -635,6 +642,7 @@ impl LineContext {
 
     fn adopt_tx(&mut self, incoming: &Self) {
         self.seq = incoming.seq;
+        self.operation_id = incoming.operation_id;
         self.source.clone_from(&incoming.source);
         self.source_style = incoming.source_style;
         self.direction = incoming.direction;
@@ -646,6 +654,7 @@ impl LineContext {
     fn display_line(&self, text: String) -> DisplayLine {
         DisplayLine {
             seq: self.seq,
+            operation_id: self.operation_id,
             source: self.source.clone(),
             bytes: text.len() + self.source.len() + 16,
             source_style: self.source_style,
@@ -1008,6 +1017,7 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
         .into_iter()
         .map(|text| DisplayLine {
             seq: event.seq,
+            operation_id: event.operation_id,
             source: source.clone(),
             bytes: text.len() + source.len() + 16,
             source_style,
@@ -1024,6 +1034,7 @@ pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
     let text = text.into();
     DisplayLine {
         seq,
+        operation_id: None,
         source: tr("d.gap").into(),
         bytes: text.len() + 20,
         source_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1449,23 +1460,132 @@ pub fn highlight_spans(
         }
         spans.push((start, end, keyword_style(rank)));
     }
+    for (start, end, style) in network_address_spans(text) {
+        if spans
+            .iter()
+            .any(|(kept_start, kept_end, _)| start < *kept_end && *kept_start < end)
+        {
+            continue;
+        }
+        spans.push((start, end, style));
+    }
     spans.sort_by_key(|(start, _, _)| *start);
     spans
 }
 
-/// Keywords are tokens, not arbitrary substrings. Underscore, hyphen,
-/// punctuation, brackets, colons and whitespace are boundaries; only a
-/// Unicode letter or digit suppresses a match on either side.
+/// Keywords are lexical tokens, not arbitrary substrings. Unicode letters,
+/// digits and underscore form identifiers; punctuation, brackets, colons and
+/// whitespace are boundaries. Thus `(error)` and `[error]` match while
+/// `get_data_error_name` does not.
 fn keyword_has_boundaries(text: &str, start: usize, end: usize) -> bool {
-    let left_is_alphanumeric = text[..start]
+    let left_is_identifier = text[..start]
         .chars()
         .next_back()
-        .is_some_and(char::is_alphanumeric);
-    let right_is_alphanumeric = text[end..]
-        .chars()
-        .next()
-        .is_some_and(char::is_alphanumeric);
-    !left_is_alphanumeric && !right_is_alphanumeric
+        .is_some_and(identifier_character);
+    let right_is_identifier = text[end..].chars().next().is_some_and(identifier_character);
+    !left_is_identifier && !right_is_identifier
+}
+
+fn identifier_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkAddressKind {
+    Ipv4,
+    Ipv6,
+    Mac,
+}
+
+fn network_address_spans(text: &str) -> Vec<(usize, usize, Style)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, character) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        let address_character =
+            character.is_ascii_hexdigit() || matches!(character, '.' | ':' | '-');
+        if address_character {
+            start.get_or_insert(index);
+            continue;
+        }
+        let Some(candidate_start) = start.take() else {
+            continue;
+        };
+        let candidate = &text[candidate_start..index];
+        let leading = candidate
+            .bytes()
+            .take_while(|byte| matches!(byte, b'.' | b'-'))
+            .count();
+        let trailing = candidate
+            .bytes()
+            .rev()
+            .take_while(|byte| matches!(byte, b'.' | b'-'))
+            .count();
+        let through = candidate.len().saturating_sub(trailing);
+        if leading >= through {
+            continue;
+        }
+        let candidate = &candidate[leading..through];
+        let Some((matched_len, kind)) = classify_network_address(candidate) else {
+            continue;
+        };
+        let span_start = candidate_start + leading;
+        spans.push((
+            span_start,
+            span_start + matched_len,
+            network_address_style(kind),
+        ));
+    }
+    spans
+}
+
+fn classify_network_address(candidate: &str) -> Option<(usize, NetworkAddressKind)> {
+    if candidate.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some((candidate.len(), NetworkAddressKind::Ipv4));
+    }
+    // An IPv4 endpoint commonly appends `:port`. Color the address while
+    // leaving the transport port in the ordinary foreground.
+    if candidate.contains('.')
+        && let Some((address, port)) = candidate.rsplit_once(':')
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && address.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Some((address.len(), NetworkAddressKind::Ipv4));
+    }
+    if candidate.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Some((candidate.len(), NetworkAddressKind::Ipv6));
+    }
+    if is_mac_address(candidate) {
+        return Some((candidate.len(), NetworkAddressKind::Mac));
+    }
+    None
+}
+
+fn is_mac_address(candidate: &str) -> bool {
+    let separator = if candidate.contains(':') {
+        ':'
+    } else if candidate.contains('-') {
+        '-'
+    } else {
+        return false;
+    };
+    let mut groups = candidate.split(separator);
+    (0..6).all(|_| {
+        groups.next().is_some_and(|group| {
+            group.len() == 2 && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
+fn network_address_style(kind: NetworkAddressKind) -> Style {
+    Style::default().fg(match kind {
+        NetworkAddressKind::Ipv4 => Color::LightMagenta,
+        NetworkAddressKind::Ipv6 => Color::LightCyan,
+        NetworkAddressKind::Mac => Color::LightYellow,
+    })
 }
 
 fn prompt_range(
@@ -1847,20 +1967,41 @@ mod tests {
     }
 
     #[test]
-    fn keyword_highlighting_requires_non_alphanumeric_boundaries() {
+    fn keyword_highlighting_uses_identifier_boundaries() {
         assert_eq!(
-            highlight_spans("[INFO] level=info xxx_info", None, None),
+            highlight_spans("[INFO] level=info", None, None),
+            vec![(1, 5, keyword_style(3)), (13, 17, keyword_style(3)),]
+        );
+        assert_eq!(
+            highlight_spans("error (error) [error]", None, None),
             vec![
-                (1, 5, keyword_style(3)),
-                (13, 17, keyword_style(3)),
-                (22, 26, keyword_style(3)),
+                (0, 5, keyword_style(0)),
+                (7, 12, keyword_style(0)),
+                (15, 20, keyword_style(0)),
             ]
         );
-        assert_eq!(
-            highlight_spans("cloud_com_error_to_log", None, None),
-            vec![(10, 15, keyword_style(0))]
+        assert!(
+            highlight_spans(
+                "get_data_error_name xxx_info xxxinfo information errorCounter",
+                None,
+                None
+            )
+            .is_empty()
         );
-        assert!(highlight_spans("xxxinfo information errorCounter", None, None).is_empty());
+    }
+
+    #[test]
+    fn network_addresses_receive_distinct_inline_styles() {
+        let text = "v4=192.168.1.10:22 v6=[2001:db8::1] mac=aa:bb:cc:dd:ee:ff";
+        assert_eq!(
+            highlight_spans(text, None, None),
+            vec![
+                (3, 15, network_address_style(NetworkAddressKind::Ipv4)),
+                (23, 34, network_address_style(NetworkAddressKind::Ipv6)),
+                (40, 57, network_address_style(NetworkAddressKind::Mac)),
+            ]
+        );
+        assert!(highlight_spans("999.1.2.3 dead:beef aa:bb:cc", None, None).is_empty());
     }
 
     #[test]
@@ -2147,6 +2288,7 @@ mod tests {
 
     #[test]
     fn target_hard_wrap_inside_long_echo_is_reconciled_without_duplicate_rows() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut parser = TerminalStreamParser::new();
         parser.set_echo_reconciliation(true);
         parser.push_event(&event_at(1, b"[root@luckfox tmp]# "));

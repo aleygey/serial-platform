@@ -52,7 +52,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Build Windows binaries
-        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp
+        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp -p serial-desktop
 
       - name: Smoke-test binaries
         shell: pwsh
@@ -62,6 +62,8 @@ jobs:
           .\target\release\seriald.exe --version
           .\target\release\serialctl.exe --version
           .\target\release\serial-mcp.exe --version
+          .\target\release\serial-desktop.exe --version
+          .\target\release\serial-desktop.exe --help
           .\target\release\serial.exe --version
           .\target\release\serial.exe --help
           .\target\release\serial.exe console --version
@@ -79,6 +81,7 @@ jobs:
           Copy-Item "target\release\seriald.exe" $packageDir
           Copy-Item "target\release\serialctl.exe" $packageDir
           Copy-Item "target\release\serial-mcp.exe" $packageDir
+          Copy-Item "target\release\serial-desktop.exe" $packageDir
           Copy-Item "target\release\serial.exe" $packageDir
           Copy-Item "adapters" $packageDir -Recurse
           Copy-Item "docs" $packageDir -Recurse
@@ -86,6 +89,15 @@ jobs:
           Copy-Item "DOCUMENTATION.md" $packageDir
           Copy-Item "ROADMAP.md" $packageDir
           Copy-Item "LICENSE" $packageDir
+          $packageRoot = (Resolve-Path $packageDir).Path
+          $manifestLines = Get-ChildItem -LiteralPath $packageRoot -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relative = $_.FullName.Substring($packageRoot.Length + 1).Replace('\', '/')
+              $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              "${digest}  ${relative}"
+            }
+          Set-Content -LiteralPath (Join-Path $packageRoot "MANIFEST.sha256") -Value $manifestLines -Encoding ascii
           Compress-Archive -Path $packageDir -DestinationPath "dist\$packageName.zip"
           $smokeRoot = Join-Path "dist" "smoke-windows"
           Expand-Archive -LiteralPath "dist\$packageName.zip" -DestinationPath $smokeRoot
@@ -94,6 +106,14 @@ jobs:
           & "$smokeDir\serial.exe" console --version
           & "$smokeDir\serial.exe" mcp --version
           & "$smokeDir\serial.exe" serve --help
+          & "$smokeDir\serial-desktop.exe" --version
+          & "$smokeDir\serial-desktop.exe" --help
+          Get-Content -LiteralPath (Join-Path $smokeDir "MANIFEST.sha256") | ForEach-Object {
+            $parts = $_ -split '  ', 2
+            if ($parts.Count -ne 2) { throw "invalid package manifest line: $_" }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $smokeDir $parts[1])).Hash
+            if ($actual -ne $parts[0]) { throw "package manifest mismatch: $($parts[1])" }
+          }
           $portableRoot = Join-Path $smokeRoot "portable-root"
           & "$smokeDir\serial.exe" --root $portableRoot paths
 
@@ -118,7 +138,8 @@ jobs:
       - name: Install Ubuntu baseline build tools
         run: |
           apt-get update
-          apt-get install --yes binutils build-essential ca-certificates curl file git
+          apt-get install --yes binutils build-essential ca-certificates curl file git \
+            libgl1 libx11-6 libx11-xcb1 libxcursor1 libxi6 libxkbcommon0 libxrandr2
 
       - name: Check out source
         uses: actions/checkout@v4
@@ -131,12 +152,12 @@ jobs:
       - name: Test workspace natively
         run: cargo test --workspace --locked
 
-      - name: Build Ubuntu baseline clients
-        run: cargo build --release --locked -p serial-cli -p serialctl -p serial-mcp
+      - name: Build Ubuntu baseline programs
+        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp -p serial-desktop
 
-      - name: Smoke-test Ubuntu baseline clients
+      - name: Smoke-test Ubuntu baseline programs
         run: |
-          for candidate in ./target/release/serial ./target/release/serialctl ./target/release/serial-mcp; do
+          for candidate in ./target/release/serial ./target/release/seriald ./target/release/serialctl ./target/release/serial-mcp ./target/release/serial-desktop; do
             "${candidate}" --version
             "${candidate}" --help > /dev/null
             file "${candidate}" | grep -q 'ELF 64-bit LSB.*x86-64'
@@ -166,24 +187,38 @@ jobs:
           ./target/release/serial console --version
           ./target/release/serial mcp --version
 
-      - name: Package Ubuntu baseline clients
+      - name: Package Ubuntu baseline programs
         run: |
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           package_name="serial-platform-v${version}-linux-x86_64-ubuntu20.04-validation"
           package_dir="dist/${package_name}"
           mkdir -p "${package_dir}"
+          install -m 0755 target/release/seriald "${package_dir}/seriald"
           install -m 0755 target/release/serialctl "${package_dir}/serialctl"
           install -m 0755 target/release/serial-mcp "${package_dir}/serial-mcp"
+          install -m 0755 target/release/serial-desktop "${package_dir}/serial-desktop"
           install -m 0755 target/release/serial "${package_dir}/serial"
           cp -r README.md DOCUMENTATION.md ROADMAP.md LICENSE adapters docs "${package_dir}/"
+          (
+            cd "${package_dir}"
+            find . -type f ! -name MANIFEST.sha256 -print0 \
+              | LC_ALL=C sort -z \
+              | while IFS= read -r -d '' file; do sha256sum "${file}"; done \
+              > MANIFEST.sha256
+            sha256sum --check MANIFEST.sha256
+          )
           tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
           mkdir -p dist/smoke
           tar -C dist/smoke -xzf "dist/${package_name}.tar.gz"
           "dist/smoke/${package_name}/serialctl" --version
           "dist/smoke/${package_name}/serial-mcp" --version
+          "dist/smoke/${package_name}/seriald" --version
+          "dist/smoke/${package_name}/serial-desktop" --version
+          "dist/smoke/${package_name}/serial-desktop" --help > /dev/null
           "dist/smoke/${package_name}/serial" --version
           "dist/smoke/${package_name}/serial" console --version
           "dist/smoke/${package_name}/serial" mcp --version
+          (cd "dist/smoke/${package_name}" && sha256sum --check MANIFEST.sha256)
 
       - name: Upload Linux package
         uses: actions/upload-artifact@v4

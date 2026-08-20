@@ -1,17 +1,16 @@
 //! Durable, device-agnostic live RX Monitor Jobs.
 //!
 //! Monitor matching happens on independent broadcast receivers after Slot
-//! actors publish timeline events. Neither persistence nor webhook delivery
-//! can block the serial reader or the Slot actor.
+//! actors publish timeline events. Persistence cannot block the serial reader
+//! or the Slot actor.
 
-use crate::config::{MonitorEventSinkConfig, atomic_write};
+use crate::config::atomic_write;
 use crate::registry::SlotRegistry;
 use regex::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    CreateMonitorRequest, Cursor, Direction, EventKind, MonitorCloudEvent, MonitorIncident,
-    MonitorIncidentListResponse, MonitorListResponse, MonitorOutboxEvent,
-    MonitorOutboxListResponse, MonitorOutboxStatus, MonitorResponse, MonitorSpec, MonitorStatus,
+    CreateMonitorRequest, Cursor, Direction, EventKind, MonitorIncident,
+    MonitorIncidentListResponse, MonitorListResponse, MonitorResponse, MonitorSpec, MonitorStatus,
     MonitorView, TimelineEvent, UpdateMonitorRequest,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -31,11 +30,10 @@ const MAX_MONITORS: usize = 128;
 const MAX_ACTIVE_MONITORS: usize = 64;
 const MAX_INCIDENTS_PER_MONITOR: usize = 512;
 const MAX_INCIDENTS_TOTAL: usize = 1_024;
-const MAX_OUTBOX_EVENTS: usize = 512;
 const MAX_PATTERN_BYTES: usize = 4_096;
 // Keep the daemon contract aligned with the MCP schema. More importantly,
 // this participates in the persisted-state budget below because descriptions
-// are copied into both retained Incidents and notification events.
+// are copied into retained Incidents.
 const MAX_DESCRIPTION_BYTES: usize = 1_024;
 const MAX_PREVIEW_BYTES: usize = 1_024;
 const MAX_MATCH_WINDOW_BYTES: usize = 64 * 1024;
@@ -43,7 +41,6 @@ const MAX_REGEX_COMPILED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DEBOUNCE_MS: u64 = 60_000;
 const MAX_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_DURATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
-const MAX_EVENT_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_PAGE: usize = 100;
 const MAX_PAGE: usize = 200;
 /// This bounds disk work on the Monitor worker; the Slot RX actor never waits
@@ -62,9 +59,7 @@ struct MonitorInner {
     state: RwLock<PersistedState>,
     mutation: Mutex<()>,
     workers: Mutex<HashMap<Uuid, WorkerHandle>>,
-    sink: MonitorEventSinkConfig,
     startup_task: StdMutex<Option<JoinHandle<()>>>,
-    sink_task: Mutex<Option<JoinHandle<()>>>,
     shutdown: watch::Sender<bool>,
     #[cfg(test)]
     fail_persists: std::sync::atomic::AtomicBool,
@@ -91,10 +86,6 @@ struct PersistedState {
     /// is live status and can be newer than this durable checkpoint.
     #[serde(default)]
     checkpoints: BTreeMap<Uuid, MonitorCheckpoint>,
-    #[serde(default)]
-    outbox: VecDeque<StoredOutboxEvent>,
-    #[serde(default = "default_next_outbox_seq")]
-    next_outbox_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,28 +106,14 @@ impl Default for PersistedState {
             monitors: BTreeMap::new(),
             incidents: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
-            outbox: VecDeque::new(),
-            next_outbox_seq: default_next_outbox_seq(),
         }
     }
-}
-
-const fn default_next_outbox_seq() -> u64 {
-    1
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct StoredOutboxEvent {
-    public: MonitorOutboxEvent,
-    next_attempt_wall_time_ns: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum MonitorError {
     #[error("Monitor Job {0} was not found")]
     NotFound(Uuid),
-    #[error("Monitor outbox event {0} was not found")]
-    OutboxNotFound(u64),
     #[error("unknown Slot {0}")]
     UnknownSlot(String),
     #[error("Monitor request_id {0} was reused with a different specification")]
@@ -167,7 +144,6 @@ impl MonitorManager {
         registry: SlotRegistry,
         _daemon_epoch: Uuid,
         server_id: Uuid,
-        sink: MonitorEventSinkConfig,
     ) -> Result<Self, MonitorError> {
         let state = load_state(&path)?;
         validate_loaded_state(&state)?;
@@ -180,9 +156,7 @@ impl MonitorManager {
                 state: RwLock::new(state),
                 mutation: Mutex::new(()),
                 workers: Mutex::new(HashMap::new()),
-                sink,
                 startup_task: StdMutex::new(None),
-                sink_task: Mutex::new(None),
                 shutdown,
                 #[cfg(test)]
                 fail_persists: std::sync::atomic::AtomicBool::new(false),
@@ -194,9 +168,6 @@ impl MonitorManager {
                 return;
             }
             startup.resume_workers().await;
-            if !startup.is_shutting_down() {
-                startup.start_sink_worker().await;
-            }
         });
         *manager
             .inner
@@ -531,13 +502,6 @@ impl MonitorManager {
                 if let Some(monitor) = state.monitors.get_mut(&monitor_id) {
                     monitor.unacked_incident_count =
                         monitor.unacked_incident_count.saturating_sub(1);
-                }
-                for entry in &mut state.outbox {
-                    if entry.public.event.id == incident_id.to_string()
-                        && entry.public.status == MonitorOutboxStatus::Pending
-                    {
-                        entry.public.status = MonitorOutboxStatus::Acknowledged;
-                    }
                 }
             }
             Ok(())
@@ -889,7 +853,6 @@ impl MonitorManager {
         let now = wall_time_ns();
         let server_id = self.inner.server_id;
         self.mutate_and_persist(|state| {
-            prune_expired_metadata(state, now);
             let monitor = state
                 .monitors
                 .get_mut(&monitor_id)
@@ -914,7 +877,6 @@ impl MonitorManager {
             let incidents = state.incidents.entry(monitor_id).or_default();
             let incident_seq = monitor.incident_count.saturating_add(1);
             let incident_id = Uuid::new_v4();
-            let expires = now.saturating_add(ms_to_ns(monitor.spec.event_ttl_ms));
             let cursor = Cursor {
                 epoch: pending.daemon_epoch,
                 after_seq: pending.seq_start.saturating_sub(1),
@@ -941,83 +903,24 @@ impl MonitorManager {
                     pending.seq_end
                 ),
                 created_wall_time_ns: now,
-                expires_wall_time_ns: expires,
                 acked_wall_time_ns: None,
             };
             monitor.incident_count = incident_seq;
             monitor.unacked_incident_count = monitor.unacked_incident_count.saturating_add(1);
             incidents.push_back(incident.clone());
             state.checkpoints.insert(monitor_id, checkpoint);
-            enqueue_outbox(state, server_id, &incident, now);
             recompute_unacked_counts(state);
             Ok(())
         })
         .await
     }
 
-    pub async fn outbox(
-        &self,
-        after_outbox_seq: Option<u64>,
-        limit: Option<usize>,
-    ) -> MonitorOutboxListResponse {
-        // Standalone deployments have no sink loop. Expire stale entries before
-        // exposing a pull page so consumers never mistake them for deliverable.
-        if let Err(error) = self.expire_outbox(wall_time_ns()).await {
-            tracing::warn!(%error, "failed to expire Monitor outbox entries before read");
-        }
-        let state = self.inner.state.read().await;
-        let limit = limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-        let eligible = state
-            .outbox
-            .iter()
-            .filter(|entry| after_outbox_seq.is_none_or(|after| entry.public.outbox_seq > after))
-            .map(|entry| entry.public.clone())
-            .collect::<Vec<_>>();
-        let truncated = eligible.len() > limit;
-        let events = eligible.into_iter().take(limit).collect::<Vec<_>>();
-        let next_cursor = events.last().map(|event| event.outbox_seq);
-        MonitorOutboxListResponse {
-            events,
-            next_cursor,
-            truncated,
-        }
-    }
-
-    pub async fn acknowledge_outbox(
-        &self,
-        outbox_seq: u64,
-    ) -> Result<MonitorOutboxEvent, MonitorError> {
-        self.mutate_and_persist(|state| {
-            let event = state
-                .outbox
-                .iter_mut()
-                .find(|entry| entry.public.outbox_seq == outbox_seq)
-                .ok_or(MonitorError::OutboxNotFound(outbox_seq))?;
-            if event.public.status == MonitorOutboxStatus::Pending {
-                event.public.status = MonitorOutboxStatus::Acknowledged;
-            }
-            Ok(())
-        })
-        .await?;
-        self.inner
-            .state
-            .read()
-            .await
-            .outbox
-            .iter()
-            .find(|entry| entry.public.outbox_seq == outbox_seq)
-            .map(|entry| entry.public.clone())
-            .ok_or(MonitorError::OutboxNotFound(outbox_seq))
-    }
-
     pub async fn shutdown(&self) {
         // `send` drops the new value when there are no receivers. That is a
         // real startup race here: an immediately shut down manager may not
-        // have spawned a Monitor or sink receiver yet, and its startup task
-        // would then observe `false` and create a sink task that shutdown waits
-        // on forever. `send_replace` makes shutdown authoritative even with no
-        // current subscribers; later subscribers also observe the terminal
-        // state before starting work.
+        // have spawned a Monitor receiver yet. `send_replace` makes shutdown
+        // authoritative even with no current subscribers; later subscribers
+        // also observe the terminal state before starting work.
         self.inner.shutdown.send_replace(true);
         let startup = self
             .inner
@@ -1040,9 +943,6 @@ impl MonitorManager {
                 let _ = task.await;
             }
         }
-        if let Some(task) = self.inner.sink_task.lock().await.take() {
-            let _ = task.await;
-        }
         if let Err(error) = self.persist().await {
             tracing::error!(%error, "failed to persist Monitor state during shutdown");
         }
@@ -1058,194 +958,6 @@ impl MonitorManager {
             .fail_persists
             .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-impl MonitorManager {
-    async fn start_sink_worker(&self) {
-        if self.is_shutting_down() {
-            return;
-        }
-        let endpoint = self.inner.sink.endpoint.clone();
-        let client = match endpoint.as_ref() {
-            Some(_) => match reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-            {
-                Ok(client) => Some(client),
-                Err(error) => {
-                    tracing::error!(%error, "failed to construct Monitor webhook client");
-                    return;
-                }
-            },
-            None => None,
-        };
-        let manager = self.clone();
-        let token_file = self.inner.sink.token_file.clone();
-        let mut shutdown = self.inner.shutdown.subscribe();
-        let task = tokio::spawn(async move {
-            loop {
-                if *shutdown.borrow() {
-                    break;
-                }
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-                }
-                let now = wall_time_ns();
-                if let Err(error) = manager.expire_outbox(now).await {
-                    tracing::warn!(%error, "failed to expire Monitor outbox entries");
-                    continue;
-                }
-                let (Some(client), Some(endpoint)) = (client.as_ref(), endpoint.as_deref()) else {
-                    continue;
-                };
-                let Some(entry) = manager.next_due_outbox(now).await else {
-                    continue;
-                };
-                let result =
-                    send_cloud_event(client, endpoint, token_file.as_deref(), &entry.public.event)
-                        .await;
-                if let Err(error) = manager
-                    .record_delivery_result(entry.public.outbox_seq, result)
-                    .await
-                {
-                    tracing::warn!(%error, "failed to persist Monitor webhook result");
-                }
-            }
-        });
-        if self.is_shutting_down() {
-            task.abort();
-            return;
-        }
-        *self.inner.sink_task.lock().await = Some(task);
-    }
-
-    async fn next_due_outbox(&self, now: i64) -> Option<StoredOutboxEvent> {
-        self.inner
-            .state
-            .read()
-            .await
-            .outbox
-            .iter()
-            .find(|entry| {
-                entry.public.status == MonitorOutboxStatus::Pending
-                    && entry.public.expires_wall_time_ns > now
-                    && entry.next_attempt_wall_time_ns <= now
-            })
-            .cloned()
-    }
-
-    async fn expire_outbox(&self, now: i64) -> Result<(), MonitorError> {
-        let state = self.inner.state.read().await;
-        let needs_change = state.outbox.iter().any(|entry| {
-            entry.public.status == MonitorOutboxStatus::Pending
-                && entry.public.expires_wall_time_ns <= now
-        });
-        drop(state);
-        if !needs_change {
-            return Ok(());
-        }
-        self.mutate_and_persist(|state| {
-            prune_expired_metadata(state, now);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn record_delivery_result(
-        &self,
-        outbox_seq: u64,
-        result: Result<(), String>,
-    ) -> Result<(), MonitorError> {
-        let now = wall_time_ns();
-        let retry_min_ms = self.inner.sink.retry_min_ms;
-        let retry_max_ms = self.inner.sink.retry_max_ms;
-        self.mutate_and_persist(|state| {
-            let entry = state
-                .outbox
-                .iter_mut()
-                .find(|entry| entry.public.outbox_seq == outbox_seq)
-                .ok_or_else(|| MonitorError::Runtime("outbox entry disappeared".into()))?;
-            if entry.public.status != MonitorOutboxStatus::Pending {
-                return Ok(());
-            }
-            entry.public.attempts = entry.public.attempts.saturating_add(1);
-            match result {
-                Ok(()) => {
-                    entry.public.status = MonitorOutboxStatus::Delivered;
-                    entry.public.last_error = None;
-                }
-                Err(error) => {
-                    entry.public.last_error = Some(truncate_text(&error, MAX_DESCRIPTION_BYTES));
-                    let shift = entry.public.attempts.saturating_sub(1).min(20);
-                    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
-                    let delay_ms = retry_min_ms.saturating_mul(multiplier).min(retry_max_ms);
-                    entry.next_attempt_wall_time_ns = now.saturating_add(ms_to_ns(delay_ms));
-                }
-            }
-            Ok(())
-        })
-        .await
-    }
-}
-
-async fn send_cloud_event(
-    client: &reqwest::Client,
-    endpoint: &str,
-    token_file: Option<&Path>,
-    event: &MonitorCloudEvent,
-) -> Result<(), String> {
-    let mut request = client
-        .post(endpoint)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/cloudevents+json",
-        )
-        .json(event);
-    if let Some(path) = token_file {
-        let token = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|_| "could not read Monitor sink token file".to_owned())?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err("Monitor sink token file is empty".into());
-        }
-        request = request.bearer_auth(token);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("webhook request failed: {error}"))?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("webhook returned HTTP {}", response.status()))
-    }
-}
-
-fn prune_expired_metadata(state: &mut PersistedState, now: i64) {
-    for entry in &mut state.outbox {
-        if entry.public.status == MonitorOutboxStatus::Pending
-            && entry.public.expires_wall_time_ns <= now
-        {
-            entry.public.status = MonitorOutboxStatus::Expired;
-        }
-    }
-    while state.outbox.len() >= MAX_OUTBOX_EVENTS {
-        let Some(index) = state
-            .outbox
-            .iter()
-            .position(|entry| entry.public.status != MonitorOutboxStatus::Pending)
-        else {
-            break;
-        };
-        state.outbox.remove(index);
-    }
-    recompute_unacked_counts(state);
 }
 
 fn recompute_unacked_counts(state: &mut PersistedState) {
@@ -1265,66 +977,6 @@ fn recompute_unacked_counts(state: &mut PersistedState) {
     for monitor in state.monitors.values_mut() {
         monitor.unacked_incident_count = counts.get(&monitor.id).copied().unwrap_or(0);
     }
-}
-
-fn enqueue_outbox(
-    state: &mut PersistedState,
-    server_id: Uuid,
-    incident: &MonitorIncident,
-    now: i64,
-) {
-    prune_expired_metadata(state, now);
-    if state.outbox.len() >= MAX_OUTBOX_EVENTS {
-        if let Some(monitor) = state.monitors.get_mut(&incident.monitor_id) {
-            monitor.gap_count = monitor.gap_count.saturating_add(1);
-            monitor.last_error =
-                Some("notification outbox is full; Incident remains queryable".into());
-        }
-        return;
-    }
-    let outbox_seq = state.next_outbox_seq;
-    state.next_outbox_seq = state.next_outbox_seq.saturating_add(1).max(1);
-    let created = rfc3339_ns(incident.created_wall_time_ns);
-    let expires = rfc3339_ns(incident.expires_wall_time_ns);
-    let cloud_event = MonitorCloudEvent {
-        specversion: "1.0".into(),
-        id: incident.id.to_string(),
-        source: format!("serial://{server_id}/{}", incident.slot_id),
-        event_type: "io.openchamber.serial.monitor.incident.detected.v1".into(),
-        subject: format!("monitors/{}/incidents/{}", incident.monitor_id, incident.id),
-        time: created,
-        datacontenttype: "application/json".into(),
-        expiresat: expires,
-        data: serde_json::json!({
-            "text": format!(
-                "Serial monitor {} detected {:?} output on {} (seq {}-{}): {}",
-                incident.monitor_id,
-                incident.severity,
-                incident.slot_id,
-                incident.seq_start,
-                incident.seq_end,
-                incident.preview
-            ),
-            "incident": incident,
-        }),
-    };
-    state.outbox.push_back(StoredOutboxEvent {
-        public: MonitorOutboxEvent {
-            outbox_seq,
-            event: cloud_event,
-            status: MonitorOutboxStatus::Pending,
-            created_wall_time_ns: now,
-            expires_wall_time_ns: incident.expires_wall_time_ns,
-            attempts: 0,
-            last_error: None,
-        },
-        next_attempt_wall_time_ns: now,
-    });
-}
-
-fn rfc3339_ns(value: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(value)
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 fn truncate_text(value: &str, limit: usize) -> String {
@@ -2104,7 +1756,6 @@ fn validate_loaded_state(state: &PersistedState) -> Result<(), MonitorError> {
             .filter(|monitor| monitor.status == MonitorStatus::Running)
             .count()
             > MAX_ACTIVE_MONITORS
-        || state.outbox.len() > MAX_OUTBOX_EVENTS
         || state.incidents.values().map(VecDeque::len).sum::<usize>() > MAX_INCIDENTS_TOTAL
         || state
             .incidents
@@ -2168,11 +1819,6 @@ fn validate_spec(spec: &MonitorSpec) -> Result<(), MonitorError> {
             "duration_ms is out of range".into(),
         ));
     }
-    if spec.event_ttl_ms == 0 || spec.event_ttl_ms > MAX_EVENT_TTL_MS {
-        return Err(MonitorError::InvalidSpec(
-            "event_ttl_ms is out of range".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -2225,7 +1871,6 @@ mod matcher_tests {
             debounce_ms: 0,
             cooldown_ms: 0,
             duration_ms: None,
-            event_ttl_ms: 60_000,
         }
     }
 
@@ -2353,7 +1998,6 @@ mod tests {
             debounce_ms: 0,
             cooldown_ms: 0,
             duration_ms: None,
-            event_ttl_ms: 60_000,
         }
     }
 
@@ -2398,7 +2042,6 @@ mod tests {
             },
             evidence_ref: format!("serial://test/{incident_seq}"),
             created_wall_time_ns: incident_seq as i64,
-            expires_wall_time_ns: i64::MAX,
             acked_wall_time_ns: None,
         }
     }
@@ -2480,7 +2123,6 @@ mod tests {
             registry.clone(),
             epoch,
             Uuid::new_v4(),
-            MonitorEventSinkConfig::default(),
         )
         .unwrap();
         (manager, registry, journal, epoch)
@@ -2575,7 +2217,6 @@ mod tests {
             registry.clone(),
             epoch,
             Uuid::new_v4(),
-            MonitorEventSinkConfig::default(),
         )
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2720,7 +2361,6 @@ mod tests {
             registry.clone(),
             registry.daemon_epoch(),
             Uuid::new_v4(),
-            MonitorEventSinkConfig::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2733,7 +2373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incidents_are_bounded_tail_page_and_ack_cancels_pending_notification() {
+    async fn incidents_are_bounded_tail_page_and_ack_updates_core_state() {
         let temp = TempDir::new().unwrap();
         let (manager, registry, journal, epoch) = fixture(&temp).await;
         let monitor_id = Uuid::new_v4();
@@ -2783,15 +2423,24 @@ mod tests {
             .acknowledge_incident(monitor_id, incident.id)
             .await
             .unwrap();
-        let outbox = manager.outbox(None, None).await;
-        assert_eq!(
-            outbox
-                .events
-                .iter()
-                .find(|event| event.event.id == incident.id.to_string())
+        assert!(
+            manager
+                .incidents(monitor_id, Some(0), Some(10), true)
+                .await
                 .unwrap()
-                .status,
-            MonitorOutboxStatus::Acknowledged
+                .incidents
+                .iter()
+                .find(|stored| stored.id == incident.id)
+                .is_some_and(|stored| stored.acked_wall_time_ns.is_some())
+        );
+        assert_eq!(
+            manager
+                .get(monitor_id)
+                .await
+                .unwrap()
+                .monitor
+                .unacked_incident_count,
+            2
         );
         manager.shutdown().await;
         registry.shutdown().await;
@@ -2979,7 +2628,6 @@ mod tests {
         assert_eq!(MAX_DESCRIPTION_BYTES, 1_024);
         assert_eq!(MAX_INCIDENTS_PER_MONITOR, 512);
         assert_eq!(MAX_INCIDENTS_TOTAL, 1_024);
-        assert_eq!(MAX_OUTBOX_EVENTS, 512);
     }
 
     #[tokio::test]
@@ -3078,7 +2726,6 @@ mod tests {
             registry.clone(),
             epoch,
             Uuid::new_v4(),
-            MonitorEventSinkConfig::default(),
         )
         .unwrap();
         let recovered = reopened
@@ -3159,61 +2806,6 @@ mod tests {
             rewound
         );
 
-        manager.shutdown().await;
-        registry.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn notification_ttl_does_not_delete_retained_incident_evidence() {
-        let temp = TempDir::new().unwrap();
-        let (manager, registry, journal, epoch) = fixture(&temp).await;
-        let monitor_id = Uuid::new_v4();
-        let revision = manager
-            .create(CreateMonitorRequest {
-                request_id: monitor_id,
-                spec: spec("slot-1"),
-            })
-            .await
-            .unwrap()
-            .monitor
-            .revision;
-        manager
-            .record_incident(
-                monitor_id,
-                revision,
-                PendingIncident {
-                    daemon_epoch: epoch,
-                    seq_start: 1,
-                    seq_end: 1,
-                    wall_time_start_ns: 1,
-                    wall_time_end_ns: 1,
-                    preview: "kernel panic".into(),
-                },
-                MonitorCheckpoint {
-                    cursor: Cursor {
-                        epoch,
-                        after_seq: 1,
-                    },
-                    cooldown_until_wall_time_ns: None,
-                    pending: None,
-                },
-            )
-            .await
-            .unwrap();
-        {
-            let mut state = manager.inner.state.write().await;
-            prune_expired_metadata(&mut state, i64::MAX);
-        }
-        assert_eq!(
-            manager
-                .get(monitor_id)
-                .await
-                .unwrap()
-                .monitor
-                .unacked_incident_count,
-            1
-        );
         manager.shutdown().await;
         registry.shutdown().await;
         journal.shutdown().await.unwrap();
@@ -3312,7 +2904,6 @@ mod tests {
         let (manager, registry, journal, _) = fixture(&temp).await;
         manager.shutdown().await;
         assert!(manager.inner.workers.lock().await.is_empty());
-        assert!(manager.inner.sink_task.lock().await.is_none());
         registry.shutdown().await;
         journal.shutdown().await.unwrap();
     }

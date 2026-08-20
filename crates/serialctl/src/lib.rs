@@ -4,6 +4,7 @@ mod clipboard;
 mod config;
 mod display;
 mod doctor;
+mod history;
 mod i18n;
 mod model;
 mod profile;

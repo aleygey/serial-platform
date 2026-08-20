@@ -1,22 +1,24 @@
 # Serial Platform
 
-`serial-platform` is an independent shared serial-port control plane. `seriald`
-runs on the machine physically connected to the serial card; any number of
-`serialctl` clients can observe the same Slots, while a fenced control lease
-serializes ordinary writers. A separately audited cooperative Human write may
-be injected without taking over an Agent-owned Run.
+`serial-platform` is a device-agnostic, auditable shared serial control plane
+for Human/Agent collaboration. `seriald` runs on the machine physically
+connected to the serial adapter and remains the sole owner of physical ports;
+Human clients and Agent adapters observe the same Slots, while a fenced control
+lease serializes ordinary writers. A separately audited cooperative Human write
+may be injected without taking over an Agent-owned Run.
 
 It deliberately has no OpenCode or OpenChamber runtime dependency. The
 `serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
 MCP clients without making `seriald` Agent-specific.
 
-v0.6.2 isolates every MCP-owned Run with a private caller capability, records
-the human-readable purpose of confirmed Agent commands, and adds a bounded
-full-width Run/command-history bar to the Chinese-first terminal. It also adds native
-macOS arm64/x86_64 packages to the Jenkins pipeline. The current 19-tool MCP
-registry retains the persistent Monitor Jobs introduced in v0.5.0 and the
-ordinary serial/Run/Trigger operations. The unified launcher introduced in
-v0.4 remains: `serial serve` starts the backend,
+The v0.7.0 development tree reduces every Run-scoped MCP call to one opaque
+`run_handle`, makes normal `run_end` cleanup explicit, and makes the orphan-Run
+fallback and terminal command-history height configurable. The latest release,
+v0.6.2, introduced private Run capabilities, described command history,
+dependent command sequences, the full-width Run/history bar, and native macOS
+arm64/x86_64 packages. The 19-tool MCP registry retains the persistent Monitor
+Jobs introduced in v0.5.0 and the ordinary serial/Run/Trigger operations. The
+unified launcher introduced in v0.4 remains: `serial serve` starts the backend,
 `serial console` opens the TUI, `serial setup` configures a station,
 `serial profile ...` manages reusable profiles, `serial model ...` manages the
 DUT identity tree, and `serial mcp` starts the MCP adapter. The component
@@ -32,7 +34,62 @@ Protocol and integration references:
 - [All MCP tool schemas and result contracts](./docs/MCP_TOOLS.md); inspect the
   installed executable directly with `serial mcp --dump-tools`.
 
-## v0.6.2 development highlights
+## v0.7.0 development highlights
+
+- `run_start` returns one opaque `run_handle` for later Run-scoped MCP calls;
+  the public `run_id` remains audit identity only. This keeps the model-facing
+  capability small while preventing another LLM session sharing one long-lived
+  adapter from adopting a visible Run. Normal completion calls `run_end`; the
+  configurable orphan timeout defaults to 1,800 seconds and is only a
+  crash/abandonment fallback.
+- The terminal menu can persist both `agent_history_rows` and
+  `orphan_run_timeout_seconds`; changing the latter takes effect for newly
+  started MCP processes and does not alter WebSocket protocol v3.
+- Reopening the terminal reconstructs the current daemon epoch from the
+  durable journal before it resumes live WebSocket traffic. `Ctrl-] /` adds a
+  bounded persistent-history search with text/regex, case, RX/TX, current
+  epoch, retained-epoch, and active-Run modes; older epochs stay separate from
+  the currently attached device view.
+- MCP `read(scope=tail)` now snapshots at most 200 events directly from the
+  bounded live replay ring, so long-running stations no longer make a tail read
+  discover every retained journal segment or rescan a large active segment.
+  `read(scope=continue)` pages the same ring from its process-local cursor, so
+  live continuation is bounded too; eviction and daemon restarts are explicit
+  gaps rather than silent history joins.
+- MCP results expose compact third-party serial activity only when relevant.
+  Before a command/input/signal/Trigger physical action, unacknowledged foreign
+  activity or an incomplete ring interval fails closed with
+  `context_changed` and `no_bytes_written=true`; `read(scope=tail)` or `wait`
+  acknowledges the new state before retry.
+- `serial-desktop` adds a native egui MVP for the same HTTP/WebSocket control
+  plane: local `serial serve` lifecycle management, persistent current-epoch
+  console replay, Agent command history, Slot configuration/open/close,
+  retained Human drafts/history, shortcuts, and dark/light themes. The v0.7
+  release archives include it on Windows and Ubuntu, plus architecture-specific
+  macOS binaries and a double-clickable `Serial Platform.app`; see
+  [its run and packaging notes](./crates/serial-desktop/README.md).
+
+### Upgrading the MCP adapter from v0.6.2
+
+The v0.7.0 MCP tool schema intentionally replaces the Run-scoped
+`slot_id`/`run_id`/`run_token` argument set with one `run_handle`. Restart the
+MCP process and let the host refresh `tools/list` after upgrading; cached
+v0.6.2 tool calls fail closed against the strict v0.7.0 schemas. A handle is
+process-local, so an unfinished v0.6.2 Run or capability cannot be migrated
+into the new adapter. End it before upgrading when possible; otherwise its
+existing disconnect/lease-expiry path aborts it. This is an MCP-tool contract
+change for Run authorization. WebSocket protocol v3, seriald Run IDs, and the
+durable timeline remain unchanged. Separately, v0.7 removes the retired
+`/api/v1/monitor-events` delivery routes and `MonitorSpec.event_ttl_ms`; the
+core Monitor/Incident routes remain. An older `[monitor_event_sink]` table is
+accepted only for migration, ignored at runtime, and omitted on the next
+configuration save. HTTP status also adds the optional
+`serial_context_precondition_supported` capability. Older protocol-v3 daemons
+decode as unsupported; v0.7 MCP refuses command/input/signal/sequence/Trigger
+physical actions before any byte or BREAK rather than allowing an old daemon
+to ignore the new atomic context guard.
+
+## v0.6.2 release highlights
 
 - `run_start` now returns a private `run_token` alongside the public audit
   `run_id`. Every Run-scoped MCP action must present both, preventing another
@@ -143,10 +200,8 @@ Protocol and integration references:
   confirmed, audited write path.
 - Persistent Monitor Jobs that match one literal or bounded UTF-8 regular
   expression against live RX, group bursts into retained incidents, and keep
-  an exact evidence cursor/range. Notification delivery is optional: without a
-  message center, incidents remain pullable through HTTP and `serial-mcp`; with
-  a configured sink, seriald also emits CloudEvents-shaped notifications from
-  a durable bounded outbox.
+  an exact evidence cursor/range. Incidents remain available through the core
+  HTTP API and `serial-mcp` without any external delivery service.
 - Bounded cross-reconnect write safety within one daemon epoch: recent duplicate
   request IDs return their cached result, older executed IDs are rejected
   instead of being written again, and an unacknowledged outcome remains
@@ -186,29 +241,34 @@ untouched, or use electrical isolation/reset gating.
 
 ## Install from a release
 
-Starting with v0.6.2, the Jenkins release pipeline can
-provide four platform packages:
+The v0.7 Jenkins release pipeline provides four platform packages. These are
+the v0.7 package contracts; already-published v0.6.2 assets remain unchanged
+and keep their historical contents.
 
-- `serial-platform-<version>-windows-x86_64.zip` contains the unified
-  `serial.exe` plus `seriald.exe`, `serialctl.exe`, and `serial-mcp.exe`. These
-  binaries use the GNU/MinGW-w64 ABI, not the MSVC ABI.
-- `serial-platform-<version>-linux-x86_64-ubuntu20.04.tar.gz` contains
-  `x86_64-unknown-linux-gnu`/glibc `serial`, `serialctl`, and `serial-mcp`
-  clients cross-built with cargo-zigbuild against the Ubuntu 20.04 glibc 2.31
-  ceiling. It is intended for 64-bit x86 Ubuntu 20.04 or newer. It does not
-  contain `seriald`, because the Windows host owns the workstation COM ports,
-  and it does not support 32-bit i386/i686 Ubuntu.
-- `serial-platform-<version>-macos-aarch64.zip` contains native Apple Silicon
-  `serial`, `seriald`, `serialctl`, and `serial-mcp` binaries.
-- `serial-platform-<version>-macos-x86_64.zip` contains the same four programs
-  for Intel Macs and is tested through Rosetta 2 on the Apple Silicon Jenkins
-  worker. Both macOS packages declare a macOS 11.0 deployment target. Until a
-  Developer ID credential is configured, `BUILD-INFO.json` explicitly marks
-  these command-line packages as unsigned and not notarized.
+- `serial-platform-v<version>-windows-x86_64.zip` contains the unified
+  `serial.exe` plus `seriald.exe`, `serialctl.exe`, `serial-mcp.exe`, and
+  `serial-desktop.exe`. These binaries use the GNU/MinGW-w64 ABI, not the MSVC
+  ABI; the sibling daemon lets the desktop App start its local backend.
+- `serial-platform-v<version>-linux-x86_64-ubuntu20.04.tar.gz` contains
+  `x86_64-unknown-linux-gnu`/glibc `serial`, `seriald`, `serialctl`,
+  `serial-mcp`, and `serial-desktop`, cross-built with cargo-zigbuild against
+  the Ubuntu 20.04 glibc 2.31 ceiling. It is intended for 64-bit x86 Ubuntu
+  20.04 or newer and does not support 32-bit i386/i686 Ubuntu. The desktop App
+  needs an X11 display and the normal X11/XKB/OpenGL runtime libraries.
+- `serial-platform-v<version>-macos-aarch64.zip` contains native Apple Silicon
+  `serial`, `seriald`, `serialctl`, `serial-mcp`, and `serial-desktop` binaries,
+  plus a double-clickable `Serial Platform.app` containing `serial-desktop`,
+  `serial`, and `seriald` in `Contents/MacOS`.
+- `serial-platform-v<version>-macos-x86_64.zip` contains the same programs and
+  App for Intel Macs and is tested through Rosetta 2 on the Apple Silicon
+  Jenkins worker. Both macOS packages declare a macOS 11.0 deployment target.
+  Until a Developer ID credential is configured, `BUILD-INFO.json` explicitly
+  marks the App and binaries as unsigned and not notarized.
 
 Use every executable from the same release across the Windows host, Linux VM,
-and Mac. v0.6.2 retains WebSocket protocol v3 from v0.4.0; existing v0.4 realtime
-peers are wire-compatible for that protocol surface, but the Monitor HTTP APIs
+and Mac. The v0.7.0 development tree and released v0.6.2 packages retain
+WebSocket protocol v3 from v0.4.0; existing v0.4 realtime peers are
+wire-compatible for that protocol surface, but the Monitor HTTP APIs
 and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
 protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
 namespace remains `/api/v1`; the route namespace and WebSocket payload protocol
@@ -219,9 +279,9 @@ the Linux package in the VM and make the client executable if the archive tool
 did not preserve its mode:
 
 ```sh
-tar -xzf serial-platform-v0.6.2-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.6.2-linux-x86_64-ubuntu20.04
-chmod +x serial serialctl serial-mcp
+tar -xzf serial-platform-v0.7.0-linux-x86_64-ubuntu20.04.tar.gz
+cd serial-platform-v0.7.0-linux-x86_64-ubuntu20.04
+chmod +x serial seriald serialctl serial-mcp serial-desktop
 ./serial --version
 ```
 
@@ -250,10 +310,11 @@ exact pinned build commit, and a Jenkins Secret Text credential named
 `github-release-token`. Publishing is draft-first and refuses to overwrite a
 same-named asset with different bytes.
 
-The published `v0.6.1` tag remains immutable and predates this four-platform
-pipeline. After changing CI or packaging code, increment the workspace version
-and create a new annotated tag at that exact commit; the publisher deliberately
-rejects attempts to attach newer bytes to an older tag.
+Every published tag is immutable. `v0.6.1` predates the four-platform pipeline;
+`v0.6.2` is the first published four-platform release and its historical assets
+are likewise never rewritten. After changing CI or packaging code, increment
+the workspace version and create a new annotated tag at that exact commit; the
+publisher deliberately rejects attempts to attach newer bytes to an older tag.
 
 ## Build
 
@@ -377,12 +438,28 @@ On terminals at least 22 rows tall, powerline-style separators frame a
 full-width recent Agent task/command projection between serial output and
 command input. Run rows contain only state and task; purpose rows expand to the
 actual commands, and `command_sequence` steps stay grouped under one sequence
-purpose. In detail view, `✅` means complete TX and `❌` means partial TX; these
-icons do not claim DUT execution success. `Ctrl-] h` focuses the pane,
-Up/Down selects a purpose, Enter/Right expands it, and PageUp/PageDown or the
-wheel scrolls expanded detail without collapsing it. Set
-`agent_history_rows = 3..20` in `serialctl.toml` (default `5`). Short terminals
+purpose. Detail view uses clean command text without status emoji. `Ctrl-] h`
+focuses the pane, Up/Down selects a purpose, and Enter/Right expands it while
+jumping the main serial-output viewport to the operation (or sequence fallback)
+when it remains in bounded local scrollback. PageUp/PageDown or the wheel
+scrolls expanded detail without collapsing it. Records are newest-first and
+follow the newest command until the operator navigates or expands one. Set
+the height directly from **Console configuration → Terminal display settings**,
+or set `agent_history_rows = 3..20` in `serialctl.toml` (default `5`). The value
+is the number of visible content rows and is saved immediately. Short terminals
 use an on-demand popup.
+
+**Console configuration → Agent Run lifecycle settings** writes
+`orphan_run_timeout_seconds` to the shared `serialctl.toml`. It accepts
+`0` for unlimited or any finite value of at least `300` seconds, with no
+artificial maximum, and defaults to `1800` (30 minutes). Unlimited Runs release
+only through explicit `run_end`, MCP process exit, or Human takeover. This is a
+local
+`serial-mcp` crash/abandonment fallback after the last Run-scoped tool call,
+not a wire-protocol field and not the daemon's 60-second fenced Control lease.
+Normal completion still uses `run_end`. Restart any already-running
+`serial-mcp` process after changing the value because it is read at process
+startup; the lease still renews every 20 seconds while a Run remains eligible.
 
 The serial-output title resolves the bound Device Model in the background and
 shows its exact catalog name (spaces and casing preserved) plus the serial port.
@@ -391,8 +468,10 @@ is shown as “device model not configured”. The baud rate is not repeated the
 
 Mouse capture is on by default. The wheel scrolls only the serial-output
 viewport; clicking the output or input pane changes focus; output left-drag
-selects without `Shift`; mouse-up automatically copies the selected text and
-resumes live output; and output right-click repeats that retained copy.
+selects without `Shift`; a double-click selects the complete lexical word even
+if Windows Terminal reports the second click a nearby cell; mouse-up
+automatically copies the selected text and resumes live output; and output
+right-click repeats that retained copy.
 A missing mouse-up event is finalized after five seconds, so a
 selection can never silently pin the live viewport indefinitely.
 On Windows, input right-click pastes from the native Unicode clipboard.
@@ -420,8 +499,46 @@ by display width, including double-width CJK; editing restores the complete
 bytes. Bytes already in a physical write are locked and cannot be recalled.
 Submitting a restored command places the edited version at the queue tail.
 
-`Ctrl-R` searches LINE input history. Serial output does not yet have an
-in-pane search; use `serialctl logs --contains TEXT` for durable RX/TX history.
+`Ctrl-R` searches LINE input history. `Ctrl-] /` opens a separate search view
+over seriald's durable RX/TX journal. `F2`/`Tab` selects ordinary text or a
+bounded regular expression, `F3` changes case sensitivity, `F4` selects RX,
+TX, or both, and `F5` selects the current seriald run, all retained epochs, or
+the current Agent Run when one exists. Search results remain in their own
+popup and never inject an archived epoch into the live serial projection. A
+result marked partial is newest-first only within the scanned portion and does
+not claim to contain the globally latest match.
+Sequence numbers order events inside one epoch. Across retained epochs, the UI
+preserves the archive catalog's newest-first rank (derived from each archive's
+last-segment wall time); individual event wall times never reorder events
+within an epoch.
+
+The popup refreshes its target whenever a search or retry is submitted. If
+live output advanced while the editor was open, the query uses the new head;
+if seriald restarted, it switches to the new daemon epoch. Agent-Run scope is
+resolved again from the Slot's currently active Run and fails locally when no
+active Agent Run exists. A journal cursor ending before the requested live
+head is reported as partial even when the HTTP page itself was not truncated.
+
+Interactive searches are deliberately bounded to 200 displayed matches, the
+newest four archives, a 10,000-sequence tail per archive, eight journal
+requests, 16 MiB per response, and a ten-second total deadline. The popup
+marks partial results and journal gaps explicitly. Because literal and regex
+matching may span adjacent RX or TX events, a result row identifies the event
+that completed the match and may not contain the complete expression by
+itself. Use `serialctl archives` and `serialctl logs --epoch ...` for an
+explicit exhaustive/archive workflow beyond the interactive bounds.
+
+Reopening the console also rebuilds the main serial view from the current
+daemon epoch's durable journal instead of starting with an empty in-process
+buffer. Startup recovery pages through the most recent 20,000 sequence numbers
+under an 8 MiB per-Slot budget and a ten-second deadline across all Slots. Its
+WebSocket cursor is the last sequence the journal actually scanned—not the
+status snapshot's possibly newer head—so the replay ring safely supplies a
+live event whose durability acknowledgement is still pending. Limits and gaps
+stay visible. A freshly opened console loads only the current daemon epoch;
+older epochs remain searchable. If seriald restarts while the console is
+already open, the rows already on screen remain above an explicit
+daemon-restart boundary, and new-epoch traffic is appended below it.
 
 `Alt-Enter` is a separate, explicit cooperative path available only while the
 same Agent owns both the current lease and active Run. It writes immediately
@@ -451,6 +568,15 @@ parent model. Profile catalog changes and serial-setting clones ask for a
 masked one-time administrator token. Its temporary values are dropped after
 the request, and the token is never written to the client config. Device-model binding uses the
 narrow operator API and records how the physical identity was confirmed.
+
+The **Current port configuration** page also presents the complete effective
+configuration as an editable form: port/profile, baud, data/parity/stop bits,
+flow control, DTR/RTS, auto-open, Device profile, EOL, echo, prompts, and write
+pacing. Profile-field edits remain a draft until **Save and apply**, which uses
+the observed catalog revisions and fails closed on a concurrent change. The
+daemon applies UART changes through its normal transactional busy/reopen safety
+boundary. Model binding and model-name edits are immediate revision-guarded
+operations and refresh the serial title after confirmation.
 
 When the output is scrolled upward, the console freezes the currently wrapped
 visual rows. New output therefore cannot push the inspected page away. If the
@@ -606,6 +732,23 @@ internal audit identifiers remain in the authoritative timeline. Model names
 remain assertions: the Agent must confirm the physical DUT through serial,
 telnet, the web UI, or a person before relying on a configured assignment.
 
+`serial_read` with the default `scope=tail` is a bounded live-ring snapshot,
+not a journal search. It returns at most 200 recent events and marks
+`source=live_ring` plus `bounded_tail=true`; its work is independent of retained
+epochs, sealed-segment count, and active log-file size. Use `continue` for this
+adapter's process-local live-ring cursor; it returns the oldest next page of at
+most 1,000 events and never scans the journal. Ring eviction or a daemon restart
+is an explicit partial gap. Use `archive` for an explicit retained epoch.
+
+When another Human or Agent transmits between this adapter's operations,
+successful observation/capture results may include a compact `recent_context`
+with actor and command-purpose summaries. Serial payload is omitted. A gap or
+bounded summary is marked incomplete instead of silently claiming there was no
+interference. Write-like tools check this before acting and return a structured
+`context_changed` zero-byte failure until `serial_read(scope=tail)` or
+`serial_wait` confirms the new live state. The daemon also enforces the final
+epoch/generation/TX boundary atomically at the physical action queue.
+
 `serial_monitor_start` takes a Slot plus exactly one `contains` or `regex`
 matcher and returns a stable Monitor ID immediately. The Job starts at the
 current Slot head by default, persists in `seriald`, and therefore survives the
@@ -654,9 +797,10 @@ action either succeeded or failed.
 
 `serial_command` requires a Run previously created by this `serial-mcp`
 process and a concise command-purpose description. `run_start` returns its
-public audit `run_id` plus an unpredictable private `run_token`; every
-Run-scoped MCP call must present both, and an Agent must not adopt a visible
-active Run from status. Inside the same serialized Slot actor that validates
+public audit `run_id` plus one opaque `run_handle`; every later Run-scoped MCP
+call presents only that handle, and an Agent must not adopt a visible active
+Run from status. The adapter resolves the Slot and private capability from the
+handle in process-local memory. Inside the same serialized Slot actor that validates
 the control lease/fence, `seriald` rejects a missing, changed, or foreign-owned
 Run before pacing-budget calculation or physical write. Ordinary Human and
 legacy non-cooperative clients may omit this optional wire boundary and retain
@@ -683,9 +827,14 @@ event carrying its own description and exact command bytes, which the terminal
 history can expand.
 
 The adapter renews control only for Runs it currently owns. A Run-scoped call
-pins its Run for that call's full lifetime; after the last call returns, five
-minutes without activity causes the adapter to release control and abort the
-abandoned Run at its next renewal tick. The underlying 60-second fenced lease
+pins its Run for that call's full lifetime. Normal workflows explicitly call
+`run_end` before the Agent's final reply. If a client crashes or abandons the
+Run, `orphan_run_timeout_seconds` sets the idle fallback to 0 (unlimited) or at
+least 300 seconds (default 1800, with no finite upper bound); the adapter
+releases control and aborts a finite-timeout orphan at its next renewal tick.
+With 0, only explicit `run_end`, adapter exit, or takeover releases it. Running
+adapters must be restarted after this startup setting is changed. The
+underlying 60-second fenced lease
 continues to renew every 20 seconds while that Run remains eligible. A lost
 connection or failed renewal
 forgets all owned Run state and never reacquires control to continue writing
@@ -693,9 +842,9 @@ outside the old boundary. Successful `run_end` stops renewal and immediately
 attempts a best-effort release; release failure cannot undo the ended Run, and
 an unacknowledged lease expires by its TTL. A later explicit `release` checks
 process-local lease ownership inside the per-Slot lock. With no local lease it
-is idempotent even if status shows another client's active Run; it never asks
-for that foreign Run's token or interferes with it. Only aborting this MCP's
-matching active Run requires its private pair. None of these operations closes
+is idempotent even if status shows another client's active Run and never
+interferes with it. Only aborting this MCP's matching active Run requires its
+opaque handle. None of these operations closes
 `seriald`'s physical port.
 
 Agent searches remain Run-scoped while paging: a `truncated` `current_run`
@@ -851,48 +1000,30 @@ Run loss/mismatch is an explicit conflict containing “no bytes were written”
 The Run ID is part of the write idempotency fingerprint, so one request ID
 cannot be reused under a different task boundary.
 
-## Monitor persistence and optional notifications
+## Monitor persistence
 
 Monitor Jobs and their retained incidents live in `seriald`, not in an MCP
 process or Agent session. A new Monitor starts strictly after the Slot head at
 creation time, so an old matching line cannot be reported as a new incident.
 Matching spans adjacent live RX events only within one serial generation; close,
 open, reconfigure, removal, generation changes, and explicit gaps reset the
-matcher. It is bounded by pattern, compiled-regex,
-window, preview, Job, incident, and outbox limits. A daemon restart reloads
+matcher. It is bounded by pattern, compiled-regex, window, preview, Job, and
+incident limits. A daemon restart reloads
 running Jobs and resumes their workers; replay-safe checkpoints are throttled
 to once per second, while Incident/cooldown state commits immediately so a
-restart does not re-alert a match already suppressed by cooldown. Notification
-TTL expires only outbox delivery, never retained incident evidence by itself.
-At a hard bound the oldest incident yields to newer evidence even when no
-consumer exposes ACK; bounded retention reports `retention_gap` and
+restart does not re-alert a match already suppressed by cooldown. At a hard
+bound the oldest incident yields to newer evidence even when no consumer
+acknowledges it; bounded retention reports `retention_gap` and
 `first_available_incident_seq` when a pull cursor is too old. The returned
 cursor advances to the observed high-water mark even when ACK filtering makes a
 page empty. Explicit gaps remain visible rather than being treated as an empty
 observation.
 
-No message center is required. The default configuration has no sink, while
 `GET /api/v1/monitors/{monitor_id}/incidents` and the MCP
-`monitor_incidents` tool continue to provide bounded pull access. To integrate a
-message center such as Agent Message Center, configure a station-owned HTTP
-sink in `seriald.toml`:
-
-```toml
-[monitor_event_sink]
-endpoint = "http://127.0.0.1:8080/api/v1/events"
-token_file = "message-center.token" # relative paths resolve under the config directory
-retry_min_ms = 1000
-retry_max_ms = 60000
-```
-
-The bearer secret is read from the file and is never placed in the event or
-Agent tool arguments. Each incident is first persisted locally, then represented
-as a CloudEvents 1.0-shaped event in a bounded outbox. Delivery retries use
-bounded exponential backoff until success or the event's freshness TTL. The
-event carries only routing/evidence metadata and a bounded preview; serial bytes
-remain authoritative in the journal. `seriald` does not know Agent instance,
-session, or return-route semantics—the message center and its adapters own those
-policies.
+`monitor_incidents` tool provide bounded pull access. Each incident carries
+only bounded preview and routing/evidence metadata; the serial journal remains
+authoritative for the exact byte range. `seriald` deliberately exposes no
+external-delivery endpoint, credential, retry, or routing configuration.
 
 ## Control tuning
 

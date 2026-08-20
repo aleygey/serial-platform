@@ -246,13 +246,13 @@ pub struct CommandSequenceAuditContext {
     pub step_count: u8,
 }
 
-/// Optional fail-closed boundary for one `command_sequence` physical write.
+/// Optional fail-closed boundary for one Agent physical serial action.
 ///
 /// The daemon validates this inside the Slot actor immediately before the
-/// write enters the port queue. RX and ordinary control events after `cursor`
-/// are allowed, but a changed serial generation, a changed TX offset, an
-/// explicit Gap event, or an evicted replay window rejects the write with a
-/// definite zero-byte outcome.
+/// write, BREAK, or Trigger enters the physical action boundary. RX and
+/// ordinary control events after `cursor` are allowed, but a changed serial
+/// generation, a changed TX offset, an explicit Gap event, or an evicted
+/// replay window rejects the action with a definite zero-byte outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceWritePrecondition {
     pub cursor: Cursor,
@@ -862,9 +862,10 @@ pub enum ClientMessage {
         /// Ordinary command, Human, and legacy writes omit this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command_sequence: Option<CommandSequenceAuditContext>,
-        /// Optional daemon-enforced, fail-closed boundary for a dependent
-        /// sequence write. Ordinary command, Human, and legacy writes omit
-        /// this field and retain their existing behavior.
+        /// Optional daemon-enforced, fail-closed serial-context boundary.
+        /// Agent adapters use it for ordinary commands and dependent sequence
+        /// writes. Human and legacy clients may omit it and retain their
+        /// existing behavior.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence_precondition: Option<SequenceWritePrecondition>,
         /// Explicit Human-only injection while an Agent owns control. This
@@ -886,6 +887,9 @@ pub enum ClientMessage {
         operation_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_run_id: Option<Uuid>,
+        /// Optional daemon-enforced, fail-closed serial-context boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence_precondition: Option<SequenceWritePrecondition>,
     },
     TriggerStart {
         request_id: Uuid,
@@ -904,6 +908,9 @@ pub enum ClientMessage {
         /// clients may omit this and retain lease-only authorization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_run_id: Option<Uuid>,
+        /// Optional daemon-enforced, fail-closed serial-context boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence_precondition: Option<SequenceWritePrecondition>,
         spec: TriggerSpec,
     },
     TriggerStatus {
@@ -1122,6 +1129,11 @@ pub struct StatusResponse {
     /// as false, so a new MCP refuses the sequence before its first TX.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sequence_write_precondition_supported: bool,
+    /// True when `sequence_precondition` is enforced atomically for every
+    /// Agent physical action: ordinary Write, BREAK, and Trigger start. Older
+    /// protocol-v3 daemons omit this additive capability and decode as false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub serial_context_precondition_supported: bool,
     pub slots: Vec<SlotSnapshot>,
 }
 
@@ -1288,6 +1300,9 @@ pub struct ArchiveSummary {
 /// Bounded archive catalog returned by `seriald`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveListResponse {
+    /// Retained Slot/epoch summaries, newest archive first. The daemon orders
+    /// by `last_segment_wall_time_ns`; clients may preserve this order as a
+    /// stable rank when sequence numbers cannot be compared across epochs.
     pub archives: Vec<ArchiveSummary>,
     /// More retained archives exist than fit in this response.
     pub truncated: bool,
@@ -1347,10 +1362,6 @@ pub struct MonitorSpec {
     /// Optional wall-clock lifetime of the Monitor Job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    /// Notification freshness deadline. Expired outbox entries remain
-    /// inspectable but are never delivered to a webhook sink.
-    #[serde(default = "default_monitor_event_ttl_ms")]
-    pub event_ttl_ms: u64,
 }
 
 fn default_monitor_debounce_ms() -> u64 {
@@ -1359,10 +1370,6 @@ fn default_monitor_debounce_ms() -> u64 {
 
 fn default_monitor_cooldown_ms() -> u64 {
     30_000
-}
-
-fn default_monitor_event_ttl_ms() -> u64 {
-    10 * 60 * 1_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1454,11 +1461,6 @@ pub struct MonitorIncident {
     pub evidence_cursor: Cursor,
     pub evidence_ref: String,
     pub created_wall_time_ns: i64,
-    /// Notification freshness deadline. This only expires webhook/outbox
-    /// delivery; the Incident itself is retained until bounded retention
-    /// removes it. At a hard bound, the oldest summary yields to newer evidence
-    /// regardless of ACK.
-    pub expires_wall_time_ns: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acked_wall_time_ns: Option<i64>,
 }
@@ -1484,59 +1486,6 @@ pub struct MonitorIncidentListResponse {
     /// begin after an irrecoverable retention gap.
     #[serde(default)]
     pub retention_gap: bool,
-}
-
-/// Strict CloudEvents-shaped notification retained by seriald until ACK,
-/// webhook delivery, or TTL expiry. The serial byte stream remains in the
-/// journal and is referenced through the Incident evidence fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MonitorCloudEvent {
-    pub specversion: String,
-    pub id: String,
-    pub source: String,
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub subject: String,
-    pub time: String,
-    pub datacontenttype: String,
-    /// CloudEvents extension attribute. Consumers must not start stale work
-    /// after this RFC3339 timestamp.
-    pub expiresat: String,
-    pub data: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MonitorOutboxStatus {
-    Pending,
-    Delivered,
-    Acknowledged,
-    Expired,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MonitorOutboxEvent {
-    pub outbox_seq: u64,
-    pub event: MonitorCloudEvent,
-    pub status: MonitorOutboxStatus,
-    pub created_wall_time_ns: i64,
-    pub expires_wall_time_ns: i64,
-    pub attempts: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MonitorOutboxListResponse {
-    pub events: Vec<MonitorOutboxEvent>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<u64>,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MonitorOutboxEventResponse {
-    pub event: MonitorOutboxEvent,
 }
 
 /// Read-only journal health and retention metrics. Gathering this information
@@ -2239,6 +2188,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!status.sequence_write_precondition_supported);
+        assert!(!status.serial_context_precondition_supported);
     }
 
     #[test]
@@ -2252,6 +2202,14 @@ mod tests {
             duration_ms: 250,
             operation_id: Some(Uuid::new_v4()),
             expected_run_id: Some(Uuid::new_v4()),
+            sequence_precondition: Some(SequenceWritePrecondition {
+                cursor: Cursor {
+                    epoch: Uuid::new_v4(),
+                    after_seq: 9,
+                },
+                expected_generation: 2,
+                expected_tx_offset: 17,
+            }),
         };
         assert_eq!(message.request_id(), request_id);
         let frame = encode_client_control(&message).unwrap();
@@ -2531,6 +2489,14 @@ mod tests {
             generation: 5,
             operation_id: Some(operation_id),
             expected_run_id: Some(expected_run_id),
+            sequence_precondition: Some(SequenceWritePrecondition {
+                cursor: Cursor {
+                    epoch: daemon_epoch,
+                    after_seq: 9,
+                },
+                expected_generation: 5,
+                expected_tx_offset: 17,
+            }),
             spec: trigger_spec(),
         };
         assert_eq!(start.request_id(), request_id);

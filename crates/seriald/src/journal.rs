@@ -1265,6 +1265,9 @@ struct StreamSearchCarry {
     bytes: Vec<u8>,
     generation: Option<u64>,
     next_offset: Option<u64>,
+    /// Absolute stream offset at which the next non-overlapping regex match
+    /// may begin. A paginated query reconstructs it while scanning its seed.
+    regex_search_from: Option<u64>,
 }
 
 impl StreamSearchCarry {
@@ -1272,6 +1275,7 @@ impl StreamSearchCarry {
         self.bytes.clear();
         self.generation = None;
         self.next_offset = None;
+        self.regex_search_from = None;
     }
 
     fn matches(&mut self, event: &TimelineEvent, needle: &[u8]) -> bool {
@@ -1293,11 +1297,46 @@ impl StreamSearchCarry {
             && event.stream_offset_start == self.next_offset;
         if !continuous {
             self.bytes.clear();
+            self.regex_search_from = event.stream_offset_start;
         }
+        let retained_len = self.bytes.len();
+        let window_offset = event
+            .stream_offset_start
+            .and_then(|start| start.checked_sub(retained_len as u64))
+            .unwrap_or(0);
         let mut combined = Vec::with_capacity(self.bytes.len().saturating_add(event.data.len()));
         combined.extend_from_slice(&self.bytes);
         combined.extend_from_slice(&event.data);
-        let matched = expression.is_match(&combined);
+        // Resume after the previous match instead of evaluating the same
+        // left-most match against an ever-growing suffix. Otherwise a greedy
+        // expression such as `panic.*` would be re-attributed to every later
+        // event merely because its end can grow.
+        let search_offset = self
+            .regex_search_from
+            .unwrap_or(window_offset)
+            .max(window_offset);
+        let mut search_at = usize::try_from(search_offset.saturating_sub(window_offset))
+            .unwrap_or(usize::MAX)
+            .min(combined.len());
+        let mut matched = false;
+        while search_at <= combined.len() {
+            let Some(found) = expression.find_at(&combined, search_at) else {
+                break;
+            };
+            // Empty matches have no serial event byte to own. Query
+            // validation rejects expressions that match an empty stream, but
+            // an otherwise useful alternative can still be empty here.
+            if found.is_empty() {
+                if found.end() == combined.len() {
+                    break;
+                }
+                search_at = found.end().saturating_add(1);
+                continue;
+            }
+            matched |= found.end() > retained_len;
+            self.regex_search_from = Some(window_offset.saturating_add(found.end() as u64));
+            search_at = found.end();
+        }
         let keep_from = combined.len().saturating_sub(MAX_REGEX_STREAM_CARRY_BYTES);
         self.bytes.clear();
         self.bytes.extend_from_slice(&combined[keep_from..]);
@@ -1657,7 +1696,16 @@ fn query_files_with_limits(
                 .map_err(|error| JournalError::InvalidRegex(error.to_string()))
         })
         .transpose()?;
-    let mut descriptors = discover_segments_for_query(&config.root_dir, slot_id, &mut budget)?;
+    if expression
+        .as_ref()
+        .is_some_and(|expression| expression.is_match(b""))
+    {
+        return Err(JournalError::InvalidRegex(
+            "pattern must not match an empty byte string".into(),
+        ));
+    }
+    let discovery = discover_segments_for_query(&config.root_dir, slot_id, query, &mut budget)?;
+    let mut descriptors = discovery.descriptors;
 
     // Sequence numbers are only meaningful within one daemon epoch. An
     // omitted epoch is accepted only for the first page and means the latest
@@ -1697,11 +1745,13 @@ fn query_files_with_limits(
     let mut events = Vec::new();
     let mut bytes = 0_usize;
     let mut truncated = false;
-    let first_available_seq = descriptors
-        .iter()
-        .filter(|segment| segment.last_seq.is_some())
-        .map(|segment| segment.header.first_seq)
-        .min();
+    let first_available_seq = discovery.first_available_seq.or_else(|| {
+        descriptors
+            .iter()
+            .filter(|segment| segment.last_seq.is_some())
+            .map(|segment| segment.header.first_seq)
+            .min()
+    });
     let mut last_scanned_seq = query.after_seq;
     let seed_segment_id = (contains.is_some() || expression.is_some())
         .then_some(())
@@ -2194,14 +2244,36 @@ fn discover_segments(
     Ok(result)
 }
 
+struct QuerySegmentDiscovery {
+    descriptors: Vec<SegmentDescriptor>,
+    /// Earliest retained sequence in an explicitly selected epoch. The
+    /// epoch-local fast path may omit fully consumed descriptors, but callers
+    /// still need the true retention boundary rather than the first descriptor
+    /// that happens to overlap the requested page.
+    first_available_seq: Option<u64>,
+}
+
 fn discover_segments_for_query(
     root: &Path,
     slot_id: &str,
+    query: &EventQuery,
     budget: &mut QueryBudget,
-) -> Result<Vec<SegmentDescriptor>, JournalError> {
+) -> Result<QuerySegmentDiscovery, JournalError> {
+    // A continuation/tail query always names its epoch. Epoch directories are
+    // the durable top-level index: never recursively discover every archived
+    // epoch merely to read the current tail. Sealed filenames additionally
+    // carry their exact sequence range, so fully consumed files can be skipped
+    // without opening and charging every historical segment header.
+    if let Some(epoch) = query.epoch {
+        return discover_epoch_segments_for_query(root, slot_id, epoch, query, budget);
+    }
+
     let search_root = slot_dir(root, slot_id);
     if !search_root.exists() {
-        return Ok(Vec::new());
+        return Ok(QuerySegmentDiscovery {
+            descriptors: Vec::new(),
+            first_available_seq: None,
+        });
     }
 
     let mut result = Vec::new();
@@ -2271,7 +2343,128 @@ fn discover_segments_for_query(
             });
         }
     }
-    Ok(result)
+    Ok(QuerySegmentDiscovery {
+        descriptors: result,
+        first_available_seq: None,
+    })
+}
+
+fn discover_epoch_segments_for_query(
+    root: &Path,
+    slot_id: &str,
+    epoch: Uuid,
+    query: &EventQuery,
+    budget: &mut QueryBudget,
+) -> Result<QuerySegmentDiscovery, JournalError> {
+    let directory = epoch_dir(root, slot_id, epoch);
+    if !directory.exists() {
+        return Ok(QuerySegmentDiscovery {
+            descriptors: Vec::new(),
+            first_available_seq: None,
+        });
+    }
+
+    let needs_search_seed = query.contains.is_some() || query.regex.is_some();
+    let sequence_floor = query.after_seq.unwrap_or(0);
+    let sequence_ceiling = query.through_seq.unwrap_or(u64::MAX);
+    let mut candidates = Vec::new();
+    let mut seed: Option<(u64, u64, PathBuf)> = None;
+    let mut first_available_seq = None;
+
+    for entry in fs::read_dir(&directory)? {
+        budget.ensure_available("segment discovery")?;
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let extension = path.extension().and_then(|value| value.to_str());
+        let sealed = extension == Some("slog");
+        if !sealed && extension != Some("open") {
+            continue;
+        }
+
+        if sealed && let Some((first_seq, last_seq)) = parse_sealed_seq_range(&path) {
+            first_available_seq =
+                Some(first_available_seq.map_or(first_seq, |current: u64| current.min(first_seq)));
+            if first_seq > sequence_ceiling {
+                continue;
+            }
+            if last_seq <= sequence_floor {
+                if needs_search_seed
+                    && seed.as_ref().is_none_or(|(seed_last, seed_first, _)| {
+                        (last_seq, first_seq) > (*seed_last, *seed_first)
+                    })
+                {
+                    seed = Some((last_seq, first_seq, path));
+                }
+                continue;
+            }
+        } else if let Some(first_seq) = parse_segment_first_seq(&path) {
+            first_available_seq =
+                Some(first_available_seq.map_or(first_seq, |current: u64| current.min(first_seq)));
+            if first_seq > sequence_ceiling {
+                continue;
+            }
+        }
+        candidates.push(path);
+    }
+
+    if let Some((_, _, seed_path)) = seed {
+        candidates.push(seed_path);
+    }
+    if candidates.len() > MAX_QUERY_SEGMENTS {
+        return Err(JournalError::TooManyQuerySegments {
+            maximum: MAX_QUERY_SEGMENTS,
+        });
+    }
+
+    let mut descriptors = Vec::with_capacity(candidates.len());
+    for path in candidates {
+        budget.ensure_available("segment discovery")?;
+        let sealed = path.extension().and_then(|value| value.to_str()) == Some("slog");
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let (header, data_offset) = read_segment_header(&mut file, &path)?;
+        budget.charge(data_offset, "segment discovery")?;
+        if header.slot_id != slot_id || header.daemon_epoch != epoch {
+            return Err(corrupt(
+                &path,
+                "segment is stored under the wrong slot or epoch directory",
+            ));
+        }
+        first_available_seq = Some(
+            first_available_seq.map_or(header.first_seq, |current| current.min(header.first_seq)),
+        );
+        let last_seq = if sealed {
+            match parse_sealed_seq_range(&path)
+                .filter(|(first_seq, last_seq)| {
+                    *first_seq == header.first_seq && *last_seq >= *first_seq
+                })
+                .map(|(_, last_seq)| last_seq)
+            {
+                Some(last_seq) => Some(last_seq),
+                None => scan_last_seq_for_query(&mut file, &path, &header, data_offset, budget)?,
+            }
+        } else {
+            scan_last_seq_for_query(&mut file, &path, &header, data_offset, budget)?
+        };
+        descriptors.push(SegmentDescriptor {
+            header,
+            path,
+            last_seq,
+            sealed,
+        });
+    }
+
+    Ok(QuerySegmentDiscovery {
+        descriptors,
+        first_available_seq,
+    })
 }
 
 fn scan_last_seq_for_query(
@@ -2334,6 +2527,10 @@ fn parse_sealed_seq_range(path: &Path) -> Option<(u64, u64)> {
     let first = parts.next()?.parse::<u64>().ok()?;
     let last = parts.next()?.parse::<u64>().ok()?;
     Some((first, last))
+}
+
+fn parse_segment_first_seq(path: &Path) -> Option<u64> {
+    path.file_stem()?.to_str()?.split('-').next()?.parse().ok()
 }
 
 fn sealed_path(open_path: &Path, header: &SegmentHeader, last_seq: u64) -> PathBuf {
@@ -2749,10 +2946,9 @@ mod tests {
             .append(event(first_epoch, 2, Direction::Tx, b"second".to_vec()))
             .await
             .unwrap();
-        handle
-            .append(event(second_epoch, 1, Direction::Rx, b"new run".to_vec()))
-            .await
-            .unwrap();
+        let mut second_epoch_event = event(second_epoch, 1, Direction::Rx, b"new run".to_vec());
+        second_epoch_event.wall_time_ns = 2_000;
+        handle.append(second_epoch_event).await.unwrap();
         let mut other = event(other_epoch, 1, Direction::Rx, b"other slot".to_vec());
         other.slot_id = "slot-2".into();
         handle.append(other).await.unwrap();
@@ -2781,6 +2977,8 @@ mod tests {
                 .iter()
                 .all(|archive| archive.slot_id == "slot-1")
         );
+        assert_eq!(filtered.archives[0].epoch, second_epoch);
+        assert_eq!(filtered.archives[1].epoch, first_epoch);
 
         manager.shutdown().await.unwrap();
         let reopened = JournalManager::open(config).unwrap();
@@ -3014,6 +3212,213 @@ mod tests {
             handle.query("slot-1", oversized).await,
             Err(JournalError::InvalidRegex(_))
         ));
+
+        let mut empty = query(epoch);
+        empty.regex = Some("a*".into());
+        assert!(matches!(
+            handle.query("slot-1", empty).await,
+            Err(JournalError::InvalidRegex(message))
+                if message.contains("empty byte string")
+        ));
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_regex_reports_only_new_non_overlapping_stream_matches() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+
+        let chunks: &[(u64, u64, &[u8])] =
+            &[(1, 0, b"panic"), (2, 5, b" ordinary"), (3, 14, b" data")];
+        for (seq, start, data) in chunks {
+            let mut item = event(epoch, *seq, Direction::Rx, data.to_vec());
+            item.stream_offset_start = Some(*start);
+            item.stream_offset_end = Some(start + data.len() as u64);
+            handle.append(item).await.unwrap();
+        }
+
+        let mut filtered = query(epoch);
+        filtered.direction = Some(Direction::Rx);
+        filtered.regex = Some("panic".into());
+        let response = handle.query("slot-1", filtered).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|item| item.seq)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "a match retained in the carry must not be re-attributed to later events"
+        );
+
+        let mut greedy = query(epoch);
+        greedy.direction = Some(Direction::Rx);
+        greedy.regex = Some("panic.*".into());
+        let response = handle.query("slot-1", greedy).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|item| item.seq)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "extending one greedy match must not attribute it to every later chunk"
+        );
+
+        let delayed_epoch = Uuid::new_v4();
+        for (seq, start, data) in [
+            (1, 0, b"foo".as_slice()),
+            (2, 3, b"x".as_slice()),
+            (3, 4, b"y".as_slice()),
+        ] {
+            let mut item = event(delayed_epoch, seq, Direction::Rx, data.to_vec());
+            item.stream_offset_start = Some(start);
+            item.stream_offset_end = Some(start + data.len() as u64);
+            handle.append(item).await.unwrap();
+        }
+        let mut delayed = query(delayed_epoch);
+        delayed.direction = Some(Direction::Rx);
+        delayed.regex = Some("foo.+".into());
+        let response = handle.query("slot-1", delayed).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|item| item.seq)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "a match that needs a later byte belongs only to its first completing event"
+        );
+
+        let mut continuation = query(epoch);
+        continuation.after_seq = Some(1);
+        continuation.direction = Some(Direction::Rx);
+        continuation.regex = Some("panic".into());
+        assert!(
+            handle
+                .query("slot-1", continuation)
+                .await
+                .unwrap()
+                .events
+                .is_empty(),
+            "seeding a continuation page must not turn the previous page's match into a new one"
+        );
+
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_regex_attributes_a_cross_event_match_to_its_completing_event() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+
+        let mut first = event(epoch, 1, Direction::Rx, b"pa".to_vec());
+        first.stream_offset_start = Some(0);
+        first.stream_offset_end = Some(2);
+        handle.append(first).await.unwrap();
+        let mut second = event(epoch, 2, Direction::Rx, b"nic".to_vec());
+        second.stream_offset_start = Some(2);
+        second.stream_offset_end = Some(5);
+        handle.append(second).await.unwrap();
+
+        let mut filtered = query(epoch);
+        filtered.direction = Some(Direction::Rx);
+        filtered.regex = Some("panic".into());
+        let response = handle.query("slot-1", filtered).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|item| item.seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_regex_uses_non_overlapping_stream_match_semantics() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+
+        let chunks: &[(u64, u64, &[u8])] = &[(1, 0, b"aba"), (2, 3, b"ba"), (3, 5, b"aba")];
+        for (seq, start, data) in chunks {
+            let mut item = event(epoch, *seq, Direction::Rx, data.to_vec());
+            item.stream_offset_start = Some(*start);
+            item.stream_offset_end = Some(start + data.len() as u64);
+            handle.append(item).await.unwrap();
+        }
+
+        let mut filtered = query(epoch);
+        filtered.direction = Some(Direction::Rx);
+        filtered.regex = Some("aba".into());
+        let response = handle.query("slot-1", filtered).await.unwrap();
+        assert_eq!(
+            response
+                .events
+                .iter()
+                .map(|item| item.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "the overlapping match ending in event 2 shares bytes with the reported event-1 match"
+        );
+
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_regex_never_joins_different_generations_or_reopen_sessions() {
+        let temp = TempDir::new().unwrap();
+        let manager = JournalManager::open(test_config(&temp)).unwrap();
+        let handle = manager.handle();
+        let epoch = Uuid::new_v4();
+
+        let mut before_generation = event(epoch, 1, Direction::Rx, b"pa".to_vec());
+        before_generation.stream_offset_start = Some(0);
+        before_generation.stream_offset_end = Some(2);
+        handle.append(before_generation).await.unwrap();
+        let mut after_generation = event(epoch, 2, Direction::Rx, b"nic".to_vec());
+        after_generation.generation = 2;
+        after_generation.stream_offset_start = Some(2);
+        after_generation.stream_offset_end = Some(5);
+        handle.append(after_generation).await.unwrap();
+
+        let mut before_reopen = event(epoch, 3, Direction::Rx, b"pa".to_vec());
+        before_reopen.generation = 2;
+        before_reopen.stream_offset_start = Some(5);
+        before_reopen.stream_offset_end = Some(7);
+        handle.append(before_reopen).await.unwrap();
+        let mut closed = event(epoch, 4, Direction::None, Vec::new());
+        closed.generation = 2;
+        closed.kind = EventKind::SerialClosed;
+        closed.stream_offset_start = None;
+        closed.stream_offset_end = None;
+        handle.append(closed).await.unwrap();
+        let mut after_reopen = event(epoch, 5, Direction::Rx, b"nic".to_vec());
+        after_reopen.generation = 3;
+        after_reopen.stream_offset_start = Some(7);
+        after_reopen.stream_offset_end = Some(10);
+        handle.append(after_reopen).await.unwrap();
+
+        let mut filtered = query(epoch);
+        filtered.direction = Some(Direction::Rx);
+        filtered.regex = Some("panic".into());
+        assert!(
+            handle
+                .query("slot-1", filtered)
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
         manager.shutdown().await.unwrap();
     }
 
@@ -3197,6 +3602,71 @@ mod tests {
         assert_eq!(response.events.len(), 1);
         assert_eq!(response.events[0].seq, 11);
         assert_eq!(response.next_cursor.unwrap().after_seq, 11);
+    }
+
+    #[test]
+    fn explicit_epoch_tail_ignores_many_archived_epochs_and_consumed_segments() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(&temp);
+        let current_epoch = Uuid::new_v4();
+
+        // A long-lived station can retain many daemon epochs. None of their
+        // segment headers belong in the discovery budget of an explicitly
+        // epoch-scoped tail query.
+        for index in 0..128_u64 {
+            let archived_epoch = Uuid::new_v4();
+            write_sealed_test_segment(
+                &config,
+                SegmentHeader {
+                    slot_id: "slot-1".into(),
+                    daemon_epoch: archived_epoch,
+                    segment_id: Uuid::new_v4(),
+                    created_wall_time_ns: index as i64,
+                    first_seq: 1,
+                },
+                event(archived_epoch, 1, Direction::Rx, b"archive".to_vec()),
+            );
+        }
+
+        // The selected epoch itself can also contain many sealed files. Their
+        // filename ranges form the index, so only the page-overlapping file is
+        // opened when no cross-record search seed is needed.
+        for seq in 1..=128_u64 {
+            write_sealed_test_segment(
+                &config,
+                SegmentHeader {
+                    slot_id: "slot-1".into(),
+                    daemon_epoch: current_epoch,
+                    segment_id: Uuid::new_v4(),
+                    created_wall_time_ns: 1_000 + seq as i64,
+                    first_seq: seq,
+                },
+                event(
+                    current_epoch,
+                    seq,
+                    Direction::Rx,
+                    format!("event-{seq}").into_bytes(),
+                ),
+            );
+        }
+
+        let mut request = query(current_epoch);
+        request.after_seq = Some(127);
+        let response = query_files_with_limits(
+            &config,
+            "slot-1",
+            &request,
+            QueryLimits {
+                max_scan_bytes: 4 * 1024,
+                max_scan_time: Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.first_available_seq, Some(1));
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].seq, 128);
+        assert_eq!(response.next_cursor.unwrap().after_seq, 128);
     }
 
     #[test]

@@ -56,7 +56,12 @@ pub struct NetworkHandle {
     pub events: mpsc::Receiver<NetworkEvent>,
 }
 
-pub fn spawn(endpoint: String, token: Option<String>, slots: Vec<String>) -> NetworkHandle {
+pub fn spawn(
+    endpoint: String,
+    token: Option<String>,
+    slots: Vec<String>,
+    initial_cursors: HashMap<String, Cursor>,
+) -> NetworkHandle {
     // Writes and control RPCs are bounded too: a stalled connection must not
     // accumulate arbitrary RAW keystrokes or a large paste in memory.
     let (command_tx, command_rx) = mpsc::channel(256);
@@ -64,7 +69,14 @@ pub fn spawn(endpoint: String, token: Option<String>, slots: Vec<String>) -> Net
     // this fills, WebSocket backpressure lets seriald apply its per-consumer
     // lag policy without ever blocking the physical serial reader.
     let (event_tx, event_rx) = mpsc::channel(1_024);
-    tokio::spawn(run_worker(endpoint, token, slots, command_rx, event_tx));
+    tokio::spawn(run_worker(
+        endpoint,
+        token,
+        slots,
+        initial_cursors,
+        command_rx,
+        event_tx,
+    ));
     NetworkHandle {
         commands: command_tx,
         events: event_rx,
@@ -118,10 +130,14 @@ async fn run_worker(
     endpoint: String,
     token: Option<String>,
     slots: Vec<String>,
+    initial_cursors: HashMap<String, Cursor>,
     mut commands: mpsc::Receiver<NetworkCommand>,
     events: mpsc::Sender<NetworkEvent>,
 ) {
-    let mut cursors = HashMap::<String, Cursor>::new();
+    // Startup journal recovery supplies only the last sequence it actually
+    // scanned. Beginning replay there lets the in-memory ring close a pending
+    // durability tail without duplicating the recovered prefix.
+    let mut cursors = initial_cursors;
     let mut slot_epochs = HashMap::new();
     let mut generation = 0u64;
     let mut backoff = Duration::from_millis(250);
@@ -199,14 +215,7 @@ async fn run_worker(
         let attach_request_id = Uuid::new_v4();
         let attach = ClientMessage::Attach {
             request_id: attach_request_id,
-            subscriptions: slots
-                .iter()
-                .map(|slot_id| Subscription {
-                    slot_id: slot_id.clone(),
-                    cursor: cursors.get(slot_id).cloned(),
-                    tail_events: 500,
-                })
-                .collect(),
+            subscriptions: build_subscriptions(&slots, &cursors),
         };
         if let Err(error) = send_control(&mut socket, &attach).await {
             let _ = events
@@ -317,6 +326,17 @@ async fn run_worker(
             })
             .await;
     }
+}
+
+fn build_subscriptions(slots: &[String], cursors: &HashMap<String, Cursor>) -> Vec<Subscription> {
+    slots
+        .iter()
+        .map(|slot_id| Subscription {
+            slot_id: slot_id.clone(),
+            cursor: cursors.get(slot_id).cloned(),
+            tail_events: 500,
+        })
+        .collect()
 }
 
 fn reconnect_directive(frame: &WireFrame, attach_request_id: Uuid) -> Option<ReconnectDirective> {
@@ -457,5 +477,35 @@ mod tests {
             reconnect_directive(&frame, attach_request_id),
             Some(ReconnectDirective::ResetCursors(_))
         ));
+    }
+
+    #[test]
+    fn startup_subscription_resumes_at_the_scanned_journal_cursor_not_live_head() {
+        let epoch = Uuid::new_v4();
+        let slots = vec!["slot-1".to_string()];
+        let cursors = HashMap::from([(
+            "slot-1".to_string(),
+            Cursor {
+                epoch,
+                after_seq: 10,
+            },
+        )]);
+
+        // The status snapshot may already report #12 while #11/#12 are still
+        // awaiting journal acknowledgement. Only K=#10 is supplied here, so
+        // seriald's ring remains responsible for replaying that live tail.
+        let subscriptions = build_subscriptions(&slots, &cursors);
+
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].cursor.as_ref().unwrap().after_seq, 10);
+        assert_eq!(subscriptions[0].cursor.as_ref().unwrap().epoch, epoch);
+    }
+
+    #[test]
+    fn startup_subscription_without_a_verified_cursor_uses_tail_attach() {
+        let subscriptions = build_subscriptions(&["slot-1".into()], &HashMap::new());
+
+        assert!(subscriptions[0].cursor.is_none());
+        assert_eq!(subscriptions[0].tail_events, 500);
     }
 }

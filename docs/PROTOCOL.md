@@ -116,7 +116,7 @@ it.
 | Method and path | Minimum role | Request/query and result |
 |---|---|---|
 | `GET /api/v1/health` | observer | Process status, `server_id`, `daemon_epoch`, uptime, protocol version, and `auth_required`. |
-| `GET /api/v1/status` | observer | All authoritative `SlotSnapshot`s plus identities, `config_revision`, and the additive `sequence_write_precondition_supported` capability. |
+| `GET /api/v1/status` | observer | All authoritative `SlotSnapshot`s plus identities, `config_revision`, and the additive `sequence_write_precondition_supported` / `serial_context_precondition_supported` capabilities. |
 | `GET /api/v1/ports` | admin | Enumerates serial ports on the daemon host. |
 | `PUT /api/v1/config/slots` | admin | Body `{slots, expected_revision?}`; full validated Slot replacement and resulting snapshots. |
 | `GET /api/v1/config/transport-profiles` | observer | `{profiles, config_revision}`. |
@@ -126,23 +126,51 @@ it.
 | `GET /api/v1/config/device-models` | observer | `{models, bindings, config_revision}`. |
 | `PUT /api/v1/config/device-models` | admin | Body `{models, expected_revision?}`; full identity-catalog replacement while retaining valid bindings. |
 | `PUT /api/v1/slots/{slot_id}/device-model` | operator | Atomically attach/detach a model and optionally create a missing model; response includes binding, model, `created`, and revision. |
-| `GET /api/v1/archives` | observer | Optional `slot_id`; bounded retained Slot/epoch archive catalog. |
+| `GET /api/v1/archives` | observer | Optional `slot_id`; bounded retained Slot/epoch archive catalog ordered newest first by `last_segment_wall_time_ns`. |
 | `GET /api/v1/diagnostics` | observer | Daemon, WebSocket, journal, and all per-Slot diagnostics. |
 | `GET /api/v1/diagnostics/storage` | observer | Journal quota, queue, archive, and logging health. |
 | `GET /api/v1/slots/{slot_id}/diagnostics` | observer | One snapshot plus subscriber count/lag. |
 | `GET /api/v1/slots/{slot_id}/events` | observer | `EventQuery`; bounded durable event page, cursor, retention information, and gaps. |
+| `GET /api/v1/slots/{slot_id}/tail` | observer | Atomic bounded live-ring snapshot or cursor page; optional `tail_events` is clamped to `[1,2000]`, and a cursor requires both `epoch` and `after_seq`. |
+| `GET /api/v1/slots/{slot_id}/recent-activity` | observer | Bounded TX/ownership evidence over one live-ring interval; requires `epoch`, exclusive `after_seq`, and inclusive `through_seq`. |
 | `POST /api/v1/monitors` | operator | Body `{request_id, spec}`; idempotently creates a persistent Monitor. |
 | `GET /api/v1/monitors` | observer | Optional `slot_id` and `status`; lists Monitors. |
 | `GET /api/v1/monitors/{monitor_id}` | observer | Gets one Monitor. |
 | `PUT /api/v1/monitors/{monitor_id}` | operator | Body `{spec, expected_revision}`; replaces the Monitor under optimistic concurrency. |
 | `DELETE /api/v1/monitors/{monitor_id}` | operator | Required query `expected_revision`; stops the Monitor. |
 | `GET /api/v1/monitors/{monitor_id}/incidents` | observer | Optional `after_incident_seq`, `limit`, `include_acked`; bounded incident page. |
-| `POST /api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | operator | Idempotently ACKs the incident and returns it; a pending matching outbox event becomes acknowledged. |
-| `GET /api/v1/monitor-events` | observer | Optional `after_outbox_seq` and `limit`; bounded notification-outbox page. |
-| `POST /api/v1/monitor-events/{outbox_seq}/ack` | operator | Idempotently changes a pending outbox event to acknowledged and returns it. |
+| `POST /api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | operator | Idempotently ACKs the incident and returns it. |
 | `GET /api/v1/ws` | observer | Upgrades to WebSocket v3; observer may subscribe, while Slot commands require operator. |
 
+v0.7 keeps WebSocket protocol v3 and the core Monitor/Incident routes, but
+removes the retired `/api/v1/monitor-events` delivery routes and
+`MonitorSpec.event_ttl_ms`. A legacy `[monitor_event_sink]` configuration table
+is accepted only for migration, ignored at runtime, and omitted on the next
+configuration save.
+
 ### Event queries
+
+`/tail` is not an `EventQuery` and never discovers journal segments. Without a
+cursor it uses the Slot actor's atomic Attach snapshot, returns the newest
+`tail_events`, sets `next_cursor` to the snapshot head, and keeps
+`first_available_seq` equal to the actual oldest ring event even when the
+requested tail window is smaller. serial-mcp adds
+`source=live_ring,bounded_tail=true` so this intentional window is not
+presented as journal retention loss.
+
+With both `epoch` and exclusive `after_seq`, `/tail` is a bounded oldest-next
+page through that same snapshot. It returns at most `tail_events` and advances
+`next_cursor` only through the last returned event when more retained events
+remain. Ring eviction and epoch change produce explicit gaps and a partial
+result, while the returned current-epoch cursor can resume retained events.
+This path is bounded by the 20,000-event / 4-MiB live ring and never scans an
+active or sealed journal segment. serial-mcp uses it for
+`read(scope=continue)` and adds `source=live_ring,bounded_continue=true`.
+
+`/recent-activity` uses the same live ring, filters to TX and control/Run-loss
+evidence, and returns at most 32 newest matching events. Replay loss or that
+summary bound sets `truncated=true`, including when no relevant event survives,
+so a caller cannot mistake incomplete evidence for proof of no interference.
 
 `EventQuery` supports `epoch`, exclusive `after_seq`, inclusive
 `through_seq`, `before_wall_time_ns`, `after_wall_time_ns`, `direction`,
@@ -150,7 +178,21 @@ it.
 `limit_events`, and `limit_bytes`. If `epoch` is omitted, the HTTP handler
 inserts the current daemon epoch; archived history therefore requires an
 explicit epoch. Invalid regexes are `regex_invalid`; exhausted query budgets
-return HTTP 429 with `query_budget_exceeded`.
+return HTTP 429 with `query_budget_exceeded`. Expressions that can match an
+empty byte string are rejected because no serial event byte can own such a
+match.
+
+Literal and regex matching may span adjacent events only while direction,
+generation, byte offsets, and serial lifecycle remain continuous. Regex
+results use non-empty, non-overlapping stream-match semantics: the event that
+supplies the final byte is returned once, and an overlapping match that reuses
+bytes from an earlier non-overlapping match is not reported. A match wholly
+contained in the bounded 64 KiB carry prefix is old evidence and is never
+attributed to a later event. At most 64 KiB from preceding chunks is retained;
+a match whose required prefix has already fallen outside that window is not
+found, while the current event may itself be larger. Once a match completes,
+later bytes cannot extend that same left-most match into duplicate results;
+matching resumes after its end.
 
 ### Configuration concurrency and commit order
 
@@ -206,7 +248,7 @@ listed in response `affected_slots`; it never changes those Slots' bindings.
 - 400: invalid DTO/config/query/Monitor spec.
 - 401: missing, malformed, or invalid bearer credential.
 - 403: authenticated role is too weak.
-- 404: unknown Slot, Monitor, Incident, outbox event, model, or archive target.
+- 404: unknown Slot, Monitor, Incident, model, or archive target.
 - 409: configuration/Monitor revision mismatch, model binding guard mismatch,
   or conflicting idempotent definition.
 - 429: WebSocket/Monitor capacity or journal query budget exhausted.
@@ -293,8 +335,8 @@ Every variant is tagged by `type` and carries `request_id`.
 | `release_control` | operator | `slot_id`, `control_id`, `fence`. |
 | `cancel_acquire` | operator | `slot_id`, `control_id`; queued actors have no lease, so the daemon matches the authenticated actor and ignores this compatibility ID. |
 | `write` | operator | `slot_id`, `control_id`, `fence`, base64 `data`, optional `operation_id`, `expected_run_id`, `pacing`, human-readable `description`, `command_sequence`, `sequence_precondition`, and `cooperative=false`. `expected_run_id` is required when cooperative. |
-| `send_break` | operator | `slot_id`, `control_id`, `fence`, `duration_ms`, optional `operation_id` and `expected_run_id`. |
-| `trigger_start` | operator | `slot_id`, Control ID/fence, `daemon_epoch`, `generation`, optional Operation/expected Run, and `spec`. |
+| `send_break` | operator | `slot_id`, `control_id`, `fence`, `duration_ms`, optional `operation_id`, `expected_run_id`, and `sequence_precondition`. |
+| `trigger_start` | operator | `slot_id`, Control ID/fence, `daemon_epoch`, `generation`, optional Operation/expected Run and `sequence_precondition`, plus `spec`. |
 | `trigger_status` | operator | `slot_id`, epoch, generation, `trigger_id`. |
 | `trigger_cancel` | operator | `slot_id`, Control ID/fence, epoch, generation, `trigger_id`. |
 | `start_run` | operator | `slot_id`, Control ID/fence, `label`, metadata map. |
@@ -328,23 +370,26 @@ step or completed the sequence.
 
 `sequence_precondition` is an optional additive, daemon-enforced write guard:
 `{cursor:{epoch,after_seq}, expected_generation, expected_tx_offset}`. It is
-valid only alongside `command_sequence`. serial-mcp sends it on every sequence
-step, including the first step using the initial status snapshot. Inside the
-Slot actor, after lease/Run authorization and immediately before the write is
-put in the physical port queue, seriald atomically verifies the daemon epoch,
-serial generation, and TX offset. It also replays the timeline strictly after
-the cursor and rejects an evicted replay window, an explicit `gap` event, or
-any additional TX. Ordinary RX and non-TX control events are allowed and the
-post-write command matcher still ignores replayed pre-write RX. A rejected
+the historical field name remains wire-compatible, but serial-mcp now sends it
+for ordinary commands, sequence steps, raw input/control-byte signals, BREAK,
+and Trigger start. Inside the Slot actor, after lease/Run authorization and
+immediately before the physical action boundary, seriald atomically verifies
+the daemon epoch, serial generation, and TX offset. It also replays the
+timeline strictly after the cursor and rejects an evicted replay window, an
+explicit `gap` event, or any additional TX. Ordinary RX is allowed. A rejected
 guard returns `sequence_boundary_changed`, is a definite zero-byte outcome,
-creates no TX event, and causes MCP `command_sequence` to return `partial` with
-`failure.next_step_sent=false`. The precondition participates in both
+and creates no TX/Break/Trigger-start event. The precondition participates in
 request-id fingerprints.
 
-The HTTP status capability defaults to false when omitted by an older daemon.
+The HTTP status capabilities default to false when omitted by an older daemon.
 A current serial-mcp refuses `command_sequence` before step 1 unless
-`sequence_write_precondition_supported=true`; ordinary `command`, Human, and
-legacy writes omit the precondition and retain their previous behavior.
+`sequence_write_precondition_supported=true`, and refuses every ordinary
+command/input/control-byte write, BREAK, sequence, or Trigger start unless
+`serial_context_precondition_supported=true`. This additive gate is required
+because an older protocol-v3 daemon can deserialize an unknown optional guard
+without enforcing it; the MCP therefore fails before any physical byte or line
+action. Human and legacy writes may omit the precondition and retain their
+previous behavior.
 
 `send_break.duration_ms` is in `[1,5000]`. BREAK is a UART line condition, not
 a byte; Ctrl-C/D/Z are ordinary `write` payload bytes `03`, `04`, and `1a`.
@@ -503,6 +548,14 @@ change, Slot reconfiguration/removal, or shutdown aborts the Run and emits
 daemon verifies both the ID and the server-issued Run owner before pacing or
 physical write. Missing, changed, or foreign Runs fail without writing bytes.
 
+At the MCP tool boundary, `run_start` also issues one opaque 22-character
+`run_handle`. It is a process-local capability that maps to the Slot, this
+public Run ID, and a separate private validator. Run-scoped MCP calls accept
+the handle instead of asking the model to repeat Slot/Run/token fields. The
+handle never crosses HTTP or WebSocket and does not change protocol v3:
+seriald continues to receive and enforce the public `run_id`, actor, Control
+ID, and fence exactly as documented here.
+
 A described write that confirms at least one serial byte stores its purpose as
 TX event metadata `command_description`. The TX event's existing `run_id`,
 `operation_id`, sequence, timestamp, and `data` fields provide the Run grouping
@@ -613,7 +666,8 @@ EOL, echo, pacing, port lifecycle, or Run state.
 - Additive optional fields use Serde defaults where implemented, including
   legacy writes defaulting `description=null`, `command_sequence=null`,
   `sequence_precondition=null`, and `cooperative=false`; legacy HTTP status
-  defaults `sequence_write_precondition_supported=false`.
+  defaults `sequence_write_precondition_supported=false` and
+  `serial_context_precondition_supported=false`.
 - `0x04` is reserved only; clients must use the `write` control message.
 - Exact schema inspection should use the Rust DTOs for HTTP/WebSocket and
   `tools/list` or `serial mcp --dump-tools` for MCP.
