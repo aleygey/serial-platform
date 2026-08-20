@@ -9,6 +9,7 @@ readonly GITHUB_REPOSITORY="aleygey/serial-platform"
 
 CURRENT_PHASE="startup"
 TEMP_DIR=""
+readonly RELEASE_NOT_FOUND_STATUS=44
 
 log() {
     printf '\n==> %s\n' "$*"
@@ -122,6 +123,102 @@ verify_release_api_digests() {
             | @tsv
         ' "${release_json}"
     )
+}
+
+discover_release_by_tag() {
+    local tag="$1"
+    local output="$2"
+    local matches="${output}.matches"
+
+    # The REST tag endpoint intentionally does not expose draft releases. List
+    # all releases instead so both draft and published releases are discoverable
+    # and so we can retain the database ID required for later snapshots.
+    if ! gh api --paginate \
+        "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+        --jq ".[] | select(.tag_name == \"${tag}\")" \
+        >"${matches}"; then
+        fail "could not list GitHub Releases while discovering ${tag}"
+    fi
+
+    local match_count
+    if ! match_count="$(jq -es 'length' "${matches}")"; then
+        fail "GitHub returned invalid Release data while discovering ${tag}"
+    fi
+    case "${match_count}" in
+        0)
+            return "${RELEASE_NOT_FOUND_STATUS}"
+            ;;
+        1)
+            if ! jq -es '.[0]' "${matches}" >"${output}"; then
+                fail "could not persist discovered GitHub Release ${tag}"
+            fi
+            ;;
+        *)
+            fail "GitHub returned multiple releases for tag ${tag}"
+            ;;
+    esac
+}
+
+fetch_release_snapshot_by_id() {
+    local release_database_id="$1"
+    local output="$2"
+
+    if ! gh api --method GET \
+        "repos/${GITHUB_REPOSITORY}/releases/${release_database_id}" \
+        >"${output}"; then
+        fail "could not fetch GitHub Release database ID ${release_database_id}"
+    fi
+}
+
+publish_release_by_id() {
+    local release_database_id="$1"
+    local output="$2"
+
+    if ! gh api --method PATCH \
+        "repos/${GITHUB_REPOSITORY}/releases/${release_database_id}" \
+        -F draft=false \
+        -f make_latest=true \
+        >"${output}"; then
+        fail "could not publish GitHub Release database ID ${release_database_id}"
+    fi
+}
+
+assert_release_snapshot() {
+    local release_json="$1"
+    local expected_database_id="$2"
+    local expected_tag="$3"
+    local expected_draft="$4"
+
+    jq -e \
+        --argjson database_id "${expected_database_id}" \
+        --arg tag "${expected_tag}" \
+        --argjson draft "${expected_draft}" \
+        '.id == $database_id and .tag_name == $tag and .draft == $draft' \
+        "${release_json}" >/dev/null \
+        || fail "GitHub Release identity or draft state changed before publication"
+}
+
+assert_verified_release_snapshot() {
+    local release_json="$1"
+    local expected_database_id="$2"
+    local expected_tag="$3"
+    local expected_draft="$4"
+    local expected_assets_file="$5"
+    local actual_assets_file="$6"
+    local artifact_dir="$7"
+    local context="$8"
+
+    assert_release_snapshot \
+        "${release_json}" \
+        "${expected_database_id}" \
+        "${expected_tag}" \
+        "${expected_draft}"
+    assert_exact_release_asset_set \
+        "${release_json}" \
+        "${expected_assets_file}" \
+        "${actual_assets_file}" \
+        "${context}"
+    verify_release_api_digests "${release_json}" "${artifact_dir}"
 }
 
 main() {
@@ -244,19 +341,12 @@ main() {
     CURRENT_PHASE="release-discovery"
     local release_json="${TEMP_DIR}/release.json"
     local release_exists=false
-    if gh release view "${tag}" \
-        --repo "${GITHUB_REPOSITORY}" \
-        --json isDraft,assets >"${release_json}" 2>"${TEMP_DIR}/release-view.err"; then
+    if discover_release_by_tag "${tag}" "${release_json}"; then
         release_exists=true
     else
-        if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
-            >/dev/null 2>"${TEMP_DIR}/release-api.err"; then
-            fail "gh release view failed even though GitHub reports ${tag} exists"
-        fi
-        local api_error
-        api_error="$(tr '\n' ' ' <"${TEMP_DIR}/release-api.err")"
-        grep -Eiq 'HTTP 404|Not Found' <<<"${api_error}" \
-            || fail "could not query GitHub Release ${tag}: ${api_error}"
+        local discovery_status=$?
+        [[ "${discovery_status}" -eq "${RELEASE_NOT_FOUND_STATUS}" ]] \
+            || fail "GitHub Release discovery failed for ${tag}"
     fi
 
     if [[ "${release_exists}" == "false" ]]; then
@@ -267,13 +357,20 @@ main() {
             --draft \
             --title "Serial Platform ${tag}" \
             --generate-notes
-        gh release view "${tag}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --json isDraft,assets >"${release_json}"
+        if discover_release_by_tag "${tag}" "${release_json}"; then
+            :
+        else
+            local created_discovery_status=$?
+            [[ "${created_discovery_status}" -eq "${RELEASE_NOT_FOUND_STATUS}" ]] \
+                || fail "GitHub Release discovery failed after creating ${tag}"
+            fail "newly created draft GitHub Release ${tag} was not discoverable"
+        fi
     fi
 
+    local release_database_id
+    release_database_id="$(jq -er '.id | select(type == "number" and . > 0 and floor == .)' "${release_json}")"
     local is_draft
-    is_draft="$(jq -er '.isDraft' "${release_json}")"
+    is_draft="$(jq -er '.draft | select(type == "boolean")' "${release_json}")"
     local remote_names_file="${TEMP_DIR}/remote-assets"
     jq -r '.assets[].name' "${release_json}" | LC_ALL=C sort >"${remote_names_file}"
     local unexpected_remote
@@ -325,28 +422,36 @@ main() {
     # being made public accidentally.
     CURRENT_PHASE="pre-publish-guard"
     local final_release_json="${TEMP_DIR}/release-before-publish.json"
-    gh api --method GET \
-        "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
-        >"${final_release_json}"
-    assert_exact_release_asset_set \
+    fetch_release_snapshot_by_id "${release_database_id}" "${final_release_json}"
+    assert_verified_release_snapshot \
         "${final_release_json}" \
+        "${release_database_id}" \
+        "${tag}" \
+        "${is_draft}" \
         "${expected_assets_file}" \
         "${TEMP_DIR}/remote-assets-before-publish" \
+        "${ARTIFACT_DIR}" \
         "GitHub Release ${tag} immediately before publication"
-    verify_release_api_digests "${final_release_json}" "${ARTIFACT_DIR}"
 
     if [[ "${is_draft}" == "true" ]]; then
-        jq -e '.draft == true' "${final_release_json}" >/dev/null \
-            || fail "GitHub Release ${tag} is no longer a draft; refusing to publish"
         CURRENT_PHASE="publish"
         log "Publishing verified GitHub Release ${tag}"
-        gh release edit "${tag}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --draft=false \
-            --latest
+        local publish_response_json="${TEMP_DIR}/release-publish-response.json"
+        publish_release_by_id "${release_database_id}" "${publish_response_json}"
+
+        CURRENT_PHASE="post-publish-verification"
+        local published_release_json="${TEMP_DIR}/release-after-publish.json"
+        fetch_release_snapshot_by_id "${release_database_id}" "${published_release_json}"
+        assert_verified_release_snapshot \
+            "${published_release_json}" \
+            "${release_database_id}" \
+            "${tag}" \
+            false \
+            "${expected_assets_file}" \
+            "${TEMP_DIR}/remote-assets-after-publish" \
+            "${ARTIFACT_DIR}" \
+            "published GitHub Release ${tag}"
     else
-        jq -e '.draft == false' "${final_release_json}" >/dev/null \
-            || fail "GitHub Release ${tag} unexpectedly became a draft"
         log "GitHub Release ${tag} is already published with identical assets"
     fi
 }
