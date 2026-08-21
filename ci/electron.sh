@@ -319,6 +319,11 @@ package_windows() {
     local artifact
     artifact="$(single_match 'Windows portable executable' "${candidates[@]}")"
     local unpacked_resources="${DESKTOP_DIR}/dist/win-unpacked/resources/bin"
+    local unpacked_app="${DESKTOP_DIR}/dist/win-unpacked/Serial Platform.exe"
+    [[ -f "${unpacked_app}" ]] \
+        || fail "Windows Electron executable is missing from the unpacked application"
+    file "${unpacked_app}" | grep -Eq 'PE32\+ executable.*x86-64' \
+        || fail "Electron Windows application is not an x86_64 PE32+ executable"
     local sidecar
     for sidecar in serial.exe seriald.exe; do
         [[ -f "${unpacked_resources}/${sidecar}" ]] \
@@ -327,8 +332,8 @@ package_windows() {
             || fail "Windows Electron package sidecar differs from staged ${sidecar}"
     done
     install -m 0755 "${artifact}" "${destination}/Serial Platform.exe"
-    file "${destination}/Serial Platform.exe" | grep -Eq 'PE32\+ executable.*x86-64' \
-        || fail "Electron Windows artifact is not an x86_64 PE32+ executable"
+    file "${destination}/Serial Platform.exe" | grep -Eq 'PE32 executable.*Nullsoft Installer' \
+        || fail "Electron Windows artifact is not an NSIS portable executable"
 }
 
 run_package() {

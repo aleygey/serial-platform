@@ -47,6 +47,9 @@
     "appId": "dev.serial-platform.desktop",
     "productName": "Serial Platform",
     "asar": true,
+    "toolsets": {
+      "nsis": "1.2.1"
+    },
     "afterPack": "./scripts/after-pack.mjs",
     "directories": {
       "output": "dist",
