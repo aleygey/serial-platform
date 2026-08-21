@@ -114,7 +114,7 @@ impl Default for PersistedState {
 pub enum MonitorError {
     #[error("Monitor Job {0} was not found")]
     NotFound(Uuid),
-    #[error("unknown Slot {0}")]
+    #[error("unknown port {0}")]
     UnknownSlot(String),
     #[error("Monitor request_id {0} was reused with a different specification")]
     RequestIdReused(Uuid),
@@ -126,7 +126,7 @@ pub enum MonitorError {
     ActiveCapacity,
     #[error("invalid Monitor specification: {0}")]
     InvalidSpec(String),
-    #[error("Monitor cursor is ahead of the current Slot timeline")]
+    #[error("Monitor cursor is ahead of the current port timeline")]
     CursorAhead,
     #[error("Monitor state is corrupt or incompatible: {0}")]
     InvalidState(String),
@@ -206,9 +206,9 @@ impl MonitorManager {
         let handle = self
             .inner
             .registry
-            .get(&request.spec.slot_id)
+            .get(&request.spec.port)
             .await
-            .ok_or_else(|| MonitorError::UnknownSlot(request.spec.slot_id.clone()))?;
+            .ok_or_else(|| MonitorError::UnknownSlot(request.spec.port.clone()))?;
         let snapshot = handle.snapshot();
         let mut spec = request.spec;
         let cursor = resolve_start_cursor(&spec, snapshot.daemon_epoch, snapshot.head_seq)?;
@@ -275,9 +275,9 @@ impl MonitorManager {
         let handle = self
             .inner
             .registry
-            .get(&request.spec.slot_id)
+            .get(&request.spec.port)
             .await
-            .ok_or_else(|| MonitorError::UnknownSlot(request.spec.slot_id.clone()))?;
+            .ok_or_else(|| MonitorError::UnknownSlot(request.spec.port.clone()))?;
         let snapshot = handle.snapshot();
         let mut spec = request.spec;
         let cursor = resolve_start_cursor(&spec, snapshot.daemon_epoch, snapshot.head_seq)?;
@@ -404,7 +404,7 @@ impl MonitorManager {
 
     pub async fn list(
         &self,
-        slot_id: Option<&str>,
+        port: Option<&str>,
         status: Option<MonitorStatus>,
     ) -> MonitorListResponse {
         let mut monitors = self
@@ -414,7 +414,7 @@ impl MonitorManager {
             .await
             .monitors
             .values()
-            .filter(|monitor| slot_id.is_none_or(|slot| monitor.spec.slot_id == slot))
+            .filter(|monitor| port.is_none_or(|slot| monitor.spec.port == slot))
             .filter(|monitor| status.is_none_or(|value| monitor.status == value))
             .cloned()
             .collect::<Vec<_>>();
@@ -885,7 +885,7 @@ impl MonitorManager {
                 id: incident_id,
                 incident_seq,
                 monitor_id,
-                slot_id: monitor.spec.slot_id.clone(),
+                port: monitor.spec.port.clone(),
                 daemon_epoch: pending.daemon_epoch,
                 seq_start: pending.seq_start,
                 seq_end: pending.seq_end,
@@ -896,8 +896,8 @@ impl MonitorManager {
                 preview: truncate_text(&pending.preview, MAX_PREVIEW_BYTES),
                 evidence_cursor: cursor,
                 evidence_ref: format!(
-                    "serial://{server_id}/slots/{}/events?epoch={}&after_seq={}&through_seq={}",
-                    monitor.spec.slot_id,
+                    "serial://{server_id}/ports/{}/events?epoch={}&after_seq={}&through_seq={}",
+                    monitor.spec.port,
                     pending.daemon_epoch,
                     pending.seq_start.saturating_sub(1),
                     pending.seq_end
@@ -1211,8 +1211,8 @@ impl WorkerRuntime {
             event.kind,
             EventKind::SerialOpened
                 | EventKind::SerialClosed
-                | EventKind::SlotReconfigured
-                | EventKind::SlotRemoved
+                | EventKind::PortReconfigured
+                | EventKind::PortRemoved
         );
         let generation_changed = self
             .generation
@@ -1314,9 +1314,9 @@ async fn run_monitor_worker(
     let handle = manager
         .inner
         .registry
-        .get(&monitor.spec.slot_id)
+        .get(&monitor.spec.port)
         .await
-        .ok_or_else(|| MonitorError::UnknownSlot(monitor.spec.slot_id.clone()))?;
+        .ok_or_else(|| MonitorError::UnknownSlot(monitor.spec.port.clone()))?;
     let snapshot = handle.snapshot();
     let fallback = monitor.current_cursor.clone().unwrap_or(Cursor {
         epoch: snapshot.daemon_epoch,
@@ -1543,7 +1543,7 @@ async fn run_monitor_worker(
                                 runtime.checkpoint(&cursor),
                             )
                             .await?;
-                        return Err(MonitorError::Runtime("Slot event stream closed".into()));
+                        return Err(MonitorError::Runtime("port event stream closed".into()));
                     }
                 }
             }
@@ -1773,8 +1773,8 @@ fn validate_loaded_state(state: &PersistedState) -> Result<(), MonitorError> {
 }
 
 fn validate_spec(spec: &MonitorSpec) -> Result<(), MonitorError> {
-    if spec.slot_id.is_empty() || spec.slot_id.len() > 64 {
-        return Err(MonitorError::InvalidSpec("invalid slot_id".into()));
+    if spec.port.is_empty() || spec.port.len() > 64 {
+        return Err(MonitorError::InvalidSpec("invalid port".into()));
     }
     match (spec.contains.as_deref(), spec.regex.as_deref()) {
         (Some(literal), None) if !literal.is_empty() && literal.len() <= MAX_PATTERN_BYTES => {}
@@ -1862,7 +1862,7 @@ mod matcher_tests {
 
     fn literal_spec(literal: &str) -> MonitorSpec {
         MonitorSpec {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             contains: Some(literal.into()),
             regex: None,
             start_cursor: None,
@@ -1876,7 +1876,7 @@ mod matcher_tests {
 
     fn rx_event(epoch: Uuid, seq: u64, start: u64, data: &[u8]) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: epoch,
             seq,
             generation: 1,
@@ -1983,13 +1983,13 @@ mod tests {
     use super::*;
     use crate::control::ControlLimits;
     use crate::journal::{JournalConfig, JournalManager};
-    use serial_protocol::{MonitorSeverity, SerialSettings, SlotConfig};
+    use serial_protocol::{MonitorSeverity, SlotConfig};
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
-    fn spec(slot_id: &str) -> MonitorSpec {
+    fn spec(port: &str) -> MonitorSpec {
         MonitorSpec {
-            slot_id: slot_id.into(),
+            port: port.into(),
             contains: Some("kernel panic".into()),
             regex: None,
             start_cursor: None,
@@ -2003,7 +2003,7 @@ mod tests {
 
     fn rx_event(epoch: Uuid, seq: u64, start: u64, data: &[u8]) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: epoch,
             seq,
             generation: 1,
@@ -2027,7 +2027,7 @@ mod tests {
             id: Uuid::new_v4(),
             incident_seq,
             monitor_id,
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: epoch,
             seq_start: incident_seq,
             seq_end: incident_seq,
@@ -2098,16 +2098,10 @@ mod tests {
         let journal =
             JournalManager::open(JournalConfig::new(temp.path().join("journal"))).unwrap();
         let slot = SlotConfig {
-            id: "slot-1".into(),
-            display_name: "Slot 1".into(),
-            port: "TEST0".into(),
-            profile: "generic-115200".into(),
-            device_profile: None,
+            port: "slot-1".into(),
+            transport_profile: None,
+            model_profile: None,
             enabled: false,
-            settings: SerialSettings {
-                auto_open: false,
-                ..SerialSettings::default()
-            },
         };
         let registry = SlotRegistry::new(
             epoch,

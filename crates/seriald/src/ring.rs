@@ -163,10 +163,7 @@ fn event_size(event: &TimelineEvent) -> usize {
             .len()
             .saturating_mul(BTREE_ENTRY_OVERHEAD_ESTIMATE),
     );
-    event
-        .data
-        .capacity()
-        .saturating_add(event.slot_id.capacity())
+    event.data.capacity().saturating_add(event.port.capacity())
         + event
             .actor
             .as_ref()
@@ -185,7 +182,7 @@ mod tests {
 
     fn event(epoch: Uuid, seq: u64) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: epoch,
             seq,
             generation: 1,

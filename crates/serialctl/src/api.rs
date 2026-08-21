@@ -1,53 +1,35 @@
 use std::fmt;
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, RequestBuilder};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    ArchiveListResponse, ConfigureDeviceModelsRequest, ConfigureDeviceModelsResponse, DeviceModel,
-    DeviceModelListResponse, DeviceProfile, EventQuery, EventQueryResponse, HealthResponse,
-    JournalDiagnostics, PortDescriptor, SetSlotDeviceModelRequest, SetSlotDeviceModelResponse,
-    SlotConfig, SlotDiagnostics, SlotSnapshot, StatusResponse, StorageDiagnosticsResponse,
-    TransportProfile,
+    ArchiveListResponse, ConfigureModelProfilesRequest, ConfigureModelProfilesResponse,
+    ConfigurePortsRequest, ConfigurePortsResponse, ConfigureTransportProfilesRequest,
+    ConfigureTransportProfilesResponse, EventQuery, EventQueryResponse, HealthResponse,
+    JournalDiagnostics, ModelProfile, ModelProfileListResponse, PortDescriptor, SlotConfig,
+    SlotDiagnostics, SlotSnapshot, StatusResponse, StorageDiagnosticsResponse, TransportProfile,
+    TransportProfileListResponse,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigurationStatus {
     pub server_id: uuid::Uuid,
     pub daemon_epoch: uuid::Uuid,
-    pub slots: Vec<SlotSnapshot>,
+    pub ports: Vec<SlotSnapshot>,
     #[serde(default)]
     pub protocol_version: Option<u16>,
     #[serde(default)]
     pub config_revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ConfigureSlotsDocument {
-    slots: Vec<SlotConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_revision: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConfigureSlotsDocumentResponse {
-    pub slots: Vec<SlotSnapshot>,
-    #[serde(default)]
-    pub config_revision: Option<u64>,
-}
+pub type ConfigurePortsDocumentResponse = ConfigurePortsResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileCatalog<T> {
     pub profiles: Vec<T>,
     #[serde(default)]
     pub config_revision: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ConfigureProfilesDocument<T> {
-    profiles: Vec<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expected_revision: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -73,11 +55,10 @@ impl std::error::Error for ApiHttpError {}
 pub struct ApiClient {
     client: Client,
     endpoint: String,
-    token: Option<String>,
 }
 
 impl ApiClient {
-    pub fn new(endpoint: String, token: Option<String>) -> Result<Self> {
+    pub fn new(endpoint: String) -> Result<Self> {
         let endpoint = normalize_endpoint(&endpoint)?;
         Ok(Self {
             client: Client::builder()
@@ -85,7 +66,6 @@ impl ApiClient {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()?,
             endpoint,
-            token,
         })
     }
 
@@ -112,26 +92,27 @@ impl ApiClient {
             .journal)
     }
 
-    pub async fn slot_diagnostics(&self, slot_id: &str) -> Result<SlotDiagnostics> {
+    pub async fn port_diagnostics(&self, port: &str) -> Result<SlotDiagnostics> {
         self.get_json(&format!(
-            "/api/v1/slots/{}/diagnostics",
-            encode_path_segment(slot_id)
+            "/api/v1/ports/{}/diagnostics",
+            encode_path_segment(port)
         ))
         .await
     }
 
-    pub async fn configure_slots(
+    pub async fn configure_ports(
         &self,
-        slots: Vec<SlotConfig>,
+        ports: Vec<SlotConfig>,
         expected_revision: Option<u64>,
-    ) -> Result<ConfigureSlotsDocumentResponse> {
+    ) -> Result<ConfigurePortsDocumentResponse> {
         let response = self
-            .authorize(self.client.put(self.url("/api/v1/config/slots")).json(
-                &ConfigureSlotsDocument {
-                    slots,
-                    expected_revision,
-                },
-            ))
+            .client
+            .put(self.url("/api/v1/config/ports"))
+            .json(&ConfigurePortsRequest {
+                ports,
+                source: "human:serialctl".into(),
+                expected_revision,
+            })
             .send()
             .await
             .context("seriald configuration request failed")?;
@@ -139,7 +120,13 @@ impl ApiClient {
     }
 
     pub async fn transport_profiles(&self) -> Result<ProfileCatalog<TransportProfile>> {
-        self.get_json("/api/v1/config/transport-profiles").await
+        let response = self
+            .get_json::<TransportProfileListResponse>("/api/v1/config/transport-profiles")
+            .await?;
+        Ok(ProfileCatalog {
+            profiles: response.profiles,
+            config_revision: Some(response.config_revision),
+        })
     }
 
     pub async fn configure_transport_profiles(
@@ -147,148 +134,92 @@ impl ApiClient {
         profiles: Vec<TransportProfile>,
         expected_revision: Option<u64>,
     ) -> Result<ProfileCatalog<TransportProfile>> {
-        self.put_profiles(
-            "/api/v1/config/transport-profiles",
-            profiles,
-            expected_revision,
-        )
-        .await
-    }
-
-    pub async fn device_profiles(&self) -> Result<ProfileCatalog<DeviceProfile>> {
-        self.get_json("/api/v1/config/device-profiles").await
-    }
-
-    pub async fn configure_device_profiles(
-        &self,
-        profiles: Vec<DeviceProfile>,
-        expected_revision: Option<u64>,
-    ) -> Result<ProfileCatalog<DeviceProfile>> {
-        self.put_profiles(
-            "/api/v1/config/device-profiles",
-            profiles,
-            expected_revision,
-        )
-        .await
-    }
-
-    pub async fn device_models(&self) -> Result<DeviceModelListResponse> {
-        self.get_json("/api/v1/config/device-models").await
-    }
-
-    pub async fn configure_device_models(
-        &self,
-        models: Vec<DeviceModel>,
-        expected_revision: Option<u64>,
-    ) -> Result<ConfigureDeviceModelsResponse> {
         let response = self
-            .authorize(
-                self.client
-                    .put(self.url("/api/v1/config/device-models"))
-                    .json(&ConfigureDeviceModelsRequest {
-                        models,
-                        expected_revision,
-                    }),
-            )
+            .client
+            .put(self.url("/api/v1/config/transport-profiles"))
+            .json(&ConfigureTransportProfilesRequest {
+                profiles,
+                expected_revision,
+            })
             .send()
             .await
-            .context("seriald device model configuration request failed")?;
-        decode_response(response).await
+            .context("seriald transport profile configuration request failed")?;
+        let response = decode_response::<ConfigureTransportProfilesResponse>(response).await?;
+        Ok(ProfileCatalog {
+            profiles: response.profiles,
+            config_revision: Some(response.config_revision),
+        })
     }
 
-    pub async fn set_slot_device_model(
-        &self,
-        slot_id: &str,
-        request: &SetSlotDeviceModelRequest,
-    ) -> Result<SetSlotDeviceModelResponse> {
+    pub async fn model_profiles(&self) -> Result<ProfileCatalog<ModelProfile>> {
         let response = self
-            .authorize(
-                self.client
-                    .put(self.url(&format!(
-                        "/api/v1/slots/{}/device-model",
-                        encode_path_segment(slot_id)
-                    )))
-                    .json(request),
-            )
+            .get_json::<ModelProfileListResponse>("/api/v1/config/model-profiles")
+            .await?;
+        Ok(ProfileCatalog {
+            profiles: response.profiles,
+            config_revision: Some(response.config_revision),
+        })
+    }
+
+    pub async fn configure_model_profiles(
+        &self,
+        profiles: Vec<ModelProfile>,
+        expected_revision: Option<u64>,
+    ) -> Result<ProfileCatalog<ModelProfile>> {
+        let response = self
+            .client
+            .put(self.url("/api/v1/config/model-profiles"))
+            .json(&ConfigureModelProfilesRequest {
+                profiles,
+                expected_revision,
+            })
             .send()
             .await
-            .context("seriald Slot model binding request failed")?;
-        decode_response(response).await
+            .context("seriald model profile configuration request failed")?;
+        let response = decode_response::<ConfigureModelProfilesResponse>(response).await?;
+        Ok(ProfileCatalog {
+            profiles: response.profiles,
+            config_revision: Some(response.config_revision),
+        })
     }
 
-    pub async fn archives(&self, slot_id: Option<&str>) -> Result<ArchiveListResponse> {
+    pub async fn archives(&self, port: Option<&str>) -> Result<ArchiveListResponse> {
         let mut request = self.client.get(self.url("/api/v1/archives"));
-        if let Some(slot_id) = slot_id {
-            request = request.query(&[("slot_id", slot_id)]);
+        if let Some(port) = port {
+            request = request.query(&[("port", port)]);
         }
         let response = self
-            .authorize(request)
-            .send()
+            .client
+            .execute(request.build()?)
             .await
             .context("seriald archive catalog request failed")?;
         decode_response(response).await
     }
 
-    pub async fn events(&self, slot_id: &str, query: &EventQuery) -> Result<EventQueryResponse> {
-        let encoded_slot = encode_path_segment(slot_id);
+    pub async fn events(&self, port: &str, query: &EventQuery) -> Result<EventQueryResponse> {
+        let encoded_port = encode_path_segment(port);
         let response = self
-            .authorize(
-                self.client
-                    .get(self.url(&format!("/api/v1/slots/{encoded_slot}/events")))
-                    .query(query),
-            )
+            .client
+            .get(self.url(&format!("/api/v1/ports/{encoded_port}/events")))
+            .query(query)
             .send()
             .await
             .context("seriald event query failed")?;
         decode_response(response).await
     }
 
-    async fn put_profiles<T>(
-        &self,
-        path: &str,
-        profiles: Vec<T>,
-        expected_revision: Option<u64>,
-    ) -> Result<ProfileCatalog<T>>
-    where
-        T: Serialize + serde::de::DeserializeOwned,
-    {
-        let response = self
-            .authorize(
-                self.client
-                    .put(self.url(path))
-                    .json(&ConfigureProfilesDocument {
-                        profiles,
-                        expected_revision,
-                    }),
-            )
-            .send()
-            .await
-            .with_context(|| format!("seriald profile configuration request to {path} failed"))?;
-        decode_response(response).await
-    }
-
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
-            .authorize(self.client.get(self.url(path)))
+            .client
+            .get(self.url(path))
             .send()
             .await
             .with_context(|| format!("request to {path} failed"))?;
         decode_response(response).await
     }
 
-    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
-        match &self.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
-    }
-
     pub fn endpoint(&self) -> &str {
         &self.endpoint
-    }
-
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
     }
 
     fn url(&self, path: &str) -> String {
@@ -302,14 +233,6 @@ pub fn is_not_found(error: &anyhow::Error) -> bool {
 
 pub fn is_conflict(error: &anyhow::Error) -> bool {
     has_http_status(error, reqwest::StatusCode::CONFLICT)
-}
-
-pub fn is_forbidden(error: &anyhow::Error) -> bool {
-    has_http_status(error, reqwest::StatusCode::FORBIDDEN)
-}
-
-pub fn is_unauthorized(error: &anyhow::Error) -> bool {
-    has_http_status(error, reqwest::StatusCode::UNAUTHORIZED)
 }
 
 fn has_http_status(error: &anyhow::Error, status: reqwest::StatusCode) -> bool {
@@ -375,7 +298,10 @@ mod tests {
 
     #[test]
     fn path_segments_are_percent_encoded() {
-        assert_eq!(encode_path_segment("slot/one 二"), "slot%2Fone%20%E4%BA%8C");
+        assert_eq!(
+            encode_path_segment("/dev/cu.port 二"),
+            "%2Fdev%2Fcu.port%20%E4%BA%8C"
+        );
     }
 
     #[test]
@@ -392,7 +318,7 @@ mod tests {
             "https://127.0.0.1:3210",
             "http://user@127.0.0.1:3210",
             "http://127.0.0.1:3210/base",
-            "http://127.0.0.1:3210?token=bad",
+            "http://127.0.0.1:3210?unexpected=bad",
             "http://127.0.0.1:3210#fragment",
         ] {
             assert!(normalize_endpoint(endpoint).is_err(), "accepted {endpoint}");

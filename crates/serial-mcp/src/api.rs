@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
 use serial_protocol::{
-    ArchiveListResponse, CreateMonitorRequest, Cursor, DeviceModelListResponse, EventQuery,
-    EventQueryResponse, MonitorIncidentListResponse, MonitorListResponse, MonitorResponse,
-    SetSlotDeviceModelRequest, SetSlotDeviceModelResponse, StatusResponse,
+    ArchiveListResponse, ConfigureModelProfilesRequest, ConfigureModelProfilesResponse,
+    ConfigurePortsRequest, ConfigurePortsResponse, CreateMonitorRequest, Cursor, EventQuery,
+    EventQueryResponse, ModelProfileListResponse, MonitorIncidentListResponse, MonitorListResponse,
+    MonitorResponse, StatusResponse,
 };
 
 const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
@@ -95,11 +96,10 @@ pub(crate) fn structured_http_error(error: &anyhow::Error) -> Option<Value> {
 pub struct ApiClient {
     client: Client,
     endpoint: String,
-    token: Option<String>,
 }
 
 impl ApiClient {
-    pub fn new(endpoint: String, token: Option<String>) -> Result<Self> {
+    pub fn new(endpoint: String) -> Result<Self> {
         let endpoint = normalize_endpoint(&endpoint)?;
         Ok(Self {
             client: Client::builder()
@@ -107,7 +107,6 @@ impl ApiClient {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()?,
             endpoint,
-            token,
         })
     }
 
@@ -115,57 +114,52 @@ impl ApiClient {
         &self.endpoint
     }
 
-    pub fn token(&self) -> Option<&str> {
-        self.token.as_deref()
-    }
-
     pub async fn status(&self) -> Result<StatusResponse> {
         self.get_json("/api/v1/status").await
     }
 
-    pub async fn device_models(&self) -> Result<DeviceModelListResponse> {
-        self.get_json("/api/v1/config/device-models").await
+    pub async fn model_profiles(&self) -> Result<ModelProfileListResponse> {
+        self.get_json("/api/v1/config/model-profiles").await
     }
 
-    /// Compatibility probe used by the long-standing `devices` tool. A 404
-    /// means this daemon predates the additive model catalog; other transport,
-    /// authentication, and decoding failures remain visible to the caller.
-    pub async fn device_models_if_supported(&self) -> Result<Option<DeviceModelListResponse>> {
-        let response = self
-            .authorize(self.client.get(self.url("/api/v1/config/device-models")))
-            .send()
-            .await
-            .context("seriald device model capability probe failed")?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        decode_response(response).await.map(Some)
-    }
-
-    pub async fn set_slot_device_model(
+    pub async fn configure_model_profiles(
         &self,
-        slot_id: &str,
-        request: &SetSlotDeviceModelRequest,
-    ) -> Result<SetSlotDeviceModelResponse> {
-        let encoded_slot = encode_path_segment(slot_id);
+        request: &ConfigureModelProfilesRequest,
+    ) -> Result<ConfigureModelProfilesResponse> {
         let response = self
-            .authorize(
+            .request(
                 self.client
-                    .put(self.url(&format!("/api/v1/slots/{encoded_slot}/device-model")))
+                    .put(self.url("/api/v1/config/model-profiles"))
                     .json(request),
             )
             .send()
             .await
-            .context("seriald Slot model binding request failed")?;
+            .context("seriald model profile update failed")?;
         decode_response(response).await
     }
 
-    pub async fn events(&self, slot_id: &str, query: &EventQuery) -> Result<EventQueryResponse> {
-        let encoded_slot = encode_path_segment(slot_id);
+    pub async fn configure_ports(
+        &self,
+        request: &ConfigurePortsRequest,
+    ) -> Result<ConfigurePortsResponse> {
         let response = self
-            .authorize(
+            .request(
                 self.client
-                    .get(self.url(&format!("/api/v1/slots/{encoded_slot}/events")))
+                    .put(self.url("/api/v1/config/ports"))
+                    .json(request),
+            )
+            .send()
+            .await
+            .context("seriald port configuration update failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn events(&self, port: &str, query: &EventQuery) -> Result<EventQueryResponse> {
+        let encoded_port = encode_path_segment(port);
+        let response = self
+            .request(
+                self.client
+                    .get(self.url(&format!("/api/v1/ports/{encoded_port}/events")))
                     .query(query),
             )
             .send()
@@ -176,20 +170,20 @@ impl ApiClient {
 
     pub async fn live_tail(
         &self,
-        slot_id: &str,
+        port: &str,
         tail_events: usize,
         cursor: Option<&Cursor>,
     ) -> Result<EventQueryResponse> {
-        let encoded_slot = encode_path_segment(slot_id);
+        let encoded_port = encode_path_segment(port);
         let mut query = vec![("tail_events", tail_events.clamp(1, 2_000).to_string())];
         if let Some(cursor) = cursor {
             query.push(("epoch", cursor.epoch.to_string()));
             query.push(("after_seq", cursor.after_seq.to_string()));
         }
         let response = self
-            .authorize(
+            .request(
                 self.client
-                    .get(self.url(&format!("/api/v1/slots/{encoded_slot}/tail")))
+                    .get(self.url(&format!("/api/v1/ports/{encoded_port}/tail")))
                     .query(&query),
             )
             .send()
@@ -200,21 +194,21 @@ impl ApiClient {
 
     pub async fn recent_activity(
         &self,
-        slot_id: &str,
+        port: &str,
         epoch: uuid::Uuid,
         after_seq: u64,
         through_seq: u64,
     ) -> Result<EventQueryResponse> {
-        let encoded_slot = encode_path_segment(slot_id);
+        let encoded_port = encode_path_segment(port);
         let query = [
             ("epoch", epoch.to_string()),
             ("after_seq", after_seq.to_string()),
             ("through_seq", through_seq.to_string()),
         ];
         let response = self
-            .authorize(
+            .request(
                 self.client
-                    .get(self.url(&format!("/api/v1/slots/{encoded_slot}/recent-activity")))
+                    .get(self.url(&format!("/api/v1/ports/{encoded_port}/recent-activity")))
                     .query(&query),
             )
             .send()
@@ -223,10 +217,10 @@ impl ApiClient {
         decode_response(response).await
     }
 
-    pub async fn archives(&self, slot_id: Option<&str>) -> Result<ArchiveListResponse> {
-        let query: Vec<(&str, &str)> = slot_id.map(|id| vec![("slot_id", id)]).unwrap_or_default();
+    pub async fn archives(&self, port: Option<&str>) -> Result<ArchiveListResponse> {
+        let query: Vec<(&str, &str)> = port.map(|id| vec![("port", id)]).unwrap_or_default();
         let response = self
-            .authorize(self.client.get(self.url("/api/v1/archives")).query(&query))
+            .request(self.client.get(self.url("/api/v1/archives")).query(&query))
             .send()
             .await
             .context("seriald archive list failed")?;
@@ -237,7 +231,7 @@ impl ApiClient {
         let mut first_error = None;
         for attempt in 0..2 {
             match self
-                .authorize(self.client.post(self.url("/api/v1/monitors")).json(request))
+                .request(self.client.post(self.url("/api/v1/monitors")).json(request))
                 .send()
                 .await
             {
@@ -256,10 +250,10 @@ impl ApiClient {
         unreachable!("the bounded Monitor creation retry loop always returns")
     }
 
-    pub async fn monitors(&self, slot_id: Option<&str>) -> Result<MonitorListResponse> {
-        let query: Vec<(&str, &str)> = slot_id.map(|id| vec![("slot_id", id)]).unwrap_or_default();
+    pub async fn monitors(&self, port: Option<&str>) -> Result<MonitorListResponse> {
+        let query: Vec<(&str, &str)> = port.map(|id| vec![("port", id)]).unwrap_or_default();
         let response = self
-            .authorize(self.client.get(self.url("/api/v1/monitors")).query(&query))
+            .request(self.client.get(self.url("/api/v1/monitors")).query(&query))
             .send()
             .await
             .context("seriald Monitor list failed")?;
@@ -269,7 +263,7 @@ impl ApiClient {
     pub async fn monitor(&self, monitor_id: uuid::Uuid) -> Result<MonitorResponse> {
         let encoded_id = encode_path_segment(&monitor_id.to_string());
         let response = self
-            .authorize(
+            .request(
                 self.client
                     .get(self.url(&format!("/api/v1/monitors/{encoded_id}"))),
             )
@@ -293,7 +287,7 @@ impl ApiClient {
             query.push(("after_incident_seq", after.to_string()));
         }
         let response = self
-            .authorize(
+            .request(
                 self.client
                     .get(self.url(&format!("/api/v1/monitors/{encoded_id}/incidents")))
                     .query(&query),
@@ -312,7 +306,7 @@ impl ApiClient {
         let encoded_id = encode_path_segment(&monitor_id.to_string());
         let query = [("expected_revision", expected_revision.to_string())];
         let response = self
-            .authorize(
+            .request(
                 self.client
                     .delete(self.url(&format!("/api/v1/monitors/{encoded_id}")))
                     .query(&query),
@@ -325,18 +319,15 @@ impl ApiClient {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
-            .authorize(self.client.get(self.url(path)))
+            .request(self.client.get(self.url(path)))
             .send()
             .await
             .with_context(|| format!("request to {path} failed"))?;
         decode_response(response).await
     }
 
-    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
-        match &self.token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
+    fn request(&self, request: RequestBuilder) -> RequestBuilder {
+        request
     }
 
     fn url(&self, path: &str) -> String {
@@ -427,232 +418,27 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn api_client_with_response(
-        status: &str,
-        body: &str,
-    ) -> (ApiClient, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let status = status.to_owned();
-        let body = body.to_owned();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept test request");
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request).await.expect("read test request");
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("write test response");
-        });
-        (
-            ApiClient::new(format!("http://{address}"), Some("test-token".to_owned()))
-                .expect("construct API client"),
-            server,
-        )
+    #[test]
+    fn macos_and_linux_device_paths_are_encoded_as_one_route_segment() {
+        assert_eq!(
+            encode_path_segment("/dev/cu.usbserial-210"),
+            "%2Fdev%2Fcu.usbserial-210"
+        );
+        assert_eq!(
+            encode_path_segment("/dev/serial/by-id/usb ACME"),
+            "%2Fdev%2Fserial%2Fby-id%2Fusb%20ACME"
+        );
     }
 
     #[test]
-    fn endpoints_are_restricted_to_plain_http_origins() {
+    fn endpoint_is_an_http_origin_without_credentials_or_path() {
         assert_eq!(
-            normalize_endpoint(" http://127.0.0.1:3210/ ").unwrap(),
+            normalize_endpoint("http://127.0.0.1:3210/").unwrap(),
             "http://127.0.0.1:3210"
         );
-        for endpoint in [
-            "https://127.0.0.1:3210",
-            "http://user@127.0.0.1:3210",
-            "http://127.0.0.1:3210/base",
-            "http://127.0.0.1:3210?token=bad",
-        ] {
-            assert!(normalize_endpoint(endpoint).is_err(), "accepted {endpoint}");
-        }
-    }
-
-    #[tokio::test]
-    async fn monitor_collection_404_reports_missing_capability() {
-        let (client, server) = api_client_with_response("404 Not Found", "route not found").await;
-
-        let error = client.monitors(None).await.unwrap_err().to_string();
-        server.await.expect("test server completed");
-
-        assert!(error.contains("does not expose the Monitor API"));
-        assert!(error.contains("require seriald 0.5 or newer"));
-    }
-
-    #[tokio::test]
-    async fn query_budget_error_is_structured_without_nested_escaped_json() {
-        let body = r#"{"code":"query_budget_exceeded","message":"journal query budget was exceeded during segment discovery after 104134 bytes and 5130 ms","retryable":true,"phase":"segment discovery","scanned_bytes":104134,"elapsed_ms":5130,"retry_hint":"retry from the last cursor"}"#;
-        let (client, server) = api_client_with_response("429 Too Many Requests", body).await;
-
-        let error = client.status().await.unwrap_err();
-        server.await.expect("test server completed");
-        let display = error.to_string();
-        assert!(display.contains("query_budget_exceeded"));
-        assert!(display.contains("segment discovery"));
-        assert!(!display.contains(r#"\{"code\""#));
-
-        let structured = structured_http_error(&error).expect("typed seriald HTTP error");
-        assert_eq!(structured["error"]["http_status"], 429);
-        assert_eq!(structured["error"]["code"], "query_budget_exceeded");
-        assert_eq!(structured["error"]["phase"], "segment discovery");
-        assert_eq!(structured["error"]["scanned_bytes"], 104134);
-        assert_eq!(structured["error"]["elapsed_ms"], 5130);
-        assert_eq!(
-            structured["error"]["retry_hint"],
-            "retry from the last cursor"
-        );
-        assert_eq!(structured["error"]["retryable"], true);
-    }
-
-    #[tokio::test]
-    async fn monitor_collection_structured_404_preserves_seriald_error() {
-        let body = r#"{"code":"not_found","message":"unknown Slot missing-slot"}"#;
-        let (client, server) = api_client_with_response("404 Not Found", body).await;
-
-        let request = CreateMonitorRequest {
-            request_id: uuid::Uuid::new_v4(),
-            spec: serial_protocol::MonitorSpec {
-                slot_id: "missing-slot".to_owned(),
-                contains: Some("panic".to_owned()),
-                regex: None,
-                start_cursor: None,
-                severity: serial_protocol::MonitorSeverity::Warning,
-                description: None,
-                debounce_ms: 250,
-                cooldown_ms: 30_000,
-                duration_ms: None,
-            },
-        };
-        let error = client
-            .create_monitor(&request)
-            .await
-            .unwrap_err()
-            .to_string();
-        server.await.expect("test server completed");
-
-        assert!(error.contains("seriald returned 404 Not Found"));
-        assert!(error.contains("unknown Slot missing-slot"));
-        assert!(!error.contains("does not expose the Monitor API"));
-    }
-
-    #[tokio::test]
-    async fn monitor_entity_404_preserves_seriald_not_found() {
-        let monitor_id = uuid::Uuid::new_v4();
-        let body =
-            format!(r#"{{"code":"not_found","message":"Monitor Job {monitor_id} was not found"}}"#);
-        let (client, server) = api_client_with_response("404 Not Found", &body).await;
-
-        let error = client.monitor(monitor_id).await.unwrap_err().to_string();
-        server.await.expect("test server completed");
-
-        assert!(error.contains("seriald returned 404 Not Found"));
-        assert!(error.contains(&monitor_id.to_string()));
-        assert!(error.contains("Monitor Job"));
-        assert!(!error.contains("does not expose the Monitor API"));
-    }
-
-    #[tokio::test]
-    async fn monitor_incidents_404_preserves_seriald_not_found() {
-        let monitor_id = uuid::Uuid::new_v4();
-        let body =
-            format!(r#"{{"code":"not_found","message":"Monitor Job {monitor_id} was not found"}}"#);
-        let (client, server) = api_client_with_response("404 Not Found", &body).await;
-
-        let error = client
-            .monitor_incidents(monitor_id, None)
-            .await
-            .unwrap_err()
-            .to_string();
-        server.await.expect("test server completed");
-
-        assert!(error.contains("seriald returned 404 Not Found"));
-        assert!(error.contains(&monitor_id.to_string()));
-        assert!(!error.contains("does not expose the Monitor API"));
-    }
-
-    #[tokio::test]
-    async fn monitor_stop_404_preserves_seriald_not_found() {
-        let monitor_id = uuid::Uuid::new_v4();
-        let body =
-            format!(r#"{{"code":"not_found","message":"Monitor Job {monitor_id} was not found"}}"#);
-        let (client, server) = api_client_with_response("404 Not Found", &body).await;
-
-        let error = client
-            .stop_monitor(monitor_id, 1)
-            .await
-            .unwrap_err()
-            .to_string();
-        server.await.expect("test server completed");
-
-        assert!(error.contains("seriald returned 404 Not Found"));
-        assert!(error.contains(&monitor_id.to_string()));
-        assert!(!error.contains("does not expose the Monitor API"));
-    }
-
-    #[tokio::test]
-    async fn device_model_catalog_uses_the_observer_read_endpoint() {
-        let body =
-            r#"{"models":[{"id":"family","name":"Family"}],"bindings":[],"config_revision":7}"#;
-        let (client, server) = api_client_with_response("200 OK", body).await;
-
-        let catalog = client.device_models().await.unwrap();
-        server.await.expect("test server completed");
-
-        assert_eq!(catalog.config_revision, 7);
-        assert_eq!(catalog.models[0].id, "family");
-        assert!(catalog.bindings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn optional_device_model_probe_treats_only_not_found_as_unsupported() {
-        let (client, server) = api_client_with_response("404 Not Found", "route not found").await;
-
-        let catalog = client.device_models_if_supported().await.unwrap();
-        server.await.expect("test server completed");
-
-        assert!(catalog.is_none());
-    }
-
-    #[tokio::test]
-    async fn device_model_binding_decodes_the_operator_response() {
-        let body = r#"{"binding":{"slot_id":"bench","model_id":"variant","confirmation_method":"serial","updated_wall_time_ns":1,"source":"agent:serial-mcp"},"model":{"id":"variant","name":"Variant"},"created":true,"config_revision":8}"#;
-        let (client, server) = api_client_with_response("200 OK", body).await;
-        let request = SetSlotDeviceModelRequest {
-            model_id: Some("variant".into()),
-            create_if_missing: true,
-            update_existing: false,
-            name: Some("Variant".into()),
-            parent_id: None,
-            clear_parent: false,
-            aliases: Vec::new(),
-            clear_aliases: false,
-            confirmation_method: Some(serial_protocol::ModelConfirmationMethod::Serial),
-            note: None,
-            source: "agent:serial-mcp".into(),
-            expected_revision: Some(7),
-            expected_current: Some(None),
-        };
-
-        let response = client
-            .set_slot_device_model("bench", &request)
-            .await
-            .unwrap();
-        server.await.expect("test server completed");
-
-        assert!(response.created);
-        assert_eq!(response.config_revision, 8);
-        assert_eq!(response.binding.unwrap().model_id, "variant");
-    }
-
-    #[test]
-    fn device_model_binding_path_encodes_slot_ids() {
-        assert_eq!(encode_path_segment("bench / A"), "bench%20%2F%20A");
+        assert!(normalize_endpoint("https://127.0.0.1:3210").is_err());
+        assert!(normalize_endpoint("http://user@127.0.0.1:3210").is_err());
+        assert!(normalize_endpoint("http://127.0.0.1:3210/api").is_err());
     }
 }

@@ -13,20 +13,17 @@ pub(crate) const DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS: u64 = 30 * 60;
 pub(crate) const MIN_ORPHAN_RUN_TIMEOUT_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct ClientConfig {
     endpoint: Option<String>,
-    token_file: Option<PathBuf>,
     #[allow(dead_code)]
-    last_slot: Option<String>,
+    last_port: Option<String>,
     // These are serialctl-owned console preferences. serial-mcp reads the
     // same file, so it must accept them without giving them Agent semantics.
     #[allow(dead_code)]
     human_idle_release_seconds: Option<u64>,
     #[allow(dead_code)]
     language: Option<String>,
-    #[allow(dead_code)]
-    merge_echo: Option<bool>,
     #[allow(dead_code)]
     mouse_capture: Option<bool>,
     #[allow(dead_code)]
@@ -39,7 +36,7 @@ struct ClientConfig {
 /// Bounds for one bounded capture window. When either limit is exceeded the
 /// oldest events are dropped and the response reports `capture_truncated`.
 /// Values come from the shared serialctl.toml; both are optional and keep
-/// these defaults so older configs are unaffected.
+/// these defaults so capture memory stays bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureLimits {
     pub max_events: usize,
@@ -57,7 +54,6 @@ impl Default for CaptureLimits {
 
 pub struct ResolvedConfig {
     pub endpoint: String,
-    pub token: Option<String>,
     pub capture: CaptureLimits,
     /// `None` is the explicit unlimited mode selected with zero seconds.
     pub orphan_run_timeout: Option<Duration>,
@@ -66,7 +62,6 @@ pub struct ResolvedConfig {
 pub fn resolve(
     config_override: Option<PathBuf>,
     endpoint_override: Option<String>,
-    token_file_override: Option<PathBuf>,
     orphan_run_timeout_override: Option<u64>,
 ) -> Result<ResolvedConfig> {
     let config_path = match config_override {
@@ -87,35 +82,6 @@ pub fn resolve(
     let endpoint = endpoint_override
         .or(config.endpoint)
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    let legacy_default_token = config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("token");
-    let token_file = token_file_override.or(config.token_file).or_else(|| {
-        // Before token-free personal mode, serial-mcp implicitly read this
-        // path even when serialctl.toml omitted token_file. Preserve that
-        // established installation shape, but no longer fail when the file
-        // does not exist.
-        legacy_default_token
-            .exists()
-            .then_some(legacy_default_token)
-    });
-    let token = token_file
-        .as_deref()
-        .map(|path| {
-            let token = fs::read_to_string(path)
-                .with_context(|| format!("cannot read operator token {}", path.display()))?
-                .trim()
-                .to_string();
-            anyhow::ensure!(
-                !token.is_empty(),
-                "operator token file {} is empty",
-                path.display()
-            );
-            Ok::<_, anyhow::Error>(token)
-        })
-        .transpose()?;
-
     // A zero limit would make every capture empty, so treat it as unset.
     // The upper bounds are deliberately not configurable: this process may
     // run inside an Agent host and one noisy UART must not retain unbounded
@@ -145,7 +111,6 @@ pub fn resolve(
 
     Ok(ResolvedConfig {
         endpoint,
-        token,
         capture,
         orphan_run_timeout: (orphan_run_timeout_seconds != 0)
             .then(|| Duration::from_secs(orphan_run_timeout_seconds)),
@@ -163,48 +128,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolved_config_debug_never_exposes_a_token() {
-        let config = ResolvedConfig {
-            endpoint: DEFAULT_ENDPOINT.into(),
-            token: Some("do-not-log-this-token".into()),
-            capture: CaptureLimits::default(),
-            orphan_run_timeout: Some(Duration::from_secs(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS)),
-        };
-        let summary = format!("endpoint={}", config.endpoint);
-        assert!(!summary.contains(config.token.as_deref().unwrap()));
-    }
-
-    #[test]
-    fn legacy_config_without_capture_keys_keeps_defaults() {
-        let config: ClientConfig =
-            toml::from_str("endpoint = \"http://127.0.0.1:3210\"\nlast_slot = \"bench\"\n")
-                .unwrap();
+    fn config_without_capture_keys_keeps_defaults() {
+        let config: ClientConfig = toml::from_str(
+            "endpoint = \"http://127.0.0.1:3210\"\nlast_port = \"COM4\"\nui_hint = true\n",
+        )
+        .unwrap();
         assert!(config.capture_max_events.is_none());
         assert!(config.capture_max_bytes.is_none());
     }
 
     #[test]
-    fn token_file_is_optional_for_loopback_personal_mode() {
+    fn endpoint_config_needs_no_credentials() {
         let temporary = tempfile::tempdir().unwrap();
         let config_path = temporary.path().join("serialctl.toml");
         fs::write(&config_path, "endpoint = \"http://127.0.0.1:3210\"\n").unwrap();
-        let resolved = resolve(Some(config_path), None, None, None).unwrap();
+        let resolved = resolve(Some(config_path), None, None).unwrap();
         assert_eq!(resolved.endpoint, DEFAULT_ENDPOINT);
-        assert!(resolved.token.is_none());
         assert_eq!(
             resolved.orphan_run_timeout,
             Some(Duration::from_secs(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS))
         );
-    }
-
-    #[test]
-    fn existing_implicit_legacy_token_file_is_still_loaded() {
-        let temporary = tempfile::tempdir().unwrap();
-        let config_path = temporary.path().join("serialctl.toml");
-        fs::write(&config_path, "endpoint = \"http://127.0.0.1:3210\"\n").unwrap();
-        fs::write(temporary.path().join("token"), "legacy-token\n").unwrap();
-        let resolved = resolve(Some(config_path), None, None, None).unwrap();
-        assert_eq!(resolved.token.as_deref(), Some("legacy-token"));
     }
 
     #[test]
@@ -221,7 +164,6 @@ mod tests {
             r#"
 human_idle_release_seconds = 60
 language = "zh"
-merge_echo = true
 mouse_capture = false
 agent_history_rows = 12
 orphan_run_timeout_seconds = 1800
@@ -230,7 +172,6 @@ orphan_run_timeout_seconds = 1800
         .unwrap();
         assert_eq!(config.human_idle_release_seconds, Some(60));
         assert_eq!(config.language.as_deref(), Some("zh"));
-        assert_eq!(config.merge_echo, Some(true));
         assert_eq!(config.mouse_capture, Some(false));
         assert_eq!(config.agent_history_rows, Some(12));
         assert_eq!(config.orphan_run_timeout_seconds, Some(1800));
@@ -242,13 +183,13 @@ orphan_run_timeout_seconds = 1800
         let config_path = temporary.path().join("serialctl.toml");
         fs::write(&config_path, "orphan_run_timeout_seconds = 3600\n").unwrap();
 
-        let from_config = resolve(Some(config_path.clone()), None, None, None).unwrap();
+        let from_config = resolve(Some(config_path.clone()), None, None).unwrap();
         assert_eq!(
             from_config.orphan_run_timeout,
             Some(Duration::from_secs(3600))
         );
 
-        let overridden = resolve(Some(config_path), None, None, Some(7200)).unwrap();
+        let overridden = resolve(Some(config_path), None, Some(7200)).unwrap();
         assert_eq!(
             overridden.orphan_run_timeout,
             Some(Duration::from_secs(7200))
@@ -260,11 +201,11 @@ orphan_run_timeout_seconds = 1800
         let temporary = tempfile::tempdir().unwrap();
         let config_path = temporary.path().join("serialctl.toml");
         fs::write(&config_path, "orphan_run_timeout_seconds = 299\n").unwrap();
-        assert!(resolve(Some(config_path.clone()), None, None, None).is_err());
+        assert!(resolve(Some(config_path.clone()), None, None).is_err());
 
         fs::write(&config_path, "orphan_run_timeout_seconds = 0\n").unwrap();
         assert_eq!(
-            resolve(Some(config_path.clone()), None, None, None)
+            resolve(Some(config_path.clone()), None, None)
                 .unwrap()
                 .orphan_run_timeout,
             None
@@ -272,7 +213,7 @@ orphan_run_timeout_seconds = 1800
 
         fs::write(&config_path, "orphan_run_timeout_seconds = 86401\n").unwrap();
         assert_eq!(
-            resolve(Some(config_path), None, None, None)
+            resolve(Some(config_path), None, None)
                 .unwrap()
                 .orphan_run_timeout,
             Some(Duration::from_secs(86401))

@@ -26,7 +26,7 @@ const STARTUP_HISTORY_CONCURRENCY: usize = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StartupHistoryTarget {
-    pub(crate) slot_id: String,
+    pub(crate) port: String,
     pub(crate) epoch: Uuid,
     pub(crate) head_seq: u64,
 }
@@ -34,7 +34,7 @@ pub(crate) struct StartupHistoryTarget {
 impl From<&SlotSnapshot> for StartupHistoryTarget {
     fn from(snapshot: &SlotSnapshot) -> Self {
         Self {
-            slot_id: snapshot.config.id.clone(),
+            port: snapshot.config.port.clone(),
             epoch: snapshot.daemon_epoch,
             head_seq: snapshot.head_seq,
         }
@@ -43,7 +43,7 @@ impl From<&SlotSnapshot> for StartupHistoryTarget {
 
 #[derive(Debug)]
 pub(crate) struct StartupHistory {
-    pub(crate) slot_id: String,
+    pub(crate) port: String,
     pub(crate) epoch: Uuid,
     pub(crate) head_seq: u64,
     pub(crate) events: Vec<TimelineEvent>,
@@ -59,7 +59,7 @@ pub(crate) struct StartupHistory {
 impl StartupHistory {
     fn empty(target: StartupHistoryTarget) -> Self {
         Self {
-            slot_id: target.slot_id,
+            port: target.port,
             epoch: target.epoch,
             head_seq: target.head_seq,
             events: Vec::new(),
@@ -92,7 +92,7 @@ pub(crate) async fn load_startup_histories<F>(
     let mut unfinished = targets
         .iter()
         .cloned()
-        .map(|target| (target.slot_id.clone(), target))
+        .map(|target| (target.port.clone(), target))
         .collect::<HashMap<_, _>>();
     let mut pending = Box::pin(
         stream::iter(targets.into_iter().map(|target| {
@@ -107,7 +107,7 @@ pub(crate) async fn load_startup_histories<F>(
     loop {
         match timeout_at(deadline, pending.next()).await {
             Ok(Some(history)) => {
-                unfinished.remove(&history.slot_id);
+                unfinished.remove(&history.port);
                 consume(history);
             }
             Ok(None) => break,
@@ -165,7 +165,7 @@ async fn load_startup_history(api: &ApiClient, target: StartupHistoryTarget) -> 
             limit_bytes: Some(STARTUP_HISTORY_PAGE_BYTES),
         };
 
-        let response = match timeout(query_timeout, api.events(&history.slot_id, &query)).await {
+        let response = match timeout(query_timeout, api.events(&history.port, &query)).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 history.limited = true;
@@ -187,7 +187,7 @@ async fn load_startup_history(api: &ApiClient, target: StartupHistoryTarget) -> 
             response.next_cursor,
         );
         let invalid_event = response.events.iter().any(|event| {
-            event.slot_id != history.slot_id
+            event.port != history.port
                 || event.daemon_epoch != history.epoch
                 || event.seq <= previous_after
                 || event.seq > history.head_seq
@@ -200,7 +200,7 @@ async fn load_startup_history(api: &ApiClient, target: StartupHistoryTarget) -> 
         });
         if invalid_event || invalid_gap {
             history.limited = true;
-            history.error = Some("startup history response crossed its Slot/epoch boundary".into());
+            history.error = Some("startup history response crossed its Port/epoch boundary".into());
             break;
         }
         loaded_bytes =
@@ -271,7 +271,7 @@ mod tests {
 
     fn history(epoch: Uuid, head_seq: u64) -> StartupHistory {
         StartupHistory::empty(StartupHistoryTarget {
-            slot_id: "slot-1".into(),
+            port: "COM4".into(),
             epoch,
             head_seq,
         })
@@ -310,7 +310,7 @@ mod tests {
         let epoch = Uuid::new_v4();
         let mut recovered = history(epoch, 12);
         let make_event = |seq| TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "COM4".into(),
             daemon_epoch: epoch,
             seq,
             wall_time_ns: 0,

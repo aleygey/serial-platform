@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use serial_protocol::{
-    ActorKind, Direction, ErrorCode, EventKind, GapReason, Role, SessionState, TargetActivity,
+    ActorKind, Direction, ErrorCode, EventKind, GapReason, SessionState, TargetActivity,
     TimelineEvent, TriggerStatus,
 };
 use unicode_width::UnicodeWidthChar;
@@ -65,7 +65,7 @@ pub enum RunBoundary {
 
 /// The bounded amount of one unterminated terminal row retained in memory.
 /// Long binary/no-newline streams are committed in readable chunks instead of
-/// allowing a single Slot to grow without limit.
+/// allowing a single port to grow without limit.
 const MAX_STREAM_LINE_CHARS: usize = 16 * 1024;
 const MAX_CSI_PARAMETER_BYTES: usize = 64;
 /// A malformed remote control string must not hide an unbounded amount of
@@ -102,9 +102,9 @@ pub struct StreamDisplayBatch {
     pub pending_committed: bool,
 }
 
-/// Incremental, per-Slot terminal-to-text projection.
+/// Incremental, per-port terminal-to-text projection.
 ///
-/// Keep one instance for each Slot and feed timeline events in sequence order.
+/// Keep one instance for each port and feed timeline events in sequence order.
 /// The parser deliberately does not execute remote terminal controls. It
 /// strips CSI/OSC/DCS/SOS/PM/APC sequences while preserving enough single-row
 /// cursor semantics for CR, backspace, tabs, and common CSI erase/cursor
@@ -487,7 +487,7 @@ fn terminal_boundary(kind: EventKind) -> bool {
             | EventKind::SerialOpened
             | EventKind::SerialOpenFailed
             | EventKind::SerialClosed
-            | EventKind::SlotRemoved
+            | EventKind::PortRemoved
             | EventKind::Gap
     )
 }
@@ -1242,8 +1242,8 @@ fn event_kind_label(kind: EventKind) -> &'static str {
         EventKind::SerialOpened => tr("d.ev.serial_opened"),
         EventKind::SerialOpenFailed => tr("d.ev.serial_open_failed"),
         EventKind::SerialClosed => tr("d.ev.serial_closed"),
-        EventKind::SlotReconfigured => tr("d.ev.slot_reconfigured"),
-        EventKind::SlotRemoved => tr("d.ev.slot_removed"),
+        EventKind::PortReconfigured => tr("d.ev.port_reconfigured"),
+        EventKind::PortRemoved => tr("d.ev.port_removed"),
         EventKind::ControlGranted => tr("d.ev.control_granted"),
         EventKind::ControlReleased => tr("d.ev.control_released"),
         EventKind::ControlRevoked => tr("d.ev.control_revoked"),
@@ -1284,14 +1284,6 @@ pub fn trigger_status_label(status: TriggerStatus) -> &'static str {
     }
 }
 
-pub fn role_label(role: Role) -> &'static str {
-    match role {
-        Role::Observer => tr("role.observer"),
-        Role::Operator => tr("role.operator"),
-        Role::Admin => tr("role.admin"),
-    }
-}
-
 pub fn session_state_label(state: SessionState) -> &'static str {
     match state {
         SessionState::Disabled => tr("state.disabled"),
@@ -1325,8 +1317,6 @@ pub fn gap_reason_label(reason: GapReason) -> &'static str {
 pub fn error_code_label(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::BadRequest => tr("error.bad_request"),
-        ErrorCode::Unauthorized => tr("error.unauthorized"),
-        ErrorCode::Forbidden => tr("error.forbidden"),
         ErrorCode::NotFound => tr("error.not_found"),
         ErrorCode::Conflict => tr("error.conflict"),
         ErrorCode::ControlRequired => tr("error.control_required"),
@@ -1716,7 +1706,7 @@ mod tests {
 
     fn event(data: &[u8]) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             daemon_epoch: Uuid::nil(),
             seq: 1,
             generation: 1,

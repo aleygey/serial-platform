@@ -29,7 +29,7 @@ const FORMAT_VERSION: u32 = 1;
 const SEGMENT_PREFIX_LEN: usize = 20;
 const RECORD_PREFIX_LEN: usize = 20;
 const MAX_SEGMENT_HEADER_BYTES: usize = 64 * 1024;
-const MAX_SLOT_ID_BYTES: usize = 80;
+const MAX_PORT_BYTES: usize = 80;
 const GAP_LEDGER_NAME: &str = "retention-gaps.jsonl";
 const DEFAULT_QUERY_EVENTS: usize = 1_000;
 const MAX_QUERY_EVENTS: usize = 10_000;
@@ -131,17 +131,17 @@ impl JournalConfig {
 pub enum JournalError {
     #[error("journal configuration is invalid: {0}")]
     InvalidConfig(String),
-    #[error("slot id must contain 1..={MAX_SLOT_ID_BYTES} UTF-8 bytes")]
-    InvalidSlotId,
+    #[error("port must contain 1..={MAX_PORT_BYTES} UTF-8 bytes")]
+    InvalidPortId,
     #[error("journal event payload is too large: {actual} bytes (max {maximum})")]
     PayloadTooLarge { actual: usize, maximum: usize },
     #[error("journal event header is too large: {actual} bytes (max {maximum})")]
     HeaderTooLarge { actual: usize, maximum: usize },
     #[error(
-        "event sequence is not monotonic for slot {slot_id} epoch {epoch}: previous {previous}, got {got}"
+        "event sequence is not monotonic for port {port} epoch {epoch}: previous {previous}, got {got}"
     )]
     NonMonotonicSequence {
-        slot_id: String,
+        port: String,
         epoch: Uuid,
         previous: u64,
         got: u64,
@@ -308,11 +308,11 @@ impl JournalHandle {
     /// worker. A slow historical search therefore never occupies the writer.
     pub async fn query(
         &self,
-        slot_id: impl Into<String>,
+        port: impl Into<String>,
         query: EventQuery,
     ) -> Result<EventQueryResponse, JournalError> {
-        let slot_id = slot_id.into();
-        validate_slot_id(&slot_id)?;
+        let port = port.into();
+        validate_port(&port)?;
         let config = Arc::clone(&self.config);
         let permit = Arc::clone(&self.query_gate)
             .acquire_owned()
@@ -320,7 +320,7 @@ impl JournalHandle {
             .map_err(|_| JournalError::WriterClosed)?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            query_files(&config, &slot_id, &query)
+            query_files(&config, &port, &query)
         })
         .await
         .map_err(|_| JournalError::WriterPanicked)?
@@ -330,10 +330,10 @@ impl JournalHandle {
     /// memory. It shares the historical-query semaphore and scan budgets.
     pub async fn list_archives(
         &self,
-        slot_id: Option<String>,
+        port: Option<String>,
     ) -> Result<ArchiveListResponse, JournalError> {
-        if let Some(slot_id) = slot_id.as_deref() {
-            validate_slot_id(slot_id)?;
+        if let Some(port) = port.as_deref() {
+            validate_port(port)?;
         }
         let config = Arc::clone(&self.config);
         let permit = Arc::clone(&self.query_gate)
@@ -342,7 +342,7 @@ impl JournalHandle {
             .map_err(|_| JournalError::WriterClosed)?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            list_archive_files(&config, slot_id.as_deref())
+            list_archive_files(&config, port.as_deref())
         })
         .await
         .map_err(|_| JournalError::WriterPanicked)?
@@ -479,7 +479,7 @@ fn writer_loop(mut state: WriterState, mut receiver: mpsc::Receiver<WriterComman
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct StreamKey {
-    slot_id: String,
+    port: String,
     epoch: Uuid,
 }
 
@@ -502,7 +502,7 @@ impl WriterState {
         for segment in discover_segments(&config.root_dir, None)? {
             if let Some(last_seq) = segment.last_seq {
                 let key = StreamKey {
-                    slot_id: segment.header.slot_id.clone(),
+                    port: segment.header.port.clone(),
                     epoch: segment.header.daemon_epoch,
                 };
                 heads
@@ -530,10 +530,10 @@ impl WriterState {
     }
 
     fn append(&mut self, mut event: TimelineEvent) -> Result<TimelineEvent, JournalError> {
-        validate_slot_id(&event.slot_id)?;
+        validate_port(&event.port)?;
         if event.seq == 0 {
             return Err(JournalError::NonMonotonicSequence {
-                slot_id: event.slot_id,
+                port: event.port,
                 epoch: event.daemon_epoch,
                 previous: 0,
                 got: 0,
@@ -541,13 +541,13 @@ impl WriterState {
         }
 
         let key = StreamKey {
-            slot_id: event.slot_id.clone(),
+            port: event.port.clone(),
             epoch: event.daemon_epoch,
         };
         let previous = self.heads.get(&key).copied().unwrap_or(0);
         if event.seq <= previous {
             return Err(JournalError::NonMonotonicSequence {
-                slot_id: event.slot_id,
+                port: event.port,
                 epoch: event.daemon_epoch,
                 previous,
                 got: event.seq,
@@ -556,7 +556,7 @@ impl WriterState {
 
         if event.seq > previous.saturating_add(1) {
             self.record_gap(StoredGap {
-                slot_id: event.slot_id.clone(),
+                port: event.port.clone(),
                 epoch: event.daemon_epoch,
                 first_seq: previous.saturating_add(1),
                 last_seq: event.seq - 1,
@@ -746,7 +746,7 @@ impl WriterState {
                 Err(error) => return Err(error.into()),
             };
             let gap = StoredGap {
-                slot_id: segment.header.slot_id.clone(),
+                port: segment.header.port.clone(),
                 epoch: segment.header.daemon_epoch,
                 first_seq: segment.header.first_seq,
                 last_seq,
@@ -810,7 +810,7 @@ impl WriterState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SegmentHeader {
-    slot_id: String,
+    port: String,
     daemon_epoch: Uuid,
     segment_id: Uuid,
     created_wall_time_ns: i64,
@@ -820,7 +820,7 @@ struct SegmentHeader {
 impl SegmentHeader {
     fn for_event(event: &TimelineEvent) -> Self {
         Self {
-            slot_id: event.slot_id.clone(),
+            port: event.port.clone(),
             daemon_epoch: event.daemon_epoch,
             segment_id: Uuid::new_v4(),
             created_wall_time_ns: now_wall_time_ns(),
@@ -853,7 +853,7 @@ impl OpenSegment {
     }
 
     fn create_with_header(root: &Path, header: SegmentHeader) -> Result<Self, JournalError> {
-        let directory = epoch_dir(root, &header.slot_id, header.daemon_epoch);
+        let directory = epoch_dir(root, &header.port, header.daemon_epoch);
         fs::create_dir_all(&directory)?;
         let name = format!("{:020}-{}.open", header.first_seq, header.segment_id);
         let path = directory.join(name);
@@ -967,7 +967,7 @@ struct SegmentDescriptor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StoredGap {
-    slot_id: String,
+    port: String,
     epoch: Uuid,
     first_seq: u64,
     last_seq: u64,
@@ -1075,7 +1075,7 @@ fn read_segment_header(file: &mut File, path: &Path) -> Result<(SegmentHeader, u
     }
     let header: SegmentHeader = serde_json::from_slice(&encoded)
         .map_err(|error| corrupt(path, format!("invalid segment metadata: {error}")))?;
-    validate_slot_id(&header.slot_id)?;
+    validate_port(&header.port)?;
     Ok((header, (SEGMENT_PREFIX_LEN + header_len) as u64))
 }
 
@@ -1166,7 +1166,7 @@ fn recover_open_segment(path: &Path) -> Result<(), JournalError> {
     loop {
         match read_record(&mut file)? {
             RecordRead::Event(event)
-                if event.slot_id == header.slot_id
+                if event.port == header.port
                     && event.daemon_epoch == header.daemon_epoch
                     && event.seq > previous =>
             {
@@ -1355,7 +1355,7 @@ impl ArchiveAccumulator {
     fn new(header: &SegmentHeader, last_seq: u64, bytes: u64, sealed: bool) -> Self {
         Self {
             summary: ArchiveSummary {
-                slot_id: header.slot_id.clone(),
+                port: header.port.clone(),
                 epoch: header.daemon_epoch,
                 first_seq: header.first_seq,
                 last_seq,
@@ -1387,19 +1387,19 @@ impl ArchiveAccumulator {
 
 fn list_archive_files(
     config: &JournalConfig,
-    slot_id: Option<&str>,
+    port: Option<&str>,
 ) -> Result<ArchiveListResponse, JournalError> {
-    list_archive_files_with_limits(config, slot_id, QueryLimits::default())
+    list_archive_files_with_limits(config, port, QueryLimits::default())
 }
 
 fn list_archive_files_with_limits(
     config: &JournalConfig,
-    slot_id: Option<&str>,
+    port: Option<&str>,
     limits: QueryLimits,
 ) -> Result<ArchiveListResponse, JournalError> {
     let mut budget = QueryBudget::new(limits);
-    let search_root = match slot_id {
-        Some(slot_id) => slot_dir(&config.root_dir, slot_id),
+    let search_root = match port {
+        Some(port) => slot_dir(&config.root_dir, port),
         None => slots_root(&config.root_dir),
     };
     if !search_root.exists() {
@@ -1466,10 +1466,10 @@ fn list_archive_files_with_limits(
                 }
             };
             budget.charge(data_offset, "archive discovery")?;
-            if slot_id.is_some_and(|expected| header.slot_id != expected)
+            if port.is_some_and(|expected| header.port != expected)
                 || !path.starts_with(epoch_dir(
                     &config.root_dir,
-                    &header.slot_id,
+                    &header.port,
                     header.daemon_epoch,
                 ))
             {
@@ -1495,7 +1495,7 @@ fn list_archive_files_with_limits(
                 continue;
             };
 
-            let key = (header.slot_id.clone(), header.daemon_epoch);
+            let key = (header.port.clone(), header.daemon_epoch);
             match archives.entry(key) {
                 Entry::Vacant(entry) => {
                     entry.insert(ArchiveAccumulator::new(
@@ -1522,7 +1522,7 @@ fn list_archive_files_with_limits(
         right
             .last_segment_wall_time_ns
             .cmp(&left.last_segment_wall_time_ns)
-            .then_with(|| left.slot_id.cmp(&right.slot_id))
+            .then_with(|| left.port.cmp(&right.port))
             .then_with(|| right.epoch.cmp(&left.epoch))
     });
     if archives.len() > MAX_ARCHIVE_SUMMARIES {
@@ -1595,7 +1595,7 @@ fn scan_last_seq_metadata(
             Ok(header) => header,
             Err(_) => break,
         };
-        if header.slot_id != segment.slot_id
+        if header.port != segment.port
             || header.daemon_epoch != segment.daemon_epoch
             || last_seq.is_some_and(|previous| header.seq <= previous)
         {
@@ -1613,15 +1613,15 @@ fn scan_last_seq_metadata(
 
 fn query_files(
     config: &JournalConfig,
-    slot_id: &str,
+    port: &str,
     query: &EventQuery,
 ) -> Result<EventQueryResponse, JournalError> {
-    query_files_with_limits(config, slot_id, query, QueryLimits::default())
+    query_files_with_limits(config, port, query, QueryLimits::default())
 }
 
 fn query_files_with_limits(
     config: &JournalConfig,
-    slot_id: &str,
+    port: &str,
     query: &EventQuery,
     limits: QueryLimits,
 ) -> Result<EventQueryResponse, JournalError> {
@@ -1704,7 +1704,7 @@ fn query_files_with_limits(
             "pattern must not match an empty byte string".into(),
         ));
     }
-    let discovery = discover_segments_for_query(&config.root_dir, slot_id, query, &mut budget)?;
+    let discovery = discover_segments_for_query(&config.root_dir, port, query, &mut budget)?;
     let mut descriptors = discovery.descriptors;
 
     // Sequence numbers are only meaningful within one daemon epoch. An
@@ -1724,7 +1724,7 @@ fn query_files_with_limits(
     });
     let selected_epoch = match selected_epoch {
         Some(epoch) => Some(epoch),
-        None => find_latest_gap_epoch(&config.root_dir, slot_id, &mut budget)?,
+        None => find_latest_gap_epoch(&config.root_dir, port, &mut budget)?,
     };
     descriptors
         .retain(|segment| selected_epoch.is_some_and(|epoch| segment.header.daemon_epoch == epoch));
@@ -1733,7 +1733,7 @@ fn query_files_with_limits(
     let mut gaps = match selected_epoch {
         Some(epoch) => load_query_gap_ranges(
             &config.root_dir,
-            slot_id,
+            port,
             epoch,
             query.after_seq,
             query.through_seq,
@@ -1811,8 +1811,7 @@ fn query_files_with_limits(
             }
             return Err(budget.error("event scan"));
         }
-        if disk_header.slot_id != slot_id || disk_header.daemon_epoch != segment.header.daemon_epoch
-        {
+        if disk_header.port != port || disk_header.daemon_epoch != segment.header.daemon_epoch {
             return Err(corrupt(
                 &segment.path,
                 "segment identity changed while querying",
@@ -1880,7 +1879,7 @@ fn query_files_with_limits(
                     break;
                 }
             };
-            if event.slot_id != slot_id || event.daemon_epoch != segment.header.daemon_epoch {
+            if event.port != port || event.daemon_epoch != segment.header.daemon_epoch {
                 return Err(corrupt(
                     &segment.path,
                     "record identity does not match segment",
@@ -2069,8 +2068,8 @@ fn event_breaks_stream(kind: serial_protocol::EventKind) -> bool {
             | serial_protocol::EventKind::SerialOpened
             | serial_protocol::EventKind::SerialOpenFailed
             | serial_protocol::EventKind::SerialClosed
-            | serial_protocol::EventKind::SlotReconfigured
-            | serial_protocol::EventKind::SlotRemoved
+            | serial_protocol::EventKind::PortReconfigured
+            | serial_protocol::EventKind::PortRemoved
             | serial_protocol::EventKind::LoggingDegraded
             | serial_protocol::EventKind::Gap
     )
@@ -2201,10 +2200,10 @@ fn gap_reason_rank(reason: GapReason) -> u8 {
 
 fn discover_segments(
     root: &Path,
-    slot_id: Option<&str>,
+    port: Option<&str>,
 ) -> Result<Vec<SegmentDescriptor>, JournalError> {
-    let search_root = match slot_id {
-        Some(slot_id) => slot_dir(root, slot_id),
+    let search_root = match port {
+        Some(port) => slot_dir(root, port),
         None => slots_root(root),
     };
     if !search_root.exists() {
@@ -2223,7 +2222,7 @@ fn discover_segments(
             Err(error) => return Err(error.into()),
         };
         let (header, _) = read_segment_header(&mut file, &path)?;
-        if slot_id.is_some_and(|expected| header.slot_id != expected) {
+        if port.is_some_and(|expected| header.port != expected) {
             return Err(corrupt(
                 &path,
                 "segment is stored under the wrong slot directory",
@@ -2255,7 +2254,7 @@ struct QuerySegmentDiscovery {
 
 fn discover_segments_for_query(
     root: &Path,
-    slot_id: &str,
+    port: &str,
     query: &EventQuery,
     budget: &mut QueryBudget,
 ) -> Result<QuerySegmentDiscovery, JournalError> {
@@ -2265,10 +2264,10 @@ fn discover_segments_for_query(
     // carry their exact sequence range, so fully consumed files can be skipped
     // without opening and charging every historical segment header.
     if let Some(epoch) = query.epoch {
-        return discover_epoch_segments_for_query(root, slot_id, epoch, query, budget);
+        return discover_epoch_segments_for_query(root, port, epoch, query, budget);
     }
 
-    let search_root = slot_dir(root, slot_id);
+    let search_root = slot_dir(root, port);
     if !search_root.exists() {
         return Ok(QuerySegmentDiscovery {
             descriptors: Vec::new(),
@@ -2319,7 +2318,7 @@ fn discover_segments_for_query(
             };
             let (header, data_offset) = read_segment_header(&mut file, &path)?;
             budget.charge(data_offset, "segment discovery")?;
-            if header.slot_id != slot_id {
+            if header.port != port {
                 return Err(corrupt(
                     &path,
                     "segment is stored under the wrong slot directory",
@@ -2351,12 +2350,12 @@ fn discover_segments_for_query(
 
 fn discover_epoch_segments_for_query(
     root: &Path,
-    slot_id: &str,
+    port: &str,
     epoch: Uuid,
     query: &EventQuery,
     budget: &mut QueryBudget,
 ) -> Result<QuerySegmentDiscovery, JournalError> {
-    let directory = epoch_dir(root, slot_id, epoch);
+    let directory = epoch_dir(root, port, epoch);
     if !directory.exists() {
         return Ok(QuerySegmentDiscovery {
             descriptors: Vec::new(),
@@ -2431,7 +2430,7 @@ fn discover_epoch_segments_for_query(
         };
         let (header, data_offset) = read_segment_header(&mut file, &path)?;
         budget.charge(data_offset, "segment discovery")?;
-        if header.slot_id != slot_id || header.daemon_epoch != epoch {
+        if header.port != port || header.daemon_epoch != epoch {
             return Err(corrupt(
                 &path,
                 "segment is stored under the wrong slot or epoch directory",
@@ -2486,7 +2485,7 @@ fn scan_last_seq_for_query(
         )?;
         match record {
             RecordRead::Event(event)
-                if event.slot_id == header.slot_id && event.daemon_epoch == header.daemon_epoch =>
+                if event.port == header.port && event.daemon_epoch == header.daemon_epoch =>
             {
                 last = Some(event.seq);
             }
@@ -2507,7 +2506,7 @@ fn scan_last_seq(path: &Path) -> Result<Option<u64>, JournalError> {
     loop {
         match read_record(&mut file)? {
             RecordRead::Event(event)
-                if event.slot_id == header.slot_id && event.daemon_epoch == header.daemon_epoch =>
+                if event.port == header.port && event.daemon_epoch == header.daemon_epoch =>
             {
                 last = Some(event.seq);
             }
@@ -2611,7 +2610,7 @@ fn recover_gap_ledger_file(file: &mut File, path: &Path) -> Result<u64, JournalE
             let valid = serde_json::from_slice::<StoredGap>(&line)
                 .ok()
                 .is_some_and(|gap| {
-                    validate_slot_id(&gap.slot_id).is_ok() && gap.first_seq <= gap.last_seq
+                    validate_port(&gap.port).is_ok() && gap.first_seq <= gap.last_seq
                 });
             if valid {
                 last_valid_end = offset;
@@ -2680,12 +2679,12 @@ fn visit_gap_ledger(
 
 fn find_latest_gap_epoch(
     root: &Path,
-    slot_id: &str,
+    port: &str,
     budget: &mut QueryBudget,
 ) -> Result<Option<Uuid>, JournalError> {
     let mut latest = None;
     visit_gap_ledger(root, budget, |gap| {
-        if gap.slot_id == slot_id {
+        if gap.port == port {
             let candidate = (gap.recorded_wall_time_ns, gap.epoch);
             if latest.is_none_or(|current| candidate > current) {
                 latest = Some(candidate);
@@ -2698,7 +2697,7 @@ fn find_latest_gap_epoch(
 
 fn load_query_gap_ranges(
     root: &Path,
-    slot_id: &str,
+    port: &str,
     epoch: Uuid,
     after_seq: Option<u64>,
     through_seq: Option<u64>,
@@ -2706,7 +2705,7 @@ fn load_query_gap_ranges(
 ) -> Result<Vec<GapRange>, JournalError> {
     let mut gaps = Vec::new();
     visit_gap_ledger(root, budget, |gap| {
-        if gap.slot_id == slot_id
+        if gap.port == port
             && gap.epoch == epoch
             && after_seq.is_none_or(|after| gap.last_seq > after)
             && through_seq.is_none_or(|through| gap.first_seq <= through)
@@ -2778,12 +2777,12 @@ fn slots_root(root: &Path) -> PathBuf {
     root.join("slots")
 }
 
-fn slot_dir(root: &Path, slot_id: &str) -> PathBuf {
-    slots_root(root).join(format!("slot-{}", hex_encode(slot_id.as_bytes())))
+fn slot_dir(root: &Path, port: &str) -> PathBuf {
+    slots_root(root).join(format!("slot-{}", hex_encode(port.as_bytes())))
 }
 
-fn epoch_dir(root: &Path, slot_id: &str, epoch: Uuid) -> PathBuf {
-    slot_dir(root, slot_id).join(epoch.to_string())
+fn epoch_dir(root: &Path, port: &str, epoch: Uuid) -> PathBuf {
+    slot_dir(root, port).join(epoch.to_string())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2796,9 +2795,9 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn validate_slot_id(slot_id: &str) -> Result<(), JournalError> {
-    if slot_id.is_empty() || slot_id.len() > MAX_SLOT_ID_BYTES {
-        Err(JournalError::InvalidSlotId)
+fn validate_port(port: &str) -> Result<(), JournalError> {
+    if port.is_empty() || port.len() > MAX_PORT_BYTES {
+        Err(JournalError::InvalidPortId)
     } else {
         Ok(())
     }
@@ -2854,7 +2853,7 @@ mod tests {
 
     fn event(epoch: Uuid, seq: u64, direction: Direction, data: Vec<u8>) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: epoch,
             seq,
             generation: 1,
@@ -2950,7 +2949,7 @@ mod tests {
         second_epoch_event.wall_time_ns = 2_000;
         handle.append(second_epoch_event).await.unwrap();
         let mut other = event(other_epoch, 1, Direction::Rx, b"other slot".to_vec());
-        other.slot_id = "slot-2".into();
+        other.port = "slot-2".into();
         handle.append(other).await.unwrap();
 
         let all = handle.list_archives(None).await.unwrap();
@@ -2959,7 +2958,7 @@ mod tests {
         let first = all
             .archives
             .iter()
-            .find(|archive| archive.slot_id == "slot-1" && archive.epoch == first_epoch)
+            .find(|archive| archive.port == "slot-1" && archive.epoch == first_epoch)
             .unwrap();
         assert_eq!((first.first_seq, first.last_seq), (1, 2));
         assert_eq!(first.segment_count, 1);
@@ -2975,7 +2974,7 @@ mod tests {
             filtered
                 .archives
                 .iter()
-                .all(|archive| archive.slot_id == "slot-1")
+                .all(|archive| archive.port == "slot-1")
         );
         assert_eq!(filtered.archives[0].epoch, second_epoch);
         assert_eq!(filtered.archives[1].epoch, first_epoch);
@@ -3567,7 +3566,7 @@ mod tests {
         write_sealed_test_events(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -3578,7 +3577,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 200,
@@ -3618,7 +3617,7 @@ mod tests {
             write_sealed_test_segment(
                 &config,
                 SegmentHeader {
-                    slot_id: "slot-1".into(),
+                    port: "slot-1".into(),
                     daemon_epoch: archived_epoch,
                     segment_id: Uuid::new_v4(),
                     created_wall_time_ns: index as i64,
@@ -3635,7 +3634,7 @@ mod tests {
             write_sealed_test_segment(
                 &config,
                 SegmentHeader {
-                    slot_id: "slot-1".into(),
+                    port: "slot-1".into(),
                     daemon_epoch: current_epoch,
                     segment_id: Uuid::new_v4(),
                     created_wall_time_ns: 1_000 + seq as i64,
@@ -3675,7 +3674,7 @@ mod tests {
         let config = test_config(&temp);
         let epoch = Uuid::new_v4();
         let header = SegmentHeader {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: epoch,
             segment_id: Uuid::new_v4(),
             created_wall_time_ns: 100,
@@ -3730,7 +3729,7 @@ mod tests {
         write_sealed_test_segment(
             &segment_config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: segment_epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -3762,7 +3761,7 @@ mod tests {
         append_gap_ledger(
             &ledger_config.root_dir,
             &StoredGap {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 epoch: ledger_epoch,
                 first_seq: 1,
                 last_seq: 1,
@@ -3800,7 +3799,7 @@ mod tests {
             let first_seq = (index as u64).saturating_mul(2).saturating_add(1);
             ledger.extend_from_slice(
                 &serde_json::to_vec(&StoredGap {
-                    slot_id: "slot-1".into(),
+                    port: "slot-1".into(),
                     epoch,
                     first_seq,
                     last_seq: first_seq,
@@ -3966,7 +3965,7 @@ mod tests {
         write_sealed_test_events(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -4003,7 +4002,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -4035,7 +4034,7 @@ mod tests {
         write_sealed_test_events(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -4068,7 +4067,7 @@ mod tests {
         fs::create_dir_all(&config.root_dir).unwrap();
         let epoch = Uuid::new_v4();
         let first = StoredGap {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             epoch,
             first_seq: 1,
             last_seq: 1,
@@ -4084,7 +4083,7 @@ mod tests {
         let mut bytes = serde_json::to_vec(&first).unwrap();
         bytes.push(b'\n');
         let valid_prefix = bytes.clone();
-        bytes.extend_from_slice(br#"{"slot_id":"torn"#);
+        bytes.extend_from_slice(br#"{"port":"torn"#);
         fs::write(config.root_dir.join(GAP_LEDGER_NAME), bytes).unwrap();
 
         let update = append_gap_ledger(&config.root_dir, &second).unwrap();
@@ -4112,7 +4111,7 @@ mod tests {
         append_gap_ledger(
             &config.root_dir,
             &StoredGap {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 epoch,
                 first_seq: 1,
                 last_seq: 10,
@@ -4142,7 +4141,7 @@ mod tests {
         let config = test_config(&temp);
         fs::create_dir_all(&config.root_dir).unwrap();
         let gap = StoredGap {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             epoch: Uuid::new_v4(),
             first_seq: 1,
             last_seq: 1,
@@ -4152,7 +4151,7 @@ mod tests {
         let mut valid = serde_json::to_vec(&gap).unwrap();
         valid.push(b'\n');
         let mut torn = valid.clone();
-        torn.extend_from_slice(br#"{"slot_id":"partial"#);
+        torn.extend_from_slice(br#"{"port":"partial"#);
         fs::write(config.root_dir.join(GAP_LEDGER_NAME), torn).unwrap();
 
         let manager = JournalManager::open(config.clone()).unwrap();
@@ -4175,7 +4174,7 @@ mod tests {
             .append(event(epoch, 1, Direction::Rx, b"one".to_vec()))
             .unwrap();
         let key = StreamKey {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             epoch,
         };
         let (poisoned_path, valid_len) = {
@@ -4223,7 +4222,7 @@ mod tests {
                 .unwrap();
         }
         let head_before = state.heads[&StreamKey {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             epoch,
         }];
         let mut constrained_config = (*state.config).clone();
@@ -4238,7 +4237,7 @@ mod tests {
         assert!(matches!(error, JournalError::RetentionFailed { .. }));
         assert_eq!(
             state.heads[&StreamKey {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 epoch,
             }],
             head_before
@@ -4266,7 +4265,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: old_epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -4277,7 +4276,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: latest_epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 200,
@@ -4288,7 +4287,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: latest_epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 201,
@@ -4327,7 +4326,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 100,
@@ -4338,7 +4337,7 @@ mod tests {
         write_sealed_test_segment(
             &config,
             SegmentHeader {
-                slot_id: "slot-1".into(),
+                port: "slot-1".into(),
                 daemon_epoch: epoch,
                 segment_id: Uuid::new_v4(),
                 created_wall_time_ns: 200,

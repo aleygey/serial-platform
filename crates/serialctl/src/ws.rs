@@ -1,19 +1,15 @@
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
-    ActorKind, ClientMessage, Cursor, ErrorCode, PROTOCOL_VERSION, Role, ServerMessage,
-    Subscription, WireFrame, decode_wire_frame, encode_client_control,
+    ActorKind, ClientMessage, Cursor, ErrorCode, PROTOCOL_VERSION, ServerMessage, Subscription,
+    WireFrame, decode_wire_frame, encode_client_control,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        http::{HeaderValue, header::AUTHORIZATION},
-    },
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use uuid::Uuid;
 
@@ -58,8 +54,7 @@ pub struct NetworkHandle {
 
 pub fn spawn(
     endpoint: String,
-    token: Option<String>,
-    slots: Vec<String>,
+    ports: Vec<String>,
     initial_cursors: HashMap<String, Cursor>,
 ) -> NetworkHandle {
     // Writes and control RPCs are bounded too: a stalled connection must not
@@ -71,8 +66,7 @@ pub fn spawn(
     let (event_tx, event_rx) = mpsc::channel(1_024);
     tokio::spawn(run_worker(
         endpoint,
-        token,
-        slots,
+        ports,
         initial_cursors,
         command_rx,
         event_tx,
@@ -83,53 +77,9 @@ pub fn spawn(
     }
 }
 
-/// Authenticates a short-lived WebSocket without attaching any Slot and
-/// returns the daemon-authoritative role. `serialctl init` uses this to avoid
-/// accidentally persisting an observer or admin credential for daily use.
-pub async fn probe_role(endpoint: &str, token: &str) -> Result<Role> {
-    let mut socket = connect(endpoint, Some(token)).await?;
-    let hello = ClientMessage::Hello {
-        request_id: Uuid::new_v4(),
-        protocol_version: PROTOCOL_VERSION,
-        client_name: "serialctl-init-role-check".into(),
-        actor_kind: ActorKind::Human,
-    };
-    send_control(&mut socket, &hello).await?;
-
-    let role = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match socket.next().await {
-                Some(Ok(Message::Binary(bytes))) => match decode_wire_frame(&bytes)? {
-                    WireFrame::Control(ServerMessage::Welcome { role, .. }) => {
-                        return Ok::<Role, anyhow::Error>(role);
-                    }
-                    WireFrame::Control(ServerMessage::Error { message, .. }) => {
-                        bail!("seriald rejected the operator credential: {message}")
-                    }
-                    _ => {}
-                },
-                Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
-                Some(Ok(Message::Close(_))) | None => {
-                    bail!("seriald closed the role-check connection before authentication")
-                }
-                Some(Ok(Message::Text(_))) => {
-                    bail!("seriald sent an unsupported text role-check response")
-                }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(error.into()),
-            }
-        }
-    })
-    .await
-    .context("timed out verifying the operator token")??;
-    let _ = socket.close(None).await;
-    Ok(role)
-}
-
 async fn run_worker(
     endpoint: String,
-    token: Option<String>,
-    slots: Vec<String>,
+    ports: Vec<String>,
     initial_cursors: HashMap<String, Cursor>,
     mut commands: mpsc::Receiver<NetworkCommand>,
     events: mpsc::Sender<NetworkEvent>,
@@ -144,7 +94,7 @@ async fn run_worker(
 
     'reconnect: loop {
         let connection = tokio::select! {
-            result = connect(&endpoint, token.as_deref()) => result,
+            result = connect(&endpoint) => result,
             command = commands.recv() => {
                 match command {
                     Some(NetworkCommand::Shutdown) | None => break 'reconnect,
@@ -215,7 +165,7 @@ async fn run_worker(
         let attach_request_id = Uuid::new_v4();
         let attach = ClientMessage::Attach {
             request_id: attach_request_id,
-            subscriptions: build_subscriptions(&slots, &cursors),
+            subscriptions: build_subscriptions(&ports, &cursors),
         };
         if let Err(error) = send_control(&mut socket, &attach).await {
             let _ = events
@@ -328,12 +278,12 @@ async fn run_worker(
     }
 }
 
-fn build_subscriptions(slots: &[String], cursors: &HashMap<String, Cursor>) -> Vec<Subscription> {
-    slots
+fn build_subscriptions(ports: &[String], cursors: &HashMap<String, Cursor>) -> Vec<Subscription> {
+    ports
         .iter()
-        .map(|slot_id| Subscription {
-            slot_id: slot_id.clone(),
-            cursor: cursors.get(slot_id).cloned(),
+        .map(|port| Subscription {
+            port: port.clone(),
+            cursor: cursors.get(port).cloned(),
             tail_events: 500,
         })
         .collect()
@@ -342,11 +292,11 @@ fn build_subscriptions(slots: &[String], cursors: &HashMap<String, Cursor>) -> V
 fn reconnect_directive(frame: &WireFrame, attach_request_id: Uuid) -> Option<ReconnectDirective> {
     match frame {
         WireFrame::Control(ServerMessage::Lagged {
-            slot_id,
+            port,
             from_seq,
             to_seq,
         }) => Some(ReconnectDirective::PreserveCursors(format!(
-            "{slot_id} lagged at sequences {from_seq}..={to_seq}; reconnecting all Slots"
+            "{port} lagged at sequences {from_seq}..={to_seq}; reconnecting all Ports"
         ))),
         WireFrame::Control(ServerMessage::Error {
             request_id: Some(request_id),
@@ -362,7 +312,6 @@ fn reconnect_directive(frame: &WireFrame, attach_request_id: Uuid) -> Option<Rec
 
 async fn connect(
     endpoint: &str,
-    token: Option<&str>,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
@@ -371,16 +320,9 @@ async fn connect(
         .strip_prefix("http://")
         .expect("normalized v1 endpoint always uses http");
     let ws_base = format!("ws://{rest}");
-    let mut request = format!("{ws_base}/api/v1/ws")
+    let request = format!("{ws_base}/api/v1/ws")
         .into_client_request()
         .context("invalid seriald WebSocket URL")?;
-    if let Some(token) = token {
-        request.headers_mut().insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("token contains invalid HTTP header characters")?,
-        );
-    }
     let (socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
         .await
         .context("WebSocket connection timed out")??;
@@ -404,30 +346,25 @@ fn update_cursors(
 ) {
     match frame {
         WireFrame::Rx(header, _) | WireFrame::Tx(header, _) => {
-            advance_cursor(cursors, &header.slot_id, header.daemon_epoch, header.seq);
+            advance_cursor(cursors, &header.port, header.daemon_epoch, header.seq);
         }
         WireFrame::Control(ServerMessage::Timeline { event, .. }) => {
-            advance_cursor(cursors, &event.slot_id, event.daemon_epoch, event.seq);
+            advance_cursor(cursors, &event.port, event.daemon_epoch, event.seq);
         }
-        WireFrame::Control(ServerMessage::Snapshot { slot }) => {
-            slot_epochs.insert(slot.config.id.clone(), slot.daemon_epoch);
+        WireFrame::Control(ServerMessage::Snapshot { port: slot }) => {
+            slot_epochs.insert(slot.config.port.clone(), slot.daemon_epoch);
         }
-        WireFrame::Control(ServerMessage::Ready { slot_id, head_seq }) => {
-            if let Some(epoch) = slot_epochs.get(slot_id).copied() {
-                advance_cursor(cursors, slot_id, epoch, *head_seq);
+        WireFrame::Control(ServerMessage::Ready { port, head_seq }) => {
+            if let Some(epoch) = slot_epochs.get(port).copied() {
+                advance_cursor(cursors, port, epoch, *head_seq);
             }
         }
         _ => {}
     }
 }
 
-fn advance_cursor(
-    cursors: &mut HashMap<String, Cursor>,
-    slot_id: &str,
-    epoch: uuid::Uuid,
-    seq: u64,
-) {
-    match cursors.get_mut(slot_id) {
+fn advance_cursor(cursors: &mut HashMap<String, Cursor>, port: &str, epoch: uuid::Uuid, seq: u64) {
+    match cursors.get_mut(port) {
         Some(cursor) if cursor.epoch == epoch => cursor.after_seq = cursor.after_seq.max(seq),
         Some(cursor) => {
             *cursor = Cursor {
@@ -437,7 +374,7 @@ fn advance_cursor(
         }
         None => {
             cursors.insert(
-                slot_id.to_string(),
+                port.to_string(),
                 Cursor {
                     epoch,
                     after_seq: seq,
@@ -454,7 +391,7 @@ mod tests {
     #[test]
     fn lagged_forces_reconnect_without_discarding_the_last_received_cursor() {
         let frame = WireFrame::Control(ServerMessage::Lagged {
-            slot_id: "slot-1".into(),
+            port: "COM4".into(),
             from_seq: 11,
             to_seq: 20,
         });
@@ -482,9 +419,9 @@ mod tests {
     #[test]
     fn startup_subscription_resumes_at_the_scanned_journal_cursor_not_live_head() {
         let epoch = Uuid::new_v4();
-        let slots = vec!["slot-1".to_string()];
+        let ports = vec!["COM4".to_string()];
         let cursors = HashMap::from([(
-            "slot-1".to_string(),
+            "COM4".to_string(),
             Cursor {
                 epoch,
                 after_seq: 10,
@@ -494,7 +431,7 @@ mod tests {
         // The status snapshot may already report #12 while #11/#12 are still
         // awaiting journal acknowledgement. Only K=#10 is supplied here, so
         // seriald's ring remains responsible for replaying that live tail.
-        let subscriptions = build_subscriptions(&slots, &cursors);
+        let subscriptions = build_subscriptions(&ports, &cursors);
 
         assert_eq!(subscriptions.len(), 1);
         assert_eq!(subscriptions[0].cursor.as_ref().unwrap().after_seq, 10);
@@ -503,7 +440,7 @@ mod tests {
 
     #[test]
     fn startup_subscription_without_a_verified_cursor_uses_tail_attach() {
-        let subscriptions = build_subscriptions(&["slot-1".into()], &HashMap::new());
+        let subscriptions = build_subscriptions(&["COM4".into()], &HashMap::new());
 
         assert!(subscriptions[0].cursor.is_none());
         assert_eq!(subscriptions[0].tail_events, 500);

@@ -6,7 +6,7 @@ mod render;
 mod session;
 mod tools;
 
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -14,8 +14,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "serial-mcp", version, about = "MCP adapter for seriald")]
 struct Args {
-    /// Print the complete MCP tool definitions as JSON and exit without
-    /// reading credentials or connecting to seriald.
+    /// Print the complete MCP tool definitions as JSON without connecting.
     #[arg(long)]
     dump_tools: bool,
     /// serialctl-compatible TOML config path.
@@ -24,9 +23,13 @@ struct Args {
     /// seriald HTTP origin, normally the Windows host-only address from a Linux VM.
     #[arg(long, env = "SERIALD_ENDPOINT")]
     endpoint: Option<String>,
-    /// File containing the seriald operator token. Never pass the token itself.
-    #[arg(long, env = "SERIALD_TOKEN_FILE")]
-    token_file: Option<PathBuf>,
+    /// Serve sessionless MCP Streamable HTTP on this loopback address instead
+    /// of stdio. The unified `serial` launcher uses 127.0.0.1:3211.
+    #[arg(long, env = "SERIAL_MCP_LISTEN")]
+    listen: Option<SocketAddr>,
+    /// Exit cleanly when the parent launcher closes stdin.
+    #[arg(long, hide = true)]
+    managed: bool,
     /// Stable audit label for this agent adapter process.
     #[arg(long, env = "SERIAL_MCP_ACTOR_LABEL", default_value = "agent")]
     actor_label: String,
@@ -60,32 +63,24 @@ async fn run() -> Result<()> {
     {
         bail!("actor label must contain 1-128 non-control UTF-8 bytes");
     }
-    let resolved = config::resolve(
-        args.config,
-        args.endpoint,
-        args.token_file,
-        args.orphan_run_timeout_seconds,
-    )?;
+    let resolved = config::resolve(args.config, args.endpoint, args.orphan_run_timeout_seconds)?;
     if resolved.orphan_run_timeout.is_none() {
         eprintln!(
             "serial-mcp: warning: orphan Run timeout is unlimited; every workflow must call \
              run_end, or this process will keep renewing its 60-second control lease"
         );
     }
-    let api = api::ApiClient::new(resolved.endpoint.clone(), resolved.token.clone())?;
+    let api = api::ApiClient::new(resolved.endpoint.clone())?;
     let session = session::SessionHandle::spawn(
         resolved.endpoint,
-        resolved.token,
         actor_label.clone(),
         resolved.orphan_run_timeout,
     );
-    mcp::serve(tools::AgentTools::new(
-        api,
-        session,
-        actor_label,
-        resolved.capture,
-    ))
-    .await
+    let tools = tools::AgentTools::new(api, session, actor_label, resolved.capture);
+    match args.listen {
+        Some(listen) => mcp::serve_http(tools, listen, args.managed).await,
+        None => mcp::serve_stdio(tools).await,
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +93,16 @@ mod tests {
         assert!(args.dump_tools);
         assert!(args.config.is_none());
         assert!(args.endpoint.is_none());
-        assert!(args.token_file.is_none());
+        assert!(args.listen.is_none());
+        assert!(!args.managed);
         assert!(args.orphan_run_timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn managed_http_mode_is_available_to_the_unified_launcher() {
+        let args = Args::try_parse_from(["serial-mcp", "--listen", "127.0.0.1:3211", "--managed"])
+            .unwrap();
+        assert!(args.managed);
+        assert_eq!(args.listen, Some("127.0.0.1:3211".parse().unwrap()));
     }
 }

@@ -1,673 +1,511 @@
-# Serial Platform Protocol Reference
+# Serial Platform Protocol v4
 
-This document records the protocol surface implemented by the current source
-tree. It covers the `serial-mcp` stdio transport, the `seriald` HTTP API, and
-WebSocket protocol v3. The Rust DTOs in `crates/serial-protocol`, the routes in
-`crates/seriald/src/api.rs`, and the MCP dispatcher in
-`crates/serial-mcp/src/mcp.rs` remain the executable source of truth.
+本文是 `seriald` HTTP/WebSocket 和 `serial-mcp` transport 的当前线协议说明。Rust DTO 与编码实现位于 `serial-protocol`；Agent 工具参数见 [MCP_TOOLS.md](./MCP_TOOLS.md)。
 
-For the complete MCP tool schemas and result contracts, see
-[MCP_TOOLS.md](./MCP_TOOLS.md). `serial mcp --dump-tools` emits the same
-authoritative tool registry as JSON without starting the stdio server.
+## 端点
 
-## Shared conventions
+默认本地地址：
 
-- New personal installations default to token-free loopback-only mode. In that
-  mode HTTP and WebSocket requests omit Authorization and seriald grants the
-  local connection the admin role. seriald rejects both configured and
-  runtime bind overrides to non-loopback addresses while authentication is
-  disabled.
-- Existing configurations remain authenticated because a missing
-  `auth_required` field defaults to `true`; those HTTP and WebSocket endpoints
-  use `Authorization: Bearer <token>` and keep the three roles below.
-- Roles are ordered `observer < operator < admin`; a stronger credential may
-  use every weaker-role operation.
-- JSON enum names and tagged-union `type` values use `snake_case`.
-- UUID fields are JSON strings. Wall-clock timestamps ending in `_ns` are Unix
-  nanoseconds; monotonic timestamps are meaningful only inside the current
-  daemon process.
-- Raw serial and Trigger bytes are base64 in JSON control objects. RX/TX data
-  frames carry the bytes unchanged in the binary payload.
-- A durable serial cursor is `(slot_id, daemon_epoch, after_seq)`. A sequence
-  number without its epoch is not a cross-restart continuation.
-- `server_id` identifies one installation, `daemon_epoch` one daemon process,
-  and a Slot `generation` one successfully opened physical serial session.
-- An HTTP error body is `{"code": <ErrorCode>, "message": <string>}`.
-  WebSocket errors use `ServerMessage::Error` and additionally carry
-  `request_id` and `retryable`.
+```text
+seriald HTTP/WebSocket: http://127.0.0.1:3210
+MCP Streamable HTTP:    http://127.0.0.1:3211/mcp
+```
 
-## MCP stdio JSON-RPC
+公开设备标识只有 `port`，值是操作系统串口名。HTTP path 中必须 percent-encode `/` 等保留字符，例如：
 
-### Framing and lifecycle
+```text
+/dev/cu.usbserial-210
+→ /api/v1/ports/%2Fdev%2Fcu.usbserial-210/events
+```
 
-`serial-mcp` uses newline-delimited JSON-RPC 2.0 on stdin/stdout: one complete
-JSON object per line. Blank input lines are ignored. Requests execute
-concurrently, while one dedicated writer serializes and flushes complete
-stdout lines so responses cannot interleave.
+JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端口字符串。
 
-The normal lifecycle is:
+## HTTP v1
 
-1. The host sends `initialize` with an optional MCP `protocolVersion`.
-2. The server returns the selected version, fixed tool capability, server
-   identity, and operating instructions.
-3. The host may send the `notifications/initialized` notification. It has no
-   response; unknown notifications are also ignored.
-4. The host uses `ping`, `tools/list`, and `tools/call`.
-5. Closing stdin cancels only cancellable observations. Mutating requests are
-   allowed to converge to an authoritative result before the process exits.
+### 路由
 
-Supported MCP protocol versions are `2025-11-25`, `2025-06-18`, `2025-03-26`,
-and `2024-11-05`. `2025-11-25` is the current default. An unsupported requested
-version falls back to that current version.
-
-### Methods
-
-| Method | Request/response |
-|---|---|
-| `initialize` | Accepts `params.protocolVersion`; returns `protocolVersion`, `capabilities.tools.listChanged=false`, `serverInfo`, and safety instructions. |
-| `ping` | Returns an empty object. |
-| `tools/list` | Returns the current registry under `tools`. Use this response or `serial mcp --dump-tools` instead of a copied tool count/schema. |
-| `tools/call` | Requires `params.name`; `params.arguments` defaults to `{}`. Unknown tools and invalid arguments are rejected. |
-| `notifications/cancelled` | Notification; reads the target ID from `params.requestId` or fallback `params.id`. |
-| `$/cancelRequest` | LSP-compatible cancellation notification; reads `params.id` (or `requestId`). |
-
-A successful tool call returns both a compact compatibility text block and the
-same JSON value as `structuredContent`. A tool-level failure is still a
-JSON-RPC success envelope whose tool result has `isError=true`; it is not
-silently converted into a transport error.
-
-### JSON-RPC errors
-
-| Code | Meaning |
-|---:|---|
-| `-32700` | Input is not valid JSON or cannot be decoded as the implemented request envelope. |
-| `-32600` | Invalid JSON-RPC version or a duplicate active request ID. |
-| `-32601` | Method not found. |
-| `-32602` | Invalid `tools/call` parameters or unknown tool. |
-| `-32800` | A cancellable request was cancelled. |
-
-Requests must carry `jsonrpc: "2.0"`. Notifications have no `id` and receive
-no response. Reusing an ID while it is still active is rejected; the existing
-request is never replaced.
-
-### Cancellation boundary
-
-Cancellation is deliberately restricted to pure observations. The currently
-cancellable tool calls are `devices`, `device_models`, `read`, `wait`,
-`search`, `monitor_list`, `monitor_status`, and `monitor_incidents`. All other
-tool calls are non-cancellable because they can cross a serial, Control, Run,
-Trigger, Monitor, or persistence side-effect boundary. Cancellation of those
-mutations is ignored and their tasks continue toward an authoritative result.
-
-When stdin closes, the dispatcher sends cancellation only to those read-only
-tasks, waits for all non-cancellable tasks, closes the stdout writer, and then
-exits. Per-Slot write serialization in the adapter still prevents concurrent
-Agent calls from interleaving physical bytes.
-
-## HTTP `/api/v1`
-
-Every route enforces the minimum role below. In token-free loopback mode,
-requests omit Authorization and receive the effective admin role. In
-authenticated mode, every route—including health and WebSocket upgrade—needs
-a bearer token meeting that role. `GET /api/v1/health` reports
-`auth_required`; clients decode the field as `true` when an older daemon omits
-it.
-
-| Method and path | Minimum role | Request/query and result |
+| Method | Path | 用途 |
 |---|---|---|
-| `GET /api/v1/health` | observer | Process status, `server_id`, `daemon_epoch`, uptime, protocol version, and `auth_required`. |
-| `GET /api/v1/status` | observer | All authoritative `SlotSnapshot`s plus identities, `config_revision`, and the additive `sequence_write_precondition_supported` / `serial_context_precondition_supported` capabilities. |
-| `GET /api/v1/ports` | admin | Enumerates serial ports on the daemon host. |
-| `PUT /api/v1/config/slots` | admin | Body `{slots, expected_revision?}`; full validated Slot replacement and resulting snapshots. |
-| `GET /api/v1/config/transport-profiles` | observer | `{profiles, config_revision}`. |
-| `PUT /api/v1/config/transport-profiles` | admin | Body `{profiles, expected_revision?}`; full catalog replacement. |
-| `GET /api/v1/config/device-profiles` | observer | `{profiles, config_revision}`. |
-| `PUT /api/v1/config/device-profiles` | admin | Body `{profiles, expected_revision?}`; full catalog replacement. |
-| `GET /api/v1/config/device-models` | observer | `{models, bindings, config_revision}`. |
-| `PUT /api/v1/config/device-models` | admin | Body `{models, expected_revision?}`; full identity-catalog replacement while retaining valid bindings. |
-| `PUT /api/v1/slots/{slot_id}/device-model` | operator | Atomically attach/detach a model and optionally create a missing model; response includes binding, model, `created`, and revision. |
-| `GET /api/v1/archives` | observer | Optional `slot_id`; bounded retained Slot/epoch archive catalog ordered newest first by `last_segment_wall_time_ns`. |
-| `GET /api/v1/diagnostics` | observer | Daemon, WebSocket, journal, and all per-Slot diagnostics. |
-| `GET /api/v1/diagnostics/storage` | observer | Journal quota, queue, archive, and logging health. |
-| `GET /api/v1/slots/{slot_id}/diagnostics` | observer | One snapshot plus subscriber count/lag. |
-| `GET /api/v1/slots/{slot_id}/events` | observer | `EventQuery`; bounded durable event page, cursor, retention information, and gaps. |
-| `GET /api/v1/slots/{slot_id}/tail` | observer | Atomic bounded live-ring snapshot or cursor page; optional `tail_events` is clamped to `[1,2000]`, and a cursor requires both `epoch` and `after_seq`. |
-| `GET /api/v1/slots/{slot_id}/recent-activity` | observer | Bounded TX/ownership evidence over one live-ring interval; requires `epoch`, exclusive `after_seq`, and inclusive `through_seq`. |
-| `POST /api/v1/monitors` | operator | Body `{request_id, spec}`; idempotently creates a persistent Monitor. |
-| `GET /api/v1/monitors` | observer | Optional `slot_id` and `status`; lists Monitors. |
-| `GET /api/v1/monitors/{monitor_id}` | observer | Gets one Monitor. |
-| `PUT /api/v1/monitors/{monitor_id}` | operator | Body `{spec, expected_revision}`; replaces the Monitor under optimistic concurrency. |
-| `DELETE /api/v1/monitors/{monitor_id}` | operator | Required query `expected_revision`; stops the Monitor. |
-| `GET /api/v1/monitors/{monitor_id}/incidents` | observer | Optional `after_incident_seq`, `limit`, `include_acked`; bounded incident page. |
-| `POST /api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | operator | Idempotently ACKs the incident and returns it. |
-| `GET /api/v1/ws` | observer | Upgrades to WebSocket v3; observer may subscribe, while Slot commands require operator. |
+| `GET` | `/api/v1/health` | 进程健康、server/epoch、uptime、protocol version |
+| `GET` | `/api/v1/status` | 全局状态、config revision、所有配置端口 snapshot |
+| `GET` | `/api/v1/ports` | 枚举主机可见的 OS 串口 |
+| `PUT` | `/api/v1/config/ports` | 原子替换端口配置 |
+| `GET` / `PUT` | `/api/v1/config/transport-profiles` | 读取/原子替换 Transport Profile catalog |
+| `GET` / `PUT` | `/api/v1/config/model-profiles` | 读取/原子替换 Model Profile catalog |
+| `GET` | `/api/v1/archives` | 枚举保留的端口/周期日志 |
+| `GET` | `/api/v1/diagnostics` | 后端、连接、journal 与所有端口诊断 |
+| `GET` | `/api/v1/diagnostics/storage` | journal 用量与 writer health |
+| `GET` | `/api/v1/ports/{port}/diagnostics` | 一个端口的权威状态与 subscriber 指标 |
+| `GET` | `/api/v1/ports/{port}/tail` | 从有界 replay ring 读取实时 tail/continuation |
+| `GET` | `/api/v1/ports/{port}/recent-activity` | MCP 操作间的紧凑第三方活动 |
+| `GET` | `/api/v1/ports/{port}/events` | 有界 journal 查询 |
+| `GET` / `POST` | `/api/v1/monitors` | 列表/创建 Monitor |
+| `GET` / `PUT` / `DELETE` | `/api/v1/monitors/{monitor_id}` | 读取/更新/停止 Monitor |
+| `GET` | `/api/v1/monitors/{monitor_id}/incidents` | 分页读取 incident |
+| `POST` | `/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | 确认 incident |
+| `GET` | `/api/v1/ws` | WebSocket protocol v4 |
 
-v0.7 keeps WebSocket protocol v3 and the core Monitor/Incident routes, but
-removes the retired `/api/v1/monitor-events` delivery routes and
-`MonitorSpec.event_ttl_ms`. A legacy `[monitor_event_sink]` configuration table
-is accepted only for migration, ignored at runtime, and omitted on the next
-configuration save.
+### Health
 
-### Event queries
+```json
+{
+  "status": "ok",
+  "server_id": "uuid",
+  "daemon_epoch": "uuid",
+  "uptime_ms": 1200,
+  "protocol_version": 4
+}
+```
 
-`/tail` is not an `EventQuery` and never discovers journal segments. Without a
-cursor it uses the Slot actor's atomic Attach snapshot, returns the newest
-`tail_events`, sets `next_cursor` to the snapshot head, and keeps
-`first_available_seq` equal to the actual oldest ring event even when the
-requested tail window is smaller. serial-mcp adds
-`source=live_ring,bounded_tail=true` so this intentional window is not
-presented as journal retention loss.
+### Status 与 PortSnapshot
 
-With both `epoch` and exclusive `after_seq`, `/tail` is a bounded oldest-next
-page through that same snapshot. It returns at most `tail_events` and advances
-`next_cursor` only through the last returned event when more retained events
-remain. Ring eviction and epoch change produce explicit gaps and a partial
-result, while the returned current-epoch cursor can resume retained events.
-This path is bounded by the 20,000-event / 4-MiB live ring and never scans an
-active or sealed journal segment. serial-mcp uses it for
-`read(scope=continue)` and adds `source=live_ring,bounded_continue=true`.
+`GET /api/v1/status`：
 
-`/recent-activity` uses the same live ring, filters to TX and control/Run-loss
-evidence, and returns at most 32 newest matching events. Replay loss or that
-summary bound sets `truncated=true`, including when no relevant event survives,
-so a caller cannot mistake incomplete evidence for proof of no interference.
+```json
+{
+  "server_id": "uuid",
+  "daemon_epoch": "uuid",
+  "protocol_version": 4,
+  "config_revision": 12,
+  "sequence_write_precondition_supported": true,
+  "serial_context_precondition_supported": true,
+  "ports": []
+}
+```
 
-`EventQuery` supports `epoch`, exclusive `after_seq`, inclusive
-`through_seq`, `before_wall_time_ns`, `after_wall_time_ns`, `direction`,
-`kind`, `actor_id`, `run_id`, `operation_id`, one of `contains` or `regex`,
-`limit_events`, and `limit_bytes`. If `epoch` is omitted, the HTTP handler
-inserts the current daemon epoch; archived history therefore requires an
-explicit epoch. Invalid regexes are `regex_invalid`; exhausted query budgets
-return HTTP 429 with `query_budget_exceeded`. Expressions that can match an
-empty byte string are rejected because no serial event byte can own such a
-match.
+每个 port snapshot 的主要字段：
 
-Literal and regex matching may span adjacent events only while direction,
-generation, byte offsets, and serial lifecycle remain continuous. Regex
-results use non-empty, non-overlapping stream-match semantics: the event that
-supplies the final byte is returned once, and an overlapping match that reuses
-bytes from an earlier non-overlapping match is not reported. A match wholly
-contained in the bounded 64 KiB carry prefix is old evidence and is never
-attributed to a later event. At most 64 KiB from preceding chunks is retained;
-a match whose required prefix has already fallen outside that window is not
-found, while the current event may itself be larger. Once a match completes,
-later bytes cannot extend that same left-most match into duplicate results;
-matching resumes after its end.
+```json
+{
+  "config": {
+    "port": "COM4",
+    "transport_profile": "uart-115200",
+    "model_profile": "TL-AS7230 1.0",
+    "enabled": true
+  },
+  "daemon_epoch": "uuid",
+  "head_seq": 812,
+  "ring_oldest_seq": 590,
+  "generation": 3,
+  "endpoint_present": true,
+  "session_state": "online",
+  "state_reason": null,
+  "state_code": null,
+  "target_activity": "active",
+  "last_rx_wall_time_ns": 1700000000000000000,
+  "rx_offset": 20480,
+  "tx_offset": 311,
+  "control": null,
+  "active_run": null,
+  "active_trigger": null,
+  "logging": "healthy",
+  "effective_shell_prompt": "root@router:~# ",
+  "effective_uboot_prompt": "=> ",
+  "effective_write_eol": "\r",
+  "effective_echo": "auto",
+  "effective_transport": {
+    "baud_rate": 115200,
+    "data_bits": "eight",
+    "parity": "none",
+    "stop_bits": "one",
+    "flow_control": "none",
+    "dtr": false,
+    "rts": false,
+    "auto_open": true
+  },
+  "effective_write_pacing": {
+    "chunk_size": 1,
+    "chunk_delay_ms": 1
+  }
+}
+```
 
-### Configuration concurrency and commit order
+`session_state`：`disabled`、`waiting_for_port`、`opening`、`online`、`backoff`、`stopping`。
 
-All Slot/Profile/model mutations share one daemon configuration mutation lock.
-They validate a complete candidate and increment the monotonic
-`config_revision`. If `expected_revision` is supplied and does not equal the
-current revision, the request returns HTTP 409 / `config_revision_mismatch`
-before staging or saving.
+### 配置 DTO
 
-Slot and behavior-changing Profile replacements stage affected actors, save
-the candidate atomically, commit runtime state, then publish it. Save failures
-roll back staged actors; final commit failures attempt to restore the prior
-persisted configuration. Device-model identity changes do not alter serial
-behavior, but their catalog and bindings are still validated, saved, and
-published as one configuration revision. Removing a Slot also removes its
-model binding; replacing a retained Slot preserves its binding.
+`PUT /api/v1/config/ports`：
 
-Monitor creation uses `request_id` as its stable idempotency key. Reuse with a
-different spec is a conflict. Monitor update and stop require the current
-Monitor `revision`. Monitor and ACK mutations serialize through the Monitor
-persistence lock and restore the previous in-memory state if persistence
-fails.
+```json
+{
+  "ports": [
+    {
+      "port": "COM4",
+      "transport_profile": "uart-115200",
+      "model_profile": "TL-AS7230 1.0",
+      "enabled": true
+    }
+  ],
+  "source": "human:desktop",
+  "expected_revision": 12
+}
+```
 
-### Slot device-model request
+响应返回更新后的 `ports` snapshots 与新 `config_revision`。`source` 是 1–128 字符的审计标签。
 
-`SetSlotDeviceModelRequest` has:
+Transport Profile：
 
-- `model_id`: string to attach; JSON `null`/omission detaches.
-- `create_if_missing`: when true, `name`, `parent_id`, and `aliases` describe
-  a model created in the same transaction before binding.
-- `update_existing`: mutually exclusive with creation; patches only the node
-  whose ID exactly matches this Slot's current binding. It requires both an
-  exact `expected_revision` and string `expected_current`. `name` replaces the
-  display name, `parent_id`/`clear_parent` replace/remove the parent, and a
-  non-empty `aliases`/`clear_aliases` replaces/removes aliases.
-- `confirmation_method`: `serial`, `telnet`, `web`, `human`, or `other`;
-  required when attaching.
-- `note`: optional audit context for how the assignment was established.
-- `source`: required workflow/audit source string.
-- `expected_revision`: optional global configuration guard.
-- `expected_current`: a three-state per-Slot guard. Omitted means no binding
-  guard, explicit JSON `null` requires the Slot to be unbound, and a string
-  requires that exact current model ID.
+```json
+{
+  "name": "uart-115200",
+  "baud_rate": 115200,
+  "data_bits": "eight",
+  "parity": "none",
+  "stop_bits": "one",
+  "flow_control": "none",
+  "dtr": false,
+  "rts": false,
+  "auto_open": true
+}
+```
 
-An existing ID plus a conflicting `create_if_missing` definition returns HTTP
-409. An unknown parent, hierarchy cycle, duplicate ID/alias, dangling binding,
-or invalid field returns HTTP 400. Create/bind and guarded update/bind are
-atomic. An update to a shared node changes the metadata observed by every Slot
-listed in response `affected_slots`; it never changes those Slots' bindings.
+Model Profile：
 
-### HTTP status/error mapping
+```json
+{
+  "name": "TL-AS7230 1.0",
+  "shell_prompt": "root@router:~# ",
+  "uboot_prompt": "=> ",
+  "write_eol": "\r",
+  "echo": "auto",
+  "write_chunk_size": 1,
+  "write_chunk_delay_ms": 1
+}
+```
 
-- 400: invalid DTO/config/query/Monitor spec.
-- 401: missing, malformed, or invalid bearer credential.
-- 403: authenticated role is too weak.
-- 404: unknown Slot, Monitor, Incident, model, or archive target.
-- 409: configuration/Monitor revision mismatch, model binding guard mismatch,
-  or conflicting idempotent definition.
-- 429: WebSocket/Monitor capacity or journal query budget exhausted.
-- 503: the runtime registry is shutting down or degraded.
-- 500: persistence, rollback, journal, Monitor runtime, or unexpected internal
-  failure.
+Profile catalog GET 响应是 `{profiles, config_revision}`；PUT body 是 `{profiles, expected_revision?}`，表示完整替换。Profile 名称按原字符串比较和显示。
 
-## WebSocket protocol v3
+### TimelineEvent
 
-### Endpoint, envelope, and limits
+历史 API 与 WebSocket timeline 使用相同事件模型：
 
-Endpoint: `GET /api/v1/ws`. The upgrade requires at least Observer. At most
-256 WebSocket connections are admitted; excess upgrades receive HTTP 429.
-Each connection has a bounded 512-frame outbound queue. Incoming messages and
-frames are capped at 64 KiB.
+```json
+{
+  "port": "COM4",
+  "daemon_epoch": "uuid",
+  "seq": 812,
+  "generation": 3,
+  "wall_time_ns": 1700000000000000000,
+  "monotonic_time_ns": 4123000000,
+  "kind": "rx",
+  "direction": "rx",
+  "actor": null,
+  "run_id": null,
+  "operation_id": null,
+  "stream_offset_start": 20470,
+  "stream_offset_end": 20480,
+  "data": "base64",
+  "metadata": {},
+  "durable": true
+}
+```
 
-Binary frames use:
+`kind` 当前取值：
+
+```text
+rx tx
+serial_opening serial_opened serial_open_failed serial_closed
+port_reconfigured port_removed
+control_granted control_released control_revoked control_expired
+run_started run_ended run_aborted
+trigger_started trigger_completed trigger_cancelled trigger_failed
+break checkpoint logging_degraded gap
+```
+
+`direction` 是 `rx`、`tx` 或 `none`。`data` 在 JSON control/history 中使用 base64；WebSocket data frame 把 raw bytes 放在 payload 中。
+
+Agent command TX 的 metadata 可以包含：
+
+```json
+{
+  "command_description": "输入登录账号",
+  "command_capture_matchers": [
+    {"kind": "contains", "value": "Password:"}
+  ],
+  "command_sequence_id": "uuid",
+  "command_sequence_description": "登录设备",
+  "command_sequence_step_index": 0,
+  "command_sequence_step_count": 2
+}
+```
+
+matcher kind 为 `contains`、`regex`、`shell_prompt` 或 `uboot_prompt`。数组为空时省略。
+
+端口机型变化的 `port_reconfigured` metadata 包含 `source`、`previous_model_profile` 和 `new_model_profile`。
+
+### Archive 与 events
+
+`GET /api/v1/archives?port=COM4` 返回：
+
+```json
+{
+  "archives": [
+    {
+      "port": "COM4",
+      "epoch": "uuid",
+      "first_seq": 1,
+      "last_seq": 812,
+      "first_segment_wall_time_ns": 0,
+      "last_segment_wall_time_ns": 0,
+      "segment_count": 2,
+      "total_bytes": 1048576,
+      "has_open_segment": true
+    }
+  ],
+  "truncated": false
+}
+```
+
+`GET /api/v1/ports/{port}/events` 接受以下 query 参数：
+
+| 参数 | 含义 |
+|---|---|
+| `epoch` | 后端周期；省略时限定当前周期 |
+| `after_seq` | 严格大于该序号 |
+| `through_seq` | 包含式上界，形成 `(after_seq, through_seq]` |
+| `before_wall_time_ns` / `after_wall_time_ns` | wall time 边界 |
+| `direction` | `rx` / `tx` / `none` |
+| `kind` | 一个 event kind |
+| `actor_id` | actor 过滤 |
+| `run_id` | Run 过滤 |
+| `operation_id` | operation 过滤 |
+| `contains` | 普通 UTF-8 文本 |
+| `regex` | bounded UTF-8 regex，与 `contains` 互斥 |
+| `limit_events` / `limit_bytes` | 返回边界 |
+
+响应：
+
+```json
+{
+  "events": [],
+  "next_cursor": {"epoch": "uuid", "after_seq": 812},
+  "truncated": false,
+  "first_available_seq": 1,
+  "gaps": []
+}
+```
+
+每个 gap 是 `{epoch, first_seq, last_seq, reason}`。`reason`：`epoch_changed`、`ring_evicted`、`retention`、`corruption`、`logging_fault` 或 `sequence_discontinuity`。
+
+### Live tail
+
+`GET /api/v1/ports/{port}/tail` 从有界内存 ring 返回，接受：
+
+- `tail_events`：1–2000，默认 200；
+- continuation 必须同时提供 `epoch` 与 `after_seq`。
+
+tail 使用 `EventQueryResponse` 结构。`truncated` 或 `gaps` 明确表示 ring 边界，不会静默跳过仍应读取的数据。
+
+### Recent activity
+
+`GET /api/v1/ports/{port}/recent-activity` 必须同时提供 `epoch`、`after_seq`、`through_seq`。它只从 ring 返回最多 32 条与协同上下文有关的 TX、Control、Run 中止、端口重配或移除事件，排除普通 RX，避免高流量端口放大 MCP 结果。
+
+### Diagnostics
+
+全局 diagnostics 包含 uptime、WebSocket 连接数、journal metrics 和每端口 snapshot/subscriber lag。storage diagnostics 只返回 journal metrics。端口 diagnostics 返回 snapshot、subscriber count 和 lag events。
+
+诊断读取不会主动探测目标设备，也不会写串口。
+
+### Monitor HTTP
+
+Monitor spec：
+
+```json
+{
+  "port": "COM4",
+  "contains": "watchdog",
+  "start_cursor": {"epoch": "uuid", "after_seq": 100},
+  "severity": "warning",
+  "description": "观察复位",
+  "debounce_ms": 250,
+  "cooldown_ms": 30000,
+  "duration_ms": 3600000
+}
+```
+
+`contains` 与 `regex` 二选一。创建 body 是 `{request_id, spec}`，其中 `request_id` 同时作为幂等创建 ID。更新 body 是 `{spec, expected_revision}`；DELETE query 必须提供 `expected_revision`。
+
+列表 query 可使用 `port` 和 `status`。incident query：`after_incident_seq`、`limit`、`include_acked`。incident 响应提供 `next_cursor`、`truncated`、`first_available_incident_seq` 和 `retention_gap`。
+
+## WebSocket protocol v4
+
+连接地址：`GET /api/v1/ws`。
+
+### 二进制 envelope
+
+每个 frame：
 
 ```text
 [tag: u8][header_len: u32 big-endian][JSON header][raw payload]
 ```
 
-| Tag | Meaning |
-|---:|---|
-| `0x01` | JSON `ClientMessage`/`ServerMessage`; payload must be empty. |
-| `0x02` | RX `DataFrameHeader` plus unchanged serial bytes. |
-| `0x03` | Confirmed TX `DataFrameHeader` plus unchanged serial bytes. |
-| `0x04` | Reserved `WRITE_FRAME_TAG`; v3 does not decode or accept it. |
-
-The shared codec bounds JSON headers to 256 KiB and payloads to 1 MiB; the
-daemon's stricter 64 KiB incoming WebSocket cap applies first. After the
-handshake, the daemon accepts either binary `0x01` envelopes or text JSON for
-client control messages. Server control/state frames and RX/TX events are
-binary envelopes. Ordinary WebSocket Ping receives Pong.
-
-`DataFrameHeader` contains `protocol_version`, `slot_id`, `daemon_epoch`,
-`seq`, `generation`, wall and monotonic times, `kind`, `direction`, optional
-`actor`, `run_id`, `operation_id`, optional stream offsets, metadata,
-`durable`, and `replay`. Non-byte events (`direction=none`) use a control
-`timeline` message containing the complete `TimelineEvent` instead of an
-RX/TX frame.
-
-### Handshake and actor identity
-
-The first application message, received within ten seconds, must be `hello`
-with the exact `protocol_version=3`, `client_name`, declared `actor_kind`, and
-`request_id`. Allowed client declarations are `human`, `agent`, and `script`;
-`system` is reserved for the daemon. The server normalizes the label and
-issues a fresh opaque actor ID bound to this authenticated connection.
-
-Success produces, in order, `welcome` and a correlated `result` containing
-`hello_accepted`. A second `hello` is rejected. Closing the connection removes
-its subscriptions and queued acquisition, releases any lease held by that
-actor, promotes the next valid waiter, and aborts an affected active Run.
-
-### Attach, replay, and live delivery
-
-An `attach` carries one or more `Subscription` values:
-`{slot_id, cursor?, tail_events=200}`. For each Slot the daemon subscribes to
-live events before capturing the head, then sends:
-
-1. `snapshot` at head `H`;
-2. optional `gap` if the requested cursor cannot be satisfied;
-3. optional `replay_begin` and replay events through `H`;
-4. `ready {head_seq: H}`;
-5. live events with `seq > H`.
-
-This ordering closes the attach/replay race. Attaching a Slot already attached
-on the connection replaces its old subscription. `detach` removes only named
-subscriptions. Subscriber lag sends `lagged {from_seq,to_seq}` and ends only
-that Slot forwarder; the client must query durable history and reattach.
-
-### ClientMessage
-
-Every variant is tagged by `type` and carries `request_id`.
-
-| Type | Minimum role | Fields and semantics |
+| Tag | 方向 | 内容 |
 |---|---|---|
-| `hello` | observer | `protocol_version`, `client_name`, `actor_kind`; first message only. |
-| `attach` | observer | `subscriptions[]`. |
-| `detach` | observer | `slots[]`. |
-| `acquire_control` | operator | `slot_id`, `mode` (`queue`/`takeover`), `ttl_ms`. |
-| `renew_control` | operator | `slot_id`, `control_id`, `fence`, `ttl_ms`. |
-| `release_control` | operator | `slot_id`, `control_id`, `fence`. |
-| `cancel_acquire` | operator | `slot_id`, `control_id`; queued actors have no lease, so the daemon matches the authenticated actor and ignores this compatibility ID. |
-| `write` | operator | `slot_id`, `control_id`, `fence`, base64 `data`, optional `operation_id`, `expected_run_id`, `pacing`, human-readable `description`, `command_sequence`, `sequence_precondition`, and `cooperative=false`. `expected_run_id` is required when cooperative. |
-| `send_break` | operator | `slot_id`, `control_id`, `fence`, `duration_ms`, optional `operation_id`, `expected_run_id`, and `sequence_precondition`. |
-| `trigger_start` | operator | `slot_id`, Control ID/fence, `daemon_epoch`, `generation`, optional Operation/expected Run and `sequence_precondition`, plus `spec`. |
-| `trigger_status` | operator | `slot_id`, epoch, generation, `trigger_id`. |
-| `trigger_cancel` | operator | `slot_id`, Control ID/fence, epoch, generation, `trigger_id`. |
-| `start_run` | operator | `slot_id`, Control ID/fence, `label`, metadata map. |
-| `end_run` | operator | `slot_id`, Control ID/fence, `run_id`. |
-| `checkpoint` | operator | `slot_id`, Control ID/fence, `label`; requires an active Run. |
-| `ping` | observer | No fields beyond `request_id`; returns daemon wall time. |
+| `0x01` | 双向 | JSON control message；raw payload 必须为空，client write bytes 位于 JSON 的 base64 `data` |
+| `0x02` | server → client | RX `DataFrameHeader` + raw serial bytes |
+| `0x03` | server → client | confirmed TX `DataFrameHeader` + raw serial bytes |
 
-`WritePacing` is `{chunk_size, chunk_delay_ms}`; zero delay selects the
-full-speed/no-sleep path (the daemon still chunks driver calls). The delay unit
-is milliseconds and is inserted only after a complete planned chunk when more
-payload remains. Thus `chunk_size=1, chunk_delay_ms=1` applies N-1 requested
-gaps to N bytes; partial driver acceptance within one chunk adds no pacing gap,
-and there is never a delay after the final chunk. Driver latency and scheduler
-granularity are additional, so this is a minimum requested cadence rather than
-an exact per-character clock. Ordinary writes resolve an explicit override
-before the effective Slot/Device Profile pacing. `description` is an additive
-optional wire field for legacy-client compatibility. When present it must be
-non-empty, trimmed, free of control characters, and at most 256 UTF-8 bytes.
-Current serial-mcp `command` calls require it. Empty writes are rejected. One
-physical write is bounded to 4 KiB and a computed maximum 15-second
-physical-write deadline.
+最大 JSON header 256 KiB，最大 payload 1 MiB；单次物理串口写入另有更小的后端边界。
 
-`command_sequence` is optional additive audit context for one physical write:
-`{sequence_id, description, step_index, step_count}`. Its `description` is the
-overall sequence purpose; the write's ordinary `description` remains the
-individual step purpose. The sequence UUID must be non-nil, `step_index` is
-zero-based, `step_count` is in `[1,8]`, and `step_index < step_count`. A
-sequence-tagged write must also have a valid per-step write description. This
-context groups confirmed TX only and does not assert that the DUT executed a
-step or completed the sequence.
+### Hello 与 attach
 
-`sequence_precondition` is an optional additive, daemon-enforced write guard:
-`{cursor:{epoch,after_seq}, expected_generation, expected_tx_offset}`. It is
-the historical field name remains wire-compatible, but serial-mcp now sends it
-for ordinary commands, sequence steps, raw input/control-byte signals, BREAK,
-and Trigger start. Inside the Slot actor, after lease/Run authorization and
-immediately before the physical action boundary, seriald atomically verifies
-the daemon epoch, serial generation, and TX offset. It also replays the
-timeline strictly after the cursor and rejects an evicted replay window, an
-explicit `gap` event, or any additional TX. Ordinary RX is allowed. A rejected
-guard returns `sequence_boundary_changed`, is a definite zero-byte outcome,
-and creates no TX/Break/Trigger-start event. The precondition participates in
-request-id fingerprints.
+客户端首先发送：
 
-The HTTP status capabilities default to false when omitted by an older daemon.
-A current serial-mcp refuses `command_sequence` before step 1 unless
-`sequence_write_precondition_supported=true`, and refuses every ordinary
-command/input/control-byte write, BREAK, sequence, or Trigger start unless
-`serial_context_precondition_supported=true`. This additive gate is required
-because an older protocol-v3 daemon can deserialize an unknown optional guard
-without enforcing it; the MCP therefore fails before any physical byte or line
-action. Human and legacy writes may omit the precondition and retain their
-previous behavior.
+```json
+{
+  "type": "hello",
+  "request_id": "uuid",
+  "protocol_version": 4,
+  "client_name": "serialctl",
+  "actor_kind": "human"
+}
+```
 
-`send_break.duration_ms` is in `[1,5000]`. BREAK is a UART line condition, not
-a byte; Ctrl-C/D/Z are ordinary `write` payload bytes `03`, `04`, and `1a`.
+`actor_kind` 为 `human`、`agent` 或 `script`；后端为连接生成 actor ID。成功时 server 发送 `welcome`：
 
-### ServerMessage
+```json
+{
+  "type": "welcome",
+  "server_id": "uuid",
+  "daemon_epoch": "uuid",
+  "protocol_version": 4,
+  "actor": {"id": "...", "label": "serialctl", "kind": "human"}
+}
+```
 
-| Type | Fields and meaning |
-|---|---|
-| `welcome` | `server_id`, `daemon_epoch`, protocol version, issued actor, authenticated role. |
-| `snapshot` | One complete `SlotSnapshot`. |
-| `replay_begin` | `slot_id`, first replay seq, inclusive replay head. |
-| `ready` | `slot_id`, attachment head. |
-| `timeline` | Complete non-byte event plus `replay`. |
-| `result` | Correlated `request_id` and `CommandResult`. |
-| `error` | Optional request ID, stable `ErrorCode`, message, and `retryable`. |
-| `gap` | Slot, requested cursor, first available seq, current head, and `GapReason`. |
-| `lagged` | Slot and missed inclusive sequence range; that Slot subscription ends. |
+再发送 attach：
 
-`SlotSnapshot` contains the Slot config, daemon epoch, head/ring oldest seq,
-generation, endpoint/session state and stable reason code, target activity,
-last RX time, RX/TX offsets and overflow count, current Control, active Run,
-active Trigger, logging health, and effective Shell prompt, U-Boot prompt,
-write EOL, echo, Transport settings, and write pacing.
+```json
+{
+  "type": "attach",
+  "request_id": "uuid",
+  "subscriptions": [
+    {
+      "port": "COM4",
+      "cursor": {"epoch": "uuid", "after_seq": 800},
+      "tail_events": 200
+    }
+  ]
+}
+```
 
-### CommandResult
+每个端口依次收到 snapshot、可选 replay begin/timeline/gap、ready。之后实时 timeline 按序到达。detach 使用 `ports: ["COM4"]`。
 
-The exhaustive result `type` values are:
+### Client messages
 
-- `hello_accepted {actor, role}`
-- `attached {slots}` and `detached {slots}`
-- `control_granted {lease}`, `control_queued {position}`,
-  `control_renewed {lease}`, and `control_released`
-- `acquire_cancelled {removed}`
-- `write_accepted {event_seq}` and `break_sent {event_seq}`
-- `trigger_started {trigger}`, `trigger_status {trigger}`, and
-  `trigger_cancelled {trigger}`
-- `run_started {run}` and `run_ended {run}`
-- `checkpoint_created {event_seq}`
-- `pong {server_wall_time_ns}`
+control 消息使用 tagged JSON `type`：
 
-### ErrorCode, EventKind, and GapReason
+```text
+hello attach detach
+acquire_control renew_control release_control cancel_acquire
+write send_break
+trigger_start trigger_status trigger_cancel
+start_run end_run checkpoint ping
+```
 
-The exhaustive stable `ErrorCode` values are:
+端口相关消息全部包含 `port`。
 
-`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
-`control_required`, `stale_fence`, `port_offline`, `cursor_ahead`,
-`sequence_boundary_changed`, `resource_exhausted`, `idempotency_expired`, `config_revision_mismatch`,
-`profile_change_busy`, `port_not_found`, `port_busy`, `port_access_denied`,
-`port_io`, `break_unsupported`, `regex_invalid`, `query_budget_exceeded`,
-`unavailable`, and `internal`.
+普通 physical write 的关键字段：
 
-The exhaustive `EventKind` values are:
+```json
+{
+  "type": "write",
+  "request_id": "uuid",
+  "port": "COM4",
+  "control_id": "uuid",
+  "fence": 7,
+  "data": "dW5hbWUgLWEN",
+  "operation_id": "uuid",
+  "expected_run_id": "uuid",
+  "pacing": {"chunk_size": 1, "chunk_delay_ms": 1},
+  "description": "查看系统版本",
+  "command_capture_matchers": [
+    {"kind": "shell_prompt", "value": "root@router:~# "}
+  ],
+  "command_sequence": null,
+  "sequence_precondition": {
+    "cursor": {"epoch": "uuid", "after_seq": 811},
+    "expected_generation": 3,
+    "expected_tx_offset": 300
+  },
+  "cooperative": false
+}
+```
 
-`rx`, `tx`, `serial_opening`, `serial_opened`, `serial_open_failed`,
-`serial_closed`, `slot_reconfigured`, `slot_removed`, `control_granted`,
-`control_released`, `control_revoked`, `control_expired`, `run_started`,
-`run_ended`, `run_aborted`, `trigger_started`, `trigger_completed`,
-`trigger_cancelled`, `trigger_failed`, `break`, `checkpoint`,
-`logging_degraded`, and `gap`.
+`data` 是待写 bytes 的 base64 表示。后端在物理动作边界检查 Control/fence、Run、generation、sequence precondition 与 pacing budget。成功 result 是 `write_accepted` 并返回 TX event seq；确认后的同一批 bytes 再通过 `0x03` TX data frame 分发。
 
-`Direction` is `rx`, `tx`, or `none`. `GapReason` is `epoch_changed`,
-`ring_evicted`, `retention`, `corruption`, `logging_fault`, or
-`sequence_discontinuity`.
+`send_break` 发送 UART line condition，不是字节；duration 为 1–5000 ms。
 
-## Control, takeover, and cooperative Human writes
+### Server messages
 
-Control is one fenced lease per Slot. A lease contains its ID, owner, daemon
-epoch, generation, monotonically increasing fence, issued wall time, and
-display expiry. Authorization and expiry use monotonic time. Requested TTL is
-clamped to at least five seconds and the configured ceiling (60 seconds by
-default; hard ceiling 24 hours).
+```text
+welcome snapshot replay_begin ready timeline
+result error gap lagged
+```
 
-`queue` grants immediately when free. Otherwise it inserts or refreshes one
-waiter per actor and returns a one-based queue position. The queue is FIFO,
-bounded (128 by default), and each waiter expires after the configured wait
-timeout (60 seconds by default). Release, expiry, disconnect, or revocation
-promotes the first non-expired waiter. `cancel_acquire` removes only the
-calling actor's queued entry.
+`result` 通过 `request_id` 对应请求。命令结果类型包括 Control grant/queue/renew/release、write accepted、Break sent、Trigger state、Run state、checkpoint 和 pong。
 
-`takeover` immediately revokes the current lease, clears the taker's own queued
-entry, increments the fence, grants the new lease, stops the old owner's
-Trigger, and aborts the active Run with reason `human takeover`. The MCP adapter
-never requests takeover, even though the lower protocol exposes the mode to an
-Operator client. The revoked actor observes `control_revoked` and
-`run_aborted`; stale Control ID/fence writes are rejected before touching the
-port.
+`error`：
 
-A `write` with `cooperative=true` is the narrow no-takeover Human injection
-path. It is accepted only when:
+```json
+{
+  "type": "error",
+  "request_id": "uuid",
+  "code": "sequence_boundary_changed",
+  "message": "...",
+  "retryable": true
+}
+```
 
-- the caller's issued actor kind is `human`;
-- the current lease owner is an `agent`;
-- an active Run exists, is Agent-owned, and has the same owner as the lease;
-- `expected_run_id` is present and exactly matches that active Agent Run;
-- per-request `pacing` is omitted;
-- no Trigger is active; and
-- the current Agent lease's remaining monotonic TTL covers the complete
-  physical-write budget plus the normal scheduling margin.
+稳定 error code：
 
-It neither transfers nor revokes Control. The request's ordinary lease fields
-do not borrow the Agent fence. Confirmed TX is attributed to the Human, marked
-`cooperative=true`, and includes the interfered Run/owner in metadata. It is
-therefore visible as foreign interference to Agent capture. Every other use of
-the flag is rejected as control-required/not-owner.
+```text
+bad_request not_found conflict
+control_required stale_fence port_offline cursor_ahead
+sequence_boundary_changed resource_exhausted idempotency_expired
+config_revision_mismatch profile_change_busy
+port_not_found port_busy port_access_denied port_io
+break_unsupported regex_invalid query_budget_exceeded
+unavailable internal
+```
 
-`actor_kind` is an authenticated connection's audit/cooperation declaration
-within its bearer role, not an independently verified Human identity. A shared
-Operator credential lets its holder declare `human`, `agent`, or `script` on a
-new connection. Deployments that require a Human-only security boundary must
-not share that Operator credential with untrusted automation; the cooperative
-check itself is a coordination policy, not separate person authentication.
+`retryable` 只说明错误类别可能在状态改变后恢复，不代表客户端应自动重放物理动作。连接丢失、timeout、partial write 或结果未确认时必须先观察时间线。
 
-Human takeover and cooperative injection are different operations: takeover
-ends the Agent ownership boundary; cooperative injection preserves it but
-adds explicitly audited foreign TX.
+## Run、Control 与 Trigger 语义
 
-If an already accepted MCP Trigger reaches `control_lost` or `run_lost`, the
-adapter correlates that terminal state with the Run timeline. A confirmed
-`run_aborted` reason of `human takeover` adds
-`abort_diagnosis:{code:"human_takeover", taken_over_by, run_id,
-no_bytes_written:false}` to the Trigger result. The value is never `true` for
-an accepted Trigger: its kickoff or one or more actions may already have
-reached the physical device before takeover became terminal. The Human Actor
-is `null` only when the abort reason is retained but its following revocation
-event is unavailable.
+Control lease 绑定一个 actor、周期、generation 和 fence。续租不改变物理所有权；Takeover 产生新 fence 并使旧写入失效。
 
-### Request idempotency
+Run 只能在当前 Control 上开始。Run 是审计与证据区间，不重置设备。结束或中止形成明确 timeline event。
 
-Ordinary Slot commands cache results by actor plus request ID and reject reuse
-with different content. Physical-write operations (`write`, `send_break`, and
-`trigger_start`) additionally use a daemon-epoch write history keyed by request
-ID and a fingerprint that excludes reconnect-specific lease identity but
-includes the intended bytes/action, Operation, expected Run, pacing, and
-cooperative flag as applicable. A recent exact duplicate returns its cached
-result. If execution is known but its result aged out, the daemon returns
-`idempotency_expired` and does not repeat the physical operation. Partial or
-transport-lost outcomes remain uncertain and are never safe for blind retry.
-Because a cooperative write requires its Agent Run ID, retrying the same request
-ID against a later Run has a different fingerprint and cannot return the old
-Run's cached success.
+Trigger spec 包含 optional initial write、optional start literal、action bytes、interval、stop literals、timeout、max fires 和 optional pacing。所有 Trigger 写入仍走同一 Control/fence/Run/confirmed TX 路径。
 
-## Runs and Trigger Jobs
+## MCP Streamable HTTP
 
-### Runs
+`serial-mcp --listen 127.0.0.1:3211` 提供：
 
-A Run is an explicit evidence interval, not a reset, reservation, or device
-initialization. `start_run` requires current fenced Control, no active Trigger,
-and no other active Run. It creates a server UUID, owner, label, `active`
-status, start sequence, and bounded metadata. `checkpoint` adds an audited
-label inside the active Run. `end_run` requires current Control and the exact
-Run ID, emits `run_ended`, and returns a `completed` Run.
+```text
+POST /mcp
+```
 
-Control release, expiry, takeover, owner disconnect, serial close/generation
-change, Slot reconfiguration/removal, or shutdown aborts the Run and emits
-`run_aborted` with an explicit reason. Agent writes set `expected_run_id`; the
-daemon verifies both the ID and the server-issued Run owner before pacing or
-physical write. Missing, changed, or foreign Runs fail without writing bytes.
+实现是 sessionless JSON-RPC：
 
-At the MCP tool boundary, `run_start` also issues one opaque 22-character
-`run_handle`. It is a process-local capability that maps to the Slot, this
-public Run ID, and a separate private validator. Run-scoped MCP calls accept
-the handle instead of asking the model to repeat Slot/Run/token fields. The
-handle never crosses HTTP or WebSocket and does not change protocol v3:
-seriald continues to receive and enforce the public `run_id`, actor, Control
-ID, and fence exactly as documented here.
+- request 返回一个 JSON-RPC response；
+- notification 和 cancellation notification 返回 HTTP 202；
+- `GET /mcp` 返回 method not allowed；
+- 支持 MCP protocol `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`；
+- `MCP-Protocol-Version` 若存在必须是支持值；
+- 仅允许监听 `127.0.0.1`；
+- `Origin` 若存在，只接受同端口的 `localhost` 或 `127.0.0.1`。
 
-A described write that confirms at least one serial byte stores its purpose as
-TX event metadata `command_description`. The TX event's existing `run_id`,
-`operation_id`, sequence, timestamp, and `data` fields provide the Run grouping
-and exact confirmed command bytes; `partial=true` marks a confirmed prefix.
-For a sequence-tagged write, the same TX metadata additionally stores
-`command_sequence_id`, `command_sequence_description`,
-`command_sequence_step_index`, and `command_sequence_step_count`. Every sent
-step has its own Operation ID and TX event. A step stopped before any byte is
-written has no TX event; later sequence steps are not synthesized in history.
-This keeps command history queryable through the existing event API without a
-new event kind. A write rejected before any byte reaches the port creates no
-command-history event, and legacy writes without `description` keep their
-original event shape.
+initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回 19 项；`tools/call` 的成功与工具错误都放在 MCP tool result 中，结构化值位于 `structuredContent`，紧凑 JSON 文本位于 `content[0].text`。
 
-### TriggerSpec and lifecycle
+stdio transport 使用每行一个 JSON-RPC frame。stdout 只写 MCP frame，诊断写 stderr。并发 request 的响应次序可以与请求次序不同，但每个 frame 由一个 writer 完整写出。
 
-A Trigger is one daemon-owned, bounded, device-agnostic reaction job:
+## 幂等、取消与结果确定性
 
-| Field | Meaning/default/bound |
-|---|---|
-| `initial_write` | Optional one-time base64 write after matchers are armed; max 4 KiB. Once confirmed, action is immediately eligible unless an explicit start gate exists. |
-| `start_contains` | Optional advanced base64 RX literal gating the first action; omission means no RX start gate. |
-| `action` | Required non-empty base64 bytes for each fire; max 256 bytes. |
-| `interval_ms` | Delay after one confirmed action before the next; default 20, range 5–1000. |
-| `stop_contains` | Up to eight non-empty base64 RX literals, each max 256 bytes. |
-| `timeout_ms` | Original observation deadline; default 5000, range 100–30000. |
-| `max_fires` | Confirmed action-write send budget; default 250, range 1–1000. |
-| `pacing` | Optional pacing for initial/action writes; otherwise effective Slot pacing. |
-
-The total bounded Trigger write plan may not exceed 64 KiB. Start requires
-current Control, exact daemon epoch and generation, an online port, no active
-Trigger, and a valid optional expected Run. The daemon drains the ordered RX
-barrier, arms matchers, emits `trigger_started`, and returns immediately.
-
-The field shape is unchanged from protocol v2/v3. Its explicit omission rule
-is: without `start_contains`, arming immediately enables `action` when
-`initial_write` is absent, or a confirmed `initial_write` immediately enables
-`action` when present. With `start_contains`, the Trigger instead enters
-`waiting_for_start` after the kickoff and does not schedule its first action
-until that literal is observed in live RX. This gate is optional; clients
-should not synthesize one for routine kickoff-then-action jobs.
-
-Exhausting `max_fires` prevents every later action write. With no
-`stop_contains`, that immediately completes as `max_fires_reached`. With one
-or more stop literals, the live matcher remains armed without scheduling more
-writes until a literal matches or the original deadline expires. A deadline
-after exhausting the send budget is reported as `max_fires_reached`; a
-deadline reached before exhausting it is `timed_out`.
-
-Nonterminal `TriggerStatus` values are `armed`, `waiting_for_start`, `running`,
-and `stopping`. Terminal values are `matched`, `timed_out`,
-`max_fires_reached`, `cancelled`, `control_lost`, `run_lost`,
-`generation_changed`, `port_closed`, `write_failed`, and `rx_gap`.
-`TriggerInfo` records identity/owner, epoch/generation, Control/fence,
-Operation/expected Run, full spec, start/end/last-write sequences, confirmed
-fire and TX-byte counts, and an optional matched pattern.
-
-Status is bounded and does not require ownership, but the WebSocket command
-still requires an Operator connection. Cancellation requires the Trigger
-owner and its exact current Control/fence; cancelling an already terminal Job
-returns its terminal state. A terminal cause stops new scheduling, while one
-already accepted physical write may finish and be audited before the status
-leaves `stopping`.
-
-## Profiles and independent device-model identity
-
-The configuration deliberately separates behavior from identity:
-
-1. `SlotConfig` identifies the stable station channel and physical port.
-2. `TransportProfile` owns baud rate, data bits, parity, stop bits, flow
-   control, DTR/RTS, and `auto_open`.
-3. Optional `DeviceProfile` owns Shell/U-Boot prompt presence and optional EOL,
-   echo, write chunk size, and write delay overrides.
-4. `DeviceModel`/`SlotModelBinding` records what DUT is believed to be connected
-   without changing serial behavior.
-
-For compatibility, `SlotConfig.profile` is the Transport Profile name and
-`SlotConfig.device_profile` is the behavior Profile name. A model identity is
-not stored in either field. Resolved behavior is published in snapshots as the
-effective prompts, EOL, echo, Transport settings, and write pacing.
-
-`DeviceModel` is `{id, name, parent_id?, aliases[]}`. `parent_id` forms an
-arbitrary-depth tree; parent and child display names may intentionally repeat.
-The daemon rejects unknown parents, cycles, duplicate IDs, and
-case-insensitive duplicate aliases. `SlotModelBinding` is `{slot_id, model_id,
-confirmation_method, note?, updated_wall_time_ns, source}` and is validated
-against both catalogs.
-
-Model identity is a maintained assertion, not automatic proof. Before an Agent
-connects or writes, it must confirm that the configured model matches the
-physical DUT using serial evidence, telnet, the device web UI, or a Human.
-Recording `confirmation_method` and a note describes that evidence; it does
-not make a stale label true. The MCP server repeats this requirement in its
-initialization instructions and exposes only the narrow Operator binding path,
-not Admin replacement of the entire catalog.
-
-Transport changes can reopen the physical handle. Device Profile changes keep
-the port open but are rejected while a Run or Trigger would otherwise continue
-under changed prompt/pacing semantics. DeviceModel changes never alter prompts,
-EOL, echo, pacing, port lifecycle, or Run state.
-
-## Compatibility summary
-
-- WebSocket protocol v3 requires an exact version match. Protocol v1/v2 peers
-  are rejected rather than allowed to fail later on enum/field differences.
-- HTTP remains namespaced `/api/v1`; that route namespace is independent of
-  the WebSocket protocol number.
-- Additive optional fields use Serde defaults where implemented, including
-  legacy writes defaulting `description=null`, `command_sequence=null`,
-  `sequence_precondition=null`, and `cooperative=false`; legacy HTTP status
-  defaults `sequence_write_precondition_supported=false` and
-  `serial_context_precondition_supported=false`.
-- `0x04` is reserved only; clients must use the `write` control message.
-- Exact schema inspection should use the Rust DTOs for HTTP/WebSocket and
-  `tools/list` or `serial mcp --dump-tools` for MCP.
+- `request_id` 标识协议请求；后端缓存近期已执行写入的结果。
+- 相同请求重试可返回缓存；已执行但超出幂等缓存的 ID 被拒绝，避免再次写入。
+- MCP cancellation 只中断纯观察工具。
+- 物理 action、Run transition 和 Monitor mutation 会继续收敛到结果。
+- 明确的前置条件拒绝会说明零字节写入；transport loss、timeout 和 partial write 不能据此自动重试。
+- replay ring 淘汰、journal retention 与周期变化都通过 gap 显式表达。

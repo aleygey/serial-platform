@@ -9,6 +9,7 @@ readonly PACKAGE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "${PROJECT_ROOT}
 readonly GIT_COMMIT="$(git -C "${PROJECT_ROOT}" rev-parse HEAD)"
 readonly SOURCE_DATE_EPOCH="$(git -C "${PROJECT_ROOT}" show -s --format=%ct HEAD)"
 readonly MCP_TOOL_COUNT=19
+readonly ELECTRON_SCRIPT="${SCRIPT_DIR}/electron.sh"
 
 CURRENT_PHASE="startup"
 BUILD_PROFILE="release"
@@ -127,12 +128,14 @@ run_environment() {
     rustc -vV
 
     assert_workspace_version
+    "${ELECTRON_SCRIPT}" env
 }
 
 run_fetch() {
     CURRENT_PHASE="fetch"
     log "Fetching locked Cargo dependencies"
     cargo fetch --locked
+    "${ELECTRON_SCRIPT}" fetch
 }
 
 run_fmt() {
@@ -145,12 +148,15 @@ run_clippy() {
     CURRENT_PHASE="clippy"
     log "Running Clippy"
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    "${ELECTRON_SCRIPT}" typecheck
 }
 
 run_test() {
     CURRENT_PHASE="test"
     log "Running workspace tests"
     cargo test --workspace --locked
+    "${ELECTRON_SCRIPT}" test
+    bash "${SCRIPT_DIR}/test-publish-github-release.sh"
 }
 
 run_build() {
@@ -162,8 +168,8 @@ run_build() {
         -p serial-cli \
         -p seriald \
         -p serialctl \
-        -p serial-mcp \
-        -p serial-desktop
+        -p serial-mcp
+    "${ELECTRON_SCRIPT}" build
 }
 
 run_smoke() {
@@ -174,7 +180,7 @@ run_smoke() {
     output_dir="$(host_output_dir)"
 
     local binary
-    for binary in serial seriald serialctl serial-mcp serial-desktop; do
+    for binary in serial seriald serialctl serial-mcp; do
         [[ -x "${output_dir}/${binary}" ]] \
             || fail "${BUILD_PROFILE} binary is missing or not executable: ${output_dir}/${binary}"
         "${output_dir}/${binary}" --version | grep -F "${PACKAGE_VERSION}" >/dev/null \
@@ -182,7 +188,8 @@ run_smoke() {
     done
 
     "${output_dir}/serial" --help >/dev/null
-    "${output_dir}/serial-desktop" --help >/dev/null
+    [[ -f "${PROJECT_ROOT}/crates/serial-desktop/out/main/index.js" ]] \
+        || fail "Electron desktop bundle is missing; run ci/build.sh build ${BUILD_PROFILE} first"
     local tool_count
     tool_count="$(dump_tool_count)"
     [[ "${tool_count}" == "${MCP_TOOL_COUNT}" ]] \
@@ -237,16 +244,11 @@ assert_linux_binary() {
         readelf -d "${binary}" \
             | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p'
     )"
-    printf '%s\n' "${needed}"
     local library
     while IFS= read -r library; do
         [[ -z "${library}" ]] && continue
         case "${library}" in
             libc.so.6|libm.so.6|libgcc_s.so.1|libpthread.so.0|libdl.so.2|librt.so.1|libutil.so.1|ld-linux-x86-64.so.2)
-                ;;
-            libX11.so.6|libX11-xcb.so.1|libXcursor.so.1|libXfixes.so.3|libXi.so.6|libXinerama.so.1|libXrandr.so.2|libXrender.so.1|libxcb.so.1|libEGL.so.1|libGL.so.1|libxkbcommon.so.0)
-                [[ "$(basename "${binary}")" == "serial-desktop" ]] \
-                    || fail "non-desktop Linux binary unexpectedly links GUI library ${library}: ${binary}"
                 ;;
             *)
                 fail "Linux package has an unexpected dynamic dependency ${library}: ${binary}"
@@ -281,16 +283,16 @@ write_build_info() {
     local rust_target="$2"
     local compatibility="$3"
     local tool_count="$4"
-    local desktop_runtime="$5"
-    local desktop_local_service="$6"
+    local desktop_artifact="$5"
+    local desktop_runtime="$6"
 
     jq -n \
         --arg version "${PACKAGE_VERSION}" \
         --arg git_commit "${GIT_COMMIT}" \
         --arg rust_target "${rust_target}" \
         --arg compatibility "${compatibility}" \
+        --arg desktop_artifact "${desktop_artifact}" \
         --arg desktop_runtime "${desktop_runtime}" \
-        --arg desktop_local_service "${desktop_local_service}" \
         --arg cargo_profile "${BUILD_PROFILE}" \
         --arg rustc "$(rustc --version)" \
         --arg zig "$(zig version)" \
@@ -308,9 +310,10 @@ write_build_info() {
             mcp_tool_count: $mcp_tool_count,
             desktop: {
                 included: true,
-                executable: (if $rust_target | startswith("x86_64-pc-windows") then "serial-desktop.exe" else "serial-desktop" end),
+                framework: "Electron",
+                artifact: $desktop_artifact,
                 runtime: $desktop_runtime,
-                local_service: $desktop_local_service
+                local_service: "serial and seriald are embedded in the desktop application"
             },
             build_system: "Jenkins"
         }' >"${destination}"
@@ -347,8 +350,8 @@ normalize_package_metadata() {
     # ZIP records Unix mode bits, so normalize modes as well as timestamps.
     find "${package_dir}" -type d -exec chmod 0755 {} +
     find "${package_dir}" -type f -exec chmod 0644 {} +
-    for binary in serial seriald serialctl serial-mcp serial-desktop \
-        serial.exe seriald.exe serialctl.exe serial-mcp.exe serial-desktop.exe; do
+    for binary in serial seriald serialctl serial-mcp "Serial Platform.AppImage" \
+        serial.exe seriald.exe serialctl.exe serial-mcp.exe "Serial Platform.exe"; do
         if [[ -f "${package_dir}/${binary}" ]]; then
             chmod 0755 "${package_dir}/${binary}"
         fi
@@ -375,7 +378,7 @@ create_tar_archive() {
     tar -tzf "${archive}" \
         | grep -Fx "${package_name}/docs/MCP_TOOLS.md" >/dev/null
     tar -tzf "${archive}" \
-        | grep -Fx "${package_name}/serial-desktop" >/dev/null
+        | grep -Fx "${package_name}/Serial Platform.AppImage" >/dev/null
     tar -tzf "${archive}" \
         | grep -Fx "${package_name}/seriald" >/dev/null
 }
@@ -393,7 +396,7 @@ create_zip_archive() {
     unzip -Z1 "${archive}" \
         | grep -Fx "${package_name}/docs/MCP_TOOLS.md" >/dev/null
     unzip -Z1 "${archive}" \
-        | grep -Fx "${package_name}/serial-desktop.exe" >/dev/null
+        | grep -Fx "${package_name}/Serial Platform.exe" >/dev/null
 }
 
 run_package_target() {
@@ -403,8 +406,9 @@ run_package_target() {
     local package_dir
     local compatibility
     local build_target
+    local desktop_artifact
     local desktop_runtime
-    local desktop_local_service
+    local desktop_platform
     local -a binaries
 
     case "${target}" in
@@ -419,15 +423,15 @@ run_package_target() {
                 -p serial-cli \
                 -p seriald \
                 -p serialctl \
-                -p serial-mcp \
-                -p serial-desktop
+                -p serial-mcp
             profile_dir="$(resolve_profile_dir "${target}" "${zig_target}")"
             package_name="serial-platform-v${PACKAGE_VERSION}$(profile_suffix)-linux-x86_64-ubuntu20.04"
             compatibility="Ubuntu 20.04+ x86_64; GNU/Linux glibc <= 2.31"
             build_target="${zig_target}"
-            desktop_runtime="X11 display plus system X11/OpenGL runtime libraries"
-            desktop_local_service="sibling serial and seriald executables are included"
-            binaries=(serial seriald serialctl serial-mcp serial-desktop)
+            desktop_artifact="Serial Platform.AppImage"
+            desktop_runtime="Electron AppImage for x86_64 Linux"
+            desktop_platform="linux"
+            binaries=(serial seriald serialctl serial-mcp)
             ;;
         x86_64-pc-windows-gnu)
             log "Building ${target} with the GNU/MinGW-w64 ABI"
@@ -440,15 +444,15 @@ run_package_target() {
                     -p serial-cli \
                     -p seriald \
                     -p serialctl \
-                    -p serial-mcp \
-                    -p serial-desktop
+                    -p serial-mcp
             profile_dir="$(resolve_profile_dir "${target}")"
             package_name="serial-platform-v${PACKAGE_VERSION}$(profile_suffix)-windows-x86_64"
             compatibility="Windows x86_64; GNU/MinGW-w64 ABI (not MSVC)"
             build_target="${target}"
-            desktop_runtime="Windows x86_64 desktop environment; MinGW runtime is statically linked"
-            desktop_local_service="sibling seriald.exe is included"
-            binaries=(serial.exe seriald.exe serialctl.exe serial-mcp.exe serial-desktop.exe)
+            desktop_artifact="Serial Platform.exe"
+            desktop_runtime="Electron portable executable for Windows x86_64"
+            desktop_platform="windows"
+            binaries=(serial.exe seriald.exe serialctl.exe serial-mcp.exe)
             ;;
         *)
             fail "unsupported release target: ${target}"
@@ -474,6 +478,12 @@ run_package_target() {
         esac
     done
 
+    "${ELECTRON_SCRIPT}" package \
+        "${desktop_platform}" \
+        x86_64 \
+        "${profile_dir}" \
+        "${package_dir}"
+
     copy_release_materials "${package_dir}"
     local tool_count
     tool_count="$(dump_tool_count)"
@@ -484,19 +494,19 @@ run_package_target() {
         "${build_target}" \
         "${compatibility}" \
         "${tool_count}" \
-        "${desktop_runtime}" \
-        "${desktop_local_service}"
+        "${desktop_artifact}" \
+        "${desktop_runtime}"
     write_package_manifest "${package_dir}"
     case "${target}" in
         x86_64-unknown-linux-gnu)
-            grep -F "  ./serial-desktop" "${package_dir}/MANIFEST.sha256" >/dev/null \
-                || fail "Linux package manifest does not cover serial-desktop"
+            grep -F "  ./Serial Platform.AppImage" "${package_dir}/MANIFEST.sha256" >/dev/null \
+                || fail "Linux package manifest does not cover the Electron AppImage"
             grep -F "  ./seriald" "${package_dir}/MANIFEST.sha256" >/dev/null \
                 || fail "Linux package manifest does not cover the local daemon"
             ;;
         x86_64-pc-windows-gnu)
-            grep -F "  ./serial-desktop.exe" "${package_dir}/MANIFEST.sha256" >/dev/null \
-                || fail "Windows package manifest does not cover serial-desktop.exe"
+            grep -F "  ./Serial Platform.exe" "${package_dir}/MANIFEST.sha256" >/dev/null \
+                || fail "Windows package manifest does not cover the Electron portable executable"
             ;;
     esac
     normalize_package_metadata "${package_dir}"
@@ -564,6 +574,7 @@ run_package() {
     done
 
     assert_workspace_version
+    "${ELECTRON_SCRIPT}" build
     rm -rf "${ARTIFACT_DIR}"
     mkdir -p "${ARTIFACT_DIR}"
 

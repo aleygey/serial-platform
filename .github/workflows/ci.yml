@@ -54,3 +54,26 @@ jobs:
 
       - name: Check workspace with minimum Rust
         run: cargo check --workspace --all-targets --locked
+
+  desktop:
+    name: Electron desktop
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/serial-desktop/package-lock.json
+
+      - name: Install locked desktop dependencies
+        working-directory: crates/serial-desktop
+        run: npm ci --no-audit --no-fund
+
+      - name: Type-check, test, and build desktop
+        working-directory: crates/serial-desktop
+        run: npm run build

@@ -1,407 +1,122 @@
-# serial-platform roadmap
+# Serial Platform Roadmap
 
-This roadmap separates shipped behavior from possible future work for
-`seriald`, the Human `serialctl`/`serial console` and `serial-desktop` clients,
-and `serial-mcp`. Items under **Later / candidate** are ideas, not commitments;
-station feedback decides whether they are promoted, changed, or removed.
+## 定义
 
-## Product boundary
+Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 
-`seriald` is a device-agnostic shared serial control plane. It owns the
-physical port, fans one byte stream out to multiple observers, serializes
-writes, records authoritative events, and provides bounded realtime
-primitives.
+这个定义成立的前提是：
 
-`serialctl` is the Human setup, diagnosis, history, and terminal client.
-`serial-desktop` is another Human client and an explicitly bounded local
-`seriald` process manager; it never owns a serial handle. `serial-mcp` is the
-thin Agent adapter. The `serial` executable is only a unified launcher for
-those separate roles:
+1. 物理串口由一个后端独占，避免多个工具争抢句柄；
+2. 人和 Agent 看到同一份串口事实、控制状态与持久历史；
+3. 写入有顺序、有确认、有来源，不把“请求发送”误当成“设备收到”；
+4. 端口和机型配置足够直观，首次使用可以快速完成；
+5. 通用平台只提供串口原语，不把厂商流程和 Shell 假设写进核心。
 
-```text
-serial serve    -> seriald
-serial console  -> serialctl TUI
-serial setup/profile/status/doctor/logs -> serialctl management
-serial mcp      -> serial-mcp
-serial-desktop  -> native Human desktop client
-```
+v0.8 的产品结构已经围绕这五点收敛。公开设备身份只有 OS 串口名 `port`；Transport Profile 与单一 Model Profile 分别描述主机 UART 和目标机型；TUI、Electron 与 19 个 MCP 工具共享 `seriald` 时间线。
 
-Flashing recipes, board reset policy, Linux command semantics, and
-model-specific workflows do not belong in `seriald`. A human, Agent adapter,
-OpenChamber integration, or later workflow package may compose the generic
-primitives.
+## 当前能力
 
-## Status
+### seriald
 
-- **Released before v0.4.0**: established platform behavior retained by the
-  current release.
-- **Released in v0.4.0**: the Profile/diagnostic/Agent-tool consolidation
-  retained by v0.5.
-- **Released in v0.5.0**: persistent serial Monitor Jobs and their additive
-  MCP/incident-query surfaces.
-- **Released in v0.6.0**: in-terminal Profile/model/serial configuration,
-  stable scrollback and Human/Agent command coexistence, plus independent
-  Agent-visible model binding and a verified Jenkins release matrix.
-- **Implemented for v0.7.0**: opaque Run handles, explicit normal Run cleanup
-  with configurable orphan fallback, bounded live-ring Agent reads and context
-  guards, durable TUI restore/search, direct TUI/Desktop configuration, and a
-  native desktop client in every platform package. This remains development
-  work until a v0.7.0 release is published.
-- **Next**: practical validation or refinement work, not yet complete.
-- **Later / candidate**: retained options with no delivery promise.
+- 独占 Windows、macOS 和 Linux 串口，自动打开、断连重试和显式开关。
+- 多观察者订阅同一 RX、确认 TX 和状态事件。
+- 带 fence 的 Control lease、排队、续租、人工 Takeover 和 cooperative write。
+- 每个端口一个活动 Run，Run/operation 边界进入权威时间线。
+- 端口重配 transaction 与 `config_revision` 并发保护。
+- Transport Profile：baud、data/parity/stop、flow control、DTR/RTS、auto-open。
+- Model Profile：机型名、Shell/U-Boot prompt、EOL、echo 解析和 write pacing。
+- 有界 replay ring；tail 查询的成本不随持久日志增长。
+- 分段 journal、CRC、断尾恢复、gap ledger、保留上限和 bounded regex 查询。
+- daemon-owned Trigger：kickoff、重复 action、RX stop literal 和硬上限。
+- 持久 Monitor：literal/regex、burst grouping、incident、证据游标和 acknowledge。
+- HTTP v1 与 WebSocket protocol v4；公开请求和事件统一使用 `port`。
 
-## seriald
+### serialctl / TUI
 
-### Released before v0.4.0
+- `serial setup` 在后端未运行时直接完成首次配置，并提供简短中英说明。
+- 两类 Profile 的 list/show/create/update/clone/import/export/delete 与端口 attach/detach。
+- connection、port、stream、storage、state 五层诊断和 JSON 输出。
+- 持久日志的文本/正则、周期、Run、operation、方向、类型和游标查询。
+- RX-only 主终端；关闭再打开后从当前周期 journal 恢复并接回实时流。
+- 顶部使用串口名，输出标题使用原样机型名。
+- Agent 历史从旧到新；新命令自动跟随底部；方向键选择与展开。
+- `command` 和 `command_sequence` 逐条定位并高亮对应 RX 区域。
+- 滚轮/PgUp/PgDn 浏览 Agent 历史，前缀组合滚动串口输出。
+- 双击词语与拖选的可见高亮和复制。
+- 串口历史搜索支持文本/正则、大小写、RX/TX 和不同周期范围。
+- 可配置 Agent 历史高度与 30 分钟默认孤立 Run 回收；`0` 为不限时。
+- 词边界关键词、IPv4、IPv6 和 MAC 地址着色。
 
-- Windows-hosted daemon with remote Windows/Linux clients over versioned HTTP
-  and WebSocket protocols.
-- Long-lived auto-open sessions with explicit online/waiting/backoff/disabled
-  state and reconnect events.
-- Multiple concurrent observers of exact RX, confirmed TX, state, Run,
-  Operation, Control, and Trigger events.
-- Fenced write-control leases with bounded queueing, TTL renewal, explicit
-  Human Takeover, stale-writer rejection, and cross-reconnect idempotency.
-- At most one active Run per Slot. Run/Operation boundaries scope evidence but
-  never pretend to reset or reserve a clean DUT.
-- Device-agnostic Trigger Jobs for bounded low-latency
-  kickoff/repeated-action/live-literal reactions.
-- Per-Slot sequence numbers, `(slot, epoch, seq)` cursors, explicit gaps,
-  bounded replay/live queues, and slow-consumer isolation.
-- Exact binary journal segments with CRC/torn-tail recovery, bounded scans,
-  archive discovery, a gap ledger, and a default 10-GiB retention ceiling.
-  Segment scanning is the current implementation; there is no SQLite index.
-- Actor-labelled timeline records and observer/operator/admin bearer roles.
+### Electron App
 
-### Released in v0.4.0
+- Electron 主进程管理本地后端生命周期并复用 HTTP/WebSocket v4。
+- 左侧端口、中间 RX 终端、右侧 Agent 历史的三栏工作台。
+- 串口开关、人工命令、持久历史、终端搜索和命令输出区域高亮。
+- Agent 命令与序列按旧到新显示并自动跟随。
+- 串口/Transport Profile 与 Model Profile 分区配置。
+- 机型名称原样显示；共享 Model Profile 影响端口明确提示。
+- 系统、浅色、深色主题和常用快捷键。
+- context-isolated preload 与类型化 IPC；renderer 不直接连接后端。
+- Linux AppImage、Windows portable EXE、macOS arm64/x86_64 `.app`。
 
-- WebSocket protocol v3 for the additive Break/event/error enum extensions.
-  v0.4 components intentionally reject v2/v1 peers instead of risking a
-  runtime decode failure.
-- Reusable Transport Profile catalog for baud, data/parity/stop bits, flow
-  control, DTR/RTS, and auto-open.
-- Device Profiles now also own optional chunk size/delay pacing, alongside
-  Shell/U-Boot prompt, EOL, and echo. Existing Slot settings remain a complete
-  compatibility snapshot.
-- Authoritative `effective_transport` and `effective_write_pacing` in every
-  Slot snapshot. A Transport change reopens the handle; a Device change does
-  not, and is rejected during an active Run or Trigger.
-- Optimistic `config_revision` on Slot and both Profile-catalog mutations,
-  with atomic stage/save/commit and stale-update rejection.
-- Stable error codes for missing, busy, access-denied, and general port I/O;
-  Profile-change conflicts; regex failures; and unsupported Break.
-- Read-only daemon/storage/Slot diagnostics including subscriber lag, RX
-  overflow, journal quota/usage/queue health, and configuration revision.
-- Bounded UTF-8 regular-expression history queries. Literal and regex matching
-  span adjacent same-direction serial events while retaining scan/time/byte/
-  result and compiled-automaton limits.
-- Fenced, Run-bound physical serial Break with an audited timeline event.
+### serial-mcp
 
-### Released in v0.5.0
+- stdio 与 loopback sessionless Streamable HTTP 两种 transport。
+- 19 工具覆盖设备/机型、Run、命令、原始输入、信号、Trigger、查询和 Monitor。
+- `run_handle` 收敛 Run-scoped 参数；正常会话结束前由 Agent 调用 `run_end`。
+- `command_sequence` 一次完成 1–8 步依赖交互；每个非最终步骤必须等到明确 RX 边界。
+- 命令 TX 持久化 `command_capture_matchers`，供人类界面精确定位输出。
+- process-local live cursor、bounded capture、明确 truncation/gap/interference。
+- Agent 写入前的串口上下文保护；第三方变化时返回紧凑 `recent_context`。
+- Monitor 在 adapter 退出后仍由后端运行。
 
-- Durable, daemon-owned Monitor Jobs over live Slot RX. A Job starts after an
-  explicit cursor or the current head, persists independently of Agent turns,
-  and resumes after daemon restart.
-- Literal and bounded byte-regex matching across adjacent RX events, with
-  explicit gap reset/recovery, 250-ms default burst grouping, 30-second default
-  cooldown, optional duration, and bounded incident previews/evidence ranges.
-- Idempotent Monitor creation keyed by `request_id`, authoritative status and
-  cursor, retained incident acknowledgement, and recent-tail/cursor-forward
-  pagination under additive `/api/v1/monitors` routes.
-- Bounded local Monitor state with explicit capacity errors/gaps. Incident
-  evidence remains in the serial journal rather than being copied without
-  bound into incident summaries. Oldest summaries yield to newer evidence at
-  hard bounds, and cursor pages surface the resulting gap.
-- WebSocket protocol remains v3. The Monitor surface is additive HTTP/MCP, so
-  protocol-v3 v0.4 peers remain wire-compatible for existing realtime features;
-  Monitor use requires v0.5 seriald and adapter components.
+### 交付
 
-### Released in v0.6.0
+- 裸 `serial` 一次启动 `seriald`、HTTP MCP 和前台 TUI。
+- 四个平台包都包含 `serial`、`seriald`、`serialctl`、`serial-mcp` 和 Electron App。
+- Jenkins 在 workspace 版本 tag 不存在时构建 Debug；当前 commit 的 annotated version tag 自动触发 Release 与 GitHub 发布；tag 类型或 commit 不匹配时仅构建 Debug，不发布。
+- GitHub Actions 负责 Rust 多平台检查和 Electron typecheck/test/build/原生打包验证，不承担发布。
 
-- An independent, arbitrary-depth `DeviceModel` tree and guarded per-Slot
-  binding record model identity without changing Device Profile behavior.
-  Confirmation method, source, note, and timestamp are retained explicitly;
-  a configured name alone is never treated as physical-DUT proof.
-- A Human may submit an audited cooperative write into the exact active Agent
-  Run without acquiring or revoking its lease. Ordinary Human queueing and
-  explicit takeover remain separate paths, and foreign TX is exposed as Agent
-  evidence interference.
-- Directed acquire cancellation preserves unrelated Slot queues and controls.
-  Run aborts caused by Human takeover carry an explicit reason so an Agent can
-  distinguish takeover from transport or generic cancellation failure.
+## 发布前必须验证
 
-### Implemented for v0.7.0
+这些项目属于 v0.8 质量门槛，不是功能扩张：
 
-- Additive atomic serial-context preconditions cover Agent Write, Break,
-  Trigger start, and every command-sequence step. Old protocol-v3 daemons that
-  do not advertise the capability are rejected before any physical action.
-- Live-ring tail and cursor continuation provide bounded realtime context
-  independent of retained journal size. Ring eviction and daemon restart are
-  explicit gaps; archive/history search continues to use bounded journal
-  queries.
-- Retired Monitor delivery/outbox routes and event TTL policy are removed while
-  durable Monitor Jobs, incident pull, and acknowledgement remain core.
+- 两个端口持续 115200 baud 输出下，TUI、App 与 MCP tail 保持有界和可响应。
+- Windows 不同 USB-UART 驱动上的拔插、访问占用、Break 与写超时分类。
+- macOS arm64/x86_64 App、Windows portable、Linux AppImage 内的 sidecar 启动与退出。
+- `serial` 首次运行、离线 `serial setup`、已有后端和端口为空四种启动路径。
+- TUI 重开恢复、后端重启边界、journal retention gap 与损坏断尾恢复。
+- command matcher 在普通命令、命令序列、无回显、提示符变化和无匹配时的定位。
+- 人工 Takeover、cooperative write、其他 Agent 写入和机型切换的 `recent_context`。
+- Streamable HTTP initialize、notification 202、cancellation、Origin 和 19 工具 schema。
+- annotated tag 到 Jenkins、四平台 artifacts、SHA256SUMS 和 GitHub Release 的完整链路。
 
-### Next
+## 下一阶段
 
-- Exercise Monitor restart, replay-gap, burst grouping, regex-boundary, and
-  incident-capacity paths against sustained real 115200-baud output.
-- Run the two-Slot 115200-baud station matrix continuously: sustained RX,
-  slow subscriber, repeated unplug/replug, daemon restart, disk pressure,
-  Profile mutation conflicts, and Break support/unsupported drivers.
-- Refine native open-error classification from additional Windows adapters and
-  drivers without hiding the original OS reason.
-- Measure retention and regex-query latency near the 10-GiB ceiling before
-  choosing an index or compression format.
+下一阶段优先解决真实使用摩擦，而不是增加抽象层：
 
-### Later / candidate
+- 用真实机架连续运行收集断连、驱动错误、journal 延迟和查询预算数据。
+- 为 App 与 TUI 建立相同 fixture 的视觉回归与交互回归，防止布局和命令定位退化。
+- 增加端口配置导入/导出的一键站点备份，仍保持 `port` 为唯一设备标识。
+- 依据真实超长会话数据评估 journal 稀疏索引；只有分段扫描达到可测瓶颈时才引入。
+- 依据真实 Monitor incident 评估 matcher 更新或组合条件；当前单 literal/regex 优先保持简单。
+- 为常见 MCP host 补充自动发现与健康检查，但不改变 19 工具的紧凑参数面。
 
-- TLS or a trusted reverse-proxy deployment profile for networks beyond
-  loopback/host-only.
-- Windows Service installation and service-account ACL guidance.
-- A rebuildable sparse query catalog and optional sealed-segment compression
-  after real 24/7 measurements. Raw segment bytes remain the source of truth.
-- Explicit external-exclusive handoff for rare `screen`, `minicom`, vendor
-  flasher, or diagnostics use.
-- Optional reset/power-control resources if stations standardize the hardware.
-- An explicit one-shot probe that runs only while the Slot is silent and has
-  no Control owner, Run, Trigger, or recent human activity. It would never be a
-  periodic guessed heartbeat.
-- Device-pool reservations and asset identity if station scale grows beyond a
-  small fixed set of frequently swapped boards.
-- Compound Monitor rules, update/delete UX, or Monitor-aware diagnostics only
-  after real station incidents show that one literal/regex plus status is
-  insufficient.
+## 后续候选
 
-### Non-goals
+只有出现明确使用需求时再推进：
 
-- Built-in firmware recipes, automatic flashing, or vendor-specific boot
-  sequences.
-- Automatically restoring a “clean board” when a Run starts or ends.
-- Guessing liveness from silence or probing a busy target.
-- Embedding OpenCode, Codex, OpenChamber, shell, or DUT semantics in the
-  daemon.
+- Windows Service 与系统启动集成。
+- 跨机器部署的加密传输与运维方案。
+- journal sealed segment 压缩和可重建稀疏索引。
+- 显式交出物理串口给 vendor flasher、`screen` 或 `minicom` 的 exclusive handoff。
+- 外部电源、复位与继电器资源；它们应是可组合资源，不应改变串口核心。
+- 大规模机架的设备池预留与资产标识；小规模固定端口继续直接使用 `port`。
 
-## serialctl / serial console
+## 非目标
 
-### Released before v0.4.0
-
-- One TUI that subscribes to and switches between multiple Slots.
-- LINE and raw byte-entry modes, Human Control queueing, explicit Takeover, and
-  visible ownership.
-- Continuous prompt/TX/echo projection with exact durable RX/TX audit events.
-- Actor-aware styling, bounded local viewport, high-rate rendering protection,
-  Shift-free selection/copy, input paste, and serial-only wheel scrolling.
-- Interactive setup, status, archive/history query, JSON output, and Windows
-  x86-64 plus Ubuntu x86-64 clients.
-
-### Released in v0.4.0
-
-- Unified `serial` launcher in both release packages:
-  `serve`, `console`, `setup`, `profile`, `status`, `doctor`, `archives`,
-  `logs`, and `mcp`. Legacy component binaries remain available. Dispatch is
-  restricted to sibling executables from the same package; there is no `PATH`
-  fallback to a possibly different release.
-- Ubuntu client release is built natively on the Ubuntu 20.04
-  x86_64/glibc-2.31 baseline; it is not a musl or 32-bit build.
-- Setup selects a reusable Transport Profile and optional Device Profile.
-  Profile commands support list/show/create/update/clone/import/export/delete/
-  attach/detach; interactive creation/update and admin-token-file automation
-  are both supported. Partial update flags preserve omitted values, explicit
-  prompt-clear flags remove prompts, and optional EOL/echo/pacing overrides
-  can return to inherited behavior.
-  Setup separates credential input/output flags, rejects global
-  `--token-file`, and refuses aliased input/destination paths.
-- Five diagnostic levels: connection, port, stream, storage, and authoritative
-  Slot state. Stream diagnosis compares WebSocket RX with offsets and journal.
-- `logs --regex` alongside literal `--contains`, with explicit Run/epoch/cursor
-  scoping, bounded continuation, and fail-closed behavior against older
-  daemons that cannot advertise bounded server-side regex.
-- Full-width colored Run start/end/abort rules in the terminal transcript.
-- Queued LINE command preview plus `Ctrl-] d` delete and `Ctrl-] e` return to
-  editor. Bytes already entering a physical write cannot be recalled.
-- RAW Ctrl-D and Ctrl-Z transmit `0x04`/`0x1a`; Ctrl-C transmits `0x03` in both
-  modes without quitting the console.
-
-### Released in v0.5.0
-
-- The Windows and Ubuntu client packages track the v0.5 daemon/MCP release
-  while preserving the existing console workflow. The first Monitor release
-  does not add Monitor policy to the human TUI.
-
-### Released in v0.6.0
-
-- `Ctrl-] m` opens an extensible menu for Transport/Device Profiles,
-  arbitrary-depth DUT models, common serial settings, and help. Hierarchical
-  model children remain indented and hidden until their parent is expanded;
-  CLI management uses the same catalogs and optimistic revision guards.
-- Scrollback freezes a wrapped visual-row snapshot when the operator leaves
-  the live tail. Later output cannot push the inspected page, and a history
-  shorter than the viewport cannot scroll into blank rows.
-- Queued LINE commands render as oldest-first numbered cards and can be edited
-  or removed individually. Empty Enter follows the live tail, ordinary Enter
-  queues without takeover, Alt-Enter requests a cooperative Human write, and
-  explicit takeover remains a visibly separate operation.
-- Jenkins produces the official x86_64 packages from one ARM64 Linux worker:
-  cargo-zigbuild enforces the Ubuntu 20.04/glibc-2.31 ceiling and MinGW-w64
-  produces the Windows GNU-ABI archive. Architecture, version, MCP tool count,
-  manifests, and archive checksums are verified before publication.
-
-### Implemented for v0.7.0
-
-- Current-epoch terminal output is restored from the durable journal before
-  live WebSocket attachment. A bounded in-terminal search supports literal or
-  regex matching, case sensitivity, RX/TX direction, current Run/current
-  epoch, and retained epochs with visible truncation/gap state.
-- The full configuration page edits port, Transport and Device parameters with
-  optimistic revisions. Shared Profile and model mutations list every affected
-  Slot and require confirmation. Agent-history height and orphan-Run fallback
-  are configurable from the same terminal menu.
-- Agent history stays newest-first, expands dependent sequence steps, and can
-  jump the serial pane to the corresponding TX. Conventional slow cursor blink,
-  double-click word selection, lexical severity boundaries, and IP/MAC styling
-  improve day-to-day terminal use.
-- `serial-desktop` supplies the same current-epoch console, Human input, Agent
-  history, direct Slot settings, explicit local-daemon lifecycle, shortcuts,
-  and system/dark/light themes without duplicating serial ownership.
-- Windows and Ubuntu archives contain five programs including `seriald` and
-  `serial-desktop`; each macOS architecture also contains a double-clickable,
-  currently unsigned and unnotarized `Serial Platform.app`.
-
-### Next
-
-- Validate selection, wrapped/wide-character rows, high-rate output, queued
-  editing, and Run boundaries in Windows Terminal and the Ubuntu station.
-- Improve Profile setup prompts from first-time user feedback while preserving
-  deterministic non-interactive flags and revision safety.
-- Add a compact in-console detail view for active Run, Operation, Trigger,
-  actor, and diagnostic counters only if it remains readable beside raw serial
-  output.
-
-### Later / candidate
-
-- Export a selected sequence/time range as text plus authoritative metadata.
-- Saved coloring themes and user rules with safe precedence over built-ins.
-- A richer native OpenChamber serial panel that reuses the protocol/state
-  model rather than embedding the TUI.
-- A compact Monitor list/incident indicator only if operators need to manage
-  Jobs without MCP or HTTP tooling; exact serial output remains the primary TUI.
-- Full terminal emulation only if real DUT workflows require cursor
-  addressing; the default remains a serial log console, not a PTY.
-
-### Non-goals
-
-- Using the mouse wheel for command history.
-- Hiding Agent writes or reconstructing a cleaner transcript than observed
-  bytes and audit events.
-- Letting an Agent close a Slot; Agents release Run/Control while `seriald`
-  keeps the configured port available.
-
-## serial-mcp
-
-### Released before v0.4.0
-
-- One stdio adapter shared by OpenCode, Codex, and other MCP hosts.
-- Adapter-owned Run and fenced-Control renewal with best-effort cleanup.
-- Attach-before-write capture, confirmed TX lower bounds, prompt/literal/regex/
-  quiet completion, interference/gap reporting, exact cursors, and bounded
-  rendered text.
-- Current-Run search by default and explicit cursor/archive scopes.
-- Generic daemon-native Trigger access with no built-in SigmaStar, U-Boot, or
-  flashing recipe.
-
-### Released in v0.4.0
-
-- Stable eleven-tool surface: `devices`, `read`, `command`, `input`, `signal`,
-  `trigger`, `wait`, `search`, `run_start`, `run_end`, and `release`.
-- Smaller Agent schemas: the adapter owns fencing, UUIDs, pacing, prompt
-  selection, live cursors, capture bounds, rendering limits, and lease renewal.
-- Compact results center on text, completion/confidence, warnings, truncation/
-  gap/interference, and one continuation cursor instead of returning internal
-  IDs and duplicate boundary fields by default.
-- `input` sends exact UTF-8 bytes without EOL. `signal` exposes Ctrl-C/D/Z and
-  physical Break so Agents need not fake raw control characters.
-- `command` and `wait` accept one optional literal `expect` or regex boundary;
-  prompt/quiet fallback is selected internally. `search` accepts bounded regex
-  and remains current-Run scoped by default.
-- Concurrent MCP request dispatch and serialized stdout frames. Cancellation
-  applies only to pure read tools; a mutating call converges to its
-  authoritative result after a possible side effect. Per-Slot write
-  serialization prevents interleaved serial bytes.
-- Repeated-line folding and bounded ANSI-cleaned evidence reduce context while
-  preserving warnings, exact cursors, and durable raw events in `seriald`.
-
-### Released in v0.5.0
-
-- Five additive tools alongside the unchanged eleven core tools:
-  `monitor_start`, `monitor_list`, `monitor_status`, `monitor_incidents`, and
-  `monitor_stop`.
-- `monitor_start` exposes only Slot, exactly one literal/regex matcher, and an
-  optional description. The adapter owns the idempotency UUID and safe
-  debounce/cooldown defaults; persistence policy never becomes a routine Agent
-  argument.
-- Monitor calls return immediately and leave the Job in seriald. Incident reads
-  are capped at 20 compact entries and carry an opaque decimal continuation,
-  exact serial range, bounded preview, and evidence reference/cursor.
-- The same tools provide the complete bounded pull and audit path without an
-  external delivery dependency.
-
-### Released in v0.6.0
-
-- `device_models` and `device_model_set` extend the registry to 18 tools. The
-  first reads the hierarchy and Slot bindings; the second performs a guarded
-  existing-node update or atomic create-if-missing-and-bind operation through
-  the narrow Operator API.
-- Server instructions and both model-tool results require the Agent to confirm
-  the configured identity against the physical DUT through serial evidence,
-  Telnet, the device web UI, or a human before model-specific operations.
-- Human takeover is surfaced as a distinct Run-abort reason instead of an
-  unexplained generic tool cancellation, reducing unsafe automatic retries.
-
-### Implemented for v0.7.0
-
-- Every Run-scoped tool accepts one 22-character opaque `run_handle`; public
-  Slot and Run IDs remain audit identity and cannot be used to adopt a Run.
-  Normal workflows must call `run_end`; the configurable orphan fallback
-  defaults to 1,800 seconds, accepts `0` for unlimited, and does not change the
-  renewable 60-second control lease.
-- `command_sequence` and the 19-tool registry remain bounded. Results surface
-  compact `recent_context` only after third-party activity or incomplete
-  evidence, and subsequent physical actions fail closed until that context is
-  observed.
-- `read(scope=tail)` and `read(scope=continue)` use the bounded live ring, so a
-  long-running journal cannot turn routine context reads into segment-discovery
-  budget failures. Historical search remains explicit and bounded.
-
-### Next
-
-- Add real OpenCode/Codex regression scenarios where a Monitor outlives the
-  initiating turn, then verify later pull recovery preserves the exact
-  incident/evidence identity.
-- Keep real-device regression fixtures for sustained output, delayed prompts,
-  partial echo, target wrapping, foreign Human writes, reconnects, cancellation,
-  raw signals, Break, and Trigger-based boot interruption.
-- Tune context limits and recovery guidance from OpenCode/Codex use without
-  adding routine parameters back to the tool surface.
-- Publish tested host configuration snippets for Windows-local and
-  Windows-daemon/Linux-VM layouts as Agent hosts evolve.
-
-### Later / candidate
-
-- Thin host-specific installers/permission helpers while preserving one shared
-  adapter.
-- Context-budget presets backed by the same exact event interval.
-- Optional workflow packages outside the platform for repeatable vendor/test
-  procedures.
-- OpenChamber integration that displays the same actor, Run, Operation,
-  Trigger, and sequence metadata.
-
-### Non-goals
-
-- Automatic retry after timeout, missing echo, transport loss, or uncertain
-  delivery.
-- Agent-selected physical pacing in ordinary tools.
-- Default global-history search.
-- Inferring command success from a returned prompt; request a unique result
-  marker when exit status matters.
-- Encoding flashing or DUT-specific recipes in MCP tool names or `seriald`.
+- 把 U-Boot、Linux、AT command 或厂商烧录流程编进 `seriald`。
+- 为没有证据的设备状态提供“成功”结论。
+- 自动重试结果不确定的物理写入。
+- 在静默端口周期性发送猜测性探针。
+- 为尚未出现的生产场景增加复杂配置和操作步骤。

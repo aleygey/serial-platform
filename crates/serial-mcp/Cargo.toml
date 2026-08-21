@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 directories.workspace = true
@@ -25,3 +26,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23"
+tower = "0.5"

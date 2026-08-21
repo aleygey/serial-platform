@@ -11,16 +11,12 @@ use serial_protocol::{
 };
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        http::{HeaderValue, header::AUTHORIZATION},
-    },
+    tungstenite::{Message, client::IntoClientRequest},
 };
 use uuid::Uuid;
 
 use crate::{
-    api::{ApiClient, is_forbidden, is_not_found},
+    api::{ApiClient, is_not_found},
     cli::{DoctorSlotArgs, DoctorStreamArgs, OutputArgs},
     display::{
         error_code_label, event_to_lines, pad_display, safe_inline, session_state_label,
@@ -46,10 +42,10 @@ fn bool_label(value: bool) -> &'static str {
 fn source_label(source: &str) -> String {
     match source {
         "daemon_port_enumeration" => tr("doctor.source.port.enumeration").into(),
-        "authoritative_slot_snapshot" => tr("doctor.source.slot.snapshot").into(),
+        "authoritative_port_snapshot" => tr("doctor.source.port.snapshot").into(),
         "authoritative daemon diagnostics" => tr("doctor.source.storage.diagnostics").into(),
         "archive_catalog_fallback" => tr("doctor.source.archive.fallback").into(),
-        "authoritative_slot_diagnostics" => tr("doctor.source.slot.diagnostics").into(),
+        "authoritative_port_diagnostics" => tr("doctor.source.port.diagnostics").into(),
         "status_fallback" => tr("doctor.source.status.fallback").into(),
         other => safe_inline(other),
     }
@@ -57,7 +53,7 @@ fn source_label(source: &str) -> String {
 
 fn assessment_label(assessment: &str) -> String {
     let key = match assessment {
-        "slot_disabled" => "doctor.assessment.slot_disabled",
+        "port_disabled" => "doctor.assessment.port_disabled",
         "port_not_present" => "doctor.assessment.port_not_present",
         "online" => "doctor.assessment.online",
         "opening" => "doctor.assessment.opening",
@@ -176,7 +172,6 @@ fn echo_label(echo: Option<EchoMode>) -> &'static str {
 
 #[derive(Debug, Serialize)]
 struct PortReport {
-    slot_id: String,
     port: String,
     port_discovered: bool,
     discovery_source: &'static str,
@@ -198,7 +193,7 @@ struct PortReport {
 
 pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
     let status = api.status().await?;
-    let snapshot = find_slot(&status.slots, &args.slot)?.clone();
+    let snapshot = find_slot(&status.ports, &args.port)?.clone();
     let (port_discovered, discovery_source) = match api.ports().await {
         Ok(ports) => (
             ports
@@ -206,19 +201,19 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
                 .any(|port| same_serial_port(&port.name, &snapshot.config.port)),
             "daemon_port_enumeration",
         ),
-        Err(error) if is_forbidden(&error) || is_not_found(&error) => {
-            (snapshot.endpoint_present, "authoritative_slot_snapshot")
+        Err(error) if is_not_found(&error) => {
+            (snapshot.endpoint_present, "authoritative_port_snapshot")
         }
         Err(error) => return Err(error),
     };
-    let diagnostics = match api.slot_diagnostics(&args.slot).await {
+    let diagnostics = match api.port_diagnostics(&args.port).await {
         Ok(diagnostics) => Some(diagnostics),
         Err(error) if is_not_found(&error) => None,
         Err(error) => return Err(error),
     };
     let (recent, recent_events_error) = match api
         .events(
-            &args.slot,
+            &args.port,
             &EventQuery {
                 epoch: Some(snapshot.daemon_epoch),
                 after_seq: Some(snapshot.head_seq.saturating_sub(100)),
@@ -243,7 +238,6 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
     };
     let assessment = assess_port(&snapshot);
     let report = PortReport {
-        slot_id: args.slot,
         port: snapshot.config.port.clone(),
         port_discovered,
         discovery_source,
@@ -267,7 +261,7 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_field("doctor.field.slot", safe_inline(&report.slot_id));
+        print_field("doctor.field.configured_port", safe_inline(&report.port));
         print_field("doctor.field.port", safe_inline(&report.port));
         print_field(
             "doctor.field.discovery",
@@ -345,7 +339,7 @@ pub async fn port(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
 
 fn assess_port(snapshot: &SlotSnapshot) -> &'static str {
     if !snapshot.config.enabled {
-        "slot_disabled"
+        "port_disabled"
     } else if !snapshot.endpoint_present {
         "port_not_present"
     } else {
@@ -355,7 +349,7 @@ fn assess_port(snapshot: &SlotSnapshot) -> &'static str {
             SessionState::Backoff => "open_failed_backoff",
             SessionState::WaitingForPort => "waiting_for_port",
             SessionState::Stopping => "stopping",
-            SessionState::Disabled => "slot_disabled",
+            SessionState::Disabled => "port_disabled",
         }
     }
 }
@@ -433,10 +427,10 @@ pub async fn storage(api: &ApiClient, args: OutputArgs) -> Result<()> {
         archive_count: archives.archives.len(),
         catalog_truncated: archives.truncated,
         degraded_slots: status
-            .slots
+            .ports
             .iter()
             .filter(|slot| slot.logging == LoggingState::Degraded)
-            .map(|slot| slot.config.id.clone())
+            .map(|slot| slot.config.port.clone())
             .collect(),
         note: "upgrade seriald for authoritative quota and writer-queue metrics",
     };
@@ -455,7 +449,7 @@ pub async fn storage(api: &ApiClient, args: OutputArgs) -> Result<()> {
         print_field("doctor.field.quota", tr("doctor.value.quota_unavailable"));
         if !report.degraded_slots.is_empty() {
             print_field(
-                "doctor.field.degraded_slots",
+                "doctor.field.degraded_ports",
                 safe_inline(&report.degraded_slots.join(", ")),
             );
         }
@@ -476,17 +470,17 @@ struct StateFallback {
 }
 
 pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
-    let report = match api.slot_diagnostics(&args.slot).await {
+    let report = match api.port_diagnostics(&args.port).await {
         Ok(diagnostics) => StateFallback {
             snapshot: diagnostics.snapshot,
             subscriber_count: Some(diagnostics.subscriber_count),
             subscriber_lag_events: Some(diagnostics.subscriber_lag_events),
-            source: "authoritative_slot_diagnostics",
+            source: "authoritative_port_diagnostics",
         },
         Err(error) if is_not_found(&error) => {
             let status = api.status().await?;
             StateFallback {
-                snapshot: find_slot(&status.slots, &args.slot)?.clone(),
+                snapshot: find_slot(&status.ports, &args.port)?.clone(),
                 subscriber_count: None,
                 subscriber_lag_events: None,
                 source: "status_fallback",
@@ -500,12 +494,12 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
         let slot = &report.snapshot;
         print_field("doctor.field.source", source_label(report.source));
         print_field(
-            "doctor.field.slot",
+            "doctor.field.configured_port",
             trf(
-                "doctor.value.slot",
+                "doctor.value.port",
                 &[
-                    &safe_inline(&slot.config.id),
-                    &safe_inline(&slot.config.display_name),
+                    &safe_inline(&slot.config.port),
+                    &safe_inline(&slot.config.port),
                 ],
             ),
         );
@@ -574,8 +568,11 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
             trf(
                 "doctor.value.profiles",
                 &[
-                    &safe_inline(&slot.config.profile),
-                    &slot.config.device_profile.as_ref().map_or_else(
+                    &slot.config.transport_profile.as_ref().map_or_else(
+                        || tr("menu.value.unbound").into(),
+                        |profile| safe_inline(profile),
+                    ),
+                    &slot.config.model_profile.as_ref().map_or_else(
                         || tr("menu.value.generic").into(),
                         |profile| safe_inline(profile),
                     ),
@@ -651,7 +648,7 @@ struct LiveObservation {
 
 #[derive(Debug, Serialize)]
 struct StreamReport {
-    slot_id: String,
+    port: String,
     duration_seconds: u64,
     daemon_epoch_before: Uuid,
     daemon_epoch_after: Uuid,
@@ -673,11 +670,10 @@ struct StreamReport {
 
 pub async fn stream(api: &ApiClient, args: DoctorStreamArgs) -> Result<()> {
     let before_status = api.status().await?;
-    let before = find_slot(&before_status.slots, &args.slot)?.clone();
+    let before = find_slot(&before_status.ports, &args.port)?.clone();
     let live = observe_live(
         api.endpoint(),
-        api.token(),
-        &args.slot,
+        &args.port,
         Cursor {
             epoch: before.daemon_epoch,
             after_seq: before.head_seq,
@@ -686,12 +682,12 @@ pub async fn stream(api: &ApiClient, args: DoctorStreamArgs) -> Result<()> {
     )
     .await?;
     let after_status = api.status().await?;
-    let after = find_slot(&after_status.slots, &args.slot)?.clone();
+    let after = find_slot(&after_status.ports, &args.port)?.clone();
 
     let journal = if before.daemon_epoch == after.daemon_epoch {
         Some(
             api.events(
-                &args.slot,
+                &args.port,
                 &EventQuery {
                     epoch: Some(before.daemon_epoch),
                     after_seq: Some(before.head_seq),
@@ -735,7 +731,7 @@ pub async fn stream(api: &ApiClient, args: DoctorStreamArgs) -> Result<()> {
         .unwrap_or(0);
     let assessment = assess_stream(&before, &after, &live, journal_rx_events, journal_gaps);
     let report = StreamReport {
-        slot_id: args.slot,
+        port: args.port,
         duration_seconds: args.duration,
         daemon_epoch_before: before.daemon_epoch,
         daemon_epoch_after: after.daemon_epoch,
@@ -759,7 +755,7 @@ pub async fn stream(api: &ApiClient, args: DoctorStreamArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_field("doctor.field.slot", safe_inline(&report.slot_id));
+        print_field("doctor.field.configured_port", safe_inline(&report.port));
         print_field(
             "doctor.field.duration",
             trf(
@@ -830,7 +826,7 @@ fn assess_stream(
     if before.daemon_epoch != after.daemon_epoch || before.generation != after.generation {
         "inconclusive_session_changed"
     } else if !after.config.enabled {
-        "slot_disabled"
+        "port_disabled"
     } else if !after.endpoint_present {
         "port_not_present"
     } else if after.session_state != SessionState::Online {
@@ -839,7 +835,7 @@ fn assess_stream(
             SessionState::Backoff => "open_failed_backoff",
             SessionState::WaitingForPort => "waiting_for_port",
             SessionState::Stopping => "stopping",
-            SessionState::Disabled => "slot_disabled",
+            SessionState::Disabled => "port_disabled",
             SessionState::Online => unreachable!("handled above"),
         }
     } else if !live.ready {
@@ -863,8 +859,7 @@ fn assess_stream(
 
 async fn observe_live(
     endpoint: &str,
-    token: Option<&str>,
-    slot_id: &str,
+    port: &str,
     cursor: Cursor,
     duration: Duration,
 ) -> Result<LiveObservation> {
@@ -872,16 +867,9 @@ async fn observe_live(
     let rest = base
         .strip_prefix("http://")
         .expect("normalized endpoint always uses http");
-    let mut request = format!("ws://{rest}/api/v1/ws")
+    let request = format!("ws://{rest}/api/v1/ws")
         .into_client_request()
         .context(tr("doctor.error.ws_url"))?;
-    if let Some(token) = token {
-        request.headers_mut().insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .context(tr("doctor.error.token_header"))?,
-        );
-    }
     let connection = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
         .await
         .context(tr("doctor.error.ws_timeout"))?;
@@ -901,7 +889,7 @@ async fn observe_live(
         &ClientMessage::Attach {
             request_id: Uuid::new_v4(),
             subscriptions: vec![Subscription {
-                slot_id: slot_id.to_owned(),
+                port: port.to_owned(),
                 cursor: Some(cursor),
                 tail_events: 0,
             }],
@@ -924,41 +912,40 @@ async fn observe_live(
         };
         match message {
             Message::Binary(bytes) => match decode_wire_frame(&bytes)? {
-                WireFrame::Rx(header, data) if header.slot_id == slot_id => {
+                WireFrame::Rx(header, data) if header.port == port => {
                     observation.rx_frames += 1;
                     observation.rx_bytes += data.len() as u64;
                     observation.last_seq = Some(observation.last_seq.unwrap_or(0).max(header.seq));
                 }
-                WireFrame::Tx(header, data) if header.slot_id == slot_id => {
+                WireFrame::Tx(header, data) if header.port == port => {
                     observation.tx_frames += 1;
                     observation.tx_bytes += data.len() as u64;
                     observation.last_seq = Some(observation.last_seq.unwrap_or(0).max(header.seq));
                 }
-                WireFrame::Control(ServerMessage::Snapshot { slot })
-                    if slot.config.id == slot_id =>
+                WireFrame::Control(ServerMessage::Snapshot { port: slot })
+                    if slot.config.port == port =>
                 {
                     observation.snapshot_generation = Some(slot.generation);
                 }
                 WireFrame::Control(ServerMessage::Ready {
-                    slot_id: ready_slot,
+                    port: ready_slot,
                     head_seq,
-                }) if ready_slot == slot_id => {
+                }) if ready_slot == port => {
                     observation.ready = true;
                     observation.last_seq = Some(observation.last_seq.unwrap_or(0).max(head_seq));
                 }
-                WireFrame::Control(ServerMessage::Timeline { event, .. })
-                    if event.slot_id == slot_id =>
-                {
+                WireFrame::Control(ServerMessage::Timeline { event, .. }) if event.port == port => {
                     observation.timeline_events += 1;
                     observation.last_seq = Some(observation.last_seq.unwrap_or(0).max(event.seq));
                 }
-                WireFrame::Control(ServerMessage::Gap {
-                    slot_id: gap_slot, ..
-                }) if gap_slot == slot_id => observation.gap_events += 1,
+                WireFrame::Control(ServerMessage::Gap { port: gap_slot, .. })
+                    if gap_slot == port =>
+                {
+                    observation.gap_events += 1
+                }
                 WireFrame::Control(ServerMessage::Lagged {
-                    slot_id: lagged_slot,
-                    ..
-                }) if lagged_slot == slot_id => observation.lagged_events += 1,
+                    port: lagged_slot, ..
+                }) if lagged_slot == port => observation.lagged_events += 1,
                 WireFrame::Control(ServerMessage::Error { message, .. }) => {
                     bail!(
                         "{}",
@@ -991,11 +978,11 @@ where
     Ok(())
 }
 
-fn find_slot<'a>(slots: &'a [SlotSnapshot], id: &str) -> Result<&'a SlotSnapshot> {
-    slots
+fn find_slot<'a>(ports: &'a [SlotSnapshot], id: &str) -> Result<&'a SlotSnapshot> {
+    ports
         .iter()
-        .find(|slot| slot.config.id == id)
-        .with_context(|| trf("doctor.error.unknown_slot", &[&safe_inline(id)]))
+        .find(|slot| slot.config.port == id)
+        .with_context(|| trf("doctor.error.unknown_port", &[&safe_inline(id)]))
 }
 
 fn same_serial_port(left: &str, right: &str) -> bool {
@@ -1033,7 +1020,6 @@ mod tests {
     fn human_assessments_localize_without_changing_json_machine_values() {
         let _guard = lang_test_lock();
         let report = PortReport {
-            slot_id: "dut-1".into(),
             port: "COM3".into(),
             port_discovered: true,
             discovery_source: "daemon_port_enumeration",

@@ -1,6 +1,5 @@
-# Jenkins is the authoritative release builder, and GitHub Releases receives
-# only its verified artifacts. This workflow validates portable builds on
-# demand and on Codex branches; tags deliberately do not trigger it.
+# Jenkins is the only release builder and publisher. This workflow is a
+# non-publishing native portability check for development branches.
 name: Release validation (non-publishing)
 
 on:
@@ -16,9 +15,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify:
-    name: Verify locked workspace metadata
-    runs-on: ubuntu-latest
+  native:
+    name: Native validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
 
     steps:
       - name: Check out source
@@ -29,201 +32,57 @@ jobs:
         with:
           toolchain: 1.88.0
 
-      - name: Verify Cargo.lock
-        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
-
-  windows:
-    name: Windows x86_64
-    runs-on: windows-latest
-    needs: verify
-    env:
-      RUSTFLAGS: -C target-feature=+crt-static
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
-          toolchain: 1.88.0
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/serial-desktop/package-lock.json
 
-      - name: Test workspace
+      - name: Verify locked Rust workspace
+        run: cargo metadata --locked --no-deps --format-version 1
+
+      - name: Test Rust workspace
         run: cargo test --workspace --locked
 
-      - name: Build Windows binaries
-        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp -p serial-desktop
+      - name: Build native Rust programs
+        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp
 
-      - name: Smoke-test binaries
-        shell: pwsh
+      - name: Install locked desktop dependencies
+        working-directory: crates/serial-desktop
+        run: npm ci --no-audit --no-fund
+
+      - name: Type-check, test, and build Electron desktop
+        working-directory: crates/serial-desktop
+        run: npm run build
+
+      - name: Package native Electron desktop with sidecars
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          .\target\release\seriald.exe --version
-          .\target\release\serialctl.exe --version
-          .\target\release\serial-mcp.exe --version
-          .\target\release\serial-desktop.exe --version
-          .\target\release\serial-desktop.exe --help
-          .\target\release\serial.exe --version
-          .\target\release\serial.exe --help
-          .\target\release\serial.exe console --version
-          .\target\release\serial.exe mcp --version
-
-      - name: Package Windows release
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          $version = (Select-String -Path "Cargo.toml" -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
-          $packageName = "serial-platform-v${version}-windows-x86_64-msvc-validation"
-          $packageDir = Join-Path "dist" $packageName
-          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-          Copy-Item "target\release\seriald.exe" $packageDir
-          Copy-Item "target\release\serialctl.exe" $packageDir
-          Copy-Item "target\release\serial-mcp.exe" $packageDir
-          Copy-Item "target\release\serial-desktop.exe" $packageDir
-          Copy-Item "target\release\serial.exe" $packageDir
-          Copy-Item "adapters" $packageDir -Recurse
-          Copy-Item "docs" $packageDir -Recurse
-          Copy-Item "README.md" $packageDir
-          Copy-Item "DOCUMENTATION.md" $packageDir
-          Copy-Item "ROADMAP.md" $packageDir
-          Copy-Item "LICENSE" $packageDir
-          $packageRoot = (Resolve-Path $packageDir).Path
-          $manifestLines = Get-ChildItem -LiteralPath $packageRoot -File -Recurse |
-            Sort-Object FullName |
-            ForEach-Object {
-              $relative = $_.FullName.Substring($packageRoot.Length + 1).Replace('\', '/')
-              $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-              "${digest}  ${relative}"
-            }
-          Set-Content -LiteralPath (Join-Path $packageRoot "MANIFEST.sha256") -Value $manifestLines -Encoding ascii
-          Compress-Archive -Path $packageDir -DestinationPath "dist\$packageName.zip"
-          $smokeRoot = Join-Path "dist" "smoke-windows"
-          Expand-Archive -LiteralPath "dist\$packageName.zip" -DestinationPath $smokeRoot
-          $smokeDir = Join-Path $smokeRoot $packageName
-          & "$smokeDir\serial.exe" --version
-          & "$smokeDir\serial.exe" console --version
-          & "$smokeDir\serial.exe" mcp --version
-          & "$smokeDir\serial.exe" serve --help
-          & "$smokeDir\serial-desktop.exe" --version
-          & "$smokeDir\serial-desktop.exe" --help
-          Get-Content -LiteralPath (Join-Path $smokeDir "MANIFEST.sha256") | ForEach-Object {
-            $parts = $_ -split '  ', 2
-            if ($parts.Count -ne 2) { throw "invalid package manifest line: $_" }
-            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $smokeDir $parts[1])).Hash
-            if ($actual -ne $parts[0]) { throw "package manifest mismatch: $($parts[1])" }
-          }
-          $portableRoot = Join-Path $smokeRoot "portable-root"
-          & "$smokeDir\serial.exe" --root $portableRoot paths
-
-      - name: Upload Windows package
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86_64-msvc-validation
-          path: dist/*.zip
-          if-no-files-found: error
-          retention-days: 7
-
-  linux:
-    name: Linux x86_64 (Ubuntu 20.04 baseline)
-    runs-on: ubuntu-latest
-    needs: verify
-    container:
-      image: ubuntu:20.04
-    env:
-      DEBIAN_FRONTEND: noninteractive
-
-    steps:
-      - name: Install Ubuntu baseline build tools
-        run: |
-          apt-get update
-          apt-get install --yes binutils build-essential ca-certificates curl file git \
-            libgl1 libx11-6 libx11-xcb1 libxcursor1 libxi6 libxkbcommon0 libxrandr2
-
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.88.0
-
-      - name: Test workspace natively
-        run: cargo test --workspace --locked
-
-      - name: Build Ubuntu baseline programs
-        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp -p serial-desktop
-
-      - name: Smoke-test Ubuntu baseline programs
-        run: |
-          for candidate in ./target/release/serial ./target/release/seriald ./target/release/serialctl ./target/release/serial-mcp ./target/release/serial-desktop; do
-            "${candidate}" --version
-            "${candidate}" --help > /dev/null
-            file "${candidate}" | grep -q 'ELF 64-bit LSB.*x86-64'
-            readelf -l "${candidate}" | grep -Fq '/lib64/ld-linux-x86-64.so.2'
-            ldd_output="$(ldd "${candidate}")"
-            printf '%s\n' "${ldd_output}"
-            if printf '%s\n' "${ldd_output}" | grep -q 'not found'; then
-              echo "${candidate} has an unresolved runtime dependency" >&2
+          set -Eeuo pipefail
+          destination="target/desktop-validation"
+          mkdir -p "${destination}"
+          case "${RUNNER_OS}" in
+            Linux)
+              bash ci/electron.sh package linux x86_64 target/release "${destination}"
+              test -x "${destination}/Serial Platform.AppImage"
+              ;;
+            Windows)
+              bash ci/electron.sh package windows x86_64 target/release "${destination}"
+              test -f "${destination}/Serial Platform.exe"
+              ;;
+            macOS)
+              case "$(uname -m)" in
+                arm64) electron_architecture=arm64 ;;
+                x86_64) electron_architecture=x86_64 ;;
+                *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              bash ci/electron.sh package \
+                macos "${electron_architecture}" target/release "${destination}"
+              test -x "${destination}/Serial Platform.app/Contents/MacOS/Serial Platform"
+              ;;
+            *)
+              echo "unsupported runner OS: ${RUNNER_OS}" >&2
               exit 1
-            fi
-            highest_glibc="$(
-              readelf --version-info "${candidate}" \
-                | grep -o 'GLIBC_[0-9][0-9.]*' \
-                | sort -Vu \
-                | tail -n 1
-            )"
-            newest="$(
-              printf '%s\n' "${highest_glibc}" 'GLIBC_2.31' \
-                | sort -V \
-                | tail -n 1
-            )"
-            if [ "${newest}" != 'GLIBC_2.31' ]; then
-              echo "${candidate} requires ${highest_glibc}, newer than the Ubuntu 20.04 baseline GLIBC_2.31" >&2
-              exit 1
-            fi
-          done
-          ./target/release/serial console --version
-          ./target/release/serial mcp --version
-
-      - name: Package Ubuntu baseline programs
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          package_name="serial-platform-v${version}-linux-x86_64-ubuntu20.04-validation"
-          package_dir="dist/${package_name}"
-          mkdir -p "${package_dir}"
-          install -m 0755 target/release/seriald "${package_dir}/seriald"
-          install -m 0755 target/release/serialctl "${package_dir}/serialctl"
-          install -m 0755 target/release/serial-mcp "${package_dir}/serial-mcp"
-          install -m 0755 target/release/serial-desktop "${package_dir}/serial-desktop"
-          install -m 0755 target/release/serial "${package_dir}/serial"
-          cp -r README.md DOCUMENTATION.md ROADMAP.md LICENSE adapters docs "${package_dir}/"
-          (
-            cd "${package_dir}"
-            find . -type f ! -name MANIFEST.sha256 -print0 \
-              | LC_ALL=C sort -z \
-              | while IFS= read -r -d '' file; do sha256sum "${file}"; done \
-              > MANIFEST.sha256
-            sha256sum --check MANIFEST.sha256
-          )
-          tar -C dist -czf "dist/${package_name}.tar.gz" "${package_name}"
-          mkdir -p dist/smoke
-          tar -C dist/smoke -xzf "dist/${package_name}.tar.gz"
-          "dist/smoke/${package_name}/serialctl" --version
-          "dist/smoke/${package_name}/serial-mcp" --version
-          "dist/smoke/${package_name}/seriald" --version
-          "dist/smoke/${package_name}/serial-desktop" --version
-          "dist/smoke/${package_name}/serial-desktop" --help > /dev/null
-          "dist/smoke/${package_name}/serial" --version
-          "dist/smoke/${package_name}/serial" console --version
-          "dist/smoke/${package_name}/serial" mcp --version
-          (cd "dist/smoke/${package_name}" && sha256sum --check MANIFEST.sha256)
-
-      - name: Upload Linux package
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-x86_64-ubuntu20.04-validation
-          path: dist/*.tar.gz
-          if-no-files-found: error
-          retention-days: 7
+              ;;
+          esac

@@ -50,7 +50,7 @@ pub fn set_lang(lang: Lang) {
 }
 
 /// Serializes tests that depend on the process-global language and gives
-/// legacy assertions a stable English baseline. Product code uses
+/// assertions a stable English baseline. Product code uses
 /// `Lang::default()` (Chinese) when no preference is configured.
 #[cfg(test)]
 pub(crate) fn lang_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -80,7 +80,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("activity.unknown", "UNKNOWN", "未知"),
     // ---- Connection summary (tab bar title) ----
     ("conn.reconnecting", "○ reconnecting", "○ 重连中"),
-    ("conn.authenticating", "◐ authenticating", "◐ 认证中"),
+    ("conn.handshaking", "◐ handshaking", "◐ 建立会话"),
     ("conn.live", "● live", "● 已连接"),
     ("conn.attaching", "◐ attaching", "◐ 接入中"),
     // ---- Status bar ----
@@ -253,9 +253,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("trigger.status.port_closed", "port_closed", "串口已关闭"),
     ("trigger.status.write_failed", "write_failed", "发送失败"),
     ("trigger.status.rx_gap", "rx_gap", "接收历史缺失"),
-    ("role.observer", "observer", "观察者"),
-    ("role.operator", "operator", "操作员"),
-    ("role.admin", "admin", "管理员"),
     (
         "gap.reason.epoch_changed",
         "epoch_changed",
@@ -271,8 +268,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "历史序号不连续",
     ),
     ("error.bad_request", "bad_request", "请求无效"),
-    ("error.unauthorized", "unauthorized", "未认证"),
-    ("error.forbidden", "forbidden", "无权限"),
     ("error.not_found", "not_found", "未找到"),
     ("error.conflict", "conflict", "状态冲突"),
     ("error.control_required", "control_required", "需要控制权"),
@@ -376,8 +371,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current",
-        "Current port {} · UART profile {} · DUT interaction profile {} · bound model {}",
-        "当前串口通道：{} · 串口参数方案：{} · 样机交互方案：{} · 样机机型：{}",
+        "Current port {} · Serial Profile {} · Model Profile {}",
+        "当前串口：{} · 串口 Profile：{} · 机型 Profile：{}",
     ),
     (
         "menu.value.generic",
@@ -393,11 +388,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.root.profile",
         "Current port configuration",
         "当前串口完整配置",
-    ),
-    (
-        "menu.root.model",
-        "DUT model bound to this port",
-        "样机机型（当前串口绑定）",
     ),
     (
         "menu.root.serial",
@@ -417,8 +407,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.root.help", "Help", "帮助"),
     (
         "menu.root.detail",
-        "Choose port profiles, DUT identity, terminal display, or local Agent runtime preferences. Catalog reads run asynchronously; protected daemon changes request authorization only when required.",
-        "可配置当前串口通道的方案和机型，也可调整终端显示及本机 Agent 运行参数。配置列表在后台加载；只有修改受保护的服务端配置时才会请求授权。",
+        "Choose the serial and model profiles for this port, terminal display settings, or local Agent runtime preferences.",
+        "可配置当前串口的串口 Profile、机型 Profile、终端显示及本机 Agent 运行参数。",
     ),
     (
         "menu.profile.title",
@@ -427,7 +417,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.profile.detail",
-        "Review and edit every active UART and DUT-interaction field here. Changes remain a local draft until Apply is selected. Reusable profile edits affect every bound Slot and require a separate impact confirmation.",
+        "Review and edit every active serial and model-profile field here. Changes remain a local draft until Apply is selected. Reusable profile edits affect every bound port and require a separate impact confirmation.",
         "可在此查看并修改当前串口参数与样机交互参数；选择“保存并应用”前，修改只保存在本页草稿中。修改可复用方案会影响所有绑定它的串口通道，提交前会另行展示影响范围并要求确认。",
     ),
     (
@@ -436,9 +426,19 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "按 Enter 可编辑或切换当前字段。端口与方案名称会明确显示；如需更换方案，请进入对应方案行。未保存的值只存在于本页。",
     ),
     (
+        "menu.current.section.serial",
+        "Serial port configuration",
+        "串口配置",
+    ),
+    (
+        "menu.current.section.model",
+        "Device model profile",
+        "机型 Profile 配置",
+    ),
+    (
         "menu.current.apply.detail",
-        "Shared UART/DUT profiles are updated in place, so Apply first lists every bound Slot and asks again. Save uses the catalog revision shown when editing began and fails closed if configuration changed. Physical UART changes still use seriald's busy/reopen safety boundary.",
-        "串口参数方案和样机交互方案会原地修改，因此“保存并应用”会先列出所有绑定通道并再次确认。保存仍校验开始编辑时的目录版本；若配置已变化会拒绝覆盖，物理串口参数也仍经过 seriald 的占用检查与安全重开边界。",
+        "Shared Serial and Model Profiles are updated in place, so Apply first lists every bound port and asks again. Save uses the profile revision shown when editing began and fails if configuration changed. Physical serial changes still use seriald's busy/reopen boundary.",
+        "共享串口 Profile 和机型 Profile 会原地修改，因此“保存并应用”会先列出所有绑定串口并再次确认。保存会校验开始编辑时的 Profile 版本；若配置已变化则拒绝覆盖，物理串口参数仍经过 seriald 的占用检查与安全重开边界。",
     ),
     (
         "menu.current.model.detail",
@@ -452,8 +452,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current.row.transport",
-        "UART profile: {} (Enter browses)",
-        "串口参数方案：{}（Enter 更换）",
+        "Serial Profile: {} (Enter browses)",
+        "串口 Profile：{}（Enter 更换）",
     ),
     ("menu.current.row.baud", "Baud rate: {}", "波特率：{}"),
     ("menu.current.row.data", "Data bits: {}", "数据位：{}"),
@@ -465,15 +465,19 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.current.row.auto", "Auto-open: {}", "自动打开串口：{}"),
     (
         "menu.current.row.device",
-        "DUT interaction profile: {} (Enter browses)",
-        "样机交互方案：{}（Enter 更换）",
+        "Model Profile: {} (Enter browses)",
+        "机型 Profile：{}（Enter 更换）",
     ),
     (
         "menu.current.row.eol",
         "Write line ending: {}",
         "发送换行符：{}",
     ),
-    ("menu.current.row.echo", "Echo handling: {}", "回显处理：{}"),
+    (
+        "menu.current.row.echo",
+        "Device echo policy (Agent capture parsing only): {}",
+        "设备回显策略（仅影响 Agent 捕获解析）：{}",
+    ),
     (
         "menu.current.row.shell",
         "Shell prompt: {}",
@@ -493,16 +497,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.current.row.delay",
         "Inter-chunk delay: {} ms",
         "分段发送间隔：{} 毫秒",
-    ),
-    (
-        "menu.current.row.model.binding",
-        "Bound model ID: {} (Enter changes binding)",
-        "已绑定机型 ID：{}（Enter 更换）",
-    ),
-    (
-        "menu.current.row.model.name",
-        "Model display name: {} (Enter renames)",
-        "机型显示名称：{}（Enter 修改）",
     ),
     (
         "menu.current.row.apply.changed",
@@ -531,20 +525,20 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.profile.shared.warning",
-        "Warning: this changes every Slot listed below, not only the currently selected serial port.",
+        "Warning: this changes every port listed below, not only the currently selected serial port.",
         "注意：本次修改会影响下方列出的每个串口通道，不只影响当前选中的串口。",
     ),
     (
         "menu.profile.shared.transport",
-        "Shared UART profile “{}” — {} affected Slot(s):",
+        "Shared Serial Profile “{}” — {} affected port(s):",
         "共享串口参数方案“{}”——影响 {} 个串口通道：",
     ),
     (
         "menu.profile.shared.device",
-        "Shared DUT interaction profile “{}” — {} affected Slot(s):",
-        "共享样机交互方案“{}”——影响 {} 个串口通道：",
+        "Shared Model Profile “{}” — {} affected port(s):",
+        "共享机型 Profile“{}”——影响 {} 个串口：",
     ),
-    ("menu.profile.shared.slot", "  • {} — {}", "  • {} — {}"),
+    ("menu.profile.shared.port", "  • {} — {}", "  • {} — {}"),
     (
         "menu.profile.shared.revision",
         "A binding or catalog change before submission is rejected by the revision guard; reload and review the new impact list.",
@@ -552,7 +546,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.profile.shared.pending",
-        "Review every affected Slot, then explicitly confirm or cancel",
+        "Review every affected port, then explicitly confirm or cancel",
         "请逐一核对所有受影响通道，再明确确认或取消",
     ),
     (
@@ -572,18 +566,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current.device.unbound",
-        "Bind a DUT interaction profile before editing its fields",
-        "请先绑定样机交互方案，再修改其字段",
+        "Bind a Model Profile before editing its fields",
+        "请先绑定机型 Profile，再修改其字段",
     ),
     (
         "menu.current.prompt.port",
         "Serial port path/name",
         "串口端口路径或名称",
-    ),
-    (
-        "menu.current.model.unbound",
-        "No model is bound; use the model-binding row first",
-        "当前未绑定机型；请先进入机型绑定行选择机型",
     ),
     (
         "menu.current.value.invalid",
@@ -616,11 +605,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "分段发送间隔毫秒（留空即继承）",
     ),
     (
-        "menu.current.prompt.model.name",
-        "Bound model display name",
-        "已绑定机型的显示名称",
-    ),
-    (
         "menu.profile.updated",
         "Current profiles saved and applied",
         "当前方案已保存并应用",
@@ -632,7 +616,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.profile.binding.changed",
-        "the Slot profile binding changed while this form was open; reload before saving",
+        "the port profile binding changed while this form was open; reload before saving",
         "本页打开后串口通道的方案绑定已变化；请重新加载后再保存",
     ),
     (
@@ -642,8 +626,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.profile.device",
-        "DUT interaction profiles (prompt/EOL/echo/pacing)",
-        "样机交互方案（提示符/换行/回显/分段发送）",
+        "Model Profiles (model name/prompt/EOL/echo/pacing)",
+        "机型 Profile（机型名/提示符/换行/回显/分段发送）",
     ),
     (
         "menu.transport.title",
@@ -675,65 +659,61 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "UART hardware profile {} no longer exists",
         "串口参数方案 {} 已不存在",
     ),
-    (
-        "menu.device.title",
-        "DUT interaction profiles",
-        "样机交互方案",
-    ),
+    ("menu.device.title", "Model Profiles", "机型 Profile"),
     (
         "menu.device.generic",
         "Generic settings (unbind profile)",
-        "通用交互设置（解除样机交互方案绑定）",
+        "通用设置（解除机型 Profile 绑定）",
     ),
     (
         "menu.device.new",
-        "+ Clone current effective DUT interaction and bind",
-        "+ 复制当前生效的样机交互设置并绑定",
+        "+ Clone the current effective Model Profile and bind",
+        "+ 复制当前生效的机型 Profile 并绑定",
     ),
     (
         "menu.device.clone.detail",
-        "The new interaction profile clones current prompts, line ending, echo and write pacing; each preset changes only its named field.",
-        "新样机交互方案会复制当前的提示符、换行符、回显和分段发送设置；每个预设只修改标出的项目。",
+        "The new Model Profile clones the current prompts, line ending, echo policy and write pacing; each preset changes only its named field.",
+        "新机型 Profile 会复制当前的提示符、换行符、回显策略和分段发送设置；每个预设只修改标出的项目。",
     ),
     (
         "menu.device.generic.detail",
-        "Unbinds the DUT interaction profile and returns this port to generic compatibility settings.",
-        "解除样机交互方案绑定，让当前串口通道使用通用交互设置。",
+        "Unbinds the Model Profile and returns this port to generic settings.",
+        "解除机型 Profile 绑定，让当前串口使用通用设置。",
     ),
     (
         "menu.device.bound",
-        "DUT interaction profile {} bound to the current port",
-        "样机交互方案 {} 已绑定到当前串口",
+        "Model Profile {} bound to the current port",
+        "机型 Profile {} 已绑定到当前串口",
     ),
     (
         "menu.device.generic.bound",
-        "DUT interaction profile unbound; generic settings are active",
-        "已解除样机交互方案；当前使用通用设置",
+        "Model Profile unbound; generic settings are active",
+        "已解除机型 Profile；当前使用通用设置",
     ),
     (
         "menu.device.created",
-        "DUT interaction profile {} created from effective settings and bound",
-        "样机交互方案 {} 已复制当前生效设置并绑定",
+        "Model Profile {} created from effective settings and bound",
+        "机型 Profile {} 已复制当前生效设置并绑定",
     ),
     (
         "menu.device.missing",
-        "DUT interaction profile {} no longer exists",
-        "样机交互方案 {} 已不存在",
+        "Model Profile {} no longer exists",
+        "机型 Profile {} 已不存在",
     ),
     (
         "menu.device.echo.on",
-        "+ Clone with Echo On",
-        "+ 复制当前设置并开启回显",
+        "+ Clone: device echoes input (Agent capture)",
+        "+ 复制当前设置：设备会回显（Agent 捕获解析）",
     ),
     (
         "menu.device.echo.off",
-        "+ Clone with Echo Off",
-        "+ 复制当前设置并关闭回显",
+        "+ Clone: device does not echo (Agent capture)",
+        "+ 复制当前设置：设备不回显（Agent 捕获解析）",
     ),
     (
         "menu.device.echo.auto",
-        "+ Clone with Echo Auto (conservative)",
-        "+ 复制当前设置并使用自动回显判断（保守）",
+        "+ Clone: auto-detect device echo (Agent capture)",
+        "+ 复制当前设置：自动判断设备回显（Agent 捕获解析）",
     ),
     (
         "menu.device.eol.cr",
@@ -759,86 +739,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.profile.exists",
         "profile {} already exists; choose another name",
         "配置方案 {} 已存在；请选择其他名称",
-    ),
-    (
-        "menu.model.title",
-        "DUT model bound to this port",
-        "样机机型（当前串口绑定）",
-    ),
-    (
-        "menu.model.parent.title",
-        "Choose parent model/family",
-        "选择父级机型/系列",
-    ),
-    (
-        "menu.model.add.root",
-        "+ Add root model/family",
-        "+ 新建一级机型/系列",
-    ),
-    (
-        "menu.model.add.child",
-        "+ Add derived child model",
-        "+ 新建二级/衍生机型",
-    ),
-    (
-        "menu.model.no.parent",
-        "add a root model before adding a child",
-        "请先新建一级机型，再添加子级",
-    ),
-    (
-        "menu.model.verify",
-        "Before binding, confirm the real DUT via serial identity output, Telnet, Web UI, or a Human. Enter expands parents and binds leaves; b binds any selected node.",
-        "绑定前请通过串口身份信息、Telnet、Web 页面或人工确认真实样机。Enter 展开父级并绑定叶子；b 可绑定任意所选节点。",
-    ),
-    (
-        "menu.model.confirm.note",
-        "Selected in serialctl TUI after Human verification; reconfirm via serial/Telnet/Web/Human before Agent use",
-        "由人工确认后在 serialctl TUI 选择；Agent 使用前应再经串口/Telnet/Web/人工确认",
-    ),
-    (
-        "menu.model.bound",
-        "model {} bound to the current serial port",
-        "样机机型 {} 已绑定到当前串口通道",
-    ),
-    (
-        "menu.model.created",
-        "model {} created and bound to the current serial port",
-        "样机机型 {} 已创建并绑定到当前串口通道",
-    ),
-    (
-        "menu.model.renamed",
-        "model renamed to {}; {} affected Slot(s): {}; serial titles were refreshed",
-        "机型已改名为 {}；影响 {} 个串口通道：{}；串口标题已刷新",
-    ),
-    (
-        "menu.model.shared.title",
-        "Confirm shared model rename",
-        "确认修改共享机型名称",
-    ),
-    (
-        "menu.model.shared.warning",
-        "Warning: this renames the shared model for every Slot listed below, not only the currently selected serial port.",
-        "注意：本次修改会重命名下方所有串口通道共享的机型，不只影响当前选中的串口。",
-    ),
-    (
-        "menu.model.shared.impact",
-        "Shared model “{}” ({}) — {} affected Slot(s):",
-        "共享机型“{}”（{}）——影响 {} 个串口通道：",
-    ),
-    (
-        "menu.model.shared.revision",
-        "A model binding or catalog change before submission is rejected by the revision guard; reload and review the new impact list.",
-        "若提交前机型绑定或目录版本发生变化，版本保护会拒绝写入；请重新加载并核对新的影响列表。",
-    ),
-    (
-        "menu.model.shared.pending",
-        "Review every Slot sharing this model, then explicitly confirm or cancel",
-        "请逐一核对所有共享该机型的串口通道，再明确确认或取消",
-    ),
-    (
-        "menu.model.shared.cancelled",
-        "Shared model rename cancelled; the catalog is unchanged",
-        "已取消共享机型改名；机型目录未发生变化",
     ),
     (
         "menu.serial.title",
@@ -1018,9 +918,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.detail.eol.none", "none", "无"),
     ("menu.detail.eol.custom", "custom", "自定义"),
     ("menu.detail.eol.inherit", "inherit", "继承"),
-    ("menu.detail.echo.on", "echo on", "回显开启"),
-    ("menu.detail.echo.off", "echo off", "回显关闭"),
-    ("menu.detail.echo.auto", "echo auto", "回显自动"),
+    ("menu.detail.echo.on", "device echoes", "设备会回显"),
+    ("menu.detail.echo.off", "device does not echo", "设备不回显"),
+    ("menu.detail.echo.auto", "auto-detect", "自动判断"),
     (
         "menu.detail.pacing",
         "write pacing {} byte(s) / {} ms",
@@ -1063,18 +963,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.help.echo",
-        "The dot is local TX projection. With device echo, echo=on plus merge_echo merges exact RX; auto conservatively suppresses nothing, so two copies may appear.",
-        "圆点表示本地显示的发送内容。样机会回显命令时，设置 echo=on 并启用 merge_echo，可合并完全一致的回显；echo=auto 不主动去重，因此可能看到两份命令。",
+        "The serial pane shows device RX only. A command appears there only when the device itself echoes it.",
+        "串口显示区只显示设备 RX；只有样机实际回显时，命令才会出现在串口内容中。",
     ),
     (
         "menu.help.model",
         "Confirm the connected model through serial, Telnet, Web, or a Human before Human or Agent operations.",
         "人工或 Agent 操作前，应通过串口、Telnet、Web 或向使用者确认当前连接的样机机型。",
-    ),
-    (
-        "menu.help.token",
-        "Administrator tokens are masked, passed only to the asynchronous request, never logged, and never saved.",
-        "管理员令牌会被遮罩，仅传给异步请求，不记录日志，也不保存。",
     ),
     (
         "menu.footer",
@@ -1085,11 +980,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.footer.current",
         "↑/↓ field · Enter edit/cycle/open · Save and apply submits draft · Esc back",
         "↑/↓ 选择字段 · Enter 编辑/切换/打开 · “保存并应用”提交草稿 · Esc 返回",
-    ),
-    (
-        "menu.footer.models",
-        "Enter expand/bind leaf · ←/→ collapse/expand · b bind node · Esc back",
-        "Enter 展开/绑定叶子 · ←/→ 收起/展开 · b 绑定节点 · Esc 返回",
     ),
     (
         "menu.footer.display",
@@ -1107,55 +997,25 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "PgUp/PgDn 滚动 · Esc 返回菜单",
     ),
     (
-        "menu.prompt.admin",
-        "One-time administrator token (masked)",
-        "一次性管理员令牌（已遮罩）",
-    ),
-    (
         "menu.prompt.transport.name",
         "New UART hardware profile name",
         "新串口参数方案名称",
     ),
     (
         "menu.prompt.device.name",
-        "New DUT interaction profile name",
-        "新样机交互方案名称",
-    ),
-    (
-        "menu.prompt.model.root",
-        "New root model name",
-        "新一级机型名称",
-    ),
-    (
-        "menu.prompt.model.child",
-        "New derived child model name",
-        "新衍生子机型名称",
+        "New Model Profile name",
+        "新机型 Profile 名称",
     ),
     ("menu.prompt.cancelled", "input cancelled", "已取消输入"),
-    (
-        "menu.admin.memory",
-        "Token is masked and used only for this request; it is never saved.",
-        "令牌已遮罩且仅用于本次请求；不会保存。",
-    ),
-    (
-        "menu.admin.not.required",
-        "Trusted local daemon: applying without an administrator token.",
-        "受信任的本机守护进程：无需管理员令牌，正在应用。",
-    ),
-    (
-        "menu.admin.required",
-        "administrator token is required",
-        "必须输入管理员令牌",
-    ),
     (
         "menu.name.invalid",
         "name must be non-empty, trimmed, control-free, and at most 128 bytes",
         "名称必须非空、无首尾空白和控制字符，且不超过 128 字节",
     ),
     (
-        "menu.slot.missing",
-        "Slot {} no longer exists",
-        "串口通道 {} 已不存在",
+        "menu.port.missing",
+        "Port {} no longer exists",
+        "串口 {} 已不存在",
     ),
     (
         "ui.search.title",
@@ -1308,11 +1168,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "ui.output.search.no.run",
-        "This Slot has no active Agent task to search.",
-        "当前通道没有可搜索的 Agent 任务。",
+        "This port has no active Agent task to search.",
+        "当前串口没有可搜索的 Agent 任务。",
     ),
     (
-        "ui.output.search.slot.missing",
+        "ui.output.search.port.missing",
         "This serial channel no longer exists.",
         "当前串口通道已不存在。",
     ),
@@ -1364,7 +1224,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Ctrl-] PgUp/PgDn scroll",
         "Ctrl-] PgUp/PgDn 滚动",
     ),
-    ("ui.scroll.plain", "PgUp/PgDn scroll", "PgUp/PgDn 滚动"),
+    (
+        "ui.scroll.plain",
+        "wheel/PgUp/PgDn browse Agent history",
+        "滚轮/PgUp/PgDn 查看 Agent 历史",
+    ),
     // ---- Help popup ----
     ("help.title", " serialctl help ", " serialctl 帮助 "),
     (
@@ -1383,13 +1247,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.group.safety", "Safety and history", "安全与历史"),
     (
         "help.switch",
-        "  Alt-1..9 / Ctrl-] 1..9   switch Slot",
-        "  Alt-1..9 / Ctrl-] 1..9   切换串口通道",
+        "  Alt-1..9 / Ctrl-] 1..9   switch port",
+        "  Alt-1..9 / Ctrl-] 1..9   切换串口",
     ),
     (
         "help.next",
-        "  Ctrl-] s                 next Slot",
-        "  Ctrl-] s                 下一个串口通道",
+        "  Ctrl-] s                 next port",
+        "  Ctrl-] s                 下一个串口",
     ),
     (
         "help.mode",
@@ -1413,8 +1277,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.wheel",
-        "  wheel / left drag / right click   scroll / select+copy / copy again",
-        "  滚轮 / 左键拖动 / 右键       滚动 / 拖选后自动复制 / 再次复制",
+        "  wheel / left drag / right click   Agent history / select+copy / copy again",
+        "  滚轮 / 左键拖动 / 右键       Agent 历史 / 拖选后自动复制 / 再次复制",
     ),
     (
         "help.selection",
@@ -1428,8 +1292,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.menu",
-        "  Ctrl-] m                 profiles / bound model / quick UART settings",
-        "  Ctrl-] m                 串口参数方案 / 样机交互方案 / 样机机型",
+        "  Ctrl-] m                 Serial Profile / Model Profile / quick serial settings",
+        "  Ctrl-] m                 串口 Profile / 机型 Profile / 快速串口设置",
     ),
     (
         "help.profile",
@@ -1438,13 +1302,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.run.history",
-        "  Ctrl-] h                 focus/show command-history bar; repeat while focused hides",
-        "  Ctrl-] h                 聚焦/显示命令记录横栏；聚焦时再按可隐藏",
+        "  Arrow keys / Ctrl-] h     browse command history / toggle its bar",
+        "  方向键 / Ctrl-] h         浏览命令记录 / 显示或隐藏横栏",
     ),
     (
         "help.run.keys",
-        "  Up/Down · Enter/Right · Left   select / expand and jump / collapse",
-        "  上下 · Enter/右 · 左       选择 / 展开并跳转串口位置 / 收起",
+        "  Up/Down · Right/Left · Pg/wheel   select / expand / collapse / page",
+        "  上下 · 右/左 · Pg/滚轮     选择 / 展开 / 收起 / 翻页",
     ),
     (
         "help.takeover",
@@ -1478,8 +1342,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.queue.behavior",
-        "  ordinary Enter           queue each non-empty LINE; Agent Run empty Enter only follows",
-        "  直接按 Enter             每条非空 LINE 独立排队；Agent 任务中空 Enter 只回到最新输出",
+        "  ordinary Enter           send non-empty LINE; empty Enter follows latest output",
+        "  直接按 Enter             发送非空命令；空输入时回到最新串口输出",
     ),
     (
         "help.follow",
@@ -1488,8 +1352,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.echo",
-        "  ● / ✓ marker             local TX / exact RX merged; echo=auto suppresses nothing",
-        "  ● / ✓ 标记               本地 TX / 与精确 RX 合并；echo=auto 不抑制回显",
+        "  Serial pane              device output only; commands appear only when the device echoes them",
+        "  串口显示区               只显示设备输出；命令仅在设备实际回显时出现",
     ),
     (
         "help.paste",
@@ -1581,8 +1445,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("st.viewing", "viewing {} ({})", "当前串口通道：{}（{}）"),
     (
         "st.transport",
-        "transport connected; authenticating and attaching all Slots",
-        "已连接服务器，正在认证并接入所有串口通道",
+        "transport connected; establishing the session and attaching all ports",
+        "已连接服务器，正在建立会话并接入所有串口",
     ),
     (
         "st.disconnected",
@@ -1596,8 +1460,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.welcome",
-        "connected as {} (protocol v{})",
-        "已连接，角色：{}（协议 v{}）",
+        "connected (protocol v{})",
+        "已连接（协议 v{}）",
     ),
     (
         "st.session.changed.unsent",
@@ -1680,21 +1544,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Trigger {} is {} after {} confirmed fire(s)",
         "触发任务 {} 当前为 {}，已确认发送 {} 次",
     ),
-    (
-        "st.authenticated",
-        "authenticated as {}",
-        "已认证，角色：{}",
-    ),
-    (
-        "st.watching",
-        "watching {} Slot(s)",
-        "正在监视 {} 个串口通道",
-    ),
-    (
-        "st.detached",
-        "detached {} Slot(s)",
-        "已停止监视 {} 个串口通道",
-    ),
+    ("st.session.ready", "connection ready", "连接就绪"),
+    ("st.watching", "watching {} port(s)", "正在监视 {} 个串口"),
+    ("st.detached", "detached {} port(s)", "已停止监视 {} 个串口"),
     ("st.run.started", "run started: {}", "Agent 任务已开始：{}"),
     ("st.run.ended", "run ended: {}", "Agent 任务已结束：{}"),
     (
@@ -1703,9 +1555,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "已在序列 {} 创建检查点",
     ),
     (
-        "st.not.auth.queued",
-        "connection is not authenticated; input was not queued",
-        "连接尚未认证；输入未加入队列",
+        "st.not.ready.queued",
+        "connection handshake is incomplete; input was not queued",
+        "连接握手尚未完成；输入未加入队列",
     ),
     (
         "st.not.connected",
@@ -1728,9 +1580,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "网络工作线程已停止",
     ),
     (
-        "st.not.auth2",
-        "not authenticated; input was not queued",
-        "尚未认证；输入未加入队列",
+        "st.not.ready",
+        "connection handshake is incomplete; input was not queued",
+        "连接握手尚未完成；输入未加入队列",
     ),
     (
         "st.not.live",
@@ -1743,9 +1595,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "本地发送队列已满；输入未加入队列",
     ),
     (
-        "st.not.auth.live",
-        "the selected Slot is not authenticated and live; control was not requested",
-        "所选串口通道尚未认证并进入实时模式；未请求控制权",
+        "st.not.ready.live",
+        "the selected port is not attached and live; control was not requested",
+        "所选串口尚未接入实时会话；未请求控制权",
     ),
     (
         "st.requesting.control",
@@ -1768,9 +1620,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Agent 任务已中止：{} · 原因：{}",
     ),
     (
-        "st.slot.not.live",
-        "the selected Slot is not live; control was not released",
-        "所选串口通道尚未进入实时模式；未释放控制权",
+        "st.port.not.live",
+        "the selected port is not live; control was not released",
+        "所选串口尚未进入实时模式；未释放控制权",
     ),
     (
         "st.cancel.reason",
@@ -1779,8 +1631,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.no.control",
-        "this Slot has no active write control",
-        "当前串口通道没有人持有控制权",
+        "this port has no active write control",
+        "当前串口没有人持有控制权",
     ),
     (
         "st.control.belongs",
@@ -1789,8 +1641,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.reconnect.reason",
-        "{} for {}; reconnecting cancels this actor's queues and releases its controls on every Slot",
-        "{}（{}）；重新连接会取消当前操作方的队列，并释放其在所有串口通道上的控制权",
+        "{} for {}; reconnecting cancels this actor's queues and releases its controls on every port",
+        "{}（{}）；重新连接会取消当前操作方的队列，并释放其在所有串口上的控制权",
     ),
     (
         "st.cancel.full",
@@ -1980,8 +1832,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.paste.blocked",
-        "multi-line/large paste blocked; Ctrl-] p confirms for the original Slot",
-        "多行或大段粘贴正在等待确认；按 Ctrl-] p 发送到原串口通道",
+        "multi-line/large paste blocked; Ctrl-] p confirms for the original port",
+        "多行或大段粘贴正在等待确认；按 Ctrl-] p 发送到原串口",
     ),
     (
         "st.paste.none",
@@ -1990,8 +1842,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.paste.gone",
-        "the paste target Slot no longer exists",
-        "粘贴目标串口通道已不存在",
+        "the paste target port no longer exists",
+        "粘贴目标串口已不存在",
     ),
     (
         "st.paste.queued",
@@ -1999,9 +1851,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "已将确认后的粘贴加入 {} 的发送队列",
     ),
     (
-        "st.no.slot",
-        "no Slot is configured; run `serialctl init`",
-        "尚未配置串口通道；请运行 `serialctl init`",
+        "st.no.port",
+        "no port is configured; run `serialctl setup`",
+        "尚未配置串口；请运行 `serialctl setup`",
     ),
     ("st.language", "language: {}", "语言：{}"),
     (
@@ -2034,11 +1886,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("d.ev.serial_closed", "serial_closed", "串口已关闭"),
     (
-        "d.ev.slot_reconfigured",
-        "slot_reconfigured",
-        "串口通道配置已更新",
+        "d.ev.port_reconfigured",
+        "port_reconfigured",
+        "串口配置已更新",
     ),
-    ("d.ev.slot_removed", "slot_removed", "串口通道已移除"),
+    ("d.ev.port_removed", "port_removed", "串口已移除"),
     ("d.ev.control_granted", "control_granted", "控制权已授予"),
     ("d.ev.control_released", "control_released", "控制权已释放"),
     ("d.ev.control_revoked", "control_revoked", "控制权已撤销"),
@@ -2076,13 +1928,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "m.scope.error",
-        "--initial-slot applies only to the interactive `serialctl` console",
-        "--initial-slot 仅适用于交互式 `serialctl` 控制台",
+        "--initial-port applies only to the interactive `serialctl` console",
+        "--initial-port 仅适用于交互式 `serialctl` 控制台",
     ),
     (
         "m.status.header",
-        "seriald {}  epoch {}  {} Slot(s)",
-        "seriald {}  服务实例 {}  {} 个串口通道",
+        "seriald {}  epoch {}  {} port(s)",
+        "seriald {}  服务实例 {}  {} 个串口",
     ),
     ("m.status.control", "control: {}", "控制权：{}"),
     ("m.status.reason", "  reason: {}", "  原因：{}"),
@@ -2093,7 +1945,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("m.doctor.config", "config", "配置文件"),
     ("m.doctor.endpoint", "endpoint", "服务地址"),
-    ("m.doctor.token", "token", "令牌"),
     ("m.doctor.daemon", "daemon", "守护进程"),
     ("m.doctor.server", "server", "服务器"),
     ("m.doctor.epoch", "epoch", "服务实例"),
@@ -2105,17 +1956,15 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "版本不匹配",
     ),
     ("m.doctor.uptime", "uptime", "运行时长"),
-    ("m.doctor.slots", "slots", "串口通道"),
-    ("m.token.configured", "configured", "已配置"),
-    ("m.token.missing", "not configured", "未配置"),
+    ("m.doctor.ports", "ports", "串口"),
     (
-        "m.doctor.slots.value",
+        "m.doctor.ports.value",
         "{} total, {} online",
         "共 {} 个，{} 个在线",
     ),
     // ---- doctor.rs human-readable diagnostics ----
     ("doctor.field.source", "Source", "数据来源"),
-    ("doctor.field.slot", "Slot", "串口通道"),
+    ("doctor.field.configured_port", "Port", "串口"),
     ("doctor.field.port", "Port", "串口设备"),
     ("doctor.field.discovery", "Discovery", "串口发现"),
     ("doctor.field.session", "Session", "会话状态"),
@@ -2132,9 +1981,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("doctor.field.logging", "Logging", "日志状态"),
     ("doctor.field.quota", "Quota", "存储配额"),
     (
-        "doctor.field.degraded_slots",
-        "Degraded Slots",
-        "日志降级通道",
+        "doctor.field.degraded_ports",
+        "Degraded ports",
+        "日志降级串口",
     ),
     ("doctor.field.catalog", "Archive catalog", "归档目录"),
     ("doctor.field.note", "Note", "提示"),
@@ -2215,7 +2064,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "incomplete (bounded scan was truncated)",
         "不完整（受限扫描已截断）",
     ),
-    ("doctor.value.slot", "{} ({})", "{}（{}）"),
+    ("doctor.value.port", "{} ({})", "{}（{}）"),
     (
         "doctor.value.stream",
         "head={} rx={} tx={} overflow={} bytes",
@@ -2268,9 +2117,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "守护进程串口枚举",
     ),
     (
-        "doctor.source.slot.snapshot",
-        "authoritative Slot snapshot",
-        "串口通道权威快照",
+        "doctor.source.port.snapshot",
+        "authoritative port snapshot",
+        "串口权威快照",
     ),
     (
         "doctor.source.storage.diagnostics",
@@ -2283,9 +2132,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "归档目录兼容数据",
     ),
     (
-        "doctor.source.slot.diagnostics",
-        "authoritative Slot diagnostics",
-        "串口通道权威诊断数据",
+        "doctor.source.port.diagnostics",
+        "authoritative port diagnostics",
+        "串口权威诊断数据",
     ),
     (
         "doctor.source.status.fallback",
@@ -2300,9 +2149,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "升级 seriald 后可查看权威配额和日志写入队列指标",
     ),
     (
-        "doctor.assessment.slot_disabled",
-        "the Slot is disabled",
-        "串口通道已禁用",
+        "doctor.assessment.port_disabled",
+        "the port is disabled",
+        "串口已禁用",
     ),
     (
         "doctor.assessment.port_not_present",
@@ -2390,11 +2239,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "seriald WebSocket 地址无效",
     ),
     (
-        "doctor.error.token_header",
-        "token contains invalid HTTP header characters",
-        "令牌包含 HTTP 请求头不允许的字符",
-    ),
-    (
         "doctor.error.ws_timeout",
         "independent WebSocket connection timed out",
         "独立 WebSocket 连接超时",
@@ -2415,9 +2259,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "seriald 在二进制协议连接中发送了不受支持的文本消息",
     ),
     (
-        "doctor.error.unknown_slot",
-        "unknown Slot `{}`",
-        "串口通道 `{}` 不存在",
+        "doctor.error.unknown_port",
+        "unknown port `{}`",
+        "串口 `{}` 不存在",
     ),
     ("m.uptime.ms", "{} ms", "{} 毫秒"),
     (
@@ -2499,29 +2343,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // ---- init wizard ----
     ("i.endpoint", "seriald endpoint", "seriald 服务地址"),
     (
-        "i.token.notice",
-        "The saved token is treated as the daily operator token; setup still requires a separate admin token.",
-        "已保存的令牌将作为日常操作员令牌；初始配置仍需单独的管理员令牌。",
-    ),
-    (
-        "i.admin.prompt",
-        "seriald admin bearer token (required for setup; never saved): ",
-        "seriald 管理员令牌（配置必需，不会保存）：",
-    ),
-    (
-        "i.admin.required",
-        "an admin bearer token is required; seriald v1 does not support disabled authentication",
-        "必须提供管理员令牌；seriald v1 不支持关闭认证",
-    ),
-    (
         "i.unreachable",
         "cannot reach seriald; start seriald on Windows and verify the host-only endpoint",
         "无法连接 seriald；请在 Windows 上启动 seriald，并检查仅本机可访问的服务地址",
     ),
     (
         "i.status.fail",
-        "cannot read existing Slot configuration; verify the admin token",
-        "无法读取现有串口通道配置；请检查管理员令牌",
+        "cannot read the existing port configuration",
+        "无法读取现有串口配置",
     ),
     (
         "i.connected",
@@ -2540,8 +2369,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "i.select.ports",
-        "Select ports for the complete Slot set (comma-separated numbers)",
-        "选择要配置为串口通道的端口（使用逗号分隔编号）",
+        "Select the serial ports to configure (comma-separated numbers)",
+        "选择要配置的串口（使用逗号分隔编号）",
     ),
     (
         "i.profile.note",
@@ -2553,12 +2382,10 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Previously configured ports keep their Profile and serial settings.",
         "此前配置过的端口会保留原串口参数方案和样机交互方案。",
     ),
-    ("i.slot.name", "Slot name for {}", "{} 的串口通道名称"),
-    ("i.slot.id", "Slot ID for {}", "{} 的串口通道 ID"),
     (
         "i.omitted.header",
-        "\nExisting Slots not selected in this scan:",
-        "\n本次扫描未选择的已有串口通道：",
+        "\nExisting ports not selected in this scan:",
+        "\n本次扫描未选择的已有串口：",
     ),
     (
         "i.omitted.note",
@@ -2567,53 +2394,23 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "i.omitted.delete",
-        "Explicitly delete these omitted Slots from seriald configuration?",
-        "是否从 seriald 配置中删除这些未选择的串口通道？",
+        "Explicitly delete these omitted ports from seriald configuration?",
+        "是否从 seriald 配置中删除这些未选择的串口？",
     ),
     (
         "i.omitted.deleting",
-        "Deleting {} explicitly omitted Slot(s).",
-        "正在删除 {} 个未选择的串口通道。",
+        "Deleting {} explicitly omitted port(s).",
+        "正在删除 {} 个未选择的串口。",
     ),
     (
         "i.omitted.keeping",
-        "Keeping {} existing Slot(s).",
-        "保留 {} 个已有串口通道。",
+        "Keeping {} existing port(s).",
+        "保留 {} 个已有串口。",
     ),
     (
         "i.configured",
-        "\nConfigured {} Slot(s):",
-        "\n已配置 {} 个串口通道：",
-    ),
-    (
-        "i.operator.keep",
-        "seriald operator bearer token for daily use (leave empty to keep the saved token): ",
-        "seriald 日常操作员令牌（留空可保留已保存的令牌）：",
-    ),
-    (
-        "i.operator.required.prompt",
-        "seriald operator bearer token for daily use (required; saved locally): ",
-        "seriald 日常操作员令牌（必需；保存在本机）：",
-    ),
-    (
-        "i.operator.required",
-        "an operator bearer token is required for the daily console; the admin token is not saved",
-        "日常控制台需要操作员令牌；管理员令牌不会保存",
-    ),
-    (
-        "i.operator.fail",
-        "the operator token could not read daemon status; the token file was not changed",
-        "操作员令牌无法读取守护进程状态；令牌文件未更改",
-    ),
-    (
-        "i.role.fail",
-        "the daily token role could not be verified; the token file was not changed",
-        "无法验证日常令牌的角色；令牌文件未更改",
-    ),
-    (
-        "i.role.wrong",
-        "the daily token has role {}; an operator token is required and the token file was not changed",
-        "日常令牌的角色为 {}；必须使用操作员令牌，令牌文件未更改",
+        "\nConfigured {} port(s):",
+        "\n已配置 {} 个串口：",
     ),
     (
         "i.saved",
@@ -2622,8 +2419,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "i.open.console",
-        "Run `serialctl` to open the multi-Slot console.",
-        "运行 `serialctl` 打开多串口通道控制台。",
+        "Run `serialctl` to open the multi-port console.",
+        "运行 `serialctl` 打开多串口控制台。",
     ),
     (
         "i.interactive",
@@ -2647,8 +2444,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "i.delete.confirm",
-        "enter `y` to delete the omitted Slots or `n` to keep them",
-        "输入 `y` 删除未选择的串口通道，输入 `n` 保留",
+        "enter `y` to delete the omitted ports or `n` to keep them",
+        "输入 `y` 删除未选择的串口，输入 `n` 保留",
     ),
 ];
 
@@ -2713,14 +2510,11 @@ mod tests {
         let _guard = lang_test_lock();
         set_lang(Lang::Zh);
         assert_eq!(
-            trf("st.live", &["slot-1", "42"]),
-            "slot-1 已进入实时模式，最新序号为 42"
+            trf("st.live", &["COM4", "42"]),
+            "COM4 已进入实时模式，最新序号为 42"
         );
         set_lang(Lang::En);
-        assert_eq!(
-            trf("st.live", &["slot-1", "42"]),
-            "slot-1 live at sequence 42"
-        );
+        assert_eq!(trf("st.live", &["COM4", "42"]), "COM4 live at sequence 42");
         assert_eq!(trf("st.live", &[]), "{} live at sequence {}");
     }
 
@@ -2738,13 +2532,14 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_chinese_names_explain_the_binding_scope() {
+    fn main_menu_chinese_names_use_the_two_profile_sections() {
         let _guard = lang_test_lock();
         set_lang(Lang::Zh);
         assert_eq!(tr("menu.root.profile"), "当前串口完整配置");
-        assert_eq!(tr("menu.root.model"), "样机机型（当前串口绑定）");
         assert_eq!(tr("menu.root.serial"), "快速创建串口参数方案");
         assert!(tr("menu.current").contains("当前串口"));
+        assert!(tr("menu.current").contains("串口 Profile"));
+        assert!(tr("menu.current").contains("机型 Profile"));
         assert!(!tr("menu.current").contains("Transport"));
     }
 

@@ -5,16 +5,16 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandResult, CommandSequenceAuditContext, ControlMode, Cursor, DataBits,
-    DeviceProfile, Direction, ErrorCode, EventKind, FlowControl, LoggingState,
+    Actor, ActorKind, CommandCaptureMatcher, CommandResult, CommandSequenceAuditContext,
+    ControlMode, Cursor, DataBits, Direction, ErrorCode, EventKind, FlowControl, LoggingState,
     MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
     MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
     MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
     MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, Parity, RunInfo, RunStatus,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelProfile, Parity, RunInfo, RunStatus,
     SequenceWritePrecondition, SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits,
     TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerSpec, TriggerStatus,
-    WritePacing, apply_transport_profile, resolve_device_settings, resolve_transport_settings,
+    WritePacing, apply_transport_profile, resolve_model_settings, resolve_transport_settings,
 };
 #[cfg(windows)]
 use serialport::COMPort;
@@ -83,7 +83,7 @@ const WINDOWS_PORT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 
 #[derive(Clone)]
 pub struct SlotHandle {
-    slot_id: Arc<str>,
+    port: Arc<str>,
     commands: mpsc::Sender<SlotCommand>,
     snapshot: watch::Receiver<SlotSnapshot>,
     events: broadcast::Sender<TimelineEvent>,
@@ -99,7 +99,7 @@ pub struct AttachState {
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum SlotError {
-    #[error("slot command queue is closed")]
+    #[error("port command queue is closed")]
     Closed,
     #[error("serial port is offline")]
     PortOffline,
@@ -127,7 +127,7 @@ pub enum SlotError {
     )]
     WriteRunMissing { expected_run_id: Uuid },
     #[error(
-        "serial write expected active Run {expected_run_id}, but the Slot's active Run is {active_run_id} (no bytes were written)"
+        "serial write expected active Run {expected_run_id}, but the port's active Run is {active_run_id} (no bytes were written)"
     )]
     WriteRunMismatch {
         expected_run_id: Uuid,
@@ -139,9 +139,9 @@ pub enum SlotError {
     WriteRunNotOwner { expected_run_id: Uuid },
     #[error("cursor is ahead of the current timeline")]
     CursorAhead,
-    #[error("slot actor stopped before replying")]
+    #[error("port actor stopped before replying")]
     ReplyDropped,
-    #[error("slot id cannot change while reconfiguring an existing slot")]
+    #[error("port identity cannot change during reconfiguration")]
     SlotIdChanged,
     #[error("serial write exceeds the {MAX_WRITE_BYTES}-byte request limit")]
     WriteTooLarge,
@@ -176,7 +176,7 @@ pub enum SlotError {
     )]
     WriteResultExpired,
     #[error(
-        "the Slot has reached its bounded write idempotency history for this daemon epoch; restart seriald before accepting more writes"
+        "the port has reached its bounded write idempotency history for this daemon epoch; restart seriald before accepting more writes"
     )]
     WriteIdempotencyCapacity,
     #[error("the write-control wait queue is full; retry after another waiter leaves")]
@@ -189,7 +189,7 @@ pub enum SlotError {
     RunMetadataTooManyKeys { actual: usize },
     #[error("Run metadata encodes to {actual} bytes; the maximum is {MAX_RUN_METADATA_BYTES}")]
     RunMetadataTooLarge { actual: usize },
-    #[error("a Trigger Job is already active on this Slot (no bytes were written)")]
+    #[error("a Trigger Job is already active on this port (no bytes were written)")]
     TriggerActive,
     #[error("Trigger Job {trigger_id} was not found")]
     TriggerNotFound { trigger_id: Uuid },
@@ -229,7 +229,7 @@ pub enum SlotError {
     BreakUnsupported,
     #[error("UART BREAK failed and the physical port state is uncertain: {message}")]
     BreakFailed { message: String },
-    #[error("device profile cannot change while a Run or Trigger Job is active")]
+    #[error("model profile cannot change while a Run or Trigger Job is active")]
     ProfileChangeBusy,
 }
 
@@ -243,7 +243,7 @@ impl SlotHandle {
     pub fn spawn(
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
@@ -252,35 +252,37 @@ impl SlotHandle {
         Self::spawn_inner(
             config,
             transport_profile,
-            device_profile,
+            model_profile,
             control_limits,
             daemon_epoch,
             daemon_started,
             journal,
-            false,
+            None,
         )
     }
 
     /// Creates a candidate Slot actor that cannot open its port until the
     /// surrounding configuration transaction has been persisted and commits.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_staged(
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
+        source: String,
     ) -> Self {
         Self::spawn_inner(
             config,
             transport_profile,
-            device_profile,
+            model_profile,
             control_limits,
             daemon_epoch,
             daemon_started,
             journal,
-            true,
+            Some(source),
         )
     }
 
@@ -288,17 +290,18 @@ impl SlotHandle {
     fn spawn_inner(
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
         control_limits: ControlLimits,
         daemon_epoch: Uuid,
         daemon_started: Instant,
         journal: JournalHandle,
-        staged: bool,
+        staged_source: Option<String>,
     ) -> Self {
+        let staged = staged_source.is_some();
         let initial = initial_snapshot(
             config.clone(),
             transport_profile.clone(),
-            device_profile.clone(),
+            model_profile.clone(),
             daemon_epoch,
             staged,
         );
@@ -310,7 +313,7 @@ impl SlotHandle {
         let ring = Arc::new(Mutex::new(EventRing::new(RING_EVENTS, RING_BYTES)));
         let subscriber_lag_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = Self {
-            slot_id: Arc::from(config.id.as_str()),
+            port: Arc::from(config.port.as_str()),
             commands,
             snapshot,
             events: events.clone(),
@@ -321,7 +324,7 @@ impl SlotHandle {
             SlotActor {
                 config,
                 transport_profile,
-                device_profile,
+                model_profile,
                 daemon_epoch,
                 daemon_started,
                 journal,
@@ -340,7 +343,7 @@ impl SlotHandle {
                 } else {
                     SessionState::WaitingForPort
                 },
-                state_reason: staged.then(|| "slot configuration pending persistence".into()),
+                state_reason: staged.then(|| "port configuration pending persistence".into()),
                 state_code: None,
                 target_activity: TargetActivity::Unknown,
                 last_rx_wall_time_ns: None,
@@ -360,7 +363,8 @@ impl SlotHandle {
                 journal_ack_permits: Arc::new(Semaphore::new(JOURNAL_ACK_QUEUE)),
                 trigger_arming: false,
                 administratively_paused: staged,
-                pending_reconfiguration: staged.then_some(PendingReconfiguration::Add),
+                pending_reconfiguration: staged_source
+                    .map(|source| PendingReconfiguration::Add { source }),
                 retry_at: Instant::now(),
                 retry_delay: OPEN_BACKOFF_MIN,
                 request_cache: HashMap::new(),
@@ -375,7 +379,7 @@ impl SlotHandle {
     }
 
     pub fn id(&self) -> &str {
-        &self.slot_id
+        &self.port
     }
 
     pub fn snapshot(&self) -> SlotSnapshot {
@@ -501,6 +505,7 @@ impl SlotHandle {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
         description: Option<String>,
+        command_capture_matchers: Vec<CommandCaptureMatcher>,
         command_sequence: Option<CommandSequenceAuditContext>,
         sequence_precondition: Option<SequenceWritePrecondition>,
         cooperative: bool,
@@ -518,6 +523,7 @@ impl SlotHandle {
             expected_run_id,
             pacing,
             description,
+            command_capture_matchers,
             command_sequence,
             sequence_precondition,
             cooperative,
@@ -700,7 +706,8 @@ impl SlotHandle {
         &self,
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
+        source: String,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
         let (reply, result) = oneshot::channel();
@@ -708,7 +715,8 @@ impl SlotHandle {
             .send(SlotCommand::StageReconfiguration {
                 config: Box::new(config),
                 transport_profile,
-                device_profile,
+                model_profile,
+                source,
                 resume_on_rollback,
                 reply,
             })
@@ -717,17 +725,17 @@ impl SlotHandle {
         result.await.map_err(|_| SlotError::ReplyDropped)?
     }
 
-    /// Stages a device-profile refresh without changing the live snapshot,
+    /// Stages a model-profile refresh without changing the live snapshot,
     /// sequence, control/Run state, or physical port. The boolean is false for
     /// an exact no-op, in which case there is nothing to commit or roll back.
-    pub(crate) async fn stage_device_profile(
+    pub(crate) async fn stage_model_profile(
         &self,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
     ) -> Result<bool, SlotError> {
         let (reply, done) = oneshot::channel();
         self.commands
-            .send(SlotCommand::StageDeviceProfile {
-                device_profile,
+            .send(SlotCommand::StageModelProfile {
+                model_profile,
                 reply,
             })
             .await
@@ -735,10 +743,10 @@ impl SlotHandle {
         done.await.map_err(|_| SlotError::ReplyDropped)?
     }
 
-    pub(crate) async fn stage_removal(&self) -> Result<(), SlotError> {
+    pub(crate) async fn stage_removal(&self, source: String) -> Result<(), SlotError> {
         let (reply, result) = oneshot::channel();
         self.commands
-            .send(SlotCommand::StageRemoval { reply })
+            .send(SlotCommand::StageRemoval { source, reply })
             .await
             .map_err(|_| SlotError::Closed)?;
         result.await.map_err(|_| SlotError::ReplyDropped)?
@@ -826,6 +834,7 @@ enum SlotCommand {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
         description: Option<String>,
+        command_capture_matchers: Vec<CommandCaptureMatcher>,
         command_sequence: Option<CommandSequenceAuditContext>,
         sequence_precondition: Option<SequenceWritePrecondition>,
         cooperative: bool,
@@ -904,15 +913,17 @@ enum SlotCommand {
     StageReconfiguration {
         config: Box<SlotConfig>,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
+        source: String,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
-    StageDeviceProfile {
-        device_profile: Option<DeviceProfile>,
+    StageModelProfile {
+        model_profile: Option<ModelProfile>,
         reply: oneshot::Sender<Result<bool, SlotError>>,
     },
     StageRemoval {
+        source: String,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
     CommitStagedReconfiguration {
@@ -1257,28 +1268,27 @@ enum PortReaderCommand {
 enum PendingReconfiguration {
     /// A newly-created actor. Its candidate config is already stored in
     /// `config`, but it starts paused and is not present in the active map.
-    Add,
+    Add { source: String },
     /// A replacement config held entirely inside the actor until commit.
     Replace {
         config: Box<SlotConfig>,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
+        source: String,
         resume_on_rollback: bool,
         reopened: bool,
     },
     /// An active Slot that will move to the retired map on commit.
-    Remove,
-    /// A device-profile catalog refresh. Staging it is deliberately inert:
+    Remove { source: String },
+    /// A model-profile catalog refresh. Staging it is deliberately inert:
     /// only commit changes the resolved behavior and publishes an event.
-    DeviceProfile {
-        device_profile: Option<DeviceProfile>,
-    },
+    ModelProfile { model_profile: Option<ModelProfile> },
 }
 
 struct SlotActor {
     config: SlotConfig,
     transport_profile: Option<TransportProfile>,
-    device_profile: Option<DeviceProfile>,
+    model_profile: Option<ModelProfile>,
     daemon_epoch: Uuid,
     daemon_started: Instant,
     journal: JournalHandle,
@@ -1647,7 +1657,8 @@ impl SlotActor {
             CommandDisposition::StageReconfiguration {
                 config,
                 transport_profile,
-                device_profile,
+                model_profile,
+                source,
                 resume_on_rollback,
                 reply,
             } => {
@@ -1655,23 +1666,24 @@ impl SlotActor {
                     .stage_reconfiguration(
                         *config,
                         transport_profile,
-                        device_profile,
+                        model_profile,
+                        source,
                         resume_on_rollback,
                     )
                     .await;
                 let _ = reply.send(result);
                 return false;
             }
-            CommandDisposition::StageDeviceProfile {
-                device_profile,
+            CommandDisposition::StageModelProfile {
+                model_profile,
                 reply,
             } => {
-                let result = self.stage_device_profile(device_profile);
+                let result = self.stage_model_profile(model_profile);
                 let _ = reply.send(result);
                 return false;
             }
-            CommandDisposition::StageRemoval { reply } => {
-                let result = self.stage_removal().await;
+            CommandDisposition::StageRemoval { source, reply } => {
+                let result = self.stage_removal(source).await;
                 let _ = reply.send(result);
                 return false;
             }
@@ -1868,6 +1880,7 @@ impl SlotActor {
                 expected_run_id,
                 pacing,
                 description,
+                command_capture_matchers,
                 command_sequence,
                 sequence_precondition,
                 cooperative,
@@ -1954,6 +1967,7 @@ impl SlotActor {
                         outcome.written != total,
                         cooperative,
                         description,
+                        command_capture_matchers,
                         command_sequence,
                     );
                     if cooperative && let Some(run) = self.active_run.as_ref() {
@@ -3026,7 +3040,7 @@ impl SlotActor {
             Direction::None => (None, None),
         };
         let event = TimelineEvent {
-            slot_id: self.config.id.clone(),
+            port: self.config.port.clone(),
             daemon_epoch: self.daemon_epoch,
             seq: event_seq,
             generation: self.generation,
@@ -3158,7 +3172,7 @@ impl SlotActor {
     async fn publish_nondurable_logging_event(&mut self, error: String) {
         self.seq = self.seq.saturating_add(1);
         let event = TimelineEvent {
-            slot_id: self.config.id.clone(),
+            port: self.config.port.clone(),
             daemon_epoch: self.daemon_epoch,
             seq: self.seq,
             generation: self.generation,
@@ -3186,9 +3200,10 @@ impl SlotActor {
 
     async fn publish_snapshot(&self) {
         let oldest = self.ring.lock().await.oldest_seq();
-        let resolved = resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+        let resolved =
+            resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
         let transport =
-            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
+            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
         let effective_settings = self.effective_serial_settings();
         self.snapshot.send_replace(SlotSnapshot {
             config: self.config.clone(),
@@ -3226,10 +3241,10 @@ impl SlotActor {
 
     fn effective_serial_settings(&self) -> SerialSettings {
         let mut effective =
-            apply_transport_profile(&self.config.settings, self.transport_profile.as_ref());
-        let device = resolve_device_settings(&effective, self.device_profile.as_ref());
-        effective.write_chunk_size = device.write_pacing.chunk_size;
-        effective.write_chunk_delay_ms = device.write_pacing.chunk_delay_ms;
+            apply_transport_profile(&SerialSettings::default(), self.transport_profile.as_ref());
+        let model = resolve_model_settings(&effective, self.model_profile.as_ref());
+        effective.write_chunk_size = model.write_pacing.chunk_size;
+        effective.write_chunk_delay_ms = model.write_pacing.chunk_delay_ms;
         effective
     }
 
@@ -3253,16 +3268,16 @@ impl SlotActor {
                 .change_generation(self.generation, wall_time_ns(), Instant::now())
         {
             self.abort_run(
-                "slot reconfiguration",
+                "port reconfiguration",
                 Some(released.released.owner.clone()),
             )
             .await;
             self.emit_release(released, EventKind::ControlRevoked).await;
         } else {
-            self.abort_run("slot reconfiguration", None).await;
+            self.abort_run("port reconfiguration", None).await;
         }
         self.session_state = SessionState::Disabled;
-        self.state_reason = Some("slot reconfiguration in progress".into());
+        self.state_reason = Some("port reconfiguration in progress".into());
         self.state_code = None;
         self.target_activity = TargetActivity::Unknown;
         if was_online {
@@ -3272,7 +3287,7 @@ impl SlotActor {
                 Vec::new(),
                 Some(system_actor()),
                 None,
-                metadata([("reason", json!("slot reconfiguration"))]),
+                metadata([("reason", json!("port reconfiguration"))]),
             )
             .await;
         } else {
@@ -3285,26 +3300,27 @@ impl SlotActor {
         &mut self,
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
+        source: String,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
-        if config.id != self.config.id {
+        if config.port != self.config.port {
             return Err(SlotError::SlotIdChanged);
         }
         debug_assert!(self.pending_reconfiguration.is_none());
         let previous_transport =
-            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
+            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
         let next_transport =
-            resolve_transport_settings(&config.settings, transport_profile.as_ref());
+            resolve_transport_settings(&SerialSettings::default(), transport_profile.as_ref());
         let previous_device =
-            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
-        let next_device = resolve_device_settings(&config.settings, device_profile.as_ref());
+            resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
+        let next_model = resolve_model_settings(&SerialSettings::default(), model_profile.as_ref());
         let reopened = self.config.port != config.port
             || self.config.enabled != config.enabled
             || previous_transport != next_transport;
-        let device_changed = self.device_profile != device_profile
-            || self.config.device_profile != config.device_profile
-            || previous_device != next_device;
+        let device_changed = self.model_profile != model_profile
+            || self.config.model_profile != config.model_profile
+            || previous_device != next_model;
         if profile_change_requires_idle(
             reopened,
             device_changed,
@@ -3319,74 +3335,95 @@ impl SlotActor {
         self.pending_reconfiguration = Some(PendingReconfiguration::Replace {
             config: Box::new(config),
             transport_profile,
-            device_profile,
+            model_profile,
+            source,
             resume_on_rollback,
             reopened,
         });
         Ok(())
     }
 
-    async fn stage_removal(&mut self) -> Result<(), SlotError> {
+    async fn stage_removal(&mut self, source: String) -> Result<(), SlotError> {
         debug_assert!(self.pending_reconfiguration.is_none());
         self.pause_for_reconfigure().await?;
-        self.pending_reconfiguration = Some(PendingReconfiguration::Remove);
+        self.pending_reconfiguration = Some(PendingReconfiguration::Remove { source });
         Ok(())
     }
 
-    fn stage_device_profile(
+    fn stage_model_profile(
         &mut self,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
     ) -> Result<bool, SlotError> {
         debug_assert!(self.pending_reconfiguration.is_none());
-        if self.device_profile == device_profile {
+        if self.model_profile == model_profile {
             return Ok(false);
         }
         if self.active_run.is_some() || self.active_trigger.is_some() {
             return Err(SlotError::ProfileChangeBusy);
         }
-        self.pending_reconfiguration =
-            Some(PendingReconfiguration::DeviceProfile { device_profile });
+        self.pending_reconfiguration = Some(PendingReconfiguration::ModelProfile { model_profile });
         Ok(true)
     }
 
     async fn commit_staged_reconfiguration(&mut self) -> Result<(), SlotError> {
         let Some(pending) = self.pending_reconfiguration.take() else {
-            debug_assert!(false, "commit requires a staged Slot change");
+            debug_assert!(false, "commit requires a staged port change");
             return Err(SlotError::ReplyDropped);
         };
         match pending {
-            PendingReconfiguration::Add => {
+            PendingReconfiguration::Add { source } => {
                 self.resume_current_config();
-                self.publish_snapshot().await;
+                self.emit(
+                    EventKind::PortReconfigured,
+                    Direction::None,
+                    Vec::new(),
+                    Some(system_actor()),
+                    None,
+                    metadata([
+                        ("port", json!(self.config.port)),
+                        ("source", json!(source)),
+                        ("previous_model_profile", Value::Null),
+                        ("new_model_profile", json!(self.config.model_profile)),
+                    ]),
+                )
+                .await;
             }
             PendingReconfiguration::Replace {
                 config,
                 transport_profile,
-                device_profile,
+                model_profile,
+                source,
                 reopened,
                 ..
             } => {
                 self.apply_committed_reconfiguration(
                     *config,
                     transport_profile,
-                    device_profile,
+                    model_profile,
+                    source,
                     reopened,
                 )
                 .await;
             }
-            PendingReconfiguration::Remove => {
+            PendingReconfiguration::Remove { source } => {
                 self.emit(
-                    EventKind::SlotRemoved,
+                    EventKind::PortRemoved,
                     Direction::None,
                     Vec::new(),
                     Some(system_actor()),
                     None,
-                    metadata([("reason", json!("slot removed from active configuration"))]),
+                    metadata([
+                        ("reason", json!("port removed from active configuration")),
+                        ("port", json!(self.config.port)),
+                        ("source", json!(source)),
+                        ("previous_model_profile", json!(self.config.model_profile)),
+                        ("new_model_profile", Value::Null),
+                    ]),
                 )
                 .await;
             }
-            PendingReconfiguration::DeviceProfile { device_profile } => {
-                self.apply_committed_device_profile(device_profile).await;
+            PendingReconfiguration::ModelProfile { model_profile } => {
+                self.apply_committed_model_profile(model_profile).await;
             }
         }
         Ok(())
@@ -3394,11 +3431,11 @@ impl SlotActor {
 
     async fn rollback_staged_reconfiguration(&mut self) -> Result<(), SlotError> {
         let Some(pending) = self.pending_reconfiguration.take() else {
-            debug_assert!(false, "rollback requires a staged Slot change");
+            debug_assert!(false, "rollback requires a staged port change");
             return Err(SlotError::ReplyDropped);
         };
         match pending {
-            PendingReconfiguration::Add => {
+            PendingReconfiguration::Add { .. } => {
                 // New candidate actors are shut down by the Registry after
                 // rollback; keep the physical port parked until then.
             }
@@ -3412,11 +3449,11 @@ impl SlotActor {
                     self.publish_snapshot().await;
                 }
             }
-            PendingReconfiguration::Remove => {
+            PendingReconfiguration::Remove { .. } => {
                 self.resume_current_config();
                 self.publish_snapshot().await;
             }
-            PendingReconfiguration::DeviceProfile { .. } => {
+            PendingReconfiguration::ModelProfile { .. } => {
                 // Staging a profile is inert, so dropping the candidate fully
                 // restores the pre-transaction state without an event.
             }
@@ -3424,14 +3461,14 @@ impl SlotActor {
         Ok(())
     }
 
-    async fn apply_committed_device_profile(&mut self, device_profile: Option<DeviceProfile>) {
+    async fn apply_committed_model_profile(&mut self, model_profile: Option<ModelProfile>) {
         let previous_effective =
-            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
-        self.device_profile = device_profile;
+            resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
+        self.model_profile = model_profile;
         let effective =
-            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+            resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
         self.emit(
-            EventKind::SlotReconfigured,
+            EventKind::PortReconfigured,
             Direction::None,
             Vec::new(),
             Some(system_actor()),
@@ -3442,9 +3479,9 @@ impl SlotActor {
                     serde_json::to_value(&self.config).unwrap_or(Value::Null),
                 ),
                 (
-                    "device_profile",
+                    "model_profile",
                     serde_json::to_value(
-                        self.device_profile
+                        self.model_profile
                             .as_ref()
                             .map(|profile| profile.name.as_str()),
                     )
@@ -3468,25 +3505,27 @@ impl SlotActor {
         &mut self,
         config: SlotConfig,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
+        source: String,
         reopened: bool,
     ) {
         let previous_effective =
-            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+            resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
         let previous_transport =
-            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
+            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
         let previous = std::mem::replace(&mut self.config, config);
+        let previous_model_profile = previous.model_profile.clone();
         self.transport_profile = transport_profile;
-        self.device_profile = device_profile;
+        self.model_profile = model_profile;
         if reopened {
             self.resume_current_config();
         }
         let effective =
-            resolve_device_settings(&self.config.settings, self.device_profile.as_ref());
+            resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
         let effective_transport =
-            resolve_transport_settings(&self.config.settings, self.transport_profile.as_ref());
+            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
         self.emit(
-            EventKind::SlotReconfigured,
+            EventKind::PortReconfigured,
             Direction::None,
             Vec::new(),
             Some(system_actor()),
@@ -3501,14 +3540,18 @@ impl SlotActor {
                     serde_json::to_value(&self.config).unwrap_or(Value::Null),
                 ),
                 (
-                    "device_profile",
+                    "model_profile",
                     serde_json::to_value(
-                        self.device_profile
+                        self.model_profile
                             .as_ref()
                             .map(|profile| profile.name.as_str()),
                     )
                     .unwrap_or(Value::Null),
                 ),
+                ("port", json!(self.config.port)),
+                ("source", json!(source)),
+                ("previous_model_profile", json!(previous_model_profile)),
+                ("new_model_profile", json!(self.config.model_profile)),
                 (
                     "previous_effective",
                     serde_json::to_value(previous_effective).unwrap_or(Value::Null),
@@ -3562,14 +3605,14 @@ impl SlotActor {
             self.control
                 .change_generation(self.generation, wall_time_ns(), Instant::now())
         {
-            self.abort_run("slot shutdown", Some(released.released.owner.clone()))
+            self.abort_run("port shutdown", Some(released.released.owner.clone()))
                 .await;
             self.emit_release(released, EventKind::ControlRevoked).await;
         } else {
-            self.abort_run("slot shutdown", None).await;
+            self.abort_run("port shutdown", None).await;
         }
         self.session_state = SessionState::Disabled;
-        self.state_reason = Some("slot stopped".into());
+        self.state_reason = Some("port stopped".into());
         self.state_code = None;
         self.target_activity = TargetActivity::Unknown;
         if was_online {
@@ -3579,7 +3622,7 @@ impl SlotActor {
                 Vec::new(),
                 Some(system_actor()),
                 None,
-                metadata([("reason", json!("slot shutdown"))]),
+                metadata([("reason", json!("port shutdown"))]),
             )
             .await;
         } else {
@@ -3710,6 +3753,7 @@ enum SlotRequest {
         expected_run_id: Option<Uuid>,
         pacing: Option<WritePacing>,
         description: Option<String>,
+        command_capture_matchers: Vec<CommandCaptureMatcher>,
         command_sequence: Option<CommandSequenceAuditContext>,
         sequence_precondition: Option<SequenceWritePrecondition>,
         cooperative: bool,
@@ -3829,6 +3873,7 @@ impl SlotRequest {
                 expected_run_id,
                 pacing,
                 description,
+                command_capture_matchers,
                 command_sequence,
                 sequence_precondition,
                 cooperative,
@@ -3841,6 +3886,7 @@ impl SlotRequest {
                     expected_run_id,
                     pacing,
                     description,
+                    command_capture_matchers,
                     command_sequence,
                     sequence_precondition,
                     cooperative,
@@ -3964,6 +4010,7 @@ impl SlotRequest {
                 expected_run_id,
                 pacing,
                 description,
+                command_capture_matchers,
                 command_sequence,
                 sequence_precondition,
                 cooperative,
@@ -3977,6 +4024,7 @@ impl SlotRequest {
                 expected_run_id,
                 pacing,
                 description,
+                command_capture_matchers,
                 command_sequence,
                 sequence_precondition,
                 cooperative,
@@ -4069,7 +4117,7 @@ impl SlotRequest {
                 label,
             } => serde_json::to_vec(&("checkpoint", &actor.id, control_id, fence, label)),
         }
-        .expect("Slot request fields are serializable")
+        .expect("port request fields are serializable")
     }
 }
 
@@ -4223,6 +4271,7 @@ fn write_event_metadata(
     partial: bool,
     cooperative: bool,
     description: Option<String>,
+    command_capture_matchers: Vec<CommandCaptureMatcher>,
     command_sequence: Option<CommandSequenceAuditContext>,
 ) -> BTreeMap<String, Value> {
     let mut event_metadata = metadata([
@@ -4231,6 +4280,12 @@ fn write_event_metadata(
     ]);
     if let Some(description) = description {
         event_metadata.insert("command_description".into(), json!(description));
+    }
+    if !command_capture_matchers.is_empty() {
+        event_metadata.insert(
+            "command_capture_matchers".into(),
+            json!(command_capture_matchers),
+        );
     }
     if let Some(command_sequence) = command_sequence {
         event_metadata.insert(
@@ -4426,15 +4481,17 @@ enum CommandDisposition {
     StageReconfiguration {
         config: Box<SlotConfig>,
         transport_profile: Option<TransportProfile>,
-        device_profile: Option<DeviceProfile>,
+        model_profile: Option<ModelProfile>,
+        source: String,
         resume_on_rollback: bool,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
-    StageDeviceProfile {
-        device_profile: Option<DeviceProfile>,
+    StageModelProfile {
+        model_profile: Option<ModelProfile>,
         reply: oneshot::Sender<Result<bool, SlotError>>,
     },
     StageRemoval {
+        source: String,
         reply: oneshot::Sender<Result<(), SlotError>>,
     },
     CommitStagedReconfiguration {
@@ -4519,6 +4576,7 @@ impl SlotCommand {
                 expected_run_id,
                 pacing,
                 description,
+                command_capture_matchers,
                 command_sequence,
                 sequence_precondition,
                 cooperative,
@@ -4533,6 +4591,7 @@ impl SlotCommand {
                     expected_run_id,
                     pacing,
                     description,
+                    command_capture_matchers,
                     command_sequence,
                     sequence_precondition,
                     cooperative,
@@ -4686,24 +4745,28 @@ impl SlotCommand {
             SlotCommand::StageReconfiguration {
                 config,
                 transport_profile,
-                device_profile,
+                model_profile,
+                source,
                 resume_on_rollback,
                 reply,
             } => CommandDisposition::StageReconfiguration {
                 config,
                 transport_profile,
-                device_profile,
+                model_profile,
+                source,
                 resume_on_rollback,
                 reply,
             },
-            SlotCommand::StageDeviceProfile {
-                device_profile,
+            SlotCommand::StageModelProfile {
+                model_profile,
                 reply,
-            } => CommandDisposition::StageDeviceProfile {
-                device_profile,
+            } => CommandDisposition::StageModelProfile {
+                model_profile,
                 reply,
             },
-            SlotCommand::StageRemoval { reply } => CommandDisposition::StageRemoval { reply },
+            SlotCommand::StageRemoval { source, reply } => {
+                CommandDisposition::StageRemoval { source, reply }
+            }
             SlotCommand::CommitStagedReconfiguration { reply } => {
                 CommandDisposition::CommitStagedReconfiguration { reply }
             }
@@ -4718,21 +4781,23 @@ impl SlotCommand {
 fn initial_snapshot(
     config: SlotConfig,
     transport_profile: Option<TransportProfile>,
-    device_profile: Option<DeviceProfile>,
+    model_profile: Option<ModelProfile>,
     daemon_epoch: Uuid,
     staged: bool,
 ) -> SlotSnapshot {
     let state = if staged {
         SessionState::Disabled
     } else if config.enabled
-        && resolve_transport_settings(&config.settings, transport_profile.as_ref()).auto_open
+        && resolve_transport_settings(&SerialSettings::default(), transport_profile.as_ref())
+            .auto_open
     {
         SessionState::WaitingForPort
     } else {
         SessionState::Disabled
     };
-    let resolved = resolve_device_settings(&config.settings, device_profile.as_ref());
-    let transport = resolve_transport_settings(&config.settings, transport_profile.as_ref());
+    let resolved = resolve_model_settings(&SerialSettings::default(), model_profile.as_ref());
+    let transport =
+        resolve_transport_settings(&SerialSettings::default(), transport_profile.as_ref());
     SlotSnapshot {
         config,
         daemon_epoch,
@@ -4741,7 +4806,7 @@ fn initial_snapshot(
         generation: 0,
         endpoint_present: false,
         session_state: state,
-        state_reason: staged.then(|| "slot configuration pending persistence".into()),
+        state_reason: staged.then(|| "port configuration pending persistence".into()),
         state_code: None,
         target_activity: TargetActivity::Unknown,
         last_rx_wall_time_ns: None,
@@ -6338,7 +6403,7 @@ mod tests {
     }
 
     #[test]
-    fn device_profile_changes_require_idle_without_a_transport_reopen() {
+    fn model_profile_changes_require_idle_without_a_transport_reopen() {
         assert!(profile_change_requires_idle(false, true, true, false));
         assert!(profile_change_requires_idle(false, true, false, true));
         assert!(!profile_change_requires_idle(false, false, true, true));
@@ -6414,6 +6479,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6427,6 +6493,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6440,6 +6507,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6465,6 +6533,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6481,6 +6550,7 @@ mod tests {
                 chunk_delay_ms: 5,
             }),
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6506,6 +6576,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: description.map(str::to_string),
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6563,6 +6634,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: Some("输入账号".into()),
+            command_capture_matchers: Vec::new(),
             command_sequence,
             sequence_precondition: None,
             cooperative: false,
@@ -6653,7 +6725,7 @@ mod tests {
         actor: Option<Actor>,
     ) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "bench".into(),
+            port: "bench".into(),
             daemon_epoch: epoch,
             seq,
             generation: 3,
@@ -6793,20 +6865,38 @@ mod tests {
 
     #[test]
     fn confirmed_tx_metadata_retains_command_and_sequence_descriptions() {
-        let described = write_event_metadata(false, false, Some("查看样机内存".into()), None);
+        let described = write_event_metadata(
+            false,
+            false,
+            Some("查看样机内存".into()),
+            vec![CommandCaptureMatcher {
+                kind: serial_protocol::CommandCaptureMatcherKind::ShellPrompt,
+                value: "root@dut:# ".into(),
+            }],
+            None,
+        );
         assert_eq!(described["command_description"], json!("查看样机内存"));
+        assert_eq!(
+            described["command_capture_matchers"],
+            json!([{"kind": "shell_prompt", "value": "root@dut:# "}])
+        );
         assert_eq!(described["partial"], json!(false));
         assert_eq!(described["cooperative"], json!(false));
 
-        let legacy = write_event_metadata(true, false, None, None);
-        assert!(!legacy.contains_key("command_description"));
-        assert_eq!(legacy["partial"], json!(true));
+        let raw = write_event_metadata(true, false, None, Vec::new(), None);
+        assert!(!raw.contains_key("command_description"));
+        assert!(!raw.contains_key("command_capture_matchers"));
+        assert_eq!(raw["partial"], json!(true));
 
         let sequence_id = Uuid::new_v4();
         let grouped = write_event_metadata(
             false,
             false,
             Some("输入账号".into()),
+            vec![CommandCaptureMatcher {
+                kind: serial_protocol::CommandCaptureMatcherKind::Contains,
+                value: "Password:".into(),
+            }],
             Some(CommandSequenceAuditContext {
                 sequence_id,
                 description: "登录样机".into(),
@@ -6840,6 +6930,7 @@ mod tests {
             expected_run_id,
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -6935,6 +7026,7 @@ mod tests {
             expected_run_id: Some(run.id),
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: true,
@@ -6991,6 +7083,7 @@ mod tests {
             expected_run_id: Some(expected_run_id),
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: true,
@@ -7023,6 +7116,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: Some("重启样机".into()),
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -7040,6 +7134,7 @@ mod tests {
             expected_run_id: None,
             pacing: None,
             description: Some("重启样机".into()),
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,

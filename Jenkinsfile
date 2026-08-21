@@ -5,63 +5,7 @@ pipeline {
         skipDefaultCheckout(true)
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
-        timeout(time: 90, unit: 'MINUTES')
-    }
-
-    parameters {
-        choice(
-            name: 'BUILD_PROFILE',
-            choices: ['release', 'debug'],
-            description: '构建档位：release 生成正式优化产物；debug 生成带调试信息的测试产物，绝不会发布到 GitHub Release'
-        )
-
-        booleanParam(
-            name: 'RUN_FORMAT_CHECK',
-            defaultValue: true,
-            description: '检查 Rust 代码格式'
-        )
-
-        booleanParam(
-            name: 'RUN_CLIPPY',
-            defaultValue: true,
-            description: '运行 Clippy，并将警告视为错误'
-        )
-
-        booleanParam(
-            name: 'RUN_TESTS',
-            defaultValue: true,
-            description: '运行 workspace 全部测试；启用 macOS 构建时也在 Mac 节点运行测试'
-        )
-
-        booleanParam(
-            name: 'BUILD_PACKAGES',
-            defaultValue: true,
-            description: '打包并归档当前档位的 CLI、daemon、MCP 与 serial-desktop GUI 可下载产物'
-        )
-
-        booleanParam(
-            name: 'BUILD_MACOS',
-            defaultValue: true,
-            description: '在原生 Apple Silicon Jenkins Agent 上构建 macOS arm64 与 x86_64，并为各架构生成可双击的 Serial Platform.app；需要 rust-macos && arm64 节点'
-        )
-
-        booleanParam(
-            name: 'PUBLISH_GITHUB_RELEASE',
-            defaultValue: false,
-            description: '将完整的四平台 Release 产物直接发布到 GitHub；仅 release、全部质量检查和 macOS 构建均启用时允许'
-        )
-
-        string(
-            name: 'PACKAGE_TARGETS',
-            defaultValue: 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu',
-            description: 'Linux Agent 上的正式 target，逗号分隔；仅允许 x86_64 Linux glibc 2.31 与 Windows GNU/MinGW-w64'
-        )
-
-        booleanParam(
-            name: 'BUILD_RELEASE',
-            defaultValue: true,
-            description: '[兼容旧调用，后续版本移除] release 档位的总开关；新构建请保持勾选，并使用 BUILD_PACKAGES 控制是否打包'
-        )
+        timeout(time: 120, unit: 'MINUTES')
     }
 
     environment {
@@ -69,46 +13,19 @@ pipeline {
         CARGO_NET_RETRY = '5'
         CARGO_HTTP_TIMEOUT = '120'
         RUST_BACKTRACE = '1'
-        EFFECTIVE_BUILD_PROFILE = "${params.BUILD_PROFILE ?: 'release'}"
-        EFFECTIVE_BUILD_PACKAGES = "${params.BUILD_PACKAGES == null ? true : params.BUILD_PACKAGES}"
-        EFFECTIVE_BUILD_MACOS = "${params.BUILD_MACOS == null ? false : params.BUILD_MACOS}"
-        EFFECTIVE_PUBLISH_GITHUB_RELEASE = "${params.PUBLISH_GITHUB_RELEASE == null ? false : params.PUBLISH_GITHUB_RELEASE}"
-        EFFECTIVE_BUILD_RELEASE = "${params.BUILD_RELEASE == null ? true : params.BUILD_RELEASE}"
-        EFFECTIVE_PACKAGE_TARGETS = "${params.PACKAGE_TARGETS ?: 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu'}"
-        EFFECTIVE_RUN_FORMAT_CHECK = "${params.RUN_FORMAT_CHECK == null ? true : params.RUN_FORMAT_CHECK}"
-        EFFECTIVE_RUN_CLIPPY = "${params.RUN_CLIPPY == null ? true : params.RUN_CLIPPY}"
-        EFFECTIVE_RUN_TESTS = "${params.RUN_TESTS == null ? true : params.RUN_TESTS}"
+        ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
+        ELECTRON_BUILDER_BINARIES_MIRROR = 'https://npmmirror.com/mirrors/electron-builder-binaries/'
+        EFFECTIVE_PACKAGE_TARGETS = 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu'
     }
 
     stages {
-        stage('Prepare source and parameters') {
+        stage('Prepare source and release mode') {
             agent {
                 label 'rust'
             }
 
             steps {
                 script {
-                    if (env.EFFECTIVE_PUBLISH_GITHUB_RELEASE == 'true' &&
-                        env.EFFECTIVE_BUILD_PROFILE != 'release') {
-                        error('Debug 产物禁止发布到 GitHub Release。')
-                    }
-                    if (env.EFFECTIVE_PUBLISH_GITHUB_RELEASE == 'true' &&
-                        (env.EFFECTIVE_BUILD_RELEASE != 'true' ||
-                         env.EFFECTIVE_BUILD_PACKAGES != 'true' ||
-                         env.EFFECTIVE_BUILD_MACOS != 'true')) {
-                        error('GitHub Release 要求启用 BUILD_RELEASE、BUILD_PACKAGES 和 BUILD_MACOS。')
-                    }
-                    if (env.EFFECTIVE_PUBLISH_GITHUB_RELEASE == 'true' &&
-                        (env.EFFECTIVE_RUN_FORMAT_CHECK != 'true' ||
-                         env.EFFECTIVE_RUN_CLIPPY != 'true' ||
-                         env.EFFECTIVE_RUN_TESTS != 'true')) {
-                        error('GitHub Release 要求格式、Clippy 和测试三个质量检查全部启用。')
-                    }
-                    if (env.EFFECTIVE_PUBLISH_GITHUB_RELEASE == 'true' &&
-                        env.EFFECTIVE_PACKAGE_TARGETS != 'x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu') {
-                        error('GitHub Release 要求构建完整且顺序固定的 Linux/Windows target 集。')
-                    }
-
                     deleteDir()
                     def checkoutState = checkout scm
                     env.SOURCE_GIT_COMMIT = checkoutState.GIT_COMMIT ?: sh(
@@ -118,10 +35,46 @@ pipeline {
                     if (!(env.SOURCE_GIT_COMMIT ==~ /[0-9a-f]{40}/)) {
                         error("无法确定本次构建的完整 Git commit：${env.SOURCE_GIT_COMMIT}")
                     }
+                    def packageVersion = sh(
+                        returnStdout: true,
+                        script: "sed -n 's/^version = \\\"\\(.*\\)\\\"/\\1/p' Cargo.toml | head -n 1"
+                    ).trim()
+                    if (!packageVersion) {
+                        error('无法从 Cargo.toml 读取 workspace 版本。')
+                    }
+                    env.RELEASE_TAG = "v${packageVersion}"
+                    def tagExists = sh(
+                        returnStatus: true,
+                        script: 'git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"'
+                    ) == 0
+                    env.EFFECTIVE_BUILD_PROFILE = 'debug'
+                    env.AUTOMATIC_RELEASE = 'false'
+                    if (tagExists) {
+                        def tagType = sh(
+                            returnStdout: true,
+                            script: 'git cat-file -t "$RELEASE_TAG"'
+                        ).trim()
+                        if (tagType == 'tag') {
+                            def tagCommit = sh(
+                                returnStdout: true,
+                                script: 'git rev-parse "$RELEASE_TAG^{}"'
+                            ).trim()
+                            if (tagCommit == env.SOURCE_GIT_COMMIT) {
+                                env.EFFECTIVE_BUILD_PROFILE = 'release'
+                                env.AUTOMATIC_RELEASE = 'true'
+                            } else {
+                                echo "${env.RELEASE_TAG} 指向 ${tagCommit}；本次提交按 debug 构建，不发布。"
+                            }
+                        } else {
+                            echo "${env.RELEASE_TAG} 不是 annotated tag；本次提交按 debug 构建，不发布。"
+                        }
+                    }
                 }
                 sh '''
                     test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
                     printf 'Pinned source commit: %s\n' "$SOURCE_GIT_COMMIT"
+                    printf 'Build profile: %s\n' "$EFFECTIVE_BUILD_PROFILE"
+                    printf 'Release tag: %s (%s)\n' "$RELEASE_TAG" "$AUTOMATIC_RELEASE"
                 '''
             }
         }
@@ -158,49 +111,24 @@ pipeline {
                 }
 
                 stage('Format') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_RUN_FORMAT_CHECK == 'true'
-                        }
-                    }
-
                     steps {
                         sh 'ci/build.sh fmt'
                     }
                 }
 
                 stage('Clippy') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_RUN_CLIPPY == 'true'
-                        }
-                    }
-
                     steps {
                         sh 'ci/build.sh clippy'
                     }
                 }
 
                 stage('Test') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_RUN_TESTS == 'true'
-                        }
-                    }
-
                     steps {
                         sh 'ci/build.sh test'
                     }
                 }
 
                 stage('Host build') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_BUILD_PROFILE == 'debug' ||
-                                env.EFFECTIVE_BUILD_RELEASE == 'true'
-                        }
-                    }
-
                     steps {
                         withEnv(["BUILD_PROFILE=${env.EFFECTIVE_BUILD_PROFILE}"]) {
                             sh 'ci/build.sh build "$BUILD_PROFILE"'
@@ -209,13 +137,6 @@ pipeline {
                 }
 
                 stage('Host smoke test') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_BUILD_PROFILE == 'debug' ||
-                                env.EFFECTIVE_BUILD_RELEASE == 'true'
-                        }
-                    }
-
                     steps {
                         withEnv(["BUILD_PROFILE=${env.EFFECTIVE_BUILD_PROFILE}"]) {
                             sh 'ci/build.sh smoke "$BUILD_PROFILE"'
@@ -224,20 +145,14 @@ pipeline {
                 }
 
                 stage('Linux and Windows packages') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_BUILD_PACKAGES == 'true' &&
-                                (env.EFFECTIVE_BUILD_PROFILE == 'debug' ||
-                                 env.EFFECTIVE_BUILD_RELEASE == 'true')
-                        }
-                    }
-
                     steps {
                         withEnv([
                             "BUILD_PROFILE=${env.EFFECTIVE_BUILD_PROFILE}",
                             "PACKAGE_TARGETS=${env.EFFECTIVE_PACKAGE_TARGETS}"
                         ]) {
-                            sh 'ci/build.sh package "$PACKAGE_TARGETS" "$BUILD_PROFILE"'
+                            retry(2) {
+                                sh 'ci/build.sh package "$PACKAGE_TARGETS" "$BUILD_PROFILE"'
+                            }
                         }
                         stash(
                             name: 'linux-windows-packages',
@@ -250,16 +165,6 @@ pipeline {
         }
 
         stage('macOS packages') {
-            when {
-                beforeAgent true
-                expression {
-                    return env.EFFECTIVE_BUILD_MACOS == 'true' &&
-                        env.EFFECTIVE_BUILD_PACKAGES == 'true' &&
-                        (env.EFFECTIVE_BUILD_PROFILE == 'debug' ||
-                         env.EFFECTIVE_BUILD_RELEASE == 'true')
-                }
-            }
-
             agent {
                 label 'rust-macos && arm64'
             }
@@ -291,12 +196,6 @@ pipeline {
                 }
 
                 stage('macOS test') {
-                    when {
-                        expression {
-                            return env.EFFECTIVE_RUN_TESTS == 'true'
-                        }
-                    }
-
                     steps {
                         withEnv(["BUILD_PROFILE=${env.EFFECTIVE_BUILD_PROFILE}"]) {
                             sh 'ci/build-macos.sh test "$BUILD_PROFILE"'
@@ -307,7 +206,9 @@ pipeline {
                 stage('macOS arm64 and x86_64 package') {
                     steps {
                         withEnv(["BUILD_PROFILE=${env.EFFECTIVE_BUILD_PROFILE}"]) {
-                            sh 'ci/build-macos.sh package "$BUILD_PROFILE"'
+                            retry(2) {
+                                sh 'ci/build-macos.sh package "$BUILD_PROFILE"'
+                            }
                         }
                         stash(
                             name: 'macos-packages',
@@ -320,15 +221,6 @@ pipeline {
         }
 
         stage('Collect and archive packages') {
-            when {
-                beforeAgent true
-                expression {
-                    return env.EFFECTIVE_BUILD_PACKAGES == 'true' &&
-                        (env.EFFECTIVE_BUILD_PROFILE == 'debug' ||
-                         env.EFFECTIVE_BUILD_RELEASE == 'true')
-                }
-            }
-
             agent {
                 label 'rust'
             }
@@ -341,15 +233,11 @@ pipeline {
                     test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
                 '''
                 unstash 'linux-windows-packages'
-                script {
-                    if (env.EFFECTIVE_BUILD_MACOS == 'true') {
-                        unstash 'macos-packages'
-                        sh '''
-                            mkdir -p target/artifacts
-                            cp target/macos-artifacts/*.zip target/artifacts/
-                        '''
-                    }
-                }
+                unstash 'macos-packages'
+                sh '''
+                    mkdir -p target/artifacts
+                    cp target/macos-artifacts/*.zip target/artifacts/
+                '''
                 sh 'ci/build.sh checksums'
                 archiveArtifacts(
                     artifacts: 'target/artifacts/*.tar.gz,target/artifacts/*.zip,target/artifacts/SHA256SUMS',
@@ -368,7 +256,7 @@ pipeline {
             when {
                 beforeAgent true
                 expression {
-                    return env.EFFECTIVE_PUBLISH_GITHUB_RELEASE == 'true'
+                    return env.AUTOMATIC_RELEASE == 'true'
                 }
             }
 
@@ -387,7 +275,9 @@ pipeline {
                 withCredentials([
                     string(credentialsId: 'github-release-token', variable: 'GH_TOKEN')
                 ]) {
-                    sh 'ci/publish-github-release.sh release'
+                    retry(2) {
+                        sh 'ci/publish-github-release.sh release'
+                    }
                 }
             }
         }
@@ -397,10 +287,8 @@ pipeline {
         success {
             script {
                 def commit = env.SOURCE_GIT_COMMIT ? env.SOURCE_GIT_COMMIT.take(12) : 'unknown'
-                def platforms = env.EFFECTIVE_BUILD_PACKAGES != 'true' ?
-                    '未打包' : (env.EFFECTIVE_BUILD_MACOS == 'true' ?
-                    'Linux + Windows + macOS arm64/x86_64' : 'Linux + Windows')
-                def published = env.EFFECTIVE_PUBLISH_GITHUB_RELEASE == 'true' ?
+                def platforms = 'Linux + Windows + macOS arm64/x86_64'
+                def published = env.AUTOMATIC_RELEASE == 'true' ?
                     ' · GitHub Release 已发布' : ''
                 currentBuild.description = "${commit} · ${env.EFFECTIVE_BUILD_PROFILE} · ${platforms}${published}"
             }

@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, IsTerminal, Write as _},
+    io::{self, IsTerminal as _, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -8,19 +8,17 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serial_protocol::{
-    DataBits, DeviceProfile, EchoMode, FlowControl, Parity, SlotConfig, StopBits, TransportProfile,
-    apply_transport_profile,
+    DataBits, EchoMode, FlowControl, ModelProfile, Parity, SlotConfig, StopBits, TransportProfile,
 };
 
 use crate::{
-    api::{ApiClient, ProfileCatalog, is_conflict, is_not_found},
-    config,
+    api::{ApiClient, ProfileCatalog, is_conflict},
     display::safe_inline,
-    i18n::tr,
 };
 
 pub const SAFE_TRANSPORT_NAME: &str = "generic-115200";
 
+#[cfg(test)]
 fn safe_transport_profile() -> TransportProfile {
     TransportProfile {
         name: SAFE_TRANSPORT_NAME.into(),
@@ -37,12 +35,6 @@ fn safe_transport_profile() -> TransportProfile {
 
 #[derive(Debug, Args)]
 pub struct ProfileArgs {
-    /// Read the one-time administrator credential from this file for mutations.
-    /// Interactive mutations prompt when this is omitted; the credential is
-    /// never saved.
-    #[arg(long, global = true)]
-    admin_token_file: Option<PathBuf>,
-
     #[command(subcommand)]
     command: ProfileCommand,
 }
@@ -55,13 +47,13 @@ enum ProfileCommand {
         command: TransportCommand,
     },
     /// Manage reusable DUT shell/U-Boot behavior and write pacing.
-    Device {
+    Model {
         #[command(subcommand)]
-        command: DeviceCommand,
+        command: ModelCommand,
     },
-    /// Attach one or both profiles to a Slot.
+    /// Attach one or both profiles to a serial port.
     Attach(ProfileAttachArgs),
-    /// Return a Slot to Generic device behavior and/or the safe UART baseline.
+    /// Remove one or both profile bindings from a serial port.
     Detach(ProfileDetachArgs),
 }
 
@@ -86,17 +78,17 @@ enum TransportCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum DeviceCommand {
+enum ModelCommand {
     /// List available DUT behavior profiles. Generic means unbound.
     List(OutputArgs),
     /// Show one DUT behavior profile.
     Show(ShowArgs),
     /// Create a DUT behavior profile from explicit values or prompts.
-    Create(DeviceCreateArgs),
+    Create(ModelCreateArgs),
     /// Update selected fields of an existing DUT behavior profile.
-    Update(DeviceUpdateArgs),
+    Update(ModelUpdateArgs),
     /// Copy a DUT behavior profile and optionally override fields.
-    Clone(DeviceCloneArgs),
+    Clone(ModelCloneArgs),
     /// Import one profile or a profile catalog from TOML/JSON.
     Import(ImportArgs),
     /// Export one profile as TOML or JSON.
@@ -343,7 +335,7 @@ struct TransportUpdateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct DeviceCreateArgs {
+struct ModelCreateArgs {
     /// Unique DUT profile name.
     #[arg(long)]
     name: Option<String>,
@@ -364,7 +356,7 @@ struct DeviceCreateArgs {
     /// Delay between paced write chunks.
     #[arg(long)]
     write_chunk_delay_ms: Option<u64>,
-    /// Prompt for all device behavior fields.
+    /// Prompt for all model behavior fields.
     #[arg(long, conflicts_with = "json")]
     interactive: bool,
     /// Emit machine-readable JSON.
@@ -373,7 +365,7 @@ struct DeviceCreateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct DeviceCloneArgs {
+struct ModelCloneArgs {
     source: String,
     #[arg(long)]
     name: Option<String>,
@@ -394,17 +386,17 @@ struct DeviceCloneArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-struct DeviceUpdateArgs {
+struct ModelUpdateArgs {
     /// Exact profile name. Profile identity cannot be renamed in place.
     name: String,
     #[arg(long, conflicts_with = "clear_shell_prompt")]
     shell_prompt: Option<String>,
-    /// Clear the shell prompt for this Device Profile.
+    /// Clear the shell prompt for this Model Profile.
     #[arg(long)]
     clear_shell_prompt: bool,
     #[arg(long, conflicts_with = "clear_uboot_prompt")]
     uboot_prompt: Option<String>,
-    /// Clear the U-Boot prompt for this Device Profile.
+    /// Clear the U-Boot prompt for this Model Profile.
     #[arg(long)]
     clear_uboot_prompt: bool,
     /// `none`, `cr`, `lf`, or `crlf`.
@@ -414,12 +406,12 @@ struct DeviceUpdateArgs {
         conflicts_with = "inherit_write_eol"
     )]
     write_eol: Option<String>,
-    /// Remove the EOL override so the Slot value is inherited.
+    /// Remove the EOL override so the Port value is inherited.
     #[arg(long)]
     inherit_write_eol: bool,
     #[arg(long, value_enum, conflicts_with = "inherit_echo")]
     echo: Option<EchoArg>,
-    /// Remove the echo override so the Slot value is inherited.
+    /// Remove the echo override so the Port value is inherited.
     #[arg(long)]
     inherit_echo: bool,
     #[arg(
@@ -446,15 +438,15 @@ struct DeviceUpdateArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ProfileAttachArgs {
-    /// Slot ID to update.
+    /// Serial port to update.
     #[arg(long)]
-    slot: String,
+    port: String,
     /// UART transport profile name.
     #[arg(long)]
     transport: Option<String>,
     /// DUT behavior profile name.
     #[arg(long, conflicts_with = "generic")]
-    device: Option<String>,
+    model: Option<String>,
     /// Attach no DUT-specific profile.
     #[arg(long)]
     generic: bool,
@@ -465,66 +457,26 @@ struct ProfileAttachArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ProfileDetachArgs {
-    /// Slot ID to update.
+    /// Serial port to update.
     #[arg(long)]
-    slot: String,
+    port: String,
     /// Reset the physical UART profile to the safe 115200/8N1 baseline.
     #[arg(long)]
     transport: bool,
     /// Detach DUT-specific behavior. This is the default when no kind is set.
     #[arg(long)]
-    device: bool,
+    model: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
 
 pub async fn run(api: &ApiClient, args: ProfileArgs) -> Result<()> {
-    let ProfileArgs {
-        admin_token_file,
-        command,
-    } = args;
+    let ProfileArgs { command } = args;
     command.validate_local()?;
-    let admin_api = if command.requires_admin() {
-        let authentication_required = match api.health().await {
-            Ok(health) => health.auth_required,
-            Err(error) if crate::api::is_unauthorized(&error) => true,
-            Err(error) => return Err(error),
-        };
-        if !authentication_required {
-            Some(api.clone())
-        } else {
-            let token = match admin_token_file.as_deref() {
-                Some(path) => config::read_token_if_present(path)?.with_context(|| {
-                    format!("administrator token file {} is empty", path.display())
-                })?,
-                None if !command.json_mode()
-                    && io::stdin().is_terminal()
-                    && io::stdout().is_terminal() =>
-                {
-                    rpassword::prompt_password(tr("i.admin.prompt"))?
-                        .trim()
-                        .to_owned()
-                }
-                None => {
-                    bail!(
-                        "--admin-token-file is required for non-interactive Profile changes; the administrator credential is never saved"
-                    )
-                }
-            };
-            if token.is_empty() {
-                bail!(tr("i.admin.required"));
-            }
-            Some(ApiClient::new(api.endpoint().to_owned(), Some(token))?)
-        }
-    } else {
-        None
-    };
-    let api = admin_api.as_ref().unwrap_or(api);
-
     match command {
         ProfileCommand::Transport { command } => run_transport(api, command).await,
-        ProfileCommand::Device { command } => run_device(api, command).await,
+        ProfileCommand::Model { command } => run_model(api, command).await,
         ProfileCommand::Attach(args) => attach(api, args).await,
         ProfileCommand::Detach(args) => detach(api, args).await,
     }
@@ -538,53 +490,12 @@ impl ProfileCommand {
             } if !args.interactive && !args.has_changes() => bail!(
                 "transport update requires at least one field flag or --interactive; no changes were requested"
             ),
-            Self::Device {
-                command: DeviceCommand::Update(args),
+            Self::Model {
+                command: ModelCommand::Update(args),
             } if !args.interactive && !args.has_changes() => bail!(
-                "device update requires at least one field flag, one --clear-*/--inherit-* flag, or --interactive; no changes were requested"
+                "model update requires at least one field flag, one --clear-*/--inherit-* flag, or --interactive; no changes were requested"
             ),
             _ => Ok(()),
-        }
-    }
-
-    fn requires_admin(&self) -> bool {
-        match self {
-            Self::Transport { command } => !matches!(
-                command,
-                TransportCommand::List(_) | TransportCommand::Show(_) | TransportCommand::Export(_)
-            ),
-            Self::Device { command } => !matches!(
-                command,
-                DeviceCommand::List(_) | DeviceCommand::Show(_) | DeviceCommand::Export(_)
-            ),
-            Self::Attach(_) | Self::Detach(_) => true,
-        }
-    }
-
-    fn json_mode(&self) -> bool {
-        match self {
-            Self::Transport { command } => match command {
-                TransportCommand::List(args) => args.json,
-                TransportCommand::Show(args) => args.json,
-                TransportCommand::Create(args) => args.json,
-                TransportCommand::Update(args) => args.json,
-                TransportCommand::Clone(args) => args.json,
-                TransportCommand::Import(args) => args.json,
-                TransportCommand::Delete(args) => args.json,
-                TransportCommand::Export(_) => false,
-            },
-            Self::Device { command } => match command {
-                DeviceCommand::List(args) => args.json,
-                DeviceCommand::Show(args) => args.json,
-                DeviceCommand::Create(args) => args.json,
-                DeviceCommand::Update(args) => args.json,
-                DeviceCommand::Clone(args) => args.json,
-                DeviceCommand::Import(args) => args.json,
-                DeviceCommand::Delete(args) => args.json,
-                DeviceCommand::Export(_) => false,
-            },
-            Self::Attach(args) => args.json,
-            Self::Detach(args) => args.json,
         }
     }
 }
@@ -592,26 +503,11 @@ impl ProfileCommand {
 pub async fn load_transport_catalog(
     api: &ApiClient,
 ) -> Result<(ProfileCatalog<TransportProfile>, bool)> {
-    match api.transport_profiles().await {
-        Ok(mut catalog) => {
-            if catalog.profiles.is_empty() {
-                catalog.profiles.insert(0, safe_transport_profile());
-            }
-            Ok((catalog, true))
-        }
-        Err(error) if is_not_found(&error) => Ok((
-            ProfileCatalog {
-                profiles: vec![safe_transport_profile()],
-                config_revision: None,
-            },
-            false,
-        )),
-        Err(error) => Err(error),
-    }
+    Ok((api.transport_profiles().await?, true))
 }
 
-pub async fn load_device_catalog(api: &ApiClient) -> Result<ProfileCatalog<DeviceProfile>> {
-    api.device_profiles().await
+pub async fn load_model_catalog(api: &ApiClient) -> Result<ProfileCatalog<ModelProfile>> {
+    api.model_profiles().await
 }
 
 async fn run_transport(api: &ApiClient, command: TransportCommand) -> Result<()> {
@@ -722,10 +618,10 @@ async fn run_transport(api: &ApiClient, command: TransportCommand) -> Result<()>
     }
 }
 
-async fn run_device(api: &ApiClient, command: DeviceCommand) -> Result<()> {
+async fn run_model(api: &ApiClient, command: ModelCommand) -> Result<()> {
     match command {
-        DeviceCommand::List(args) => {
-            let catalog = load_device_catalog(api).await?;
+        ModelCommand::List(args) => {
+            let catalog = load_model_catalog(api).await?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&catalog)?);
             } else {
@@ -761,7 +657,7 @@ async fn run_device(api: &ApiClient, command: DeviceCommand) -> Result<()> {
             }
             Ok(())
         }
-        DeviceCommand::Show(args) => {
+        ModelCommand::Show(args) => {
             if args.name.eq_ignore_ascii_case("generic") {
                 if args.json {
                     println!(
@@ -777,15 +673,15 @@ async fn run_device(api: &ApiClient, command: DeviceCommand) -> Result<()> {
                 }
                 return Ok(());
             }
-            let catalog = load_device_catalog(api).await?;
+            let catalog = load_model_catalog(api).await?;
             print_profile(find_named(&catalog.profiles, &args.name)?, args.json)
         }
-        DeviceCommand::Create(mut args) => {
+        ModelCommand::Create(mut args) => {
             if args.interactive {
-                populate_device_interactively(&mut args)?;
+                populate_model_interactively(&mut args)?;
             }
-            let profile = DeviceProfile {
-                name: required_name(args.name, "Device Profile name", !args.json)?,
+            let profile = ModelProfile {
+                name: required_name(args.name, "Model Profile name", !args.json)?,
                 shell_prompt: args.shell_prompt,
                 uboot_prompt: args.uboot_prompt,
                 write_eol: args.write_eol,
@@ -793,14 +689,14 @@ async fn run_device(api: &ApiClient, command: DeviceCommand) -> Result<()> {
                 write_chunk_size: args.write_chunk_size,
                 write_chunk_delay_ms: args.write_chunk_delay_ms,
             };
-            validate_device(&profile)?;
-            upsert_device(api, vec![profile], false, args.json).await
+            validate_model(&profile)?;
+            upsert_model(api, vec![profile], false, args.json).await
         }
-        DeviceCommand::Update(args) => update_device(api, args).await,
-        DeviceCommand::Clone(args) => {
-            let catalog = load_device_catalog(api).await?;
+        ModelCommand::Update(args) => update_model(api, args).await,
+        ModelCommand::Clone(args) => {
+            let catalog = load_model_catalog(api).await?;
             let mut profile = find_named(&catalog.profiles, &args.source)?.clone();
-            profile.name = required_name(args.name, "New Device Profile name", !args.json)?;
+            profile.name = required_name(args.name, "New Model Profile name", !args.json)?;
             if let Some(value) = args.shell_prompt {
                 profile.shell_prompt = Some(value);
             }
@@ -819,21 +715,21 @@ async fn run_device(api: &ApiClient, command: DeviceCommand) -> Result<()> {
             if let Some(value) = args.write_chunk_delay_ms {
                 profile.write_chunk_delay_ms = Some(value);
             }
-            validate_device(&profile)?;
-            upsert_device(api, vec![profile], false, args.json).await
+            validate_model(&profile)?;
+            upsert_model(api, vec![profile], false, args.json).await
         }
-        DeviceCommand::Import(args) => {
-            let profiles = read_profiles::<DeviceProfile>(&args.file)?;
+        ModelCommand::Import(args) => {
+            let profiles = read_profiles::<ModelProfile>(&args.file)?;
             for profile in &profiles {
-                validate_device(profile)?;
+                validate_model(profile)?;
             }
-            upsert_device(api, profiles, args.replace, args.json).await
+            upsert_model(api, profiles, args.replace, args.json).await
         }
-        DeviceCommand::Export(args) => {
-            let catalog = load_device_catalog(api).await?;
+        ModelCommand::Export(args) => {
+            let catalog = load_model_catalog(api).await?;
             export_profile(find_named(&catalog.profiles, &args.name)?, &args)
         }
-        DeviceCommand::Delete(args) => delete_device(api, args).await,
+        ModelCommand::Delete(args) => delete_model(api, args).await,
     }
 }
 
@@ -864,30 +760,30 @@ async fn update_transport(api: &ApiClient, args: TransportUpdateArgs) -> Result<
     print_catalog_result(&response, args.json)
 }
 
-async fn update_device(api: &ApiClient, args: DeviceUpdateArgs) -> Result<()> {
-    let mut catalog = load_device_catalog(api).await?;
+async fn update_model(api: &ApiClient, args: ModelUpdateArgs) -> Result<()> {
+    let mut catalog = load_model_catalog(api).await?;
     let index = catalog
         .profiles
         .iter()
         .position(|profile| profile.name == args.name)
         .with_context(|| format!("unknown Profile {:?}", safe_inline(&args.name)))?;
     let mut profile = catalog.profiles[index].clone();
-    apply_device_update(&mut profile, &args);
+    apply_model_update(&mut profile, &args);
     if args.interactive {
-        populate_device_profile_interactively(&mut profile)?;
+        populate_model_profile_interactively(&mut profile)?;
     }
-    validate_device(&profile)?;
+    validate_model(&profile)?;
     if catalog.config_revision.is_none()
         && (profile.write_chunk_size.is_some() || profile.write_chunk_delay_ms.is_some())
     {
         bail!(
-            "this seriald predates managed Device Profile pacing; upgrade seriald before saving write_chunk_size or write_chunk_delay_ms"
+            "this seriald predates managed Model Profile pacing; upgrade seriald before saving write_chunk_size or write_chunk_delay_ms"
         );
     }
     catalog.profiles[index] = profile;
 
     let response = api
-        .configure_device_profiles(catalog.profiles, catalog.config_revision)
+        .configure_model_profiles(catalog.profiles, catalog.config_revision)
         .await
         .map_err(revision_error)?;
     print_catalog_result(&response, args.json)
@@ -933,7 +829,7 @@ fn apply_transport_update(profile: &mut TransportProfile, args: &TransportUpdate
     }
 }
 
-impl DeviceUpdateArgs {
+impl ModelUpdateArgs {
     fn has_changes(&self) -> bool {
         self.shell_prompt.is_some()
             || self.clear_shell_prompt
@@ -950,7 +846,7 @@ impl DeviceUpdateArgs {
     }
 }
 
-fn apply_device_update(profile: &mut DeviceProfile, args: &DeviceUpdateArgs) {
+fn apply_model_update(profile: &mut ModelProfile, args: &ModelUpdateArgs) {
     if let Some(value) = &args.shell_prompt {
         profile.shell_prompt = Some(value.clone());
     } else if args.clear_shell_prompt {
@@ -1003,25 +899,25 @@ async fn upsert_transport(
     print_catalog_result(&response, json)
 }
 
-async fn upsert_device(
+async fn upsert_model(
     api: &ApiClient,
-    incoming: Vec<DeviceProfile>,
+    incoming: Vec<ModelProfile>,
     replace: bool,
     json: bool,
 ) -> Result<()> {
-    let mut catalog = load_device_catalog(api).await?;
+    let mut catalog = load_model_catalog(api).await?;
     if catalog.config_revision.is_none()
         && incoming.iter().any(|profile| {
             profile.write_chunk_size.is_some() || profile.write_chunk_delay_ms.is_some()
         })
     {
         bail!(
-            "this seriald predates managed Device Profile pacing; upgrade seriald before saving write_chunk_size or write_chunk_delay_ms"
+            "this seriald predates managed Model Profile pacing; upgrade seriald before saving write_chunk_size or write_chunk_delay_ms"
         );
     }
     merge_profiles(&mut catalog.profiles, incoming, replace)?;
     let response = api
-        .configure_device_profiles(catalog.profiles, catalog.config_revision)
+        .configure_model_profiles(catalog.profiles, catalog.config_revision)
         .await
         .map_err(revision_error)?;
     print_catalog_result(&response, json)
@@ -1034,10 +930,10 @@ async fn delete_transport(api: &ApiClient, args: DeleteArgs) -> Result<()> {
     confirm_delete(&args.name, args.yes, !args.json)?;
     let status = api.configuration_status().await?;
     let used = status
-        .slots
+        .ports
         .iter()
-        .filter(|slot| slot.config.profile == args.name)
-        .map(|slot| slot.config.id.as_str())
+        .filter(|slot| slot.config.transport_profile.as_deref() == Some(args.name.as_str()))
+        .map(|slot| slot.config.port.as_str())
         .collect::<Vec<_>>();
     if !used.is_empty() {
         let used = used
@@ -1046,7 +942,7 @@ async fn delete_transport(api: &ApiClient, args: DeleteArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "Transport Profile {:?} is attached to Slot(s) {}; attach another profile first",
+            "Transport Profile {:?} is attached to Port(s) {}; attach another profile first",
             safe_inline(&args.name),
             used
         );
@@ -1063,14 +959,14 @@ async fn delete_transport(api: &ApiClient, args: DeleteArgs) -> Result<()> {
     print_catalog_result(&response, args.json)
 }
 
-async fn delete_device(api: &ApiClient, args: DeleteArgs) -> Result<()> {
+async fn delete_model(api: &ApiClient, args: DeleteArgs) -> Result<()> {
     confirm_delete(&args.name, args.yes, !args.json)?;
     let status = api.configuration_status().await?;
     let used = status
-        .slots
+        .ports
         .iter()
-        .filter(|slot| slot.config.device_profile.as_deref() == Some(args.name.as_str()))
-        .map(|slot| slot.config.id.as_str())
+        .filter(|slot| slot.config.model_profile.as_deref() == Some(args.name.as_str()))
+        .map(|slot| slot.config.port.as_str())
         .collect::<Vec<_>>();
     if !used.is_empty() {
         let used = used
@@ -1079,57 +975,56 @@ async fn delete_device(api: &ApiClient, args: DeleteArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "Device Profile {:?} is attached to Slot(s) {}; detach it first",
+            "Model Profile {:?} is attached to Port(s) {}; detach it first",
             safe_inline(&args.name),
             used
         );
     }
-    let mut catalog = load_device_catalog(api).await?;
+    let mut catalog = load_model_catalog(api).await?;
     remove_named(&mut catalog.profiles, &args.name)?;
     let response = api
-        .configure_device_profiles(catalog.profiles, status.config_revision)
+        .configure_model_profiles(catalog.profiles, status.config_revision)
         .await
         .map_err(revision_error)?;
     print_catalog_result(&response, args.json)
 }
 
 async fn attach(api: &ApiClient, args: ProfileAttachArgs) -> Result<()> {
-    if args.transport.is_none() && args.device.is_none() && !args.generic {
-        bail!("attach requires --transport, --device, or --generic");
+    if args.transport.is_none() && args.model.is_none() && !args.generic {
+        bail!("attach requires --transport, --model, or --generic");
     }
     let status = api.configuration_status().await?;
-    let mut slots = status
-        .slots
+    let mut ports = status
+        .ports
         .into_iter()
         .map(|slot| slot.config)
         .collect::<Vec<_>>();
-    let slot = find_slot_mut(&mut slots, &args.slot)?;
+    let slot = find_port_mut(&mut ports, &args.port)?;
 
     if let Some(name) = args.transport {
         let (catalog, _) = load_transport_catalog(api).await?;
         let selected = find_named(&catalog.profiles, &name)?;
-        slot.settings = apply_transport_profile(&slot.settings, Some(selected));
-        slot.profile = selected.name.clone();
+        slot.transport_profile = Some(selected.name.clone());
     }
     if args.generic {
-        slot.device_profile = None;
-    } else if let Some(name) = args.device {
+        slot.model_profile = None;
+    } else if let Some(name) = args.model {
         if name.eq_ignore_ascii_case("generic") {
-            slot.device_profile = None;
+            slot.model_profile = None;
         } else {
-            let catalog = load_device_catalog(api).await?;
+            let catalog = load_model_catalog(api).await?;
             find_named(&catalog.profiles, &name)?;
-            slot.device_profile = Some(name);
+            slot.model_profile = Some(name);
         }
     }
 
     let response = api
-        .configure_slots(slots, status.config_revision)
+        .configure_ports(ports, status.config_revision)
         .await
         .map_err(revision_error)?;
     print_slot_result(
-        &response.slots,
-        &args.slot,
+        &response.ports,
+        &args.port,
         response.config_revision,
         args.json,
     )
@@ -1137,78 +1032,81 @@ async fn attach(api: &ApiClient, args: ProfileAttachArgs) -> Result<()> {
 
 async fn detach(api: &ApiClient, args: ProfileDetachArgs) -> Result<()> {
     let status = api.configuration_status().await?;
-    let mut slots = status
-        .slots
+    let mut ports = status
+        .ports
         .into_iter()
         .map(|slot| slot.config)
         .collect::<Vec<_>>();
-    let slot = find_slot_mut(&mut slots, &args.slot)?;
-    let detach_device = args.device || !args.transport;
-    if detach_device {
-        slot.device_profile = None;
+    let slot = find_port_mut(&mut ports, &args.port)?;
+    let detach_model = args.model || !args.transport;
+    if detach_model {
+        slot.model_profile = None;
     }
     if args.transport {
-        let safe = safe_transport_profile();
-        slot.settings = apply_transport_profile(&slot.settings, Some(&safe));
-        slot.profile = safe.name;
+        slot.transport_profile = None;
     }
     let response = api
-        .configure_slots(slots, status.config_revision)
+        .configure_ports(ports, status.config_revision)
         .await
         .map_err(revision_error)?;
     print_slot_result(
-        &response.slots,
-        &args.slot,
+        &response.ports,
+        &args.port,
         response.config_revision,
         args.json,
     )
 }
 
 fn print_slot_result(
-    slots: &[serial_protocol::SlotSnapshot],
-    slot_id: &str,
-    revision: Option<u64>,
+    ports: &[serial_protocol::SlotSnapshot],
+    port: &str,
+    revision: u64,
     json: bool,
 ) -> Result<()> {
-    let slot = slots
+    let slot = ports
         .iter()
-        .find(|slot| slot.config.id == slot_id)
+        .find(|slot| slot.config.port == port)
         .with_context(|| {
             format!(
-                "seriald did not return configured Slot {:?}",
-                safe_inline(slot_id)
+                "seriald did not return configured port {:?}",
+                safe_inline(port)
             )
         })?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "slot": slot,
+                "port": slot,
                 "config_revision": revision,
             }))?
         );
     } else {
         println!(
-            "Slot {}: transport={}, device={}",
-            safe_inline(&slot.config.id),
-            safe_inline(&slot.config.profile),
-            safe_inline(slot.config.device_profile.as_deref().unwrap_or("Generic"))
+            "Port {}: transport={}, model={}",
+            safe_inline(&slot.config.port),
+            safe_inline(
+                slot.config
+                    .transport_profile
+                    .as_deref()
+                    .unwrap_or("115200 8N1")
+            ),
+            safe_inline(slot.config.model_profile.as_deref().unwrap_or("Generic"))
         );
     }
     Ok(())
 }
 
-fn find_slot_mut<'a>(slots: &'a mut [SlotConfig], id: &str) -> Result<&'a mut SlotConfig> {
-    slots
+fn find_port_mut<'a>(ports: &'a mut [SlotConfig], port: &str) -> Result<&'a mut SlotConfig> {
+    ports
         .iter_mut()
-        .find(|slot| slot.id == id)
-        .with_context(|| format!("unknown Slot {:?}", safe_inline(id)))
+        .find(|slot| slot.port == port)
+        .with_context(|| format!("unknown serial port {:?}", safe_inline(port)))
 }
 
 fn revision_error(error: anyhow::Error) -> anyhow::Error {
     if is_conflict(&error) {
         anyhow::anyhow!(
-            "configuration changed on another client; reload the Profile/Slot state and retry ({error})"
+            "configuration changed on another client; reload the Profile/port state and retry ({error})"
         )
     } else {
         error
@@ -1248,7 +1146,7 @@ fn validate_transport(profile: &TransportProfile) -> Result<()> {
     Ok(())
 }
 
-fn validate_device(profile: &DeviceProfile) -> Result<()> {
+fn validate_model(profile: &ModelProfile) -> Result<()> {
     validate_name(&profile.name)?;
     if profile
         .write_chunk_size
@@ -1264,7 +1162,7 @@ fn validate_name(name: &str) -> Result<()> {
         bail!("Profile name must be non-empty and must not have surrounding whitespace");
     }
     if name.eq_ignore_ascii_case("generic") {
-        bail!("Generic is reserved for an unbound Device Profile");
+        bail!("Generic is reserved for an unbound Model Profile");
     }
     Ok(())
 }
@@ -1304,11 +1202,11 @@ fn populate_transport_profile_interactively(profile: &mut TransportProfile) -> R
     Ok(())
 }
 
-fn populate_device_interactively(args: &mut DeviceCreateArgs) -> Result<()> {
+fn populate_model_interactively(args: &mut ModelCreateArgs) -> Result<()> {
     ensure_tty()?;
     args.name = Some(match args.name.take() {
-        Some(name) => prompt_with_default("Device Profile name", &name)?,
-        None => prompt("Device Profile name")?,
+        Some(name) => prompt_with_default("Model Profile name", &name)?,
+        None => prompt("Model Profile name")?,
     });
     args.shell_prompt = prompt_optional_prompt("Shell prompt", args.shell_prompt.take())?;
     args.uboot_prompt = prompt_optional_prompt("U-Boot prompt", args.uboot_prompt.take())?;
@@ -1350,7 +1248,7 @@ fn populate_device_interactively(args: &mut DeviceCreateArgs) -> Result<()> {
     Ok(())
 }
 
-fn populate_device_profile_interactively(profile: &mut DeviceProfile) -> Result<()> {
+fn populate_model_profile_interactively(profile: &mut ModelProfile) -> Result<()> {
     ensure_tty()?;
     profile.shell_prompt = prompt_optional_prompt("Shell prompt", profile.shell_prompt.take())?;
     profile.uboot_prompt = prompt_optional_prompt("U-Boot prompt", profile.uboot_prompt.take())?;
@@ -1586,7 +1484,7 @@ impl Named for TransportProfile {
     }
 }
 
-impl Named for DeviceProfile {
+impl Named for ModelProfile {
     fn name(&self) -> &str {
         &self.name
     }
@@ -1695,6 +1593,7 @@ fn parse_positive_u32(value: &str) -> Result<u32, String> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use serial_protocol::apply_transport_profile;
 
     #[derive(Debug, Parser)]
     struct ProfileParser {
@@ -1715,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn applying_transport_does_not_overwrite_device_behavior_or_pacing() {
+    fn applying_transport_does_not_overwrite_model_behavior_or_pacing() {
         let settings = serial_protocol::SerialSettings {
             write_eol: "\n".into(),
             shell_prompt: Some("# ".into()),
@@ -1747,66 +1646,8 @@ mod tests {
     }
 
     #[test]
-    fn only_profile_mutations_require_the_one_time_admin_credential() {
-        assert!(
-            !ProfileCommand::Transport {
-                command: TransportCommand::List(OutputArgs { json: false })
-            }
-            .requires_admin()
-        );
-        assert!(
-            !ProfileCommand::Device {
-                command: DeviceCommand::Show(ShowArgs {
-                    name: "dut".into(),
-                    json: false,
-                })
-            }
-            .requires_admin()
-        );
-        assert!(
-            ProfileCommand::Transport {
-                command: TransportCommand::Delete(DeleteArgs {
-                    name: "uart".into(),
-                    yes: true,
-                    json: false,
-                })
-            }
-            .requires_admin()
-        );
-        assert!(
-            ProfileCommand::Attach(ProfileAttachArgs {
-                slot: "slot-1".into(),
-                transport: None,
-                device: Some("dut".into()),
-                generic: false,
-                json: false,
-            })
-            .requires_admin()
-        );
-    }
-
-    #[test]
-    fn json_profile_mutations_never_enter_interactive_mode() {
-        let command = ProfileCommand::Device {
-            command: DeviceCommand::Create(DeviceCreateArgs {
-                name: Some("dut".into()),
-                shell_prompt: None,
-                uboot_prompt: None,
-                write_eol: None,
-                echo: None,
-                write_chunk_size: None,
-                write_chunk_delay_ms: None,
-                interactive: false,
-                json: true,
-            }),
-        };
-        assert!(command.requires_admin());
-        assert!(command.json_mode());
-    }
-
-    #[test]
-    fn device_profile_files_use_the_protocol_pacing_schema() {
-        let profile = DeviceProfile {
+    fn model_profile_files_use_the_protocol_pacing_schema() {
+        let profile = ModelProfile {
             name: "slow-dut".into(),
             shell_prompt: Some("# ".into()),
             uboot_prompt: None,
@@ -1819,7 +1660,7 @@ mod tests {
         assert_eq!(encoded["write_chunk_size"], 8);
         assert_eq!(encoded["write_chunk_delay_ms"], 1);
         assert_eq!(
-            serde_json::from_value::<DeviceProfile>(encoded).unwrap(),
+            serde_json::from_value::<ModelProfile>(encoded).unwrap(),
             profile
         );
     }
@@ -1855,10 +1696,10 @@ mod tests {
     }
 
     #[test]
-    fn device_update_parser_supports_clearing_prompts_and_inheriting_other_fields() {
+    fn model_update_parser_supports_clearing_prompts_and_inheriting_other_fields() {
         let parsed = ProfileParser::try_parse_from([
             "profile",
-            "device",
+            "model",
             "update",
             "slow-dut",
             "--clear-shell-prompt",
@@ -1868,11 +1709,11 @@ mod tests {
             "8",
         ])
         .unwrap();
-        let ProfileCommand::Device {
-            command: DeviceCommand::Update(args),
+        let ProfileCommand::Model {
+            command: ModelCommand::Update(args),
         } = parsed.command
         else {
-            panic!("expected device update");
+            panic!("expected model update");
         };
         assert_eq!(args.name, "slow-dut");
         assert!(args.clear_shell_prompt);
@@ -1883,7 +1724,7 @@ mod tests {
         assert!(
             ProfileParser::try_parse_from([
                 "profile",
-                "device",
+                "model",
                 "update",
                 "slow-dut",
                 "--shell-prompt",
@@ -1918,7 +1759,7 @@ mod tests {
             .is_err()
         );
 
-        let device = DeviceUpdateArgs {
+        let model = ModelUpdateArgs {
             name: "dut".into(),
             shell_prompt: None,
             clear_shell_prompt: false,
@@ -1935,10 +1776,10 @@ mod tests {
             interactive: false,
             json: false,
         };
-        assert!(!device.has_changes());
+        assert!(!model.has_changes());
         assert!(
-            ProfileCommand::Device {
-                command: DeviceCommand::Update(device)
+            ProfileCommand::Model {
+                command: ModelCommand::Update(model)
             }
             .validate_local()
             .is_err()
@@ -1946,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_updates_preserve_unmentioned_fields_and_can_clear_device_overrides() {
+    fn partial_updates_preserve_unmentioned_fields_and_can_clear_model_overrides() {
         let mut transport = safe_transport_profile();
         let transport_update = TransportUpdateArgs {
             name: transport.name.clone(),
@@ -1968,7 +1809,7 @@ mod tests {
         assert_eq!(transport.flow_control, FlowControl::None);
         assert!(transport.auto_open);
 
-        let mut device = DeviceProfile {
+        let mut model = ModelProfile {
             name: "dut".into(),
             shell_prompt: Some("# ".into()),
             uboot_prompt: Some("=> ".into()),
@@ -1977,8 +1818,8 @@ mod tests {
             write_chunk_size: Some(8),
             write_chunk_delay_ms: Some(1),
         };
-        let device_update = DeviceUpdateArgs {
-            name: device.name.clone(),
+        let model_update = ModelUpdateArgs {
+            name: model.name.clone(),
             shell_prompt: None,
             clear_shell_prompt: true,
             uboot_prompt: None,
@@ -1994,12 +1835,12 @@ mod tests {
             interactive: false,
             json: false,
         };
-        apply_device_update(&mut device, &device_update);
-        assert_eq!(device.shell_prompt, None);
-        assert_eq!(device.uboot_prompt.as_deref(), Some("=> "));
-        assert_eq!(device.write_eol.as_deref(), Some("\r"));
-        assert_eq!(device.echo, Some(EchoMode::Off));
-        assert_eq!(device.write_chunk_size, Some(8));
-        assert_eq!(device.write_chunk_delay_ms, Some(5));
+        apply_model_update(&mut model, &model_update);
+        assert_eq!(model.shell_prompt, None);
+        assert_eq!(model.uboot_prompt.as_deref(), Some("=> "));
+        assert_eq!(model.write_eol.as_deref(), Some("\r"));
+        assert_eq!(model.echo, Some(EchoMode::Off));
+        assert_eq!(model.write_chunk_size, Some(8));
+        assert_eq!(model.write_chunk_delay_ms, Some(5));
     }
 }

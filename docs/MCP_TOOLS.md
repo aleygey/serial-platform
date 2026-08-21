@@ -1,811 +1,485 @@
-# serial-mcp tool reference
+# Serial MCP Tools
 
-This document describes the complete Agent-facing tool surface implemented by
-`serial-mcp` 0.7.0. The executable is the schema authority: run
+`serial-mcp` 把 Serial Platform 收敛为 19 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
 
-```console
+```sh
 serial mcp --dump-tools
+# 或
+serial-mcp --dump-tools
 ```
 
-to print the exact `tools/list` JSON without loading credentials or connecting
-to `seriald`.
+所有设备选择字段统一为 `port`，例如 `COM4` 或 `/dev/cu.usbserial-210`。工具不要求 Agent 传 request ID、Control ID、fence、generation、operation ID、pacing 或续租参数。
 
-## Session contract
+## Transport
 
-`serial-mcp` is an MCP stdio server. It supports `initialize`, `ping`,
-`tools/list`, `tools/call`, and cancellation. Tool arguments are strict JSON
-objects: unknown fields are rejected. Schema `maxLength` values count JSON
-string characters; where bytes cross the UART or enter daemon configuration,
-the runtime also enforces the stated UTF-8 byte bound. All serial writes
-require an active Run owned by this MCP process.
+### 统一启动的 HTTP MCP
 
-`run_start` returns a public audit `run_id` and one opaque `run_handle`. The
-22-character base64url handle contains 128 bits drawn directly from the OS
-CSPRNG. It exists only in `serial-mcp` memory and in tool results; it is never
-copied into Run metadata, timeline events, `devices`, daemon status, or the
-seriald WebSocket protocol. Internally it resolves to the Slot, public Run ID,
-and a separate private capability. The initiating LLM session passes only this
-one handle to every Run-scoped call: `command`, `command_sequence`, `input`,
-`signal`, `trigger`, `wait`, and `run_end`. An aborting `release` also requires
-it while that Run remains active. A caller must never discover an active
-`run_id` through `devices` or `search` and adopt it; a public ID cannot be
-converted into a handle.
+运行：
 
-This is an intentional v0.7.0 migration from the v0.6.2 Run-scoped
-`slot_id`/`run_id`/`run_token` inputs. Restart `serial-mcp` and refresh the
-host's tool registry after upgrading. Old argument objects are rejected by the
-strict schemas, and process-local capabilities from an old adapter cannot be
-resumed in a new one. Run authorization changes only the MCP tool surface;
-seriald continues to use WebSocket protocol v3 and public Run UUIDs. The v0.7
-HTTP status adds `serial_context_precondition_supported`; an older protocol-v3
-daemon omits it and therefore decodes as false. Before any command, raw input,
-control-byte/BREAK signal, command sequence, or Trigger can reach the UART, a
-v0.7 MCP requires this capability and otherwise fails closed with a definite
-zero-byte result. Separately, v0.7 removes the retired
-`/api/v1/monitor-events` HTTP delivery routes and `MonitorSpec.event_ttl_ms`;
-the core Monitor/Incident HTTP APIs remain.
+```sh
+serial
+```
 
-An authorized Run-scoped call pins its Run for that call's complete lifetime,
-including a `wait`/command capture lasting up to 120 seconds or a validated
-command sequence whose capture deadlines total up to 300 seconds. Normal
-completion is explicit: the Agent calls `run_end` before its final reply unless
-it deliberately hands the live Run to a continuing Agent workflow. The
-configurable orphan timeout is only a crash/abandonment fallback. It defaults
-to 1,800 seconds; `orphan_run_timeout_seconds` accepts 0 for unlimited or any
-finite value of at least 300 seconds, with no artificial maximum, and takes
-effect after restarting `serial-mcp`. At the next 20-second renewal tick after
-that deadline the adapter releases control, aborting the abandoned active Run.
-If that release cannot reach `seriald`, the separately renewed, fenced
-60-second daemon lease still expires and aborts the Run.
+会在下面地址启动 sessionless Streamable HTTP MCP：
 
-A successful `tools/call` result has `isError=false`, the documented object in
-`structuredContent`, and the same object serialized as compact JSON in its
-single text content item. A known tool's validation or execution failure uses
-the same envelope with `isError=true` and `{error}` as structured content.
-Malformed JSON-RPC, invalid `tools/call` framing, and unknown tool names use
-JSON-RPC errors instead.
+```text
+http://127.0.0.1:3211/mcp
+```
 
-HTTP failures from seriald are decoded rather than embedded as a second escaped
-JSON string. `structuredContent.error` preserves stable fields such as
-`http_status`, `code`, `retryable`, and, for a journal query-budget failure,
-`phase`, `scanned_bytes`, `elapsed_ms`, and `retry_hint`; the text content is a
-plain human-readable message.
+MCP host 对该 URL 发送 JSON-RPC `POST`。notification 返回 HTTP 202；没有持久 HTTP session 或 SSE GET channel。
 
-The adapter accepts multiple outstanding `tools/call` requests, but serial
-mutations for one Slot are serialized. Independent Slots can progress
-concurrently. `command` remains the ordinary one-command primitive.
-`command_sequence` is the bounded alternative for a known dependent exchange,
-such as waiting for `Password:` after a username before sending a password. It
-defines a purpose, completion boundary, timeout, and result for each ordered
-step and always stops before the first step whose predecessor did not complete.
+### stdio MCP
 
-Before connecting to or operating a DUT, an Agent must confirm that the model
-assigned to the Slot matches the physical device. A saved model name is an
-assignment, not evidence. Valid confirmation sources include serial evidence,
-telnet, the device Web UI, and a human. A Run scopes evidence; it does not reset
-or initialize the device.
+MCP host 也可以直接启动：
 
-The server currently exposes 19 tools:
+```sh
+serial mcp --actor-label codex:workstation
+```
 
-| Tool | External mutation | Cancellable | Purpose |
-|---|---:|---:|---|
-| `devices` | No | Yes | List Slots, effective profiles, state, ownership, and Run |
-| `device_models` | No | Yes | Read the hierarchical model catalog and Slot bindings |
-| `device_model_set` | Yes | No | Assign/create a confirmed model, or guarded-update the Slot's current model node |
-| `read` | No | Yes | Read a bounded live or archived serial window |
-| `command` | Yes | No | Write a line and capture its bounded RX result |
-| `command_sequence` | Yes | No | Execute 1–8 matcher-gated dependent commands in order |
-| `input` | Yes | No | Write exact UTF-8 bytes without adding EOL |
-| `signal` | Yes | No | Send Ctrl-C/D/Z or physical serial BREAK |
-| `trigger` | Yes | No | Run a bounded daemon-side repeated-write matcher |
-| `wait` | No | Yes | Wait for a literal, regex, prompt, or quiet boundary |
-| `search` | No | Yes | Search the current Run/cursor or an archive |
-| `monitor_start` | Yes | No | Start a persistent daemon-side RX Monitor |
-| `monitor_list` | No | Yes | List persistent Monitors |
-| `monitor_status` | No | Yes | Read one Monitor's authoritative state |
-| `monitor_incidents` | No | Yes | Page through retained Monitor incidents |
-| `monitor_stop` | Yes | No | Stop a Monitor while retaining incidents |
-| `run_start` | Yes | No | Acquire control and open an evidence Run |
-| `run_end` | Yes | No | End the Run and best-effort release control |
-| `release` | Yes | No | Release control without closing the serial port |
+stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到 stderr。`--endpoint` 或 `SERIALD_ENDPOINT` 可覆盖默认后端 `http://127.0.0.1:3210`。
 
-The eight cancellable tools are exactly the read-only calls marked above.
-`notifications/cancelled` and `$/cancelRequest` end one of those calls with
-JSON-RPC error `-32800`. Mutation-capable calls deliberately ignore
-cancellation once dispatched, and stdin shutdown waits for them to converge so
-an unknown side-effect outcome is not hidden. In `tools/list`, only those eight
-tools have `readOnlyHint=true` and `idempotentHint=true`. The physical-write
-tools (`command`, `command_sequence`, `input`, `signal`, and `trigger`),
-model-binding mutation, and `monitor_stop` declare `destructiveHint=true`.
-Tools that observe or affect the
-physical DUT (`devices`, `read`, `command`, `command_sequence`, `input`,
-`signal`, `trigger`, `wait`, and `search`) declare `openWorldHint=true`; catalog
-and daemon-local bookkeeping tools keep it false.
+支持 MCP protocol：`2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`。
 
-## Tool definitions
+## 19 个工具
 
-Connection authentication is outside individual tool schemas. With the
-default loopback-only personal daemon, `serial-mcp` has no `token_file` and
-omits Authorization on its HTTP, control-WebSocket, and capture-WebSocket
-connections. Existing authenticated or remote installations continue to use
-the serialctl-compatible operator `token_file`.
+| Tool | Required | Optional | 作用 |
+|---|---|---|---|
+| `devices` | — | `port` | 读取端口、Profile、生效参数、连接、Control、Run、Trigger 和 cursor head |
+| `model_profiles` | — | `port` | 读取 Model Profile catalog 与端口绑定 |
+| `model_profile_set` | `port`, `profile` | — | 创建/更新一个完整 Model Profile 并绑定；`profile:null` 解绑 |
+| `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq` | 从实时 ring 或指定历史周期读取有界文本 |
+| `command` | `run_handle`, `command`, `description` | `expect`, `regex`, `timeout_seconds` | 追加有效 EOL、写入、捕获 RX 并保留任务说明 |
+| `command_sequence` | `run_handle`, `description`, `steps` | 每步 matcher/timeout | 一次完成 1–8 步已知依赖交互 |
+| `input` | `run_handle`, `text` | — | 不追加 EOL，写入精确 UTF-8 bytes |
+| `signal` | `run_handle`, `signal` | Break 的 `duration_ms` | Ctrl-C/D/Z byte 或 UART Break |
+| `trigger` | `run_handle`, `action` | `kickoff`, start/stop matcher 与硬上限 | 在后端执行一次有界低延迟反应 |
+| `wait` | `run_handle` | `expect`, `regex`, `timeout_seconds` | 从 live cursor 等待 RX 边界 |
+| `search` | `port`, `query` | `regex`, `scope`, `run_id`, `epoch`, `after_seq` | 搜索当前 Run、当前 cursor 或归档 |
+| `monitor_start` | `port` + `contains`/`regex` 二选一 | `description`, `idempotency_key` | 创建持久 Monitor并立即返回 |
+| `monitor_list` | — | `port` | 列出 Monitor |
+| `monitor_status` | `monitor_id` | — | 读取一个 Monitor 的权威状态 |
+| `monitor_incidents` | `monitor_id` | `after` | 读取 incident tail 或向前分页 |
+| `monitor_stop` | `monitor_id` | — | 停止未来匹配，保留 incident |
+| `run_start` | `port`, `label` | — | 排队获取 Control，开始 Run，返回 `run_handle` |
+| `run_end` | `run_handle` | — | 正常结束 Run 并 best-effort 释放 Control |
+| `release` | 见下文 | — | 释放无 Run Control，或显式中止当前 adapter 的 Run |
 
-### `devices`
+## 标准工作流
 
-Lists authoritative Slot snapshots and effective serial/device behavior.
+1. 调用 `devices`，明确选择 `port`，核对 `model_profile` 与实际设备。
+2. 调用 `run_start`，在本次 Agent 工作流中保存返回的 `run_handle`。`run_id` 只用于审计和查询。
+3. 普通 Shell/Bootloader 命令使用 `command`；已知的多轮依赖交互使用一次 `command_sequence`。
+4. 需要补充观察时使用 `wait`、`read`、`search` 或 Monitor。
+5. 在最终 Agent 回复前调用 `run_end`。只有明确把活动 Run 交给后续 Agent 工作流时才保持它打开。
 
-Input:
+Run 只界定证据，不复位设备，也不证明当前状态干净。Agent 应通过串口、其他设备界面或人工确认实际机型和状态。
 
-| Field | Required | Type | Meaning |
-|---|---:|---|---|
-| `slot_id` | No | string | Return only this Slot; an unknown ID is an error |
+## Run handle 与回收
 
-The result contains `daemon_epoch`, `model_config_revision`,
-`device_model_capability`, `slots`, and `selection_note`. Against a daemon that
-predates the additive model API, the capability is `"unavailable"`, the
-revision is `null`, and every Slot model is `null`; the established `devices`
-tool remains usable. Each compact Slot entry includes `slot_id`, disambiguated
-`display_name`, `port`, `enabled`, `transport_profile`, `device_profile`,
-`endpoint_present`, `session_state`, `state_code`, `state_reason`,
-`target_activity`, `effective_transport`, `effective_device`, `cursor`,
-`generation`, `control`, `active_run`, `active_trigger`, `logging`,
-`rx_overflow_bytes`, and `device_model`. `control`, `active_run`, and
-`active_trigger` are `null` when absent. `device_model` is `null` when the Slot
-is unbound; otherwise it is `{id, name, parent_id, aliases,
-confirmation_method, confirmation_note, confirmed_wall_time_ns, source}`.
-`effective_transport` is `{baud_rate, data_bits, parity, stop_bits,
-flow_control, dtr, rts, auto_open}` and `effective_device` is `{write_eol,
-echo, shell_prompt, uboot_prompt, write_pacing:{chunk_size,chunk_delay_ms}}`.
-An owner is `{id, label, kind}`. `control` is
-`{owner,expires_wall_time_ns}`, `active_run` is
-`{id,label,status,start_seq,owner}`, and `active_trigger` is
-`{id,status,start_seq,end_seq,last_write_seq,fires_confirmed,
-tx_bytes_confirmed,owner}`.
-`device_profile` controls behavior while `device_model` records identity; one
-must not be inferred from the other. The selection note repeats that the
-configured model must be independently verified.
-
-### `device_models`
-
-Reads model identity metadata. This does not change UART behavior.
-
-Input:
-
-| Field | Required | Type | Meaning |
-|---|---:|---|---|
-| `slot_id` | No | string | Filter bindings to one known Slot |
-
-The result contains `config_revision`, all `models`, filtered `bindings`,
-`slot_id_filter` (string or `null`), and `identity_warning`. An unknown filter
-Slot is an error; a known but unbound Slot returns an empty binding list. A
-model is `{id, name, parent_id?, aliases?}`; empty aliases may be omitted. A
-binding records `{slot_id, model_id, confirmation_method, note?,
-updated_wall_time_ns, source}`. The warning says that this catalog is an
-assignment record, not physical-device evidence, and requires
-serial/telnet/Web/human confirmation on first connection or whenever identity
-is uncertain.
-
-### `device_model_set`
-
-Records a model assignment through the narrow Operator endpoint. It never
-changes a Device Profile, prompt, EOL, echo mode, pacing, or UART setting.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `slot_id` | Yes | non-empty string | Slot being assigned |
-| `model_id` | Yes | string, 1..128 schema characters; max 128 UTF-8 bytes server-side | Existing model ID or ID to create |
-| `confirmation_method` | Yes | `serial`, `telnet`, `web`, `human`, `other` | How physical identity was checked |
-| `create_if_missing` | No | boolean, default `false` | Atomically create a missing leaf and bind it |
-| `update_existing` | No | boolean, default `false` | Patch the existing node currently bound to this Slot; mutually exclusive with create |
-| `name` | With create; optional with update | string, 1..128 schema characters; max 128 UTF-8 bytes server-side | Required creation name or replacement name |
-| `parent` | Create/update only | string, 1..128 schema characters; max 128 UTF-8 bytes server-side | Creation or replacement parent model ID |
-| `clear_parent` | Update only | boolean, default `false` | Remove the parent; conflicts with `parent` |
-| `aliases` | Create/update only | array, default empty, at most 32 strings of 1..128; 128 UTF-8 bytes per alias server-side | Creation aliases or complete non-empty replacement |
-| `clear_aliases` | Update only | boolean, default `false` | Remove all aliases; conflicts with non-empty `aliases` |
-| `expected_current` | No | string of 1..128 schema characters, or `null` | Optimistic binding guard; omitted means guard the binding observed by the tool, `null` requires unbound, string requires that exact model |
-| `note` | No | string, at most 2048 schema characters and UTF-8 bytes server-side | Confirmation evidence or context; NUL is rejected server-side |
-
-Creation and update are mutually exclusive. An update requires at least one
-model field, and is accepted only when `model_id` is the model currently bound
-to `slot_id`; the tool always sends the just-read global revision and exact
-current binding. Thus an Operator cannot use this route as a bulk catalog
-editor. Updating a shared node changes its metadata for every Slot bound to it.
-Model IDs, names, parents, and aliases must be trimmed and contain no control
-characters; hierarchy cycles and duplicate aliases remain invalid. For create
-on an existing ID, the supplied definition must exactly match the catalog
-entry. The tool cannot detach and does not expose Admin bulk replacement. It sends fixed audit source
-`agent:serial-mcp`, the catalog revision it just read, and the
-explicit-or-observed current binding as concurrency guards.
-
-The result contains `slot_id`, `previous_model_id`, resulting `binding` and
-`model`, `created`, `affected_slots`, `shared_model_warning`, `config_revision`,
-`identity_warning`, and `next_step`.
-`previous_model_id` is a string or `null`; `binding` and `model` use the exact
-shapes documented for `device_models`.
-`shared_model_warning` is non-null only when `update_existing=true` changes a
-catalog node currently shared by more than one Slot; ordinary binding does not
-claim that metadata was changed.
-Concurrent changes fail instead of silently replacing a newer assignment. The
-warning and next step repeat that a saved name is not evidence and that the
-physical DUT must be confirmed on first connection or whenever it remains in
-doubt.
-
-### `read`
-
-Reads a bounded timeline window and returns rendered text plus a resumable
-cursor.
-
-Input:
-
-| Field | Required | Type | Meaning |
-|---|---:|---|---|
-| `slot_id` | Yes | string | Slot to read |
-| `scope` | No | `tail`, `continue`, `archive`; default `tail` | Window selection |
-| `epoch` | With `archive` | UUID | Explicit daemon epoch for retained history; ignored by `tail` and `continue` |
-| `after_seq` | No | integer >= 0 | Optional exclusive archive lower boundary; ignored by `tail` and `continue` |
-| `through_seq` | No | integer >= 1 | Optional inclusive archive upper boundary; rejected outside `archive` |
-
-`tail` takes an atomic, at-most-200-event snapshot from seriald's bounded live
-replay ring. It never discovers or scans journal segments, so its latency does
-not grow with retained epochs, segment count, or a large active `.open` file.
-Its result additionally reports `source="live_ring"`, `bounded_tail=true`, and
-`tail_events=200`; the underlying live endpoint retains the actual oldest ring
-sequence as its retention boundary rather than treating the selected window's
-first event as a gap. `continue` resumes this MCP process's per-Slot cursor
-through the same live-ring endpoint, returns the oldest next page of at most
-1,000 events, and never scans the journal. With no remembered cursor it starts
-at the current head. Ring eviction or a daemon-epoch change is returned as an
-explicit gap and a partial page; the returned cursor resumes the retained
-current-epoch events without silently joining epochs. Those two scopes do not
-consume caller-supplied `epoch`/`after_seq`. `archive`
-requires an explicit epoch and is the only scope that accepts `through_seq`;
-omitting `after_seq` starts at the archive beginning. Journal-backed pages are
-capped at 1,000 events and 512 KiB before rendering. Every result includes
-`slot_id`, `scope`, `confidence`, `text`, `truncated`, `gap`, and `cursor`, plus
-optional `gaps`, `warnings`, and `omitted:{chars,lines}`. Live results identify
-their source; `continue` reports `source="live_ring"`,
-`bounded_continue=true`, and `limit_events=1000`.
-
-### `command`
-
-Writes `command + effective Slot EOL`, then captures RX after the authoritative
-TX event. The MCP must own an active Run.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
-| `command` | Yes | string, max 4096 schema characters | Command text; empty sends only EOL (Enter); command plus effective EOL must be at most 4096 UTF-8 bytes |
-| `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | Concise human-readable purpose, for example `查看样机内存`; retained in the Run's confirmed TX audit history |
-| `expect` | No | non-empty string | Literal completion boundary |
-| `regex` | No | string, 1..4096 schema characters and UTF-8 bytes | Regex completion boundary |
-| `timeout_seconds` | No | integer 1..120, default 10 | Capture deadline |
-
-`expect` and `regex` are mutually exclusive. Without either, configured prompt
-matching is preferred; if no prompt is configured, completion requires some
-post-write RX followed by one second of quiet. An explicit literal or regex is
-the sole requested boundary. If both command and effective EOL are empty, the
-tool rejects the no-op write. The capture begins from the pre-attached current
-head, discards pre-write RX from command output, and uses the accepted TX event
-as its authoritative lower bound.
-
-The result fields are `slot_id`, `run_handle`, `run_open`, `write`, `capture`, `execution`, `confidence`,
-`text`, `truncated`, `gap`, `interfered`, `run_id`, `operation_id`, `event_seq`,
-`description`, and `cursor`, plus optional `warnings` and
-`omitted:{chars,lines}`. `execution` is always `"unknown"`: seeing a prompt or
-literal is not proof of the command's higher-level success. `write` is
-`"confirmed"` after the accepted TX audit unless configured `echo=on` required
-an echo that was not observed, in which case it is conservatively
-`"uncertain"`. Echo `auto` does not require that echo proof. `capture` is one of
-`literal`, `prompt`, `regex`, `quiet`, `timeout`, or `disconnected` on a normal
-result. Human-takeover errors are described below.
-
-After at least one byte is confirmed written, seriald stores `description` as
-`command_description` in that TX event's metadata. The same event already
-contains the authoritative `run_id`, `operation_id`, timestamp, sequence, and
-the exact confirmed serial bytes in `data`; partial writes retain the
-description together with `partial=true`. Pre-write failures produce no command
-history entry. Legacy writes without a description remain valid at the wire
-level and simply omit this metadata.
-
-### `command_sequence`
-
-Executes one known, dependent serial interaction inside a single MCP call. It
-is intended for exchanges where the Agent already knows the next input but
-must wait for device evidence before sending it—for example, username →
-`Password:` → password → shell prompt. It is not a parallel command facility,
-does not branch or loop, and never retries a step automatically.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
-| `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | Human-readable purpose of the complete dependent interaction |
-| `steps` | Yes | array of 1..8 strict step objects | Commands executed in array order; unknown step fields are rejected |
-
-Each step is:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `command` | Yes | string, max 4096 schema characters | Command text; empty sends only effective EOL; command plus EOL is bounded to 4096 UTF-8 bytes |
-| `description` | Yes | non-empty trimmed string, max 256 schema characters and UTF-8 bytes | This step's human-readable purpose in Run/TX history |
-| `expect` | Every non-final step needs one matcher | string, 1..4096 schema characters and UTF-8 bytes | Literal boundary that must be observed before the next step may write |
-| `regex` | Every non-final step needs one matcher | string, 1..4096 schema characters and UTF-8 bytes | Non-empty-stream regex boundary; mutually exclusive with `expect` |
-| `timeout_seconds` | No | integer 1..120, default 10 | This step's capture deadline |
-
-All steps are validated before the first write. Their effective EOL-inclusive
-writes must total no more than 32768 bytes, and the sum of their effective
-timeouts must not exceed 300 seconds. Every non-final step must supply exactly
-one of `expect` or `regex`; the final step may omit both and then uses the same
-configured-prompt/quiet fallback as `command`. An explicit matcher remains the
-sole completion boundary for its step.
-
-For example:
+`run_start` 的典型结果：
 
 ```json
 {
-  "run_handle": "5L7VnrmuNeSfHz0O5pH9xw",
-  "description": "登录样机管理终端",
+  "port": "COM4",
+  "run_id": "uuid",
+  "run_handle": "22-character-handle",
+  "cursor": {"epoch": "uuid", "after_seq": 120},
+  "cleanup_required": "Call run_end ..."
+}
+```
+
+`run_handle` 固定 22 个 URL-safe 字符，仅由当前 `serial-mcp` 进程解析。所有 Run-scoped 工具只需要这一个值，因此小模型不必在每次调用中同时复制端口、Run ID 和其他底层状态。
+
+默认 `orphan_run_timeout_seconds=1800`。`0` 表示不限时，其他值至少 300 秒。该设置只处理最后一个 Run-scoped 调用后无人继续的情况；正常工作流仍调用 `run_end`。
+
+设置来源优先级：
+
+1. `--orphan-run-timeout-seconds`
+2. `SERIAL_MCP_ORPHAN_RUN_TIMEOUT_SECONDS`
+3. 共享 `serialctl.toml`
+4. 默认 1800 秒
+
+已运行的 adapter 不热加载该值。
+
+## `devices`
+
+Input：
+
+```json
+{}
+```
+
+或：
+
+```json
+{"port":"COM4"}
+```
+
+结果包含 `daemon_epoch`、`config_revision`、`ports` 和设备选择提示。每个端口项包含配置、session state、generation、head/ring cursor、有效 Transport/Model 参数、Control、active Run、active Trigger、logging 和 RX overflow。
+
+指定未知 `port` 会失败；工具不会静默选择另一个端口。
+
+## `model_profiles`
+
+```json
+{"port":"COM4"}
+```
+
+`port` 可省略。结果：
+
+```json
+{
+  "config_revision": 12,
+  "profiles": [],
+  "bindings": [
+    {"port":"COM4","model_profile":"TL-AS7230 1.0"}
+  ],
+  "port_filter": "COM4"
+}
+```
+
+## `model_profile_set`
+
+创建或替换一个完整 Profile 并绑定端口：
+
+```json
+{
+  "port": "COM4",
+  "profile": {
+    "name": "TL-AS7230 1.0",
+    "shell_prompt": "root@router:~# ",
+    "uboot_prompt": "=> ",
+    "write_eol": "\r",
+    "echo": "auto",
+    "write_chunk_size": 1,
+    "write_chunk_delay_ms": 1
+  }
+}
+```
+
+Profile 字段：
+
+- `name`：必填，不含首尾空白，1–64 UTF-8 bytes；
+- `shell_prompt` / `uboot_prompt`：string 或 null，非空时最大 4096 UTF-8 bytes 且不能包含 NUL；
+- `write_eol`：`""`、`"\r"`、`"\n"`、`"\r\n"` 或 null；
+- `echo`：`on` / `off` / `auto` / null；
+- `write_chunk_size`：正整数或 null；
+- `write_chunk_delay_ms`：0–10000 或 null。
+
+解绑：
+
+```json
+{"port":"COM4","profile":null}
+```
+
+结果返回 `previous_model_profile`、当前 `model_profile` 与新 `config_revision`。Profile 名称按输入原样保存。
+
+## `read`
+
+```json
+{"port":"COM4","scope":"tail"}
+```
+
+scope：
+
+- `tail`：默认；直接读取 replay ring 最近最多 200 events；
+- `continue`：从 adapter 为该端口记住的 live cursor 继续，最多 1000 events；
+- `archive`：必须给 `epoch`，可给 `after_seq` 和包含式 `through_seq`，最多 1000 events / 512 KiB。
+
+`tail` 和 `continue` 不做 journal segment discovery，因此串口运行很久、journal 很大时，普通读取仍保持有界。ring 淘汰或后端重启以 gap/truncation 返回；需要旧内容时显式使用 `archive`。
+
+结果主要字段：
+
+```json
+{
+  "port": "COM4",
+  "scope": "tail",
+  "source": "live_ring",
+  "text": "...",
+  "cursor": {"epoch":"uuid","after_seq":812},
+  "truncated": false,
+  "gap": false
+}
+```
+
+## `command`
+
+```json
+{
+  "run_handle": "abcdefghijklmnopqrstuv",
+  "command": "uname -a",
+  "description": "查看内核版本",
+  "expect": "root@router:~# ",
+  "timeout_seconds": 10
+}
+```
+
+- `command` 最大 4096 字符；空字符串表示只发送 EOL。
+- `description` 必填，1–256 UTF-8 bytes，进入持久命令历史。
+- `expect` 与 `regex` 互斥。
+- timeout 是 1–120 秒，默认 10 秒。
+
+完成边界优先级：
+
+1. 显式 `regex`；
+2. 显式 `expect`；
+3. 当前 Model Profile 的 Shell/U-Boot prompt；
+4. 没有 prompt 时，收到至少一个 post-TX RX 后等待 quiet boundary。
+
+命令 TX 持久化实际使用的 `command_capture_matchers`：显式 matcher 一个，Profile fallback 0–2 个，quiet 不添加。TUI 与 App 用它定位 RX 区域，后来修改 Profile 不会改变旧命令的匹配定义。
+
+典型结果：
+
+```json
+{
+  "port": "COM4",
+  "write": "confirmed",
+  "capture": "prompt",
+  "execution": "unknown",
+  "confidence": "high",
+  "text": "Linux ...\nroot@router:~# ",
+  "description": "查看内核版本",
+  "truncated": false,
+  "gap": false,
+  "interfered": false,
+  "cursor": {"epoch":"uuid","after_seq":812},
+  "run_handle": "abcdefghijklmnopqrstuv",
+  "run_open": true
+}
+```
+
+`execution` 保持 `unknown`：看到提示符只证明捕获边界出现，不证明 shell exit status。需要确定退出码时让命令输出唯一 sentinel。
+
+effective `echo=on` 时，adapter 识别并移除设备自身的 command+EOL echo。缺少应有回显、gap、第三方 TX、timeout 或 truncation 会降低 `confidence` 并添加 `warnings`。不确定的物理写入不自动重试。
+
+## `command_sequence`
+
+用于 Agent 已经知道后续步骤、但每一步必须等待设备提示的交互。例如登录：
+
+```json
+{
+  "run_handle": "abcdefghijklmnopqrstuv",
+  "description": "登录设备控制台",
   "steps": [
     {
       "command": "admin",
-      "description": "输入登录账号",
+      "description": "输入账号",
       "expect": "Password:",
       "timeout_seconds": 10
     },
     {
-      "command": "example-password",
-      "description": "输入登录密码",
-      "regex": "[#$>]\\s*$",
+      "command": "admin123",
+      "description": "输入密码",
+      "expect": "root@router:~# ",
       "timeout_seconds": 10
     }
   ]
 }
 ```
 
-The adapter holds its process-local Slot mutation path across the sequence.
-Additionally, every step carries a daemon-enforced precondition derived from
-the initial Slot snapshot or preceding capture cursor. The seriald Slot actor
-atomically checks the epoch, generation, TX offset, and replay window before
-the write enters the physical port queue. Pure RX is allowed; any intervening
-TX, explicit Gap, or evicted replay window rejects that step with zero bytes
-written. This closes the cross-client/cooperative Human race that a local MCP
-lock cannot cover. A current adapter refuses the sequence before step 1 if the
-daemon does not advertise this capability. Timeout, disconnect, evidence gap,
-Run/Control loss, Human takeover, write uncertainty, or any other failed step
-stops the sequence before every remaining write. A reported match is still
-completion evidence rather than proof of higher-level command success.
+约束：
 
-The result is:
+- 1–8 步；
+- 每步必须有 `command` 和 `description`；
+- 每个非最终步骤必须有且仅有 `expect` 或 `regex`；
+- 最终步骤可以使用显式 matcher，也可以回落到 Profile prompt/quiet；
+- 每步 timeout 1–120 秒，默认 10；有效 timeout 总和最多 300 秒；
+- 每步含 EOL 后最多 4096 bytes；完整计划最多 32768 bytes。
 
-| Field | Meaning |
+adapter 在写第一步前验证完整计划，并为整个 sequence 持有该端口的 mutation lock。只有当前步骤到达 matcher 才发送下一步；timeout、disconnect、gap、Run/Control 丢失或上下文变化都会停止所有剩余写入。工具不分支、不循环、不重试。
+
+每个已确认步骤保留独立 TX、description 和 matcher，整体由 `sequence_id` 与 sequence description 分组。结果包含 `requested_steps`、`completed_steps`、逐步结果、最终 cursor 和 Run 状态。
+
+## `input`
+
+```json
+{"run_handle":"abcdefghijklmnopqrstuv","text":"exact bytes"}
+```
+
+写入 `text` 的 UTF-8 bytes，不追加 Model Profile EOL。1–4096 bytes。结果返回 `write=confirmed`、`kind=input`、bytes 和 cursor。
+
+## `signal`
+
+```json
+{"run_handle":"abcdefghijklmnopqrstuv","signal":"ctrl_c"}
+```
+
+| `signal` | 动作 |
 |---|---|
-| `slot_id`, `run_id` | Authoritative public audit identities resolved from the handle |
-| `run_handle`, `run_open` | Opaque continuation capability and whether this result retained the Run |
-| `sequence_id` | UUID grouping this interaction's TX events and terminal history |
-| `description` | Overall sequence purpose supplied by the caller |
-| `status` | `completed` when every step completed safely; otherwise `partial` |
-| `execution` | Always `unknown`; serial boundaries do not prove application success |
-| `requested_steps` | Validated plan length |
-| `sent_steps` | Steps whose TX was accepted far enough to produce a step result |
-| `completed_steps` | Leading steps that completed without a stop condition |
-| `steps` | Ordered results for sent steps |
-| `failure` | Present only for `partial`; `{step_index,phase,code,message,next_step_sent:false}` |
-| `cursor` | Cursor from the last sent step, or the pre-write Slot head when none was sent |
+| `ctrl_c` | `0x03` |
+| `ctrl_d` | `0x04` |
+| `ctrl_z` | `0x1a` |
+| `break` | UART Break line condition |
 
-Each entry in `steps` contains the ordinary `command` result plus
-`sequence_id`, zero-based `step_index`, `step_count`, `status`, and
-`safe_to_advance`. `safe_to_advance=true` occurs only on a completed non-final
-step whose matcher made its following write eligible; the final step therefore
-reports it as false even when the sequence completed. A capture-level stop
-includes that sent step with `status=partial`. A daemon boundary rejection is
-always a structured top-level `partial`, even before step 1, with
-`code=sequence_boundary_changed` and `next_step_sent=false`. Other first-step
-failures before a step result use the ordinary MCP error envelope. If a later
-non-boundary failure occurs before TX/capture can yield a result, prior steps
-are returned with top-level `status=partial` and failure `code=step_error`.
+Break 默认 250 ms，可用 `duration_ms` 设置 1–5000 ms。其他 signal 不接受 duration。Break 不是 NUL 或任何编码字节。
 
-Capture stop codes are `timeout`, `disconnected`, `rx_gap`,
-`capture_truncated`, `interfered`, `echo_uncertain`, `no_rx`,
-`boundary_not_matched`, and `run_aborted`. `failure.phase` is `capture` for
-those outcomes; a lower-level later-step failure reports its originating phase
-such as `attach` or `write` with `code=step_error`. A write-phase atomic guard
-failure uses `sequence_boundary_changed`. In every failure form,
-`next_step_sent=false` is the explicit stop-before-next-write guarantee.
-
-Every confirmed or partially confirmed step is a normal independent TX audit
-event with its own Operation UUID and `command_description`. Its exact command
-bytes are persisted in plaintext in the existing TX timeline, just like
-`command`. Sequence audit metadata carries the `sequence_id`, overall purpose,
-zero-based step index, and step count as `command_sequence_id`,
-`command_sequence_description`, `command_sequence_step_index`, and
-`command_sequence_step_count`, allowing the terminal command-history bar to
-group the sequence and expand each step.
-
-### `input`
-
-Writes exact UTF-8 bytes without appending EOL. Requires this MCP's active Run.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
-| `text` | Yes | string, 1..4096 schema characters and UTF-8 bytes | Exact UTF-8 payload |
-
-The result is `{slot_id, run_handle, run_open:true, write:"confirmed", kind:"input", bytes, cursor}`.
-This confirms the physical write audit, not target-side execution.
-
-### `signal`
-
-Sends one control signal in the active Run.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
-| `signal` | Yes | `ctrl_c`, `ctrl_d`, `ctrl_z`, `break` | Signal kind |
-| `duration_ms` | BREAK only | integer 1..5000, default 250 | Physical BREAK duration; providing it for Ctrl-C/D/Z is an error |
-
-Ctrl-C/D/Z are ordinary one-byte writes. BREAK is a driver line condition and
-has an independent confirmed event. Results include `run_handle` and
-`run_open:true`; Ctrl results otherwise contain `{slot_id, write:"confirmed",
-kind, bytes:1, cursor}`. A BREAK result otherwise contains `{slot_id,
-write:"confirmed", kind:"break", cursor}`; it does not echo `duration_ms` or a
-byte count. These results confirm the write/signal audit, not target-side
-execution.
-
-### `trigger`
-
-Creates one bounded daemon-side Trigger tied to the current Run. The normal
-form supplies `kickoff` and `action` but omits `start_contains`: once kickoff
-is confirmed, the first action is immediately eligible. Use `start_contains`
-only for the advanced case where a specific live RX literal must gate the
-first action. A configured stop matcher keeps observing without additional
-writes after the send budget is exhausted until it matches or the original
-timeout expires.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; also selects its Slot and Run |
-| `kickoff` | No | `{text, eol?}`; each string max 4096 schema characters, combined max 4096 UTF-8 bytes | One write after matchers are armed; confirmation immediately enables action unless an explicit start gate is present |
-| `start_contains` | No | string, 1..256 schema characters and UTF-8 bytes | Advanced live-RX gate for the first action; omit for normal kickoff-then-action use |
-| `action` | Yes | `{text, eol?}`; each string max 256 schema characters, combined max 256 UTF-8 bytes | Repeated non-empty write |
-| `interval_ms` | No | integer 5..1000, default 20 | Action interval |
-| `stop_contains` | No | array, default empty, max 8 strings of 1..256 schema characters and UTF-8 bytes | Any literal stops successfully; observation continues after the send budget is exhausted |
-| `timeout_ms` | No | integer 100..30000, default 5000 | Hard deadline |
-| `max_fires` | No | integer 1..1000, default 250 | Confirmed-action send budget, not an observation cutoff |
-
-Each nested object requires `text`; `eol` defaults to an empty string, and the
-two strings are concatenated exactly. Empty combined kickoff/action payloads
-are rejected. Planned `kickoff + action * max_fires` is additionally capped at
-65,536 bytes. Trigger writes always inherit Slot pacing; pacing overrides are
-not tool arguments. Only one active Trigger is allowed on the Slot.
-
-Typical call shape:
+## `trigger`
 
 ```json
 {
-  "run_handle": "<run_start 返回的 run_handle>",
-  "kickoff": {"text": "reboot", "eol": "\r"},
-  "action": {"text": "slp"},
-  "stop_contains": ["prompt>"]
+  "run_handle": "abcdefghijklmnopqrstuv",
+  "kickoff": {"text":"reboot","eol":"\r"},
+  "action": {"text":" ","eol":""},
+  "interval_ms": 20,
+  "stop_contains": ["=> "],
+  "timeout_ms": 5000,
+  "max_fires": 250
 }
 ```
 
-This does not wait for a separate start literal. Add `start_contains` only
-when target output must explicitly authorize the first `action`.
+- `kickoff` 可省略；
+- `action` 必填；
+- 普通调用省略 `start_contains`，kickoff 确认后立即允许 action；
+- `start_contains` 只用于必须等待 live RX gate 的场景；
+- `stop_contains` 最多 8 个 literal；
+- interval 5–1000 ms；timeout 100–30000 ms；max fires 1–1000。
 
-The result fields are `slot_id`, `run_handle`, `run_open`, terminal `outcome`, `matched`, confirmed
-`fires`, configured `fire_budget`, boolean `send_budget_exhausted`,
-`confidence`, evidence `text`, `truncated`, `gap`, and `cursor`, plus optional
-`matched_pattern`, `warnings`, `omitted:{chars,lines}`, and `abort_diagnosis`.
-`matched=true`
-means a caller-supplied stop literal ended the Trigger; other authoritative
-outcomes include `timed_out`, `max_fires_reached`, `cancelled`, `control_lost`,
-`run_lost`, `generation_changed`, `port_closed`, `write_failed`, and `rx_gap`.
-A control/session-loss result warns that the MCP no longer owns the Run. The
-tool best-effort cancels a Trigger whose status cannot be made authoritative;
-if cancellation/status identity remains uncertain, it returns an error rather
-than presenting success.
+Trigger 在后端内调度，避免每个 action 都经过一次 Agent 往返。结果的 `matched=true` 只说明 stop literal 被观察到，不证明更大的业务流程成功。
 
-With `stop_contains`, reaching `max_fires` sets
-`send_budget_exhausted=true`, schedules no additional action, and leaves the
-RX matcher armed. A later literal can still return `outcome="matched"`; if the
-original deadline arrives first, the terminal outcome is
-`max_fires_reached`. Without a stop literal, exhausting the budget completes
-immediately. Confirmed TX is transport evidence only, so callers must inspect
-the resulting RX/state before retrying or changing parameters.
+## `wait`
 
-When a `control_lost` or `run_lost` terminal state can be correlated with a
-retained `RunAborted(reason="human takeover")`, `abort_diagnosis` is the stable
-object `{code:"human_takeover", reason:"human takeover", taken_over_by,
-run_id, no_bytes_written:false}`. `taken_over_by` is the retained Human Actor
-object or `null` when the abort is retained but the following revocation actor
-is unavailable. `false` is intentional: seriald had already accepted the
-Trigger Job, so its kickoff or action may have physically executed before the
-takeover. This field does not claim that a write definitely occurred; it means
-the zero-write guarantee is unavailable.
+```json
+{
+  "run_handle": "abcdefghijklmnopqrstuv",
+  "regex": "ready|root@.*# ",
+  "timeout_seconds": 30
+}
+```
 
-### `wait`
+`expect` 与 `regex` 互斥；均省略时使用 Profile prompt，仍没有 prompt 时使用 quiet boundary。wait 从 `run_start`、`command`、`command_sequence` 或上次 wait 保存的 live cursor 开始，避免两个调用之间的 RX 丢失窗口。
 
-Waits from the remembered live cursor without writing.
+## `search`
 
-Input:
+```json
+{
+  "port": "COM4",
+  "query": "kernel panic",
+  "regex": false,
+  "scope": "current_run"
+}
+```
 
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; selects and pins its Slot and Run for the entire wait |
-| `expect` | No | non-empty string | Literal boundary |
-| `regex` | No | string, 1..4096 schema characters and UTF-8 bytes | Regex boundary |
-| `timeout_seconds` | No | integer 1..120, default 10 | Deadline |
+scope：
 
-`expect` and `regex` are mutually exclusive. Without an explicit matcher,
-configured prompts are used; if none exist, completion requires observed RX
-followed by one second of quiet, so an entirely empty stream times out rather
-than claiming quiet completion. The start cursor is the valid remembered
-per-Slot cursor, otherwise the current head. The result fields are `slot_id`,
-`run_handle`, `run_open:true`, `capture`, `confidence`, `text`, `truncated`, `gap`, and `cursor`, plus optional
-`warnings` and `omitted:{chars,lines}`. `wait` requires the exact active Run
-handle even though it never writes. A matching `RunAborted` immediately
-ends the wait and exposes the reason/takeover diagnostic rather than timing
-out. The capability pin lasts for the complete wait, so a legal 120-second
-wait is not mistaken for adapter inactivity.
+- `current_run`：默认；只搜索当前 Run；
+- `current_cursor`：从显式或 adapter 记住的 cursor 开始；
+- `archive`：必须显式给 `epoch`。
 
-### `search`
+`run_id` 可以进一步过滤。`regex=true` 使用 bounded server-side regex。结果 `truncated=true` 时必须按返回的 continuation 继续，直到 false，才能把空结果解释为“未找到”。
 
-Searches durable events with bounded server-side literal or regex matching.
-
-Input:
-
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `slot_id` | Yes | string | Slot to search |
-| `query` | Yes | string, 1..4096 schema characters; regex/literal server bound is 4096 UTF-8 bytes | Literal or regex; whitespace-only is rejected |
-| `regex` | No | boolean, default `false` | Treat query as regex |
-| `scope` | No | `current_run`, `current_cursor`, `archive`; default `current_run` | Evidence boundary |
-| `run_id` | No | UUID | Optional Run filter; required with a `current_run` continuation cursor |
-| `epoch` | Cursor/archive | UUID | Required with `after_seq` for `current_run`/`current_cursor`; always required for `archive` |
-| `after_seq` | No | integer >= 0 | Exclusive lower sequence boundary; for live scopes, supply together with `epoch` |
-
-For `current_run`, omitting `run_id` selects the active Run; without an active
-Run, pass an explicit ID or choose another scope. A truncated continuation must
-repeat its `epoch`, `after_seq`, and `run_id`. `current_cursor` uses an explicit
-epoch/sequence pair or the MCP's remembered cursor and may optionally filter a
-Run. `archive` requires an epoch and accepts optional sequence/Run filters. One
-search is capped at 1,000 matched events and 1 MiB before rendering.
-
-The result adds `matched` to the common rendered fields `slot_id`, `scope`,
-`confidence`, `text`, `truncated`, `gap`, and `cursor`; matched excerpt lines,
-`warnings`, `omitted:{chars,lines}`, `guidance`, and `archive_epochs` appear
-when applicable. Matched excerpt lines use `matches`. When the server page is
-truncated, `continuation` contains the scope/cursor and, for a Run-scoped
-query, `run_id`; repeat the same query and that continuation unchanged.
+## Monitor tools
 
 ### `monitor_start`
 
-Starts a persistent Monitor owned by `seriald`; it survives this MCP process.
+```json
+{
+  "port": "COM4",
+  "regex": "(?i)kernel panic|watchdog",
+  "description": "观察间歇性设备崩溃"
+}
+```
 
-Input:
+`contains` 和 `regex` 二选一，最大 4096。可传 UUID `idempotency_key` 复用创建意图。调用立即返回；Monitor 在 `seriald` 中继续运行。
 
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `slot_id` | Yes | string | Slot whose live RX is observed |
-| `contains` | Exactly one matcher | string, 1..4096 schema characters and UTF-8 bytes | Literal matcher |
-| `regex` | Exactly one matcher | string, 1..4096 schema characters and UTF-8 bytes | Regex matcher; must not match an empty stream |
-| `description` | No | string, 1..1024 schema characters and UTF-8 bytes | Human-readable purpose |
-| `idempotency_key` | No | UUID | Reuse the same value after an uncertain transport retry |
+### `monitor_list` / `monitor_status`
 
-Omitting `idempotency_key` generates a UUID. The adapter automatically reuses
-the same request ID for its one bounded transport retry. Other Monitor policy
-is adapter-owned: observation starts strictly after the Slot head resolved at
-creation, severity defaults to `warning`, debounce is 250 ms, cooldown is
-30,000 ms, and there is no duration limit.
+`monitor_list` 可用 `port` 过滤。`monitor_status` 输入：
 
-The result is the compact Monitor record (`monitor_id`, `slot_id`, `status`,
-`severity`, `description`, `matcher`, `current_cursor`, `incident_count`,
-`unacked_incident_count`, `gap_count`, `expires_wall_time_ns`, `last_error`)
-plus `persistent=true`,
-`returns_immediately=true`, and polling `guidance`. Persistence means the Job
-continues in `seriald` after the tool call or MCP process ends.
+```json
+{"monitor_id":"uuid"}
+```
 
-### `monitor_list`
-
-Input: optional string `slot_id` filter, defaulting to all Slots. No fields are
-required. The result is `{monitors, count}`; each compact Monitor has the same
-fields documented for `monitor_start`.
-
-### `monitor_status`
-
-Input: required UUID `monitor_id`; there are no defaults. Returns one compact
-authoritative Monitor with the fields documented for `monitor_start`.
+状态包含 matcher、cursor、incident/gap count 和 last error。
 
 ### `monitor_incidents`
 
-Reads a bounded retained incident page.
+```json
+{"monitor_id":"uuid"}
+```
 
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `monitor_id` | Yes | UUID | Monitor to read |
-| `after` | No | decimal string, 1..20 digits, fitting `u64` | Exclusive incident cursor; omit for recent tail |
+省略 `after` 返回 recent tail；`after:"0"` 从最早保留 incident 开始；继续时原样传回十进制字符串 `next_after`。每个 incident 包含 preview、port、epoch、seq range、evidence cursor/ref 和 acknowledge 信息。
 
-Each API page requests at most 20 incidents and includes acknowledged items.
-With `after` omitted, the mode is `recent_tail`; with it present, the mode is
-forward from that exclusive cursor. The result fields are `monitor_id`,
-`started_after`, `mode`, compact `incidents`, `count`, `next_after`,
-`truncated`, `first_available_after`, `retention_gap`,
-`has_older_retained`, `warning`, and `guidance`. Each incident includes its ID
-and sequence, Slot/severity/description/preview, serial range, evidence
-reference/cursor, wall-clock range, creation/expiry, and `acked`. Its exact
-shape is `{incident_id, incident_seq, slot_id, severity, description, preview,
-serial_range:{epoch,seq_start,seq_end}, evidence_ref, evidence_cursor,
-wall_time_start_ns, wall_time_end_ns, created_wall_time_ns,
-expires_wall_time_ns, acked}`. Reuse `next_after` as `after` to poll only newer
-incidents; use `"0"` to page from the oldest retained item.
+若需要完整证据，调用 `read(scope=archive)`，传 incident 的 epoch/after seq，并用 `through_seq=seq_end` 锁定包含式上界。
 
 ### `monitor_stop`
 
-Input: required UUID `monitor_id`. The tool first reads the current Monitor
-revision, then conditionally stops that exact revision. The result is the
-compact Monitor plus `stopped=true` and `incidents_retained=true`; retained
-incidents remain readable.
+```json
+{"monitor_id":"uuid"}
+```
 
-### `run_start`
+停止未来匹配，已有 incident 继续可读。
 
-Acquires queued fenced control without takeover and starts an evidence Run.
+## `run_end`
 
-| Field | Required | Type / bound | Meaning |
-|---|---:|---|---|
-| `slot_id` | Yes | string | Online Slot |
-| `label` | Yes | string, 1..128 schema characters and max 256 UTF-8 bytes server-side | Concrete task performed in this Run; must be trimmed and contain no control characters |
+```json
+{"run_handle":"abcdefghijklmnopqrstuv"}
+```
 
-The adapter waits at most 15 seconds in the control queue; this fixed policy is
-not a tool argument. An already-active Run is an error. The result is
-`{slot_id, run_id, run_handle, cursor, cleanup_required}`. `run_id` remains the
-public audit identity. `run_handle` is the sole continuation capability for
-Run-scoped tools and cannot be reconstructed from public state.
-`cleanup_required` concisely requires `run_end` before the Agent's final reply,
-unless the workflow deliberately hands the live Run to a continuing Agent.
+结束由 handle 指定的活动 Run，并 best-effort 释放 Control。结果中 `run_open=false`。这是正常 Agent 会话的标准结束动作。
 
-### `run_end`
+## `release`
 
-| Field | Required | Type | Meaning |
-|---|---:|---|---|
-| `run_handle` | Yes | 22-character base64url string | Opaque capability returned by this caller's `run_start`; selects its Slot and Run |
+无活动 Run 时，按端口释放当前 adapter 的 Control：
 
-Ends only that handle's active Run, then best-effort releases its lease; it
-refuses an expired, unknown, or foreign-process handle. The result is
-`{slot_id, run_id, run_handle, run_open:false,
-control_release:"best_effort"}`.
+```json
+{"port":"COM4","abort_run":false}
+```
 
-### `release`
+显式中止当前 adapter 的活动 Run：
 
-Releases this MCP's control without closing the daemon-owned serial port.
+```json
+{"run_handle":"abcdefghijklmnopqrstuv","abort_run":true}
+```
 
-| Field | Required | Type | Meaning |
-|---|---:|---|---|
-| `slot_id` | No-Run release only | string | Slot whose lease should be released; omit when using `run_handle` |
-| `abort_run` | Aborting release only | boolean, must be `true` | Explicitly permit release to abort this MCP's active Run; normal completion uses `run_end` |
-| `run_handle` | Aborting release only | 22-character base64url string | Exact handle for this MCP's active Run; it selects the Slot, so do not also pass `slot_id` |
+中止模式不能同时传 `port`。正常完成应使用 `run_end`。adapter 没有持有本地 Control 时，release 是 no-op，不会影响其他连接的 Run。
 
-Provide either `slot_id`, or `{run_handle, abort_run:true}`, never both.
-Inside the resolved per-Slot lock, the tool first asks its serialized control session
-whether this MCP actually holds a local lease. With no local lease, the call is
-an immediate idempotent no-op (`already_released=true`) and does not inspect,
-require a handle for, or interfere with a foreign Run visible in daemon status.
-When this MCP has a lease but authoritative status has no active Run, both
-`run_handle` may be omitted: stale local Run bookkeeping is discarded and
-the remaining lease is released with the default `abort_run=false`. Only this
-MCP's matching active Run requires `abort_run=true` and its exact handle. A
-mismatch between the local owned Run and the daemon's active Run fails
-closed rather than releasing across the changed boundary. The result is
-`{slot_id, released, already_released, serial_port_closed:false}`. Releasing
-control never closes the daemon-owned serial port.
+## Recent context 与 physical action guard
 
-## Confidence and safety fields
+adapter 记住每端口上次成功操作的 cursor。两个操作之间出现其他 actor 的 TX、用户 Takeover、Control/Run 中止、端口重配或机型切换时，相关工具结果才附加：
 
-Read/capture tools use `confidence` values instead of equating returned text
-with proof:
+```json
+{
+  "recent_context": {
+    "interference": true,
+    "complete": true,
+    "after_seq": 800,
+    "through_seq": 812,
+    "events": []
+  }
+}
+```
 
-| Value | Meaning |
-|---|---|
-| `high` | Bounded query/capture completed with complete retained evidence |
-| `medium` | Useful RX exists, but configured echo evidence is missing |
-| `low` | Quiet was the boundary, or a completed capture contained no RX |
-| `incomplete` | Deadline elapsed before a completion boundary |
-| `partial` | Capture or rendering hit a bound |
-| `interfered` | Another actor wrote inside the command evidence window |
-| `unreliable` | Gap, disconnect, or Run abort invalidated the evidence |
+没有第三方变化时省略该字段，减少 Agent context。
 
-All returned cursors are `{epoch, after_seq}`. The epoch prevents a cursor from
-silently crossing a daemon restart, while sequence/generation checks prevent a
-write or Trigger from crossing a reopened physical serial session.
+在 `command`、`command_sequence`、`input`、`signal`、`trigger` 前，adapter 把已观察 cursor、generation 和 TX offset 作为后端原子 precondition。若 ring 无法证明上下文连续，或有第三方 TX/重开/gap，工具在物理动作前返回：
 
-## Cross-actor recent context
+```json
+{
+  "error": {
+    "code": "context_changed",
+    "no_bytes_written": true,
+    "recent_context": {},
+    "retry_hint": "Call read(scope=tail) or wait ..."
+  }
+}
+```
 
-Successful `read`, `wait`, `command`, `command_sequence`, `input`, `signal`,
-and `trigger` results may add `recent_context`, but only when another actor
-changed the relevant serial interval or the bounded live ring cannot prove
-that no change occurred. A complete interval with no third-party event omits
-the field. The adapter compares the server-issued actor ID for its exact
-WebSocket connection; a shared actor label never causes a foreign Agent to be
-mistaken for this adapter.
+Agent 应先读取并确认新状态，再决定是否重试。
 
-`recent_context` contains `interference`, `complete`, `truncated`, exclusive
-`after_seq`, inclusive `through_seq`, and up to 32 compact `events`. Each event
-contains sequence, kind, and actor kind/label. A TX summary adds byte count and
-the durable `command_description` / `command_sequence_description` purposes
-when present, not the serial payload. A replay gap or 32-event truncation is
-returned as `complete=false,truncated=true` even if no matching event survives;
-only a complete empty interval proves absence of interference.
+## 结果、截断与取消
 
-Before `command`, the first `command_sequence` step, `input`, `signal`, or
-`trigger` can perform a physical action, the adapter checks the interval after
-its previous operation. Third-party activity or incomplete evidence fails
-closed with `error.code="context_changed"`, `no_bytes_written=true`, and the
-same `recent_context`. Call `read(scope=tail)` or `wait` to observe and
-acknowledge the new state, then retry. If interference is first discovered
-while a successful mutation call is completing, that result includes
-`recent_context` and the next mutation is blocked until this observation step.
-An archive read cannot acknowledge a changed live session.
+每个工具结果同时出现在：
 
-The daemon closes the check-to-action race with `sequence_precondition` on
-ordinary command/input/control-byte writes, BREAK, Trigger start, and every
-sequence step. It atomically rejects epoch/generation changes, TX-offset
-changes, replay gaps/eviction, or intervening TX before enqueuing the physical
-action. A later sequence step can still return a partial sequence because
-earlier steps were already confirmed; the rejected step itself writes zero
-bytes. MCP requires the additive
-`serial_context_precondition_supported=true` HTTP status capability before it
-uses that boundary; a protocol-v3 daemon from an older release omits the field
-and is rejected before the first physical byte or line action.
+- `structuredContent`：结构化 JSON；
+- `content[0].text`：同一 JSON 的紧凑文本。
 
-After Trigger start is accepted, the daemon owns its complete bounded Job.
-While it is active, ordinary external writes and BREAK are rejected; a Control
-takeover first terminalizes the Trigger and aborts its bound Run before the new
-owner can write. Trigger action fires therefore cannot silently continue across
-a third-party takeover.
+长串口内容受 event、byte 和 text budget 限制。`truncated`、`gap`、`omitted`、`warnings` 与 cursor 明确说明结果范围；不能把一次有界空结果当成全历史不存在。
 
-## Human takeover and control-loss diagnostics
+可取消的纯观察工具：
 
-A Human takeover authoritatively aborts the Agent Run, emits `RunAborted` with
-reason `human takeover`, and revokes fenced control. `command`,
-`command_sequence`, and `wait` subscribe to the current Run and stop promptly
-on that timeline event rather than waiting for their ordinary boundary/timeout. Write-like tools also
-diagnose renewal/write rejection by querying the Run and following
-`ControlRevoked` event when available.
+```text
+devices model_profiles read wait search
+monitor_list monitor_status monitor_incidents
+```
 
-Tool failures use normal MCP error results (`isError=true`, with
-`structuredContent.error` and the same compact JSON in text content). The
-stable error string for confirmed takeover starts with `human_takeover:` and
-contains:
-
-- `taken_over_by`, rendered as the Human label and actor ID when retained
-  timeline evidence is available, otherwise `unknown`;
-- `run_id` for the aborted Run;
-- `no_bytes_written=true|false`.
-
-`no_bytes_written=true` means the rejected operation did not reach the serial
-port (or, for `wait`, that the tool made no write). If `command` had already
-received its authoritative TX acceptance before the takeover event, the error
-uses `no_bytes_written=false`; it never rewrites that confirmed write as a
-pre-write rejection. `StaleFence` and `ControlRequired` are definite pre-write
-rejections. When the event reason or Human actor cannot be recovered, the
-stable fallback begins `human_takeover_or_control_revoked:` and still carries
-`taken_over_by=unknown`, `run_id`, and `no_bytes_written`. A non-Human abort
-uses `run_aborted:` with its reason.
-
-A daemon-side Trigger that reaches an authoritative ownership terminal state
-returns `outcome=control_lost` or `run_lost` with warnings rather than claiming
-a matcher success. A terminal Trigger correlated with confirmed Human takeover
-also carries the structured `abort_diagnosis` described above and explicitly
-uses `no_bytes_written=false`, because the accepted Job may already have
-written. After any ownership loss, start a new Run only after the current owner
-releases control and the physical model and DUT state are reconfirmed.
+其他工具可能已经改变物理设备或后端状态，会继续完成并给出权威结果。MCP host 关闭 stdin 时也遵循同一原则。

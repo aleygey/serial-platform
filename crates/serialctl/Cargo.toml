@@ -16,7 +16,6 @@ futures-util.workspace = true
 ratatui.workspace = true
 regex = "1"
 reqwest.workspace = true
-rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }

@@ -1,27 +1,19 @@
-use std::{
-    io::IsTerminal,
-    path::{Component, Path, PathBuf},
-};
+use std::{io::IsTerminal, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use clap::{Args, Parser, Subcommand};
-use serial_protocol::{
-    Direction, EventKind, EventQuery, PROTOCOL_VERSION, SerialSettings, SlotConfig,
-    apply_transport_profile,
-};
+use serial_protocol::{Direction, EventKind, EventQuery, PROTOCOL_VERSION, SlotConfig};
 
 use crate::{
     api::ApiClient,
     config::{self, LoadedConfig},
     display::{
-        format_event_plain, format_wall_time_local, gap_reason_label, pad_display, role_label,
-        safe_inline, session_state_label, target_activity_label, trigger_status_label,
+        format_event_plain, format_wall_time_local, gap_reason_label, pad_display, safe_inline,
+        session_state_label, target_activity_label, trigger_status_label,
     },
     i18n::{self, Lang, tr, trf},
-    model,
-    profile::{self, SAFE_TRANSPORT_NAME},
-    tui, ws,
+    profile, tui,
 };
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:3210";
@@ -37,10 +29,6 @@ pub struct Cli {
     #[arg(long, global = true, env = "SERIALD_ENDPOINT")]
     endpoint: Option<String>,
 
-    /// Read the bearer token from this file. Tokens are never accepted inline.
-    #[arg(long, global = true, env = "SERIALD_TOKEN_FILE")]
-    token_file: Option<PathBuf>,
-
     /// Override the serialctl configuration file.
     #[arg(long, global = true, env = "SERIALCTL_CONFIG")]
     config: Option<PathBuf>,
@@ -49,9 +37,9 @@ pub struct Cli {
     #[arg(long, global = true, env = "SERIALCTL_LANG", value_parser = parse_lang)]
     lang: Option<Lang>,
 
-    /// Open this Slot initially in interactive mode.
+    /// Open this serial port initially in interactive mode.
     #[arg(long)]
-    initial_slot: Option<String>,
+    initial_port: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -59,18 +47,15 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Discover serial ports, configure Slots and save the daily credential.
-    #[command(alias = "init")]
+    /// Discover and configure serial ports.
     Setup(SetupArgs),
-    /// Manage reusable UART and DUT Profiles.
+    /// Manage reusable Serial and Model Profiles.
     Profile(profile::ProfileArgs),
-    /// Manage the hierarchical DUT model catalog and per-Slot assignments.
-    Model(model::ModelArgs),
-    /// Print the daemon and Slot state.
+    /// Print the daemon and serial-port state.
     Status(OutputArgs),
-    /// Diagnose the saved client connection, ports, stream, storage, or Slot state.
+    /// Diagnose the saved client connection, ports, stream, storage, or port state.
     Doctor(DoctorArgs),
-    /// List retained Slot/epoch journal archives.
+    /// List retained port/epoch journal archives.
     Archives(ArchivesArgs),
     /// Query durable serial timeline events.
     Logs(LogsArgs),
@@ -78,43 +63,19 @@ pub enum Command {
 
 #[derive(Debug, Clone, Args)]
 pub struct SetupArgs {
-    /// Serial port on the seriald host. Repeat for multiple Slots.
+    /// Serial port on the seriald host. Repeat for multiple ports.
     #[arg(long)]
     port: Vec<String>,
-
-    /// Display name matching each --port by position.
-    #[arg(long)]
-    display_name: Vec<String>,
-
-    /// Stable Slot ID matching each --port by position.
-    #[arg(long)]
-    slot_id: Vec<String>,
 
     /// Transport Profile applied to every selected port.
     #[arg(long)]
     transport: Option<String>,
 
-    /// Device Profile applied to every selected port.
-    #[arg(long, conflicts_with = "generic")]
-    device: Option<String>,
-
-    /// Use no DUT-specific Profile.
+    /// Model Profile applied to every selected port.
     #[arg(long)]
-    generic: bool,
+    model: Option<String>,
 
-    /// Read the one-time setup administrator credential from this file.
-    #[arg(long)]
-    admin_token_file: Option<PathBuf>,
-
-    /// Read the daily operator credential to save from this file.
-    #[arg(long)]
-    operator_token_file: Option<PathBuf>,
-
-    /// Destination for the validated daily operator credential.
-    #[arg(long)]
-    save_operator_token_file: Option<PathBuf>,
-
-    /// Remove existing Slots whose ports were not selected. The safe default is to keep them.
+    /// Remove existing configured ports that were not selected.
     #[arg(long)]
     delete_omitted: bool,
 
@@ -142,7 +103,7 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DoctorCommand {
-    /// Verify client configuration, HTTP reachability, authentication and daemon identity.
+    /// Verify client configuration, HTTP reachability and daemon identity.
     Connection(OutputArgs),
     /// Explain whether one configured serial endpoint can be opened.
     Port(DoctorSlotArgs),
@@ -150,14 +111,14 @@ pub enum DoctorCommand {
     Stream(DoctorStreamArgs),
     /// Report retained journal usage and logging health.
     Storage(OutputArgs),
-    /// Print the authoritative Slot state, control, Run, Trigger and effective settings.
+    /// Print the authoritative port state, control, Run, Trigger and effective settings.
     State(DoctorSlotArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct DoctorSlotArgs {
     #[arg(long)]
-    pub slot: String,
+    pub port: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -165,7 +126,7 @@ pub struct DoctorSlotArgs {
 #[derive(Debug, Args)]
 pub struct DoctorStreamArgs {
     #[arg(long)]
-    pub slot: String,
+    pub port: String,
     /// Observation duration in seconds (1..=60).
     #[arg(long, default_value_t = 10, value_parser = parse_doctor_duration)]
     pub duration: u64,
@@ -175,9 +136,9 @@ pub struct DoctorStreamArgs {
 
 #[derive(Debug, Args)]
 pub struct ArchivesArgs {
-    /// Only list archives for this Slot.
+    /// Only list archives for this port.
     #[arg(long)]
-    slot: Option<String>,
+    port: Option<String>,
 
     /// Emit machine-readable JSON.
     #[arg(long)]
@@ -186,9 +147,9 @@ pub struct ArchivesArgs {
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    /// Slot to query. Defaults to the last selected Slot.
+    /// Port to query. Defaults to the last selected port.
     #[arg(long)]
-    slot: Option<String>,
+    port: Option<String>,
 
     /// Only return events whose decoded data contains this text.
     #[arg(long, conflicts_with = "regex")]
@@ -253,11 +214,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     validate_cli_scope(&cli)?;
 
     if let Some(Command::Setup(args)) = &cli.command {
-        return run_setup(loaded, cli.endpoint, cli.token_file, args.clone()).await;
+        return run_setup(loaded, cli.endpoint, args.clone()).await;
     }
 
-    let resolved = loaded.resolve(cli.endpoint, cli.token_file)?;
-    let api = ApiClient::new(resolved.endpoint.clone(), resolved.token.clone())?;
+    let resolved = loaded.resolve(cli.endpoint)?;
+    let api = ApiClient::new(resolved.endpoint.clone())?;
 
     match cli.command {
         None => {
@@ -267,24 +228,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             tui::run(
                 api,
                 loaded,
-                cli.initial_slot.or(resolved.last_slot),
+                cli.initial_port.or(resolved.last_port),
                 resolved.endpoint,
-                resolved.token,
             )
             .await
         }
         Some(Command::Status(args)) => run_status(&api, args).await,
         Some(Command::Doctor(args)) => run_doctor(&api, &loaded, &resolved, args).await,
         Some(Command::Profile(args)) => profile::run(&api, args).await,
-        Some(Command::Model(args)) => model::run(&api, args).await,
         Some(Command::Archives(args)) => run_archives(&api, args).await,
-        Some(Command::Logs(args)) => run_logs(&api, resolved.last_slot, args).await,
+        Some(Command::Logs(args)) => run_logs(&api, resolved.last_port, args).await,
         Some(Command::Setup(_)) => unreachable!("handled before resolving configuration"),
     }
 }
 
 fn validate_cli_scope(cli: &Cli) -> Result<()> {
-    if cli.initial_slot.is_some() && cli.command.is_some() {
+    if cli.initial_port.is_some() && cli.command.is_some() {
         bail!(tr("m.scope.error"));
     }
     Ok(())
@@ -304,33 +263,33 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
             &[
                 &status.server_id.to_string(),
                 &status.daemon_epoch.to_string(),
-                &status.slots.len().to_string(),
+                &status.ports.len().to_string(),
             ]
         )
     );
-    for slot in status.slots {
-        let baud_rate = slot
+    for port in status.ports {
+        let baud_rate = port
             .effective_transport
             .map(|transport| transport.baud_rate)
-            .unwrap_or(slot.config.settings.baud_rate);
-        let control = slot
+            .unwrap_or(115_200);
+        let control = port
             .control
             .as_ref()
             .map(|lease| lease.owner.label.as_str())
             .unwrap_or("-");
         println!(
             "{} {:<10} {:<8} {} {:>7} baud  {}",
-            pad_display(&safe_inline(&slot.config.display_name), 16),
-            session_state_label(slot.session_state),
-            target_activity_label(slot.target_activity),
-            pad_display(&safe_inline(&slot.config.port), 8),
+            pad_display(&safe_inline(&port.config.port), 16),
+            session_state_label(port.session_state),
+            target_activity_label(port.target_activity),
+            pad_display(&safe_inline(&port.config.port), 8),
             baud_rate,
             trf("m.status.control", &[&safe_inline(control)])
         );
-        if let Some(reason) = slot.state_reason {
+        if let Some(reason) = port.state_reason {
             println!("{}", trf("m.status.reason", &[&safe_inline(&reason)]));
         }
-        if let Some(trigger) = slot.active_trigger {
+        if let Some(trigger) = port.active_trigger {
             println!(
                 "{}",
                 trf(
@@ -351,16 +310,14 @@ async fn run_status(api: &ApiClient, args: OutputArgs) -> Result<()> {
 struct DoctorReport<'a> {
     config_path: String,
     endpoint: &'a str,
-    token_configured: bool,
-    authentication_required: bool,
     daemon_status: &'a str,
     server_id: String,
     daemon_epoch: String,
     protocol_version: u16,
     protocol_compatible: bool,
     uptime_ms: u64,
-    slots: usize,
-    online_slots: usize,
+    ports: usize,
+    online_ports: usize,
 }
 
 async fn run_doctor(
@@ -389,16 +346,14 @@ async fn run_doctor_connection(
 ) -> Result<()> {
     let health = api.health().await.context("daemon health check failed")?;
     let status = api.status().await.context("daemon status request failed")?;
-    let online_slots = status
-        .slots
+    let online_ports = status
+        .ports
         .iter()
         .filter(|slot| slot.session_state == serial_protocol::SessionState::Online)
         .count();
     let report = DoctorReport {
         config_path: loaded.path.display().to_string(),
         endpoint: &resolved.endpoint,
-        token_configured: resolved.token.is_some(),
-        authentication_required: health.auth_required,
         daemon_status: &health.status,
         server_id: health.server_id.to_string(),
         daemon_epoch: health.daemon_epoch.to_string(),
@@ -406,8 +361,8 @@ async fn run_doctor_connection(
         protocol_compatible: health.protocol_version == PROTOCOL_VERSION
             && status.protocol_version == PROTOCOL_VERSION,
         uptime_ms: health.uptime_ms,
-        slots: status.slots.len(),
-        online_slots,
+        ports: status.ports.len(),
+        online_ports,
     };
 
     if args.json {
@@ -422,17 +377,6 @@ async fn run_doctor_connection(
             "{} {}",
             pad_display(tr("m.doctor.endpoint"), 12),
             report.endpoint
-        );
-        println!(
-            "{} {}",
-            pad_display(tr("m.doctor.token"), 12),
-            if report.token_configured {
-                tr("m.token.configured")
-            } else if !report.authentication_required {
-                "not required (loopback personal mode)"
-            } else {
-                tr("m.token.missing")
-            }
         );
         println!(
             "{} {}",
@@ -466,10 +410,10 @@ async fn run_doctor_connection(
         );
         println!(
             "{} {}",
-            pad_display(tr("m.doctor.slots"), 12),
+            pad_display(tr("m.doctor.ports"), 12),
             trf(
-                "m.doctor.slots.value",
-                &[&report.slots.to_string(), &report.online_slots.to_string()]
+                "m.doctor.ports.value",
+                &[&report.ports.to_string(), &report.online_ports.to_string()]
             )
         );
     }
@@ -477,7 +421,7 @@ async fn run_doctor_connection(
 }
 
 async fn run_archives(api: &ApiClient, args: ArchivesArgs) -> Result<()> {
-    let response = api.archives(args.slot.as_deref()).await?;
+    let response = api.archives(args.port.as_deref()).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
         return Ok(());
@@ -492,7 +436,7 @@ async fn run_archives(api: &ApiClient, args: ArchivesArgs) -> Result<()> {
             trf(
                 "m.archives.line",
                 &[
-                    &pad_display(&safe_inline(&archive.slot_id), 16),
+                    &pad_display(&safe_inline(&archive.port), 16),
                     &archive.epoch.to_string(),
                     &format_wall_time_local(archive.first_segment_wall_time_ns),
                     &format_wall_time_local(archive.last_segment_wall_time_ns),
@@ -515,7 +459,7 @@ async fn run_archives(api: &ApiClient, args: ArchivesArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) -> Result<()> {
+async fn run_logs(api: &ApiClient, last_port: Option<String>, args: LogsArgs) -> Result<()> {
     if let (Some(after), Some(before)) = (args.after_time, args.before_time)
         && after >= before
     {
@@ -543,20 +487,20 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
              {PROTOCOL_VERSION}; use matching-version components or --contains"
         );
     }
-    let slot_id = match args.slot.or(last_slot) {
-        Some(slot) => slot,
+    let port = match args.port.or(last_port) {
+        Some(port) => port,
         None => api
             .status()
             .await?
-            .slots
+            .ports
             .into_iter()
             .next()
-            .map(|slot| slot.config.id)
-            .context(tr("st.no.slot"))?,
+            .map(|port| port.config.port)
+            .context(tr("st.no.port"))?,
     };
     let response = api
         .events(
-            &slot_id,
+            &port,
             &EventQuery {
                 epoch: args.epoch,
                 after_seq: args.after_seq,
@@ -617,19 +561,10 @@ async fn run_logs(api: &ApiClient, last_slot: Option<String>, args: LogsArgs) ->
 async fn run_setup(
     mut loaded: LoadedConfig,
     endpoint_override: Option<String>,
-    token_file_override: Option<PathBuf>,
     args: SetupArgs,
 ) -> Result<()> {
     let interactive =
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !args.json;
-    if token_file_override.is_some() {
-        bail!(
-            "--token-file is a daily read credential for normal commands and is not accepted by \
-             setup; use --operator-token-file for input and --save-operator-token-file for the \
-             validated destination"
-        );
-    }
-
     let saved_endpoint = loaded
         .config
         .endpoint
@@ -641,71 +576,25 @@ async fn run_setup(
         None => saved_endpoint,
     };
 
-    let token_file = args
-        .save_operator_token_file
-        .clone()
-        .or_else(|| loaded.config.token_file.clone())
-        .unwrap_or_else(|| loaded.default_token_path());
-    // New personal installations intentionally have no token at all. Probe
-    // without a credential first; old authenticated daemons answer 401 and
-    // retain the existing one-time admin + daily operator setup flow.
-    let local_api = ApiClient::new(endpoint.clone(), None)?;
-    let (admin_api, admin_token, health, authentication_required) = match local_api.health().await {
-        Ok(health) if !health.auth_required => (local_api, None, health, false),
-        Ok(_) => bail!(
-            "seriald reports that authentication is required but accepted an unauthenticated health request"
-        ),
-        Err(error) if crate::api::is_unauthorized(&error) => {
-            ensure_distinct_credential_paths(
-                args.admin_token_file.as_deref(),
-                args.operator_token_file.as_deref(),
-                &token_file,
-            )?;
-            let admin_token = match args.admin_token_file.as_deref() {
-                Some(path) => config::read_token_if_present(path)?.with_context(|| {
-                    format!("administrator token file {} is empty", path.display())
-                })?,
-                None if interactive => rpassword::prompt_password(tr("i.admin.prompt"))?
-                    .trim()
-                    .to_owned(),
-                None => bail!("--admin-token-file is required in non-interactive setup"),
-            };
-            if admin_token.is_empty() {
-                bail!(tr("i.admin.required"));
-            }
-            let api = ApiClient::new(endpoint.clone(), Some(admin_token.clone()))?;
-            let health = api.health().await.context(tr("i.unreachable"))?;
-            (api, Some(admin_token), health, true)
-        }
-        Err(error) => return Err(error).context(tr("i.unreachable")),
-    };
-    let existing_operator_token = if authentication_required {
-        let token = config::read_token_if_present(&token_file)?;
-        if token.is_some() && !args.json {
-            println!("{}", tr("i.token.notice"));
-        }
-        token
-    } else {
-        None
-    };
+    let api = ApiClient::new(endpoint.clone())?;
+    let health = api.health().await.context(tr("i.unreachable"))?;
     if health.protocol_version != PROTOCOL_VERSION {
         bail!(
-            "seriald protocol {} is incompatible with this client (expected {}); install all \
-             v0.4 components from the same release package",
+            "seriald protocol {} is incompatible with this client (expected {})",
             health.protocol_version,
             PROTOCOL_VERSION
         );
     }
-    let current = admin_api
+    let current = api
         .configuration_status()
         .await
         .context(tr("i.status.fail"))?;
-    let config_revision = current.config_revision;
-    let existing_slots = current
-        .slots
+    let existing_ports = current
+        .ports
         .into_iter()
-        .map(|slot| slot.config)
+        .map(|port| port.config)
         .collect::<Vec<_>>();
+
     if !args.json {
         println!(
             "{}",
@@ -719,13 +608,13 @@ async fn run_setup(
         );
     }
 
-    let ports = admin_api.ports().await?;
-    if ports.is_empty() {
+    let discovered = api.ports().await?;
+    if discovered.is_empty() {
         bail!(tr("i.no.ports"));
     }
     if !args.json {
         println!("{}", tr("i.ports.header"));
-        for (index, port) in ports.iter().enumerate() {
+        for (index, port) in discovered.iter().enumerate() {
             let detail = port
                 .product
                 .as_deref()
@@ -739,21 +628,19 @@ async fn run_setup(
             );
         }
     }
-    let existing_selection = ports
+
+    let existing_selection = discovered
         .iter()
         .enumerate()
         .filter(|(_, port)| {
-            existing_slots
+            existing_ports
                 .iter()
-                .any(|slot| same_serial_port(&slot.port, &port.name))
+                .any(|configured| same_serial_port(&configured.port, &port.name))
         })
         .map(|(index, _)| (index + 1).to_string())
         .collect::<Vec<_>>();
     let default_selection = if existing_selection.is_empty() {
-        (1..=ports.len().min(2))
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
+        "1".to_string()
     } else {
         existing_selection.join(",")
     };
@@ -762,12 +649,12 @@ async fn run_setup(
             bail!("at least one --port is required in non-interactive setup");
         }
         let selection = prompt_with_default(tr("i.select.ports"), &default_selection)?;
-        parse_selection(&selection, ports.len())?
+        parse_selection(&selection, discovered.len())?
     } else {
         args.port
             .iter()
             .map(|requested| {
-                ports
+                discovered
                     .iter()
                     .position(|port| same_serial_port(&port.name, requested))
                     .with_context(|| {
@@ -776,266 +663,101 @@ async fn run_setup(
             })
             .collect::<Result<Vec<_>>>()?
     };
-    validate_parallel_values("--display-name", &args.display_name, selected.len())?;
-    validate_parallel_values("--slot-id", &args.slot_id, selected.len())?;
 
-    let (transport_catalog, transport_server_managed) =
-        profile::load_transport_catalog(&admin_api).await?;
-    let device_catalog = profile::load_device_catalog(&admin_api).await?;
-
+    let (transport_catalog, _) = profile::load_transport_catalog(&api).await?;
+    let model_catalog = profile::load_model_catalog(&api).await?;
     if !args.json {
-        println!("{}", tr("i.profile.note"));
-        println!(
-            "Transport Profiles: {}",
+        println!("串口 Profile：配置波特率、数据位、校验位、停止位和流控");
+        println!("机型 Profile：配置机型名、Shell/U-Boot 提示符、换行和发送节奏");
+    }
+
+    let mut configured_ports = Vec::with_capacity(selected.len());
+    for port_index in selected {
+        let discovered_port = &discovered[port_index];
+        let existing = existing_ports
+            .iter()
+            .find(|configured| same_serial_port(&configured.port, &discovered_port.name));
+
+        let default_transport = existing.and_then(|port| port.transport_profile.clone());
+        let transport_profile = match args.transport.as_deref() {
+            Some(name) => Some(name.to_owned()),
+            None if interactive => {
+                let default = default_transport.as_deref().unwrap_or("none");
+                let chosen =
+                    prompt_with_default("串口 Profile（none 表示默认 115200 8N1）", default)?;
+                (!chosen.eq_ignore_ascii_case("none")).then_some(chosen)
+            }
+            None => default_transport,
+        };
+        if let Some(name) = transport_profile.as_deref() {
             transport_catalog
                 .profiles
                 .iter()
-                .map(|profile| profile.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        println!(
-            "Device Profiles: Generic{}",
-            if device_catalog.profiles.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", {}",
-                    device_catalog
-                        .profiles
-                        .iter()
-                        .map(|profile| profile.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        );
-    }
-    if !existing_slots.is_empty() && !args.json {
-        println!("{}", tr("i.existing.keep"));
-    }
-    let mut slots = Vec::with_capacity(selected.len());
-    for (slot_index, port_index) in selected.into_iter().enumerate() {
-        let port = &ports[port_index];
-        let existing = existing_slots
-            .iter()
-            .find(|slot| same_serial_port(&slot.port, &port.name))
-            .cloned();
-        let preserve_existing_transport = existing.is_some()
-            && args.transport.is_none()
-            && (!interactive || !transport_server_managed);
-        let default_name = existing
-            .as_ref()
-            .map(|slot| slot.display_name.clone())
-            .unwrap_or_else(|| port.name.clone());
-        let display_name = match args.display_name.get(slot_index) {
-            Some(name) => name.clone(),
-            None if interactive => prompt_with_default(
-                &trf("i.slot.name", &[&safe_inline(&port.name)]),
-                &default_name,
-            )?,
-            None => default_name,
-        };
-        let default_id = existing
-            .as_ref()
-            .map(|slot| slot.id.clone())
-            .unwrap_or_else(|| normalize_slot_id(&display_name, slot_index + 1));
-        let entered_id = match args.slot_id.get(slot_index) {
-            Some(id) => id.clone(),
+                .find(|profile| profile.name == name)
+                .with_context(|| format!("unknown serial Profile {name:?}"))?;
+        }
+
+        let default_model = existing.and_then(|port| port.model_profile.clone());
+        let model_profile = match args.model.as_deref() {
+            Some(name) => Some(name.to_owned()),
             None if interactive => {
-                prompt_with_default(&trf("i.slot.id", &[&safe_inline(&port.name)]), &default_id)?
+                let default = default_model.as_deref().unwrap_or("none");
+                let chosen = prompt_with_default("机型 Profile（none 表示不绑定）", default)?;
+                (!chosen.eq_ignore_ascii_case("none")).then_some(chosen)
             }
-            None => default_id,
+            None => default_model,
         };
-        let base_id = normalize_slot_id(&entered_id, slot_index + 1);
-        let mut id = base_id.clone();
-        let mut suffix = 2;
-        while slots.iter().any(|slot: &SlotConfig| slot.id == id) {
-            id = format!("{base_id}-{suffix}");
-            suffix += 1;
+        if let Some(name) = model_profile.as_deref() {
+            model_catalog
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .with_context(|| format!("unknown model Profile {name:?}"))?;
         }
-        let mut slot = existing.unwrap_or_else(|| SlotConfig {
-            id: id.clone(),
-            display_name: display_name.clone(),
-            port: port.name.clone(),
-            profile: SAFE_TRANSPORT_NAME.into(),
-            enabled: true,
-            settings: SerialSettings::default(),
-            device_profile: None,
-        });
-        let selected_transport = if preserve_existing_transport {
-            None
-        } else {
-            let default_transport = if transport_catalog
-                .profiles
-                .iter()
-                .any(|profile| profile.name == slot.profile)
-            {
-                slot.profile.clone()
-            } else {
-                transport_catalog
-                    .profiles
-                    .first()
-                    .map(|profile| profile.name.clone())
-                    .unwrap_or_else(|| SAFE_TRANSPORT_NAME.into())
-            };
-            let transport_name = match args.transport.as_deref() {
-                Some(name) => name.to_owned(),
-                None if interactive => {
-                    prompt_with_default("Transport Profile", &default_transport)?
-                }
-                None => default_transport,
-            };
-            Some(
-                transport_catalog
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.name == transport_name)
-                    .with_context(|| format!("unknown Transport Profile {transport_name:?}"))?,
-            )
-        };
-        let default_device = slot.device_profile.as_deref().unwrap_or("Generic");
-        let device_name = match args.device.as_deref() {
-            Some(name) => name.to_owned(),
-            None if args.generic => "Generic".into(),
-            None if interactive => prompt_with_default("Device Profile", default_device)?,
-            None => default_device.to_owned(),
-        };
-        let device_profile = if device_name.eq_ignore_ascii_case("generic") {
-            None
-        } else {
-            device_catalog
-                .profiles
-                .iter()
-                .find(|profile| profile.name == device_name)
-                .with_context(|| format!("unknown Device Profile {device_name:?}"))?;
-            Some(device_name)
-        };
 
-        slot.id = id;
-        slot.display_name = display_name;
-        slot.port = port.name.clone();
-        if let Some(transport) = selected_transport {
-            slot.profile = transport.name.clone();
-            slot.settings = apply_transport_profile(&slot.settings, Some(transport));
-        }
-        slot.device_profile = device_profile;
-        slots.push(slot);
+        configured_ports.push(SlotConfig {
+            port: discovered_port.name.clone(),
+            transport_profile,
+            model_profile,
+            enabled: existing.is_none_or(|port| port.enabled),
+        });
     }
 
-    let omitted_existing = unselected_existing_slots(&existing_slots, &slots);
-    if !omitted_existing.is_empty() {
+    let omitted = unselected_existing_ports(&existing_ports, &configured_ports);
+    if !omitted.is_empty() {
         if !args.json {
             println!("{}", tr("i.omitted.header"));
-            for slot in &omitted_existing {
-                println!(
-                    "{}",
-                    trf(
-                        "i.omitted.note",
-                        &[&safe_inline(&slot.display_name), &safe_inline(&slot.port)]
-                    )
-                );
+            for port in &omitted {
+                println!("  {}", safe_inline(&port.port));
             }
         }
         let delete = args.delete_omitted
             || (interactive && prompt_yes_no_default_no(tr("i.omitted.delete"))?);
-        if delete {
-            if !args.json {
-                println!(
-                    "{}",
-                    trf("i.omitted.deleting", &[&omitted_existing.len().to_string()])
-                );
-            }
-        } else {
-            if !args.json {
-                println!(
-                    "{}",
-                    trf("i.omitted.keeping", &[&omitted_existing.len().to_string()])
-                );
-            }
-            slots.extend(omitted_existing);
+        if !delete {
+            configured_ports.extend(omitted);
         }
     }
 
-    // Validate the lower-privilege daily credential before the only daemon
-    // mutation. A bad token must not leave setup reporting failure after the
-    // Slot configuration has already changed.
-    let operator_token = if authentication_required {
-        let token = match args.operator_token_file.as_deref() {
-            Some(path) => config::read_token_if_present(path)?
-                .with_context(|| format!("operator token file {} is empty", path.display()))?,
-            None if interactive => {
-                let operator_prompt = if existing_operator_token.is_some() {
-                    tr("i.operator.keep")
-                } else {
-                    tr("i.operator.required.prompt")
-                };
-                let entered = rpassword::prompt_password(operator_prompt)?;
-                let entered = entered.trim().to_owned();
-                if entered.is_empty() {
-                    existing_operator_token.context(tr("i.operator.required"))?
-                } else {
-                    entered
-                }
-            }
-            None => existing_operator_token.context(
-                "an existing daily token or --operator-token-file is required in non-interactive setup",
-            )?,
-        };
-        let operator_api = ApiClient::new(endpoint.clone(), Some(token.clone()))?;
-        operator_api.status().await.context(tr("i.operator.fail"))?;
-        let daily_role = ws::probe_role(&endpoint, &token)
-            .await
-            .context(tr("i.role.fail"))?;
-        if daily_role != serial_protocol::Role::Operator {
-            bail!(trf("i.role.wrong", &[role_label(daily_role)]));
-        }
-        Some(token)
-    } else {
-        None
-    };
-
-    let configured = admin_api
-        .configure_slots(slots, config_revision)
+    let configured = api
+        .configure_ports(configured_ports, current.config_revision)
         .await
         .map_err(|error| {
             if crate::api::is_conflict(&error) {
                 anyhow::anyhow!(
-                    "configuration changed while setup was open; rerun setup to reload the current Slot list"
+                    "configuration changed while setup was open; rerun setup to reload the current port list"
                 )
             } else {
                 error
             }
         })?;
-    if !args.json {
-        println!(
-            "{}",
-            trf("i.configured", &[&configured.slots.len().to_string()])
-        );
-        for slot in &configured.slots {
-            println!(
-                "  {} → {} ({})",
-                safe_inline(&slot.config.display_name),
-                safe_inline(&slot.config.port),
-                session_state_label(slot.session_state)
-            );
-        }
-    }
 
-    // Destroy every owner of the one-time setup credential before persisting
-    // the already validated lower-privilege daily credential.
-    drop(admin_api);
-    drop(admin_token);
-
-    if let Some(operator_token) = operator_token.as_deref() {
-        config::write_token(&token_file, operator_token)?;
-        loaded.config.token_file = Some(token_file);
-    } else {
-        loaded.config.token_file = None;
-    }
     loaded.config.endpoint = Some(endpoint.clone());
-    loaded.config.last_slot = configured.slots.first().map(|slot| slot.config.id.clone());
+    loaded.config.last_port = configured
+        .ports
+        .first()
+        .map(|port| port.config.port.clone());
     loaded.save()?;
+
     if args.json {
         println!(
             "{}",
@@ -1043,91 +765,26 @@ async fn run_setup(
                 "config_path": loaded.path,
                 "endpoint": endpoint,
                 "config_revision": configured.config_revision,
-                "slots": configured.slots,
-                "operator_token_saved": authentication_required,
-                "authentication_required": authentication_required,
+                "ports": configured.ports,
             }))?
         );
     } else {
+        println!(
+            "{}",
+            trf("i.configured", &[&configured.ports.len().to_string()])
+        );
+        for port in &configured.ports {
+            println!(
+                "  {} ({})",
+                safe_inline(&port.config.port),
+                session_state_label(port.session_state)
+            );
+        }
         println!("{}", trf("i.saved", &[&loaded.path.display().to_string()]));
         println!("{}", tr("i.open.console"));
     }
     Ok(())
 }
-
-fn validate_parallel_values(label: &str, values: &[String], expected: usize) -> Result<()> {
-    if !values.is_empty() && values.len() != expected {
-        bail!(
-            "{label} must be omitted or repeated exactly once per --port (expected {expected}, got {})",
-            values.len()
-        );
-    }
-    Ok(())
-}
-
-fn ensure_distinct_credential_paths(
-    admin_input: Option<&Path>,
-    operator_input: Option<&Path>,
-    operator_destination: &Path,
-) -> Result<()> {
-    let mut paths = vec![(
-        "--save-operator-token-file (or the saved daily token path)",
-        operator_destination,
-    )];
-    if let Some(path) = admin_input {
-        paths.push(("--admin-token-file", path));
-    }
-    if let Some(path) = operator_input {
-        paths.push(("--operator-token-file", path));
-    }
-
-    let normalized = paths
-        .iter()
-        .map(|(label, path)| Ok((*label, credential_path_key(path)?)))
-        .collect::<Result<Vec<_>>>()?;
-    for left in 0..normalized.len() {
-        for right in left + 1..normalized.len() {
-            if normalized[left].1 == normalized[right].1 {
-                bail!(
-                    "{} and {} must be different files; setup never overwrites an input credential",
-                    normalized[left].0,
-                    normalized[right].0
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn credential_path_key(path: &Path) -> Result<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("cannot resolve credential file path")?
-            .join(path)
-    };
-    let canonical = std::fs::canonicalize(&absolute).unwrap_or_else(|_| {
-        let mut normalized = PathBuf::new();
-        for component in absolute.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    normalized.pop();
-                }
-                other => normalized.push(other.as_os_str()),
-            }
-        }
-        normalized
-    });
-    let key = canonical.to_string_lossy().to_string();
-    Ok(if cfg!(windows) {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    })
-}
-
 fn prompt_with_default(label: &str, default: &str) -> Result<String> {
     use std::io::Write;
 
@@ -1157,7 +814,7 @@ fn prompt_yes_no_default_no(label: &str) -> Result<bool> {
     }
 }
 
-fn unselected_existing_slots(existing: &[SlotConfig], selected: &[SlotConfig]) -> Vec<SlotConfig> {
+fn unselected_existing_ports(existing: &[SlotConfig], selected: &[SlotConfig]) -> Vec<SlotConfig> {
     existing
         .iter()
         .filter(|existing| {
@@ -1194,27 +851,6 @@ fn parse_selection(value: &str, port_count: usize) -> Result<Vec<usize>> {
         bail!(tr("i.selection.empty"));
     }
     Ok(selected)
-}
-
-fn normalize_slot_id(display_name: &str, fallback_index: usize) -> String {
-    let normalized = display_name
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if normalized.is_empty() {
-        format!("slot-{fallback_index}")
-    } else {
-        normalized
-    }
 }
 
 fn same_serial_port(left: &str, right: &str) -> bool {
@@ -1301,8 +937,8 @@ fn parse_event_kind(value: &str) -> Result<EventKind, String> {
         "serial_opened" => Ok(EventKind::SerialOpened),
         "serial_open_failed" => Ok(EventKind::SerialOpenFailed),
         "serial_closed" => Ok(EventKind::SerialClosed),
-        "slot_reconfigured" => Ok(EventKind::SlotReconfigured),
-        "slot_removed" => Ok(EventKind::SlotRemoved),
+        "port_reconfigured" => Ok(EventKind::PortReconfigured),
+        "port_removed" => Ok(EventKind::PortRemoved),
         "control_granted" => Ok(EventKind::ControlGranted),
         "control_released" => Ok(EventKind::ControlReleased),
         "control_revoked" => Ok(EventKind::ControlRevoked),
@@ -1326,15 +962,12 @@ fn parse_event_kind(value: &str) -> Result<EventKind, String> {
 mod tests {
     use super::*;
 
-    fn configured_slot(id: &str, port: &str) -> SlotConfig {
+    fn configured_port(port: &str) -> SlotConfig {
         SlotConfig {
-            id: id.into(),
-            display_name: id.into(),
             port: port.into(),
-            profile: "generic-115200".into(),
+            transport_profile: None,
+            model_profile: None,
             enabled: true,
-            settings: SerialSettings::default(),
-            device_profile: None,
         }
     }
 
@@ -1343,15 +976,6 @@ mod tests {
         assert_eq!(parse_selection("2, 1,2", 3).unwrap(), vec![1, 0]);
         assert!(parse_selection("0", 3).is_err());
         assert!(parse_selection("4", 3).is_err());
-    }
-
-    #[test]
-    fn slot_ids_are_safe_and_stable() {
-        assert_eq!(
-            normalize_slot_id("Station A / Port 1", 1),
-            "station-a---port-1"
-        );
-        assert_eq!(normalize_slot_id("串口一", 2), "slot-2");
     }
 
     #[test]
@@ -1418,68 +1042,39 @@ mod tests {
     }
 
     #[test]
-    fn init_preserves_existing_slots_not_selected_in_the_current_scan() {
-        let existing = vec![
-            configured_slot("slot-1", "COM3"),
-            configured_slot("slot-2", "COM4"),
-        ];
-        let selected = vec![configured_slot("slot-1", "com3")];
+    fn setup_preserves_existing_ports_not_selected_in_the_current_scan() {
+        let existing = vec![configured_port("COM3"), configured_port("COM4")];
+        let selected = vec![configured_port("com3")];
 
-        let omitted = unselected_existing_slots(&existing, &selected);
+        let omitted = unselected_existing_ports(&existing, &selected);
         assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].id, "slot-2");
+        assert_eq!(omitted[0].port, "COM4");
     }
 
     #[test]
-    fn initial_slot_is_scoped_to_the_interactive_console() {
-        let interactive = Cli::try_parse_from(["serialctl", "--initial-slot", "slot-2"])
-            .expect("interactive initial Slot should parse");
-        assert_eq!(interactive.initial_slot.as_deref(), Some("slot-2"));
+    fn initial_port_is_scoped_to_the_interactive_console() {
+        let interactive = Cli::try_parse_from(["serialctl", "--initial-port", "COM4"])
+            .expect("interactive initial port should parse");
+        assert_eq!(interactive.initial_port.as_deref(), Some("COM4"));
         assert!(validate_cli_scope(&interactive).is_ok());
 
-        let status = Cli::try_parse_from(["serialctl", "--initial-slot", "slot-2", "status"])
+        let status = Cli::try_parse_from(["serialctl", "--initial-port", "COM4", "status"])
             .expect("root options may syntactically precede a subcommand");
         assert!(validate_cli_scope(&status).is_err());
 
-        let logs = Cli::try_parse_from(["serialctl", "logs", "--slot", "slot-1"])
-            .expect("logs retains its own Slot filter");
+        let logs = Cli::try_parse_from(["serialctl", "logs", "--port", "COM3"])
+            .expect("logs retains its own port filter");
         assert!(matches!(
             logs.command,
-            Some(Command::Logs(LogsArgs { slot: Some(ref slot), .. })) if slot == "slot-1"
+            Some(Command::Logs(LogsArgs { port: Some(ref port), .. })) if port == "COM3"
         ));
     }
 
     #[test]
-    fn setup_keeps_init_as_a_compatible_alias() {
-        for command in ["setup", "init"] {
-            let parsed = Cli::try_parse_from([
-                "serialctl",
-                command,
-                "--port",
-                "COM3",
-                "--admin-token-file",
-                "admin.token",
-                "--operator-token-file",
-                "operator.token",
-            ])
-            .unwrap();
-            assert!(matches!(parsed.command, Some(Command::Setup(_))));
-        }
-    }
-
-    #[test]
-    fn setup_never_overwrites_an_input_credential() {
-        let same = Path::new("same-token-file");
-        assert!(ensure_distinct_credential_paths(Some(same), None, same).is_err());
-        assert!(ensure_distinct_credential_paths(None, Some(same), same).is_err());
-        assert!(
-            ensure_distinct_credential_paths(
-                Some(Path::new("admin-token")),
-                Some(Path::new("operator-input")),
-                Path::new("operator-output"),
-            )
-            .is_ok()
-        );
+    fn setup_is_the_single_configuration_command() {
+        let parsed = Cli::try_parse_from(["serialctl", "setup", "--port", "COM3"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Setup(_))));
+        assert!(Cli::try_parse_from(["serialctl", "init", "--port", "COM3"]).is_err());
     }
 
     #[test]
@@ -1502,8 +1097,8 @@ mod tests {
             "serialctl",
             "doctor",
             "stream",
-            "--slot",
-            "dut-1",
+            "--port",
+            "COM4",
             "--duration",
             "5",
             "--json",
@@ -1521,45 +1116,13 @@ mod tests {
                 "serialctl",
                 "doctor",
                 "stream",
-                "--slot",
-                "dut-1",
+                "--port",
+                "COM4",
                 "--duration",
                 "0",
             ])
             .is_err()
         );
-    }
-
-    #[test]
-    fn model_commands_expose_help_and_parse_script_json_modes() {
-        let help = Cli::try_parse_from(["serialctl", "model", "--help"]).unwrap_err();
-        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
-        let rendered = help.to_string();
-        for command in ["list", "tree", "add", "update", "attach", "detach"] {
-            assert!(
-                rendered.contains(command),
-                "missing model help for {command}"
-            );
-        }
-
-        let list = Cli::try_parse_from(["serialctl", "model", "list", "--json"]).unwrap();
-        assert!(matches!(list.command, Some(Command::Model(_))));
-
-        let attach = Cli::try_parse_from([
-            "serialctl",
-            "model",
-            "attach",
-            "--slot",
-            "dut-1",
-            "--model",
-            "tl-as7230-w",
-            "--confirm-via",
-            "serial",
-            "--expect-unbound",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(attach.command, Some(Command::Model(_))));
     }
 
     #[test]

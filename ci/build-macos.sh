@@ -13,9 +13,11 @@ readonly MCP_TOOL_COUNT=19
 readonly ARM_TARGET="aarch64-apple-darwin"
 readonly X86_TARGET="x86_64-apple-darwin"
 readonly APP_BUNDLE_NAME="Serial Platform.app"
-readonly -a REQUIRED_BINARIES=(serial seriald serialctl serial-mcp serial-desktop)
-readonly -a APP_BINARIES=(serial-desktop serial seriald)
-readonly -a BUILD_PACKAGES=(serial-cli seriald serialctl serial-mcp serial-desktop)
+readonly APP_EXECUTABLE="Serial Platform"
+readonly ELECTRON_SCRIPT="${SCRIPT_DIR}/electron.sh"
+readonly -a REQUIRED_BINARIES=(serial seriald serialctl serial-mcp)
+readonly -a APP_SIDECARS=(serial seriald)
+readonly -a BUILD_PACKAGES=(serial-cli seriald serialctl serial-mcp)
 
 export MACOSX_DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}"
 export COPYFILE_DISABLE=1
@@ -72,7 +74,7 @@ ensure_build_environment() {
     local command
     for command in \
         git rustc cargo rustup cc jq file strings shasum \
-        zip unzip xcrun arch codesign plutil cmp; do
+        zip unzip xcrun arch codesign plutil cmp perl; do
         require_command "${command}"
     done
 
@@ -153,6 +155,7 @@ run_environment() {
     ensure_rust_target "${ARM_TARGET}"
     ensure_rust_target "${X86_TARGET}"
     assert_workspace_version
+    "${ELECTRON_SCRIPT}" env
 }
 
 run_fetch() {
@@ -160,6 +163,7 @@ run_fetch() {
     log "Fetching locked Cargo dependencies"
     require_command cargo
     cargo fetch --locked
+    "${ELECTRON_SCRIPT}" fetch
 }
 
 run_test() {
@@ -169,6 +173,8 @@ run_test() {
     log "Running the locked workspace tests for both macOS architectures"
     ensure_build_environment
     run_target_tests "${profile}"
+    "${ELECTRON_SCRIPT}" typecheck
+    "${ELECTRON_SCRIPT}" test
 }
 
 run_target_tests() {
@@ -347,16 +353,6 @@ smoke_package_binaries() {
     [[ "${tool_count}" == "${MCP_TOOL_COUNT}" ]] \
         || fail "${architecture} serial-mcp exposes ${tool_count} tools; expected ${MCP_TOOL_COUNT}"
 
-    local app_desktop="${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/serial-desktop"
-    smoke_binary "${app_desktop}" "${architecture}"
-    case "${architecture}" in
-        aarch64)
-            "${app_desktop}" --help >/dev/null
-            ;;
-        x86_64)
-            arch -x86_64 "${app_desktop}" --help >/dev/null
-            ;;
-    esac
 }
 
 assert_no_distribution_signature() {
@@ -367,8 +363,9 @@ assert_no_distribution_signature() {
     for binary in "${REQUIRED_BINARIES[@]}"; do
         binaries+=("${package_dir}/${binary}")
     done
-    for binary in "${APP_BINARIES[@]}"; do
-        binaries+=("${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/${binary}")
+    binaries+=("${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/${APP_EXECUTABLE}")
+    for binary in "${APP_SIDECARS[@]}"; do
+        binaries+=("${package_dir}/${APP_BUNDLE_NAME}/Contents/Resources/bin/${binary}")
     done
 
     for binary in "${binaries[@]}"; do
@@ -381,65 +378,6 @@ assert_no_distribution_signature() {
             continue
         fi
         fail "unexpected distribution signature; BUILD-INFO would be inaccurate: ${binary}"
-    done
-}
-
-create_desktop_app_bundle() {
-    local package_dir="$1"
-    local architecture="$2"
-    local app_dir="${package_dir}/${APP_BUNDLE_NAME}"
-    local contents_dir="${app_dir}/Contents"
-    local executable_dir="${contents_dir}/MacOS"
-
-    mkdir -p "${executable_dir}"
-    local binary
-    for binary in "${APP_BINARIES[@]}"; do
-        install -m 0755 "${package_dir}/${binary}" "${executable_dir}/${binary}"
-    done
-
-    cat >"${contents_dir}/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>zh_CN</string>
-    <key>CFBundleDisplayName</key>
-    <string>Serial Platform</string>
-    <key>CFBundleExecutable</key>
-    <string>serial-desktop</string>
-    <key>CFBundleIdentifier</key>
-    <string>io.github.aleygey.serial-platform</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>Serial Platform</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${PACKAGE_VERSION}</string>
-    <key>CFBundleVersion</key>
-    <string>${PACKAGE_VERSION}</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>${DEPLOYMENT_TARGET}</string>
-    <key>LSUIElement</key>
-    <false/>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-    plutil -lint "${contents_dir}/Info.plist" >/dev/null
-    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${contents_dir}/Info.plist")" == "serial-desktop" ]] \
-        || fail "macOS App CFBundleExecutable is not serial-desktop"
-    [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "${contents_dir}/Info.plist")" == "false" ]] \
-        || fail "macOS App must be a regular Dock application (LSUIElement=false)"
-
-    for binary in "${APP_BINARIES[@]}"; do
-        cmp "${package_dir}/${binary}" "${executable_dir}/${binary}" \
-            || fail "macOS App helper differs from packaged binary: ${binary}"
-        assert_macho "${executable_dir}/${binary}" "${architecture}"
     done
 }
 
@@ -478,17 +416,19 @@ write_build_info() {
             rust_target: $rust_target,
             architecture: $architecture,
             cargo_profile: $cargo_profile,
-            compatibility: ("macOS " + $deployment_target + "+; " + $architecture),
+            compatibility: ("CLI: macOS " + $deployment_target + "+; Desktop App: macOS 12.0+; " + $architecture),
             deployment_target: $deployment_target,
             macos_sdk: $macos_sdk,
             rustc: $rustc,
             mcp_tool_count: $mcp_tool_count,
             desktop: {
                 included: true,
-                executable: "serial-desktop",
+                framework: "Electron",
                 app_bundle: "Serial Platform.app",
-                app_executables: ["serial-desktop", "serial", "seriald"],
-                local_service: "serial and seriald are bundled beside the App executable"
+                executable: "Serial Platform.app/Contents/MacOS/Serial Platform",
+                embedded_sidecars: ["serial", "seriald"],
+                minimum_macos: "12.0",
+                local_service: "serial and seriald are embedded in the App resources"
             },
             build_system: "Jenkins-compatible native macOS builder",
             distribution: {
@@ -516,7 +456,8 @@ write_package_manifest() {
     )
     (
         cd "${package_dir}"
-        shasum -a 256 -c MANIFEST.sha256
+        shasum -a 256 -c MANIFEST.sha256 >/dev/null \
+            || fail "macOS package manifest verification failed"
     )
 }
 
@@ -526,13 +467,12 @@ normalize_package_metadata() {
 
     # ZIP stores Unix permission bits. Normalize them as well as timestamps so
     # different agent umasks or checkout settings cannot change the archive.
-    find "${package_dir}" -type d -exec chmod 0755 {} +
-    find "${package_dir}" -type f -exec chmod 0644 {} +
+    find "${package_dir}" -path "${package_dir}/${APP_BUNDLE_NAME}" -prune \
+        -o -type d -exec chmod 0755 {} +
+    find "${package_dir}" -path "${package_dir}/${APP_BUNDLE_NAME}" -prune \
+        -o -type f -exec chmod 0644 {} +
     for binary in "${REQUIRED_BINARIES[@]}"; do
         chmod 0755 "${package_dir}/${binary}"
-    done
-    for binary in "${APP_BINARIES[@]}"; do
-        chmod 0755 "${package_dir}/${APP_BUNDLE_NAME}/Contents/MacOS/${binary}"
     done
 
     # BSD touch lacks GNU's -d @epoch form. Perl is shipped by macOS and lets
@@ -551,7 +491,7 @@ create_zip_archive() {
         cd "${ARTIFACT_DIR}"
         find "${package_name}" -print \
             | LC_ALL=C sort \
-            | zip -X -q "${archive}" -@
+            | zip -X -y -q "${archive}" -@
     )
     unzip -tq "${archive}"
     local archive_entries
@@ -563,8 +503,14 @@ create_zip_archive() {
     done
     grep -Fx "${package_name}/${APP_BUNDLE_NAME}/Contents/Info.plist" \
         <<<"${archive_entries}" >/dev/null
-    for binary in "${APP_BINARIES[@]}"; do
-        grep -Fx "${package_name}/${APP_BUNDLE_NAME}/Contents/MacOS/${binary}" \
+    grep -Fx "${package_name}/${APP_BUNDLE_NAME}/Contents/MacOS/${APP_EXECUTABLE}" \
+        <<<"${archive_entries}" >/dev/null
+    unzip -Z -l "${archive}" \
+        | grep -F "${package_name}/${APP_BUNDLE_NAME}/Contents/Frameworks/Electron Framework.framework/Versions/Current" \
+        | grep -Eq '^l' \
+        || fail "macOS archive did not preserve the Electron Framework symlink"
+    for binary in "${APP_SIDECARS[@]}"; do
+        grep -Fx "${package_name}/${APP_BUNDLE_NAME}/Contents/Resources/bin/${binary}" \
             <<<"${archive_entries}" >/dev/null
     done
     grep -Fx "${package_name}/BUILD-INFO.json" <<<"${archive_entries}" >/dev/null
@@ -592,7 +538,13 @@ package_target() {
         assert_macho "${package_dir}/${binary}" "${architecture}"
     done
 
-    create_desktop_app_bundle "${package_dir}" "${architecture}"
+    local electron_architecture="${architecture}"
+    [[ "${architecture}" == "aarch64" ]] && electron_architecture="arm64"
+    "${ELECTRON_SCRIPT}" package \
+        macos \
+        "${electron_architecture}" \
+        "${release_dir}" \
+        "${package_dir}"
     smoke_package_binaries "${package_dir}" "${architecture}"
     assert_no_distribution_signature "${package_dir}"
     copy_release_materials "${package_dir}"
@@ -605,10 +557,13 @@ package_target() {
     grep -F "  ${APP_BUNDLE_NAME}/Contents/Info.plist" \
         "${package_dir}/MANIFEST.sha256" >/dev/null \
         || fail "macOS package manifest does not cover the App Info.plist"
-    for binary in "${APP_BINARIES[@]}"; do
-        grep -F "  ${APP_BUNDLE_NAME}/Contents/MacOS/${binary}" \
+    grep -F "  ${APP_BUNDLE_NAME}/Contents/MacOS/${APP_EXECUTABLE}" \
+        "${package_dir}/MANIFEST.sha256" >/dev/null \
+        || fail "macOS package manifest does not cover the Electron executable"
+    for binary in "${APP_SIDECARS[@]}"; do
+        grep -F "  ${APP_BUNDLE_NAME}/Contents/Resources/bin/${binary}" \
             "${package_dir}/MANIFEST.sha256" >/dev/null \
-            || fail "macOS package manifest does not cover App executable ${binary}"
+            || fail "macOS package manifest does not cover embedded sidecar ${binary}"
     done
     normalize_package_metadata "${package_dir}"
     create_zip_archive "${package_name}"
@@ -639,6 +594,7 @@ run_package() {
 
     ensure_build_environment
     assert_workspace_version
+    "${ELECTRON_SCRIPT}" build
 
     if [[ -e "${ARTIFACT_DIR}" ]]; then
         case "${ARTIFACT_DIR}" in

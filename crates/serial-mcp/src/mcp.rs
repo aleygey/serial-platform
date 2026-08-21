@@ -1,10 +1,19 @@
 use std::{
     collections::HashMap,
     io::{BufRead, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
 
 use anyhow::Result;
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode, header::ORIGIN},
+    response::{IntoResponse, Response},
+    routing::post,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
@@ -23,9 +32,9 @@ use crate::tools::AgentTools;
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and device_models, then confirm that the configured model matches the physical DUT before connecting or executing commands. Confirm with serial evidence, telnet, the device web UI, or a human; the configured name alone is not proof. device_model_set records an assignment; it does not prove identity. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. Never copy a public run_id from devices/status into a tool call. Runs scope evidence only. Run-scoped calls pin the Run while active; an orphan timeout is only a crash/abandonment fallback. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. Every command requires a concise purpose for durable Run history. Use command_sequence for a known, dependent interaction such as username then password; give the sequence an overall purpose and every step its own purpose. Every non-final step needs an explicit expect or regex boundary, and any failed step prevents all later writes. Its command bytes are retained in the same plaintext TX audit as command. command and command_sequence inherit Slot settings; input/signal are raw; Trigger bytes are explicit. For a normal kickoff plus repeated action, omit start_contains: a confirmed kickoff immediately enables actions. Use start_contains only when live RX must explicitly gate the first action. Trigger max_fires limits sends; configured stop matchers remain armed until match or timeout, and confirmed TX alone is not target success or failure. Monitor Jobs persist after this MCP process exits. Stop Monitors when no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices and model_profiles before executing commands. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. Runs scope evidence only. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. Every command requires a concise purpose for durable history. Use command_sequence for dependent interactions such as username then password; every non-final step needs an explicit expect or regex boundary, and a failed step prevents later writes. command and command_sequence use the selected port's transport_profile and model_profile; input and signal are raw. Monitor Jobs persist after this MCP process exits; stop them when no longer needed.";
 
-pub async fn serve(tools: AgentTools) -> Result<()> {
+pub async fn serve_stdio(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let input_thread = std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -167,6 +176,138 @@ pub async fn serve(tools: AgentTools) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct HttpState {
+    tools: AgentTools,
+    active_requests: ActiveRequests,
+    listen: SocketAddr,
+}
+
+pub async fn serve_http(tools: AgentTools, listen: SocketAddr, managed: bool) -> Result<()> {
+    if listen.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        anyhow::bail!("Streamable HTTP MCP must listen on 127.0.0.1");
+    }
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let state = HttpState {
+        tools,
+        active_requests: Arc::new(Mutex::new(HashMap::new())),
+        listen,
+    };
+    axum::serve(
+        listener,
+        Router::new()
+            .route("/mcp", post(http_post))
+            .with_state(state),
+    )
+    .with_graceful_shutdown(http_shutdown_signal(managed))
+    .await?;
+    Ok(())
+}
+
+async fn http_shutdown_signal(managed: bool) {
+    if managed {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut stdin = tokio::io::stdin();
+        let mut buffer = [0_u8; 256];
+        loop {
+            match stdin.read(&mut buffer).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("serial-mcp: failed to read the managed shutdown pipe: {error}");
+                    return;
+                }
+            }
+        }
+    } else {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn http_post(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !origin_allowed(&headers, state.listen) {
+        return (StatusCode::FORBIDDEN, "origin is not allowed").into_response();
+    }
+    if let Some(version) = headers
+        .get("MCP-Protocol-Version")
+        .and_then(|value| value.to_str().ok())
+        && !SUPPORTED_PROTOCOLS.contains(&version)
+    {
+        return (StatusCode::BAD_REQUEST, "unsupported MCP-Protocol-Version").into_response();
+    }
+    let request = match serde_json::from_slice::<RpcRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return Json(rpc_error(
+                Value::Null,
+                -32700,
+                format!("parse error: {error}"),
+            ))
+            .into_response();
+        }
+    };
+    if request.jsonrpc.as_deref() != Some("2.0") {
+        return request.id.map_or_else(
+            || StatusCode::ACCEPTED.into_response(),
+            |id| Json(rpc_error(id, -32600, "jsonrpc must be 2.0")).into_response(),
+        );
+    }
+    if is_cancel_notification(&request.method) {
+        if let Some(cancelled_id) = cancellation_id(&request.params) {
+            cancel_request(&state.active_requests, &cancelled_id);
+        }
+        return StatusCode::ACCEPTED.into_response();
+    }
+    let Some(id) = request.id.clone() else {
+        return StatusCode::ACCEPTED.into_response();
+    };
+    let key = request_key(&id);
+    let (cancel_tx, cancel_rx) = if request_is_cancellable(&request) {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    {
+        let mut active = state
+            .active_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.contains_key(&key) {
+            return Json(rpc_error(id, -32600, "request id is already active")).into_response();
+        }
+        active.insert(key.clone(), cancel_tx);
+    }
+    let response = match cancel_rx {
+        Some(cancel_rx) => tokio::select! {
+            _ = cancel_rx => rpc_error(id.clone(), -32800, "request cancelled"),
+            response = dispatch_request(&state.tools, request, id.clone()) => response,
+        },
+        None => dispatch_request(&state.tools, request, id).await,
+    };
+    state
+        .active_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    Json(response).into_response()
+}
+
+fn origin_allowed(headers: &HeaderMap, listen: SocketAddr) -> bool {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    let local_host = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
+    local_host && url.port_or_known_default() == Some(listen.port())
+}
+
 enum Input {
     Line(String),
     Error(String),
@@ -220,7 +361,7 @@ fn request_is_cancellable(request: &RpcRequest) -> bool {
             .and_then(Value::as_str)
             .unwrap_or_default(),
         "devices"
-            | "device_models"
+            | "model_profiles"
             | "read"
             | "wait"
             | "search"
@@ -337,7 +478,7 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
     // harmless merely because the adapter itself keeps an audit trail.
     let destructive = matches!(
         name,
-        "device_model_set"
+        "model_profile_set"
             | "command"
             | "command_sequence"
             | "input"
@@ -372,35 +513,36 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "devices",
-            "List Slots, configured model/Profile, and ownership; independently confirm the physical DUT before any connection or write.",
-            object(json!({"slot_id":{"type":"string"}}), &[]),
+            "List serial ports, configured profiles, and ownership.",
+            object(json!({"port":{"type":"string"}}), &[]),
             true,
         ),
         tool(
-            "device_models",
-            "Read the model catalog and Slot bindings. Names are not evidence of the physical DUT; on first connection or doubt, verify by serial, telnet, web, or human.",
-            object(json!({"slot_id":{"type":"string"}}), &[]),
+            "model_profiles",
+            "Read model profiles and their current port bindings.",
+            object(json!({"port":{"type":"string"}}), &[]),
             true,
         ),
         tool(
-            "device_model_set",
-            "Assign/create a Slot model or guarded-update its current node; shared edits affect bound Slots. Confirm physical DUT on first connection or doubt via serial, telnet, web, or human.",
+            "model_profile_set",
+            "Create or update one model profile and bind it to a port; pass null to detach the port.",
             object(
                 json!({
-                    "slot_id":{"type":"string","minLength":1},
-                    "model_id":{"type":"string","minLength":1,"maxLength":128},
-                    "create_if_missing":{"type":"boolean"},
-                    "update_existing":{"type":"boolean","description":"Guarded patch of this Slot's current node; conflicts with create."},
-                    "name":{"type":"string","minLength":1,"maxLength":128,"description":"Create name or replacement name."},
-                    "parent":{"type":"string","minLength":1,"maxLength":128,"description":"Create/replacement parent ID."},
-                    "clear_parent":{"type":"boolean"},
-                    "aliases":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":128}},
-                    "clear_aliases":{"type":"boolean"},
-                    "expected_current":{"description":"Omit to guard the observed binding; null requires unbound; string requires that model ID.","anyOf":[{"type":"string","minLength":1,"maxLength":128},{"type":"null"}]},
-                    "confirmation_method":{"type":"string","enum":["serial","telnet","web","human","other"],"description":"How the physical DUT identity was confirmed."},
-                    "note":{"type":"string","maxLength":2048}
+                    "port":{"type":"string","minLength":1},
+                    "profile":{"description":"Complete model profile, or null to detach.","anyOf":[
+                        {"type":"object","additionalProperties":false,"required":["name"],"properties":{
+                            "name":{"type":"string","minLength":1,"maxLength":64},
+                            "shell_prompt":{"type":["string","null"],"minLength":1,"maxLength":4096},
+                            "uboot_prompt":{"type":["string","null"],"minLength":1,"maxLength":4096},
+                            "write_eol":{"type":["string","null"]},
+                            "echo":{"type":["string","null"],"enum":["on","off","auto",null]},
+                            "write_chunk_size":{"type":["integer","null"],"minimum":1},
+                            "write_chunk_delay_ms":{"type":["integer","null"],"minimum":0,"maximum":10000}
+                        }},
+                        {"type":"null"}
+                    ]}
                 }),
-                &["slot_id", "model_id", "confirmation_method"],
+                &["port", "profile"],
             ),
             false,
         ),
@@ -409,13 +551,13 @@ pub fn tool_definitions() -> Vec<Value> {
             "Read bounded serial output; archive requires epoch.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
+                    "port":{"type":"string"},
                     "scope":{"type":"string","enum":["tail","continue","archive"]},
                     "epoch":{"type":"string","format":"uuid"},
                     "after_seq":{"type":"integer","minimum":0},
                     "through_seq":{"type":"integer","minimum":1,"description":"Archive inclusive end."}
                 }),
-                &["slot_id"],
+                &["port"],
             ),
             true,
         ),
@@ -527,7 +669,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Search current Run by default; archive requires explicit epoch.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},
+                    "port":{"type":"string"},
                     "query":{"type":"string","minLength":1,"maxLength":4096},
                     "regex":{"type":"boolean"},
                     "scope":{"type":"string","enum":["current_run","current_cursor","archive"]},
@@ -535,7 +677,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "epoch":{"type":"string","format":"uuid"},
                     "after_seq":{"type":"integer","minimum":0}
                 }),
-                &["slot_id", "query"],
+                &["port", "query"],
             ),
             true,
         ),
@@ -545,13 +687,13 @@ pub fn tool_definitions() -> Vec<Value> {
             {
                 let mut schema = object(
                     json!({
-                    "slot_id":{"type":"string"},
+                    "port":{"type":"string"},
                     "contains":{"type":"string","minLength":1,"maxLength":4096},
                     "regex":{"type":"string","minLength":1,"maxLength":4096},
                     "description":{"type":"string","minLength":1,"maxLength":1024},
                     "idempotency_key":{"type":"string","format":"uuid","description":"Reuse on retry."}
                     }),
-                    &["slot_id"],
+                    &["port"],
                 );
                 schema["oneOf"] = json!([
                     {"required":["contains"]},
@@ -563,8 +705,8 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "monitor_list",
-            "List persistent Monitors; optionally filter by Slot.",
-            object(json!({"slot_id":{"type":"string"}}), &[]),
+            "List persistent Monitors; optionally filter by port.",
+            object(json!({"port":{"type":"string"}}), &[]),
             true,
         ),
         tool(
@@ -602,9 +744,9 @@ pub fn tool_definitions() -> Vec<Value> {
             "Confirm the physical DUT by serial, telnet, web UI, or a human, then acquire control and return one opaque run_handle.",
             object(
                 json!({
-                    "slot_id":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
+                    "port":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
                 }),
-                &["slot_id", "label"],
+                &["port", "label"],
             ),
             false,
         ),
@@ -625,7 +767,7 @@ pub fn tool_definitions() -> Vec<Value> {
             {
                 let mut schema = object(
                     json!({
-                        "slot_id":{"type":"string"},
+                        "port":{"type":"string"},
                         "abort_run":{"type":"boolean"},
                         "run_handle":run_handle_schema()
                     }),
@@ -633,14 +775,14 @@ pub fn tool_definitions() -> Vec<Value> {
                 );
                 schema["oneOf"] = json!([
                     {
-                        "required":["slot_id"],
+                        "required":["port"],
                         "properties":{"abort_run":{"const":false}},
                         "not":{"required":["run_handle"]}
                     },
                     {
                         "required":["run_handle","abort_run"],
                         "properties":{"abort_run":{"const":true}},
-                        "not":{"required":["slot_id"]}
+                        "not":{"required":["port"]}
                     }
                 ]);
                 schema
@@ -674,6 +816,125 @@ fn run_handle_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    fn test_http_app() -> Router {
+        let endpoint = "http://127.0.0.1:1".to_string();
+        let tools = AgentTools::new(
+            crate::api::ApiClient::new(endpoint.clone()).unwrap(),
+            crate::session::SessionHandle::spawn(
+                endpoint,
+                "test-agent".into(),
+                Some(std::time::Duration::from_secs(1_800)),
+            ),
+            "test-agent".into(),
+            crate::config::CaptureLimits::default(),
+        );
+        let state = HttpState {
+            tools,
+            active_requests: Arc::new(Mutex::new(HashMap::new())),
+            listen: "127.0.0.1:3211".parse().unwrap(),
+        };
+        Router::new()
+            .route("/mcp", post(http_post))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn streamable_http_request_notification_and_get_contract() {
+        let initialize = test_http_app()
+            .oneshot(
+                Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc":"2.0",
+                            "id":1,
+                            "method":"initialize",
+                            "params":{"protocolVersion":LATEST_PROTOCOL}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initialize.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&to_bytes(initialize.into_body(), 256 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["result"]["protocolVersion"], LATEST_PROTOCOL);
+
+        let notification = test_http_app()
+            .oneshot(
+                Request::post("/mcp")
+                    .body(Body::from(
+                        json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notification.status(), StatusCode::ACCEPTED);
+        assert!(
+            to_bytes(notification.into_body(), 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let get = test_http_app()
+            .oneshot(Request::get("/mcp").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_validates_origin_and_protocol_header() {
+        let notification = || {
+            Body::from(json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string())
+        };
+        let local = test_http_app()
+            .oneshot(
+                Request::post("/mcp")
+                    .header("origin", "http://localhost:3211")
+                    .header("MCP-Protocol-Version", LATEST_PROTOCOL)
+                    .body(notification())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.status(), StatusCode::ACCEPTED);
+
+        for origin in ["http://evil.example:3211", "http://127.0.0.1:9999"] {
+            let response = test_http_app()
+                .oneshot(
+                    Request::post("/mcp")
+                        .header("origin", origin)
+                        .body(notification())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+
+        let unsupported = test_http_app()
+            .oneshot(
+                Request::post("/mcp")
+                    .header("MCP-Protocol-Version", "2000-01-01")
+                    .body(notification())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn tool_names_form_the_stable_agent_surface() {
@@ -685,8 +946,8 @@ mod tests {
             names,
             [
                 "devices",
-                "device_models",
-                "device_model_set",
+                "model_profiles",
+                "model_profile_set",
                 "read",
                 "command",
                 "command_sequence",
@@ -708,40 +969,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_guidance_requires_physical_model_confirmation() {
-        for evidence in ["serial evidence", "telnet", "web UI", "human"] {
-            assert!(SERVER_INSTRUCTIONS.contains(evidence));
-        }
-        assert!(SERVER_INSTRUCTIONS.contains("max_fires limits sends"));
-        assert!(SERVER_INSTRUCTIONS.contains("normal kickoff plus repeated action"));
-        assert!(SERVER_INSTRUCTIONS.contains("omit start_contains"));
-        assert!(SERVER_INSTRUCTIONS.contains("explicitly gate the first action"));
-        assert!(SERVER_INSTRUCTIONS.contains("remain armed until match or timeout"));
-        assert!(SERVER_INSTRUCTIONS.contains("not target success or failure"));
-        assert!(SERVER_INSTRUCTIONS.contains("configured model matches the physical DUT"));
-        assert!(SERVER_INSTRUCTIONS.contains("orphan timeout"));
+    fn agent_guidance_explains_runs_sequences_and_profiles() {
         assert!(SERVER_INSTRUCTIONS.contains("Before the final reply, call run_end"));
         assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
         assert!(SERVER_INSTRUCTIONS.contains("Use command_sequence"));
-        assert!(SERVER_INSTRUCTIONS.contains("overall purpose"));
-        assert!(SERVER_INSTRUCTIONS.contains("Every non-final step"));
-        assert!(SERVER_INSTRUCTIONS.contains("failed step prevents all later writes"));
-        assert!(SERVER_INSTRUCTIONS.contains("same plaintext TX audit"));
-
-        let tools = tool_definitions();
-        for name in ["devices", "device_models", "device_model_set", "run_start"] {
-            let description =
-                tools.iter().find(|tool| tool["name"] == name).unwrap()["description"]
-                    .as_str()
-                    .unwrap();
-            assert!(description.contains("physical DUT"));
-            if matches!(name, "device_models" | "device_model_set") {
-                assert!(description.contains("first connection or doubt"));
-                for evidence in ["serial", "telnet", "web", "human"] {
-                    assert!(description.contains(evidence));
-                }
-            }
-        }
+        assert!(SERVER_INSTRUCTIONS.contains("every non-final step"));
+        assert!(SERVER_INSTRUCTIONS.contains("failed step prevents later writes"));
+        assert!(SERVER_INSTRUCTIONS.contains("transport_profile and model_profile"));
     }
 
     #[test]
@@ -755,7 +989,7 @@ mod tests {
     fn annotations_do_not_hide_physical_or_persistent_side_effects() {
         let tools = tool_definitions();
         for name in [
-            "device_model_set",
+            "model_profile_set",
             "command",
             "command_sequence",
             "input",
@@ -782,7 +1016,7 @@ mod tests {
         }
         let catalog = tools
             .iter()
-            .find(|tool| tool["name"] == "device_models")
+            .find(|tool| tool["name"] == "model_profiles")
             .unwrap();
         assert_eq!(catalog["annotations"]["readOnlyHint"], true);
         assert_eq!(catalog["annotations"]["destructiveHint"], false);
@@ -790,45 +1024,36 @@ mod tests {
     }
 
     #[test]
-    fn device_model_tools_expose_catalog_read_and_narrow_operator_binding() {
+    fn model_profile_tools_expose_one_profile_and_port_binding_contract() {
         let tools = tool_definitions();
         let read = tools
             .iter()
-            .find(|tool| tool["name"] == "device_models")
+            .find(|tool| tool["name"] == "model_profiles")
             .unwrap();
         assert_eq!(read["annotations"]["readOnlyHint"], true);
-        assert!(read["inputSchema"]["properties"].get("slot_id").is_some());
+        assert!(read["inputSchema"]["properties"].get("port").is_some());
 
         let set = tools
             .iter()
-            .find(|tool| tool["name"] == "device_model_set")
+            .find(|tool| tool["name"] == "model_profile_set")
             .unwrap();
         assert_eq!(set["annotations"]["readOnlyHint"], false);
-        assert_eq!(
-            set["inputSchema"]["required"],
-            json!(["slot_id", "model_id", "confirmation_method"])
-        );
+        assert_eq!(set["inputSchema"]["required"], json!(["port", "profile"]));
         let properties = set["inputSchema"]["properties"].as_object().unwrap();
-        for field in [
-            "create_if_missing",
-            "update_existing",
-            "name",
-            "parent",
-            "clear_parent",
-            "aliases",
-            "clear_aliases",
-            "expected_current",
-            "confirmation_method",
-            "note",
-        ] {
-            assert!(properties.contains_key(field), "missing {field}");
+        assert!(properties.contains_key("port"));
+        assert!(properties.contains_key("profile"));
+        assert_eq!(properties.len(), 2);
+        let profile = &properties["profile"]["anyOf"][0];
+        assert_eq!(profile["required"], json!(["name"]));
+        for field in ["name", "shell_prompt", "uboot_prompt", "write_eol", "echo"] {
+            assert!(
+                profile["properties"].get(field).is_some(),
+                "missing {field}"
+            );
         }
-        assert_eq!(
-            properties["confirmation_method"]["enum"],
-            json!(["serial", "telnet", "web", "human", "other"])
-        );
-        assert!(properties.get("models").is_none());
-        assert!(properties.get("expected_revision").is_none());
+        let serialized = serde_json::to_string(set).unwrap();
+        assert!(!serialized.contains("slot_id"));
+        assert!(!serialized.contains("device_model"));
     }
 
     #[test]
@@ -993,9 +1218,9 @@ mod tests {
             .find(|tool| tool["name"] == "monitor_start")
             .unwrap();
         let properties = start["inputSchema"]["properties"].as_object().unwrap();
-        assert_eq!(start["inputSchema"]["required"], json!(["slot_id"]));
+        assert_eq!(start["inputSchema"]["required"], json!(["port"]));
         for expected in [
-            "slot_id",
+            "port",
             "contains",
             "regex",
             "description",
@@ -1031,12 +1256,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_uses_compact_compatibility_text() {
-        let value = json!({"slot_id":"bench","nested":{"ready":true}});
+    fn tool_result_uses_compact_text_and_structured_content() {
+        let value = json!({"port":"bench","nested":{"ready":true}});
         let result = tool_result(value.clone(), false);
         assert_eq!(
             result["content"][0]["text"],
-            r#"{"nested":{"ready":true},"slot_id":"bench"}"#
+            r#"{"nested":{"ready":true},"port":"bench"}"#
         );
         assert_eq!(result["structuredContent"], value);
         assert_eq!(result["isError"], false);
@@ -1097,7 +1322,7 @@ mod tests {
     fn only_read_only_tool_calls_are_cancellable() {
         for name in [
             "devices",
-            "device_models",
+            "model_profiles",
             "read",
             "wait",
             "search",
@@ -1113,7 +1338,7 @@ mod tests {
             }));
         }
         for name in [
-            "device_model_set",
+            "model_profile_set",
             "command",
             "command_sequence",
             "input",
@@ -1224,10 +1449,10 @@ mod tests {
                 schema["properties"]["run_handle"]["maxLength"], 22,
                 "{name}"
             );
-            for legacy in ["slot_id", "run_id", "run_token"] {
+            for removed_field in ["port", "run_id", "run_token"] {
                 assert!(
-                    schema["properties"].get(legacy).is_none(),
-                    "{name} exposes {legacy}"
+                    schema["properties"].get(removed_field).is_none(),
+                    "{name} exposes {removed_field}"
                 );
             }
         }
@@ -1236,12 +1461,12 @@ mod tests {
         assert_eq!(release["inputSchema"]["required"], json!([]));
         let modes = release["inputSchema"]["oneOf"].as_array().unwrap();
         assert_eq!(modes.len(), 2);
-        assert_eq!(modes[0]["required"], json!(["slot_id"]));
+        assert_eq!(modes[0]["required"], json!(["port"]));
         assert_eq!(modes[0]["properties"]["abort_run"]["const"], false);
         assert_eq!(modes[0]["not"]["required"], json!(["run_handle"]));
         assert_eq!(modes[1]["required"], json!(["run_handle", "abort_run"]));
         assert_eq!(modes[1]["properties"]["abort_run"]["const"], true);
-        assert_eq!(modes[1]["not"]["required"], json!(["slot_id"]));
+        assert_eq!(modes[1]["not"]["required"], json!(["port"]));
         assert!(
             release["inputSchema"]["properties"]
                 .get("run_handle")

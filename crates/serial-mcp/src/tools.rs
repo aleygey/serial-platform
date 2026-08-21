@@ -5,19 +5,20 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS,
-    DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, DeviceModelListResponse, Direction,
+    Actor, ActorKind, CommandCaptureMatcher, CommandCaptureMatcherKind,
+    ConfigureModelProfilesRequest, ConfigurePortsRequest, CreateMonitorRequest, Cursor,
+    DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, Direction,
     EchoMode, EventKind, EventQuery, EventQueryResponse, MAX_BREAK_DURATION_MS,
     MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
     MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
     MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
     MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS, MIN_TRIGGER_INTERVAL_MS,
-    MIN_TRIGGER_TIMEOUT_MS, ModelConfirmationMethod, PROTOCOL_VERSION, SequenceWritePrecondition,
-    SessionState, SetSlotDeviceModelRequest, SlotSnapshot, StatusResponse, TriggerInfo,
-    TriggerSpec, TriggerStatus, WritePacing,
+    MIN_TRIGGER_TIMEOUT_MS, ModelProfile, PROTOCOL_VERSION, SequenceWritePrecondition,
+    SessionState, SlotSnapshot, StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus,
+    WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -42,8 +43,6 @@ const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
 const TRIGGER_STATUS_MARGIN: Duration =
     Duration::from_millis(MAX_PHYSICAL_WRITE_TIMEOUT_MS + 5_000);
 const TRIGGER_CANCEL_MARGIN: Duration = Duration::from_secs(5);
-const MODEL_BINDING_SOURCE: &str = "agent:serial-mcp";
-const MODEL_IDENTITY_WARNING: &str = "A configured model name is an assignment, not evidence of the connected hardware. On first connection or whenever the identity is uncertain, confirm it via serial evidence, telnet, the device web UI, or a human.";
 
 struct PreparedCommandStep {
     bytes: Vec<u8>,
@@ -51,6 +50,7 @@ struct PreparedCommandStep {
     timeout: Duration,
     patterns: Vec<CompletionPattern>,
     until_regex: Option<regex::Regex>,
+    capture_matchers: Vec<CommandCaptureMatcher>,
     complete_on_quiet: bool,
     expected_echo: Option<Vec<u8>>,
 }
@@ -147,8 +147,8 @@ impl AgentTools {
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
         let mut output = match name {
             "devices" => self.devices(parse(arguments)?).await,
-            "device_models" => self.device_models(parse(arguments)?).await,
-            "device_model_set" => self.device_model_set(parse(arguments)?).await,
+            "model_profiles" => self.model_profiles(parse(arguments)?).await,
+            "model_profile_set" => self.model_profile_set(parse(arguments)?).await,
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,
             "command_sequence" => self.command_sequence(parse(arguments)?).await,
@@ -195,7 +195,7 @@ impl AgentTools {
         if tool_name == "read" && output.get("scope").and_then(Value::as_str) == Some("archive") {
             return;
         }
-        let Some(slot_id) = output.get("slot_id").and_then(Value::as_str) else {
+        let Some(port) = output.get("port").and_then(Value::as_str) else {
             return;
         };
         let Some(after_seq) = output.pointer("/cursor/after_seq").and_then(Value::as_u64) else {
@@ -214,32 +214,30 @@ impl AgentTools {
             .operation_cursors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(slot_id.to_owned(), current.clone());
+            .insert(port.to_owned(), current.clone());
         if tool_name == "run_start" {
             return;
         }
         let Some(previous) = previous else {
             if is_observation {
-                self.clear_pending_context(slot_id);
+                self.clear_pending_context(port);
             }
             return;
         };
         if previous.epoch != current.epoch || previous.after_seq >= current.after_seq {
             if is_observation {
-                self.clear_pending_context(slot_id);
+                self.clear_pending_context(port);
             }
             return;
         }
-        let context = self
-            .recent_context_between(slot_id, &previous, &current)
-            .await;
+        let context = self.recent_context_between(port, &previous, &current).await;
         if is_observation {
-            self.clear_pending_context(slot_id);
+            self.clear_pending_context(port);
         } else if let Some(context) = context.as_ref() {
             self.pending_context
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(slot_id.to_owned(), context.clone());
+                .insert(port.to_owned(), context.clone());
         }
         if let Some(context) = context {
             output["recent_context"] = context;
@@ -248,7 +246,7 @@ impl AgentTools {
 
     async fn recent_context_between(
         &self,
-        slot_id: &str,
+        port: &str,
         previous: &Cursor,
         current: &Cursor,
     ) -> Option<Value> {
@@ -258,12 +256,7 @@ impl AgentTools {
         let own_actor_id = self.session.actor_id().await.ok().flatten();
         match self
             .api
-            .recent_activity(
-                slot_id,
-                current.epoch,
-                previous.after_seq,
-                current.after_seq,
-            )
+            .recent_activity(port, current.epoch, previous.after_seq, current.after_seq)
             .await
         {
             Ok(activity) => {
@@ -290,7 +283,7 @@ impl AgentTools {
             .pending_context
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&slot.config.id)
+            .get(&slot.config.port)
             .cloned()
         {
             return Err(ContextChanged { recent_context }.into());
@@ -299,7 +292,7 @@ impl AgentTools {
             .operation_cursors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&slot.config.id)
+            .get(&slot.config.port)
             .cloned();
         let Some(previous) = previous else {
             return Ok(());
@@ -321,27 +314,27 @@ impl AgentTools {
             self.pending_context
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(slot.config.id.clone(), recent_context.clone());
+                .insert(slot.config.port.clone(), recent_context.clone());
             return Err(ContextChanged { recent_context }.into());
         }
         if let Some(recent_context) = self
-            .recent_context_between(&slot.config.id, &previous, &current)
+            .recent_context_between(&slot.config.port, &previous, &current)
             .await
         {
             self.pending_context
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(slot.config.id.clone(), recent_context.clone());
+                .insert(slot.config.port.clone(), recent_context.clone());
             return Err(ContextChanged { recent_context }.into());
         }
         Ok(())
     }
 
-    fn clear_pending_context(&self, slot_id: &str) {
+    fn clear_pending_context(&self, port: &str) {
         self.pending_context
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(slot_id);
+            .remove(port);
     }
 
     async fn context_changed_after_boundary(
@@ -350,7 +343,7 @@ impl AgentTools {
         boundary_error: &anyhow::Error,
     ) -> anyhow::Error {
         let current_slot = self
-            .slot(&slot.config.id)
+            .slot(&slot.config.port)
             .await
             .unwrap_or_else(|_| slot.clone());
         let current = Cursor {
@@ -361,14 +354,14 @@ impl AgentTools {
             .operation_cursors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&slot.config.id)
+            .get(&slot.config.port)
             .cloned()
             .unwrap_or(Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: slot.head_seq,
             });
         let recent_context = if previous.epoch == current.epoch {
-            self.recent_context_between(&slot.config.id, &previous, &current)
+            self.recent_context_between(&slot.config.port, &previous, &current)
                 .await
         } else {
             None
@@ -387,108 +380,118 @@ impl AgentTools {
         self.pending_context
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(slot.config.id.clone(), recent_context.clone());
+            .insert(slot.config.port.clone(), recent_context.clone());
         ContextChanged { recent_context }.into()
     }
 
     async fn devices(&self, args: DevicesArgs) -> Result<Value> {
         let status = self.status().await?;
-        let model_catalog = self.api.device_models_if_supported().await?;
-        let mut slots: Vec<Value> = status
-            .slots
+        let ports: Vec<Value> = status
+            .ports
             .iter()
-            .filter(|slot| args.slot_id.as_ref().is_none_or(|id| &slot.config.id == id))
-            .map(|slot| {
-                let mut summary = slot_summary(slot);
-                summary["device_model"] = model_catalog.as_ref().map_or(Value::Null, |catalog| {
-                    slot_device_model_summary(&slot.config.id, catalog)
-                });
-                summary
+            .filter(|slot| {
+                args.port
+                    .as_ref()
+                    .is_none_or(|port| &slot.config.port == port)
             })
+            .map(slot_summary)
             .collect();
-        disambiguate_display_names(&mut slots);
-        if let Some(slot_id) = args.slot_id
-            && slots.is_empty()
+        if let Some(port) = args.port
+            && ports.is_empty()
         {
-            bail!("unknown Slot {slot_id:?}");
+            bail!("unknown serial port {port:?}");
         }
         Ok(json!({
             "daemon_epoch": status.daemon_epoch,
-            "model_config_revision": model_catalog.as_ref().map(|catalog| catalog.config_revision),
-            "device_model_capability": if model_catalog.is_some() { "available" } else { "unavailable" },
-            "slots": slots,
-            "selection_note": "Choose a Slot explicitly and confirm that its configured model matches the physical DUT before connecting or writing. Confirm by serial evidence, telnet, the device web UI, or a human; a configured name alone is not proof. A Run isolates only its log/event interval; it does not reset, initialize, or otherwise isolate device state."
+            "config_revision": status.config_revision,
+            "ports": ports,
+            "selection_note": "Choose a port explicitly and confirm its model_profile matches the connected device before writing. A Run scopes evidence; it does not reset the device."
         }))
     }
 
-    async fn device_models(&self, args: DeviceModelsArgs) -> Result<Value> {
-        if let Some(slot_id) = args.slot_id.as_deref() {
-            // A missing binding is valid for a known Slot, so validate the
-            // filter independently instead of treating an empty result as an
-            // unknown Slot.
-            self.slot(slot_id).await?;
+    async fn model_profiles(&self, args: ModelProfilesArgs) -> Result<Value> {
+        let status = self.status().await?;
+        if let Some(port) = args.port.as_deref() {
+            self.slot(port).await?;
         }
-        let catalog = self.api.device_models().await?;
-        let bindings = catalog
-            .bindings
+        let catalog = self.api.model_profiles().await?;
+        let bindings = status.ports
             .into_iter()
-            .filter(|binding| {
-                args.slot_id
-                    .as_deref()
-                    .is_none_or(|slot_id| binding.slot_id == slot_id)
-            })
+            .filter(|slot| args.port.as_deref().is_none_or(|port| slot.config.port == port))
+            .map(|slot| json!({"port": slot.config.port, "model_profile": slot.config.model_profile}))
             .collect::<Vec<_>>();
         Ok(json!({
             "config_revision": catalog.config_revision,
-            "models": catalog.models,
+            "profiles": catalog.profiles,
             "bindings": bindings,
-            "slot_id_filter": args.slot_id,
-            "identity_warning": MODEL_IDENTITY_WARNING,
+            "port_filter": args.port,
         }))
     }
 
-    async fn device_model_set(&self, args: DeviceModelSetArgs) -> Result<Value> {
-        let catalog = self.api.device_models().await?;
-        let observed_previous_model_id = catalog
-            .bindings
+    async fn model_profile_set(&self, args: ModelProfileSetArgs) -> Result<Value> {
+        let status = self.status().await?;
+        let current = status
+            .ports
             .iter()
-            .find(|binding| binding.slot_id == args.slot_id)
-            .map(|binding| binding.model_id.clone());
-        let request = build_device_model_set_request(&args, &catalog)?;
+            .find(|slot| slot.config.port == args.port)
+            .ok_or_else(|| anyhow!("unknown serial port {:?}", args.port))?;
+        let previous = current.config.model_profile.clone();
+        let mut config_revision = status.config_revision;
+        let catalog = self.api.model_profiles().await?;
+        if let Some(profile) = args.profile.clone() {
+            let mut profiles = catalog.profiles;
+            match profiles
+                .iter()
+                .position(|candidate| candidate.name == profile.name)
+            {
+                Some(index) => profiles[index] = profile,
+                None => profiles.push(profile),
+            }
+            config_revision = self
+                .api
+                .configure_model_profiles(&ConfigureModelProfilesRequest {
+                    profiles,
+                    expected_revision: Some(catalog.config_revision),
+                })
+                .await?
+                .config_revision;
+        }
+        let latest = self.status().await?;
+        let mut port_configs = latest
+            .ports
+            .into_iter()
+            .map(|port| port.config)
+            .collect::<Vec<_>>();
+        let configured = port_configs
+            .iter_mut()
+            .find(|port| port.port == args.port)
+            .expect("port was validated against the same daemon");
+        configured.model_profile = args.profile.as_ref().map(|profile| profile.name.clone());
         let response = self
             .api
-            .set_slot_device_model(&args.slot_id, &request)
+            .configure_ports(&ConfigurePortsRequest {
+                ports: port_configs,
+                source: "agent:serial-mcp".into(),
+                expected_revision: Some(config_revision),
+            })
             .await?;
-        let shared_model_warning =
-            (args.update_existing && response.affected_slots.len() > 1).then(|| {
-            format!(
-                "This model node is shared by {} Slots; updated name, parent, or aliases are visible to every affected Slot.",
-                response.affected_slots.len()
-            )
-        });
         Ok(json!({
-            "slot_id": args.slot_id,
-            "previous_model_id": observed_previous_model_id,
-            "binding": response.binding,
-            "model": response.model,
-            "created": response.created,
-            "affected_slots": response.affected_slots,
-            "shared_model_warning": shared_model_warning,
+            "port": args.port,
+            "previous_model_profile": previous,
+            "model_profile": args.profile,
             "config_revision": response.config_revision,
-            "identity_warning": MODEL_IDENTITY_WARNING,
-            "next_step": "Before connecting or issuing commands, re-confirm the physical DUT whenever this is its first connection or its identity remains uncertain."
         }))
     }
 
     async fn read(&self, args: ReadArgs) -> Result<Value> {
-        let slot = self.slot(&args.slot_id).await?;
+        let slot = self.slot(&args.port).await?;
         let scope = args.scope.as_deref().unwrap_or("tail");
         if args.through_seq.is_some() && scope != "archive" {
             bail!("through_seq is only valid with scope=archive");
         }
         let (epoch, response) = match scope {
             "tail" => {
-                let response = self.api.live_tail(&args.slot_id, 200, None).await?;
+                let response = self.api.live_tail(&args.port, 200, None).await?;
                 let epoch = response
                     .next_cursor
                     .as_ref()
@@ -497,14 +500,11 @@ impl AgentTools {
                 (epoch, response)
             }
             "continue" => {
-                let cursor = self.live_cursor(&slot.config.id).unwrap_or(Cursor {
+                let cursor = self.live_cursor(&slot.config.port).unwrap_or(Cursor {
                     epoch: slot.daemon_epoch,
                     after_seq: slot.head_seq,
                 });
-                let response = self
-                    .api
-                    .live_tail(&args.slot_id, 1_000, Some(&cursor))
-                    .await?;
+                let response = self.api.live_tail(&args.port, 1_000, Some(&cursor)).await?;
                 let response_epoch = response
                     .next_cursor
                     .as_ref()
@@ -518,7 +518,7 @@ impl AgentTools {
                 let response = self
                     .api
                     .events(
-                        &args.slot_id,
+                        &args.port,
                         &EventQuery {
                             epoch: Some(epoch),
                             after_seq: args.after_seq,
@@ -568,7 +568,7 @@ impl AgentTools {
             && let Some(after_seq) = output["cursor"]["after_seq"].as_u64()
         {
             self.remember_live_cursor(
-                &slot.config.id,
+                &slot.config.port,
                 Cursor {
                     epoch: slot.daemon_epoch,
                     after_seq,
@@ -586,7 +586,7 @@ impl AgentTools {
             .regex
             .then(|| compile_regex(&args.query, "query"))
             .transpose()?;
-        let slot = self.slot(&args.slot_id).await?;
+        let slot = self.slot(&args.port).await?;
         let scope = args.scope.as_deref().unwrap_or("current_run");
         let (epoch, after_seq, run_id) = match scope {
             "current_run" => {
@@ -596,14 +596,14 @@ impl AgentTools {
             }
             "current_cursor" => {
                 let cursor = requested_cursor(args.epoch, args.after_seq, &slot)?
-                    .or_else(|| self.live_cursor(&slot.config.id))
+                    .or_else(|| self.live_cursor(&slot.config.port))
                     .context("scope=current_cursor has no remembered cursor; call read/run_start first or pass epoch and after_seq")?;
                 (cursor.epoch, Some(cursor.after_seq), args.run_id)
             }
             "archive" => {
                 let epoch = match args.epoch {
                     Some(epoch) => epoch,
-                    None => bail!("{}", self.archive_epoch_hint(&args.slot_id, &slot).await),
+                    None => bail!("{}", self.archive_epoch_hint(&args.port, &slot).await),
                 };
                 (epoch, args.after_seq, args.run_id)
             }
@@ -625,7 +625,7 @@ impl AgentTools {
             limit_events: Some(1000),
             limit_bytes: Some(1024 * 1024),
         };
-        let response = self.api.events(&args.slot_id, &query).await?;
+        let response = self.api.events(&args.port, &query).await?;
         let no_matches = response.events.is_empty();
         let truncated = response.truncated;
         let mut output = render_response(
@@ -656,7 +656,7 @@ impl AgentTools {
         if truncated {
             attach_search_continuation_guidance(&mut output, scope, run_id);
         } else if no_matches {
-            self.attach_archive_guidance(&mut output, &args.slot_id, scope)
+            self.attach_archive_guidance(&mut output, &args.port, scope)
                 .await;
         }
         Ok(output)
@@ -664,10 +664,10 @@ impl AgentTools {
 
     /// Error text for scope=archive without an epoch, carrying a concrete
     /// example value the caller can retry with.
-    async fn archive_epoch_hint(&self, slot_id: &str, slot: &SlotSnapshot) -> String {
+    async fn archive_epoch_hint(&self, port: &str, slot: &SlotSnapshot) -> String {
         let example = self
             .api
-            .archives(Some(slot_id))
+            .archives(Some(port))
             .await
             .ok()
             .and_then(|list| list.archives.first().map(|archive| archive.epoch))
@@ -679,11 +679,11 @@ impl AgentTools {
         let request = create_monitor_request(args)?;
         let status = self.status().await?;
         if !status
-            .slots
+            .ports
             .iter()
-            .any(|slot| slot.config.id == request.spec.slot_id)
+            .any(|slot| slot.config.port == request.spec.port)
         {
-            bail!("unknown Slot {:?}", request.spec.slot_id);
+            bail!("unknown port {:?}", request.spec.port);
         }
         let response = self.api.create_monitor(&request).await?;
         let monitor = monitor_from_response(response)?;
@@ -698,7 +698,7 @@ impl AgentTools {
 
     async fn monitor_list(&self, args: MonitorListArgs) -> Result<Value> {
         self.status().await?;
-        let response = serde_json::to_value(self.api.monitors(args.slot_id.as_deref()).await?)
+        let response = serde_json::to_value(self.api.monitors(args.port.as_deref()).await?)
             .context("seriald returned an invalid Monitor list")?;
         let monitors = response
             .get("monitors")
@@ -796,8 +796,8 @@ impl AgentTools {
     }
 
     /// Point an empty search at wider scopes and the retained archive epochs.
-    async fn attach_archive_guidance(&self, output: &mut Value, slot_id: &str, scope: &str) {
-        match self.api.archives(Some(slot_id)).await {
+    async fn attach_archive_guidance(&self, output: &mut Value, port: &str, scope: &str) {
+        match self.api.archives(Some(port)).await {
             Ok(list) => {
                 output["archive_epochs"] = json!({
                     "archives": list.archives.iter().map(|archive| json!({
@@ -824,21 +824,20 @@ impl AgentTools {
             .session
             .authorize_run_use(args.run_handle.clone())
             .await?;
-        let slot = self.slot_online(&run_use.slot_id).await?;
+        let slot = self.slot_online(&run_use.port).await?;
         let active_run = matching_active_run(&slot, run_use.run_id, "wait")?;
         let watched_run = (active_run.id, active_run.start_seq);
-        let (patterns, until_regex, completion_mode) =
+        let (patterns, until_regex, completion_mode, _) =
             requested_completion(args.expect.as_deref(), args.regex.as_deref(), &slot, true)?;
         let complete_on_quiet = completion_mode == "quiet";
-        let remembered_cursor = self.live_cursor(&slot.config.id);
+        let remembered_cursor = self.live_cursor(&slot.config.port);
         let (cursor, _) = select_wait_cursor(None, remembered_cursor, &slot);
         let started_epoch = cursor.epoch;
         let started_after_seq = cursor.after_seq;
         let capture = Capture::attach(
             self.api.endpoint(),
-            self.api.token(),
             &self.actor_label,
-            run_use.slot_id.clone(),
+            run_use.port.clone(),
             cursor,
             self.capture_limits,
         )
@@ -857,7 +856,7 @@ impl AgentTools {
         if let Completion::RunAborted { run_id, reason } = &result.completion {
             let last_seq = result.through_seq.unwrap_or(started_after_seq);
             self.remember_live_cursor(
-                &slot.config.id,
+                &slot.config.port,
                 Cursor {
                     epoch: started_epoch,
                     after_seq: last_seq,
@@ -885,7 +884,7 @@ impl AgentTools {
         );
         let last_seq = result.through_seq.unwrap_or(started_after_seq);
         self.remember_live_cursor(
-            &slot.config.id,
+            &slot.config.port,
             Cursor {
                 epoch: started_epoch,
                 after_seq: last_seq,
@@ -895,7 +894,7 @@ impl AgentTools {
         let truncated = result.truncated || rendered.text_truncated;
         let confidence = capture_confidence(&result.completion, truncated, gap);
         let mut output = json!({
-            "slot_id": slot.config.id,
+            "port": slot.config.port,
             "run_handle": args.run_handle,
             "run_open": true,
             "capture": completion_kind(&result.completion),
@@ -928,10 +927,8 @@ impl AgentTools {
             .session
             .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&run_use.slot_id).await;
-        let slot = self
-            .slot_online_for_physical_action(&run_use.slot_id)
-            .await?;
+        let _write_guard = self.write_guard(&run_use.port).await;
+        let slot = self.slot_online_for_physical_action(&run_use.port).await?;
         let active_run = matching_active_run(&slot, run_use.run_id, "command")?;
         self.ensure_serial_context_unchanged(&slot).await?;
         let expected_run_id = run_use.run_id;
@@ -988,21 +985,21 @@ impl AgentTools {
         // dependent interaction. No other call through this MCP can insert a
         // write between two sequence steps.
         let run_use = self.session.authorize_run_use(run_handle.clone()).await?;
-        let slot_id = run_use.slot_id.clone();
+        let port = run_use.port.clone();
         let run_id = run_use.run_id;
         let run_token = run_use.run_token;
-        let _write_guard = self.write_guard(&slot_id).await;
+        let _write_guard = self.write_guard(&port).await;
         let status = self.status().await?;
         ensure_sequence_write_precondition_supported(&status)?;
         ensure_serial_context_precondition_supported(&status)?;
         let slot = status
-            .slots
+            .ports
             .into_iter()
-            .find(|slot| slot.config.id == slot_id)
-            .with_context(|| format!("unknown Slot {slot_id:?}"))?;
+            .find(|slot| slot.config.port == port)
+            .with_context(|| format!("unknown port {port:?}"))?;
         if slot.session_state != SessionState::Online {
             bail!(
-                "Slot {slot_id:?} is {:?}: {}",
+                "port {port:?} is {:?}: {}",
                 slot.session_state,
                 slot.state_reason.as_deref().unwrap_or("no reason reported")
             );
@@ -1080,7 +1077,7 @@ impl AgentTools {
                     );
                     let run_open = self
                         .session
-                        .run_ownership_retained(slot_id.clone(), run_id, run_token)
+                        .run_ownership_retained(port.clone(), run_id, run_token)
                         .await
                         .unwrap_or(false);
                     attach_run_state(&mut output, &run_handle, run_open);
@@ -1119,7 +1116,7 @@ impl AgentTools {
                     false
                 } else {
                     self.session
-                        .run_ownership_retained(slot_id.clone(), run_id, run_token)
+                        .run_ownership_retained(port.clone(), run_id, run_token)
                         .await
                         .unwrap_or(false)
                 };
@@ -1157,7 +1154,7 @@ impl AgentTools {
         );
         let run_open = self
             .session
-            .run_ownership_retained(slot_id, run_id, run_token)
+            .run_ownership_retained(port, run_id, run_token)
             .await
             .unwrap_or(false);
         attach_run_state(&mut output, &run_handle, run_open);
@@ -1183,9 +1180,8 @@ impl AgentTools {
         };
         let capture = Capture::attach(
             self.api.endpoint(),
-            self.api.token(),
             &self.actor_label,
-            slot.config.id.clone(),
+            slot.config.port.clone(),
             cursor,
             self.capture_limits,
         )
@@ -1199,13 +1195,14 @@ impl AgentTools {
         let write = self
             .session
             .write(
-                slot.config.id.clone(),
+                slot.config.port.clone(),
                 prepared.bytes,
                 operation_id,
                 expected_run_id,
                 run_token,
                 effective_write_pacing(slot),
                 Some(prepared.description.clone()),
+                prepared.capture_matchers,
                 sequence,
                 sequence_precondition,
             )
@@ -1286,9 +1283,9 @@ impl AgentTools {
             epoch: slot.daemon_epoch,
             after_seq: last_seq,
         };
-        self.remember_live_cursor(&slot.config.id, cursor.clone());
+        self.remember_live_cursor(&slot.config.port, cursor.clone());
         let mut output = json!({
-            "slot_id": slot.config.id,
+            "port": slot.config.port,
             "write": if echo_missing { "uncertain" } else { "confirmed" },
             "capture": completion_kind(&result.completion),
             "execution": "unknown",
@@ -1332,10 +1329,8 @@ impl AgentTools {
             .session
             .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&run_use.slot_id).await;
-        let slot = self
-            .slot_online_for_physical_action(&run_use.slot_id)
-            .await?;
+        let _write_guard = self.write_guard(&run_use.port).await;
+        let slot = self.slot_online_for_physical_action(&run_use.port).await?;
         matching_active_run(&slot, run_use.run_id, "input")?;
         self.ensure_serial_context_unchanged(&slot).await?;
         let bytes = args.text.into_bytes();
@@ -1357,10 +1352,8 @@ impl AgentTools {
             .session
             .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&run_use.slot_id).await;
-        let slot = self
-            .slot_online_for_physical_action(&run_use.slot_id)
-            .await?;
+        let _write_guard = self.write_guard(&run_use.port).await;
+        let slot = self.slot_online_for_physical_action(&run_use.port).await?;
         matching_active_run(&slot, run_use.run_id, "signal")?;
         self.ensure_serial_context_unchanged(&slot).await?;
         if args.signal == "break" {
@@ -1407,7 +1400,7 @@ impl AgentTools {
         let sent = match self
             .session
             .send_break(
-                slot.config.id.clone(),
+                slot.config.port.clone(),
                 duration_ms,
                 operation_id,
                 expected_run_id,
@@ -1427,14 +1420,14 @@ impl AgentTools {
             }
         };
         self.remember_live_cursor(
-            &slot.config.id,
+            &slot.config.port,
             Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: sent.event_seq,
             },
         );
         Ok(json!({
-            "slot_id": slot.config.id,
+            "port": slot.config.port,
             "write": "confirmed",
             "kind": "break",
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": sent.event_seq}
@@ -1455,13 +1448,14 @@ impl AgentTools {
         let write = match self
             .session
             .write(
-                slot.config.id.clone(),
+                slot.config.port.clone(),
                 bytes,
                 operation_id,
                 expected_run_id,
                 run_token,
                 effective_write_pacing(slot),
                 None,
+                Vec::new(),
                 None,
                 Some(serial_context_precondition(slot)),
             )
@@ -1478,14 +1472,14 @@ impl AgentTools {
             }
         };
         self.remember_live_cursor(
-            &slot.config.id,
+            &slot.config.port,
             Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: write.event_seq,
             },
         );
         Ok(json!({
-            "slot_id": slot.config.id,
+            "port": slot.config.port,
             "write": "confirmed",
             "kind": label,
             "bytes": byte_count,
@@ -1498,16 +1492,14 @@ impl AgentTools {
             .session
             .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&run_use.slot_id).await;
-        let slot = self
-            .slot_online_for_physical_action(&run_use.slot_id)
-            .await?;
+        let _write_guard = self.write_guard(&run_use.port).await;
+        let slot = self.slot_online_for_physical_action(&run_use.port).await?;
         let active_run = matching_active_run(&slot, run_use.run_id, "trigger")?;
         self.ensure_serial_context_unchanged(&slot).await?;
         let expected_run_id = run_use.run_id;
         if let Some(active) = &slot.active_trigger {
             bail!(
-                "Slot already has Trigger {} in status {:?}; wait for it to finish or cancel it \
+                "port already has Trigger {} in status {:?}; wait for it to finish or cancel it \
                  from its owning client",
                 active.id,
                 active.status
@@ -1519,9 +1511,8 @@ impl AgentTools {
         let attached_after_seq = slot.head_seq;
         let capture = Capture::attach(
             self.api.endpoint(),
-            self.api.token(),
             &self.actor_label,
-            run_use.slot_id.clone(),
+            run_use.port.clone(),
             Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: attached_after_seq,
@@ -1543,7 +1534,7 @@ impl AgentTools {
         let started = match self
             .session
             .trigger_start(
-                run_use.slot_id.clone(),
+                run_use.port.clone(),
                 slot.daemon_epoch,
                 slot.generation,
                 operation_id,
@@ -1584,7 +1575,7 @@ impl AgentTools {
                 let cancel = self
                     .session
                     .trigger_cancel(
-                        run_use.slot_id.clone(),
+                        run_use.port.clone(),
                         slot.daemon_epoch,
                         slot.generation,
                         started_id,
@@ -1634,7 +1625,7 @@ impl AgentTools {
             .context("trigger capture task stopped unexpectedly")?;
         let run_ownership_retained = self
             .session
-            .run_ownership_retained(slot.config.id.clone(), expected_run_id, run_use.run_token)
+            .run_ownership_retained(slot.config.port.clone(), expected_run_id, run_use.run_token)
             .await
             .unwrap_or(false);
 
@@ -1660,7 +1651,7 @@ impl AgentTools {
         let observed_through_seq = capture.through_seq;
         let last_seq = terminal_end_seq;
         self.remember_live_cursor(
-            &slot.config.id,
+            &slot.config.port,
             Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: last_seq,
@@ -1695,7 +1686,7 @@ impl AgentTools {
             None
         };
         let mut output = json!({
-            "slot_id": slot.config.id,
+            "port": slot.config.port,
             "run_handle": args.run_handle,
             "run_open": run_ownership_retained,
             "outcome": outcome,
@@ -1778,7 +1769,7 @@ impl AgentTools {
             trigger = self
                 .session
                 .trigger_status(
-                    slot.config.id.clone(),
+                    slot.config.port.clone(),
                     slot.daemon_epoch,
                     slot.generation,
                     trigger_id,
@@ -1791,7 +1782,7 @@ impl AgentTools {
         trigger = self
             .session
             .trigger_cancel(
-                slot.config.id.clone(),
+                slot.config.port.clone(),
                 slot.daemon_epoch,
                 slot.generation,
                 trigger_id,
@@ -1817,7 +1808,7 @@ impl AgentTools {
             trigger = self
                 .session
                 .trigger_status(
-                    slot.config.id.clone(),
+                    slot.config.port.clone(),
                     slot.daemon_epoch,
                     slot.generation,
                     trigger_id,
@@ -1827,15 +1818,15 @@ impl AgentTools {
     }
 
     async fn run_start(&self, args: RunStartArgs) -> Result<Value> {
-        let _write_guard = self.write_guard(&args.slot_id).await;
-        let slot = self.slot_online(&args.slot_id).await?;
+        let _write_guard = self.write_guard(&args.port).await;
+        let slot = self.slot_online(&args.port).await?;
         if let Some(run) = slot.active_run {
-            bail!("Slot already has active Run {} ({})", run.id, run.label);
+            bail!("port already has active Run {} ({})", run.id, run.label);
         }
         let started = self
             .session
             .start_run_with_handle(
-                args.slot_id.clone(),
+                args.port.clone(),
                 args.label,
                 BTreeMap::new(),
                 Duration::from_secs(15),
@@ -1843,14 +1834,14 @@ impl AgentTools {
             .await?;
         let run = started.run;
         self.remember_live_cursor(
-            &slot.config.id,
+            &slot.config.port,
             Cursor {
                 epoch: slot.daemon_epoch,
                 after_seq: run.start_seq,
             },
         );
         Ok(json!({
-            "slot_id": args.slot_id,
+            "port": args.port,
             "run_id": run.id,
             "run_handle": started.run_handle,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
@@ -1863,15 +1854,15 @@ impl AgentTools {
             .session
             .authorize_run_use(args.run_handle.clone())
             .await?;
-        let _write_guard = self.write_guard(&run_use.slot_id).await;
-        let slot = self.slot(&run_use.slot_id).await?;
+        let _write_guard = self.write_guard(&run_use.port).await;
+        let slot = self.slot(&run_use.port).await?;
         matching_active_run(&slot, run_use.run_id, "run_end")?;
         let ended = self
             .session
-            .end_run(run_use.slot_id.clone(), run_use.run_id, run_use.run_token)
+            .end_run(run_use.port.clone(), run_use.run_id, run_use.run_token)
             .await?;
         Ok(json!({
-            "slot_id": run_use.slot_id,
+            "port": run_use.port,
             "run_id": ended.id,
             "run_handle": args.run_handle,
             "run_open": false,
@@ -1880,46 +1871,44 @@ impl AgentTools {
     }
 
     async fn release(&self, args: ReleaseArgs) -> Result<Value> {
-        let (slot_id, run_use) = match args.run_handle.as_ref() {
+        let (port, run_use) = match args.run_handle.as_ref() {
             Some(handle) => {
                 if !args.abort_run {
                     bail!(
                         "run_handle is valid for release only with abort_run=true; use run_end for normal completion"
                     );
                 }
-                if args.slot_id.is_some() {
-                    bail!(
-                        "aborting release needs only run_handle and abort_run=true; omit slot_id"
-                    );
+                if args.port.is_some() {
+                    bail!("aborting release needs only run_handle and abort_run=true; omit port");
                 }
                 let authorized = self.session.authorize_run_use(handle.clone()).await?;
-                (authorized.slot_id.clone(), Some(authorized))
+                (authorized.port.clone(), Some(authorized))
             }
             None => {
                 if args.abort_run {
                     bail!("abort_run=true requires run_handle from run_start");
                 }
-                let slot_id = args
-                    .slot_id
-                    .context("release requires slot_id, or run_handle with abort_run=true")?;
-                (slot_id, None)
+                let port = args
+                    .port
+                    .context("release requires port, or run_handle with abort_run=true")?;
+                (port, None)
             }
         };
         let run_capability = run_use.as_ref().map(|run| (run.run_id, run.run_token));
-        let _write_guard = self.write_guard(&slot_id).await;
-        let local = self.session.local_control_state(slot_id.clone()).await?;
+        let _write_guard = self.write_guard(&port).await;
+        let local = self.session.local_control_state(port.clone()).await?;
         if !local.has_lease {
             // Public status may show a foreign Run, but release controls only
             // this MCP connection. Avoid consulting or modifying that Run;
             // the local no-lease release also discards any stale owned_run.
             let had_lease = self
                 .session
-                .release(slot_id.clone(), false, None, true)
+                .release(port.clone(), false, None, true)
                 .await?;
-            return Ok(release_output(slot_id, had_lease));
+            return Ok(release_output(port, had_lease));
         }
 
-        let current = self.slot(&slot_id).await?;
+        let current = self.slot(&port).await?;
         let decision = plan_release(
             local,
             current.active_run.as_ref().map(|run| run.id),
@@ -1935,23 +1924,18 @@ impl AgentTools {
         };
         let had_lease = self
             .session
-            .release(
-                slot_id.clone(),
-                args.abort_run,
-                authorize,
-                allow_stale_cleanup,
-            )
+            .release(port.clone(), args.abort_run, authorize, allow_stale_cleanup)
             .await?;
-        Ok(release_output(slot_id, had_lease))
+        Ok(release_output(port, had_lease))
     }
 
-    async fn slot(&self, slot_id: &str) -> Result<SlotSnapshot> {
+    async fn slot(&self, port: &str) -> Result<SlotSnapshot> {
         self.status()
             .await?
-            .slots
+            .ports
             .into_iter()
-            .find(|slot| slot.config.id == slot_id)
-            .with_context(|| format!("unknown Slot {slot_id:?}"))
+            .find(|slot| slot.config.port == port)
+            .with_context(|| format!("unknown port {port:?}"))
     }
 
     async fn status(&self) -> Result<StatusResponse> {
@@ -1960,11 +1944,11 @@ impl AgentTools {
         Ok(status)
     }
 
-    async fn slot_online(&self, slot_id: &str) -> Result<SlotSnapshot> {
-        let slot = self.slot(slot_id).await?;
+    async fn slot_online(&self, port: &str) -> Result<SlotSnapshot> {
+        let slot = self.slot(port).await?;
         if slot.session_state != SessionState::Online {
             bail!(
-                "Slot {slot_id:?} is {:?}: {}",
+                "port {port:?} is {:?}: {}",
                 slot.session_state,
                 slot.state_reason.as_deref().unwrap_or("no reason reported")
             );
@@ -1972,17 +1956,17 @@ impl AgentTools {
         Ok(slot)
     }
 
-    async fn slot_online_for_physical_action(&self, slot_id: &str) -> Result<SlotSnapshot> {
+    async fn slot_online_for_physical_action(&self, port: &str) -> Result<SlotSnapshot> {
         let status = self.status().await?;
         ensure_serial_context_precondition_supported(&status)?;
         let slot = status
-            .slots
+            .ports
             .into_iter()
-            .find(|slot| slot.config.id == slot_id)
-            .with_context(|| format!("unknown Slot {slot_id:?}"))?;
+            .find(|slot| slot.config.port == port)
+            .with_context(|| format!("unknown port {port:?}"))?;
         if slot.session_state != SessionState::Online {
             bail!(
-                "Slot {slot_id:?} is {:?}: {}",
+                "port {port:?} is {:?}: {}",
                 slot.session_state,
                 slot.state_reason.as_deref().unwrap_or("no reason reported")
             );
@@ -1999,7 +1983,7 @@ impl AgentTools {
         let response = self
             .api
             .events(
-                &slot.config.id,
+                &slot.config.port,
                 &EventQuery {
                     epoch: Some(slot.daemon_epoch),
                     after_seq: Some(start_seq.saturating_sub(1)),
@@ -2033,7 +2017,7 @@ impl AgentTools {
         let taken_over_by = if reason == "human takeover" {
             self.api
                 .events(
-                    &slot.config.id,
+                    &slot.config.port,
                     &EventQuery {
                         epoch: Some(slot.daemon_epoch),
                         after_seq: Some(abort_seq),
@@ -2085,7 +2069,7 @@ impl AgentTools {
                 taken_over_by: None,
             });
         anyhow!(format_run_abort_error(
-            &slot.config.id,
+            &slot.config.port,
             run_id,
             &diagnosis,
             no_bytes_written,
@@ -2105,17 +2089,17 @@ impl AgentTools {
         }
         if let Some(diagnosis) = self.diagnose_run_abort(slot, run_id, start_seq).await {
             return anyhow!(format_run_abort_error(
-                &slot.config.id,
+                &slot.config.port,
                 run_id,
                 &diagnosis,
                 no_bytes_written,
             ));
         }
         anyhow!(
-            "human_takeover_or_control_revoked: Slot {:?} Run {} lost fenced serial control; \
+            "human_takeover_or_control_revoked: port {:?} Run {} lost fenced serial control; \
              taken_over_by=unknown; run_id={}; no_bytes_written={}; start a new Run only after \
              the current owner releases control and the DUT model/state is reconfirmed: {}",
-            slot.config.id,
+            slot.config.port,
             run_id,
             run_id,
             no_bytes_written,
@@ -2123,31 +2107,31 @@ impl AgentTools {
         )
     }
 
-    fn live_cursor(&self, slot_id: &str) -> Option<Cursor> {
+    fn live_cursor(&self, port: &str) -> Option<Cursor> {
         self.live_cursors
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(slot_id)
+            .get(port)
             .cloned()
     }
 
-    fn remember_live_cursor(&self, slot_id: &str, cursor: Cursor) {
+    fn remember_live_cursor(&self, port: &str, cursor: Cursor) {
         remember_live_cursor(
             &mut self
                 .live_cursors
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            slot_id,
+            port,
             cursor,
         );
     }
 
-    async fn write_guard(&self, slot_id: &str) -> OwnedMutexGuard<()> {
+    async fn write_guard(&self, port: &str) -> OwnedMutexGuard<()> {
         let lock = self
             .write_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(slot_id.to_string())
+            .entry(port.to_string())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone();
         lock.lock_owned().await
@@ -2205,6 +2189,21 @@ fn summarize_recent_context(
             if let Some(reason) = event.metadata.get("reason").and_then(Value::as_str) {
                 summary["reason"] = json!(reason);
             }
+            if matches!(
+                event.kind,
+                EventKind::PortReconfigured | EventKind::PortRemoved
+            ) {
+                for field in [
+                    "port",
+                    "source",
+                    "previous_model_profile",
+                    "new_model_profile",
+                ] {
+                    if let Some(value) = event.metadata.get(field) {
+                        summary[field] = value.clone();
+                    }
+                }
+            }
             summary
         })
         .collect::<Vec<_>>();
@@ -2228,7 +2227,7 @@ struct RunAbortDiagnosis {
 }
 
 fn format_run_abort_error(
-    slot_id: &str,
+    port: &str,
     run_id: Uuid,
     diagnosis: &RunAbortDiagnosis,
     no_bytes_written: bool,
@@ -2244,7 +2243,7 @@ fn format_run_abort_error(
         "run_aborted"
     };
     format!(
-        "{code}: Slot {slot_id:?} Run {run_id} was aborted; reason={:?}; \
+        "{code}: port {port:?} Run {run_id} was aborted; reason={:?}; \
          taken_over_by={taken_over_by:?}; run_id={run_id}; \
          no_bytes_written={no_bytes_written}; start a new Run only after the current owner \
          releases control and the DUT model/state is reconfirmed",
@@ -2299,17 +2298,6 @@ enum CursorSource {
     CurrentHead,
 }
 
-impl CursorSource {
-    #[cfg(test)]
-    fn label(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-            Self::SessionLiveCursor => "session_live_cursor",
-            Self::CurrentHead => "current_head",
-        }
-    }
-}
-
 fn select_wait_cursor(
     explicit: Option<Cursor>,
     remembered: Option<Cursor>,
@@ -2344,14 +2332,14 @@ fn serial_context_precondition(slot: &SlotSnapshot) -> SequenceWritePrecondition
     }
 }
 
-fn remember_live_cursor(cursors: &mut BTreeMap<String, Cursor>, slot_id: &str, cursor: Cursor) {
-    match cursors.get_mut(slot_id) {
+fn remember_live_cursor(cursors: &mut BTreeMap<String, Cursor>, port: &str, cursor: Cursor) {
+    match cursors.get_mut(port) {
         Some(current) if current.epoch == cursor.epoch => {
             current.after_seq = current.after_seq.max(cursor.after_seq);
         }
         Some(current) => *current = cursor,
         None => {
-            cursors.insert(slot_id.to_string(), cursor);
+            cursors.insert(port.to_string(), cursor);
         }
     }
 }
@@ -2371,7 +2359,7 @@ fn matching_active_run<'a>(
         .with_context(|| format!("no active Run; call run_start before {operation}"))?;
     if active.id != expected_run_id {
         bail!(
-            "{operation} expected Run {expected_run_id}, but Slot has active Run {}; refusing to \
+            "{operation} expected Run {expected_run_id}, but port has active Run {}; refusing to \
              adopt or modify another caller's Run",
             active.id
         );
@@ -2438,9 +2426,9 @@ fn plan_release(
     })
 }
 
-fn release_output(slot_id: String, had_lease: bool) -> Value {
+fn release_output(port: String, had_lease: bool) -> Value {
     json!({
-        "slot_id": slot_id,
+        "port": port,
         "released": had_lease,
         "already_released": !had_lease,
         "serial_port_closed": false
@@ -2530,7 +2518,8 @@ fn prepare_command_step(
 ) -> Result<PreparedCommandStep> {
     validate_command_description(&description)?;
     let bytes = compose_write_bytes(command, effective_write_eol(slot))?;
-    let (patterns, until_regex, completion_mode) = requested_completion(expect, regex, slot, true)?;
+    let (patterns, until_regex, completion_mode, capture_matchers) =
+        requested_completion(expect, regex, slot, true)?;
     // An explicit matcher is the sole authoritative boundary. A configured
     // prompt or a brief quiet period must never pre-empt it.
     let complete_on_quiet = completion_mode == "quiet";
@@ -2542,6 +2531,7 @@ fn prepare_command_step(
         timeout,
         patterns,
         until_regex,
+        capture_matchers,
         complete_on_quiet,
         expected_echo,
     })
@@ -2664,7 +2654,7 @@ fn command_sequence_output(
         .unwrap_or_else(|| json!({"epoch": slot.daemon_epoch, "after_seq": slot.head_seq}));
     let sent_steps = steps.len();
     let mut output = json!({
-        "slot_id": slot.config.id,
+        "port": slot.config.port,
         "run_id": run_id,
         "sequence_id": sequence_id,
         "description": description,
@@ -2718,7 +2708,7 @@ fn create_monitor_request(args: MonitorStartArgs) -> Result<CreateMonitorRequest
     serde_json::from_value(json!({
         "request_id": args.idempotency_key.unwrap_or_else(Uuid::new_v4),
         "spec": {
-            "slot_id": args.slot_id,
+            "port": args.port,
             "contains": args.contains,
             "regex": args.regex,
             "description": args.description,
@@ -2753,7 +2743,7 @@ fn compact_monitor(monitor: &Value) -> Value {
     };
     json!({
         "monitor_id": monitor.get("id").cloned().unwrap_or(Value::Null),
-        "slot_id": spec.get("slot_id").cloned().unwrap_or(Value::Null),
+        "port": spec.get("port").cloned().unwrap_or(Value::Null),
         "status": monitor.get("status").cloned().unwrap_or(Value::Null),
         "severity": spec.get("severity").cloned().unwrap_or(Value::Null),
         "description": spec.get("description").cloned().unwrap_or(Value::Null),
@@ -2771,7 +2761,7 @@ fn compact_monitor_incident(incident: &Value) -> Value {
     json!({
         "incident_id": incident.get("id").cloned().unwrap_or(Value::Null),
         "incident_seq": incident.get("incident_seq").cloned().unwrap_or(Value::Null),
-        "slot_id": incident.get("slot_id").cloned().unwrap_or(Value::Null),
+        "port": incident.get("port").cloned().unwrap_or(Value::Null),
         "severity": incident.get("severity").cloned().unwrap_or(Value::Null),
         "description": incident.get("description").cloned().unwrap_or(Value::Null),
         "preview": incident.get("preview").cloned().unwrap_or(Value::Null),
@@ -2801,7 +2791,7 @@ fn requested_cursor(
                 bail!("cursor epoch changed; refresh devices/read before continuing");
             }
             if after_seq > slot.head_seq {
-                bail!("cursor is ahead of Slot head_seq {}", slot.head_seq);
+                bail!("cursor is ahead of port head_seq {}", slot.head_seq);
             }
             Ok(Some(Cursor { epoch, after_seq }))
         }
@@ -2866,7 +2856,7 @@ fn render_response(
     let gap = !response.gaps.is_empty();
     let truncated = response.truncated || rendered.text_truncated;
     let mut output = json!({
-        "slot_id": slot.config.id,
+        "port": slot.config.port,
         "scope": scope,
         "confidence": if gap { "unreliable" } else if truncated { "partial" } else { "high" },
         "text": rendered.text,
@@ -3059,48 +3049,38 @@ fn compose_write_bytes(command: &str, default_eol: &str) -> Result<Vec<u8>> {
 }
 
 fn effective_write_eol(slot: &SlotSnapshot) -> &str {
-    slot.effective_write_eol
-        .as_deref()
-        .unwrap_or(&slot.config.settings.write_eol)
+    slot.effective_write_eol.as_deref().unwrap_or("\r")
 }
 
 fn effective_echo_mode(slot: &SlotSnapshot) -> EchoMode {
-    slot.effective_echo.unwrap_or(slot.config.settings.echo)
+    slot.effective_echo.unwrap_or(EchoMode::Auto)
 }
 
 fn effective_write_pacing(slot: &SlotSnapshot) -> WritePacing {
     slot.effective_write_pacing
-        .unwrap_or_else(|| WritePacing::resolve(None, &slot.config.settings))
+        .unwrap_or_else(|| WritePacing::resolve(None, &serial_protocol::SerialSettings::default()))
 }
 
 fn effective_prompts(slot: &SlotSnapshot) -> (Option<String>, Option<String>) {
-    // Current daemons always publish effective EOL/echo, even when both
-    // effective prompts are authoritatively unset. Only snapshots with no
-    // effective bundle at all come from an older daemon and may fall back to
-    // legacy raw Slot prompt fields.
-    if slot.effective_shell_prompt.is_some()
-        || slot.effective_uboot_prompt.is_some()
-        || slot.effective_write_eol.is_some()
-        || slot.effective_echo.is_some()
-    {
-        (
-            slot.effective_shell_prompt.clone(),
-            slot.effective_uboot_prompt.clone(),
-        )
-    } else {
-        (
-            slot.config.settings.shell_prompt.clone(),
-            slot.config.settings.uboot_prompt.clone(),
-        )
-    }
+    (
+        slot.effective_shell_prompt.clone(),
+        slot.effective_uboot_prompt.clone(),
+    )
 }
+
+type RequestedCompletion = (
+    Vec<CompletionPattern>,
+    Option<regex::Regex>,
+    String,
+    Vec<CommandCaptureMatcher>,
+);
 
 fn requested_completion(
     expect: Option<&str>,
     regex: Option<&str>,
     slot: &SlotSnapshot,
     use_profile_prompts: bool,
-) -> Result<(Vec<CompletionPattern>, Option<regex::Regex>, String)> {
+) -> Result<RequestedCompletion> {
     if expect.is_some() && regex.is_some() {
         bail!("expect and regex are alternative completion boundaries; choose one");
     }
@@ -3109,6 +3089,10 @@ fn requested_completion(
             Vec::new(),
             Some(compile_regex(regex, "regex")?),
             "regex".into(),
+            vec![CommandCaptureMatcher {
+                kind: CommandCaptureMatcherKind::Regex,
+                value: regex.to_string(),
+            }],
         ));
     }
     if let Some(expect) = expect {
@@ -3119,10 +3103,31 @@ fn requested_completion(
             vec![CompletionPattern::Literal(expect.to_string())],
             None,
             "expect".into(),
+            vec![CommandCaptureMatcher {
+                kind: CommandCaptureMatcherKind::Contains,
+                value: expect.to_string(),
+            }],
         ));
     }
 
     let (shell_prompt, uboot_prompt) = effective_prompts(slot);
+    let capture_matchers: Vec<_> = if use_profile_prompts {
+        [
+            shell_prompt.as_ref().map(|value| CommandCaptureMatcher {
+                kind: CommandCaptureMatcherKind::ShellPrompt,
+                value: value.clone(),
+            }),
+            uboot_prompt.as_ref().map(|value| CommandCaptureMatcher {
+                kind: CommandCaptureMatcherKind::UbootPrompt,
+                value: value.clone(),
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    } else {
+        Vec::new()
+    };
     let patterns: Vec<_> = if use_profile_prompts {
         [shell_prompt, uboot_prompt]
             .into_iter()
@@ -3137,7 +3142,142 @@ fn requested_completion(
     } else {
         "prompt"
     };
-    Ok((patterns, None, mode.into()))
+    Ok((patterns, None, mode.into(), capture_matchers))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn slot(shell: Option<&str>, uboot: Option<&str>) -> SlotSnapshot {
+        SlotSnapshot {
+            config: serial_protocol::SlotConfig {
+                port: "/dev/cu.usbserial-210".into(),
+                transport_profile: None,
+                model_profile: Some("TL-AS7230 1.0".into()),
+                enabled: true,
+            },
+            daemon_epoch: Uuid::new_v4(),
+            head_seq: 0,
+            ring_oldest_seq: None,
+            generation: 1,
+            endpoint_present: true,
+            session_state: SessionState::Online,
+            state_reason: None,
+            state_code: None,
+            target_activity: serial_protocol::TargetActivity::Active,
+            last_rx_wall_time_ns: None,
+            rx_offset: 0,
+            tx_offset: 0,
+            rx_overflow_bytes: 0,
+            control: None,
+            active_run: None,
+            active_trigger: None,
+            logging: serial_protocol::LoggingState::Healthy,
+            effective_shell_prompt: shell.map(str::to_owned),
+            effective_uboot_prompt: uboot.map(str::to_owned),
+            effective_write_eol: Some("\r".into()),
+            effective_echo: Some(EchoMode::Auto),
+            effective_transport: None,
+            effective_write_pacing: None,
+        }
+    }
+
+    #[test]
+    fn profile_prompt_matchers_preserve_kind_and_value() {
+        let (_, _, mode, matchers) =
+            requested_completion(None, None, &slot(Some("root# "), Some("U-Boot> ")), true)
+                .unwrap();
+        assert_eq!(mode, "prompt");
+        assert_eq!(
+            matchers,
+            vec![
+                CommandCaptureMatcher {
+                    kind: CommandCaptureMatcherKind::ShellPrompt,
+                    value: "root# ".into(),
+                },
+                CommandCaptureMatcher {
+                    kind: CommandCaptureMatcherKind::UbootPrompt,
+                    value: "U-Boot> ".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_and_quiet_boundaries_produce_exact_audit_matchers() {
+        let (_, _, _, contains) =
+            requested_completion(Some("Password:"), None, &slot(None, None), true).unwrap();
+        assert_eq!(contains[0].kind, CommandCaptureMatcherKind::Contains);
+        assert_eq!(contains[0].value, "Password:");
+
+        let (_, _, _, regex) =
+            requested_completion(None, Some("ready\\s+#"), &slot(None, None), true).unwrap();
+        assert_eq!(regex[0].kind, CommandCaptureMatcherKind::Regex);
+        assert_eq!(regex[0].value, "ready\\s+#");
+
+        let (_, _, mode, quiet) =
+            requested_completion(None, None, &slot(None, None), true).unwrap();
+        assert_eq!(mode, "quiet");
+        assert!(quiet.is_empty());
+    }
+
+    #[test]
+    fn recent_context_reports_human_model_profile_switches() {
+        let epoch = Uuid::new_v4();
+        let event = serial_protocol::TimelineEvent {
+            port: "COM4".into(),
+            daemon_epoch: epoch,
+            seq: 9,
+            generation: 1,
+            wall_time_ns: 1,
+            monotonic_time_ns: 1,
+            kind: EventKind::PortReconfigured,
+            direction: Direction::None,
+            actor: Some(Actor {
+                id: "system:seriald".into(),
+                label: "seriald".into(),
+                kind: ActorKind::System,
+            }),
+            run_id: None,
+            operation_id: None,
+            stream_offset_start: None,
+            stream_offset_end: None,
+            data: Vec::new(),
+            metadata: BTreeMap::from([
+                ("port".into(), json!("COM4")),
+                ("source".into(), json!("human:desktop")),
+                ("previous_model_profile".into(), json!("TL-AS7230 1.0")),
+                ("new_model_profile".into(), json!("TL-AS7230 2.0")),
+            ]),
+            durable: true,
+        };
+        let context = summarize_recent_context(
+            EventQueryResponse {
+                events: vec![event],
+                next_cursor: None,
+                truncated: false,
+                first_available_seq: Some(1),
+                gaps: Vec::new(),
+            },
+            Some("agent:self"),
+            &Cursor {
+                epoch,
+                after_seq: 8,
+            },
+            &Cursor {
+                epoch,
+                after_seq: 9,
+            },
+        )
+        .unwrap();
+        assert_eq!(context["events"][0]["source"], "human:desktop");
+        assert_eq!(
+            context["events"][0]["previous_model_profile"],
+            "TL-AS7230 1.0"
+        );
+        assert_eq!(context["events"][0]["new_model_profile"], "TL-AS7230 2.0");
+    }
 }
 
 fn compile_regex(value: &str, field: &str) -> Result<regex::Regex> {
@@ -3368,7 +3508,7 @@ fn ensure_protocol_compatible(status: &StatusResponse) -> Result<()> {
 fn ensure_sequence_write_precondition_supported(status: &StatusResponse) -> Result<()> {
     if !status.sequence_write_precondition_supported {
         bail!(
-            "seriald does not advertise atomic command_sequence write boundaries; no bytes were written. Install seriald and serial-mcp from the same v0.7.0-or-newer build"
+            "seriald does not advertise atomic command_sequence write boundaries; no bytes were written. Install seriald and serial-mcp from the same release"
         );
     }
     Ok(())
@@ -3377,7 +3517,7 @@ fn ensure_sequence_write_precondition_supported(status: &StatusResponse) -> Resu
 fn ensure_serial_context_precondition_supported(status: &StatusResponse) -> Result<()> {
     if !status.serial_context_precondition_supported {
         bail!(
-            "seriald does not advertise atomic serial-context boundaries for Write, BREAK, and Trigger; no bytes were written. Install seriald and serial-mcp from the same v0.7.0-or-newer build"
+            "seriald does not advertise atomic serial-context boundaries for Write, BREAK, and Trigger; no bytes were written. Install seriald and serial-mcp from the same release"
         );
     }
     Ok(())
@@ -3385,7 +3525,10 @@ fn ensure_serial_context_precondition_supported(status: &StatusResponse) -> Resu
 
 fn slot_summary(slot: &SlotSnapshot) -> Value {
     let effective_transport = slot.effective_transport.unwrap_or_else(|| {
-        serial_protocol::resolve_transport_settings(&slot.config.settings, None)
+        serial_protocol::resolve_transport_settings(
+            &serial_protocol::SerialSettings::default(),
+            None,
+        )
     });
     let (shell_prompt, uboot_prompt) = effective_prompts(slot);
     let control = slot.control.as_ref().map(|lease| {
@@ -3416,12 +3559,10 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
         })
     });
     json!({
-        "slot_id": slot.config.id,
-        "display_name": slot.config.display_name,
         "port": slot.config.port,
         "enabled": slot.config.enabled,
-        "transport_profile": slot.config.profile,
-        "device_profile": slot.config.device_profile,
+        "transport_profile": slot.config.transport_profile,
+        "model_profile": slot.config.model_profile,
         "endpoint_present": slot.endpoint_present,
         "session_state": slot.session_state,
         "state_code": slot.state_code,
@@ -3445,201 +3586,30 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
     })
 }
 
-fn slot_device_model_summary(slot_id: &str, catalog: &DeviceModelListResponse) -> Value {
-    let Some(binding) = catalog
-        .bindings
-        .iter()
-        .find(|binding| binding.slot_id == slot_id)
-    else {
-        return Value::Null;
-    };
-    let model = catalog
-        .models
-        .iter()
-        .find(|model| model.id == binding.model_id);
-    json!({
-        "id": binding.model_id.as_str(),
-        "name": model.map(|model| model.name.as_str()),
-        "parent_id": model.and_then(|model| model.parent_id.as_deref()),
-        "aliases": model.map(|model| model.aliases.as_slice()).unwrap_or(&[]),
-        "confirmation_method": binding.confirmation_method,
-        "confirmation_note": binding.note.as_deref(),
-        "confirmed_wall_time_ns": binding.updated_wall_time_ns,
-        "source": binding.source.as_str(),
-    })
-}
-
 fn actor_summary(actor: &serial_protocol::Actor) -> Value {
     json!({"id": actor.id, "label": actor.label, "kind": actor.kind})
-}
-
-fn build_device_model_set_request(
-    args: &DeviceModelSetArgs,
-    catalog: &DeviceModelListResponse,
-) -> Result<SetSlotDeviceModelRequest> {
-    if args.model_id.is_empty() {
-        bail!("model_id must not be empty");
-    }
-    if args.create_if_missing && args.update_existing {
-        bail!("create_if_missing and update_existing are mutually exclusive");
-    }
-    let observed_current = catalog
-        .bindings
-        .iter()
-        .find(|binding| binding.slot_id == args.slot_id)
-        .map(|binding| binding.model_id.clone());
-    if args.create_if_missing {
-        if args.name.is_none() {
-            bail!("name is required when create_if_missing=true");
-        }
-        if args.clear_parent || args.clear_aliases {
-            bail!("clear_parent and clear_aliases require update_existing=true");
-        }
-    } else if args.update_existing {
-        if !catalog.models.iter().any(|model| model.id == args.model_id) {
-            bail!("cannot update unknown device model {:?}", args.model_id);
-        }
-        if observed_current.as_deref() != Some(args.model_id.as_str()) {
-            bail!(
-                "update_existing may only modify the model currently bound to Slot {:?}; observed {:?}",
-                args.slot_id,
-                observed_current
-            );
-        }
-        if args.parent.is_some() && args.clear_parent {
-            bail!("parent and clear_parent are mutually exclusive");
-        }
-        if !args.aliases.is_empty() && args.clear_aliases {
-            bail!("aliases and clear_aliases are mutually exclusive");
-        }
-        if args.name.is_none()
-            && args.parent.is_none()
-            && !args.clear_parent
-            && args.aliases.is_empty()
-            && !args.clear_aliases
-        {
-            bail!(
-                "update_existing requires at least one of name, parent, clear_parent, aliases, or clear_aliases"
-            );
-        }
-    } else if args.name.is_some()
-        || args.parent.is_some()
-        || args.clear_parent
-        || !args.aliases.is_empty()
-        || args.clear_aliases
-    {
-        bail!("model definition fields require create_if_missing=true or update_existing=true");
-    } else if !catalog.models.iter().any(|model| model.id == args.model_id) {
-        bail!(
-            "unknown device model {:?}; call device_models or set create_if_missing=true",
-            args.model_id
-        );
-    }
-
-    if let Some(expected_current) = args.expected_current.as_ref()
-        && expected_current.as_deref() != observed_current.as_deref()
-    {
-        bail!(
-            "Slot {:?} model binding changed: expected {:?}, observed {:?}; inspect device_models \
-             and re-confirm the physical DUT before retrying",
-            args.slot_id,
-            expected_current,
-            observed_current,
-        );
-    }
-    // Even when the caller omits expected_current, guard the PUT with the
-    // binding observed in the immediately preceding catalog read. Together
-    // with expected_revision this prevents an Agent from overwriting a Human
-    // correction made concurrently.
-    let expected_current = args
-        .expected_current
-        .clone()
-        .unwrap_or_else(|| observed_current.clone());
-    Ok(SetSlotDeviceModelRequest {
-        model_id: Some(args.model_id.clone()),
-        create_if_missing: args.create_if_missing,
-        update_existing: args.update_existing,
-        name: args.name.clone(),
-        parent_id: args.parent.clone(),
-        clear_parent: args.clear_parent,
-        aliases: args.aliases.clone(),
-        clear_aliases: args.clear_aliases,
-        confirmation_method: Some(args.confirmation_method),
-        note: args.note.clone(),
-        source: MODEL_BINDING_SOURCE.into(),
-        expected_revision: Some(catalog.config_revision),
-        expected_current: Some(expected_current),
-    })
-}
-
-fn deserialize_present_option<'de, D, T>(
-    deserializer: D,
-) -> std::result::Result<Option<Option<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(Some)
-}
-
-/// Keep display names usable as identifiers: an empty name falls back to the
-/// port, and names shared by several Slots on one daemon gain a port suffix.
-fn disambiguate_display_names(slots: &mut [Value]) {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for slot in slots.iter() {
-        let name = slot["display_name"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        *counts.entry(name).or_default() += 1;
-    }
-    for slot in slots.iter_mut() {
-        let name = slot["display_name"].as_str().unwrap_or_default();
-        let port = slot["port"].as_str().unwrap_or_default();
-        if name.is_empty() {
-            slot["display_name"] = json!(format!("({port})"));
-        } else if counts.get(name).copied().unwrap_or(0) > 1 {
-            slot["display_name"] = json!(format!("{name} ({port})"));
-        }
-    }
 }
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct DevicesArgs {
-    slot_id: Option<String>,
+    port: Option<String>,
 }
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct DeviceModelsArgs {
-    slot_id: Option<String>,
+struct ModelProfilesArgs {
+    port: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DeviceModelSetArgs {
-    slot_id: String,
-    model_id: String,
-    #[serde(default)]
-    create_if_missing: bool,
-    #[serde(default)]
-    update_existing: bool,
-    name: Option<String>,
-    parent: Option<String>,
-    #[serde(default)]
-    clear_parent: bool,
-    #[serde(default)]
-    aliases: Vec<String>,
-    #[serde(default)]
-    clear_aliases: bool,
-    confirmation_method: ModelConfirmationMethod,
-    note: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_present_option")]
-    expected_current: Option<Option<String>>,
+struct ModelProfileSetArgs {
+    port: String,
+    profile: Option<ModelProfile>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
-    slot_id: String,
+    port: String,
     scope: Option<String>,
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
@@ -3648,7 +3618,7 @@ struct ReadArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
-    slot_id: String,
+    port: String,
     query: String,
     #[serde(default)]
     regex: bool,
@@ -3660,7 +3630,7 @@ struct SearchArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MonitorStartArgs {
-    slot_id: String,
+    port: String,
     contains: Option<String>,
     regex: Option<String>,
     description: Option<String>,
@@ -3669,7 +3639,7 @@ struct MonitorStartArgs {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct MonitorListArgs {
-    slot_id: Option<String>,
+    port: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3752,7 +3722,7 @@ struct TriggerArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunStartArgs {
-    slot_id: String,
+    port: String,
     label: String,
 }
 #[derive(Deserialize)]
@@ -3763,1887 +3733,8 @@ struct RunEndArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseArgs {
-    slot_id: Option<String>,
+    port: Option<String>,
     #[serde(default)]
     abort_run: bool,
     run_handle: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_protocol::{GapRange, GapReason, TimelineEvent};
-
-    const TEST_RUN_HANDLE: &str = "AAAAAAAAAAAAAAAAAAAAAA";
-
-    fn activity_event(
-        epoch: Uuid,
-        seq: u64,
-        actor_id: &str,
-        actor_label: &str,
-        metadata: BTreeMap<String, Value>,
-    ) -> TimelineEvent {
-        TimelineEvent {
-            slot_id: "bench".into(),
-            daemon_epoch: epoch,
-            seq,
-            generation: 1,
-            wall_time_ns: seq as i64,
-            monotonic_time_ns: seq,
-            kind: EventKind::Tx,
-            direction: Direction::Tx,
-            actor: Some(Actor {
-                id: actor_id.into(),
-                label: actor_label.into(),
-                kind: ActorKind::Agent,
-            }),
-            run_id: None,
-            operation_id: None,
-            stream_offset_start: Some(0),
-            stream_offset_end: Some(4),
-            data: b"test".to_vec(),
-            metadata,
-            durable: true,
-        }
-    }
-
-    #[test]
-    fn recent_context_filters_by_server_actor_id_not_shared_label_and_keeps_descriptions() {
-        let epoch = Uuid::new_v4();
-        let previous = Cursor {
-            epoch,
-            after_seq: 1,
-        };
-        let current = Cursor {
-            epoch,
-            after_seq: 3,
-        };
-        let own = activity_event(epoch, 2, "own-id", "serial-mcp", BTreeMap::new());
-        let foreign = activity_event(
-            epoch,
-            3,
-            "foreign-id",
-            // Deliberately identical: labels are audit text, not identity.
-            "serial-mcp",
-            BTreeMap::from([
-                ("command_description".into(), json!("查看样机内存")),
-                (
-                    "command_sequence_description".into(),
-                    json!("登录并检查内存"),
-                ),
-            ]),
-        );
-        let context = summarize_recent_context(
-            EventQueryResponse {
-                events: vec![own, foreign],
-                next_cursor: Some(current.clone()),
-                truncated: false,
-                first_available_seq: Some(1),
-                gaps: Vec::new(),
-            },
-            Some("own-id"),
-            &previous,
-            &current,
-        )
-        .expect("foreign same-label actor must remain visible");
-
-        assert_eq!(context["interference"], true);
-        assert_eq!(context["complete"], true);
-        assert_eq!(context["events"].as_array().unwrap().len(), 1);
-        assert_eq!(context["events"][0]["actor"]["label"], "serial-mcp");
-        assert_eq!(context["events"][0]["description"], "查看样机内存");
-        assert_eq!(
-            context["events"][0]["sequence_description"],
-            "登录并检查内存"
-        );
-    }
-
-    #[test]
-    fn recent_context_surfaces_gap_even_when_no_relevant_event_survives() {
-        let epoch = Uuid::new_v4();
-        let previous = Cursor {
-            epoch,
-            after_seq: 1,
-        };
-        let current = Cursor {
-            epoch,
-            after_seq: 50,
-        };
-        let context = summarize_recent_context(
-            EventQueryResponse {
-                events: Vec::new(),
-                next_cursor: Some(current.clone()),
-                truncated: false,
-                first_available_seq: Some(40),
-                gaps: vec![GapRange {
-                    epoch,
-                    first_seq: 2,
-                    last_seq: 39,
-                    reason: GapReason::RingEvicted,
-                }],
-            },
-            Some("own-id"),
-            &previous,
-            &current,
-        )
-        .expect("a gap must not be mistaken for proof of no interference");
-
-        assert_eq!(context["interference"], false);
-        assert_eq!(context["complete"], false);
-        assert_eq!(context["truncated"], true);
-        assert_eq!(context["events"], json!([]));
-    }
-
-    #[tokio::test]
-    async fn pending_context_fails_closed_before_any_side_effect() {
-        let api = ApiClient::new("http://127.0.0.1:1".into(), None).unwrap();
-        let session = SessionHandle::spawn(
-            "http://127.0.0.1:1".into(),
-            None,
-            "serial-mcp".into(),
-            Some(Duration::from_secs(1_800)),
-        );
-        let tools = AgentTools::new(api, session, "serial-mcp".into(), CaptureLimits::default());
-        tools.pending_context.lock().unwrap().insert(
-            "bench".into(),
-            json!({
-                "interference": true,
-                "complete": true,
-                "after_seq": 40,
-                "through_seq": 42,
-                "events": [{"seq": 41, "kind": "tx"}],
-                "truncated": false,
-            }),
-        );
-
-        let error = tools
-            .ensure_serial_context_unchanged(&test_slot())
-            .await
-            .unwrap_err();
-        let structured = structured_tool_error(&error).expect("typed context_changed error");
-        assert_eq!(structured["error"]["code"], "context_changed");
-        assert_eq!(structured["error"]["no_bytes_written"], true);
-        assert_eq!(structured["error"]["recent_context"]["interference"], true);
-        assert!(
-            structured["error"]["retry_hint"]
-                .as_str()
-                .unwrap()
-                .contains("read(scope=tail)")
-        );
-    }
-
-    fn device_model_catalog() -> DeviceModelListResponse {
-        DeviceModelListResponse {
-            models: vec![serial_protocol::DeviceModel {
-                id: "tl-as7230".into(),
-                name: "TL-AS7230".into(),
-                parent_id: None,
-                aliases: vec!["7230".into()],
-            }],
-            bindings: vec![serial_protocol::SlotModelBinding {
-                slot_id: "bench".into(),
-                model_id: "tl-as7230".into(),
-                confirmation_method: ModelConfirmationMethod::Human,
-                note: Some("operator checked label".into()),
-                updated_wall_time_ns: 1,
-                source: "human:serialctl".into(),
-            }],
-            config_revision: 9,
-        }
-    }
-
-    #[test]
-    fn device_summary_exposes_the_confirmed_model_binding() {
-        let catalog = device_model_catalog();
-        let summary = slot_device_model_summary("bench", &catalog);
-        assert_eq!(summary["id"], "tl-as7230");
-        assert_eq!(summary["name"], "TL-AS7230");
-        assert_eq!(summary["aliases"], json!(["7230"]));
-        assert_eq!(summary["confirmation_method"], "human");
-        assert_eq!(summary["confirmation_note"], "operator checked label");
-        assert!(slot_device_model_summary("unbound", &catalog).is_null());
-    }
-
-    #[test]
-    fn device_model_set_preserves_expected_current_tristate() {
-        let omitted: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "model_id": "tl-as7230",
-            "confirmation_method": "serial"
-        }))
-        .unwrap();
-        assert_eq!(omitted.expected_current, None);
-
-        let unbound: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "model_id": "tl-as7230",
-            "confirmation_method": "human",
-            "expected_current": null
-        }))
-        .unwrap();
-        assert_eq!(unbound.expected_current, Some(None));
-
-        let exact: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "model_id": "tl-as7230",
-            "confirmation_method": "web",
-            "expected_current": "old-model"
-        }))
-        .unwrap();
-        assert_eq!(exact.expected_current, Some(Some("old-model".into())));
-    }
-
-    #[test]
-    fn device_model_set_uses_observed_revision_and_binding_guards() {
-        let catalog = device_model_catalog();
-        let args: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "model_id": "tl-as7230",
-            "confirmation_method": "serial",
-            "note": "confirmed from boot banner"
-        }))
-        .unwrap();
-        let request = build_device_model_set_request(&args, &catalog).unwrap();
-        assert_eq!(request.expected_revision, Some(9));
-        assert_eq!(request.expected_current, Some(Some("tl-as7230".into())));
-        assert_eq!(
-            request.confirmation_method,
-            Some(ModelConfirmationMethod::Serial)
-        );
-        assert_eq!(request.source, MODEL_BINDING_SOURCE);
-
-        let mismatch: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "model_id": "tl-as7230",
-            "confirmation_method": "human",
-            "expected_current": null
-        }))
-        .unwrap();
-        let error = build_device_model_set_request(&mismatch, &catalog)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("expected None"));
-        assert!(error.contains("re-confirm the physical DUT"));
-    }
-
-    #[test]
-    fn device_model_set_maps_create_fields_without_catalog_admin_access() {
-        let catalog = device_model_catalog();
-        let args: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench-2",
-            "model_id": "tl-as7230-w",
-            "create_if_missing": true,
-            "name": "TL-AS7230-W",
-            "parent": "tl-as7230",
-            "aliases": ["7230-W"],
-            "confirmation_method": "telnet",
-            "expected_current": null,
-            "note": "confirmed from telnet identity output"
-        }))
-        .unwrap();
-        let request = build_device_model_set_request(&args, &catalog).unwrap();
-        assert_eq!(request.parent_id.as_deref(), Some("tl-as7230"));
-        assert_eq!(request.aliases, vec!["7230-W".to_string()]);
-        assert_eq!(request.expected_current, Some(None));
-        assert_eq!(request.expected_revision, Some(9));
-        assert_eq!(request.model_id.as_deref(), Some("tl-as7230-w"));
-
-        let serialized = serde_json::to_value(request).unwrap();
-        assert!(serialized.get("models").is_none());
-        assert_eq!(serialized["create_if_missing"], true);
-    }
-
-    #[test]
-    fn device_model_set_updates_only_the_exact_current_model_with_guards() {
-        let catalog = device_model_catalog();
-        let args: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "model_id": "tl-as7230",
-            "update_existing": true,
-            "name": "TL-AS7230 rev2",
-            "clear_aliases": true,
-            "confirmation_method": "web"
-        }))
-        .unwrap();
-        let request = build_device_model_set_request(&args, &catalog).unwrap();
-        assert!(request.update_existing);
-        assert_eq!(request.expected_revision, Some(9));
-        assert_eq!(request.expected_current, Some(Some("tl-as7230".into())));
-        assert_eq!(request.name.as_deref(), Some("TL-AS7230 rev2"));
-        assert!(request.clear_aliases);
-
-        let wrong_slot: DeviceModelSetArgs = serde_json::from_value(json!({
-            "slot_id": "unbound",
-            "model_id": "tl-as7230",
-            "update_existing": true,
-            "name": "wrong",
-            "confirmation_method": "human"
-        }))
-        .unwrap();
-        assert!(
-            build_device_model_set_request(&wrong_slot, &catalog)
-                .unwrap_err()
-                .to_string()
-                .contains("only modify the model currently bound")
-        );
-    }
-
-    #[test]
-    fn device_model_results_warn_that_configuration_is_not_evidence() {
-        assert!(MODEL_IDENTITY_WARNING.contains("not evidence"));
-        for method in ["serial", "telnet", "web UI", "human"] {
-            assert!(MODEL_IDENTITY_WARNING.contains(method));
-        }
-    }
-
-    #[test]
-    fn empty_command_is_allowed_when_eol_contributes_bytes() {
-        assert_eq!(compose_write_bytes("", "\r").unwrap(), b"\r".to_vec());
-        assert_eq!(compose_write_bytes("", "\r\n").unwrap(), b"\r\n".to_vec());
-    }
-
-    #[test]
-    fn fully_empty_write_is_rejected() {
-        let error = compose_write_bytes("", "").unwrap_err();
-        assert!(error.to_string().contains("nothing would be sent"));
-    }
-
-    #[test]
-    fn write_size_limit_counts_command_plus_eol() {
-        let command = "x".repeat(MAX_WRITE_BYTES);
-        assert!(compose_write_bytes(&command, "").is_ok());
-        assert!(compose_write_bytes(&command, "\r").is_err());
-    }
-
-    #[test]
-    fn read_args_keep_only_scope_and_bounded_archive_cursor() {
-        let args: ReadArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "scope": "archive",
-            "epoch": Uuid::nil(),
-            "after_seq": 42,
-            "through_seq": 47,
-        }))
-        .unwrap();
-        assert_eq!(args.scope.as_deref(), Some("archive"));
-        assert_eq!(args.epoch, Some(Uuid::nil()));
-        assert_eq!(args.after_seq, Some(42));
-        assert_eq!(args.through_seq, Some(47));
-        assert!(
-            serde_json::from_value::<ReadArgs>(json!({"slot_id":"bench","include_raw":true}))
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_v3_status_fails_the_common_physical_action_gate_closed() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut legacy_status = serde_json::to_value(StatusResponse {
-            server_id: Uuid::from_u128(10),
-            daemon_epoch: Uuid::from_u128(11),
-            protocol_version: PROTOCOL_VERSION,
-            config_revision: 1,
-            sequence_write_precondition_supported: true,
-            serial_context_precondition_supported: true,
-            slots: vec![test_slot()],
-        })
-        .unwrap();
-        legacy_status
-            .as_object_mut()
-            .unwrap()
-            .remove("serial_context_precondition_supported");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = vec![0_u8; 4096];
-            let read = stream.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.starts_with("GET /api/v1/status HTTP/1.1"));
-            let body = serde_json::to_string(&legacy_status).unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        let endpoint = format!("http://{address}");
-        let tools = AgentTools::new(
-            ApiClient::new(endpoint.clone(), None).unwrap(),
-            SessionHandle::spawn(
-                endpoint,
-                None,
-                "test".into(),
-                Some(Duration::from_secs(1_800)),
-            ),
-            "test".into(),
-            CaptureLimits::default(),
-        );
-        let error = tools
-            .slot_online_for_physical_action("bench")
-            .await
-            .unwrap_err()
-            .to_string();
-        server.await.unwrap();
-
-        assert!(error.contains("Write, BREAK, and Trigger"));
-        assert!(error.contains("no bytes were written"));
-    }
-
-    #[tokio::test]
-    async fn read_tail_uses_bounded_live_ring_endpoint_instead_of_journal_events() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let slot = test_slot();
-        let status = StatusResponse {
-            server_id: Uuid::from_u128(10),
-            daemon_epoch: slot.daemon_epoch,
-            protocol_version: PROTOCOL_VERSION,
-            config_revision: 1,
-            sequence_write_precondition_supported: true,
-            serial_context_precondition_supported: true,
-            slots: vec![slot.clone()],
-        };
-        let timeline_event = serial_protocol::TimelineEvent {
-            slot_id: "bench".into(),
-            daemon_epoch: slot.daemon_epoch,
-            seq: 42,
-            generation: 1,
-            wall_time_ns: 42,
-            monotonic_time_ns: 42,
-            kind: EventKind::Rx,
-            direction: Direction::Rx,
-            actor: None,
-            run_id: None,
-            operation_id: None,
-            stream_offset_start: Some(0),
-            stream_offset_end: Some(5),
-            data: b"ready".to_vec(),
-            metadata: BTreeMap::new(),
-            durable: true,
-        };
-        let tail = serial_protocol::EventQueryResponse {
-            events: vec![timeline_event],
-            next_cursor: Some(Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: 42,
-            }),
-            truncated: false,
-            first_available_seq: Some(42),
-            gaps: Vec::new(),
-        };
-        let server = tokio::spawn(async move {
-            for expected_path in ["/api/v1/status", "/api/v1/slots/bench/tail?tail_events=200"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = vec![0_u8; 4096];
-                let read = stream.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]);
-                assert!(
-                    request.starts_with(&format!("GET {expected_path} HTTP/1.1")),
-                    "unexpected request: {request}"
-                );
-                assert!(!request.starts_with("GET /api/v1/slots/bench/events"));
-                let body = if expected_path == "/api/v1/status" {
-                    serde_json::to_string(&status).unwrap()
-                } else {
-                    serde_json::to_string(&tail).unwrap()
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        let endpoint = format!("http://{address}");
-        let tools = AgentTools::new(
-            ApiClient::new(endpoint.clone(), None).unwrap(),
-            SessionHandle::spawn(
-                endpoint,
-                None,
-                "test".into(),
-                Some(Duration::from_secs(1_800)),
-            ),
-            "test".into(),
-            CaptureLimits::default(),
-        );
-        let output = tools
-            .read(ReadArgs {
-                slot_id: "bench".into(),
-                scope: Some("tail".into()),
-                epoch: None,
-                after_seq: None,
-                through_seq: None,
-            })
-            .await
-            .unwrap();
-        server.await.unwrap();
-
-        assert_eq!(output["text"], "ready");
-        assert_eq!(output["cursor"]["after_seq"], 42);
-    }
-
-    #[tokio::test]
-    async fn read_continue_uses_cursor_bounded_live_ring_and_surfaces_eviction() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let slot = test_slot();
-        let status = StatusResponse {
-            server_id: Uuid::from_u128(10),
-            daemon_epoch: slot.daemon_epoch,
-            protocol_version: PROTOCOL_VERSION,
-            config_revision: 1,
-            sequence_write_precondition_supported: true,
-            serial_context_precondition_supported: true,
-            slots: vec![slot.clone()],
-        };
-        let event = activity_event(slot.daemon_epoch, 42, "target", "target", BTreeMap::new());
-        let live = EventQueryResponse {
-            events: vec![serial_protocol::TimelineEvent {
-                actor: None,
-                kind: EventKind::Rx,
-                direction: Direction::Rx,
-                data: b"latest".to_vec(),
-                ..event
-            }],
-            next_cursor: Some(Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: 42,
-            }),
-            truncated: true,
-            first_available_seq: Some(42),
-            gaps: vec![GapRange {
-                epoch: slot.daemon_epoch,
-                first_seq: 41,
-                last_seq: 41,
-                reason: GapReason::RingEvicted,
-            }],
-        };
-        let expected_continue = format!(
-            "/api/v1/slots/bench/tail?tail_events=1000&epoch={}&after_seq=40",
-            slot.daemon_epoch
-        );
-        let server = tokio::spawn(async move {
-            for expected_path in ["/api/v1/status".to_owned(), expected_continue] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = vec![0_u8; 4096];
-                let read = stream.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..read]);
-                assert!(
-                    request.starts_with(&format!("GET {expected_path} HTTP/1.1")),
-                    "unexpected request: {request}"
-                );
-                assert!(!request.starts_with("GET /api/v1/slots/bench/events"));
-                let body = if expected_path == "/api/v1/status" {
-                    serde_json::to_string(&status).unwrap()
-                } else {
-                    serde_json::to_string(&live).unwrap()
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        let endpoint = format!("http://{address}");
-        let tools = AgentTools::new(
-            ApiClient::new(endpoint.clone(), None).unwrap(),
-            SessionHandle::spawn(
-                endpoint,
-                None,
-                "test".into(),
-                Some(Duration::from_secs(1_800)),
-            ),
-            "test".into(),
-            CaptureLimits::default(),
-        );
-        tools.remember_live_cursor(
-            "bench",
-            Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: 40,
-            },
-        );
-        let output = tools
-            .read(ReadArgs {
-                slot_id: "bench".into(),
-                scope: Some("continue".into()),
-                epoch: None,
-                after_seq: None,
-                through_seq: None,
-            })
-            .await
-            .unwrap();
-        server.await.unwrap();
-
-        assert_eq!(output["source"], "live_ring");
-        assert_eq!(output["bounded_continue"], true);
-        assert_eq!(output["text"], "latest");
-        assert_eq!(output["cursor"]["after_seq"], 42);
-        assert_eq!(output["gap"], true);
-        assert_eq!(output["truncated"], true);
-        assert_eq!(output["gaps"][0]["reason"], "ring_evicted");
-        assert_eq!(output["gaps"][0]["first_seq"], 41);
-        assert_eq!(output["gaps"][0]["last_seq"], 41);
-        assert!(
-            output["warnings"][0]
-                .as_str()
-                .unwrap()
-                .contains("live replay gap")
-        );
-    }
-
-    #[test]
-    fn search_and_wait_args_parse_new_optional_fields() {
-        let search: SearchArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "query": "ERROR.*1006",
-            "regex": true,
-        }))
-        .unwrap();
-        assert_eq!(search.query, "ERROR.*1006");
-        assert!(search.regex);
-
-        let wait: WaitArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "expect": "ready"
-        }))
-        .unwrap();
-        assert_eq!(wait.expect.as_deref(), Some("ready"));
-    }
-
-    #[test]
-    fn monitor_arguments_are_small_and_matchers_are_unambiguous() {
-        let literal: MonitorStartArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "contains": "kernel panic",
-            "description": "intermittent crash"
-        }))
-        .unwrap();
-        validate_monitor_matcher(literal.contains.as_deref(), literal.regex.as_deref()).unwrap();
-        let request = create_monitor_request(literal).unwrap();
-        assert!(!request.request_id.is_nil());
-        assert_eq!(request.spec.slot_id, "bench");
-        assert_eq!(request.spec.contains.as_deref(), Some("kernel panic"));
-        assert_eq!(
-            request.spec.description.as_deref(),
-            Some("intermittent crash")
-        );
-        assert_eq!(request.spec.debounce_ms, 250);
-        assert_eq!(request.spec.cooldown_ms, 30_000);
-
-        let idempotency_key = Uuid::new_v4();
-        let retry: MonitorStartArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "contains": "kernel panic",
-            "idempotency_key": idempotency_key,
-        }))
-        .unwrap();
-        assert_eq!(
-            create_monitor_request(retry).unwrap().request_id,
-            idempotency_key
-        );
-
-        let regex: MonitorStartArgs = serde_json::from_value(json!({
-            "slot_id": "bench",
-            "regex": "(?i)watchdog|panic"
-        }))
-        .unwrap();
-        validate_monitor_matcher(regex.contains.as_deref(), regex.regex.as_deref()).unwrap();
-
-        for invalid in [
-            json!({"slot_id":"bench"}),
-            json!({"slot_id":"bench","contains":"panic","regex":"panic"}),
-            json!({"slot_id":"bench","contains":""}),
-            json!({"slot_id":"bench","regex":".*"}),
-        ] {
-            let args: MonitorStartArgs = serde_json::from_value(invalid).unwrap();
-            assert!(
-                validate_monitor_matcher(args.contains.as_deref(), args.regex.as_deref()).is_err()
-            );
-        }
-        assert!(
-            serde_json::from_value::<MonitorStartArgs>(json!({
-                "slot_id":"bench", "contains":"panic", "delivery_mode":"push"
-            }))
-            .is_err()
-        );
-        for description in [
-            "".to_string(),
-            "x".repeat(MAX_MONITOR_DESCRIPTION_BYTES + 1),
-        ] {
-            let args: MonitorStartArgs = serde_json::from_value(json!({
-                "slot_id": "bench", "contains": "panic", "description": description
-            }))
-            .unwrap();
-            assert!(create_monitor_request(args).is_err());
-        }
-    }
-
-    #[test]
-    fn monitor_incident_cursor_is_opaque_decimal_text() {
-        let args: MonitorIncidentsArgs = serde_json::from_value(json!({
-            "monitor_id": Uuid::nil(),
-            "after": "18446744073709551615"
-        }))
-        .unwrap();
-        assert_eq!(
-            parse_monitor_cursor(args.after.as_deref().unwrap()).unwrap(),
-            u64::MAX
-        );
-        for invalid in ["-1", " 1", "1.0", "next"] {
-            assert!(parse_monitor_cursor(invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn compact_monitor_incident_keeps_evidence_without_internal_policy() {
-        let incident = json!({
-            "id": Uuid::from_u128(1),
-            "incident_seq": 7,
-            "monitor_id": Uuid::from_u128(2),
-            "slot_id": "bench",
-            "daemon_epoch": Uuid::from_u128(3),
-            "seq_start": 40,
-            "seq_end": 43,
-            "severity": "error",
-            "description": "panic",
-            "preview": "Kernel panic",
-            "evidence_cursor": {"epoch": Uuid::from_u128(3), "after_seq": 39},
-            "evidence_ref": "serial://bench/epochs/3/events?after_seq=39&through_seq=43",
-            "wall_time_start_ns": 10,
-            "wall_time_end_ns": 20,
-            "created_wall_time_ns": 21,
-            "acked_wall_time_ns": null,
-            "internal_worker_token": "omit"
-        });
-        let compact = compact_monitor_incident(&incident);
-        assert_eq!(compact["incident_id"], json!(Uuid::from_u128(1)));
-        assert_eq!(compact["serial_range"]["seq_start"], 40);
-        assert_eq!(compact["evidence_cursor"]["after_seq"], 39);
-        assert_eq!(compact["acked"], false);
-        assert!(compact.get("internal_worker_token").is_none());
-    }
-
-    #[test]
-    fn wait_cursor_prefers_explicit_then_compatible_session_cursor() {
-        let slot = test_slot();
-        let explicit = Cursor {
-            epoch: slot.daemon_epoch,
-            after_seq: 7,
-        };
-        let remembered = Cursor {
-            epoch: slot.daemon_epoch,
-            after_seq: 21,
-        };
-
-        let (selected, source) =
-            select_wait_cursor(Some(explicit.clone()), Some(remembered.clone()), &slot);
-        assert_eq!(selected, explicit);
-        assert_eq!(source, CursorSource::Explicit);
-
-        let (selected, source) = select_wait_cursor(None, Some(remembered.clone()), &slot);
-        assert_eq!(selected, remembered);
-        assert_eq!(source, CursorSource::SessionLiveCursor);
-        assert_eq!(source.label(), "session_live_cursor");
-    }
-
-    #[test]
-    fn wait_cursor_falls_back_to_head_for_missing_or_stale_session_state() {
-        let slot = test_slot();
-        for remembered in [
-            None,
-            Some(Cursor {
-                epoch: Uuid::new_v4(),
-                after_seq: 21,
-            }),
-            Some(Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: slot.head_seq + 1,
-            }),
-        ] {
-            let (selected, source) = select_wait_cursor(None, remembered, &slot);
-            assert_eq!(
-                selected,
-                Cursor {
-                    epoch: slot.daemon_epoch,
-                    after_seq: slot.head_seq,
-                }
-            );
-            assert_eq!(source, CursorSource::CurrentHead);
-        }
-    }
-
-    #[test]
-    fn remembered_live_cursor_is_monotonic_within_an_epoch_and_resets_across_epochs() {
-        let mut cursors = BTreeMap::new();
-        let first_epoch = Uuid::new_v4();
-        remember_live_cursor(
-            &mut cursors,
-            "bench",
-            Cursor {
-                epoch: first_epoch,
-                after_seq: 20,
-            },
-        );
-        remember_live_cursor(
-            &mut cursors,
-            "bench",
-            Cursor {
-                epoch: first_epoch,
-                after_seq: 10,
-            },
-        );
-        assert_eq!(cursors["bench"].after_seq, 20);
-
-        let next_epoch = Uuid::new_v4();
-        remember_live_cursor(
-            &mut cursors,
-            "bench",
-            Cursor {
-                epoch: next_epoch,
-                after_seq: 3,
-            },
-        );
-        assert_eq!(
-            cursors["bench"],
-            Cursor {
-                epoch: next_epoch,
-                after_seq: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn command_args_accept_an_empty_command() {
-        let args: CommandArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "command": "",
-            "description": "发送回车"
-        }))
-        .unwrap();
-        assert!(args.command.is_empty());
-    }
-
-    #[test]
-    fn command_description_is_required_and_utf8_byte_bounded() {
-        assert!(
-            serde_json::from_value::<CommandArgs>(json!({
-                "run_handle": TEST_RUN_HANDLE,
-                "command": "cat /proc/meminfo"
-            }))
-            .is_err()
-        );
-        for invalid in ["", " 前导空格", "尾随空格 ", "包含\n换行"] {
-            assert!(validate_command_description(invalid).is_err());
-        }
-        assert!(validate_command_description("查看样机内存").is_ok());
-        let oversized = "界".repeat(MAX_COMMAND_DESCRIPTION_BYTES / "界".len() + 1);
-        assert!(validate_command_description(&oversized).is_err());
-    }
-
-    fn sequence_step(value: Value) -> CommandSequenceStepArgs {
-        serde_json::from_value(value).unwrap()
-    }
-
-    #[test]
-    fn command_sequence_args_are_strict_and_require_an_overall_description() {
-        let args: CommandSequenceArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "description": "登录样机",
-            "steps": [
-                {"command":"admin", "description":"输入账号", "expect":"Password:"},
-                {"command":"secret", "description":"输入密码", "regex":"[#>$]\\s*$"}
-            ]
-        }))
-        .unwrap();
-        assert_eq!(args.description, "登录样机");
-        assert_eq!(args.steps.len(), 2);
-
-        assert!(
-            serde_json::from_value::<CommandSequenceArgs>(json!({
-                "run_handle":TEST_RUN_HANDLE,
-                "steps":[{"command":"admin","description":"输入账号"}]
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<CommandSequenceArgs>(json!({
-                "run_handle":TEST_RUN_HANDLE,
-                "description":"登录样机",
-                "steps":[{"command":"admin","description":"输入账号","sensitive":true}]
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn command_sequence_prevalidates_every_dependent_boundary_and_timeout() {
-        let valid = vec![
-            sequence_step(json!({
-                "command":"admin", "description":"输入账号", "expect":"Password:"
-            })),
-            sequence_step(json!({
-                "command":"secret", "description":"输入密码", "regex":"[#>$]\\s*$",
-                "timeout_seconds":120
-            })),
-        ];
-        validate_command_sequence_shape(&valid).unwrap();
-
-        for invalid in [
-            vec![],
-            vec![
-                sequence_step(json!({"command":"admin","description":"输入账号"})),
-                sequence_step(json!({"command":"secret","description":"输入密码"})),
-            ],
-            vec![
-                sequence_step(json!({
-                    "command":"admin", "description":"输入账号",
-                    "expect":"Password:", "regex":"Password:"
-                })),
-                sequence_step(json!({"command":"secret","description":"输入密码"})),
-            ],
-            vec![sequence_step(json!({
-                "command":"admin", "description":"输入账号", "regex":"("
-            }))],
-            vec![sequence_step(json!({
-                "command":"admin", "description":"输入账号", "regex":".*"
-            }))],
-            vec![sequence_step(json!({
-                "command":"admin", "description":"输入账号", "timeout_seconds":0
-            }))],
-            vec![sequence_step(json!({
-                "command":"admin", "description":"输入账号", "timeout_seconds":121
-            }))],
-            vec![
-                sequence_step(json!({
-                    "command":"one", "description":"第一步", "expect":"1",
-                    "timeout_seconds":120
-                })),
-                sequence_step(json!({
-                    "command":"two", "description":"第二步", "expect":"2",
-                    "timeout_seconds":120
-                })),
-                sequence_step(json!({
-                    "command":"three", "description":"第三步", "timeout_seconds":61
-                })),
-            ],
-        ] {
-            assert!(validate_command_sequence_shape(&invalid).is_err());
-        }
-
-        let too_many = (0..=MAX_COMMAND_SEQUENCE_STEPS)
-            .map(|index| {
-                sequence_step(json!({
-                    "command":format!("step-{index}"),
-                    "description":format!("第{}步", index + 1),
-                    "expect":"ready"
-                }))
-            })
-            .collect::<Vec<_>>();
-        assert!(validate_command_sequence_shape(&too_many).is_err());
-    }
-
-    #[test]
-    fn command_sequence_physical_byte_budget_uses_each_effective_eol() {
-        let mut slot = test_slot();
-        slot.effective_write_eol = Some("\r".into());
-        slot.effective_echo = Some(EchoMode::On);
-        let max_command = "x".repeat(MAX_WRITE_BYTES - 1);
-        let steps = (0..MAX_COMMAND_SEQUENCE_STEPS)
-            .map(|index| CommandSequenceStepArgs {
-                command: max_command.clone(),
-                description: format!("第{}步", index + 1),
-                expect: (index + 1 < MAX_COMMAND_SEQUENCE_STEPS).then(|| "ready".into()),
-                regex: None,
-                timeout_seconds: Some(1),
-            })
-            .collect::<Vec<_>>();
-        let prepared = prepare_command_sequence_steps(steps, &slot).unwrap();
-        assert_eq!(
-            prepared.iter().map(|step| step.bytes.len()).sum::<usize>(),
-            MAX_COMMAND_SEQUENCE_TOTAL_WRITE_BYTES
-        );
-
-        let oversized = vec![CommandSequenceStepArgs {
-            command: "x".repeat(MAX_WRITE_BYTES),
-            description: "超过物理写上限".into(),
-            expect: None,
-            regex: None,
-            timeout_seconds: Some(1),
-        }];
-        assert!(prepare_command_sequence_steps(oversized, &slot).is_err());
-    }
-
-    #[test]
-    fn command_sequence_advances_only_on_unambiguous_explicit_evidence() {
-        let execution = |completion| ExecutedCommandStep {
-            output: json!({}),
-            completion,
-            cursor: Cursor {
-                epoch: Uuid::nil(),
-                after_seq: 1,
-            },
-            truncated: false,
-            gap: false,
-            interfered: false,
-            echo_missing: false,
-            no_rx: false,
-        };
-        assert!(
-            command_sequence_stop(&execution(Completion::Pattern("Password:".into())), true)
-                .is_none()
-        );
-        assert!(
-            command_sequence_stop(&execution(Completion::Regex("prompt".into())), true).is_none()
-        );
-        for completion in [
-            Completion::Quiet,
-            Completion::Prompt("# ".into()),
-            Completion::Timeout,
-            Completion::Disconnected("closed".into()),
-        ] {
-            assert!(command_sequence_stop(&execution(completion), true).is_some());
-        }
-
-        for mutate in ["gap", "truncated", "interfered", "echo_missing", "no_rx"] {
-            let mut unsafe_step = execution(Completion::Pattern("Password:".into()));
-            match mutate {
-                "gap" => unsafe_step.gap = true,
-                "truncated" => unsafe_step.truncated = true,
-                "interfered" => unsafe_step.interfered = true,
-                "echo_missing" => unsafe_step.echo_missing = true,
-                "no_rx" => unsafe_step.no_rx = true,
-                _ => unreachable!(),
-            }
-            assert!(command_sequence_stop(&unsafe_step, true).is_some());
-        }
-
-        let aborted = execution(Completion::RunAborted {
-            run_id: Uuid::new_v4(),
-            reason: "human takeover".into(),
-        });
-        let stop = command_sequence_stop(&aborted, true).expect("abort stops sequence");
-        assert_eq!(stop.code, "run_aborted");
-        assert!(sequence_stop_forces_closed(&stop));
-    }
-
-    #[test]
-    fn complete_echo_counts_as_post_write_rx_after_echo_bytes_are_stripped() {
-        assert!(!command_has_no_rx(0, true));
-        assert!(command_has_no_rx(0, false));
-        assert!(!command_has_no_rx(1, false));
-    }
-
-    #[test]
-    fn sequence_boundary_failure_is_a_zero_next_step_partial_result() {
-        let slot = test_slot();
-        let run_id = Uuid::new_v4();
-        let output = command_sequence_output(
-            &slot,
-            run_id,
-            Uuid::new_v4(),
-            "登录样机".into(),
-            2,
-            1,
-            vec![json!({
-                "step_index": 0,
-                "status": "completed",
-                "cursor": {"epoch": slot.daemon_epoch, "after_seq": 50}
-            })],
-            Some(json!({
-                "step_index": 1,
-                "phase": "write",
-                "code": "sequence_boundary_changed",
-                "next_step_sent": false
-            })),
-        );
-        assert_eq!(output["status"], "partial");
-        assert_eq!(output["sent_steps"], 1);
-        assert_eq!(output["completed_steps"], 1);
-        assert_eq!(output["failure"]["next_step_sent"], false);
-        assert_eq!(output["failure"]["code"], "sequence_boundary_changed");
-    }
-
-    #[test]
-    fn release_planning_uses_local_lease_ownership_and_fails_closed_on_run_races() {
-        let local_run = Uuid::new_v4();
-        let foreign_run = Uuid::new_v4();
-        let run_token = Uuid::new_v4();
-
-        // A fresh MCP must not require a token for, or interfere with, a Run
-        // merely because that foreign Run is visible in daemon status.
-        assert_eq!(
-            plan_release(
-                LocalControlState {
-                    has_lease: false,
-                    owned_run_id: None,
-                },
-                Some(foreign_run),
-                false,
-                None,
-            )
-            .unwrap(),
-            ReleaseDecision::AlreadyReleased
-        );
-
-        // No authoritative active Run turns an old process-local Run entry
-        // into cleanup state; default release needs neither abort nor token.
-        assert_eq!(
-            plan_release(
-                LocalControlState {
-                    has_lease: true,
-                    owned_run_id: Some(local_run),
-                },
-                None,
-                false,
-                None,
-            )
-            .unwrap(),
-            ReleaseDecision::Release {
-                authorize: None,
-                allow_stale_cleanup: true,
-            }
-        );
-        // A caller can race with an already-authoritative external abort after
-        // resolving its handle. The fresh daemon snapshot wins: stale cleanup
-        // must discard that now-obsolete capability instead of panicking or
-        // trying to authorize an abort of a Run that no longer exists.
-        assert_eq!(
-            plan_release(
-                LocalControlState {
-                    has_lease: true,
-                    owned_run_id: Some(local_run),
-                },
-                None,
-                true,
-                Some((local_run, run_token)),
-            )
-            .unwrap(),
-            ReleaseDecision::Release {
-                authorize: None,
-                allow_stale_cleanup: true,
-            }
-        );
-
-        let active_local = LocalControlState {
-            has_lease: true,
-            owned_run_id: Some(local_run),
-        };
-        assert!(plan_release(active_local, Some(local_run), false, None).is_err());
-        assert!(plan_release(active_local, Some(local_run), true, None).is_err());
-        assert_eq!(
-            plan_release(
-                active_local,
-                Some(local_run),
-                true,
-                Some((local_run, run_token)),
-            )
-            .unwrap(),
-            ReleaseDecision::Release {
-                authorize: Some((local_run, run_token)),
-                allow_stale_cleanup: false,
-            }
-        );
-
-        assert!(
-            plan_release(
-                active_local,
-                Some(local_run),
-                true,
-                Some((foreign_run, run_token)),
-            )
-            .is_err()
-        );
-        assert!(
-            plan_release(
-                active_local,
-                Some(foreign_run),
-                true,
-                Some((local_run, run_token)),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn control_signals_are_exact_single_bytes_without_eol() {
-        assert_eq!(control_signal_byte("ctrl_c"), Some(0x03));
-        assert_eq!(control_signal_byte("ctrl_d"), Some(0x04));
-        assert_eq!(control_signal_byte("ctrl_z"), Some(0x1a));
-        assert_eq!(control_signal_byte("break"), None);
-    }
-
-    #[test]
-    fn agent_writes_reject_transport_pacing_overrides() {
-        let command = serde_json::from_value::<CommandArgs>(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "command": "version",
-            "description": "查看版本",
-            "chunk_size": 64
-        }))
-        .err()
-        .expect("command pacing override must be rejected");
-        assert!(command.to_string().contains("unknown field"));
-
-        let trigger = serde_json::from_value::<TriggerArgs>(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "action": {"text": "slp"},
-            "inter_char_delay_ms": 0
-        }))
-        .err()
-        .expect("trigger pacing override must be rejected");
-        assert!(trigger.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn trigger_uses_only_explicit_call_text_and_eol() {
-        let args: TriggerArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "kickoff": {"text": "reboot", "eol": "\r"},
-            "start_contains": "Booting",
-            "action": {"text": "slp"},
-            "stop_contains": ["any caller literal"],
-            "interval_ms": 20,
-            "timeout_ms": 5000,
-            "max_fires": 250
-        }))
-        .unwrap();
-        let spec = trigger_spec(&args).unwrap();
-        assert_eq!(spec.initial_write.as_deref(), Some(b"reboot\r".as_slice()));
-        assert_eq!(spec.start_contains.as_deref(), Some(b"Booting".as_slice()));
-        assert_eq!(spec.action, b"slp");
-        assert_eq!(spec.stop_contains, vec![b"any caller literal".to_vec()]);
-        assert_eq!(spec.interval_ms, 20);
-        assert_eq!(spec.timeout_ms, 5000);
-        assert_eq!(spec.max_fires, 250);
-        assert_eq!(spec.pacing, None);
-    }
-
-    #[test]
-    fn normal_kickoff_trigger_omits_the_optional_start_gate() {
-        let args: TriggerArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "kickoff": {"text": "reboot", "eol": "\r"},
-            "action": {"text": "slp"},
-            "stop_contains": ["prompt>"]
-        }))
-        .unwrap();
-
-        let spec = trigger_spec(&args).unwrap();
-        assert_eq!(spec.initial_write.as_deref(), Some(b"reboot\r".as_slice()));
-        assert!(spec.start_contains.is_none());
-        assert_eq!(spec.action, b"slp");
-    }
-
-    #[test]
-    fn trigger_allows_bounded_one_shot_without_a_stop_literal() {
-        let args: TriggerArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "start_contains": "send ACK now",
-            "action": {"text": "ACK", "eol": ""},
-            "max_fires": 1
-        }))
-        .unwrap();
-        let spec = trigger_spec(&args).unwrap();
-        assert!(spec.stop_contains.is_empty());
-        assert_eq!(spec.max_fires, 1);
-        assert_eq!(
-            trigger_status_label(TriggerStatus::MaxFiresReached),
-            "max_fires_reached"
-        );
-        assert!(!TriggerStatus::MaxFiresReached.is_matched());
-    }
-
-    #[test]
-    fn trigger_guidance_separates_send_budget_from_observation() {
-        let with_stop = test_terminal_trigger(
-            TriggerStatus::MaxFiresReached,
-            DEFAULT_TRIGGER_MAX_FIRES,
-            vec![b"prompt".to_vec()],
-        );
-        assert!(trigger_send_budget_exhausted(&with_stop));
-        let guidance = trigger_guidance(&with_stop);
-        assert!(guidance.contains("send budget was exhausted"));
-        assert!(guidance.contains("kept observing until the original deadline"));
-        assert!(guidance.contains("not proof"));
-
-        let without_stop = test_terminal_trigger(
-            TriggerStatus::MaxFiresReached,
-            DEFAULT_TRIGGER_MAX_FIRES,
-            Vec::new(),
-        );
-        let guidance = trigger_guidance(&without_stop);
-        assert!(guidance.contains("No stop literal was configured"));
-        assert!(guidance.contains("instead of blindly retrying"));
-
-        let timed_out = test_terminal_trigger(TriggerStatus::TimedOut, 1, vec![b"ready".to_vec()]);
-        assert!(!trigger_send_budget_exhausted(&timed_out));
-        assert!(trigger_guidance(&timed_out).contains("observation deadline"));
-    }
-
-    #[test]
-    fn trigger_rejects_empty_or_unbounded_payload_plans() {
-        let empty: TriggerArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "action": {"text": "", "eol": ""}
-        }))
-        .unwrap();
-        assert!(
-            trigger_spec(&empty)
-                .unwrap_err()
-                .to_string()
-                .contains("both empty")
-        );
-
-        let over_total: TriggerArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "kickoff": {"text": "x"},
-            "action": {"text": "a".repeat(256)},
-            "max_fires": 256
-        }))
-        .unwrap();
-        assert!(
-            trigger_spec(&over_total)
-                .unwrap_err()
-                .to_string()
-                .contains("65536 bytes")
-        );
-    }
-
-    #[test]
-    fn trigger_stopping_is_not_a_terminal_outcome() {
-        assert!(!TriggerStatus::Stopping.is_terminal());
-        assert!(TriggerStatus::Cancelled.is_terminal());
-        assert_eq!(trigger_status_label(TriggerStatus::Stopping), "stopping");
-    }
-
-    #[test]
-    fn trigger_evidence_excludes_events_after_the_terminal_boundary() {
-        assert!(!trigger_evidence_contains(40, 41, 73));
-        assert!(trigger_evidence_contains(41, 41, 73));
-        assert!(trigger_evidence_contains(73, 41, 73));
-        assert!(!trigger_evidence_contains(74, 41, 73));
-    }
-
-    #[test]
-    fn current_run_continuation_requires_an_exact_current_cursor_pair() {
-        let slot = test_slot();
-        assert_eq!(current_run_after_seq(None, None, &slot).unwrap(), None);
-        assert_eq!(
-            current_run_after_seq(Some(slot.daemon_epoch), Some(21), &slot).unwrap(),
-            Some(21)
-        );
-
-        for (epoch, after_seq) in [(Some(slot.daemon_epoch), None), (None, Some(21))] {
-            let error = current_run_after_seq(epoch, after_seq, &slot).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("requires epoch and after_seq together")
-            );
-        }
-
-        let error = current_run_after_seq(Some(Uuid::new_v4()), Some(21), &slot).unwrap_err();
-        assert!(error.to_string().contains("cursor epoch changed"));
-        let error = current_run_after_seq(Some(slot.daemon_epoch), Some(slot.head_seq + 1), &slot)
-            .unwrap_err();
-        assert!(error.to_string().contains("cursor is ahead"));
-
-        let run_id = Uuid::new_v4();
-        assert_eq!(
-            current_run_id(Some(run_id), Some(21), &slot).unwrap(),
-            run_id
-        );
-        let error = current_run_id(None, Some(21), &slot).unwrap_err();
-        assert!(error.to_string().contains("requires the run_id"));
-    }
-
-    #[test]
-    fn truncated_current_run_search_guides_a_run_scoped_continuation() {
-        let run_id = Uuid::new_v4();
-        let epoch = Uuid::new_v4();
-        let mut output = json!({"cursor": {"epoch": epoch, "after_seq": 1234}});
-        attach_search_continuation_guidance(&mut output, "current_run", Some(run_id));
-
-        assert_eq!(output["continuation"]["scope"], "current_run");
-        assert_eq!(output["continuation"]["epoch"], json!(epoch));
-        assert_eq!(output["continuation"]["after_seq"], 1234);
-        assert_eq!(output["continuation"]["run_id"], json!(run_id));
-        assert!(output["guidance"].as_str().unwrap().contains("incomplete"));
-        assert!(!output["guidance"].as_str().unwrap().contains("archive"));
-    }
-
-    #[test]
-    fn command_assessment_never_claims_execution_success() {
-        assert_eq!(
-            completion_kind(&Completion::Pattern("]# ".into())),
-            "literal"
-        );
-        assert_eq!(completion_kind(&Completion::Prompt("]# ".into())), "prompt");
-        assert_eq!(
-            command_confidence(&Completion::Quiet, false, false, false, false, 1),
-            "low"
-        );
-        assert_eq!(
-            command_confidence(
-                &Completion::Pattern("]# ".into()),
-                false,
-                false,
-                false,
-                true,
-                1,
-            ),
-            "medium"
-        );
-    }
-
-    #[test]
-    fn human_takeover_error_has_stable_machine_readable_fields() {
-        let run_id = Uuid::new_v4();
-        let message = format_run_abort_error(
-            "bench",
-            run_id,
-            &RunAbortDiagnosis {
-                reason: "human takeover".into(),
-                taken_over_by: Some(Actor {
-                    id: "human:operator-1".into(),
-                    label: "operator-1".into(),
-                    kind: ActorKind::Human,
-                }),
-            },
-            true,
-        );
-        assert!(message.starts_with("human_takeover:"));
-        assert!(message.contains("taken_over_by=\"operator-1 (human:operator-1)\""));
-        assert!(message.contains(&format!("run_id={run_id}")));
-        assert!(message.contains("no_bytes_written=true"));
-        assert!(message.contains("DUT model/state is reconfirmed"));
-
-        for diagnostic in [
-            "human_takeover_or_control_revoked: taken_over_by=unknown",
-            "seriald StaleFence (retryable=false)",
-            "seriald ControlRequired (retryable=false)",
-        ] {
-            assert!(error_indicates_run_or_control_loss(&anyhow!(diagnostic)));
-        }
-        assert!(!error_indicates_run_or_control_loss(&anyhow!(
-            "ordinary serial I/O error"
-        )));
-    }
-
-    #[test]
-    fn accepted_trigger_takeover_has_structured_diagnosis_without_zero_write_claim() {
-        let run_id = Uuid::new_v4();
-        let actor = Actor {
-            id: "human:operator-1".into(),
-            label: "operator-1".into(),
-            kind: ActorKind::Human,
-        };
-        let mut output = json!({"outcome": "control_lost"});
-        assert!(attach_trigger_takeover_diagnosis(
-            &mut output,
-            run_id,
-            &RunAbortDiagnosis {
-                reason: "human takeover".into(),
-                taken_over_by: Some(actor.clone()),
-            },
-        ));
-        assert_eq!(output["abort_diagnosis"]["code"], "human_takeover");
-        assert_eq!(output["abort_diagnosis"]["taken_over_by"], json!(actor));
-        assert_eq!(output["abort_diagnosis"]["run_id"], json!(run_id));
-        assert_eq!(output["abort_diagnosis"]["no_bytes_written"], false);
-
-        let mut non_human = json!({"outcome": "run_lost"});
-        assert!(!attach_trigger_takeover_diagnosis(
-            &mut non_human,
-            run_id,
-            &RunAbortDiagnosis {
-                reason: "control lease expired".into(),
-                taken_over_by: None,
-            },
-        ));
-        assert!(non_human.get("abort_diagnosis").is_none());
-    }
-
-    #[test]
-    fn aborted_capture_is_never_reported_as_successful_evidence() {
-        let completion = Completion::RunAborted {
-            run_id: Uuid::new_v4(),
-            reason: "human takeover".into(),
-        };
-        assert_eq!(completion_kind(&completion), "run_aborted");
-        assert_eq!(capture_confidence(&completion, false, false), "unreliable");
-        assert_eq!(
-            command_confidence(&completion, false, false, false, false, 1),
-            "unreliable"
-        );
-    }
-
-    #[test]
-    fn rendered_text_truncation_reduces_command_and_wait_confidence() {
-        let rendered_text_truncated = true;
-        let output_truncated = rendered_text_truncated;
-        assert_eq!(
-            command_confidence(
-                &Completion::Prompt("]# ".into()),
-                output_truncated,
-                false,
-                false,
-                false,
-                1,
-            ),
-            "partial"
-        );
-        assert_eq!(
-            capture_confidence(&Completion::Prompt("]# ".into()), output_truncated, false),
-            "partial"
-        );
-    }
-
-    #[test]
-    fn display_names_are_disambiguated_by_port() {
-        let mut slots = vec![
-            json!({"display_name": "hawk", "port": "COM3"}),
-            json!({"display_name": "hawk", "port": "COM7"}),
-            json!({"display_name": "", "port": "COM9"}),
-            json!({"display_name": "unique", "port": "COM11"}),
-        ];
-        disambiguate_display_names(&mut slots);
-        assert_eq!(slots[0]["display_name"], "hawk (COM3)");
-        assert_eq!(slots[1]["display_name"], "hawk (COM7)");
-        assert_eq!(slots[2]["display_name"], "(COM9)");
-        assert_eq!(slots[3]["display_name"], "unique");
-    }
-
-    #[test]
-    fn slot_summary_is_compact_but_keeps_agent_decision_state() {
-        let mut slot = test_slot();
-        let owner = serial_protocol::Actor {
-            id: "agent:one".into(),
-            label: "agent-one".into(),
-            kind: serial_protocol::ActorKind::Agent,
-        };
-        slot.config.device_profile = Some("luckfox".into());
-        slot.control = Some(serial_protocol::ControlLease {
-            id: Uuid::from_u128(1),
-            owner: owner.clone(),
-            epoch: slot.daemon_epoch,
-            generation: slot.generation,
-            fence: 7,
-            issued_wall_time_ns: 10,
-            expires_wall_time_ns: 20,
-        });
-        slot.active_run = Some(serial_protocol::RunInfo {
-            id: Uuid::from_u128(2),
-            owner: owner.clone(),
-            label: "diagnose".into(),
-            status: serial_protocol::RunStatus::Active,
-            start_seq: 40,
-            end_seq: None,
-            metadata: BTreeMap::from([("large_internal_value".into(), json!("omit me"))]),
-        });
-        slot.active_trigger = Some(TriggerInfo {
-            id: Uuid::from_u128(3),
-            owner,
-            daemon_epoch: slot.daemon_epoch,
-            generation: slot.generation,
-            control_id: Uuid::from_u128(1),
-            fence: 7,
-            operation_id: Some(Uuid::from_u128(4)),
-            expected_run_id: Some(Uuid::from_u128(2)),
-            spec: TriggerSpec {
-                initial_write: Some(b"secret kickoff bytes".to_vec()),
-                start_contains: Some(b"boot".to_vec()),
-                action: b"slp".to_vec(),
-                interval_ms: DEFAULT_TRIGGER_INTERVAL_MS,
-                stop_contains: vec![b"prompt".to_vec()],
-                timeout_ms: DEFAULT_TRIGGER_TIMEOUT_MS,
-                max_fires: DEFAULT_TRIGGER_MAX_FIRES,
-                pacing: None,
-            },
-            status: TriggerStatus::Running,
-            start_seq: 41,
-            end_seq: None,
-            last_write_seq: Some(42),
-            fires_confirmed: 2,
-            tx_bytes_confirmed: 6,
-            matched_pattern: None,
-        });
-
-        let summary = slot_summary(&slot);
-        assert_eq!(summary["slot_id"], "bench");
-        assert_eq!(summary["transport_profile"], "linux");
-        assert_eq!(summary["device_profile"], "luckfox");
-        assert_eq!(summary["session_state"], "online");
-        assert_eq!(summary["cursor"]["epoch"], json!(Uuid::nil()));
-        assert_eq!(summary["cursor"]["after_seq"], 42);
-        assert_eq!(summary["effective_transport"]["baud_rate"], 115_200);
-        assert_eq!(summary["effective_device"]["write_eol"], "\r");
-        assert_eq!(summary["control"]["owner"]["id"], "agent:one");
-        assert_eq!(summary["active_run"]["label"], "diagnose");
-        assert_eq!(summary["active_trigger"]["fires_confirmed"], 2);
-
-        for removed in [
-            "config",
-            "profile",
-            "baud_rate",
-            "write_eol",
-            "effective_write_eol",
-            "head_seq",
-            "epoch",
-        ] {
-            assert!(
-                summary.get(removed).is_none(),
-                "legacy or duplicate field {removed:?} leaked into devices"
-            );
-        }
-        assert!(summary["active_run"].get("metadata").is_none());
-        assert!(summary["active_trigger"].get("spec").is_none());
-        assert!(
-            !serde_json::to_string(&summary)
-                .unwrap()
-                .contains("secret kickoff bytes")
-        );
-    }
-
-    #[test]
-    fn http_status_protocol_mismatch_fails_closed() {
-        let mut status = StatusResponse {
-            server_id: Uuid::from_u128(10),
-            daemon_epoch: Uuid::from_u128(11),
-            protocol_version: PROTOCOL_VERSION,
-            config_revision: 1,
-            sequence_write_precondition_supported: true,
-            serial_context_precondition_supported: true,
-            slots: vec![test_slot()],
-        };
-        ensure_protocol_compatible(&status).unwrap();
-        ensure_sequence_write_precondition_supported(&status).unwrap();
-        ensure_serial_context_precondition_supported(&status).unwrap();
-
-        status.protocol_version = 0;
-        let error = ensure_protocol_compatible(&status).unwrap_err().to_string();
-        assert!(error.contains("protocol version 0"));
-        assert!(error.contains("same release"));
-
-        status.protocol_version = PROTOCOL_VERSION;
-        status.sequence_write_precondition_supported = false;
-        let error = ensure_sequence_write_precondition_supported(&status)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("atomic command_sequence"));
-        assert!(error.contains("no bytes were written"));
-
-        status.sequence_write_precondition_supported = true;
-        status.serial_context_precondition_supported = false;
-        let error = ensure_serial_context_precondition_supported(&status)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("Write, BREAK, and Trigger"));
-        assert!(error.contains("no bytes were written"));
-    }
-
-    fn test_slot() -> SlotSnapshot {
-        let settings = serde_json::to_value(serial_protocol::SerialSettings::default()).unwrap();
-        serde_json::from_value(json!({
-            "config": {
-                "id": "bench", "display_name": "Bench", "port": "COM3", "profile": "linux",
-                "enabled": true, "settings": settings,
-            },
-            "daemon_epoch": Uuid::nil(),
-            "head_seq": 42,
-            "ring_oldest_seq": 1,
-            "generation": 1,
-            "endpoint_present": true,
-            "session_state": "online",
-            "state_reason": null,
-            "target_activity": "active",
-            "last_rx_wall_time_ns": null,
-            "rx_offset": 0,
-            "tx_offset": 0,
-            "control": null,
-            "active_run": null,
-            "logging": "healthy"
-        }))
-        .unwrap()
-    }
-
-    fn test_terminal_trigger(
-        status: TriggerStatus,
-        fires_confirmed: u32,
-        stop_contains: Vec<Vec<u8>>,
-    ) -> TriggerInfo {
-        TriggerInfo {
-            id: Uuid::from_u128(30),
-            owner: Actor {
-                id: "agent:test".into(),
-                label: "test".into(),
-                kind: ActorKind::Agent,
-            },
-            daemon_epoch: Uuid::nil(),
-            generation: 1,
-            control_id: Uuid::from_u128(31),
-            fence: 1,
-            operation_id: Some(Uuid::from_u128(32)),
-            expected_run_id: Some(Uuid::from_u128(33)),
-            spec: TriggerSpec {
-                initial_write: None,
-                start_contains: None,
-                action: b"x".to_vec(),
-                interval_ms: DEFAULT_TRIGGER_INTERVAL_MS,
-                stop_contains,
-                timeout_ms: DEFAULT_TRIGGER_TIMEOUT_MS,
-                max_fires: DEFAULT_TRIGGER_MAX_FIRES,
-                pacing: None,
-            },
-            status,
-            start_seq: 1,
-            end_seq: Some(5),
-            last_write_seq: Some(3),
-            fires_confirmed,
-            tx_bytes_confirmed: fires_confirmed as u64,
-            matched_pattern: None,
-        }
-    }
-
-    #[test]
-    fn command_defaults_to_the_daemons_effective_device_profile_eol() {
-        let mut slot = test_slot();
-        assert_eq!(effective_write_eol(&slot), "\r");
-        slot.effective_write_eol = Some("\n".into());
-        assert_eq!(effective_write_eol(&slot), "\n");
-        assert_eq!(
-            compose_write_bytes("version", effective_write_eol(&slot)).unwrap(),
-            b"version\n"
-        );
-    }
-
-    #[test]
-    fn command_echo_cleanup_uses_the_daemons_effective_device_profile_mode() {
-        let mut slot = test_slot();
-        slot.config.settings.echo = EchoMode::Off;
-        assert_eq!(effective_echo_mode(&slot), EchoMode::Off);
-        slot.effective_echo = Some(EchoMode::On);
-        assert_eq!(effective_echo_mode(&slot), EchoMode::On);
-    }
-
-    #[test]
-    fn completion_prefers_effective_device_profile_prompts() {
-        let mut slot = test_slot();
-        slot.config.settings.shell_prompt = Some("legacy# ".into());
-        slot.effective_shell_prompt = Some("]# ".into());
-        slot.effective_uboot_prompt = Some("SigmaStar #".into());
-        let (patterns, regex, mode) = requested_completion(None, None, &slot, true).unwrap();
-        assert_eq!(
-            patterns,
-            vec![
-                CompletionPattern::Prompt("]# ".to_string()),
-                CompletionPattern::Prompt("SigmaStar #".to_string())
-            ]
-        );
-        assert!(regex.is_none());
-        assert_eq!(mode, "prompt");
-    }
-
-    #[test]
-    fn promptless_effective_profile_does_not_fall_back_to_stale_slot_prompts() {
-        let mut slot = test_slot();
-        slot.config.settings.shell_prompt = Some("legacy# ".into());
-        slot.config.settings.uboot_prompt = Some("legacy=> ".into());
-        slot.effective_write_eol = Some("\r".into());
-        slot.effective_echo = Some(EchoMode::On);
-        let (patterns, _, mode) = requested_completion(None, None, &slot, true).unwrap();
-        assert!(patterns.is_empty());
-        assert_eq!(mode, "quiet");
-
-        slot.effective_write_eol = None;
-        slot.effective_echo = None;
-        let (legacy_patterns, _, _) = requested_completion(None, None, &slot, true).unwrap();
-        assert_eq!(
-            legacy_patterns,
-            vec![
-                CompletionPattern::Prompt("legacy# ".into()),
-                CompletionPattern::Prompt("legacy=> ".into())
-            ]
-        );
-    }
-
-    #[test]
-    fn command_args_parse_regex_and_lean_rendering_fields() {
-        let args: CommandArgs = serde_json::from_value(json!({
-            "run_handle": TEST_RUN_HANDLE,
-            "command": "boot",
-            "description": "启动样机",
-            "regex": "U-Boot \\d+",
-        }))
-        .unwrap();
-        assert_eq!(args.regex.as_deref(), Some("U-Boot \\d+"));
-        assert!(
-            serde_json::from_value::<CommandArgs>(json!({
-                "run_handle":TEST_RUN_HANDLE,
-                "command":"boot", "description":"启动样机", "include_events":true
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn exact_regex_replaces_configured_prompts_and_quiet_with_regex_mode() {
-        let mut slot = test_slot();
-        slot.effective_shell_prompt = Some("]# ".into());
-        slot.effective_uboot_prompt = Some("SigmaStar #".into());
-        slot.effective_write_eol = Some("\r".into());
-        slot.effective_echo = Some(EchoMode::On);
-        let (patterns, until_regex, completion_mode) =
-            requested_completion(None, Some("U-Boot \\d+"), &slot, true).unwrap();
-        let complete_on_quiet = completion_mode == "quiet";
-
-        assert!(patterns.is_empty());
-        assert_eq!(completion_mode, "regex");
-        assert!(until_regex.is_some());
-        assert!(!complete_on_quiet);
-    }
-
-    #[test]
-    fn regex_boundary_rejects_competing_literal_completion_parameters() {
-        let slot = test_slot();
-        let error =
-            requested_completion(Some("literal"), Some("__DONE__"), &slot, true).unwrap_err();
-        assert!(error.to_string().contains("choose one"));
-
-        assert!(
-            compile_regex("", "regex")
-                .unwrap_err()
-                .to_string()
-                .contains("must not be empty")
-        );
-        assert!(
-            compile_regex("(", "regex")
-                .unwrap_err()
-                .to_string()
-                .contains("not a valid regex")
-        );
-        assert!(
-            compile_regex(&"界".repeat(1366), "regex")
-                .unwrap_err()
-                .to_string()
-                .contains("4096 UTF-8 bytes")
-        );
-
-        for legacy in ["completion", "until", "eol", "quiet_ms"] {
-            let mut value = json!({"slot_id":"bench","command":"boot","description":"启动样机"});
-            value[legacy] = json!("legacy");
-            assert!(serde_json::from_value::<CommandArgs>(value).is_err());
-        }
-    }
 }

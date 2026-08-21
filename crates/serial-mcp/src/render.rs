@@ -559,7 +559,7 @@ mod tests {
 
     fn rx_event(seq: u64, data: &[u8]) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "bench".into(),
+            port: "bench".into(),
             daemon_epoch: uuid::Uuid::nil(),
             seq,
             generation: 1,

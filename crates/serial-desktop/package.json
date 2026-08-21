@@ -1,0 +1,84 @@
+{
+  "name": "serial-platform-desktop",
+  "version": "0.8.0",
+  "private": true,
+  "description": "Serial Platform desktop console",
+  "author": "Serial Platform Contributors",
+  "main": "./out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && npm run test:run && electron-vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "preview": "electron-vite preview",
+    "package": "npm run build && electron-builder --dir --publish never",
+    "package:mac": "electron-builder --mac dir --publish never",
+    "package:linux": "electron-builder --linux AppImage --publish never",
+    "package:win": "electron-builder --win portable --publish never",
+    "dist": "npm run build && electron-builder --publish never",
+    "qa:screenshots": "npm run build && electron . --qa-screenshot --qa-theme=dark && electron . --qa-screenshot --qa-theme=light"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "5.3.0",
+    "@fontsource/jetbrains-mono": "5.3.0",
+    "lucide-react": "1.33.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@electron-toolkit/preload": "3.0.2",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "plist": "3.1.0",
+    "typescript": "7.0.2",
+    "vite": "7.3.6",
+    "vitest": "4.1.11"
+  },
+  "build": {
+    "appId": "dev.serial-platform.desktop",
+    "productName": "Serial Platform",
+    "asar": true,
+    "afterPack": "./scripts/after-pack.mjs",
+    "directories": {
+      "output": "dist",
+      "buildResources": "resources"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin",
+        "filter": ["serial", "seriald", "serial.exe", "seriald.exe"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": ["dir"],
+      "icon": "resources/icon.png"
+    },
+    "win": {
+      "target": ["portable"],
+      "icon": "resources/icon.png",
+      "signAndEditExecutable": false,
+      "artifactName": "serial-platform-desktop-${version}-windows-${arch}.${ext}"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Development",
+      "icon": "resources/icon.png",
+      "artifactName": "serial-platform-desktop-${version}-linux-${arch}.${ext}"
+    }
+  }
+}

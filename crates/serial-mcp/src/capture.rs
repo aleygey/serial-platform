@@ -20,7 +20,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct Capture {
     socket: Socket,
-    slot_id: String,
+    port: String,
     events: VecDeque<TimelineEvent>,
     retained_bytes: usize,
     truncated: bool,
@@ -185,21 +185,12 @@ impl Completion {
 impl Capture {
     pub async fn attach(
         endpoint: &str,
-        token: Option<&str>,
         actor_label: &str,
-        slot_id: String,
+        port: String,
         cursor: Cursor,
         limits: CaptureLimits,
     ) -> Result<Self> {
-        let mut request = ws_url(endpoint)?.into_client_request()?;
-        if let Some(token) = token {
-            request.headers_mut().insert(
-                "Authorization",
-                format!("Bearer {token}")
-                    .parse()
-                    .context("operator token cannot be encoded as an HTTP header")?,
-            );
-        }
+        let request = ws_url(endpoint)?.into_client_request()?;
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
             .await
             .context("timed out connecting capture stream to seriald")??;
@@ -232,7 +223,7 @@ impl Capture {
             &ClientMessage::Attach {
                 request_id: attach_id,
                 subscriptions: vec![Subscription {
-                    slot_id: slot_id.clone(),
+                    port: port.clone(),
                     cursor: Some(cursor),
                     tail_events: 0,
                 }],
@@ -242,7 +233,7 @@ impl Capture {
 
         let mut capture = Self {
             socket,
-            slot_id,
+            port,
             events: VecDeque::new(),
             retained_bytes: 0,
             truncated: false,
@@ -429,36 +420,34 @@ impl Capture {
             match self.socket.next().await {
                 Some(Ok(Message::Binary(bytes))) => match decode_wire_frame(&bytes)? {
                     WireFrame::Rx(header, data) | WireFrame::Tx(header, data) => {
-                        if header.slot_id == self.slot_id {
+                        if header.port == self.port {
                             return Ok(Frame::Event(Box::new(header.into_event(data))));
                         }
                     }
                     WireFrame::Control(ServerMessage::Timeline { event, .. }) => {
-                        if event.slot_id == self.slot_id {
+                        if event.port == self.port {
                             return Ok(Frame::Event(Box::new(event)));
                         }
                     }
-                    WireFrame::Control(ServerMessage::Ready { slot_id, .. })
-                        if slot_id == self.slot_id =>
-                    {
+                    WireFrame::Control(ServerMessage::Ready { port, .. }) if port == self.port => {
                         return Ok(Frame::Ready);
                     }
                     WireFrame::Control(ServerMessage::Gap {
-                        slot_id,
+                        port,
                         requested_after_seq,
                         first_available_seq,
                         head_seq,
                         reason,
-                    }) if slot_id == self.slot_id => {
+                    }) if port == self.port => {
                         return Ok(Frame::Gap(format!(
                             "{reason:?}: requested_after={requested_after_seq:?}, first_available={first_available_seq:?}, head={head_seq}"
                         )));
                     }
                     WireFrame::Control(ServerMessage::Lagged {
-                        slot_id,
+                        port,
                         from_seq,
                         to_seq,
-                    }) if slot_id == self.slot_id => {
+                    }) if port == self.port => {
                         return Ok(Frame::Gap(format!("lagged:{from_seq}-{to_seq}")));
                     }
                     WireFrame::Control(ServerMessage::Error { message, .. }) => {
@@ -1154,7 +1143,7 @@ mod tests {
         operation_id: Option<Uuid>,
     ) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "bench".into(),
+            port: "bench".into(),
             daemon_epoch: Uuid::nil(),
             seq,
             generation: 1,

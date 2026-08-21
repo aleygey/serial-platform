@@ -1,128 +1,119 @@
 # Serial Platform Desktop
 
-`serial-desktop` is the first native GUI client for serial-platform. It is a
-thin Human client and local-process manager: `seriald` remains the only owner
-of physical ports, journal persistence, Control leases, and configuration
-transactions.
+Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v4，不直接打开物理串口。
 
-## Run the MVP from source
+## UI
 
-Build the unified launcher, daemon, and App together so the App can discover a
-matching local service executable:
+控制台是三栏工作台：
 
-```sh
-cargo build -p serial-cli -p seriald -p serial-desktop
-cargo run -p serial-desktop
-```
+- 左栏：OS 串口名、机型名、连接状态、打开/关闭串口和配置入口；
+- 中栏：只显示设备 RX 的持久/实时终端，底部是人工命令输入；
+- 右栏：从旧到新的 Agent Run、普通命令和 `command_sequence` 历史。
 
-The App defaults to `http://127.0.0.1:3210`. Before auto-starting anything it
-probes `/api/v1/health`. If that address already responds, the App only
-connects and never treats the existing process as one it owns or may stop. If
-the address is free, it starts a sibling `serial` or `seriald` process with
-`serve --bind 127.0.0.1:3210`. A custom executable can be selected in the
-configuration page.
+标题栏可启动 App 管理的本地后端，也只允许停止 App 自己启动的进程；连接外部后端时会明确显示为不可停止。配置页可以持久化“自动启动本地后端”开关，默认开启。
 
-Closing the App intentionally leaves a daemon it started running. This avoids
-turning a GUI exit into an ungraceful journal shutdown. “Stop local service” is
-explicit and confirmed; on Unix it sends SIGINT, waits up to three seconds for
-normal shutdown, and only then force-stops an unresponsive owned child. The
-button can never stop a daemon that was already running before this App.
+选择具体 Agent 命令时，终端读取 TX 事件持久化的 `command_capture_matchers`，定位并高亮对应 RX。没有匹配时只显示临时命令提示，不把本机 TX 插入 RX 历史。
 
-## Current feature surface
+终端支持普通文本搜索、双击选词、错误/警告/成功词边界着色以及 IP/MAC 着色。Agent 历史在 follow 状态下自动滚动到最新。
 
-- Connect to a local or remote `seriald` over the existing HTTP/WebSocket
-  protocol without blocking the egui thread.
-- Reconstruct up to 2,000 current-epoch durable events per Slot and then join
-  the live stream at the journal cursor, with `(epoch, seq)` de-duplication and
-  visible gap markers.
-- View bounded serial output and the durable Agent Run/command-description
-  history; expand a command purpose to inspect the confirmed bytes. An MCP
-  `command_sequence` is one purpose card whose concrete commands are ordered by
-  `step_index`; an ordinary command remains one card with one command. The App
-  does not decorate commands with success/failure emoji. History is newest
-  first and follows the top until the operator scrolls. Selecting a purpose or
-  an individual sequence step moves the serial pane to that command's first
-  timeline sequence; “返回最新” restores live following.
-- Send Human lines through queued fenced Control. Drafts and the latest 100
-  input-history entries per Slot survive App restarts; bearer tokens never do.
-- Create a Slot from discovered ports and Transport Profiles, and open/close it
-  through the authoritative full-Slot configuration transaction with
-  `expected_revision`. The GUI never opens a device handle directly.
-- Inspect and directly edit the selected Slot's port; every resolved Transport
-  parameter (baud/data/parity/stop/flow, DTR/RTS, auto-open); and every resolved
-  Device parameter (prompts, EOL, echo, write pacing). Saving never mutates a
-  bound or shared Profile in place. It first prepares content-addressed,
-  currently unbound `desktop-slot-*` Transport and Device Profiles, then
-  switches both bindings in one revision-guarded Slots transaction. Identical
-  content reuses the same entries. Changed content retains at most the current
-  binding plus one candidate; after a successful switch the old unbound entries
-  are removed best-effort and a later save retries cleanup. A stale form fails
-  instead of rebasing over a concurrent change. Existing shared Profiles and a
-  catalog model can still be attached or detached with
-  revision/current-binding guards. General catalog CRUD remains in
-  `serial setup/profile/model`.
-- Use Chinese UI text, common keyboard shortcuts, and system/dark/light themes.
+配置页明确分开：
 
-Desktop preferences are stored with user-only permissions where the platform
-supports them. The exact path is shown on the configuration page.
+- 串口配置：端口、enabled、Transport Profile 和 Model Profile 绑定；
+- 机型 Profile：原样机型名、Shell/U-Boot prompt、EOL、echo 解析和 write pacing。
 
-## v0.7 CI and release packages
+主题支持 system、light 和 dark。
 
-`serial-desktop` is a required release program, not an optional CI artifact.
-Jenkins fails the build if it is missing, has the wrong target architecture,
-requires a newer Linux glibc than the Ubuntu 20.04 baseline, or is absent from
-the package manifest. GitHub's native Windows and Ubuntu validation jobs build,
-run the headless smoke paths, package, extract, and checksum it independently.
-The release gate still asserts the exact 19-tool MCP registry.
+快捷键：
 
-Both of these commands return before logging, opening a window, probing the
-daemon, or loading a graphical backend, which makes them safe in headless CI:
+| Shortcut | Action |
+|---|---|
+| `Ctrl/Cmd+,` | 打开配置 |
+| `Ctrl/Cmd+1` | 返回控制台 |
+| `Ctrl/Cmd+F` | 聚焦串口搜索 |
+| `Ctrl/Cmd+K` | 聚焦命令输入 |
+| `Esc` | 从配置返回控制台 |
+
+## Process architecture
+
+- `src/main`：本地服务生命周期、v4 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
+- `src/preload`：context-isolated、类型化 bridge；
+- `src/renderer`：React UI 与纯展示状态；
+- `src/shared`：DTO、preferences 和 QA fixture。
+
+App 启动时读取配置 endpoint。若 endpoint 不可达且开启 `autoStartLocal`，主进程通过 `seriald serve --managed` 启动 app resources 中的 sidecar，等待 `/api/v1/health`，再建立 WebSocket。App 退出时先关闭受管子进程的 stdin，以 EOF 请求优雅退出，超时才强制终止；连接已有服务时不接管该进程。
+
+renderer 不直接访问网络或子进程。人工命令由主进程获得 Human Control 后写入，TX 进入后端审计历史，终端仍只渲染 RX。
+
+## Development
+
+需要 Node.js 24.x：
 
 ```sh
-serial-desktop --version
-serial-desktop --help
+npm ci --no-audit --no-fund
+npm run dev
 ```
 
-The platform archives contain:
-
-- **Windows x86_64:** `serial-desktop.exe` beside `serial.exe` and
-  `seriald.exe`. The App can therefore start its packaged local backend without
-  another install. Jenkins emits the GNU/MinGW-w64 build; GitHub also validates
-  an MSVC build.
-- **Ubuntu 20.04+ x86_64:** `serial-desktop`, `serial`, and `seriald` are
-  siblings in the archive, so default local-backend startup works after
-  extraction. The graphical path uses eframe's X11/glow backend and needs an
-  X11 display plus the system X11, XKB, and OpenGL libraries (on Ubuntu,
-  packages such as `libx11-6`, `libxcursor1`, `libxi6`, `libxkbcommon0`,
-  `libxrandr2`, and `libgl1`).
-- **macOS 11+ arm64 and x86_64:** each architecture-specific ZIP contains the
-  bare `serial-desktop` binary and a double-clickable `Serial Platform.app`.
-  `Contents/MacOS` contains `serial-desktop`, `serial`, and `seriald`, so the
-  App's sibling-process discovery works when launched from Finder. These are
-  thin, architecture-specific Apps rather than one universal binary.
-
-The macOS App is deliberately **unsigned and not notarized**. After verifying
-the release checksum, a tester may remove only that downloaded App's quarantine
-attribute and open it:
+完整检查：
 
 ```sh
-xattr -dr com.apple.quarantine "Serial Platform.app"
-open "Serial Platform.app"
+npm run typecheck
+npm run test:run
+npm run build
 ```
 
-Every archive contains `MANIFEST.sha256`, including every executable inside
-the macOS App. Verify it from the extracted package directory with
-`sha256sum --check MANIFEST.sha256` on Linux, or
-`shasum -a 256 -c MANIFEST.sha256` on macOS. Jenkins also publishes a top-level
-`SHA256SUMS` that covers all four platform archives.
+`npm run build` 会依次 typecheck、test 并生成 Electron main/preload/renderer bundle。
 
-## MVP boundaries
+## Visual QA
 
-- The console renders safe text rather than emulating ANSI terminal control
-  sequences; control bytes are displayed but never executed by the UI.
-- Automatic startup accepts HTTP endpoints only. A production remote setup
-  should add TLS termination and a secure OS credential store before persisting
-  credentials.
-- The initial console restores only the current daemon epoch. Older retained
-  epochs remain journal archives and are not silently mixed with a newly
-  attached device.
+使用固定 fixture 生成真实 Electron 深色/浅色截图：
+
+```sh
+npm run qa:screenshots
+```
+
+输出：
+
+```text
+qa/serial-platform-desktop-dark.png
+qa/serial-platform-desktop-light.png
+```
+
+只捕获一种主题：
+
+```sh
+electron . --qa-screenshot --qa-theme=dark
+electron . --qa-screenshot --qa-theme=light
+```
+
+renderer-only QA 必须显式使用 `?qa=1&theme=dark` 或 `light`；正常启动不会在 preload 缺失时回落到 fixture。
+
+## Packaging
+
+CI 先把同架构 `serial` 与 `seriald` 放入 `resources/bin`，再运行 electron-builder：
+
+```sh
+npm run package:mac
+npm run package:linux
+npm run package:win
+```
+
+产物形态：
+
+- macOS `.app` directory；
+- Linux AppImage；
+- Windows portable EXE。
+
+完整 Serial Platform 平台包还在 App 之外提供 `serial`、`seriald`、`serialctl` 和 `serial-mcp` 四个 Rust 程序。
+
+macOS 边界：
+
+- Rust CLI deployment target 是 macOS 11.0；
+- Electron 43 App 的最低系统版本是 macOS 12.0；
+- 当前 `.app` 没有 Developer ID 签名，也没有 Apple notarization。
+
+Jenkins 分别构建 macOS arm64 和 x86_64 App。直接调用 electron-builder 时可使用：
+
+```sh
+npx electron-builder --mac dir --arm64 --publish never
+npx electron-builder --mac dir --x64 --publish never
+```

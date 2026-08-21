@@ -1,1067 +1,230 @@
 # Serial Platform
 
-`serial-platform` is a device-agnostic, auditable shared serial control plane
-for Human/Agent collaboration. `seriald` runs on the machine physically
-connected to the serial adapter and remains the sole owner of physical ports;
-Human clients and Agent adapters observe the same Slots, while a fenced control
-lease serializes ordinary writers. A separately audited cooperative Human write
-may be injected without taking over an Agent-owned Run.
+Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。它让一个后端独占物理串口，同时把相同的实时数据、命令记录和持久历史提供给终端、桌面应用与 MCP Agent。
 
-It deliberately has no OpenCode or OpenChamber runtime dependency. The
-`serial-mcp` adapter exposes the same platform to OpenCode, Codex, and other
-MCP clients without making `seriald` Agent-specific.
+平台不内置某个芯片、Shell 或烧录流程。机型差异通过 Profile 描述，具体调试和自动化由人或 Agent 组合通用能力完成。
 
-The v0.7.0 development tree reduces every Run-scoped MCP call to one opaque
-`run_handle`, makes normal `run_end` cleanup explicit, and makes the orphan-Run
-fallback and terminal command-history height configurable. The latest release,
-v0.6.2, introduced private Run capabilities, described command history,
-dependent command sequences, the full-width Run/history bar, and native macOS
-arm64/x86_64 packages. The 19-tool MCP registry retains the persistent Monitor
-Jobs introduced in v0.5.0 and the ordinary serial/Run/Trigger operations. The
-unified launcher introduced in v0.4 remains: `serial serve` starts the backend,
-`serial console` opens the TUI, `serial setup` configures a station,
-`serial profile ...` manages reusable profiles, `serial model ...` manages the
-DUT identity tree, and `serial mcp` starts the MCP adapter. The component
-executables remain in the release package and can still be invoked directly.
+## 核心设计
 
-See [ROADMAP.md](ROADMAP.md) for released capabilities, the next practical
-work, and longer-term candidates separated by `seriald`, `serialctl`, and
-`serial-mcp`.
+- **端口就是设备位**：公开接口只使用操作系统串口名，例如 `COM4` 或 `/dev/cu.usbserial-210`。没有额外的设备位名称。
+- **一个物理写入者**：`seriald` 独占串口句柄，通过带 fencing 的 Control 串行化人和 Agent 的写入。
+- **同一份事实记录**：RX、确认后的 TX、Control、Run、Trigger、断连和重配事件进入同一条带序号时间线。
+- **历史跨客户端重开保留**：日志由后端持久化；关闭再打开 TUI 或 App 不会清空已有串口记录。
+- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 19 个 MCP 工具；三者共享同一个后端状态。
+- **配置分层清楚**：Transport Profile 管物理 UART 参数，Model Profile 管机型名、提示符、换行、设备回显解析和写入节奏。
 
-Protocol and integration references:
+## 快速开始
 
-- [Complete MCP/HTTP/WebSocket protocol](./docs/PROTOCOL.md)
-- [All MCP tool schemas and result contracts](./docs/MCP_TOOLS.md); inspect the
-  installed executable directly with `serial mcp --dump-tools`.
-
-## v0.7.0 development highlights
-
-- `run_start` returns one opaque `run_handle` for later Run-scoped MCP calls;
-  the public `run_id` remains audit identity only. This keeps the model-facing
-  capability small while preventing another LLM session sharing one long-lived
-  adapter from adopting a visible Run. Normal completion calls `run_end`; the
-  configurable orphan timeout defaults to 1,800 seconds and is only a
-  crash/abandonment fallback.
-- The terminal menu can persist both `agent_history_rows` and
-  `orphan_run_timeout_seconds`; changing the latter takes effect for newly
-  started MCP processes and does not alter WebSocket protocol v3.
-- Reopening the terminal reconstructs the current daemon epoch from the
-  durable journal before it resumes live WebSocket traffic. `Ctrl-] /` adds a
-  bounded persistent-history search with text/regex, case, RX/TX, current
-  epoch, retained-epoch, and active-Run modes; older epochs stay separate from
-  the currently attached device view.
-- MCP `read(scope=tail)` now snapshots at most 200 events directly from the
-  bounded live replay ring, so long-running stations no longer make a tail read
-  discover every retained journal segment or rescan a large active segment.
-  `read(scope=continue)` pages the same ring from its process-local cursor, so
-  live continuation is bounded too; eviction and daemon restarts are explicit
-  gaps rather than silent history joins.
-- MCP results expose compact third-party serial activity only when relevant.
-  Before a command/input/signal/Trigger physical action, unacknowledged foreign
-  activity or an incomplete ring interval fails closed with
-  `context_changed` and `no_bytes_written=true`; `read(scope=tail)` or `wait`
-  acknowledges the new state before retry.
-- `serial-desktop` adds a native egui MVP for the same HTTP/WebSocket control
-  plane: local `serial serve` lifecycle management, persistent current-epoch
-  console replay, Agent command history, Slot configuration/open/close,
-  retained Human drafts/history, shortcuts, and dark/light themes. The v0.7
-  release archives include it on Windows and Ubuntu, plus architecture-specific
-  macOS binaries and a double-clickable `Serial Platform.app`; see
-  [its run and packaging notes](./crates/serial-desktop/README.md).
-
-### Upgrading the MCP adapter from v0.6.2
-
-The v0.7.0 MCP tool schema intentionally replaces the Run-scoped
-`slot_id`/`run_id`/`run_token` argument set with one `run_handle`. Restart the
-MCP process and let the host refresh `tools/list` after upgrading; cached
-v0.6.2 tool calls fail closed against the strict v0.7.0 schemas. A handle is
-process-local, so an unfinished v0.6.2 Run or capability cannot be migrated
-into the new adapter. End it before upgrading when possible; otherwise its
-existing disconnect/lease-expiry path aborts it. This is an MCP-tool contract
-change for Run authorization. WebSocket protocol v3, seriald Run IDs, and the
-durable timeline remain unchanged. Separately, v0.7 removes the retired
-`/api/v1/monitor-events` delivery routes and `MonitorSpec.event_ttl_ms`; the
-core Monitor/Incident routes remain. An older `[monitor_event_sink]` table is
-accepted only for migration, ignored at runtime, and omitted on the next
-configuration save. HTTP status also adds the optional
-`serial_context_precondition_supported` capability. Older protocol-v3 daemons
-decode as unsupported; v0.7 MCP refuses command/input/signal/sequence/Trigger
-physical actions before any byte or BREAK rather than allowing an old daemon
-to ignore the new atomic context guard.
-
-## v0.6.2 release highlights
-
-- `run_start` now returns a private `run_token` alongside the public audit
-  `run_id`. Every Run-scoped MCP action must present both, preventing another
-  LLM session sharing one long-lived adapter from accidentally adopting an old
-  visible Run. Active calls pin the Run; an abandoned Run is released after
-  the bounded idle period.
-- `command` requires a concise `description`. Confirmed or partially confirmed
-  TX events retain that purpose, while pre-write failures create no misleading
-  command-history record.
-- `command_sequence` performs a known 1–8-step dependent interaction in one MCP
-  call. Each non-final command must reach its explicit literal/regex boundary
-  before the next write; failure stops all later steps. The sequence and each
-  step carry separate purposes and are grouped by `sequence_id` in history.
-- The terminal shows the current serial channel's recent Agent tasks and
-  command purposes in a full-width horizontal bar between serial output and
-  command input. Operators can select a purpose and expand only the bytes
-  confirmed sent. The bar labels bounded/tail history
-  as recent rather than claiming completeness.
-- Profile selection is available directly through `Ctrl-] o`; left-drag
-  mouse-up copies immediately; the TUI and human-readable `doctor` output use
-  consistent Chinese terminology with an English switch.
-- Jenkins can build Debug or Release packages for Windows x86_64, Ubuntu 20.04
-  x86_64, macOS Apple Silicon, and macOS Intel. Debug archives are never
-  eligible for GitHub Release publishing.
-
-## v0.6.1 release highlights
-
-- The console defaults to Chinese when no saved language exists; `Ctrl-] g`
-  still switches between Chinese and English and persists the choice.
-- Help is grouped by navigation/display, Control and Agent cooperation,
-  queued input, LINE mode, RAW mode, and safety/history. Its independent
-  PgUp/PgDn/Home/End scroll state keeps the full reference usable on small
-  terminals.
-- A normal Trigger supplies optional `kickoff` plus required `action` and
-  omits `start_contains`. Kickoff confirmation immediately enables actions;
-  the explicit start literal remains available only when live RX must gate the
-  first action.
-- Fresh configurations set `auth_required=false`, contain no credentials, and
-  are restricted to loopback. Older configurations without that field decode
-  it as `true` and retain their observer/operator/admin tokens unchanged.
-- Device Profile pacing is stated precisely: `write_chunk_size` bounds each
-  driver step and `write_chunk_delay_ms` is requested between steps, not after
-  the final chunk. It is neither a baud period nor an exact per-character
-  clock; driver blocking and OS timer granularity may add latency.
-
-## v0.6.0 release highlights
-
-- Operators can select or create Profiles and arbitrarily deep DUT-model
-  entries directly in the terminal, and can clone/edit common UART settings
-  without leaving the console. The same model catalog remains scriptable from
-  the CLI.
-- A frozen visual-row scrollback snapshot no longer jumps when live RX/TX
-  arrives. Short initial histories no longer scroll into blank or disappearing
-  rows.
-- Commands typed while an Agent owns the Run appear as ordered, individually
-  editable/removable cards. Empty Enter only follows the live tail; ordinary
-  Enter queues without takeover, Alt-Enter is an audited cooperative Human
-  write, and explicit takeover remains separate.
-- `device_models` and `device_model_set` bring the MCP registry to exactly
-  18 tools. Agents must confirm that the configured model matches the physical
-  DUT through serial, Telnet, web UI, or a human before model-specific work.
-- Release archives are built and verified by Jenkins from one ARM64 Linux
-  worker: cargo-zigbuild targets x86_64 GNU/Linux with a glibc 2.31 ceiling,
-  while MinGW-w64 produces the Windows x86_64 GNU-ABI package.
-
-## What v0.6 provides
-
-- Interactive COM discovery and Slot configuration from `serial setup`.
-- Two explicit reusable configuration layers: a Transport Profile for physical
-  UART settings and an optional Device Profile for DUT behavior and safe write
-  pacing.
-- Interactive and scriptable Profile list/show/create/update/clone/import/export/
-  attach/detach commands with optimistic `config_revision` protection.
-- A separate hierarchical `DeviceModel` catalog with aliases, per-Slot
-  confirmation records, CLI/TUI selection, and narrow Agent binding updates;
-  model identity never silently changes Device Profile behavior.
-- Long-lived serial ownership with auto-open and reconnect.
-- In-place Slot reconfiguration: an existing Slot keeps its epoch, sequence,
-  replay ring, and subscribers while the old OS handle is fully stopped before
-  a changed port can open. Candidate configs and new actors stay paused and
-  hidden until the atomic configuration save succeeds.
-- Multiple subscribers and one WebSocket attachment for multiple Slots.
-- Human write control with visible queueing, explicit takeover, a 60-second
-  idle release policy, TTL, and fencing.
-- LINE and RAW input modes in a full-screen terminal; switch Slot without
-  leaving the current terminal.
-- Full-width Run start/end/abort boundaries, visible queued LINE commands, and
-  edit/delete controls for commands still waiting on Human Control.
-- Source-aware TX/RX timeline with daemon epoch, per-Slot sequence, physical
-  generation, byte offsets, Run, and Operation fields.
-- Crash-recoverable binary journal, 64 MiB/1 hour segments, CRC validation,
-  recovered gap-ledger tails, query-derived sequence-discontinuity gaps,
-  bounded/concurrency-limited history queries, and a 10 GiB retention ceiling.
-- Token-free loopback-only personal mode by default. Existing authenticated
-  installations retain observer/operator/admin Bearer credentials; a remote
-  bind is rejected unless authentication is enabled.
-- Layered `doctor` checks for connection/authentication, a physical port, the
-  live WebSocket stream, journal storage, and full Slot state.
-- Windows daemon with a Windows or Linux/VM client over a trusted host-only
-  network.
-- One `serial-mcp` adapter for OpenCode and Codex, with Run-scoped search,
-  cursor-safe reads, bounded command capture, Agent writes atomically bound to
-  a Run owned by that adapter process, raw Ctrl-C/D/Z and serial Break support,
-  and no Agent takeover/close.
-- A protocol-v3, daemon-owned Trigger Job for bounded low-latency
-  `initial_write -> repeated action -> live RX stop` reactions. It is
-  byte-oriented and device-agnostic; every fire uses the normal fenced,
-  confirmed, audited write path.
-- Persistent Monitor Jobs that match one literal or bounded UTF-8 regular
-  expression against live RX, group bursts into retained incidents, and keep
-  an exact evidence cursor/range. Incidents remain available through the core
-  HTTP API and `serial-mcp` without any external delivery service.
-- Bounded cross-reconnect write safety within one daemon epoch: recent duplicate
-  request IDs return their cached result, older executed IDs are rejected
-  instead of being written again, and an unacknowledged outcome remains
-  visibly marked uncertain. Input is never automatically replayed.
-
-The safe Transport default is 115200 8N1, no flow control, DTR and RTS low,
-and `auto_open=true`. Generic device behavior uses command EOL `\r`, echo on,
-no guessed Shell/U-Boot prompt, automatic probe disabled, and one-byte/1-ms
-write pacing. Attach a Device Profile when a DUT needs different behavior.
-
-Fresh installations write `auth_required = false`, omit the `[auth]` table,
-and can listen only on `127.0.0.1` or `::1`. Existing configuration files lack
-that field, decode it as `true`, and keep their existing three credentials.
-To migrate an existing personal configuration, stop `seriald`, make sure its
-persisted bind is loopback, run `serial auth disable`, then start it again. The
-command atomically rewrites the configuration without an `[auth]` table; it
-refuses a non-loopback bind.
-Stop `seriald`, then run `seriald credentials` (or `serial credentials`) on a
-token-free install to generate and persist observer/operator/admin credentials.
-Do not run the command beside a live daemon: that process still owns its old
-configuration snapshot and a later configuration save could overwrite the
-change. Start it again before changing to a non-loopback bind. This explicit
-transition prevents a runtime bind override from accidentally exposing an
-unauthenticated daemon.
-
-On Windows, the daemon uses native bounded synchronous COM reads/writes on
-dedicated blocking workers. It does not route COM writes through Tokio's
-named-pipe/overlapped backend. A Slot is not allowed to reopen until both
-reader and writer handles have finished and been released, preventing a
-timed-out write from leaving the port permanently locked with access denied.
-
-With hardware flow control, the driver owns RTS and `rts=true` is rejected.
-Linux drivers may transiently assert DTR during open even when the final
-requested level is low; DTR-reset-sensitive targets should use validated
-Windows-host behavior, avoid automatic reopen while the target must remain
-untouched, or use electrical isolation/reset gating.
-
-## Install from a release
-
-The v0.7 Jenkins release pipeline provides four platform packages. These are
-the v0.7 package contracts; already-published v0.6.2 assets remain unchanged
-and keep their historical contents.
-
-- `serial-platform-v<version>-windows-x86_64.zip` contains the unified
-  `serial.exe` plus `seriald.exe`, `serialctl.exe`, `serial-mcp.exe`, and
-  `serial-desktop.exe`. These binaries use the GNU/MinGW-w64 ABI, not the MSVC
-  ABI; the sibling daemon lets the desktop App start its local backend.
-- `serial-platform-v<version>-linux-x86_64-ubuntu20.04.tar.gz` contains
-  `x86_64-unknown-linux-gnu`/glibc `serial`, `seriald`, `serialctl`,
-  `serial-mcp`, and `serial-desktop`, cross-built with cargo-zigbuild against
-  the Ubuntu 20.04 glibc 2.31 ceiling. It is intended for 64-bit x86 Ubuntu
-  20.04 or newer and does not support 32-bit i386/i686 Ubuntu. The desktop App
-  needs an X11 display and the normal X11/XKB/OpenGL runtime libraries.
-- `serial-platform-v<version>-macos-aarch64.zip` contains native Apple Silicon
-  `serial`, `seriald`, `serialctl`, `serial-mcp`, and `serial-desktop` binaries,
-  plus a double-clickable `Serial Platform.app` containing `serial-desktop`,
-  `serial`, and `seriald` in `Contents/MacOS`.
-- `serial-platform-v<version>-macos-x86_64.zip` contains the same programs and
-  App for Intel Macs and is tested through Rosetta 2 on the Apple Silicon
-  Jenkins worker. Both macOS packages declare a macOS 11.0 deployment target.
-  Until a Developer ID credential is configured, `BUILD-INFO.json` explicitly
-  marks the App and binaries as unsigned and not notarized.
-
-Use every executable from the same release across the Windows host, Linux VM,
-and Mac. The v0.7.0 development tree and released v0.6.2 packages retain
-WebSocket protocol v3 from v0.4.0; existing v0.4 realtime peers are
-wire-compatible for that protocol surface, but the Monitor HTTP APIs
-and MCP tools require v0.5 components. Protocol-v2 executables from 0.3.x and
-protocol-v1 executables from 0.2.x are not compatible with v3. The HTTP route
-namespace remains `/api/v1`; the route namespace and WebSocket payload protocol
-are versioned independently.
-
-Extract the Windows package on the host connected to the serial card. Extract
-the Linux package in the VM and make the client executable if the archive tool
-did not preserve its mode:
-
-```sh
-tar -xzf serial-platform-v0.7.0-linux-x86_64-ubuntu20.04.tar.gz
-cd serial-platform-v0.7.0-linux-x86_64-ubuntu20.04
-chmod +x serial seriald serialctl serial-mcp serial-desktop
-./serial --version
-```
-
-Release checksums are published in `SHA256SUMS`. Each package also contains
-`BUILD-INFO.json`, an internal `MANIFEST.sha256`, the complete `docs/` and
-`adapters/` trees, and the top-level product documentation. Jenkins verifies
-the target architecture, application version, exact 19-tool MCP registry,
-Linux glibc ceiling, absence of unbundled MinGW runtime imports, archive
-integrity, and both checksum layers before the artifacts are published. The
-command examples below assume the executables are on `PATH`. From an extracted
-package directory, use
-`.\serial.exe` on Windows and `./serial` on Linux. Linux does not search the
-current directory by default, so `serial setup` returns `command not found`
-unless the binary was installed on `PATH`; from the extracted directory, run
-`./serial setup`. The launcher itself resolves only sibling executables from
-that same directory and never falls back to another `seriald`, `serialctl`, or
-`serial-mcp` found on `PATH`; a partial/mixed installation fails visibly.
-
-Jenkins exposes `BUILD_PROFILE=debug|release`. Debug builds are archived with
-`-debug-` in their names and are never eligible for GitHub Release publishing.
-`BUILD_MACOS` defaults on and enables both Mac architectures; disable it for a
-Linux/Windows-only validation build. `PUBLISH_GITHUB_RELEASE` is
-accepted only for a complete Release build with format, Clippy, tests, all four
-platform packages, an annotated `v<workspace-version>` tag pointing at the
-exact pinned build commit, and a Jenkins Secret Text credential named
-`github-release-token`. Publishing is draft-first and refuses to overwrite a
-same-named asset with different bytes.
-
-Every published tag is immutable. `v0.6.1` predates the four-platform pipeline;
-`v0.6.2` is the first published four-platform release and its historical assets
-are likewise never rewritten. After changing CI or packaging code, increment
-the workspace version and create a new annotated tag at that exact commit; the
-publisher deliberately rejects attempts to attach newer bytes to an older tag.
-
-## Build
-
-Install Rust 1.88 or newer. A local Windows MSVC source build needs the Visual
-Studio C++ Build Tools and Windows SDK; this is distinct from the published
-GNU/MinGW-w64 package. On Linux, install the distribution's C/C++ build tools.
-Then run from this directory:
-
-```sh
-cargo build --release
-cargo test --workspace
-```
-
-Build `seriald` on the Windows host that owns the COM ports. The `serial`,
-`serialctl`, and `serial-mcp` clients can be built on Windows or natively
-inside the Linux VM.
-
-## First start
-
-On Windows:
-
-```powershell
-serial serve
-```
-
-The first start creates a token-free configuration bound to loopback. No
-credentials are generated or printed; local HTTP and WebSocket clients omit
-Authorization and receive the effective admin role. A non-loopback bind is
-rejected in this mode. Existing installations remain authenticated: a legacy
-configuration without `auth_required` decodes that field as `true` and keeps
-its observer/operator/admin credentials. Run `serial credentials` while the
-daemon is stopped to enable authentication and generate those credentials for
-a fresh installation before configuring a trusted host-only remote bind.
-
-For non-interactive setup, `--admin-token-file` and
-`--operator-token-file` are read-only credential inputs, while
-`--save-operator-token-file` is the destination for the validated daily
-operator credential. Global `--token-file` is rejected by `setup`, and all
-input/output credential paths must resolve to different files; setup never
-overwrites an input credential through a relative path, symlink, or
-case-insensitive Windows alias.
-
-In another terminal:
+发行包解压后保留其中所有文件。首次配置不需要先启动后端：
 
 ```sh
 serial setup
 ```
 
-The wizard connects to `seriald`, asks the daemon to enumerate its own COM
-ports, lets you select the usual two ports, names them `slot-1`, `slot-2`, and
-shows the available Transport and Device Profiles. Select
-`generic-115200` plus `Generic` when the DUT behavior is unknown. Existing
-Slots omitted from a new scan, including temporarily absent COM ports, are kept
-by default; deletion requires an explicit confirmation. A Slot is the stable
-station channel, not a device model or serial number. Replacing the sample
-connected to the same serial-card channel normally means attaching a different
-Device Profile, not changing the Slot.
+交互说明保持简短并同时显示中英文：
 
-Create a reusable profile before setup, or attach it later:
+- 后端地址 / Endpoint：`seriald` 的监听 IP 和端口。
+- 串口 Profile / Transport Profile：波特率、数据位、校验位、停止位、流控、DTR/RTS 和自动打开。
+- 机型 Profile / Model Profile：机型原名、Shell/U-Boot 提示符、换行、设备回显解析和慢速写入。
+
+配置完成后直接运行：
 
 ```sh
-serial profile transport create --interactive
-serial profile device create --interactive
-serial profile device update my-dut --interactive
-serial profile attach --slot slot-1 --transport generic-115200 --device my-dut
+serial
 ```
 
-In default loopback mode, Profile mutations need no credential prompt. When
-authentication is enabled, mutations request the administrator credential
-interactively and never save it. For authenticated automation, use
-`--admin-token-file`; list/show/export remain read-only. Every mutation carries
-the revision it just read, so a second administrator cannot silently overwrite
-a newer catalog or Slot update.
+不带子命令的 `serial` 会一次完成三件事：
 
-Start the console without naming a Slot:
+1. 启动本地 `seriald` 后端；
+2. 在 `http://127.0.0.1:3211/mcp` 启动 sessionless Streamable HTTP MCP；
+3. 在前台打开 TUI。
+
+若首次运行时还没有配置，`serial` 会先执行同样的简洁离线配置。退出前台 TUI 时，由本次启动的两个子进程也会结束。
+
+常用独立命令：
 
 ```sh
-serial console
-```
-
-Running plain `serial` is equivalent to `serial console`.
-
-It restores the previous Slot and keeps all configured Slots subscribed. Main
-keys:
-
-| Key | Action |
-|---|---|
-| `Alt-1` … `Alt-9` | Switch Slot |
-| `Ctrl-] 1` … `9` | Reliable Slot switch prefix |
-| `Ctrl-] l` / `Ctrl-] r` | LINE / RAW input |
-| `Ctrl-] s` | Select the next Slot |
-| `Ctrl-] f` / `Ctrl-] End` | Resume following live output |
-| `Ctrl-] PgUp` / `Ctrl-] PgDn` | Local scroll, including in RAW mode |
-| `Ctrl-] v` | Toggle compact/detailed timeline |
-| `Ctrl-] g` | Switch UI language and save it |
-| `Ctrl-] m` | Open the Profile / device-model / serial-settings / help menu |
-| `Ctrl-] o` | Open Profile selection directly; `Esc` returns to the extensible main menu |
-| `Ctrl-] h` | Focus/show the Agent command-history bar; press again while focused to hide it |
-| `Alt-Enter` | Send the current LINE command cooperatively without taking the Agent lease |
-| `Ctrl-] t` | Explicitly take over write control |
-| `Ctrl-] c` | Release control or cancel queued input |
-| `Ctrl-] d` | Delete the newest queued LINE command |
-| `Ctrl-] e` | Return the newest queued LINE command to the editor |
-| `Ctrl-] u` | Select any queued LINE command; Up/Down selects cards, PageUp/PageDown scrolls long text, and `d`/`e` deletes/edits |
-| `Ctrl-] p` | Confirm a blocked multiline/large paste |
-| `Ctrl-] ?` | Help |
-| `Ctrl-] q` | Quit |
-| `Ctrl-] Ctrl-]` | Send byte `0x1d` to the device |
-| `Ctrl-C` | Send ETX byte `0x03` immediately in LINE or RAW mode |
-| `Ctrl-D` / `Ctrl-Z` in RAW | Send `0x04` / `0x1a` exactly |
-
-In LINE mode, plain `PageUp`/`PageDown` also scroll locally; RAW keeps those
-keys for xterm byte sequences, so use the `Ctrl-]` prefix there.
-`Ctrl-C` is the asynchronous interrupt exception to LINE editing: it discards
-the unsent local draft, sends only ETX without the Profile EOL, and returns the
-view to live output. It does not quit `serialctl` or release Human Control.
-In RAW mode, Ctrl-D and Ctrl-Z are ordinary raw control bytes; they do not exit
-the local console or suspend its process.
-
-On terminals at least 22 rows tall, powerline-style separators frame a
-full-width recent Agent task/command projection between serial output and
-command input. Run rows contain only state and task; purpose rows expand to the
-actual commands, and `command_sequence` steps stay grouped under one sequence
-purpose. Detail view uses clean command text without status emoji. `Ctrl-] h`
-focuses the pane, Up/Down selects a purpose, and Enter/Right expands it while
-jumping the main serial-output viewport to the operation (or sequence fallback)
-when it remains in bounded local scrollback. PageUp/PageDown or the wheel
-scrolls expanded detail without collapsing it. Records are newest-first and
-follow the newest command until the operator navigates or expands one. Set
-the height directly from **Console configuration → Terminal display settings**,
-or set `agent_history_rows = 3..20` in `serialctl.toml` (default `5`). The value
-is the number of visible content rows and is saved immediately. Short terminals
-use an on-demand popup.
-
-**Console configuration → Agent Run lifecycle settings** writes
-`orphan_run_timeout_seconds` to the shared `serialctl.toml`. It accepts
-`0` for unlimited or any finite value of at least `300` seconds, with no
-artificial maximum, and defaults to `1800` (30 minutes). Unlimited Runs release
-only through explicit `run_end`, MCP process exit, or Human takeover. This is a
-local
-`serial-mcp` crash/abandonment fallback after the last Run-scoped tool call,
-not a wire-protocol field and not the daemon's 60-second fenced Control lease.
-Normal completion still uses `run_end`. Restart any already-running
-`serial-mcp` process after changing the value because it is read at process
-startup; the lease still renews every 20 seconds while a Run remains eligible.
-
-The serial-output title resolves the bound Device Model in the background and
-shows its exact catalog name (spaces and casing preserved) plus the serial port.
-It never substitutes the internal model ID or Slot name; an unavailable binding
-is shown as “device model not configured”. The baud rate is not repeated there.
-
-Mouse capture is on by default. The wheel scrolls only the serial-output
-viewport; clicking the output or input pane changes focus; output left-drag
-selects without `Shift`; a double-click selects the complete lexical word even
-if Windows Terminal reports the second click a nearby cell; mouse-up
-automatically copies the selected text and resumes live output; and output
-right-click repeats that retained copy.
-A missing mouse-up event is finalized after five seconds, so a
-selection can never silently pin the live viewport indefinitely.
-On Windows, input right-click pastes from the native Unicode clipboard.
-`Ctrl+Shift+V` remains the portable paste path, including Ubuntu. Linux output
-copy uses OSC 52 and may require clipboard access to be enabled in the terminal
-emulator. Set `mouse_capture = false` in `serialctl.toml` to return mouse
-selection to the terminal emulator; that also disables in-app wheel scrolling.
-After confirmation, a LINE-mode multiline paste is queued as distinct logical
-commands, each with its own Operation ID and effective EOL. RAW
-paste remains one unmodified byte burst. Adjacent RAW keystrokes that have not
-started a physical write are coalesced into bounded 4 KiB chunks, so waiting
-behind another actor does not exhaust the 16-chunk queue after only 16
-characters. The 64 KiB total local write bound still applies; input that would
-cross it is rejected as one unit and is not partially appended.
-
-Opening the console only subscribes. The first ordinary `Enter` asks for Human
-Control. If another actor owns it, the request queues; only `Takeover` revokes
-it. While an Agent Run is active, an empty `Enter` queues no bytes and simply
-returns the output to its live tail. A non-empty command appears above the input
-as its own oldest-first single row (`1. command`). Before a
-queued LINE command starts sending, `Ctrl-] d` removes the newest command and
-`Ctrl-] e` returns it to the editor; `Ctrl-] u` opens the queue selector so any
-row can be deleted or returned for modification. Long summaries are truncated
-by display width, including double-width CJK; editing restores the complete
-bytes. Bytes already in a physical write are locked and cannot be recalled.
-Submitting a restored command places the edited version at the queue tail.
-
-`Ctrl-R` searches LINE input history. `Ctrl-] /` opens a separate search view
-over seriald's durable RX/TX journal. `F2`/`Tab` selects ordinary text or a
-bounded regular expression, `F3` changes case sensitivity, `F4` selects RX,
-TX, or both, and `F5` selects the current seriald run, all retained epochs, or
-the current Agent Run when one exists. Search results remain in their own
-popup and never inject an archived epoch into the live serial projection. A
-result marked partial is newest-first only within the scanned portion and does
-not claim to contain the globally latest match.
-Sequence numbers order events inside one epoch. Across retained epochs, the UI
-preserves the archive catalog's newest-first rank (derived from each archive's
-last-segment wall time); individual event wall times never reorder events
-within an epoch.
-
-The popup refreshes its target whenever a search or retry is submitted. If
-live output advanced while the editor was open, the query uses the new head;
-if seriald restarted, it switches to the new daemon epoch. Agent-Run scope is
-resolved again from the Slot's currently active Run and fails locally when no
-active Agent Run exists. A journal cursor ending before the requested live
-head is reported as partial even when the HTTP page itself was not truncated.
-
-Interactive searches are deliberately bounded to 200 displayed matches, the
-newest four archives, a 10,000-sequence tail per archive, eight journal
-requests, 16 MiB per response, and a ten-second total deadline. The popup
-marks partial results and journal gaps explicitly. Because literal and regex
-matching may span adjacent RX or TX events, a result row identifies the event
-that completed the match and may not contain the complete expression by
-itself. Use `serialctl archives` and `serialctl logs --epoch ...` for an
-explicit exhaustive/archive workflow beyond the interactive bounds.
-
-Reopening the console also rebuilds the main serial view from the current
-daemon epoch's durable journal instead of starting with an empty in-process
-buffer. Startup recovery pages through the most recent 20,000 sequence numbers
-under an 8 MiB per-Slot budget and a ten-second deadline across all Slots. Its
-WebSocket cursor is the last sequence the journal actually scanned—not the
-status snapshot's possibly newer head—so the replay ring safely supplies a
-live event whose durability acknowledgement is still pending. Limits and gaps
-stay visible. A freshly opened console loads only the current daemon epoch;
-older epochs remain searchable. If seriald restarts while the console is
-already open, the rows already on screen remain above an explicit
-daemon-restart boundary, and new-epoch traffic is appended below it.
-
-`Alt-Enter` is a separate, explicit cooperative path available only while the
-same Agent owns both the current lease and active Run. It writes immediately
-without transferring or revoking that lease, binds the request and its retry
-identity to that exact Run, remains attributed to the Human in the audit
-timeline, and makes the Agent's overlapping evidence
-`interfered`. `Ctrl-] t` remains the explicit takeover path and aborts the
-Agent Run. These two choices are intentionally visible rather than inferred
-from typing.
-
-RAW bytes are not lossily converted into editable text; cancel their queue with
-`Ctrl-] c`. Queued input expires after 60 seconds without human activity.
-`Ctrl-] c` cancels it by reconnecting the actor connection; the protocol carries a dedicated
-`cancel_acquire` message, but the current terminal still uses that reconnect, which
-also releases this terminal's control on every other Slot, then automatically
-restores all subscriptions.
-An acquired human lease is renewed only while that Slot has recent manual
-activity or an in-flight write, and is released after 60 seconds idle. LINE/RAW
-mode and command history are independent for every Slot.
-
-`Ctrl-] m` opens the extensible configuration menu. Its current pages are
-Transport/Device Profiles, hierarchical DUT models, serial settings, and help.
-Lists use Up/Down/Enter/Esc. Model parents expand before their indented children
-become selectable. In the model tree, Enter toggles a parent or binds a leaf,
-Left/Right collapses or expands, and `b` binds the selected node including a
-parent model. Profile catalog changes and serial-setting clones ask for a
-masked one-time administrator token. Its temporary values are dropped after
-the request, and the token is never written to the client config. Device-model binding uses the
-narrow operator API and records how the physical identity was confirmed.
-
-The **Current port configuration** page also presents the complete effective
-configuration as an editable form: port/profile, baud, data/parity/stop bits,
-flow control, DTR/RTS, auto-open, Device profile, EOL, echo, prompts, and write
-pacing. Profile-field edits remain a draft until **Save and apply**, which uses
-the observed catalog revisions and fails closed on a concurrent change. The
-daemon applies UART changes through its normal transactional busy/reopen safety
-boundary. Model binding and model-name edits are immediate revision-guarded
-operations and refresh the serial title after confirmation.
-
-When the output is scrolled upward, the console freezes the currently wrapped
-visual rows. New output therefore cannot push the inspected page away. If the
-history does not exceed the output viewport, upward scrolling is a no-op; this
-also prevents the disappearing-text behavior immediately after a port opens.
-The compact console is a derived terminal projection rather than one visual row
-per audit event: a prompt, confirmed TX command, and exact device echo remain on
-one row, including character-at-a-time RAW input. Actor-colored markers are
-attached to the completed mixed row, while the durable journal retains separate
-RX and TX events. Exact echo suppression is enabled only when the resolved
-`effective_echo` is `on`; `auto` keeps all RX bytes until a future authoritative
-probe can decide the mode. Echo reconciliation also recognizes the observed
-target-TTY `CR CR LF` hard wrap inside an otherwise exact long-command echo;
-on any mismatch the complete speculative RX is replayed and all pending
-expectations are abandoned. Suppression applies only to an immediately
-following exact echo; it never searches later boot or password output for
-matching bytes. `Ready` preserves a replay-tail expectation because its echo
-may already be in flight as live RX. A serial close/reopen
-commits an unfinished TX row before any partial RX echo, so text from different
-physical sessions is never merged. Detailed timeline mode narrows its source
-column on an 80-column terminal to preserve useful command/output payload.
-The projection accepts standard 7-bit `ESC` controls but treats isolated 8-bit
-C1 values as untrusted UART data, rendering invalid UTF-8 with replacement
-characters. Unterminated escape/control strings recover on a line boundary or
-a strict size limit, so one malformed or binary RX event cannot hide all later
-replay and live output. These presentation rules never alter the exact bytes
-retained by `seriald`.
-Wrapped rows are measured before the output viewport is scrolled, so following
-live output always shows the newest prompt even when a long command or log line
-occupies several 80-column screen rows. Local presentation remains bounded to
-20,000 rows / 4 MiB per Slot. Once older local rows are evicted, the title and a
-synthetic oldest-row boundary state that local display history was truncated
-and direct the operator to `serial logs`; durable history is not presented
-as though the retained local row were its true beginning.
-Repeated device rows remain uncollapsed in v0.6: live monitoring stays faithful
-to their exact order, while bounded log/search tools handle high-volume review.
-Run lifecycle events are drawn as full-width colored start/end/abort rules, so
-an operator can see exactly which output interval belongs to an Agent task
-without confusing a Run with a board reset.
-If the connection drops after a write was sent but before its acknowledgement,
-the footer keeps an `OUTCOME UNCERTAIN` warning. Inspect the TX timeline before
-deciding whether to retry; disconnected input is never replayed automatically.
-
-## Windows host-only VM use
-
-Bind `seriald` explicitly to the Windows host-only adapter address, for example:
-
-```powershell
-serial serve --bind 192.168.56.1:3210
-```
-
-`--bind` is a runtime-only override: repeat it on every launch (or stop the
-daemon, update the persisted `bind` value, and restart). Use `serial paths` to
-print the exact daemon configuration, data, and journal locations.
-
-Then run inside the Linux VM:
-
-```sh
-./serial --endpoint http://192.168.56.1:3210 setup
-./serial console
-```
-
-The endpoint supplied during `setup` is saved in the Linux user's local
-configuration. Later launches can therefore use plain `./serial`; pass
-`--endpoint` again only to select a different daemon.
-
-Limit the Windows firewall rule to the host-only subnet. v1 accepts plain HTTP
-only and is intended for loopback or a trusted host-only network. Do not expose
-it to a normal LAN or the Internet; TLS/private-network support is on the
-roadmap.
-
-## Inspection and history
-
-```sh
+serial console                         # 连接已有后端并打开 TUI
+serial serve                           # 只运行 seriald
+serial mcp                             # 以 stdio 运行 MCP adapter
+serial mcp --dump-tools                # 输出完整 MCP tools/list JSON
 serial status
-serial doctor
-serial doctor port --slot slot-1
-serial doctor stream --slot slot-1 --duration 10
-serial doctor storage
-serial doctor state --slot slot-1
-serial archives
-serial archives --slot slot-1
-serial logs --slot slot-1 --limit 200
-serial logs --slot slot-1 --after-seq 1200 --epoch <epoch-uuid>
-serial logs --slot slot-1 --after-seq 1200 --through-seq 1250 --epoch <epoch-uuid>
-serial logs --slot slot-1 --epoch <epoch-uuid> --direction rx
-serial logs --slot slot-1 --after-time 2026-07-19T09:00:00+08:00
-serial logs --slot slot-1 --contains panic
-serial logs --slot slot-1 --regex "(?i)panic|watchdog"
-serial logs --slot slot-1 --run <run-uuid> --contains panic
+serial doctor state --port COM4
+serial logs --port COM4 --contains ready
+serial logs --port COM4 --regex '(?i)panic|watchdog'
 ```
 
-The default doctor verifies saved configuration, HTTP reachability,
-authentication, and daemon identity. The subcommands then isolate port-open,
-live-delivery, storage, and authoritative Slot-state failures. `doctor stream`
-compares an independent WebSocket subscription, RX offsets, and the journal;
-it distinguishes a legitimately silent target from a delivery fault.
+## 两类 Profile
 
-`--contains` and `--regex` are mutually exclusive bounded historical queries.
-Regular expressions are compiled with size/automaton limits and evaluated only
-inside the query's existing event/byte/time scan budget; regex does not turn a
-bounded query into an unbounded global search. Regex queries fail closed
-against an older daemon that cannot advertise bounded server-side support;
-they never fall back to an unbounded client-side scan. The interactive console
-never silently substitutes an old global match for the current Run. Every
-response carries its next cursor, truncation state, first available sequence,
-and retention/corruption gaps. If `--epoch` is omitted, the CLI searches only
-the current daemon epoch. Run `serial archives` first to discover retained
-historical epoch UUIDs, then pass one to `logs --epoch`. `archives --json` and
-`logs --json` retain exact nanosecond values and raw event fields; ordinary
-output displays RFC3339 timestamps in the client's local timezone at
-millisecond precision. Time filters require RFC3339 input with an explicit
-timezone, and `--direction` accepts `rx`, `tx`, or `none`.
-`--through-seq` is inclusive, so `--after-seq A --through-seq B` reads exactly
-`(A, B]`; use that range when dereferencing a Monitor Incident so later serial
-output cannot enter its evidence.
-Without `--run`, `--operation`, or seq/time bounds, ordinary `logs` output
-warns that the query spans the entire selected daemon epoch and may include
-older test cycles. A text or regex filter only filters that selected range; it
-does not make an old match current. Archive catalog times labeled
-`segment-open` are segment creation bounds, not exact first/last event
-timestamps.
+端口配置只有四个字段：
 
-An epoch is the UUID for one `seriald` process lifetime. It changes whenever
-the daemon restarts. A durable continuation therefore uses
-`(slot_id, epoch, after_seq)`: the same sequence number under a new epoch is a
-different timeline and must not be treated as a continuation of the old one.
+```json
+{
+  "port": "COM4",
+  "transport_profile": "uart-115200",
+  "model_profile": "TL-AS7230 1.0",
+  "enabled": true
+}
+```
 
-## OpenCode and Codex
+Profile 名称按用户输入原样保存和显示，包括空格与大小写。
 
-Install `serial-mcp` on the same Windows or Linux machine where the Agent
-platform runs. A new loopback-only personal installation needs only the
-endpoint; `serial-mcp` sends no Authorization header. Existing authenticated
-or remotely bound installations continue to reuse the operator token written
-by `serial setup`, so Agent config contains no literal secret. Configure the MCP host to
-run `serial mcp` (or the component `serial-mcp` directly). Ready-to-copy
-OpenCode JSONC and Codex TOML examples and the expected Run workflow are in
-[adapters/README.md](./adapters/README.md). The current 19-tool registry and
-result contracts are documented in [MCP_TOOLS.md](./docs/MCP_TOOLS.md) and can
-be inspected as authoritative JSON with `serial mcp --dump-tools`.
+### Transport Profile
 
-The adapter connects directly to `seriald`; the Agent is not asked to compose
-shell commands around `serialctl`. OpenCode exposes the tools as
-`serial_devices`, `serial_command`, and so on. Codex exposes the same tools in
-the configured `serial` MCP namespace.
+Transport Profile 可复用于多个端口，包含：
 
-Ordinary calls expose only task-level inputs plus the private Run capability
-returned by `run_start`; the adapter owns request/operation IDs, control
-fences, capture cursors, prompt selection, bounded rendering, and lease
-renewal. Compact results keep the main evidence
-(`text`, completion/confidence, warnings, and one continuation cursor) while
-internal audit identifiers remain in the authoritative timeline. Model names
-remain assertions: the Agent must confirm the physical DUT through serial,
-telnet, the web UI, or a person before relying on a configured assignment.
+- `baud_rate`
+- `data_bits`
+- `parity`
+- `stop_bits`
+- `flow_control`
+- `dtr` / `rts`
+- `auto_open`
 
-`serial_read` with the default `scope=tail` is a bounded live-ring snapshot,
-not a journal search. It returns at most 200 recent events and marks
-`source=live_ring` plus `bounded_tail=true`; its work is independent of retained
-epochs, sealed-segment count, and active log-file size. Use `continue` for this
-adapter's process-local live-ring cursor; it returns the oldest next page of at
-most 1,000 events and never scans the journal. Ring eviction or a daemon restart
-is an explicit partial gap. Use `archive` for an explicit retained epoch.
+安全基线为 115200 8N1、无流控、DTR/RTS 低、自动打开。
 
-When another Human or Agent transmits between this adapter's operations,
-successful observation/capture results may include a compact `recent_context`
-with actor and command-purpose summaries. Serial payload is omitted. A gap or
-bounded summary is marked incomplete instead of silently claiming there was no
-interference. Write-like tools check this before acting and return a structured
-`context_changed` zero-byte failure until `serial_read(scope=tail)` or
-`serial_wait` confirms the new live state. The daemon also enforces the final
-epoch/generation/TX boundary atomically at the physical action queue.
+### Model Profile
 
-`serial_monitor_start` takes a Slot plus exactly one `contains` or `regex`
-matcher and returns a stable Monitor ID immediately. The Job starts at the
-current Slot head by default, persists in `seriald`, and therefore survives the
-stdio MCP process or Agent turn ending. `serial_monitor_incidents` returns at
-most 20 compact incidents per call; omit `after` for the recent tail, use
-`after="0"` to page from the oldest retained incident, or pass its decimal
-`next_after` cursor to continue forward. Each incident includes a short
-preview, exact `(epoch, seq_start, seq_end)` range, and `evidence_ref`/
-`evidence_cursor` so the caller can fetch authoritative serial bytes without
-putting an unbounded log in model context. An exact MCP follow-up uses
-`read(scope=archive, epoch=evidence_cursor.epoch,
-after_seq=evidence_cursor.after_seq, through_seq=seq_end)`.
-`serial_monitor_stop` prevents future matches but retains already recorded
-incidents.
+Model Profile 同时代表机型身份和串口交互行为，包含：
 
-`serial_trigger` handles short timing windows without making the Agent or the
-Linux VM loop repeated `serial_command` or `serial_input` calls. It requires an
-adapter-owned Run and takes explicit UTF-8 text plus EOL for an optional
-one-time `kickoff` and the repeated `action`, along with an optional start
-literal, stop literals, interval, timeout, and maximum-fire bounds.
-`kickoff` is sent once after the RX matchers are armed; it does not increment
-the action fire count. For normal kickoff-then-action use, omit
-`start_contains`: successful kickoff confirmation enables the first action
-immediately. Set `start_contains` only when a specific live RX literal must
-explicitly gate that first action. The MCP surface is text-oriented, while
-seriald's lower WebSocket protocol keeps every Trigger payload and literal as
-raw bytes encoded with base64. Neither layer infers a Prompt or byte sequence
-from the device profile. For example,
-`kickoff={"text":"reboot","eol":"\r"}`,
-`action={"text":"slp","eol":""}`, and
-`stop_contains=["SigmaStar #"]` form one possible caller-supplied recipe; none
-of those strings has special meaning to the platform. A matched result proves
-only that the requested live RX literal was observed. `interval_ms` is the
-delay after one action write is confirmed before the next becomes eligible;
-pacing and physical-write time are additional. `timeout_ms` stops scheduling
-new writes, but one already accepted physical write is allowed to settle and
-be audited before the authoritative terminal result. See
-[Trigger Jobs](./DOCUMENTATION.md#trigger-jobs) for hard limits and terminal
-status semantics.
+- `name`
+- `shell_prompt`
+- `uboot_prompt`
+- `write_eol`
+- `echo`
+- `write_chunk_size`
+- `write_chunk_delay_ms`
 
-`max_fires` limits only confirmed action sends. If `stop_contains` is
-configured, exhausting that budget stops additional writes but keeps the live
-RX matcher armed until a stop literal appears or the original `timeout_ms`
-expires. A confirmed Trigger TX therefore does not prove that the target
-action either succeeded or failed.
+一个机型 Profile 可以绑定多个端口；保存共享 Profile 时，绑定端口会立即使用新的交互参数。物理 UART 参数变更可能重新打开串口，单纯修改机型行为不需要重新打开物理句柄。
 
-`serial_command` requires a Run previously created by this `serial-mcp`
-process and a concise command-purpose description. `run_start` returns its
-public audit `run_id` plus one opaque `run_handle`; every later Run-scoped MCP
-call presents only that handle, and an Agent must not adopt a visible active
-Run from status. The adapter resolves the Slot and private capability from the
-handle in process-local memory. Inside the same serialized Slot actor that validates
-the control lease/fence, `seriald` rejects a missing, changed, or foreign-owned
-Run before pacing-budget calculation or physical write. Ordinary Human and
-legacy non-cooperative clients may omit this optional wire boundary and retain
-lease-only writes. A Run isolates only its log/event interval—it does not
-reset, initialize, or otherwise clean the device.
-
-`serial_command_sequence` is for a known dependent serial exchange, not
-parallel work: for example, send a username, wait for `Password:`, then send the
-already-known password without another Agent/tool round trip. One call carries
-a required overall purpose and 1–8 ordered steps, each with its own required
-command purpose and optional 1..120-second timeout. Every non-final step must
-provide exactly one `expect` or `regex`; the final step may use the same
-configured-prompt/quiet fallback as `serial_command`. Effective timeouts may
-total at most 300 seconds, each command plus effective EOL is limited to 4096
-bytes, and the whole planned write is limited to 32768 bytes.
-
-The complete plan is validated before its first write and holds the Slot's
-serialized mutation path until it finishes. A timeout, disconnect, evidence
-gap, uncertain write, Human takeover, or Run/Control loss prevents every later
-step from being sent; there is no branch, loop, or automatic retry. The result
-uses one `sequence_id` to group the overall purpose and per-step statuses. Each
-confirmed or partially confirmed step is still an ordinary plaintext TX audit
-event carrying its own description and exact command bytes, which the terminal
-history can expand.
-
-The adapter renews control only for Runs it currently owns. A Run-scoped call
-pins its Run for that call's full lifetime. Normal workflows explicitly call
-`run_end` before the Agent's final reply. If a client crashes or abandons the
-Run, `orphan_run_timeout_seconds` sets the idle fallback to 0 (unlimited) or at
-least 300 seconds (default 1800, with no finite upper bound); the adapter
-releases control and aborts a finite-timeout orphan at its next renewal tick.
-With 0, only explicit `run_end`, adapter exit, or takeover releases it. Running
-adapters must be restarted after this startup setting is changed. The
-underlying 60-second fenced lease
-continues to renew every 20 seconds while that Run remains eligible. A lost
-connection or failed renewal
-forgets all owned Run state and never reacquires control to continue writing
-outside the old boundary. Successful `run_end` stops renewal and immediately
-attempts a best-effort release; release failure cannot undo the ended Run, and
-an unacknowledged lease expires by its TTL. A later explicit `release` checks
-process-local lease ownership inside the per-Slot lock. With no local lease it
-is idempotent even if status shows another client's active Run and never
-interferes with it. Only aborting this MCP's matching active Run requires its
-opaque handle. None of these operations closes
-`seriald`'s physical port.
-
-Agent searches remain Run-scoped while paging: a `truncated` `current_run`
-result returns the same `run_id` plus an exact `epoch`/`after_seq` continuation,
-and an incomplete empty page is never presented as proof that no match exists.
-For delayed markers such as background-test completion, `command.regex` is the
-sole command boundary; a configured Shell prompt or quiet gap cannot finish the
-capture first. `search` also accepts bounded regex matching. See the adapter
-guide for valid parameter combinations and response fields.
-
-`input` writes exact UTF-8 bytes without appending EOL. `signal` sends exact
-Ctrl-C (`0x03`), Ctrl-D (`0x04`), Ctrl-Z (`0x1a`), or a physical serial Break
-with a bounded duration. Break is a UART line condition rather than an encoded
-byte and is still fenced, Run-bound, and audited.
-
-MCP requests may run concurrently. Physical mutations targeting the same Slot
-are deliberately serialized in arrival order; independent Slots can progress
-concurrently. Use `command` for one ordinary command and `command_sequence` for
-one bounded, dependency-gated interaction whose stop-on-failure and partial
-results are explicit. The sequence is ordered rather than parallel and does
-not replace concurrent calls targeting independent Slots. Cancellation applies
-only to the read-only observations `devices`, `device_models`, `read`, `wait`, `search`,
-`monitor_list`, `monitor_status`, and `monitor_incidents`. Once a mutating
-tool may have crossed a serial/Run/Control side-effect boundary, the adapter
-waits for its authoritative result instead of hiding the outcome and inviting
-an unsafe retry.
-
-For commands where success matters, the Agent should make the target emit a
-unique result sentinel carrying the command's status and wait for that sentinel.
-The generic platform reports whether the requested boundary was observed; it
-does not inject shell syntax or equate a returned prompt with successful
-execution.
-
-## Profile adjustments
-
-Configuration has four explicit layers:
-
-1. A Slot identifies the fixed station channel: stable ID, display name, and
-   host port such as `COM4`.
-2. Its Transport Profile defines the host-side physical UART:
-   baud rate, data bits, parity, stop bits, flow control, DTR, RTS, and
-   `auto_open`.
-3. Its optional Device Profile defines DUT-facing behavior: Shell/U-Boot prompt
-   literals, command EOL, echo policy, `write_chunk_size`, and
-   `write_chunk_delay_ms`.
-4. Its independent Device Model binding records the confirmed DUT identity in
-   a hierarchical catalog without changing any serial behavior.
-
-For wire/TOML compatibility the Slot field named `profile` is the Transport
-Profile binding; `device_profile` is the optional DUT binding. `Generic` means
-no Device Profile is attached—it is a safe fallback, not a guessed model.
-
-Pacing belongs to the Device Profile because it compensates for how quickly a
-DUT consumes input, not for the COM endpoint. `write_chunk_size` is the maximum
-number of bytes passed to the driver in one paced step; the daemon waits
-`write_chunk_delay_ms` before the next step. The Generic fallback is one byte
-per 1 ms: an N-byte write has N driver chunks and N-1 requested 1-ms gaps,
-never a trailing gap. The value is an inter-chunk delay in milliseconds, not a
-baud period and not a guarantee of exact wall-clock cadence; driver blocking
-and OS timer granularity add latency. A partial driver write does not introduce
-an extra delay inside the same planned chunk. A zero delay removes the sleeps
-but still applies `write_chunk_size` to driver calls. Existing Slot `settings` retain a full
-compatibility snapshot, but current clients consume the daemon's published
-`effective_transport` and `effective_write_pacing`.
-
-The quickest interactive path is:
+CLI 管理示例：
 
 ```sh
-serial profile transport list
 serial profile transport create --interactive
-serial profile transport update uart-115200 --baud-rate 921600
-serial profile device list
-serial profile device create --interactive
-serial profile device update my-dut --interactive
-serial profile attach --slot slot-1 --transport uart-115200 --device my-dut
-serial model tree
-serial model attach --slot slot-1
-serial doctor state --slot slot-1
+serial profile model create --interactive
+serial profile attach --port COM4 --transport uart-115200 --model 'TL-AS7230 1.0'
+serial profile detach --port COM4 --model
 ```
 
-`serial model add/update/list/tree/attach/detach` maintains the independent
-identity catalog. Parent and child names may repeat, children render indented,
-and interactive attach expands a parent before selecting a descendant. A
-binding records whether identity was confirmed by serial, telnet, web UI, a
-Human, or another documented method; the configured label alone is never
-treated as proof.
+两类 Profile 都支持 `list`、`show`、`create`、`update`、`clone`、`import`、`export` 和 `delete`。
 
-`update` changes only the fields named on the command line; `--interactive`
-walks every field while showing the existing values as defaults. Use `clone`
-for a named variant, `import`/`export` for station sharing, and
-`detach --device` to return a Slot to Generic behavior. `setup` prints the
-available catalogs and asks which Transport and Device Profile to attach to
-each selected port. It does not guess a DUT from boot text or a COM number.
-Examples:
+## TUI 工作流
+
+TUI 顶部只显示串口名和连接状态；串口输出标题只显示当前机型名。主输出区只渲染设备 RX，不再把本机发送的命令重复插入串口画面。
+
+默认操作围绕键盘设计：
+
+- 输入任意可打印字符会直接进入命令输入行；有内容时按 Enter 发送，没有内容时按 Enter 返回串口底部。
+- `↑` / `↓` 选择 Agent 历史，`→` 展开，`←` 折叠。
+- 滚轮和 `PgUp` / `PgDn` 浏览 Agent 历史或已展开的命令详情，不需要点击窗口切换焦点。
+- `Ctrl-] PgUp` / `Ctrl-] PgDn` 专门滚动串口输出。
+- `Ctrl-] /` 搜索持久串口历史，可切换普通文本/正则、大小写、RX/TX 和当前周期/保留周期/当前 Run。
+- `Alt-1` 到 `Alt-9` 快速切换端口；`Ctrl-] ?` 打开完整帮助。
+
+Agent 历史按从旧到新排列；未主动浏览旧记录时，新命令到达会自动跟随到底部。选择一条命令后，TUI 根据该 TX 事件持久化的 `command_capture_matchers` 在 RX 中定位并高亮命令与回显形成的区域；没有匹配时只临时显示命令文本，不污染串口历史。`command_sequence` 的每个步骤都可以单独选择和定位。
+
+鼠标拖选和双击词语都会显示选中高亮并复制文本。串口着色使用词边界匹配错误、警告和成功关键词，不会把 `get_data_error_name` 一类标识符误判；IPv4、IPv6 和 MAC 地址使用独立颜色。
+
+TUI 配置页将“串口配置”和“机型 Profile”分开显示，并可直接修改 `agent_history_rows`（3–20，默认 5）与 `orphan_run_timeout_seconds`（默认 1800 秒；`0` 表示不限时）。
+
+## Electron App
+
+每个平台发行包都包含现代桌面客户端：
+
+- 左侧端口栏：串口名、机型名、连接状态和打开/关闭操作；
+- 中间 RX 终端：持久历史、实时输出、文本搜索、地址/关键词着色和命令区域高亮；
+- 右侧 Agent 历史：从旧到新展示 Run、普通命令和命令序列；
+- 底部命令栏：面向当前端口发送人工命令；
+- 独立配置页：分别编辑串口/Transport Profile 与 Model Profile；
+- 系统、浅色和深色三种主题。
+
+App 默认连接配置的本地后端；后端不存在且启用了自动启动时，App 会启动随包提供的服务，并只管理自己启动的进程。渲染进程只通过类型化 IPC 与主进程通信，不直接访问串口或后端网络。
+
+快捷键：`Ctrl/Cmd+,` 打开配置，`Ctrl/Cmd+1` 返回控制台，`Ctrl/Cmd+F` 搜索终端，`Ctrl/Cmd+K` 聚焦命令输入，`Esc` 返回控制台。
+
+## Agent 与 MCP
+
+`serial-mcp` 暴露 19 个工具：
+
+```text
+devices              model_profiles       model_profile_set
+read                 command              command_sequence
+input                signal               trigger
+wait                 search
+monitor_start        monitor_list          monitor_status
+monitor_incidents    monitor_stop
+run_start            run_end               release
+```
+
+所有设备选择参数都叫 `port`。典型流程是：
+
+1. `devices` 检查端口与机型；
+2. `run_start(port, label)` 获取本次工作流的 `run_handle`；
+3. 使用 `command`，或用一次 `command_sequence` 完成“账号 → 等待密码提示 → 密码”这类已知依赖交互；
+4. 用 `read`、`wait`、`search` 或 Monitor 补充证据；
+5. 在 Agent 最终回复前调用 `run_end`。
+
+`run_handle` 是 MCP 进程内的工作流句柄；Agent 不需要传 Control ID、fence、generation、请求 UUID 或续租参数。默认孤立 Run 回收时间是 30 分钟，正常结束仍由 `run_end` 表达。
+
+详见 [MCP 工具目录](./docs/MCP_TOOLS.md) 和 [adapter 配置](./adapters/README.md)。
+
+## 持久记录与查询
+
+每个端口的游标是 `(port, daemon_epoch, seq)`：
+
+- `daemon_epoch` 每次后端进程启动都会改变；
+- `seq` 在一个端口和一个后端周期内单调递增；
+- 断开再打开物理串口会增加 `generation`，但不会清空当前周期的序号和 TUI 历史；
+- 关闭再打开客户端会从持久 journal 恢复当前周期，再接上实时 WebSocket；
+- 更早周期通过 `serial archives`、`serial logs --epoch ...`、TUI 搜索或 MCP archive 查询读取。
+
+默认 journal 上限为 10 GiB，分段写入并带 CRC 与断尾恢复。实时 tail 从有界内存 ring 返回，避免串口运行很久后让普通 MCP 读取扫描全部历史；归档查询始终受事件数、字节数和时间预算限制。
+
+## 接口与架构
+
+```text
+physical UART
+    │
+    ▼
+seriald ── durable journal
+    ├── HTTP v1 configuration / diagnostics / history
+    ├── WebSocket protocol v4 realtime and control
+    ├── serialctl TUI
+    ├── Electron App
+    └── serial-mcp ── stdio or Streamable HTTP ── Agent
+```
+
+- `seriald` 是唯一持有物理串口句柄的进程。
+- `serialctl` 提供离线之外的配置、诊断、日志查询和 TUI。
+- `serial-mcp` 把同一 HTTP/WebSocket 能力收敛为 Agent 友好的工具。
+- Electron App 管理本地服务生命周期并复用 v4 接口。
+- `serial` 是统一入口。
+
+完整接口见 [架构文档](./DOCUMENTATION.md)、[protocol v4](./docs/PROTOCOL.md) 和 [roadmap](./ROADMAP.md)。
+
+## 构建与发行
+
+本地验证：
 
 ```sh
-serial profile transport clone generic-115200 --name uart-921600 --baud-rate 921600
-serial profile transport update uart-921600 --auto-open true
-serial profile device clone my-dut --name my-dut-fast --write-chunk-size 8
-serial profile device update my-dut-fast --shell-prompt "]# "
-serial profile device update my-dut-fast --clear-shell-prompt
-serial profile device update my-dut-fast --inherit-write-eol --inherit-echo
-serial profile device update my-dut-fast --inherit-write-chunk-size --inherit-write-chunk-delay
-serial profile device export my-dut --output my-dut.toml
-serial profile device import my-dut.toml
-serial profile detach --slot slot-1 --device
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+
+cd crates/serial-desktop
+npm ci --no-audit --no-fund
+npm run build
 ```
 
-Prompt fields use explicit `--clear-shell-prompt` and
-`--clear-uboot-prompt` flags because an absent prompt is an intentional Device
-Profile value, not an instruction to consult legacy Slot data. Optional EOL,
-echo, and pacing fields use `--inherit-*` to remove that Device Profile
-override and fall back to the generic/compatibility setting.
+Jenkins 是发布构建与 GitHub Release 发布入口。workspace 版本 tag 尚不存在时构建 Debug 包；当当前提交存在与 `Cargo.toml` 版本一致的 annotated tag（例如 `v0.8.0`）时，Jenkins 自动切换 Release、构建四个平台、生成校验和并发布 GitHub Release，不需要填写发布参数。若同名 tag 不是 annotated tag 或没有指向本次 commit，本次仅按 Debug 构建且不发布。
 
-Prompt matching is a literal substring, not a regular expression. Prefer a
-stable suffix such as `"]# "` over a full prompt containing the current
-directory. Omit an unknown Shell/U-Boot prompt instead of guessing. Profile
-catalogs hold at most 128 unique names and cannot be deleted while attached.
-A Transport change closes and reopens the physical port because its UART
-parameters changed. A Device change keeps the handle open, but an active Run or
-Trigger blocks the change so its evidence boundary cannot silently change
-mid-operation.
+发布矩阵：
 
-Every configuration read returns `config_revision`; every write supplies the
-revision it observed. If another setup/profile client committed first,
-`seriald` returns `config_revision_mismatch` and the stale client must reload
-before retrying. Catalog and Slot mutations are staged, atomically persisted,
-then published. A validation, actor, or file-save failure leaves the previous
-authoritative state active.
+- Ubuntu x86_64
+- Windows x86_64
+- macOS arm64
+- macOS x86_64
 
-The low-level protocol still permits an explicit per-request pacing override
-for trusted clients, but `serialctl` and `serial-mcp` use the effective Device
-Profile pacing. Agent tool schemas intentionally omit chunk size and delay, so
-an Agent cannot accidentally bypass a station-tested safe cadence. `seriald`
-also rejects zero-byte writes; a command must contribute text or an EOL.
+每个平台包都包含四个 Rust 程序 `serial`、`seriald`、`serialctl`、`serial-mcp`，以及对应的 Electron 应用：Linux AppImage、Windows portable EXE 或 macOS `.app`。
 
-One physical write has a 15-second total budget and retains a separate
-two-second timeout for any driver call that makes no progress. `seriald`
-estimates the complete paced duration before enqueueing the write. A plan over
-15 seconds is rejected explicitly before any byte reaches the port instead of
-being truncated into a predictable partial write. With the conservative
-1-byte/1-ms default this bounds one request to 591 bytes under the current
-Windows scheduling allowance; use a target-validated chunk size such as 4 or 8,
-or split a longer command. The current control lease must also have enough
-monotonic time remaining for that complete budget plus a 100 ms scheduling
-margin. Otherwise the daemon returns a retryable conflict before enqueueing any
-bytes; renew control or shorten the request, then retry. An accepted write is
-not cancelled midway merely because its lease reaches TTL.
-
-For an Agent write with `expected_run_id`, the active Run ID and its
-server-issued actor owner are checked before these pacing and lease budgets.
-Run loss/mismatch is an explicit conflict containing “no bytes were written”.
-The Run ID is part of the write idempotency fingerprint, so one request ID
-cannot be reused under a different task boundary.
-
-## Monitor persistence
-
-Monitor Jobs and their retained incidents live in `seriald`, not in an MCP
-process or Agent session. A new Monitor starts strictly after the Slot head at
-creation time, so an old matching line cannot be reported as a new incident.
-Matching spans adjacent live RX events only within one serial generation; close,
-open, reconfigure, removal, generation changes, and explicit gaps reset the
-matcher. It is bounded by pattern, compiled-regex, window, preview, Job, and
-incident limits. A daemon restart reloads
-running Jobs and resumes their workers; replay-safe checkpoints are throttled
-to once per second, while Incident/cooldown state commits immediately so a
-restart does not re-alert a match already suppressed by cooldown. At a hard
-bound the oldest incident yields to newer evidence even when no consumer
-acknowledges it; bounded retention reports `retention_gap` and
-`first_available_incident_seq` when a pull cursor is too old. The returned
-cursor advances to the observed high-water mark even when ACK filtering makes a
-page empty. Explicit gaps remain visible rather than being treated as an empty
-observation.
-
-`GET /api/v1/monitors/{monitor_id}/incidents` and the MCP
-`monitor_incidents` tool provide bounded pull access. Each incident carries
-only bounded preview and routing/evidence metadata; the serial journal remains
-authoritative for the exact byte range. `seriald` deliberately exposes no
-external-delivery endpoint, credential, retry, or routing configuration.
-
-## Control tuning
-
-Write-control leases and queues are bounded by the optional `[control]`
-section of `seriald.toml`:
-
-```toml
-[control]
-max_ttl_ms = 60000      # 5s floor at runtime; configured ceiling <= 24h
-wait_timeout_ms = 60000 # queued acquire lifetime; configured ceiling <= 1h
-max_waiters = 128       # per-Slot wait-queue bound
-```
-
-The defaults match the compiled-in v0.6 behavior, so the section can be omitted
-entirely; changes apply on the next daemon start. Configuration above the
-24-hour lease or one-hour wait ceilings is rejected instead of reaching
-platform `Instant` arithmetic.
-
-## Current boundaries
-
-v0.6 does not include device-pool Reservations, flashing recipes, automatic
-probes, full VT100 emulation, external `screen/minicom` handoff, TLS,
-compression, or a Windows Service installer. `serial serve` is the backend
-entrypoint and `serial console` is a separate client process; putting both
-behind one launcher does not merge the daemon with a terminal or prevent
-multiple consumers. Service packaging can be added after station validation.
-Explicit Windows ACL auditing/hardening for shared service accounts is also a
-candidate; current per-user files inherit the Windows profile directory ACL.
-
-The old OpenCode-only `serial_arm`/`serial_disarm` implementation was not
-copied: it could continue writing after control loss and did not create normal
-TX audit events. The protocol-v3 Trigger is Slot-owned, bound to
-Control/fence/epoch/generation and an optional Run, uses bounded literal-byte
-matching and hard limits, and sends its optional kickoff and every action fire
-through the ordinary confirmed/audited write path. Device-specific recipes
-remain explicit caller parameters rather than daemon or Profile behavior.
-
-See [DOCUMENTATION.md](./DOCUMENTATION.md) for architecture, state, logging,
-and correctness invariants; [PROTOCOL.md](./docs/PROTOCOL.md) for the complete
-MCP/HTTP/WebSocket contract; and [MCP_TOOLS.md](./docs/MCP_TOOLS.md) for the
-generated Agent tool surface.
+macOS 上，四个 Rust CLI 的 deployment target 是 11.0，Electron 43 `.app` 的最低系统版本是 12.0。当前 macOS App 没有 Developer ID 签名，也没有 Apple notarization。

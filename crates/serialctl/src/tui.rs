@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     io::{self, Write},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -27,13 +27,12 @@ use ratatui::{
 #[cfg(test)]
 use serial_protocol::WritePacing;
 use serial_protocol::{
-    Actor, ArchiveSummary, ClientMessage, CommandResult, ControlLease, ControlMode, Cursor,
-    DataBits, DeviceModel, DeviceModelListResponse, DeviceProfile, Direction, EchoMode, EventKind,
-    EventQuery, FlowControl, GapRange, LoggingState, ModelConfirmationMethod, Parity,
-    ResolvedDeviceSettings, ResolvedTransportSettings, RunInfo, RunStatus, ServerMessage,
-    SessionState, SetSlotDeviceModelRequest, SlotModelBinding, SlotSnapshot, StopBits,
-    TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerStatus, WireFrame,
-    apply_transport_profile,
+    Actor, ArchiveSummary, ClientMessage, CommandCaptureMatcher, CommandCaptureMatcherKind,
+    CommandResult, ControlLease, ControlMode, Cursor, DataBits, Direction, EchoMode, EventKind,
+    EventQuery, FlowControl, GapRange, LoggingState, ModelProfile, Parity, ResolvedModelSettings,
+    ResolvedTransportSettings, RunInfo, RunStatus, ServerMessage, SessionState, SlotSnapshot,
+    StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerStatus,
+    WireFrame,
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -45,7 +44,7 @@ use crate::{
     display::{
         DisplayLine, RunBoundary, TerminalStreamParser, error_code_label, format_event_plain,
         format_wall_time_local, gap_line, gap_reason_label, highlight_spans, pad_display,
-        role_label, safe_inline, trigger_status_label,
+        safe_inline, trigger_status_label,
     },
     history::{StartupHistory, StartupHistoryTarget, load_startup_histories},
     i18n::{self, tr, trf},
@@ -61,12 +60,12 @@ const MAX_OUTSTANDING_REQUESTS: usize = 512;
 const MAX_WRITE_BYTES: usize = 4 * 1024;
 const CONTROL_TTL_MS: u64 = 30_000;
 const DEFAULT_HUMAN_IDLE_RELEASE_SECONDS: u64 = 60;
+#[cfg(test)]
 const ACTIVE_WINDOW_NS: i64 = 5_000_000_000;
 const MOUSE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const SOFTWARE_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
-const MODEL_LABEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUN_HISTORY_PER_SLOT: usize = 20;
 const MAX_COMMANDS_PER_RUN: usize = 64;
 const MAX_RUN_COMMAND_BYTES: usize = 4 * 1024;
@@ -110,7 +109,6 @@ enum InputMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneFocus {
-    Output,
     Queue,
     RunHistory,
     Input,
@@ -126,7 +124,7 @@ struct ConsoleLayout {
 }
 
 /// A paused viewport is an immutable set of already wrapped terminal rows.
-/// Live serial events continue to update the underlying Slot, but they cannot
+/// Live serial events continue to update the underlying Port, but they cannot
 /// move these rows. Returning to offset zero drops the snapshot and resumes
 /// the ordinary live projection.
 #[derive(Debug, Clone)]
@@ -149,6 +147,7 @@ struct TextSelection {
     /// A double-click selects the lexical token even when it occupies one
     /// terminal cell, so completion must not depend on pointer movement.
     word_selected: bool,
+    completed: bool,
     last_activity: Instant,
 }
 
@@ -303,33 +302,33 @@ fn pop_last_queued_line(queue: &mut VecDeque<PendingWrite>) -> Option<Vec<u8>> {
 #[derive(Debug)]
 enum PendingRequest {
     Acquire {
-        slot_id: String,
+        port: String,
         mode: ControlMode,
     },
     Renew {
-        slot_id: String,
+        port: String,
     },
     Release {
-        slot_id: String,
+        port: String,
     },
     CancelAcquire {
-        slot_id: String,
+        port: String,
     },
     Write {
-        slot_id: String,
+        port: String,
         operation_id: Option<Uuid>,
         cooperative: bool,
     },
 }
 
 impl PendingRequest {
-    fn slot_id(&self) -> &str {
+    fn port(&self) -> &str {
         match self {
-            Self::Acquire { slot_id, .. }
-            | Self::Renew { slot_id }
-            | Self::Release { slot_id }
-            | Self::CancelAcquire { slot_id }
-            | Self::Write { slot_id, .. } => slot_id,
+            Self::Acquire { port, .. }
+            | Self::Renew { port }
+            | Self::Release { port }
+            | Self::CancelAcquire { port }
+            | Self::Write { port, .. } => port,
         }
     }
 }
@@ -351,25 +350,6 @@ enum SubscriptionPhase {
 }
 
 impl SubscriptionPhase {
-    fn label(&self) -> String {
-        match self {
-            Self::Disconnected => tr("phase.off").into(),
-            Self::Attaching => tr("phase.attach").into(),
-            Self::Replaying {
-                from_seq,
-                through_seq,
-            } => trf(
-                "phase.replay",
-                &[&from_seq.to_string(), &through_seq.to_string()],
-            ),
-            Self::Ready { head_seq } => trf("phase.live", &[&head_seq.to_string()]),
-            Self::Lagged { from_seq, to_seq } => trf(
-                "phase.lagged",
-                &[&from_seq.to_string(), &to_seq.to_string()],
-            ),
-        }
-    }
-
     fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
     }
@@ -478,6 +458,7 @@ struct RunCommandStep {
     first_seq: u64,
     last_seq: u64,
     data: Vec<u8>,
+    capture_matchers: Vec<CommandCaptureMatcher>,
     truncated: bool,
 }
 
@@ -497,6 +478,16 @@ struct RunCommandKey {
 }
 
 impl RunCommandStep {
+    fn capture_matchers(event: &TimelineEvent) -> Vec<CommandCaptureMatcher> {
+        event
+            .metadata
+            .get("command_capture_matchers")
+            .and_then(|value| {
+                serde_json::from_value::<Vec<CommandCaptureMatcher>>(value.clone()).ok()
+            })
+            .unwrap_or_default()
+    }
+
     fn from_event(event: &TimelineEvent) -> Self {
         let mut data = event.data.clone();
         let truncated = data.len() > MAX_RUN_COMMAND_BYTES;
@@ -511,6 +502,7 @@ impl RunCommandStep {
             first_seq: event.seq,
             last_seq: event.seq,
             data,
+            capture_matchers: Self::capture_matchers(event),
             truncated,
         }
     }
@@ -521,6 +513,9 @@ impl RunCommandStep {
         let available = MAX_RUN_COMMAND_BYTES.saturating_sub(self.data.len());
         let append = available.min(event.data.len());
         self.data.extend_from_slice(&event.data[..append]);
+        if self.capture_matchers.is_empty() {
+            self.capture_matchers = Self::capture_matchers(event);
+        }
         self.truncated |= append < event.data.len();
     }
 }
@@ -656,17 +651,13 @@ struct SlotView {
     /// synthetic warning visible at the oldest local boundary.
     local_history_truncated: bool,
     scroll_snapshot: Option<ScrollSnapshot>,
-    /// Visual-row offset within `scroll_snapshot`. When no snapshot exists,
-    /// this retains the legacy logical-row offset used by a few recovery paths
-    /// and tests, but all interactive scrolling creates a snapshot first.
+    /// Visual-row offset within `scroll_snapshot`. Recovery paths may retain
+    /// this offset before a snapshot is rebuilt; interactive scrolling always
+    /// creates a snapshot first.
     scroll_from_bottom: usize,
     unseen: usize,
     last_epoch: Option<Uuid>,
     last_seq: u64,
-    /// Reconcile confirmed TX bytes with an exact subsequent RX echo while
-    /// building the terminal projection. The durable RX/TX audit events stay
-    /// separate, and this applies equally to LINE and RAW input.
-    merge_echo: bool,
     draft: Vec<char>,
     draft_cursor: usize,
     mode: InputMode,
@@ -683,7 +674,7 @@ struct SlotView {
     /// durable journal has been read from sequence one. Initial attach uses a
     /// tail, and any gap or local eviction keeps this conservative marker set.
     run_history_limited: bool,
-    /// `None` follows the newest described Agent command. A concrete key
+    /// `None` follows the newest described Agent command at the bottom. A concrete key
     /// preserves an explicit operator selection when newer commands arrive.
     selected_run_command: Option<RunCommandKey>,
     expanded_run_command: Option<RunCommandKey>,
@@ -763,7 +754,7 @@ enum OutputSearchPhase {
 
 #[derive(Debug)]
 struct OutputSearchState {
-    slot_id: String,
+    port: String,
     current_epoch: Uuid,
     head_seq: u64,
     current_run: Option<OutputSearchRun>,
@@ -829,7 +820,6 @@ impl SlotView {
             scroll_snapshot: None,
             scroll_from_bottom: 0,
             unseen: 0,
-            merge_echo: true,
             draft: Vec::new(),
             draft_cursor: 0,
             mode: InputMode::Line,
@@ -1009,10 +999,10 @@ impl SlotView {
     }
 
     fn run_command_keys(&self) -> Vec<RunCommandKey> {
-        self.run_history_newest_first()
+        self.run_history_chronological()
             .into_iter()
             .flat_map(|run| {
-                run.commands.iter().rev().map(|command| RunCommandKey {
+                run.commands.iter().map(|command| RunCommandKey {
                     run_id: run.id,
                     first_seq: command.first_seq,
                 })
@@ -1020,18 +1010,9 @@ impl SlotView {
             .collect()
     }
 
-    fn run_history_newest_first(&self) -> Vec<&RunHistoryEntry> {
-        let active_run_id = self.snapshot.active_run.as_ref().and_then(|run| {
-            (run.owner.kind == serial_protocol::ActorKind::Agent).then_some(run.id)
-        });
+    fn run_history_chronological(&self) -> Vec<&RunHistoryEntry> {
         let mut runs = self.run_history.iter().collect::<Vec<_>>();
-        runs.sort_by(|left, right| {
-            let left_active = Some(left.id) == active_run_id;
-            let right_active = Some(right.id) == active_run_id;
-            right_active
-                .cmp(&left_active)
-                .then_with(|| right.start_seq.cmp(&left.start_seq))
-        });
+        runs.sort_by_key(|run| run.start_seq);
         runs
     }
 
@@ -1040,7 +1021,7 @@ impl SlotView {
         (!keys.is_empty()).then(|| {
             self.selected_run_command
                 .and_then(|selected| keys.iter().position(|key| *key == selected))
-                .unwrap_or(0)
+                .unwrap_or(keys.len() - 1)
         })
     }
 
@@ -1054,6 +1035,27 @@ impl SlotView {
     fn selected_run_command_key(&self) -> Option<RunCommandKey> {
         let index = self.selected_run_command_index()?;
         self.run_command_keys().get(index).copied()
+    }
+
+    fn run_command(&self, key: RunCommandKey) -> Option<&RunCommandRecord> {
+        self.run_history
+            .iter()
+            .find(|run| run.id == key.run_id)
+            .and_then(|run| {
+                run.commands
+                    .iter()
+                    .find(|command| command.first_seq == key.first_seq)
+            })
+    }
+
+    fn next_run_command_seq(&self, key: RunCommandKey) -> Option<u64> {
+        self.run_command_keys()
+            .into_iter()
+            .filter_map(|candidate| {
+                (candidate != key && candidate.first_seq > key.first_seq)
+                    .then_some(candidate.first_seq)
+            })
+            .min()
     }
 
     fn sync_trigger_projection(&mut self, live_start: bool) {
@@ -1279,11 +1281,14 @@ impl SlotView {
         self.observe_run_history(&event);
         self.last_epoch = Some(event.daemon_epoch);
         self.last_seq = event.seq;
-        // `Auto` is deliberately lossless: until the platform has an
-        // authoritative echo probe it behaves like local projection without
-        // suppression. Only an explicit `On` may discard an exact RX echo.
-        let reconcile_echo = self.merge_echo && self.effective_echo() == EchoMode::On;
-        self.stream.set_echo_reconciliation(reconcile_echo);
+        // TX remains in the durable journal and the Agent command history,
+        // but the serial pane represents bytes emitted by the device. If the
+        // target echoes a command, its RX bytes appear naturally; echo-off
+        // targets do not receive a synthetic local copy.
+        if event.direction == Direction::Tx {
+            return;
+        }
+        self.stream.set_echo_reconciliation(false);
         let had_pending = self.pending_line.is_some();
         let batch = self.stream.push_event(&event);
         let completed_pending = batch.pending_committed;
@@ -1302,7 +1307,7 @@ impl SlotView {
     }
 
     fn seed_startup_history(&mut self, history: StartupHistory, selected: bool) {
-        if history.epoch != self.snapshot.daemon_epoch || history.slot_id != self.snapshot.config.id
+        if history.epoch != self.snapshot.daemon_epoch || history.port != self.snapshot.config.port
         {
             return;
         }
@@ -1406,44 +1411,24 @@ impl SlotView {
     }
 
     fn effective_echo(&self) -> EchoMode {
-        self.snapshot
-            .effective_echo
-            .unwrap_or(self.snapshot.config.settings.echo)
+        self.snapshot.effective_echo.unwrap_or(EchoMode::On)
     }
 
     fn effective_write_eol(&self) -> &str {
-        self.snapshot
-            .effective_write_eol
-            .as_deref()
-            .unwrap_or(&self.snapshot.config.settings.write_eol)
-    }
-
-    fn has_effective_device_settings(&self) -> bool {
-        self.snapshot.effective_shell_prompt.is_some()
-            || self.snapshot.effective_uboot_prompt.is_some()
-            || self.snapshot.effective_write_eol.is_some()
-            || self.snapshot.effective_echo.is_some()
+        self.snapshot.effective_write_eol.as_deref().unwrap_or("\r")
     }
 
     fn effective_shell_prompt(&self) -> Option<&str> {
-        if self.has_effective_device_settings() {
-            self.snapshot.effective_shell_prompt.as_deref()
-        } else {
-            self.snapshot.config.settings.shell_prompt.as_deref()
-        }
+        self.snapshot.effective_shell_prompt.as_deref()
     }
 
     fn effective_uboot_prompt(&self) -> Option<&str> {
-        if self.has_effective_device_settings() {
-            self.snapshot.effective_uboot_prompt.as_deref()
-        } else {
-            self.snapshot.config.settings.uboot_prompt.as_deref()
-        }
+        self.snapshot.effective_uboot_prompt.as_deref()
     }
 }
 
 struct PendingPaste {
-    slot_id: String,
+    port: String,
     bytes: Vec<u8>,
     raw: bool,
 }
@@ -1456,23 +1441,19 @@ struct QueuedControl {
 
 #[derive(Debug, Clone)]
 struct QueueSelection {
-    slot_id: String,
+    port: String,
     selected: usize,
     detail_scroll: usize,
 }
 
 #[derive(Clone)]
 struct MenuCatalog {
-    auth_required: bool,
-    slots: Vec<SlotSnapshot>,
+    ports: Vec<SlotSnapshot>,
     config_revision: Option<u64>,
     transport_profiles: Vec<TransportProfile>,
     transport_revision: Option<u64>,
-    device_profiles: Vec<DeviceProfile>,
-    device_revision: Option<u64>,
-    models: Vec<DeviceModel>,
-    model_bindings: Vec<SlotModelBinding>,
-    model_revision: u64,
+    model_profiles: Vec<ModelProfile>,
+    model_profile_revision: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1481,8 +1462,8 @@ struct CurrentProfileEditor {
     port: String,
     original_transport: Option<TransportProfile>,
     transport: TransportProfile,
-    original_device: Option<DeviceProfile>,
-    device: DeviceProfile,
+    original_device: Option<ModelProfile>,
+    device: ModelProfile,
 }
 
 impl CurrentProfileEditor {
@@ -1492,7 +1473,9 @@ impl CurrentProfileEditor {
         let original_transport = catalog
             .transport_profiles
             .iter()
-            .find(|profile| profile.name == view.snapshot.config.profile)
+            .find(|profile| {
+                view.snapshot.config.transport_profile.as_deref() == Some(profile.name.as_str())
+            })
             .cloned();
         let transport = original_transport
             .clone()
@@ -1500,18 +1483,18 @@ impl CurrentProfileEditor {
         let original_device = view
             .snapshot
             .config
-            .device_profile
+            .model_profile
             .as_deref()
             .and_then(|name| {
                 catalog
-                    .device_profiles
+                    .model_profiles
                     .iter()
                     .find(|profile| profile.name == name)
             })
             .cloned();
         let device = original_device
             .clone()
-            .unwrap_or_else(|| current_device_template(view));
+            .unwrap_or_else(|| current_model_profile_template(view));
         Self {
             original_port,
             port,
@@ -1533,7 +1516,7 @@ impl CurrentProfileEditor {
             .map(|_| self.transport.clone())
     }
 
-    fn device_update(&self) -> Option<DeviceProfile> {
+    fn device_update(&self) -> Option<ModelProfile> {
         self.original_device
             .as_ref()
             .filter(|original| *original != &self.device)
@@ -1548,56 +1531,36 @@ impl CurrentProfileEditor {
 fn shared_profile_impacts(
     catalog: &MenuCatalog,
     transport: Option<&TransportProfile>,
-    device: Option<&DeviceProfile>,
+    device: Option<&ModelProfile>,
 ) -> SharedProfileImpacts {
     fn matching_slots(
         catalog: &MenuCatalog,
         mut matches: impl FnMut(&SlotSnapshot) -> bool,
     ) -> Vec<(String, String)> {
-        let mut slots = catalog
-            .slots
+        let mut ports = catalog
+            .ports
             .iter()
             .filter(|slot| matches(slot))
-            .map(|slot| (slot.config.id.clone(), slot.config.display_name.clone()))
+            .map(|slot| (slot.config.port.clone(), slot.config.port.clone()))
             .collect::<Vec<_>>();
-        slots.sort_by(|left, right| left.0.cmp(&right.0));
-        slots
+        ports.sort_by(|left, right| left.0.cmp(&right.0));
+        ports
     }
 
     SharedProfileImpacts {
         transport: transport.map(|profile| SharedProfileImpact {
             profile_name: profile.name.clone(),
-            slots: matching_slots(catalog, |slot| slot.config.profile == profile.name),
+            ports: matching_slots(catalog, |slot| {
+                slot.config.transport_profile.as_deref() == Some(profile.name.as_str())
+            }),
         }),
         device: device.map(|profile| SharedProfileImpact {
             profile_name: profile.name.clone(),
-            slots: matching_slots(catalog, |slot| {
-                slot.config.device_profile.as_deref() == Some(profile.name.as_str())
+            ports: matching_slots(catalog, |slot| {
+                slot.config.model_profile.as_deref() == Some(profile.name.as_str())
             }),
         }),
     }
-}
-
-fn shared_model_affected_slots(catalog: &MenuCatalog, model_id: &str) -> Vec<(String, String)> {
-    let mut slots = catalog
-        .model_bindings
-        .iter()
-        .filter(|binding| binding.model_id == model_id)
-        .map(|binding| {
-            let display_name = catalog
-                .slots
-                .iter()
-                .find(|slot| slot.config.id == binding.slot_id)
-                .map_or_else(
-                    || binding.slot_id.clone(),
-                    |slot| slot.config.display_name.clone(),
-                );
-            (binding.slot_id.clone(), display_name)
-        })
-        .collect::<Vec<_>>();
-    slots.sort_by(|left, right| left.0.cmp(&right.0));
-    slots.dedup_by(|left, right| left.0 == right.0);
-    slots
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1605,9 +1568,7 @@ enum MenuPage {
     Root,
     Profiles,
     TransportProfiles,
-    DeviceProfiles,
-    Models,
-    ModelParents,
+    ModelProfiles,
     SerialSettings,
     DisplaySettings,
     RunSettings,
@@ -1620,7 +1581,6 @@ struct MenuState {
     stack: Vec<(MenuPage, usize)>,
     catalog: Option<MenuCatalog>,
     profile_editor: Option<CurrentProfileEditor>,
-    expanded_models: HashSet<String>,
     prompt: Option<MenuPrompt>,
     confirmation: Option<MenuConfirmation>,
     help_scroll: usize,
@@ -1636,7 +1596,6 @@ impl MenuState {
             stack: Vec::new(),
             catalog: None,
             profile_editor: None,
-            expanded_models: HashSet::new(),
             prompt: None,
             confirmation: None,
             help_scroll: 0,
@@ -1672,14 +1631,13 @@ struct MenuConfirmation {
 }
 
 enum MenuConfirmationAction {
-    Admin(MenuAdminMutation),
-    Command(MenuIoCommand),
+    Mutation(MenuMutation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedProfileImpact {
     profile_name: String,
-    slots: Vec<(String, String)>,
+    ports: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1692,29 +1650,17 @@ struct MenuPrompt {
     title: String,
     value: Vec<char>,
     cursor: usize,
-    secret: bool,
     purpose: MenuPromptPurpose,
 }
 
 enum MenuPromptPurpose {
-    Admin(MenuAdminMutation),
     TransportName {
-        slot_id: String,
+        port: String,
         profile: TransportProfile,
     },
     DeviceName {
-        slot_id: String,
-        profile: DeviceProfile,
-    },
-    ModelName {
-        slot_id: String,
-        parent_id: Option<String>,
-    },
-    RenameBoundModel {
-        slot_id: String,
-        model_id: String,
-        expected_revision: u64,
-        expected_current: Option<String>,
+        port: String,
+        profile: ModelProfile,
     },
     CurrentProfile(CurrentProfilePromptField),
     AgentHistoryRows,
@@ -1731,31 +1677,31 @@ enum CurrentProfilePromptField {
     ChunkDelay,
 }
 
-enum MenuAdminMutation {
+enum MenuMutation {
     BindTransport {
-        slot_id: String,
+        port: String,
         profile_name: String,
     },
-    BindDevice {
-        slot_id: String,
+    BindModelProfile {
+        port: String,
         profile_name: Option<String>,
     },
     CreateTransportAndBind {
-        slot_id: String,
+        port: String,
         profile: TransportProfile,
     },
-    CreateDeviceAndBind {
-        slot_id: String,
-        profile: DeviceProfile,
+    CreateModelProfileAndBind {
+        port: String,
+        profile: ModelProfile,
     },
     UpdateCurrentProfiles {
-        slot_id: String,
-        port: Option<String>,
+        current_port: String,
+        new_port: Option<String>,
         transport: Option<TransportProfile>,
-        device: Option<DeviceProfile>,
+        device: Option<ModelProfile>,
         expected_config_revision: Option<u64>,
         expected_transport_revision: Option<u64>,
-        expected_device_revision: Option<u64>,
+        expected_model_profile_revision: Option<u64>,
     },
 }
 
@@ -1767,57 +1713,21 @@ struct CurrentProfileRevisions {
 }
 
 enum MenuIoCommand {
-    /// Lightweight startup refresh used only to resolve bound model IDs to
-    /// display names. It runs after the terminal opens and never delays the
-    /// first frame.
-    LoadModelLabels,
     Reload,
-    Admin {
-        token: Option<String>,
-        mutation: MenuAdminMutation,
-    },
-    BindModel {
-        slot_id: String,
-        model_id: String,
-        expected_revision: u64,
-        expected_current: Option<String>,
-    },
-    CreateAndBindModel {
-        slot_id: String,
-        model_id: String,
-        name: String,
-        parent_id: Option<String>,
-        expected_revision: u64,
-        expected_current: Option<String>,
-    },
-    RenameBoundModel {
-        slot_id: String,
-        model_id: String,
-        name: String,
-        expected_revision: u64,
-        expected_current: Option<String>,
-    },
+    Mutation { mutation: Box<MenuMutation> },
 }
 
 #[derive(Clone)]
 enum MenuSuccess {
     Loaded,
     TransportBound(String),
-    DeviceBound(Option<String>),
+    ModelProfileBound(Option<String>),
     TransportCreated(String),
-    DeviceCreated(String),
-    ModelBound(String),
-    ModelCreated(String),
-    ModelRenamed {
-        name: String,
-        affected_slots: Vec<String>,
-    },
+    ModelProfileCreated(String),
     ProfilesUpdated,
 }
 
 enum MenuIoEvent {
-    ModelLabelsLoaded(DeviceModelListResponse),
-    ModelLabelsUnavailable,
     Completed {
         catalog: MenuCatalog,
         success: MenuSuccess,
@@ -1857,21 +1767,21 @@ const TRANSPORT_PRESETS: &[TransportPreset] = &[
 ];
 
 #[derive(Clone, Copy)]
-enum DevicePreset {
+enum ModelPreset {
     Echo(EchoMode),
     Eol(&'static str),
 }
 
-const DEVICE_PRESETS: &[DevicePreset] = &[
-    DevicePreset::Echo(EchoMode::On),
-    DevicePreset::Echo(EchoMode::Off),
-    DevicePreset::Echo(EchoMode::Auto),
-    DevicePreset::Eol("\r"),
-    DevicePreset::Eol("\n"),
-    DevicePreset::Eol("\r\n"),
+const MODEL_PRESETS: &[ModelPreset] = &[
+    ModelPreset::Echo(EchoMode::On),
+    ModelPreset::Echo(EchoMode::Off),
+    ModelPreset::Echo(EchoMode::Auto),
+    ModelPreset::Eol("\r"),
+    ModelPreset::Eol("\n"),
+    ModelPreset::Eol("\r\n"),
 ];
 
-const CURRENT_PROFILE_ROW_COUNT: usize = 20;
+const CURRENT_PROFILE_ROW_COUNT: usize = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentProfileRow {
@@ -1885,15 +1795,13 @@ enum CurrentProfileRow {
     Dtr,
     Rts,
     AutoOpen,
-    DeviceProfile,
+    ModelProfile,
     WriteEol,
     Echo,
     ShellPrompt,
     UbootPrompt,
     ChunkSize,
     ChunkDelay,
-    ModelBinding,
-    ModelName,
     Apply,
 }
 
@@ -1910,23 +1818,21 @@ impl CurrentProfileRow {
             7 => Self::Dtr,
             8 => Self::Rts,
             9 => Self::AutoOpen,
-            10 => Self::DeviceProfile,
+            10 => Self::ModelProfile,
             11 => Self::WriteEol,
             12 => Self::Echo,
             13 => Self::ShellPrompt,
             14 => Self::UbootPrompt,
             15 => Self::ChunkSize,
             16 => Self::ChunkDelay,
-            17 => Self::ModelBinding,
-            18 => Self::ModelName,
-            19 => Self::Apply,
+            17 => Self::Apply,
             _ => return None,
         })
     }
 }
 
-impl DevicePreset {
-    fn apply(self, profile: &mut DeviceProfile) {
+impl ModelPreset {
+    fn apply(self, profile: &mut ModelProfile) {
         match self {
             Self::Echo(echo) => profile.echo = Some(echo),
             Self::Eol(eol) => profile.write_eol = Some(eol.into()),
@@ -2045,89 +1951,6 @@ fn next_echo(value: Option<EchoMode>) -> Option<EchoMode> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ModelTreeRow {
-    index: usize,
-    depth: usize,
-}
-
-fn visible_model_rows(models: &[DeviceModel], expanded: &HashSet<String>) -> Vec<ModelTreeRow> {
-    fn visit(
-        models: &[DeviceModel],
-        parent: Option<&str>,
-        depth: usize,
-        expanded: &HashSet<String>,
-        rows: &mut Vec<ModelTreeRow>,
-    ) {
-        for (index, model) in models
-            .iter()
-            .enumerate()
-            .filter(|(_, model)| model.parent_id.as_deref() == parent)
-        {
-            rows.push(ModelTreeRow { index, depth });
-            if expanded.contains(&model.id) {
-                visit(models, Some(&model.id), depth + 1, expanded, rows);
-            }
-        }
-    }
-
-    let mut rows = Vec::new();
-    visit(models, None, 0, expanded, &mut rows);
-    rows
-}
-
-fn all_model_rows(models: &[DeviceModel]) -> Vec<ModelTreeRow> {
-    let expanded = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<HashSet<_>>();
-    visible_model_rows(models, &expanded)
-}
-
-fn model_has_children(models: &[DeviceModel], model_id: &str) -> bool {
-    models
-        .iter()
-        .any(|model| model.parent_id.as_deref() == Some(model_id))
-}
-
-fn slot_model_binding<'a>(catalog: &'a MenuCatalog, slot_id: &str) -> Option<&'a SlotModelBinding> {
-    catalog
-        .model_bindings
-        .iter()
-        .find(|binding| binding.slot_id == slot_id)
-}
-
-fn normalize_model_id(name: &str, models: &[DeviceModel]) -> String {
-    let base = name
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned();
-    let base = if base.is_empty() {
-        "model".to_owned()
-    } else {
-        base
-    };
-    if !models.iter().any(|model| model.id == base) {
-        return base;
-    }
-    for suffix in 2..=9_999 {
-        let candidate = format!("{base}-{suffix}");
-        if !models.iter().any(|model| model.id == candidate) {
-            return candidate;
-        }
-    }
-    format!("{base}-{}", Uuid::new_v4().simple())
-}
-
 fn default_transport_profile(name: String) -> TransportProfile {
     TransportProfile {
         name,
@@ -2143,18 +1966,31 @@ fn default_transport_profile(name: String) -> TransportProfile {
 }
 
 fn current_transport_template(view: &SlotView, catalog: &MenuCatalog) -> TransportProfile {
-    if let Some(profile) = catalog
-        .transport_profiles
-        .iter()
-        .find(|profile| profile.name == view.snapshot.config.profile)
-    {
+    if let Some(profile) = catalog.transport_profiles.iter().find(|profile| {
+        view.snapshot.config.transport_profile.as_deref() == Some(profile.name.as_str())
+    }) {
         return profile.clone();
     }
-    let settings = view.snapshot.effective_transport.unwrap_or_else(|| {
-        serial_protocol::resolve_transport_settings(&view.snapshot.config.settings, None)
-    });
+    let settings = view
+        .snapshot
+        .effective_transport
+        .unwrap_or(ResolvedTransportSettings {
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+            dtr: false,
+            rts: false,
+            auto_open: true,
+        });
     TransportProfile {
-        name: view.snapshot.config.profile.clone(),
+        name: view
+            .snapshot
+            .config
+            .transport_profile
+            .clone()
+            .unwrap_or_else(|| format!("{}-uart", view.snapshot.config.port)),
         baud_rate: settings.baud_rate,
         data_bits: settings.data_bits,
         parity: settings.parity,
@@ -2166,15 +2002,15 @@ fn current_transport_template(view: &SlotView, catalog: &MenuCatalog) -> Transpo
     }
 }
 
-fn current_device_template(view: &SlotView) -> DeviceProfile {
+fn current_model_profile_template(view: &SlotView) -> ModelProfile {
     let pacing = view
         .snapshot
         .effective_write_pacing
         .unwrap_or(serial_protocol::WritePacing {
-            chunk_size: view.snapshot.config.settings.write_chunk_size,
-            chunk_delay_ms: view.snapshot.config.settings.write_chunk_delay_ms,
+            chunk_size: 1,
+            chunk_delay_ms: 1,
         });
-    DeviceProfile {
+    ModelProfile {
         name: String::new(),
         shell_prompt: view.effective_shell_prompt().map(ToOwned::to_owned),
         uboot_prompt: view.effective_uboot_prompt().map(ToOwned::to_owned),
@@ -2194,22 +2030,15 @@ fn valid_menu_name(value: &str) -> bool {
 
 fn menu_item_count(menu: &MenuState) -> usize {
     match menu.page {
-        MenuPage::Root => 6,
+        MenuPage::Root => 5,
         MenuPage::Profiles => CURRENT_PROFILE_ROW_COUNT,
         MenuPage::TransportProfiles => menu
             .catalog
             .as_ref()
             .map_or(0, |catalog| catalog.transport_profiles.len() + 1),
-        MenuPage::DeviceProfiles => menu.catalog.as_ref().map_or(0, |catalog| {
-            catalog.device_profiles.len() + 2 + DEVICE_PRESETS.len()
+        MenuPage::ModelProfiles => menu.catalog.as_ref().map_or(0, |catalog| {
+            catalog.model_profiles.len() + 2 + MODEL_PRESETS.len()
         }),
-        MenuPage::Models => menu.catalog.as_ref().map_or(0, |catalog| {
-            visible_model_rows(&catalog.models, &menu.expanded_models).len() + 2
-        }),
-        MenuPage::ModelParents => menu
-            .catalog
-            .as_ref()
-            .map_or(0, |catalog| all_model_rows(&catalog.models).len()),
         MenuPage::SerialSettings => TRANSPORT_PRESETS.len(),
         MenuPage::DisplaySettings => 1,
         MenuPage::RunSettings => 1,
@@ -2221,23 +2050,10 @@ fn menu_success_message(success: &MenuSuccess) -> String {
     match success {
         MenuSuccess::Loaded => tr("menu.loaded").into(),
         MenuSuccess::TransportBound(name) => trf("menu.transport.bound", &[name]),
-        MenuSuccess::DeviceBound(Some(name)) => trf("menu.device.bound", &[name]),
-        MenuSuccess::DeviceBound(None) => tr("menu.device.generic.bound").into(),
+        MenuSuccess::ModelProfileBound(Some(name)) => trf("menu.device.bound", &[name]),
+        MenuSuccess::ModelProfileBound(None) => tr("menu.device.generic.bound").into(),
         MenuSuccess::TransportCreated(name) => trf("menu.transport.created", &[name]),
-        MenuSuccess::DeviceCreated(name) => trf("menu.device.created", &[name]),
-        MenuSuccess::ModelBound(name) => trf("menu.model.bound", &[name]),
-        MenuSuccess::ModelCreated(name) => trf("menu.model.created", &[name]),
-        MenuSuccess::ModelRenamed {
-            name,
-            affected_slots,
-        } => trf(
-            "menu.model.renamed",
-            &[
-                name,
-                &affected_slots.len().to_string(),
-                &affected_slots.join(", "),
-            ],
-        ),
+        MenuSuccess::ModelProfileCreated(name) => trf("menu.device.created", &[name]),
         MenuSuccess::ProfilesUpdated => tr("menu.profile.updated").into(),
     }
 }
@@ -2245,7 +2061,7 @@ fn menu_success_message(success: &MenuSuccess) -> String {
 #[derive(Debug)]
 struct OutputSearchRequest {
     request_id: Uuid,
-    slot_id: String,
+    port: String,
     current_epoch: Uuid,
     head_seq: u64,
     current_run: Option<OutputSearchRun>,
@@ -2282,15 +2098,7 @@ enum OutputSearchIoEvent {
 }
 
 struct App {
-    slots: Vec<SlotView>,
-    /// Human-readable catalog model names keyed by bound Slot. Catalog IDs
-    /// are deliberately kept out of the serial-output title.
-    device_model_names: HashMap<String, String>,
-    /// At most one lightweight model-catalog refresh may be queued or in
-    /// flight. The daemon does not currently broadcast model-binding changes,
-    /// so a bounded periodic refresh keeps Agent/MCP edits visible without
-    /// polling on every render frame.
-    model_labels_refresh_pending: bool,
+    ports: Vec<SlotView>,
     selected: usize,
     prefix_pending: bool,
     /// The prefix key was pressed while dismissing the help overlay. The
@@ -2304,7 +2112,7 @@ struct App {
     help_scroll: usize,
     detailed_timeline: bool,
     transport_connected: bool,
-    authenticated: bool,
+    hello_accepted: bool,
     connection_generation: Option<u64>,
     actor: Option<Actor>,
     status: String,
@@ -2315,7 +2123,7 @@ struct App {
     status_notice_until: Option<Instant>,
     pending_paste: Option<PendingPaste>,
     pending_writes: HashMap<String, VecDeque<PendingWrite>>,
-    /// Current physical chunk within the first queued operation for each Slot.
+    /// Current physical chunk within the first queued operation for each Port.
     /// The complete operation stays in `pending_writes` until every chunk is
     /// acknowledged, so its UI card never disappears or shrinks in flight.
     inflight_writes: HashMap<String, InFlightWrite>,
@@ -2352,21 +2160,18 @@ struct App {
 }
 
 impl App {
-    fn new(slots: Vec<SlotSnapshot>, initial_slot: Option<&str>) -> Self {
-        let slots = slots.into_iter().map(SlotView::new).collect::<Vec<_>>();
+    fn new(ports: Vec<SlotSnapshot>, initial_port: Option<&str>) -> Self {
+        let ports = ports.into_iter().map(SlotView::new).collect::<Vec<_>>();
         let initial_status = tr("st.connecting").to_string();
-        let selected = initial_slot
+        let selected = initial_port
             .and_then(|requested| {
-                slots.iter().position(|slot| {
-                    slot.snapshot.config.id == requested
-                        || slot.snapshot.config.display_name == requested
-                })
+                ports
+                    .iter()
+                    .position(|slot| slot.snapshot.config.port == requested)
             })
             .unwrap_or(0);
         Self {
-            slots,
-            device_model_names: HashMap::new(),
-            model_labels_refresh_pending: false,
+            ports,
             selected,
             prefix_pending: false,
             help_dismiss_prefix: false,
@@ -2374,7 +2179,7 @@ impl App {
             help_scroll: 0,
             detailed_timeline: false,
             transport_connected: false,
-            authenticated: false,
+            hello_accepted: false,
             connection_generation: None,
             actor: None,
             status: initial_status.clone(),
@@ -2452,29 +2257,31 @@ impl App {
         let resume = history
             .resume_cursor
             .clone()
-            .map(|cursor| (history.slot_id.clone(), cursor));
-        let index = self.slot_index(&history.slot_id)?;
+            .map(|cursor| (history.port.clone(), cursor));
+        let index = self.slot_index(&history.port)?;
         let selected = index == self.selected;
-        self.slots[index].seed_startup_history(history, selected);
+        self.ports[index].seed_startup_history(history, selected);
         resume
     }
 
     fn current(&self) -> &SlotView {
-        &self.slots[self.selected]
+        &self.ports[self.selected]
     }
 
     fn current_mut(&mut self) -> &mut SlotView {
-        &mut self.slots[self.selected]
+        &mut self.ports[self.selected]
     }
 
-    fn selected_slot_id(&self) -> String {
-        self.current().snapshot.config.id.clone()
+    fn selected_port(&self) -> String {
+        self.current().snapshot.config.port.clone()
     }
 
-    fn current_device_model_name(&self) -> String {
-        self.device_model_names
-            .get(&self.current().snapshot.config.id)
-            .cloned()
+    fn current_model_profile_name(&self) -> String {
+        self.current()
+            .snapshot
+            .config
+            .model_profile
+            .clone()
             .unwrap_or_else(|| tr("ui.output.model.unconfigured").into())
     }
 
@@ -2486,7 +2293,7 @@ impl App {
             through_seq: view.snapshot.head_seq,
         });
         self.output_search = Some(OutputSearchState {
-            slot_id: view.snapshot.config.id.clone(),
+            port: view.snapshot.config.port.clone(),
             current_epoch: view.snapshot.daemon_epoch,
             head_seq: view.snapshot.head_seq,
             current_run,
@@ -2516,16 +2323,16 @@ impl App {
             return;
         }
         let Some(view) = self
-            .slots
+            .ports
             .iter()
-            .find(|view| view.snapshot.config.id == search.slot_id)
+            .find(|view| view.snapshot.config.port == search.port)
         else {
-            search.error = Some(tr("ui.output.search.slot.missing").into());
+            search.error = Some(tr("ui.output.search.port.missing").into());
             return;
         };
         // The popup may remain open while live Snapshot/events continue to
         // advance. Bind every actual query (including retry) to the latest
-        // authoritative Slot view, never to the state captured when `/` was
+        // authoritative Port view, never to the state captured when `/` was
         // first pressed.
         search.current_epoch = view.snapshot.daemon_epoch;
         search.head_seq = view.snapshot.head_seq;
@@ -2557,7 +2364,7 @@ impl App {
         let request_id = Uuid::new_v4();
         let request = OutputSearchRequest {
             request_id,
-            slot_id: search.slot_id.clone(),
+            port: search.port.clone(),
             current_epoch: search.current_epoch,
             head_seq: search.head_seq,
             current_run: search.current_run,
@@ -2747,30 +2554,6 @@ impl App {
         self.dirty = true;
     }
 
-    fn update_device_model_names(&mut self, models: &[DeviceModel], bindings: &[SlotModelBinding]) {
-        self.device_model_names = bindings
-            .iter()
-            .filter_map(|binding| {
-                models
-                    .iter()
-                    .find(|model| model.id == binding.model_id)
-                    .map(|model| (binding.slot_id.clone(), model.name.clone()))
-            })
-            .collect();
-    }
-
-    fn request_model_labels_refresh(&mut self) {
-        if self.model_labels_refresh_pending {
-            return;
-        }
-        let Some(commands) = self.menu_commands.as_ref() else {
-            return;
-        };
-        if commands.try_send(MenuIoCommand::LoadModelLabels).is_ok() {
-            self.model_labels_refresh_pending = true;
-        }
-    }
-
     fn sync_status_notice(&mut self, now: Instant) {
         if self.status_notice_source != self.status {
             self.status_notice_source.clone_from(&self.status);
@@ -2802,12 +2585,12 @@ impl App {
     }
 
     fn select(&mut self, index: usize) {
-        if index < self.slots.len() {
+        if index < self.ports.len() {
             self.clear_text_selection();
             self.queue_selection = None;
             self.selected = index;
             self.current_mut().unseen = 0;
-            let name = self.current().snapshot.config.display_name.clone();
+            let name = self.current().snapshot.config.port.clone();
             let port = self.current().snapshot.config.port.clone();
             self.status = trf("st.viewing", &[&name, &port]);
             self.dirty = true;
@@ -2818,14 +2601,13 @@ impl App {
         match event {
             NetworkEvent::TransportConnected { generation } => {
                 self.transport_connected = true;
-                self.authenticated = false;
+                self.hello_accepted = false;
                 self.connection_generation = Some(generation);
                 self.actor = None;
-                for slot in &mut self.slots {
+                for slot in &mut self.ports {
                     slot.subscription = SubscriptionPhase::Attaching;
                 }
                 self.status = tr("st.transport").into();
-                self.request_model_labels_refresh();
             }
             NetworkEvent::Disconnected { reason } => {
                 let old_actor_id = self.actor.take().map(|actor| actor.id);
@@ -2838,14 +2620,14 @@ impl App {
                     .uncertain_write_outcomes
                     .saturating_add(newly_uncertain);
                 self.transport_connected = false;
-                self.authenticated = false;
+                self.hello_accepted = false;
                 self.connection_generation = None;
                 self.pending_requests.clear();
                 self.pending_writes.clear();
                 self.inflight_writes.clear();
                 self.queued_controls.clear();
                 self.pending_paste = None;
-                for slot in &mut self.slots {
+                for slot in &mut self.ports {
                     slot.last_manual_activity = None;
                     if old_actor_id.as_ref().is_some_and(|actor_id| {
                         slot.snapshot
@@ -2895,51 +2677,46 @@ impl App {
         match message {
             ServerMessage::Welcome {
                 actor,
-                role,
                 protocol_version,
                 ..
             } => {
                 self.actor = Some(actor);
-                self.authenticated = true;
-                self.status = trf(
-                    "st.welcome",
-                    &[role_label(role), &protocol_version.to_string()],
-                );
+                self.hello_accepted = true;
+                self.status = trf("st.welcome", &[&protocol_version.to_string()]);
             }
-            ServerMessage::Snapshot { slot } => {
+            ServerMessage::Snapshot { port: slot } => {
                 if let Some(index) = self
-                    .slots
+                    .ports
                     .iter()
-                    .position(|view| view.snapshot.config.id == slot.config.id)
+                    .position(|view| view.snapshot.config.port == slot.config.port)
                 {
                     let epoch_changed =
-                        self.slots[index].snapshot.daemon_epoch != slot.daemon_epoch;
+                        self.ports[index].snapshot.daemon_epoch != slot.daemon_epoch;
                     let generation_changed =
-                        self.slots[index].snapshot.generation != slot.generation;
+                        self.ports[index].snapshot.generation != slot.generation;
                     if epoch_changed || generation_changed {
                         self.invalidate_slot_pending(
-                            &slot.config.id,
+                            &slot.config.port,
                             tr("st.session.changed.unsent"),
                         );
-                        self.slots[index].reset_stream();
+                        self.ports[index].reset_stream();
                     }
                     if epoch_changed {
-                        self.slots[index].clear_run_history();
+                        self.ports[index].clear_run_history();
                     }
-                    self.slots[index].snapshot = *slot;
-                    self.slots[index].sync_trigger_projection(false);
-                    self.slots[index].sync_active_run_history();
-                    self.slots[index].subscription = SubscriptionPhase::Attaching;
+                    self.ports[index].snapshot = *slot;
+                    self.ports[index].sync_trigger_projection(false);
+                    self.ports[index].sync_active_run_history();
+                    self.ports[index].subscription = SubscriptionPhase::Attaching;
                     if epoch_changed {
                         let selected = self.selected == index;
-                        let seq = self.slots[index].snapshot.head_seq;
-                        self.slots[index].push_gap(seq, tr("st.daemon.restarted"), selected);
-                        self.slots[index].last_epoch =
-                            Some(self.slots[index].snapshot.daemon_epoch);
-                        self.slots[index].last_seq = 0;
+                        let seq = self.ports[index].snapshot.head_seq;
+                        self.ports[index].push_gap(seq, tr("st.daemon.restarted"), selected);
+                        self.ports[index].last_epoch =
+                            Some(self.ports[index].snapshot.daemon_epoch);
+                        self.ports[index].last_seq = 0;
                     }
                 }
-                self.request_model_labels_refresh();
             }
             ServerMessage::Timeline { event, replay } => self.push_event(event, replay, commands),
             ServerMessage::Result { request_id, result } => {
@@ -2955,25 +2732,25 @@ impl App {
                 let mut cooperative_slot = None;
                 if let Some(request_id) = request_id {
                     match self.pending_requests.remove(&request_id) {
-                        Some(PendingRequest::Acquire { slot_id, .. })
+                        Some(PendingRequest::Acquire { port, .. })
                         | Some(PendingRequest::Write {
-                            slot_id,
+                            port,
                             cooperative: false,
                             ..
                         }) => {
-                            self.queued_controls.remove(&slot_id);
+                            self.queued_controls.remove(&port);
                             let discarded = self
                                 .pending_writes
-                                .remove(&slot_id)
+                                .remove(&port)
                                 .map_or(0, |writes| writes.len());
-                            self.inflight_writes.remove(&slot_id);
+                            self.inflight_writes.remove(&port);
                             if discarded > 0 {
                                 discarded_suffix =
-                                    trf("st.discarded.chunks", &[&slot_id, &discarded.to_string()]);
+                                    trf("st.discarded.chunks", &[&port, &discarded.to_string()]);
                             }
                         }
                         Some(PendingRequest::Write {
-                            slot_id,
+                            port,
                             cooperative: true,
                             ..
                         }) => {
@@ -2981,7 +2758,7 @@ impl App {
                             // suffix or its acquire request. A rejection (for
                             // example an Agent lease expiring at the boundary)
                             // ends only this one opportunistic write.
-                            cooperative_slot = Some(slot_id);
+                            cooperative_slot = Some(port);
                         }
                         _ => {}
                     }
@@ -2992,24 +2769,24 @@ impl App {
                     safe_inline(&message),
                     if retryable { tr("st.retryable") } else { "" }
                 );
-                if let Some(slot_id) = cooperative_slot {
+                if let Some(port) = cooperative_slot {
                     // A queue-mode acquire can be granted while the
                     // cooperative request is still in flight. That grant
                     // deliberately waits behind all writes; once this request
                     // is rejected, resume the untouched ordinary queue if the
                     // Human now owns the lease.
-                    self.flush_pending_writes(&slot_id, commands);
+                    self.flush_pending_writes(&port, commands);
                 }
             }
             ServerMessage::Gap {
-                slot_id,
+                port,
                 requested_after_seq,
                 first_available_seq,
                 head_seq,
                 reason,
             } => {
                 self.push_gap(
-                    &slot_id,
+                    &port,
                     head_seq,
                     trf(
                         "st.history.gap",
@@ -3022,44 +2799,43 @@ impl App {
                 );
             }
             ServerMessage::Lagged {
-                slot_id,
+                port,
                 from_seq,
                 to_seq,
             } => {
-                if let Some(index) = self.slot_index(&slot_id) {
-                    self.slots[index].subscription = SubscriptionPhase::Lagged { from_seq, to_seq };
+                if let Some(index) = self.slot_index(&port) {
+                    self.ports[index].subscription = SubscriptionPhase::Lagged { from_seq, to_seq };
                 }
                 self.push_gap(
-                    &slot_id,
+                    &port,
                     to_seq,
                     trf("st.lagged", &[&from_seq.to_string(), &to_seq.to_string()]),
                 );
             }
             ServerMessage::ReplayBegin {
-                slot_id,
+                port,
                 from_seq,
                 through_seq,
             } => {
-                if let Some(index) = self.slot_index(&slot_id) {
-                    self.slots[index].subscription = SubscriptionPhase::Replaying {
+                if let Some(index) = self.slot_index(&port) {
+                    self.ports[index].subscription = SubscriptionPhase::Replaying {
                         from_seq,
                         through_seq,
                     };
                 }
                 self.status = trf(
                     "st.replaying",
-                    &[&slot_id, &from_seq.to_string(), &through_seq.to_string()],
+                    &[&port, &from_seq.to_string(), &through_seq.to_string()],
                 );
             }
-            ServerMessage::Ready { slot_id, head_seq } => {
-                if let Some(index) = self.slot_index(&slot_id) {
-                    self.slots[index].subscription = SubscriptionPhase::Ready { head_seq };
+            ServerMessage::Ready { port, head_seq } => {
+                if let Some(index) = self.slot_index(&port) {
+                    self.ports[index].subscription = SubscriptionPhase::Ready { head_seq };
                     if self.owns_control(index) {
-                        self.flush_pending_writes(&slot_id, commands);
+                        self.flush_pending_writes(&port, commands);
                     }
                 }
-                self.status = trf("st.live", &[&slot_id, &head_seq.to_string()]);
-                self.request_model_labels_refresh();
+                self.status = trf("st.live", &[&port, &head_seq.to_string()]);
             }
         }
     }
@@ -3073,80 +2849,77 @@ impl App {
         let pending = self.pending_requests.remove(&request_id);
         match result {
             CommandResult::ControlGranted { lease } => {
-                if let Some(PendingRequest::Acquire { slot_id, mode }) = pending {
-                    self.queued_controls.remove(&slot_id);
-                    self.install_lease(&slot_id, lease);
+                if let Some(PendingRequest::Acquire { port, mode }) = pending {
+                    self.queued_controls.remove(&port);
+                    self.install_lease(&port, lease);
                     self.status = match mode {
-                        ControlMode::Queue => trf("st.granted", &[&slot_id]),
-                        ControlMode::Takeover => trf("st.takeover.granted", &[&slot_id]),
+                        ControlMode::Queue => trf("st.granted", &[&port]),
+                        ControlMode::Takeover => trf("st.takeover.granted", &[&port]),
                     };
-                    self.flush_pending_writes(&slot_id, commands);
+                    self.flush_pending_writes(&port, commands);
                 }
             }
             CommandResult::ControlQueued { position } => {
-                if let Some(PendingRequest::Acquire { slot_id, mode }) = pending {
+                if let Some(PendingRequest::Acquire { port, mode }) = pending {
                     self.queued_controls.insert(
-                        slot_id.clone(),
+                        port.clone(),
                         QueuedControl {
                             _position: position,
                             since: Instant::now(),
                         },
                     );
                     self.pending_requests
-                        .insert(request_id, PendingRequest::Acquire { slot_id, mode });
+                        .insert(request_id, PendingRequest::Acquire { port, mode });
                 }
                 self.status = trf("st.queued", &[&position.to_string()]);
             }
             CommandResult::ControlRenewed { lease } => {
-                if let Some(PendingRequest::Renew { slot_id }) = pending {
-                    self.install_lease(&slot_id, lease);
+                if let Some(PendingRequest::Renew { port }) = pending {
+                    self.install_lease(&port, lease);
                 }
             }
             CommandResult::ControlReleased => {
-                if let Some(PendingRequest::Release { slot_id }) = pending {
-                    if let Some(index) = self.slot_index(&slot_id) {
-                        self.slots[index].snapshot.control = None;
-                        self.slots[index].last_manual_activity = None;
+                if let Some(PendingRequest::Release { port }) = pending {
+                    if let Some(index) = self.slot_index(&port) {
+                        self.ports[index].snapshot.control = None;
+                        self.ports[index].last_manual_activity = None;
                     }
-                    self.status = trf("st.released", &[&slot_id]);
+                    self.status = trf("st.released", &[&port]);
                 }
             }
             CommandResult::AcquireCancelled { removed } => {
                 if let Some(
-                    PendingRequest::Acquire { slot_id, .. }
-                    | PendingRequest::CancelAcquire { slot_id },
+                    PendingRequest::Acquire { port, .. } | PendingRequest::CancelAcquire { port },
                 ) = pending
                 {
-                    self.queued_controls.remove(&slot_id);
-                    self.status = trf("st.acquire.cancelled", &[&slot_id]);
+                    self.queued_controls.remove(&port);
+                    self.status = trf("st.acquire.cancelled", &[&port]);
                     // The queued waiter can be promoted just before its
                     // directed cancellation is processed. If that happened,
                     // release the now-idle Human lease immediately instead of
                     // holding it until the idle timer expires.
                     if !removed
                         && self
-                            .slot_index(&slot_id)
+                            .slot_index(&port)
                             .is_some_and(|index| self.owns_control(index))
-                        && !self.pending_writes.contains_key(&slot_id)
-                        && let Some(index) = self.slot_index(&slot_id)
-                        && let Some(lease) = self.slots[index].snapshot.control.clone()
+                        && !self.pending_writes.contains_key(&port)
+                        && let Some(index) = self.slot_index(&port)
+                        && let Some(lease) = self.ports[index].snapshot.control.clone()
                     {
-                        self.release_slot_control(commands, slot_id, lease, false);
+                        self.release_slot_control(commands, port, lease, false);
                     }
                 }
             }
             CommandResult::WriteAccepted { event_seq } => {
                 if let Some(PendingRequest::Write {
-                    slot_id,
-                    cooperative,
-                    ..
+                    port, cooperative, ..
                 }) = pending
                 {
-                    self.status = trf("st.write.confirmed", &[&slot_id, &event_seq.to_string()]);
+                    self.status = trf("st.write.confirmed", &[&port, &event_seq.to_string()]);
                     if !cooperative {
-                        self.acknowledge_inflight_write(&slot_id);
+                        self.acknowledge_inflight_write(&port);
                     }
-                    self.flush_pending_writes(&slot_id, commands);
+                    self.flush_pending_writes(&port, commands);
                 }
             }
             CommandResult::BreakSent { event_seq } => {
@@ -3164,16 +2937,16 @@ impl App {
                     ],
                 );
             }
-            CommandResult::HelloAccepted { actor, role } => {
+            CommandResult::HelloAccepted { actor } => {
                 self.actor = Some(actor);
-                self.authenticated = true;
-                self.status = trf("st.authenticated", &[role_label(role)]);
+                self.hello_accepted = true;
+                self.status = tr("st.session.ready").into();
             }
-            CommandResult::Attached { slots } => {
-                self.status = trf("st.watching", &[&slots.len().to_string()]);
+            CommandResult::Attached { ports } => {
+                self.status = trf("st.watching", &[&ports.len().to_string()]);
             }
-            CommandResult::Detached { slots } => {
-                self.status = trf("st.detached", &[&slots.len().to_string()]);
+            CommandResult::Detached { ports } => {
+                self.status = trf("st.detached", &[&ports.len().to_string()]);
             }
             CommandResult::Pong { .. } => {}
             CommandResult::RunStarted { run } => {
@@ -3194,15 +2967,15 @@ impl App {
         replay: bool,
         commands: &mpsc::Sender<NetworkCommand>,
     ) {
-        if let Some(index) = self.slot_index(&event.slot_id) {
-            let slot_id = event.slot_id.clone();
+        if let Some(index) = self.slot_index(&event.port) {
+            let port = event.port.clone();
             let selected = index == self.selected;
             if replay {
-                self.slots[index].push_event(event, selected);
+                self.ports[index].push_event(event, selected);
                 return;
             }
 
-            let generation_changed = self.slots[index].snapshot.generation != event.generation;
+            let generation_changed = self.ports[index].snapshot.generation != event.generation;
             let declared_profile_only = event
                 .metadata
                 .get("profile_only")
@@ -3214,19 +2987,19 @@ impl App {
                 .and_then(|value| {
                     serde_json::from_value::<serial_protocol::SlotConfig>(value.clone()).ok()
                 })
-                .is_some_and(|current| current == self.slots[index].snapshot.config);
-            let profile_only = event.kind == EventKind::SlotReconfigured
+                .is_some_and(|current| current == self.ports[index].snapshot.config);
+            let profile_only = event.kind == EventKind::PortReconfigured
                 && declared_profile_only
                 && unchanged_config;
             let physical_reconfiguration =
-                event.kind == EventKind::SlotReconfigured && !profile_only;
+                event.kind == EventKind::PortReconfigured && !profile_only;
             if generation_changed
-                || matches!(event.kind, EventKind::SerialClosed | EventKind::SlotRemoved)
+                || matches!(event.kind, EventKind::SerialClosed | EventKind::PortRemoved)
                 || physical_reconfiguration
             {
-                self.invalidate_slot_pending(&slot_id, tr("st.session.changed.discarded"));
-                self.slots[index].snapshot.active_trigger = None;
-                self.slots[index].clear_trigger_projection();
+                self.invalidate_slot_pending(&port, tr("st.session.changed.discarded"));
+                self.ports[index].snapshot.active_trigger = None;
+                self.ports[index].clear_trigger_projection();
             }
             self.apply_event_projection(index, &event);
             if event.kind == EventKind::RunAborted {
@@ -3247,19 +3020,19 @@ impl App {
                     .unwrap_or_else(|| tr("menu.value.unbound").into());
                 self.status = trf("st.run.aborted", &[&label, &reason]);
             }
-            self.slots[index].push_event(event, selected);
-            if self.slots[index].subscription.is_ready() && self.owns_control(index) {
-                self.queued_controls.remove(&slot_id);
+            self.ports[index].push_event(event, selected);
+            if self.ports[index].subscription.is_ready() && self.owns_control(index) {
+                self.queued_controls.remove(&port);
                 self.pending_requests.retain(|_, request| {
-                    !matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == &slot_id)
+                    !matches!(request, PendingRequest::Acquire { port: pending, .. } if pending == &port)
                 });
-                self.flush_pending_writes(&slot_id, commands);
+                self.flush_pending_writes(&port, commands);
             }
         }
     }
 
     fn apply_event_projection(&mut self, index: usize, event: &TimelineEvent) {
-        let slot = &mut self.slots[index];
+        let slot = &mut self.ports[index];
         let snapshot = &mut slot.snapshot;
         snapshot.head_seq = snapshot.head_seq.max(event.seq);
         snapshot.generation = event.generation;
@@ -3333,7 +3106,7 @@ impl App {
                 snapshot.logging = LoggingState::Degraded;
             }
             EventKind::Gap => slot.mark_trigger_stopping(),
-            EventKind::SlotReconfigured => {
+            EventKind::PortReconfigured => {
                 if let Some(config) = event
                     .metadata
                     .get("current")
@@ -3342,7 +3115,7 @@ impl App {
                     snapshot.config = config;
                 }
                 if let Some(effective) = event.metadata.get("effective").and_then(|value| {
-                    serde_json::from_value::<ResolvedDeviceSettings>(value.clone()).ok()
+                    serde_json::from_value::<ResolvedModelSettings>(value.clone()).ok()
                 }) {
                     snapshot.effective_shell_prompt = effective.shell_prompt;
                     snapshot.effective_uboot_prompt = effective.uboot_prompt;
@@ -3358,7 +3131,7 @@ impl App {
                     snapshot.effective_transport = Some(effective_transport);
                 }
             }
-            EventKind::SlotRemoved => {
+            EventKind::PortRemoved => {
                 snapshot.endpoint_present = false;
                 snapshot.session_state = SessionState::Disabled;
                 snapshot.state_reason = Some(tr("state.removed").into());
@@ -3373,42 +3146,42 @@ impl App {
         }
     }
 
-    fn push_gap(&mut self, slot_id: &str, seq: u64, message: String) {
-        if let Some(index) = self.slot_index(slot_id) {
+    fn push_gap(&mut self, port: &str, seq: u64, message: String) {
+        if let Some(index) = self.slot_index(port) {
             let selected = index == self.selected;
-            self.slots[index].push_gap(seq, message, selected);
+            self.ports[index].push_gap(seq, message, selected);
         }
     }
 
-    fn slot_index(&self, slot_id: &str) -> Option<usize> {
-        self.slots
+    fn slot_index(&self, port: &str) -> Option<usize> {
+        self.ports
             .iter()
-            .position(|slot| slot.snapshot.config.id == slot_id)
+            .position(|slot| slot.snapshot.config.port == port)
     }
 
     fn all_slots_ready(&self) -> bool {
-        !self.slots.is_empty() && self.slots.iter().all(|slot| slot.subscription.is_ready())
+        !self.ports.is_empty() && self.ports.iter().all(|slot| slot.subscription.is_ready())
     }
 
     fn slot_ready(&self, index: usize) -> bool {
-        self.slots[index].subscription.is_ready()
+        self.ports[index].subscription.is_ready()
     }
 
-    fn invalidate_slot_pending(&mut self, slot_id: &str, reason: &str) {
+    fn invalidate_slot_pending(&mut self, port: &str, reason: &str) {
         let discarded_writes = self
             .pending_writes
-            .remove(slot_id)
+            .remove(port)
             .map_or(0, |writes| writes.len());
-        self.inflight_writes.remove(slot_id);
+        self.inflight_writes.remove(port);
         let before = self.pending_requests.len();
         self.pending_requests
-            .retain(|_, request| request.slot_id() != slot_id);
-        self.queued_controls.remove(slot_id);
+            .retain(|_, request| request.port() != port);
+        self.queued_controls.remove(port);
         let discarded_requests = before.saturating_sub(self.pending_requests.len());
         if self
             .pending_paste
             .as_ref()
-            .is_some_and(|paste| paste.slot_id == slot_id)
+            .is_some_and(|paste| paste.port == port)
         {
             self.pending_paste = None;
         }
@@ -3416,7 +3189,7 @@ impl App {
             self.status = trf(
                 "st.invalidated",
                 &[
-                    slot_id,
+                    port,
                     reason,
                     &discarded_writes.to_string(),
                     &discarded_requests.to_string(),
@@ -3429,17 +3202,17 @@ impl App {
         let Some(actor) = &self.actor else {
             return false;
         };
-        self.slots[index]
+        self.ports[index]
             .snapshot
             .control
             .as_ref()
             .is_some_and(|lease| lease.owner.id == actor.id)
     }
 
-    fn install_lease(&mut self, slot_id: &str, lease: ControlLease) {
-        self.queued_controls.remove(slot_id);
-        if let Some(index) = self.slot_index(slot_id) {
-            self.slots[index].snapshot.control = Some(lease);
+    fn install_lease(&mut self, port: &str, lease: ControlLease) {
+        self.queued_controls.remove(port);
+        if let Some(index) = self.slot_index(port) {
+            self.ports[index].snapshot.control = Some(lease);
         }
     }
 
@@ -3449,8 +3222,8 @@ impl App {
         message: ClientMessage,
         pending: Option<PendingRequest>,
     ) -> bool {
-        if !self.transport_connected || !self.authenticated {
-            self.status = tr("st.not.auth.queued").into();
+        if !self.transport_connected || !self.hello_accepted {
+            self.status = tr("st.not.ready.queued").into();
             return false;
         }
         let Some(generation) = self.connection_generation else {
@@ -3514,12 +3287,12 @@ impl App {
         data: Vec<u8>,
         operation_id: Option<Uuid>,
     ) -> bool {
-        if !self.transport_connected || !self.authenticated {
-            self.status = tr("st.not.auth2").into();
+        if !self.transport_connected || !self.hello_accepted {
+            self.status = tr("st.not.ready").into();
             return false;
         }
         if !self.slot_ready(self.selected) {
-            self.status = trf("st.not.live", &[&self.selected_slot_id()]);
+            self.status = trf("st.not.live", &[&self.selected_port()]);
             return false;
         }
         let human = self
@@ -3542,12 +3315,12 @@ impl App {
             return false;
         };
 
-        let slot_id = self.selected_slot_id();
+        let port = self.selected_port();
         let sent = self.send_message(
             commands,
             ClientMessage::Write {
                 request_id: Uuid::new_v4(),
-                slot_id: slot_id.clone(),
+                port: port.clone(),
                 control_id: Uuid::nil(),
                 fence: 0,
                 data,
@@ -3559,11 +3332,12 @@ impl App {
                 pacing: None,
                 description: None,
                 command_sequence: None,
+                command_capture_matchers: Vec::new(),
                 sequence_precondition: None,
                 cooperative: true,
             },
             Some(PendingRequest::Write {
-                slot_id,
+                port,
                 operation_id,
                 cooperative: true,
             }),
@@ -3612,23 +3386,19 @@ impl App {
         if writes.iter().all(|(write, _)| write.is_empty()) {
             return true;
         }
-        if !self.transport_connected || !self.authenticated {
-            self.status = tr("st.not.auth2").into();
+        if !self.transport_connected || !self.hello_accepted {
+            self.status = tr("st.not.ready").into();
             return false;
         }
         if !self.slot_ready(self.selected) {
-            self.status = trf("st.not.live", &[&self.selected_slot_id()]);
+            self.status = trf("st.not.live", &[&self.selected_port()]);
             return false;
         }
-        let slot_id = self.selected_slot_id();
+        let port = self.selected_port();
         let total_new_bytes = writes.iter().fold(0usize, |total, (write, _)| {
             total.saturating_add(write.len())
         });
-        let previous_slot_writes = self
-            .pending_writes
-            .get(&slot_id)
-            .cloned()
-            .unwrap_or_default();
+        let previous_slot_writes = self.pending_writes.get(&port).cloned().unwrap_or_default();
         let previous_slot_count = previous_slot_writes.len();
         let mut candidate_slot_writes = previous_slot_writes.clone();
         for (write, operation_id) in writes.iter().filter(|(write, _)| !write.is_empty()) {
@@ -3656,26 +3426,26 @@ impl App {
             return false;
         }
         self.pending_writes
-            .insert(slot_id.clone(), candidate_slot_writes);
-        self.slots[self.selected].last_manual_activity = Some(Instant::now());
+            .insert(port.clone(), candidate_slot_writes);
+        self.ports[self.selected].last_manual_activity = Some(Instant::now());
 
         if self.owns_control(self.selected) {
-            let flushed = self.flush_pending_writes(&slot_id, commands);
+            let flushed = self.flush_pending_writes(&port, commands);
             // A saturated outbound channel leaves the complete operation in
             // the visible local queue. Treat that as accepted local enqueue so
             // Enter may clear the draft without risking a later duplicate.
-            return flushed || self.pending_writes.contains_key(&slot_id);
+            return flushed || self.pending_writes.contains_key(&port);
         }
 
         let acquire_already_pending = self.pending_requests.values().any(|request| {
-            matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == &slot_id)
+            matches!(request, PendingRequest::Acquire { port: pending, .. } if pending == &port)
         });
         if !acquire_already_pending && !self.acquire_control(commands, ControlMode::Queue) {
             if previous_slot_writes.is_empty() {
-                self.pending_writes.remove(&slot_id);
+                self.pending_writes.remove(&port);
             } else {
                 self.pending_writes
-                    .insert(slot_id.clone(), previous_slot_writes);
+                    .insert(port.clone(), previous_slot_writes);
             }
             return false;
         }
@@ -3687,14 +3457,14 @@ impl App {
         commands: &mpsc::Sender<NetworkCommand>,
         mode: ControlMode,
     ) -> bool {
-        if !self.transport_connected || !self.authenticated || !self.slot_ready(self.selected) {
-            self.status = tr("st.not.auth.live").into();
+        if !self.transport_connected || !self.hello_accepted || !self.slot_ready(self.selected) {
+            self.status = tr("st.not.ready.live").into();
             return false;
         }
-        let slot_id = self.selected_slot_id();
+        let port = self.selected_port();
         let message = ClientMessage::AcquireControl {
             request_id: Uuid::new_v4(),
-            slot_id: slot_id.clone(),
+            port: port.clone(),
             mode,
             ttl_ms: CONTROL_TTL_MS,
         };
@@ -3702,16 +3472,16 @@ impl App {
             commands,
             message,
             Some(PendingRequest::Acquire {
-                slot_id: slot_id.clone(),
+                port: port.clone(),
                 mode,
             }),
         ) {
             if mode == ControlMode::Takeover {
-                self.slots[self.selected].last_manual_activity = Some(Instant::now());
+                self.ports[self.selected].last_manual_activity = Some(Instant::now());
             }
             self.status = match mode {
-                ControlMode::Queue => trf("st.requesting.control", &[&slot_id]),
-                ControlMode::Takeover => trf("st.requesting.takeover", &[&slot_id]),
+                ControlMode::Queue => trf("st.requesting.control", &[&port]),
+                ControlMode::Takeover => trf("st.requesting.takeover", &[&port]),
             };
             true
         } else {
@@ -3720,13 +3490,13 @@ impl App {
     }
 
     fn release_control(&mut self, commands: &mpsc::Sender<NetworkCommand>) {
-        if !self.transport_connected || !self.authenticated || !self.slot_ready(self.selected) {
-            self.status = tr("st.slot.not.live").into();
+        if !self.transport_connected || !self.hello_accepted || !self.slot_ready(self.selected) {
+            self.status = tr("st.port.not.live").into();
             return;
         }
-        let slot_id = self.selected_slot_id();
-        if !self.owns_control(self.selected) && self.has_queued_control(&slot_id) {
-            self.cancel_queued_control(commands, &slot_id, tr("st.cancel.reason"));
+        let port = self.selected_port();
+        if !self.owns_control(self.selected) && self.has_queued_control(&port) {
+            self.cancel_queued_control(commands, &port, tr("st.cancel.reason"));
             return;
         }
         let Some(lease) = self.current().snapshot.control.clone() else {
@@ -3737,9 +3507,9 @@ impl App {
             self.status = trf("st.control.belongs", &[&lease.owner.label]);
             return;
         }
-        self.pending_writes.remove(&slot_id);
-        self.inflight_writes.remove(&slot_id);
-        self.release_slot_control(commands, slot_id, lease, false);
+        self.pending_writes.remove(&port);
+        self.inflight_writes.remove(&port);
+        self.release_slot_control(commands, port, lease, false);
     }
 
     fn remove_last_queued_line(
@@ -3747,15 +3517,15 @@ impl App {
         restore_to_editor: bool,
         commands: &mpsc::Sender<NetworkCommand>,
     ) {
-        let slot_id = self.selected_slot_id();
+        let port = self.selected_port();
         let count = self
             .pending_writes
-            .get(&slot_id)
+            .get(&port)
             .map_or(0, |queue| queued_line_operations(queue).len());
         if count == 0 {
             self.status = if self
                 .pending_writes
-                .get(&slot_id)
+                .get(&port)
                 .is_some_and(|queue| !queue.is_empty())
             {
                 tr("st.queue.raw.only").into()
@@ -3773,8 +3543,8 @@ impl App {
         restore_to_editor: bool,
         commands: &mpsc::Sender<NetworkCommand>,
     ) {
-        let slot_id = self.selected_slot_id();
-        let Some(operation) = self.pending_writes.get(&slot_id).and_then(|queue| {
+        let port = self.selected_port();
+        let Some(operation) = self.pending_writes.get(&port).and_then(|queue| {
             queued_line_operations(queue)
                 .into_iter()
                 .nth(operation_index)
@@ -3785,10 +3555,10 @@ impl App {
 
         let sending = self.pending_requests.values().any(|request| match request {
             PendingRequest::Write {
-                slot_id: pending_slot,
+                port: pending_slot,
                 operation_id,
                 ..
-            } if pending_slot == &slot_id => {
+            } if pending_slot == &port => {
                 operation.operation_id.is_none() || operation.operation_id == *operation_id
             }
             _ => false,
@@ -3800,7 +3570,7 @@ impl App {
 
         let Some(mut bytes) = self
             .pending_writes
-            .get_mut(&slot_id)
+            .get_mut(&port)
             .and_then(|queue| take_queued_line_operation(queue, operation_index))
             .map(|operation| operation.data)
         else {
@@ -3809,10 +3579,10 @@ impl App {
         };
         let queue_empty = self
             .pending_writes
-            .get(&slot_id)
+            .get(&port)
             .is_some_and(VecDeque::is_empty);
         if queue_empty {
-            self.pending_writes.remove(&slot_id);
+            self.pending_writes.remove(&port);
         }
         if restore_to_editor {
             let eol = self.current().effective_write_eol().as_bytes().to_vec();
@@ -3834,22 +3604,22 @@ impl App {
             self.status = tr("st.queue.deleted").into();
             self.normalize_queue_selection();
         }
-        if !self.pending_writes.contains_key(&slot_id)
+        if !self.pending_writes.contains_key(&port)
             && !self.owns_control(self.selected)
-            && (self.queued_controls.contains_key(&slot_id)
+            && (self.queued_controls.contains_key(&port)
                 || self.pending_requests.values().any(
-                    |request| matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == &slot_id),
+                    |request| matches!(request, PendingRequest::Acquire { port: pending, .. } if pending == &port),
                 ))
         {
-            self.cancel_queued_control(commands, &slot_id, tr("st.cancel.reason"));
+            self.cancel_queued_control(commands, &port, tr("st.cancel.reason"));
         }
     }
 
     fn open_queue_selection(&mut self) {
-        let slot_id = self.selected_slot_id();
+        let port = self.selected_port();
         let count = self
             .pending_writes
-            .get(&slot_id)
+            .get(&port)
             .map_or(0, |queue| queued_line_operations(queue).len());
         if count == 0 {
             self.status = tr("st.queue.none").into();
@@ -3858,7 +3628,7 @@ impl App {
             return;
         }
         self.queue_selection = Some(QueueSelection {
-            slot_id,
+            port,
             selected: 0,
             detail_scroll: 0,
         });
@@ -3872,7 +3642,7 @@ impl App {
         };
         let count = self
             .pending_writes
-            .get(&selection.slot_id)
+            .get(&selection.port)
             .map_or(0, |queue| queued_line_operations(queue).len());
         if count == 0 {
             self.queue_selection = None;
@@ -3887,11 +3657,11 @@ impl App {
         let Some(selection) = self.queue_selection.as_ref() else {
             return;
         };
-        let slot_id = selection.slot_id.clone();
+        let port = selection.port.clone();
         let selected = selection.selected;
         let count = self
             .pending_writes
-            .get(&slot_id)
+            .get(&port)
             .map_or(0, |queue| queued_line_operations(queue).len());
         match key.code {
             KeyCode::Up => {
@@ -3959,70 +3729,86 @@ impl App {
 
     fn handle_run_history_key(&mut self, key: KeyEvent) {
         let count = self.current().run_command_keys().len();
-        let selected = self.current().selected_run_command_index().unwrap_or(0);
+        let selected = self
+            .current()
+            .selected_run_command_index()
+            .unwrap_or_else(|| count.saturating_sub(1));
+        let mut jump_to_selection = false;
         match key.code {
             KeyCode::Up if count > 0 => {
                 self.current_mut()
                     .select_run_command_index(selected.saturating_sub(1));
+                jump_to_selection = true;
             }
             KeyCode::Down if count > 0 => {
                 self.current_mut()
                     .select_run_command_index((selected + 1).min(count - 1));
+                jump_to_selection = true;
             }
-            KeyCode::Home if count > 0 => self.current_mut().select_run_command_index(0),
+            KeyCode::Home if count > 0 => {
+                self.current_mut().select_run_command_index(0);
+                jump_to_selection = true;
+            }
             KeyCode::End if count > 0 => {
                 self.current_mut().select_run_command_index(count - 1);
+                jump_to_selection = true;
             }
-            KeyCode::Enter | KeyCode::Right if count > 0 => {
+            KeyCode::Right if count > 0 => {
                 let selected_key = self.current().selected_run_command_key();
-                let expanded = {
+                {
                     let view = self.current_mut();
-                    // Expanding is an explicit operator selection. Pin it
-                    // instead of retaining the `None == follow newest`
-                    // sentinel, otherwise a newly arriving Agent command can
-                    // move selection away from the operator.
                     view.selected_run_command = selected_key;
-                    if view.expanded_run_command == selected_key && key.code == KeyCode::Enter {
-                        view.expanded_run_command = None;
-                        false
-                    } else {
-                        view.expanded_run_command = selected_key;
-                        true
-                    }
-                };
-                self.current_mut().run_detail_scroll = 0;
-                if expanded && let Some(key) = selected_key {
-                    self.jump_output_to_run_command(key);
+                    view.expanded_run_command = selected_key;
                 }
+                self.current_mut().run_detail_scroll = 0;
+                jump_to_selection = true;
             }
             KeyCode::Left if count > 0 => {
                 self.current_mut().expanded_run_command = None;
                 self.current_mut().run_detail_scroll = 0;
             }
             KeyCode::PageUp => {
-                let maximum = self.max_run_detail_scroll();
-                let scroll = self
-                    .current()
-                    .run_detail_scroll
-                    .min(maximum)
-                    .saturating_sub(5);
-                self.current_mut().run_detail_scroll = scroll;
+                if self.current().expanded_run_command.is_some() {
+                    let maximum = self.max_run_detail_scroll();
+                    let scroll = self
+                        .current()
+                        .run_detail_scroll
+                        .min(maximum)
+                        .saturating_sub(5);
+                    self.current_mut().run_detail_scroll = scroll;
+                } else if count > 0 {
+                    let page = usize::from(self.agent_history_rows.saturating_sub(1)).max(1);
+                    self.current_mut()
+                        .select_run_command_index(selected.saturating_sub(page));
+                    jump_to_selection = true;
+                }
             }
             KeyCode::PageDown => {
-                let maximum = self.max_run_detail_scroll();
-                let scroll = self
-                    .current()
-                    .run_detail_scroll
-                    .min(maximum)
-                    .saturating_add(5)
-                    .min(maximum);
-                self.current_mut().run_detail_scroll = scroll;
+                if self.current().expanded_run_command.is_some() {
+                    let maximum = self.max_run_detail_scroll();
+                    let scroll = self
+                        .current()
+                        .run_detail_scroll
+                        .min(maximum)
+                        .saturating_add(5)
+                        .min(maximum);
+                    self.current_mut().run_detail_scroll = scroll;
+                } else if count > 0 {
+                    let page = usize::from(self.agent_history_rows.saturating_sub(1)).max(1);
+                    self.current_mut()
+                        .select_run_command_index(selected.saturating_add(page).min(count - 1));
+                    jump_to_selection = true;
+                }
             }
             KeyCode::Esc => {
                 self.focus = PaneFocus::Input;
+                self.current_mut().follow();
                 self.status = tr("st.run.panel.left").into();
             }
             _ => {}
+        }
+        if jump_to_selection && let Some(key) = self.current().selected_run_command_key() {
+            self.jump_output_to_run_command(key);
         }
     }
 
@@ -4103,61 +3889,60 @@ impl App {
         true
     }
 
-    fn has_queued_control(&self, slot_id: &str) -> bool {
-        self.queued_controls.contains_key(slot_id)
-            || self.pending_writes.contains_key(slot_id)
+    fn has_queued_control(&self, port: &str) -> bool {
+        self.queued_controls.contains_key(port)
+            || self.pending_writes.contains_key(port)
             || self.pending_requests.values().any(
-                |request| matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == slot_id),
+                |request| matches!(request, PendingRequest::Acquire { port: pending, .. } if pending == port),
             )
     }
 
     fn cancel_queued_control(
         &mut self,
         commands: &mpsc::Sender<NetworkCommand>,
-        slot_id: &str,
+        port: &str,
         reason: &str,
     ) {
         let message = ClientMessage::CancelAcquire {
             request_id: Uuid::new_v4(),
-            slot_id: slot_id.to_owned(),
-            // A queued waiter has no lease identity; seriald intentionally
-            // matches it by authenticated actor and treats this field as
-            // forward-compatible wire context.
+            port: port.to_owned(),
+            // A queued waiter has no lease identity; seriald matches it by
+            // actor identity and treats this field as wire context.
             control_id: Uuid::nil(),
         };
         if self.send_message(
             commands,
             message,
             Some(PendingRequest::CancelAcquire {
-                slot_id: slot_id.to_owned(),
+                port: port.to_owned(),
             }),
         ) {
-            self.pending_writes.remove(slot_id);
-            self.inflight_writes.remove(slot_id);
-            self.queued_controls.remove(slot_id);
+            self.pending_writes.remove(port);
+            self.inflight_writes.remove(port);
+            self.queued_controls.remove(port);
             self.pending_requests.retain(|_, request| {
-                !matches!(request, PendingRequest::Acquire { slot_id: pending, .. } if pending == slot_id)
+                !matches!(request, PendingRequest::Acquire { port: pending, .. } if pending == port)
             });
             if self
                 .pending_paste
                 .as_ref()
-                .is_some_and(|paste| paste.slot_id == slot_id)
+                .is_some_and(|paste| paste.port == port)
             {
                 self.pending_paste = None;
             }
-            self.status = trf("st.reconnect.reason", &[reason, slot_id]);
+            self.status = trf("st.reconnect.reason", &[reason, port]);
         }
     }
 
     fn release_slot_control(
         &mut self,
         commands: &mpsc::Sender<NetworkCommand>,
-        slot_id: String,
+        port: String,
         lease: ControlLease,
         automatic: bool,
     ) {
         let release_pending = self.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Release { slot_id: pending } if pending == &slot_id),
+            |request| matches!(request, PendingRequest::Release { port: pending } if pending == &port),
         );
         if release_pending {
             return;
@@ -4166,41 +3951,39 @@ impl App {
             commands,
             ClientMessage::ReleaseControl {
                 request_id: Uuid::new_v4(),
-                slot_id: slot_id.clone(),
+                port: port.clone(),
                 control_id: lease.id,
                 fence: lease.fence,
             },
-            Some(PendingRequest::Release {
-                slot_id: slot_id.clone(),
-            }),
+            Some(PendingRequest::Release { port: port.clone() }),
         );
         if automatic {
             self.status = trf(
                 "st.idle.release",
-                &[&slot_id, &self.human_idle_release.as_secs().to_string()],
+                &[&port, &self.human_idle_release.as_secs().to_string()],
             );
         }
     }
 
     fn maintain_controls(&mut self, commands: &mpsc::Sender<NetworkCommand>) {
-        if !self.transport_connected || !self.authenticated {
+        if !self.transport_connected || !self.hello_accepted {
             return;
         }
         self.dirty = true;
         let idle_release = self.human_idle_release;
-        let expired_queue = self.queued_controls.iter().find_map(|(slot_id, queued)| {
+        let expired_queue = self.queued_controls.iter().find_map(|(port, queued)| {
             let last_activity = self
-                .slot_index(slot_id)
-                .and_then(|index| self.slots[index].last_manual_activity);
+                .slot_index(port)
+                .and_then(|index| self.ports[index].last_manual_activity);
             let idle = last_activity
                 .map(|activity| activity.elapsed())
                 .unwrap_or_else(|| queued.since.elapsed());
-            (idle >= idle_release).then(|| slot_id.clone())
+            (idle >= idle_release).then(|| port.clone())
         });
-        if let Some(slot_id) = expired_queue {
+        if let Some(port) = expired_queue {
             self.cancel_queued_control(
                 commands,
-                &slot_id,
+                &port,
                 &trf("st.queue.expired", &[&idle_release.as_secs().to_string()]),
             );
             return;
@@ -4208,7 +3991,7 @@ impl App {
 
         let actor_id = self.actor.as_ref().map(|actor| actor.id.clone());
         let leases = self
-            .slots
+            .ports
             .iter()
             .filter_map(|slot| {
                 if !slot.subscription.is_ready() {
@@ -4216,30 +3999,28 @@ impl App {
                 }
                 let lease = slot.snapshot.control.as_ref()?;
                 (Some(&lease.owner.id) == actor_id.as_ref())
-                    .then(|| (slot.snapshot.config.id.clone(), lease.clone()))
+                    .then(|| (slot.snapshot.config.port.clone(), lease.clone()))
             })
             .collect::<Vec<_>>();
-        for (slot_id, lease) in leases {
-            let index = self
-                .slot_index(&slot_id)
-                .expect("lease came from this Slot");
+        for (port, lease) in leases {
+            let index = self.slot_index(&port).expect("lease came from this Port");
             // Retry a locally accepted operation whose previous outbound send
             // hit channel backpressure. Pending Write requests and active
             // Triggers are already guarded inside `flush_pending_writes`.
-            self.flush_pending_writes(&slot_id, commands);
-            let operation_pending = self.pending_writes.contains_key(&slot_id)
+            self.flush_pending_writes(&port, commands);
+            let operation_pending = self.pending_writes.contains_key(&port)
                 || self.pending_requests.values().any(
-                    |request| matches!(request, PendingRequest::Write { slot_id: pending, .. } if pending == &slot_id),
+                    |request| matches!(request, PendingRequest::Write { port: pending, .. } if pending == &port),
                 );
-            let recently_active = self.slots[index]
+            let recently_active = self.ports[index]
                 .last_manual_activity
                 .is_some_and(|activity| activity.elapsed() < idle_release);
             if !recently_active && !operation_pending {
-                self.release_slot_control(commands, slot_id, lease, true);
+                self.release_slot_control(commands, port, lease, true);
                 continue;
             }
             let already_pending = self.pending_requests.values().any(|request| {
-                matches!(request, PendingRequest::Renew { slot_id: pending } if pending == &slot_id)
+                matches!(request, PendingRequest::Renew { port: pending } if pending == &port)
             });
             if already_pending {
                 continue;
@@ -4248,41 +4029,41 @@ impl App {
                 commands,
                 ClientMessage::RenewControl {
                     request_id: Uuid::new_v4(),
-                    slot_id: slot_id.clone(),
+                    port: port.clone(),
                     control_id: lease.id,
                     fence: lease.fence,
                     ttl_ms: CONTROL_TTL_MS,
                 },
-                Some(PendingRequest::Renew { slot_id }),
+                Some(PendingRequest::Renew { port }),
             );
         }
     }
 
     fn flush_pending_writes(
         &mut self,
-        slot_id: &str,
+        port: &str,
         commands: &mpsc::Sender<NetworkCommand>,
     ) -> bool {
-        let Some(index) = self.slot_index(slot_id) else {
+        let Some(index) = self.slot_index(port) else {
             return false;
         };
         if !self.transport_connected
-            || !self.authenticated
+            || !self.hello_accepted
             || !self.slot_ready(index)
             || !self.owns_control(index)
-            || self.slots[index].snapshot.active_trigger.is_some()
+            || self.ports[index].snapshot.active_trigger.is_some()
         {
             return true;
         }
         let write_already_pending = self.pending_requests.values().any(|request| {
-            matches!(request, PendingRequest::Write { slot_id: pending, .. } if pending == slot_id)
+            matches!(request, PendingRequest::Write { port: pending, .. } if pending == port)
         });
         if write_already_pending {
             return true;
         }
-        let progress = self.inflight_writes.get(slot_id).copied().or_else(|| {
+        let progress = self.inflight_writes.get(port).copied().or_else(|| {
             self.pending_writes
-                .get(slot_id)
+                .get(port)
                 .and_then(|writes| writes.front())
                 .map(|write| InFlightWrite {
                     operation_id: write.operation_id,
@@ -4292,7 +4073,7 @@ impl App {
         });
         let write = progress.and_then(|progress| {
             self.pending_writes
-                .get(slot_id)
+                .get(port)
                 .and_then(|writes| writes.get(progress.chunk_index))
                 .filter(|write| {
                     write.operation_id == progress.operation_id && write.kind == progress.kind
@@ -4301,53 +4082,53 @@ impl App {
                 .map(|write| (progress, write))
         });
         if let Some((progress, write)) = write {
-            self.inflight_writes.insert(slot_id.to_owned(), progress);
-            if !self.send_write_now(commands, slot_id, write.data, write.operation_id) {
-                self.inflight_writes.remove(slot_id);
+            self.inflight_writes.insert(port.to_owned(), progress);
+            if !self.send_write_now(commands, port, write.data, write.operation_id) {
+                self.inflight_writes.remove(port);
                 return false;
             }
         }
         true
     }
 
-    fn acknowledge_inflight_write(&mut self, slot_id: &str) {
-        let Some(mut progress) = self.inflight_writes.get(slot_id).copied() else {
+    fn acknowledge_inflight_write(&mut self, port: &str) {
+        let Some(mut progress) = self.inflight_writes.get(port).copied() else {
             return;
         };
         let next_index = progress.chunk_index.saturating_add(1);
         let same_operation_continues = self
             .pending_writes
-            .get(slot_id)
+            .get(port)
             .and_then(|writes| writes.get(next_index))
             .is_some_and(|write| {
                 write.operation_id == progress.operation_id && write.kind == progress.kind
             });
         if same_operation_continues {
             progress.chunk_index = next_index;
-            self.inflight_writes.insert(slot_id.to_owned(), progress);
+            self.inflight_writes.insert(port.to_owned(), progress);
             return;
         }
 
-        if let Some(writes) = self.pending_writes.get_mut(slot_id) {
+        if let Some(writes) = self.pending_writes.get_mut(port) {
             writes.drain(..next_index.min(writes.len()));
             if writes.is_empty() {
-                self.pending_writes.remove(slot_id);
+                self.pending_writes.remove(port);
             }
         }
-        self.inflight_writes.remove(slot_id);
+        self.inflight_writes.remove(port);
     }
 
     fn send_write_now(
         &mut self,
         commands: &mpsc::Sender<NetworkCommand>,
-        slot_id: &str,
+        port: &str,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
     ) -> bool {
-        let Some(index) = self.slot_index(slot_id) else {
+        let Some(index) = self.slot_index(port) else {
             return false;
         };
-        let Some(lease) = self.slots[index].snapshot.control.clone() else {
+        let Some(lease) = self.ports[index].snapshot.control.clone() else {
             self.status = tr("st.write.disappeared").into();
             return false;
         };
@@ -4355,7 +4136,7 @@ impl App {
             commands,
             ClientMessage::Write {
                 request_id: Uuid::new_v4(),
-                slot_id: slot_id.to_string(),
+                port: port.to_string(),
                 control_id: lease.id,
                 fence: lease.fence,
                 data,
@@ -4366,11 +4147,12 @@ impl App {
                 pacing: None,
                 description: None,
                 command_sequence: None,
+                command_capture_matchers: Vec::new(),
                 sequence_precondition: None,
                 cooperative: false,
             },
             Some(PendingRequest::Write {
-                slot_id: slot_id.to_string(),
+                port: port.to_string(),
                 operation_id,
                 cooperative: false,
             }),
@@ -4397,7 +4179,7 @@ impl App {
             Event::Mouse(mouse) => self.handle_mouse(mouse, commands),
             Event::Resize(_, _) => {
                 self.clear_text_selection();
-                for slot in &mut self.slots {
+                for slot in &mut self.ports {
                     slot.follow();
                 }
                 self.queue_selection = None;
@@ -4492,6 +4274,51 @@ impl App {
             return;
         }
 
+        match key.code {
+            KeyCode::PageUp => {
+                self.run_panel_visible = true;
+                self.focus = PaneFocus::RunHistory;
+                self.handle_run_history_key(key);
+                self.dirty = true;
+                return;
+            }
+            KeyCode::PageDown => {
+                self.run_panel_visible = true;
+                self.focus = PaneFocus::RunHistory;
+                self.handle_run_history_key(key);
+                self.dirty = true;
+                return;
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                self.run_panel_visible = true;
+                self.focus = PaneFocus::RunHistory;
+                self.handle_run_history_key(key);
+                self.dirty = true;
+                return;
+            }
+            KeyCode::Enter
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char(_)
+                if !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let leaving_history = self.focus == PaneFocus::RunHistory;
+                self.focus = PaneFocus::Input;
+                if leaving_history {
+                    self.current_mut().follow();
+                }
+                match self.current_mode() {
+                    InputMode::Line => self.handle_line_key(key, commands),
+                    InputMode::Raw => self.handle_raw_key(key, commands),
+                }
+                self.dirty = true;
+                return;
+            }
+            _ => {}
+        }
+
         if self.focus == PaneFocus::RunHistory {
             self.handle_run_history_key(key);
             self.dirty = true;
@@ -4507,53 +4334,26 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
-        let position = Position::new(mouse.column, mouse.row);
-        if self
-            .layout
-            .and_then(|layout| layout.run_history_area)
-            .is_some_and(|area| rect_contains(area, position))
-        {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            self.last_output_click = None;
             self.clear_text_selection();
+            self.run_panel_visible = true;
             self.focus = PaneFocus::RunHistory;
-            let detail_open =
-                self.current().expanded_run_command == self.current().selected_run_command_key();
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.handle_run_history_key(KeyEvent::new(
-                        if detail_open {
-                            KeyCode::PageUp
-                        } else {
-                            KeyCode::Up
-                        },
-                        KeyModifiers::NONE,
-                    ));
-                }
-                MouseEventKind::ScrollDown => {
-                    self.handle_run_history_key(KeyEvent::new(
-                        if detail_open {
-                            KeyCode::PageDown
-                        } else {
-                            KeyCode::Down
-                        },
-                        KeyModifiers::NONE,
-                    ));
-                }
-                _ => {}
-            }
+            self.handle_run_history_key(KeyEvent::new(
+                if mouse.kind == MouseEventKind::ScrollUp {
+                    KeyCode::PageUp
+                } else {
+                    KeyCode::PageDown
+                },
+                KeyModifiers::NONE,
+            ));
             self.dirty = true;
             return;
         }
         match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.last_output_click = None;
-                self.clear_text_selection();
-                self.scroll_up(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.last_output_click = None;
-                self.clear_text_selection();
-                self.scroll_down(3);
-            }
             MouseEventKind::Down(MouseButton::Left) => self.begin_mouse_selection(mouse),
             MouseEventKind::Drag(MouseButton::Left) => self.update_mouse_selection(mouse),
             MouseEventKind::Up(MouseButton::Left) => self.finish_mouse_selection(mouse),
@@ -4579,7 +4379,6 @@ impl App {
             self.reset_software_cursor_blink(Instant::now());
             self.last_output_click = None;
             self.queue_selection = None;
-            self.focus = PaneFocus::Input;
             self.clear_text_selection();
             return;
         }
@@ -4587,7 +4386,6 @@ impl App {
             self.last_output_click = None;
             return;
         }
-        self.focus = PaneFocus::Output;
         self.clear_text_selection();
         if !rect_contains(layout.output_inner, position) {
             return;
@@ -4614,6 +4412,7 @@ impl App {
             anchor,
             head,
             word_selected,
+            completed: false,
             last_activity: now,
         });
         if word_selected {
@@ -4625,6 +4424,9 @@ impl App {
         let (Some(layout), Some(selection)) = (self.layout, self.selection.as_mut()) else {
             return;
         };
+        if selection.completed {
+            return;
+        }
         let position = Position::new(mouse.column, mouse.row);
         if let Some(point) =
             selection_point_clamped(layout.output_inner, position, selection.plain_rows.len())
@@ -4643,15 +4445,20 @@ impl App {
     }
 
     fn complete_mouse_selection(&mut self) -> bool {
-        let Some(selection) = self.selection.take() else {
+        let Some(selection) = self.selection.as_ref() else {
             return false;
         };
+        if selection.completed {
+            return true;
+        }
         if !selection.is_dragged() {
+            self.selection = None;
             self.selection_copy = None;
             return false;
         }
         let text = selection.selected_text();
         if text.is_empty() {
+            self.selection = None;
             self.selection_copy = None;
             return false;
         }
@@ -4660,15 +4467,19 @@ impl App {
             Ok(()) => trf("st.selection.copied", &[&characters]),
             Err(error) => trf("st.clipboard.copy.failed", &[&error.to_string()]),
         };
-        // Keep the payload so right-click remains an explicit retry/copy path
-        // even after the automatic copy has resumed live output.
+        if let Some(selection) = self.selection.as_mut() {
+            selection.completed = true;
+        }
+        // Keep both the highlighted cells and the payload so right-click
+        // remains an explicit retry/copy path.
         self.selection_copy = Some(text);
         true
     }
 
     fn expire_mouse_selection(&mut self, now: Instant) -> bool {
         if self.selection.as_ref().is_some_and(|selection| {
-            now.saturating_duration_since(selection.last_activity) >= MOUSE_SELECTION_TIMEOUT
+            !selection.completed
+                && now.saturating_duration_since(selection.last_activity) >= MOUSE_SELECTION_TIMEOUT
         }) {
             return self.complete_mouse_selection();
         }
@@ -4693,7 +4504,6 @@ impl App {
         };
         let position = Position::new(mouse.column, mouse.row);
         if rect_contains(layout.output_area, position) {
-            self.focus = PaneFocus::Output;
             let Some(text) = self.take_selection_text() else {
                 return;
             };
@@ -4706,7 +4516,6 @@ impl App {
         if !rect_contains(layout.input_area, position) {
             return;
         }
-        self.focus = PaneFocus::Input;
         self.queue_selection = None;
         self.clear_text_selection();
         match crate::clipboard::read_text() {
@@ -4723,7 +4532,7 @@ impl App {
             KeyCode::Char(digit @ '1'..='9') => {
                 self.select((digit as usize) - ('1' as usize));
             }
-            KeyCode::Char('s' | 'S') => self.select((self.selected + 1) % self.slots.len()),
+            KeyCode::Char('s' | 'S') => self.select((self.selected + 1) % self.ports.len()),
             KeyCode::Char('l' | 'L') => {
                 self.current_mut().mode = InputMode::Line;
                 self.status = tr("st.line.mode").into();
@@ -4737,7 +4546,7 @@ impl App {
                 self.status = tr("st.follow").into();
             }
             KeyCode::Char('v' | 'V') => {
-                for slot in &mut self.slots {
+                for slot in &mut self.ports {
                     slot.follow();
                 }
                 self.detailed_timeline = !self.detailed_timeline;
@@ -4788,7 +4597,7 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let value = self.current().draft.iter().collect::<String>();
-                if value.is_empty() && self.current().active_agent_run().is_some() {
+                if value.is_empty() {
                     self.current_mut().follow();
                     self.status = tr("st.agent.enter.follow").into();
                     return;
@@ -4899,7 +4708,7 @@ impl App {
         let dangerous = value.len() > 1024 || value.contains('\n') || value.contains('\r');
         if dangerous {
             self.pending_paste = Some(PendingPaste {
-                slot_id: self.selected_slot_id(),
+                port: self.selected_port(),
                 bytes: value.into_bytes(),
                 raw: self.current_mode() == InputMode::Raw,
             });
@@ -4928,7 +4737,7 @@ impl App {
             self.status = tr("st.paste.none").into();
             return;
         };
-        let Some(index) = self.slot_index(&paste.slot_id) else {
+        let Some(index) = self.slot_index(&paste.port) else {
             self.status = tr("st.paste.gone").into();
             return;
         };
@@ -4954,7 +4763,7 @@ impl App {
         };
         self.selected = previous;
         if accepted {
-            self.status = trf("st.paste.queued", &[&paste.slot_id]);
+            self.status = trf("st.paste.queued", &[&paste.port]);
         }
     }
 
@@ -5157,15 +4966,6 @@ impl App {
             KeyCode::Char('r' | 'R') => {
                 self.submit_menu_command(&mut menu, MenuIoCommand::Reload);
             }
-            KeyCode::Right if menu.page == MenuPage::Models => {
-                self.expand_selected_model(&mut menu, true);
-            }
-            KeyCode::Left if menu.page == MenuPage::Models => {
-                self.expand_selected_model(&mut menu, false);
-            }
-            KeyCode::Char('b' | 'B') if menu.page == MenuPage::Models => {
-                self.bind_selected_model(&mut menu);
-            }
             KeyCode::Enter => self.activate_menu_item(&mut menu),
             _ => {}
         }
@@ -5187,11 +4987,8 @@ impl App {
                 menu.message = confirmation.cancelled_message;
             }
             KeyCode::Enter | KeyCode::Char('y' | 'Y') => match confirmation.action {
-                MenuConfirmationAction::Admin(mutation) => {
-                    self.begin_admin_prompt(menu, mutation);
-                }
-                MenuConfirmationAction::Command(command) => {
-                    self.submit_menu_command(menu, command);
+                MenuConfirmationAction::Mutation(mutation) => {
+                    self.submit_menu_mutation(menu, mutation);
                 }
             },
             KeyCode::Up => {
@@ -5255,8 +5052,7 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                let limit = if prompt.secret { 512 } else { 128 };
-                if prompt.value.len() < limit && !character.is_control() {
+                if prompt.value.len() < 128 && !character.is_control() {
                     prompt.value.insert(prompt.cursor, character);
                     prompt.cursor += 1;
                 }
@@ -5358,105 +5154,24 @@ impl App {
                     menu.prompt = Some(prompt);
                     return;
                 }
-                if prompt.secret {
-                    if value.trim().is_empty() {
-                        menu.message = tr("menu.admin.required").into();
-                        menu.prompt = Some(prompt);
-                        return;
-                    }
-                } else if !valid_menu_name(&value) {
+                if !valid_menu_name(&value) {
                     menu.message = tr("menu.name.invalid").into();
                     menu.prompt = Some(prompt);
                     return;
                 }
                 match prompt.purpose {
-                    MenuPromptPurpose::Admin(mutation) => {
-                        self.submit_menu_command(
-                            menu,
-                            MenuIoCommand::Admin {
-                                token: Some(value.trim().to_owned()),
-                                mutation,
-                            },
-                        );
-                    }
-                    MenuPromptPurpose::TransportName {
-                        slot_id,
-                        mut profile,
-                    } => {
+                    MenuPromptPurpose::TransportName { port, mut profile } => {
                         profile.name = value;
-                        self.begin_admin_prompt(
+                        self.submit_menu_mutation(
                             menu,
-                            MenuAdminMutation::CreateTransportAndBind { slot_id, profile },
+                            MenuMutation::CreateTransportAndBind { port, profile },
                         );
                     }
-                    MenuPromptPurpose::DeviceName {
-                        slot_id,
-                        mut profile,
-                    } => {
+                    MenuPromptPurpose::DeviceName { port, mut profile } => {
                         profile.name = value;
-                        self.begin_admin_prompt(
+                        self.submit_menu_mutation(
                             menu,
-                            MenuAdminMutation::CreateDeviceAndBind { slot_id, profile },
-                        );
-                    }
-                    MenuPromptPurpose::ModelName { slot_id, parent_id } => {
-                        let Some((model_id, expected_revision, expected_current)) =
-                            menu.catalog.as_ref().map(|catalog| {
-                                (
-                                    normalize_model_id(&value, &catalog.models),
-                                    catalog.model_revision,
-                                    slot_model_binding(catalog, &slot_id)
-                                        .map(|binding| binding.model_id.clone()),
-                                )
-                            })
-                        else {
-                            menu.message = tr("menu.catalog.unavailable").into();
-                            return;
-                        };
-                        self.submit_menu_command(
-                            menu,
-                            MenuIoCommand::CreateAndBindModel {
-                                slot_id,
-                                model_id,
-                                name: value,
-                                parent_id,
-                                expected_revision,
-                                expected_current,
-                            },
-                        );
-                    }
-                    MenuPromptPurpose::RenameBoundModel {
-                        slot_id,
-                        model_id,
-                        expected_revision,
-                        expected_current,
-                    } => {
-                        let Some((model_name, affected_slots)) =
-                            menu.catalog.as_ref().and_then(|catalog| {
-                                let model =
-                                    catalog.models.iter().find(|model| model.id == model_id)?;
-                                Some((
-                                    model.name.clone(),
-                                    shared_model_affected_slots(catalog, &model_id),
-                                ))
-                            })
-                        else {
-                            menu.message = tr("menu.catalog.unavailable").into();
-                            return;
-                        };
-                        let command = MenuIoCommand::RenameBoundModel {
-                            slot_id,
-                            model_id: model_id.clone(),
-                            name: value,
-                            expected_revision,
-                            expected_current,
-                        };
-                        self.begin_shared_model_confirmation(
-                            menu,
-                            &model_id,
-                            &model_name,
-                            affected_slots,
-                            command,
+                            MenuMutation::CreateModelProfileAndBind { port, profile },
                         );
                     }
                     MenuPromptPurpose::CurrentProfile(_)
@@ -5479,9 +5194,8 @@ impl App {
         let Some(prompt) = menu.prompt.as_mut() else {
             return;
         };
-        let limit = if prompt.secret { 512 } else { 128 };
         for character in value.chars().filter(|character| !character.is_control()) {
-            if prompt.value.len() >= limit {
+            if prompt.value.len() >= 128 {
                 break;
             }
             prompt.value.insert(prompt.cursor, character);
@@ -5490,38 +5204,19 @@ impl App {
         self.dirty = true;
     }
 
-    fn begin_admin_prompt(&mut self, menu: &mut MenuState, mutation: MenuAdminMutation) {
-        if menu
-            .catalog
-            .as_ref()
-            .is_some_and(|catalog| !catalog.auth_required)
-        {
-            self.submit_menu_command(
-                menu,
-                MenuIoCommand::Admin {
-                    token: None,
-                    mutation,
-                },
-            );
-            if menu.busy {
-                menu.message = tr("menu.admin.not.required").into();
-            }
-            return;
-        }
-        menu.prompt = Some(MenuPrompt {
-            title: tr("menu.prompt.admin").into(),
-            value: Vec::new(),
-            cursor: 0,
-            secret: true,
-            purpose: MenuPromptPurpose::Admin(mutation),
-        });
-        menu.message = tr("menu.admin.memory").into();
+    fn submit_menu_mutation(&mut self, menu: &mut MenuState, mutation: MenuMutation) {
+        self.submit_menu_command(
+            menu,
+            MenuIoCommand::Mutation {
+                mutation: Box::new(mutation),
+            },
+        );
     }
 
     fn begin_transport_name_prompt(
         &self,
         menu: &mut MenuState,
-        slot_id: String,
+        port: String,
         profile: TransportProfile,
         suggested_name: String,
     ) {
@@ -5530,43 +5225,17 @@ impl App {
             title: tr("menu.prompt.transport.name").into(),
             cursor: value.len(),
             value,
-            secret: false,
-            purpose: MenuPromptPurpose::TransportName { slot_id, profile },
+            purpose: MenuPromptPurpose::TransportName { port, profile },
         });
     }
 
-    fn begin_device_name_prompt(
-        &self,
-        menu: &mut MenuState,
-        slot_id: String,
-        profile: DeviceProfile,
-    ) {
+    fn begin_device_name_prompt(&self, menu: &mut MenuState, port: String, profile: ModelProfile) {
         let value = "device-profile".chars().collect::<Vec<_>>();
         menu.prompt = Some(MenuPrompt {
             title: tr("menu.prompt.device.name").into(),
             cursor: value.len(),
             value,
-            secret: false,
-            purpose: MenuPromptPurpose::DeviceName { slot_id, profile },
-        });
-    }
-
-    fn begin_model_name_prompt(
-        &self,
-        menu: &mut MenuState,
-        slot_id: String,
-        parent_id: Option<String>,
-    ) {
-        menu.prompt = Some(MenuPrompt {
-            title: if parent_id.is_some() {
-                tr("menu.prompt.model.child").into()
-            } else {
-                tr("menu.prompt.model.root").into()
-            },
-            value: Vec::new(),
-            cursor: 0,
-            secret: false,
-            purpose: MenuPromptPurpose::ModelName { slot_id, parent_id },
+            purpose: MenuPromptPurpose::DeviceName { port, profile },
         });
     }
 
@@ -5579,7 +5248,6 @@ impl App {
             ),
             cursor: value.len(),
             value: value.chars().collect(),
-            secret: false,
             purpose: MenuPromptPurpose::OrphanRunTimeout,
         });
     }
@@ -5642,7 +5310,6 @@ impl App {
             title: title.into(),
             cursor: value.len(),
             value,
-            secret: false,
             purpose: MenuPromptPurpose::CurrentProfile(field),
         });
     }
@@ -5739,7 +5406,7 @@ impl App {
                 }
                 menu.message = tr("menu.current.modified").into();
             }
-            CurrentProfileRow::DeviceProfile => menu.push(MenuPage::DeviceProfiles),
+            CurrentProfileRow::ModelProfile => menu.push(MenuPage::ModelProfiles),
             CurrentProfileRow::WriteEol | CurrentProfileRow::Echo => {
                 if !Self::profile_editable(menu, false) {
                     return;
@@ -5793,49 +5460,15 @@ impl App {
                 };
                 Self::begin_current_profile_prompt(menu, field, title, value);
             }
-            CurrentProfileRow::ModelBinding => menu.push(MenuPage::Models),
-            CurrentProfileRow::ModelName => self.begin_bound_model_rename(menu),
             CurrentProfileRow::Apply => self.submit_current_profile_updates(menu),
         }
-    }
-
-    fn begin_bound_model_rename(&self, menu: &mut MenuState) {
-        let slot_id = self.selected_slot_id();
-        let Some((binding, model)) = menu.catalog.as_ref().and_then(|catalog| {
-            let binding = slot_model_binding(catalog, &slot_id)?;
-            let model = catalog
-                .models
-                .iter()
-                .find(|model| model.id == binding.model_id)?;
-            Some((binding.clone(), model.clone()))
-        }) else {
-            menu.message = tr("menu.current.model.unbound").into();
-            return;
-        };
-        let value = model.name.chars().collect::<Vec<_>>();
-        menu.prompt = Some(MenuPrompt {
-            title: tr("menu.current.prompt.model.name").into(),
-            cursor: value.len(),
-            value,
-            secret: false,
-            purpose: MenuPromptPurpose::RenameBoundModel {
-                slot_id,
-                model_id: model.id,
-                expected_revision: menu
-                    .catalog
-                    .as_ref()
-                    .expect("catalog used above")
-                    .model_revision,
-                expected_current: Some(binding.model_id),
-            },
-        });
     }
 
     fn begin_shared_profile_confirmation(
         &self,
         menu: &mut MenuState,
         impacts: SharedProfileImpacts,
-        mutation: MenuAdminMutation,
+        mutation: MenuMutation,
     ) {
         let mut lines = vec![tr("menu.profile.shared.warning").into()];
         if let Some(impact) = impacts.transport {
@@ -5843,13 +5476,13 @@ impl App {
                 "menu.profile.shared.transport",
                 &[
                     &safe_inline(&impact.profile_name),
-                    &impact.slots.len().to_string(),
+                    &impact.ports.len().to_string(),
                 ],
             ));
-            lines.extend(impact.slots.into_iter().map(|(slot_id, display_name)| {
+            lines.extend(impact.ports.into_iter().map(|(port, display_name)| {
                 trf(
-                    "menu.profile.shared.slot",
-                    &[&safe_inline(&slot_id), &safe_inline(&display_name)],
+                    "menu.profile.shared.port",
+                    &[&safe_inline(&port), &safe_inline(&display_name)],
                 )
             }));
         }
@@ -5858,13 +5491,13 @@ impl App {
                 "menu.profile.shared.device",
                 &[
                     &safe_inline(&impact.profile_name),
-                    &impact.slots.len().to_string(),
+                    &impact.ports.len().to_string(),
                 ],
             ));
-            lines.extend(impact.slots.into_iter().map(|(slot_id, display_name)| {
+            lines.extend(impact.ports.into_iter().map(|(port, display_name)| {
                 trf(
-                    "menu.profile.shared.slot",
-                    &[&safe_inline(&slot_id), &safe_inline(&display_name)],
+                    "menu.profile.shared.port",
+                    &[&safe_inline(&port), &safe_inline(&display_name)],
                 )
             }));
         }
@@ -5874,43 +5507,9 @@ impl App {
             lines,
             scroll: 0,
             cancelled_message: tr("menu.profile.shared.cancelled").into(),
-            action: MenuConfirmationAction::Admin(mutation),
+            action: MenuConfirmationAction::Mutation(mutation),
         });
         menu.message = tr("menu.profile.shared.pending").into();
-    }
-
-    fn begin_shared_model_confirmation(
-        &self,
-        menu: &mut MenuState,
-        model_id: &str,
-        model_name: &str,
-        affected_slots: Vec<(String, String)>,
-        command: MenuIoCommand,
-    ) {
-        let mut lines = vec![tr("menu.model.shared.warning").into()];
-        lines.push(trf(
-            "menu.model.shared.impact",
-            &[
-                &safe_inline(model_name),
-                &safe_inline(model_id),
-                &affected_slots.len().to_string(),
-            ],
-        ));
-        lines.extend(affected_slots.into_iter().map(|(slot_id, display_name)| {
-            trf(
-                "menu.profile.shared.slot",
-                &[&safe_inline(&slot_id), &safe_inline(&display_name)],
-            )
-        }));
-        lines.push(tr("menu.model.shared.revision").into());
-        menu.confirmation = Some(MenuConfirmation {
-            title: tr("menu.model.shared.title").into(),
-            lines,
-            scroll: 0,
-            cancelled_message: tr("menu.model.shared.cancelled").into(),
-            action: MenuConfirmationAction::Command(command),
-        });
-        menu.message = tr("menu.model.shared.pending").into();
     }
 
     fn submit_current_profile_updates(&mut self, menu: &mut MenuState) {
@@ -5931,19 +5530,19 @@ impl App {
         };
         let impacts = shared_profile_impacts(catalog, transport.as_ref(), device.as_ref());
         let has_shared_profile_update = transport.is_some() || device.is_some();
-        let mutation = MenuAdminMutation::UpdateCurrentProfiles {
-            slot_id: self.selected_slot_id(),
-            port,
+        let mutation = MenuMutation::UpdateCurrentProfiles {
+            current_port: self.selected_port(),
+            new_port: port,
             transport,
             device,
             expected_config_revision: catalog.config_revision,
             expected_transport_revision: catalog.transport_revision,
-            expected_device_revision: catalog.device_revision,
+            expected_model_profile_revision: catalog.model_profile_revision,
         };
         if has_shared_profile_update {
             self.begin_shared_profile_confirmation(menu, impacts, mutation);
         } else {
-            self.begin_admin_prompt(menu, mutation);
+            self.submit_menu_mutation(menu, mutation);
         }
     }
 
@@ -5963,13 +5562,12 @@ impl App {
                     menu.push(MenuPage::Profiles);
                     self.refresh_current_profile_editor(menu);
                 }
-                1 => menu.push(MenuPage::Models),
-                2 => menu.push(MenuPage::SerialSettings),
-                3 => {
+                1 => menu.push(MenuPage::SerialSettings),
+                2 => {
                     menu.push(MenuPage::DisplaySettings);
                 }
-                4 => menu.push(MenuPage::RunSettings),
-                5 => menu.push(MenuPage::Help),
+                3 => menu.push(MenuPage::RunSettings),
+                4 => menu.push(MenuPage::Help),
                 _ => {}
             },
             MenuPage::Profiles => self.activate_current_profile_row(menu),
@@ -5986,82 +5584,67 @@ impl App {
                     menu.message = tr("menu.catalog.unavailable").into();
                     return;
                 };
-                let slot_id = self.selected_slot_id();
+                let port = self.selected_port();
                 if let Some(profile_name) = profile_name {
-                    self.begin_admin_prompt(
+                    self.submit_menu_mutation(
                         menu,
-                        MenuAdminMutation::BindTransport {
-                            slot_id,
-                            profile_name,
-                        },
+                        MenuMutation::BindTransport { port, profile_name },
                     );
                 } else if menu.selected == profiles_len {
                     self.begin_transport_name_prompt(
                         menu,
-                        slot_id,
+                        port,
                         default_transport_profile(String::new()),
                         "uart-115200-8n1".into(),
                     );
                 }
             }
-            MenuPage::DeviceProfiles => {
+            MenuPage::ModelProfiles => {
                 let Some((profiles_len, profile_name)) = menu.catalog.as_ref().map(|catalog| {
                     (
-                        catalog.device_profiles.len(),
+                        catalog.model_profiles.len(),
                         menu.selected
                             .checked_sub(1)
-                            .and_then(|index| catalog.device_profiles.get(index))
+                            .and_then(|index| catalog.model_profiles.get(index))
                             .map(|profile| profile.name.clone()),
                     )
                 }) else {
                     menu.message = tr("menu.catalog.unavailable").into();
                     return;
                 };
-                let slot_id = self.selected_slot_id();
+                let port = self.selected_port();
                 if menu.selected == 0 {
-                    self.begin_admin_prompt(
+                    self.submit_menu_mutation(
                         menu,
-                        MenuAdminMutation::BindDevice {
-                            slot_id,
+                        MenuMutation::BindModelProfile {
+                            port,
                             profile_name: None,
                         },
                     );
                 } else if let Some(profile_name) = profile_name {
-                    self.begin_admin_prompt(
+                    self.submit_menu_mutation(
                         menu,
-                        MenuAdminMutation::BindDevice {
-                            slot_id,
+                        MenuMutation::BindModelProfile {
+                            port,
                             profile_name: Some(profile_name),
                         },
                     );
                 } else if menu.selected == profiles_len + 1 {
                     self.begin_device_name_prompt(
                         menu,
-                        slot_id,
-                        current_device_template(self.current()),
+                        port,
+                        current_model_profile_template(self.current()),
                     );
                 } else if let Some(preset) = menu
                     .selected
                     .checked_sub(profiles_len + 2)
-                    .and_then(|index| DEVICE_PRESETS.get(index))
+                    .and_then(|index| MODEL_PRESETS.get(index))
                     .copied()
                 {
-                    let mut profile = current_device_template(self.current());
+                    let mut profile = current_model_profile_template(self.current());
                     preset.apply(&mut profile);
-                    self.begin_device_name_prompt(menu, slot_id, profile);
+                    self.begin_device_name_prompt(menu, port, profile);
                 }
-            }
-            MenuPage::Models => self.activate_model_item(menu),
-            MenuPage::ModelParents => {
-                let Some(parent_id) = menu.catalog.as_ref().and_then(|catalog| {
-                    let rows = all_model_rows(&catalog.models);
-                    rows.get(menu.selected)
-                        .map(|row| catalog.models[row.index].id.clone())
-                }) else {
-                    menu.message = tr("menu.catalog.unavailable").into();
-                    return;
-                };
-                self.begin_model_name_prompt(menu, self.selected_slot_id(), Some(parent_id));
             }
             MenuPage::SerialSettings => {
                 let Some(mut profile) = menu
@@ -6076,12 +5659,20 @@ impl App {
                     return;
                 };
                 preset.apply(&mut profile);
-                let suggested_name =
-                    format!("{}-custom", self.current().snapshot.config.profile.trim());
+                let suggested_name = format!(
+                    "{}-custom",
+                    self.current()
+                        .snapshot
+                        .config
+                        .transport_profile
+                        .as_deref()
+                        .unwrap_or("uart")
+                        .trim()
+                );
                 profile.name.clear();
                 self.begin_transport_name_prompt(
                     menu,
-                    self.selected_slot_id(),
+                    self.selected_port(),
                     profile,
                     suggested_name,
                 );
@@ -6098,7 +5689,6 @@ impl App {
                     ),
                     cursor: value.len(),
                     value: value.chars().collect(),
-                    secret: false,
                     purpose: MenuPromptPurpose::AgentHistoryRows,
                 });
             }
@@ -6107,118 +5697,14 @@ impl App {
         }
     }
 
-    fn activate_model_item(&mut self, menu: &mut MenuState) {
-        if menu.selected == 0 {
-            self.begin_model_name_prompt(menu, self.selected_slot_id(), None);
-            return;
-        }
-        if menu.selected == 1 {
-            if menu
-                .catalog
-                .as_ref()
-                .is_none_or(|catalog| catalog.models.is_empty())
-            {
-                menu.message = tr("menu.model.no.parent").into();
-            } else {
-                menu.push(MenuPage::ModelParents);
-            }
-            return;
-        }
-        let Some(catalog) = menu.catalog.as_ref() else {
-            menu.message = tr("menu.catalog.unavailable").into();
-            return;
-        };
-        let rows = visible_model_rows(&catalog.models, &menu.expanded_models);
-        let Some(row) = rows.get(menu.selected - 2).copied() else {
-            return;
-        };
-        let model_id = catalog.models[row.index].id.clone();
-        let has_children = model_has_children(&catalog.models, &model_id);
-        if has_children {
-            if !menu.expanded_models.remove(&model_id) {
-                menu.expanded_models.insert(model_id);
-            }
-        } else {
-            self.submit_model_binding(menu, model_id);
-        }
-    }
-
-    fn expand_selected_model(&mut self, menu: &mut MenuState, expand: bool) {
-        if menu.selected < 2 {
-            return;
-        }
-        let Some(catalog) = menu.catalog.as_ref() else {
-            return;
-        };
-        let rows = visible_model_rows(&catalog.models, &menu.expanded_models);
-        let Some(row) = rows.get(menu.selected - 2) else {
-            return;
-        };
-        let model_id = catalog.models[row.index].id.clone();
-        let has_children = model_has_children(&catalog.models, &model_id);
-        if expand && has_children {
-            menu.expanded_models.insert(model_id);
-        } else if !expand {
-            menu.expanded_models.remove(&model_id);
-        }
-    }
-
-    fn bind_selected_model(&mut self, menu: &mut MenuState) {
-        if menu.selected < 2 {
-            return;
-        }
-        let model_id = menu.catalog.as_ref().and_then(|catalog| {
-            let rows = visible_model_rows(&catalog.models, &menu.expanded_models);
-            rows.get(menu.selected - 2)
-                .map(|row| catalog.models[row.index].id.clone())
-        });
-        if let Some(model_id) = model_id {
-            self.submit_model_binding(menu, model_id);
-        }
-    }
-
-    fn submit_model_binding(&mut self, menu: &mut MenuState, model_id: String) {
-        let Some((expected_revision, expected_current)) = menu.catalog.as_ref().map(|catalog| {
-            let slot_id = self.selected_slot_id();
-            (
-                catalog.model_revision,
-                slot_model_binding(catalog, &slot_id).map(|binding| binding.model_id.clone()),
-            )
-        }) else {
-            menu.message = tr("menu.catalog.unavailable").into();
-            return;
-        };
-        let slot_id = self.selected_slot_id();
-        self.submit_menu_command(
-            menu,
-            MenuIoCommand::BindModel {
-                slot_id,
-                model_id,
-                expected_revision,
-                expected_current,
-            },
-        );
-    }
-
     fn handle_menu_io_event(&mut self, event: MenuIoEvent) {
         match event {
-            MenuIoEvent::ModelLabelsLoaded(catalog) => {
-                self.model_labels_refresh_pending = false;
-                self.update_device_model_names(&catalog.models, &catalog.bindings);
-            }
-            // The model title is cosmetic. Older daemons or a transient API
-            // error keep the explicit "model not configured" fallback without
-            // replacing the operator's current status message.
-            MenuIoEvent::ModelLabelsUnavailable => {
-                self.model_labels_refresh_pending = false;
-            }
             MenuIoEvent::Completed { catalog, success } => {
-                self.update_device_model_names(&catalog.models, &catalog.model_bindings);
-                for fresh in &catalog.slots {
+                for fresh in &catalog.ports {
                     if let Some(view) = self
-                        .slots
+                        .ports
                         .iter_mut()
-                        .find(|view| view.snapshot.config.id == fresh.config.id)
+                        .find(|view| view.snapshot.config.port == fresh.config.port)
                     {
                         let configuration_changed = view.snapshot.config != fresh.config;
                         view.snapshot = fresh.clone();
@@ -6256,7 +5742,7 @@ impl App {
     /// Ctrl-] g: switch between English and Chinese at runtime and persist
     /// the choice to the client config on a best-effort basis.
     fn toggle_language(&mut self) {
-        for slot in &mut self.slots {
+        for slot in &mut self.ports {
             slot.follow();
         }
         let next = i18n::lang().toggled();
@@ -6545,7 +6031,7 @@ async fn execute_output_search(
         OutputSearchScope::CurrentRun => {
             let run = request
                 .current_run
-                .context("the selected Slot no longer has an active Agent Run")?;
+                .context("the selected Port no longer has an active Agent Run")?;
             vec![OutputSearchArchive {
                 epoch: request.current_epoch,
                 first_seq: run.start_seq,
@@ -6553,7 +6039,7 @@ async fn execute_output_search(
             }]
         }
         OutputSearchScope::Retained => {
-            let catalog = api.archives(Some(&request.slot_id)).await?;
+            let catalog = api.archives(Some(&request.port)).await?;
             partial |= catalog.truncated;
             let mut retained = catalog.archives;
             if retained.len() > OUTPUT_SEARCH_ARCHIVE_LIMIT {
@@ -6615,7 +6101,7 @@ async fn execute_output_search(
                 query_count += 1;
                 let response = api
                     .events(
-                        &request.slot_id,
+                        &request.port,
                         &EventQuery {
                             epoch: Some(archive.epoch),
                             after_seq: Some(*after_seq),
@@ -6685,16 +6171,6 @@ fn spawn_menu_io(api: ApiClient) -> MenuIo {
     let (event_tx, event_rx) = mpsc::channel(8);
     tokio::spawn(async move {
         while let Some(command) = command_rx.recv().await {
-            if matches!(&command, MenuIoCommand::LoadModelLabels) {
-                let event = match api.device_models().await {
-                    Ok(catalog) => MenuIoEvent::ModelLabelsLoaded(catalog),
-                    Err(_) => MenuIoEvent::ModelLabelsUnavailable,
-                };
-                if event_tx.send(event).await.is_err() {
-                    break;
-                }
-                continue;
-            }
             let event = match execute_menu_io(&api, command).await {
                 Ok((catalog, success)) => MenuIoEvent::Completed { catalog, success },
                 Err(error) => MenuIoEvent::Failed(error.to_string()),
@@ -6715,135 +6191,25 @@ async fn execute_menu_io(
     command: MenuIoCommand,
 ) -> Result<(MenuCatalog, MenuSuccess)> {
     let success = match command {
-        MenuIoCommand::LoadModelLabels => unreachable!("handled by the menu I/O worker"),
         MenuIoCommand::Reload => MenuSuccess::Loaded,
-        MenuIoCommand::Admin { token, mutation } => {
-            // `None` is the explicit trusted-loopback path advertised by
-            // health.auth_required=false. A legacy/authenticated daemon still
-            // reaches this branch with the one-time masked credential.
-            if token.as_deref().is_some_and(str::is_empty) {
-                bail!(tr("menu.admin.required"));
-            }
-            let admin = ApiClient::new(api.endpoint().to_owned(), token)?;
-            execute_admin_menu_mutation(&admin, mutation).await?
-        }
-        MenuIoCommand::BindModel {
-            slot_id,
-            model_id,
-            expected_revision,
-            expected_current,
-        } => {
-            api.set_slot_device_model(
-                &slot_id,
-                &SetSlotDeviceModelRequest {
-                    model_id: Some(model_id.clone()),
-                    create_if_missing: false,
-                    update_existing: false,
-                    name: None,
-                    parent_id: None,
-                    clear_parent: false,
-                    aliases: Vec::new(),
-                    clear_aliases: false,
-                    confirmation_method: Some(ModelConfirmationMethod::Human),
-                    note: Some(tr("menu.model.confirm.note").into()),
-                    source: "human:serialctl-tui".into(),
-                    expected_revision: Some(expected_revision),
-                    expected_current: Some(expected_current),
-                },
-            )
-            .await?;
-            MenuSuccess::ModelBound(model_id)
-        }
-        MenuIoCommand::CreateAndBindModel {
-            slot_id,
-            model_id,
-            name,
-            parent_id,
-            expected_revision,
-            expected_current,
-        } => {
-            api.set_slot_device_model(
-                &slot_id,
-                &SetSlotDeviceModelRequest {
-                    model_id: Some(model_id.clone()),
-                    create_if_missing: true,
-                    update_existing: false,
-                    name: Some(name),
-                    parent_id,
-                    clear_parent: false,
-                    aliases: Vec::new(),
-                    clear_aliases: false,
-                    confirmation_method: Some(ModelConfirmationMethod::Human),
-                    note: Some(tr("menu.model.confirm.note").into()),
-                    source: "human:serialctl-tui".into(),
-                    expected_revision: Some(expected_revision),
-                    expected_current: Some(expected_current),
-                },
-            )
-            .await?;
-            MenuSuccess::ModelCreated(model_id)
-        }
-        MenuIoCommand::RenameBoundModel {
-            slot_id,
-            model_id,
-            name,
-            expected_revision,
-            expected_current,
-        } => {
-            let response = api
-                .set_slot_device_model(
-                    &slot_id,
-                    &SetSlotDeviceModelRequest {
-                        model_id: Some(model_id),
-                        create_if_missing: false,
-                        update_existing: true,
-                        name: Some(name.clone()),
-                        parent_id: None,
-                        clear_parent: false,
-                        aliases: Vec::new(),
-                        clear_aliases: false,
-                        confirmation_method: Some(ModelConfirmationMethod::Human),
-                        note: Some(tr("menu.model.confirm.note").into()),
-                        source: "human:serialctl-tui".into(),
-                        expected_revision: Some(expected_revision),
-                        expected_current: Some(expected_current),
-                    },
-                )
-                .await?;
-            let mut affected_slots = response.affected_slots;
-            affected_slots.sort();
-            affected_slots.dedup();
-            MenuSuccess::ModelRenamed {
-                name,
-                affected_slots,
-            }
-        }
+        MenuIoCommand::Mutation { mutation } => execute_menu_mutation(api, *mutation).await?,
     };
     Ok((load_menu_catalog(api).await?, success))
 }
 
-async fn execute_admin_menu_mutation(
-    admin: &ApiClient,
-    mutation: MenuAdminMutation,
-) -> Result<MenuSuccess> {
+async fn execute_menu_mutation(api: &ApiClient, mutation: MenuMutation) -> Result<MenuSuccess> {
     match mutation {
-        MenuAdminMutation::BindTransport {
-            slot_id,
-            profile_name,
-        } => {
-            bind_transport_profile(admin, &slot_id, &profile_name).await?;
+        MenuMutation::BindTransport { port, profile_name } => {
+            bind_transport_profile(api, &port, &profile_name).await?;
             Ok(MenuSuccess::TransportBound(profile_name))
         }
-        MenuAdminMutation::BindDevice {
-            slot_id,
-            profile_name,
-        } => {
-            bind_device_profile(admin, &slot_id, profile_name.as_deref()).await?;
-            Ok(MenuSuccess::DeviceBound(profile_name))
+        MenuMutation::BindModelProfile { port, profile_name } => {
+            bind_model_profile(api, &port, profile_name.as_deref()).await?;
+            Ok(MenuSuccess::ModelProfileBound(profile_name))
         }
-        MenuAdminMutation::CreateTransportAndBind { slot_id, profile } => {
+        MenuMutation::CreateTransportAndBind { port, profile } => {
             let profile_name = profile.name.clone();
-            let mut catalog = admin.transport_profiles().await?;
+            let mut catalog = api.transport_profiles().await?;
             if catalog
                 .profiles
                 .iter()
@@ -6852,15 +6218,14 @@ async fn execute_admin_menu_mutation(
                 bail!(trf("menu.profile.exists", &[&profile.name]));
             }
             catalog.profiles.push(profile);
-            admin
-                .configure_transport_profiles(catalog.profiles, catalog.config_revision)
+            api.configure_transport_profiles(catalog.profiles, catalog.config_revision)
                 .await?;
-            bind_transport_profile(admin, &slot_id, &profile_name).await?;
+            bind_transport_profile(api, &port, &profile_name).await?;
             Ok(MenuSuccess::TransportCreated(profile_name))
         }
-        MenuAdminMutation::CreateDeviceAndBind { slot_id, profile } => {
+        MenuMutation::CreateModelProfileAndBind { port, profile } => {
             let profile_name = profile.name.clone();
-            let mut catalog = admin.device_profiles().await?;
+            let mut catalog = api.model_profiles().await?;
             if catalog
                 .profiles
                 .iter()
@@ -6869,31 +6234,30 @@ async fn execute_admin_menu_mutation(
                 bail!(trf("menu.profile.exists", &[&profile.name]));
             }
             catalog.profiles.push(profile);
-            admin
-                .configure_device_profiles(catalog.profiles, catalog.config_revision)
+            api.configure_model_profiles(catalog.profiles, catalog.config_revision)
                 .await?;
-            bind_device_profile(admin, &slot_id, Some(&profile_name)).await?;
-            Ok(MenuSuccess::DeviceCreated(profile_name))
+            bind_model_profile(api, &port, Some(&profile_name)).await?;
+            Ok(MenuSuccess::ModelProfileCreated(profile_name))
         }
-        MenuAdminMutation::UpdateCurrentProfiles {
-            slot_id,
-            port,
+        MenuMutation::UpdateCurrentProfiles {
+            current_port,
+            new_port,
             transport,
             device,
             expected_config_revision,
             expected_transport_revision,
-            expected_device_revision,
+            expected_model_profile_revision,
         } => {
             update_current_profiles(
-                admin,
-                &slot_id,
-                port,
+                api,
+                &current_port,
+                new_port,
                 transport,
                 device,
                 CurrentProfileRevisions {
                     config: expected_config_revision,
                     transport: expected_transport_revision,
-                    device: expected_device_revision,
+                    device: expected_model_profile_revision,
                 },
             )
             .await?;
@@ -6903,11 +6267,11 @@ async fn execute_admin_menu_mutation(
 }
 
 async fn update_current_profiles(
-    admin: &ApiClient,
-    slot_id: &str,
-    port: Option<String>,
+    api: &ApiClient,
+    current_port: &str,
+    new_port: Option<String>,
     transport: Option<TransportProfile>,
-    device: Option<DeviceProfile>,
+    device: Option<ModelProfile>,
     revisions: CurrentProfileRevisions,
 ) -> Result<()> {
     if transport.is_some() {
@@ -6924,27 +6288,27 @@ async fn update_current_profiles(
             tr("menu.profile.revision.conflict")
         );
     }
-    let status = admin.configuration_status().await?;
+    let status = api.configuration_status().await?;
     ensure!(
         status.config_revision == revisions.config,
         "{}",
         tr("menu.profile.revision.conflict")
     );
     let slot = status
-        .slots
+        .ports
         .iter()
-        .find(|slot| slot.config.id == slot_id)
-        .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
+        .find(|slot| slot.config.port == current_port)
+        .with_context(|| trf("menu.port.missing", &[current_port]))?;
     if let Some(profile) = transport.as_ref() {
         ensure!(
-            slot.config.profile == profile.name,
+            slot.config.transport_profile.as_deref() == Some(profile.name.as_str()),
             "{}",
             tr("menu.profile.binding.changed")
         );
     }
     if let Some(profile) = device.as_ref() {
         ensure!(
-            slot.config.device_profile.as_deref() == Some(profile.name.as_str()),
+            slot.config.model_profile.as_deref() == Some(profile.name.as_str()),
             "{}",
             tr("menu.profile.binding.changed")
         );
@@ -6952,7 +6316,7 @@ async fn update_current_profiles(
 
     let mut known_revision = revisions.config;
     if let Some(profile) = transport.as_ref() {
-        let mut catalog = admin.transport_profiles().await?;
+        let mut catalog = api.transport_profiles().await?;
         ensure!(
             catalog.config_revision == revisions.transport
                 && catalog.config_revision == known_revision,
@@ -6965,13 +6329,13 @@ async fn update_current_profiles(
             .find(|existing| existing.name == profile.name)
             .with_context(|| trf("menu.transport.missing", &[&profile.name]))?;
         *existing = profile.clone();
-        let updated = admin
+        let updated = api
             .configure_transport_profiles(catalog.profiles, catalog.config_revision)
             .await?;
         known_revision = updated.config_revision;
     }
     if let Some(profile) = device.as_ref() {
-        let mut catalog = admin.device_profiles().await?;
+        let mut catalog = api.model_profiles().await?;
         ensure!(
             catalog.config_revision == known_revision,
             "{}",
@@ -6983,41 +6347,34 @@ async fn update_current_profiles(
             .find(|existing| existing.name == profile.name)
             .with_context(|| trf("menu.device.missing", &[&profile.name]))?;
         *existing = profile.clone();
-        let updated = admin
-            .configure_device_profiles(catalog.profiles, catalog.config_revision)
+        let updated = api
+            .configure_model_profiles(catalog.profiles, catalog.config_revision)
             .await?;
         known_revision = updated.config_revision;
     }
-    if let Some(port) = port {
-        let status = admin.configuration_status().await?;
+    if let Some(new_port) = new_port {
+        let status = api.configuration_status().await?;
         ensure!(
             status.config_revision == known_revision,
             "{}",
             tr("menu.profile.revision.conflict")
         );
-        let mut slots = status
-            .slots
+        let mut ports = status
+            .ports
             .into_iter()
             .map(|slot| slot.config)
             .collect::<Vec<_>>();
-        let slot = slots
+        let slot = ports
             .iter_mut()
-            .find(|slot| slot.id == slot_id)
-            .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
-        slot.port = port;
-        admin.configure_slots(slots, status.config_revision).await?;
+            .find(|slot| slot.port == current_port)
+            .with_context(|| trf("menu.port.missing", &[current_port]))?;
+        slot.port = new_port;
+        api.configure_ports(ports, status.config_revision).await?;
     }
-    // Both catalog endpoints are transactional seriald configuration paths.
-    // A transport-profile PUT stages every affected Slot and observes the
-    // daemon's ordinary busy/reopen safety boundary; a device-profile PUT
-    // stages prompt/EOL/pacing changes. Profile-only edits deliberately avoid
-    // a redundant Slot reconfiguration. A changed port is submitted once via
-    // the Slot endpoint at the latest revision. `load_menu_catalog` refreshes
-    // authoritative Snapshots before the UI reports success.
     Ok(())
 }
 
-async fn bind_transport_profile(api: &ApiClient, slot_id: &str, profile_name: &str) -> Result<()> {
+async fn bind_transport_profile(api: &ApiClient, port: &str, profile_name: &str) -> Result<()> {
     let status = api.configuration_status().await?;
     let catalog = api.transport_profiles().await?;
     let profile = catalog
@@ -7025,29 +6382,24 @@ async fn bind_transport_profile(api: &ApiClient, slot_id: &str, profile_name: &s
         .iter()
         .find(|profile| profile.name == profile_name)
         .with_context(|| trf("menu.transport.missing", &[profile_name]))?;
-    let mut slots = status
-        .slots
+    let mut ports = status
+        .ports
         .into_iter()
         .map(|slot| slot.config)
         .collect::<Vec<_>>();
-    let slot = slots
+    let slot = ports
         .iter_mut()
-        .find(|slot| slot.id == slot_id)
-        .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
-    slot.settings = apply_transport_profile(&slot.settings, Some(profile));
-    slot.profile = profile.name.clone();
-    api.configure_slots(slots, status.config_revision).await?;
+        .find(|slot| slot.port == port)
+        .with_context(|| trf("menu.port.missing", &[port]))?;
+    slot.transport_profile = Some(profile.name.clone());
+    api.configure_ports(ports, status.config_revision).await?;
     Ok(())
 }
 
-async fn bind_device_profile(
-    api: &ApiClient,
-    slot_id: &str,
-    profile_name: Option<&str>,
-) -> Result<()> {
+async fn bind_model_profile(api: &ApiClient, port: &str, profile_name: Option<&str>) -> Result<()> {
     let status = api.configuration_status().await?;
     if let Some(profile_name) = profile_name {
-        let catalog = api.device_profiles().await?;
+        let catalog = api.model_profiles().await?;
         if !catalog
             .profiles
             .iter()
@@ -7056,67 +6408,60 @@ async fn bind_device_profile(
             bail!(trf("menu.device.missing", &[profile_name]));
         }
     }
-    let mut slots = status
-        .slots
+    let mut ports = status
+        .ports
         .into_iter()
         .map(|slot| slot.config)
         .collect::<Vec<_>>();
-    let slot = slots
+    let slot = ports
         .iter_mut()
-        .find(|slot| slot.id == slot_id)
-        .with_context(|| trf("menu.slot.missing", &[slot_id]))?;
-    slot.device_profile = profile_name.map(ToOwned::to_owned);
-    api.configure_slots(slots, status.config_revision).await?;
+        .find(|slot| slot.port == port)
+        .with_context(|| trf("menu.port.missing", &[port]))?;
+    slot.model_profile = profile_name.map(ToOwned::to_owned);
+    api.configure_ports(ports, status.config_revision).await?;
     Ok(())
 }
 
 async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
-    let (health, status, transport, device, models): (_, _, _, _, DeviceModelListResponse) = tokio::try_join!(
-        api.health(),
+    let (status, transport, model) = tokio::try_join!(
         api.configuration_status(),
         api.transport_profiles(),
-        api.device_profiles(),
-        api.device_models(),
+        api.model_profiles(),
     )?;
     Ok(MenuCatalog {
-        auth_required: health.auth_required,
-        slots: status.slots,
+        ports: status.ports,
         config_revision: status.config_revision,
         transport_profiles: transport.profiles,
         transport_revision: transport.config_revision,
-        device_profiles: device.profiles,
-        device_revision: device.config_revision,
-        models: models.models,
-        model_bindings: models.bindings,
-        model_revision: models.config_revision,
+        model_profiles: model.profiles,
+        model_profile_revision: model.config_revision,
     })
 }
 
 pub async fn run(
     api: ApiClient,
     loaded: LoadedConfig,
-    initial_slot: Option<String>,
+    initial_port: Option<String>,
     endpoint: String,
-    token: Option<String>,
 ) -> Result<()> {
     let status = api
         .status()
         .await
-        .context("cannot load Slot status before opening the console")?;
-    if status.slots.is_empty() {
-        bail!(tr("st.no.slot"));
+        .context("cannot load Port status before opening the console")?;
+    if status.ports.is_empty() {
+        bail!(tr("st.no.port"));
     }
-    let slot_ids = status
-        .slots
+    let ports = status
+        .ports
         .iter()
-        .map(|slot| slot.config.id.clone())
+        .map(|slot| slot.config.port.clone())
         .collect::<Vec<_>>();
     let history_targets = status
-        .slots
+        .ports
         .iter()
         .map(StartupHistoryTarget::from)
         .collect::<Vec<_>>();
-    let mut app = App::new(status.slots, initial_slot.as_deref());
+    let mut app = App::new(status.ports, initial_port.as_deref());
     app.human_idle_release = Duration::from_secs(
         loaded
             .config
@@ -7125,18 +6470,14 @@ pub async fn run(
             .max(1),
     );
     app.config = Some(loaded.clone());
-    let merge_echo = loaded.config.merge_echo.unwrap_or(true);
-    for view in &mut app.slots {
-        view.merge_echo = merge_echo;
-    }
     app.mouse_capture = loaded.config.mouse_capture.unwrap_or(true);
     app.agent_history_rows = configured_agent_history_rows(loaded.config.agent_history_rows);
     app.orphan_run_timeout_seconds =
         configured_orphan_run_timeout_seconds(loaded.config.orphan_run_timeout_seconds);
     let mut initial_cursors = HashMap::new();
     load_startup_histories(api.clone(), history_targets, |history| {
-        if let Some((slot_id, cursor)) = app.apply_startup_history(history) {
-            initial_cursors.insert(slot_id, cursor);
+        if let Some((port, cursor)) = app.apply_startup_history(history) {
+            initial_cursors.insert(port, cursor);
         }
     })
     .await;
@@ -7144,10 +6485,7 @@ pub async fn run(
     app.menu_commands = Some(menu_io.commands.clone());
     let mut output_search_io = spawn_output_search_io(api.clone());
     app.output_search_commands = Some(output_search_io.commands.clone());
-    // Resolve model IDs after the first frame instead of adding another
-    // blocking request to console startup.
-    app.request_model_labels_refresh();
-    let mut network = ws::spawn(endpoint, token, slot_ids, initial_cursors);
+    let mut network = ws::spawn(endpoint, ports, initial_cursors);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
     let _guard = TerminalGuard {
@@ -7165,12 +6503,12 @@ pub async fn run(
     let _ = network.commands.try_send(NetworkCommand::Shutdown);
 
     // Runtime preferences are saved through `app.config`. Persist the last
-    // selected Slot using that latest copy so the startup snapshot cannot
+    // selected Port using that latest copy so the startup snapshot cannot
     // overwrite a language or display change when the console exits.
     let mut latest_config = app.config.take().unwrap_or(loaded);
-    latest_config.config.last_slot = Some(app.selected_slot_id());
+    latest_config.config.last_port = Some(app.selected_port());
     if let Err(error) = latest_config.save() {
-        tracing::warn!(%error, "failed to persist the last selected Slot");
+        tracing::warn!(%error, "failed to persist the last selected Port");
     }
     result
 }
@@ -7192,8 +6530,6 @@ async fn run_loop(
     renew_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut activity_tick = tokio::time::interval(Duration::from_secs(1));
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut model_label_tick = tokio::time::interval(MODEL_LABEL_REFRESH_INTERVAL);
-    model_label_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     terminal.draw(|frame| draw(frame, app))?;
     while !app.should_quit {
@@ -7231,17 +6567,16 @@ async fn run_loop(
                 let selection_changed = app.expire_mouse_selection(now);
                 let status_notice_changed = app.expire_status_notice(now);
                 let mut trigger_changed = false;
-                for slot in &mut app.slots {
+                for slot in &mut app.ports {
                     trigger_changed |= slot.update_trigger_deadline(now);
                 }
-                if selection_changed || status_notice_changed || trigger_changed || app.slots.iter().any(|slot| {
+                if selection_changed || status_notice_changed || trigger_changed || app.ports.iter().any(|slot| {
                     slot.snapshot.target_activity == TargetActivity::Active
                         && slot.snapshot.session_state == SessionState::Online
                 }) {
                     app.dirty = true;
                 }
             },
-            _ = model_label_tick.tick() => app.request_model_labels_refresh(),
             _ = render_tick.tick() => {
                 if app.update_software_cursor_blink(Instant::now()) {
                     app.dirty = true;
@@ -7268,10 +6603,10 @@ fn handle_network_channel_event(
         }
         None => {
             app.transport_connected = false;
-            app.authenticated = false;
+            app.hello_accepted = false;
             app.connection_generation = None;
             app.actor = None;
-            for slot in &mut app.slots {
+            for slot in &mut app.ports {
                 slot.subscription = SubscriptionPhase::Disconnected;
             }
             app.status = tr("st.network.stopped").into();
@@ -7328,15 +6663,7 @@ fn leave_terminal(mouse_capture: bool) {
     let _ = io::stdout().flush();
 }
 
-fn displayed_target_activity(snapshot: &SlotSnapshot) -> TargetActivity {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_nanos().min(i64::MAX as u128) as i64
-        });
-    displayed_target_activity_at(snapshot, now)
-}
-
+#[cfg(test)]
 fn displayed_target_activity_at(snapshot: &SlotSnapshot, now: i64) -> TargetActivity {
     if snapshot.session_state != SessionState::Online {
         return TargetActivity::Unknown;
@@ -7362,10 +6689,6 @@ fn local_history_truncated_message() -> &'static str {
     tr("history.local.truncated")
 }
 
-fn local_history_truncated_title() -> &'static str {
-    tr("history.local.truncated.title")
-}
-
 struct QueueCard {
     operation_index: usize,
     sending: bool,
@@ -7374,8 +6697,8 @@ struct QueueCard {
 }
 
 fn queue_cards(app: &App, inner_width: u16) -> Vec<QueueCard> {
-    let slot_id = app.selected_slot_id();
-    let Some(queue) = app.pending_writes.get(&slot_id) else {
+    let port = app.selected_port();
+    let Some(queue) = app.pending_writes.get(&port) else {
         return Vec::new();
     };
     let eol = app.current().effective_write_eol().as_bytes();
@@ -7385,10 +6708,10 @@ fn queue_cards(app: &App, inner_width: u16) -> Vec<QueueCard> {
         .map(|(operation_index, operation)| {
             let sending = app.pending_requests.values().any(|request| match request {
                 PendingRequest::Write {
-                    slot_id: pending_slot,
+                    port: pending_slot,
                     operation_id,
                     ..
-                } if pending_slot == &slot_id => {
+                } if pending_slot == &port => {
                     operation.operation_id.is_none() || operation.operation_id == *operation_id
                 }
                 _ => false,
@@ -7898,42 +7221,23 @@ fn session_state_label(state: SessionState) -> &'static str {
     }
 }
 
-fn target_activity_label(activity: TargetActivity) -> &'static str {
-    match activity {
-        TargetActivity::Active => tr("activity.active"),
-        TargetActivity::Silent => tr("activity.silent"),
-        TargetActivity::Unknown => tr("activity.unknown"),
-    }
-}
-
 fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let titles = app
-        .slots
+        .ports
         .iter()
-        .enumerate()
-        .map(|(index, slot)| {
+        .map(|slot| {
             let state = session_state_label(slot.snapshot.session_state);
-            let activity = target_activity_label(displayed_target_activity(&slot.snapshot));
-            let unseen = if slot.unseen > 0 {
-                format!(" +{}", slot.unseen)
-            } else {
-                String::new()
-            };
             Line::from(format!(
-                " {} {} {}/{} {}{} ",
-                index + 1,
-                safe_inline(&slot.snapshot.config.display_name),
+                " {} · {} ",
+                safe_inline(&slot.snapshot.config.port),
                 state,
-                activity,
-                slot.subscription.label(),
-                unseen
             ))
         })
         .collect::<Vec<_>>();
     let connection = if !app.transport_connected {
         tr("conn.reconnecting")
-    } else if !app.authenticated {
-        tr("conn.authenticating")
+    } else if !app.hello_accepted {
+        tr("conn.handshaking")
     } else if app.all_slots_ready() {
         tr("conn.live")
     } else {
@@ -7958,14 +7262,7 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let title = output_title(app);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(if app.focus == PaneFocus::Output {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        });
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     let mut visual_lines = app.selection.as_ref().map_or_else(
         || visible_output_lines(app, inner),
@@ -7983,22 +7280,7 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn output_title(app: &App) -> String {
-    let view = app.current();
-    format!(
-        " {} · {}{}{} ",
-        safe_inline(&app.current_device_model_name()),
-        safe_inline(&view.snapshot.config.port),
-        if view.is_paused() {
-            tr("ui.paused")
-        } else {
-            ""
-        },
-        if view.local_history_truncated {
-            local_history_truncated_title()
-        } else {
-            ""
-        }
-    )
+    format!(" {} ", safe_inline(&app.current_model_profile_name()))
 }
 
 fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
@@ -8025,33 +7307,20 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
     // actual wrapped-line count, keeping the newest prompt visible at 80
     // columns without remeasuring the full 20,000-row scrollback on each draw.
     let start = end.saturating_sub(visible_height);
-    let shell_prompt = view.effective_shell_prompt();
-    let uboot_prompt = view.effective_uboot_prompt();
-    let detailed_source_width = detailed_source_width(inner.width as usize);
-    let logical_lines = truncation_line
+    let entries = truncation_line
         .iter()
         .chain(view.lines.iter().chain(view.pending_line.iter()))
         .skip(start)
         .take(end.saturating_sub(start))
-        .map(|entry| {
-            timeline_line(
-                entry,
-                app.detailed_timeline,
-                detailed_source_width,
-                shell_prompt,
-                uboot_prompt,
-                inner.width as usize,
-            )
-        })
         .collect::<Vec<_>>();
     // Ratatui's stable public API does not expose the rendered line count for
     // a wrapped Paragraph. Pre-wrap this small logical suffix using terminal
     // character widths, then retain its visual tail. This mirrors a serial
     // terminal's character wrapping and guarantees that one long row cannot
     // push the newest prompt below the viewport.
-    let visual_lines = logical_lines
+    let visual_lines = render_output_entries(app, &entries, inner.width)
         .into_iter()
-        .flat_map(|line| wrap_timeline_line(line, inner.width))
+        .map(|row| row.line)
         .collect::<Vec<_>>();
     let visual_start = visual_lines.len().saturating_sub(visible_height);
     visual_lines.into_iter().skip(visual_start).collect()
@@ -8068,40 +7337,235 @@ struct OutputVisualRow {
     operation_id: Option<Uuid>,
 }
 
+#[derive(Debug)]
+struct CommandCapture {
+    start: Option<usize>,
+    end: Option<usize>,
+    command: String,
+    highlight_available: bool,
+    sequence: u64,
+}
+
+enum CommandBoundaryMatcher {
+    Literal(String),
+    Regex(regex::Regex),
+}
+
+impl CommandBoundaryMatcher {
+    fn matches(&self, text: &str) -> bool {
+        match self {
+            Self::Literal(value) => text.contains(value),
+            Self::Regex(value) => value.is_match(text),
+        }
+    }
+}
+
+fn command_boundary_matchers(record: &RunCommandRecord) -> Vec<CommandBoundaryMatcher> {
+    let explicit = record
+        .steps
+        .last()
+        .map(|step| step.capture_matchers.as_slice())
+        .unwrap_or_default();
+    explicit
+        .iter()
+        .filter_map(|matcher| match matcher.kind {
+            CommandCaptureMatcherKind::Regex => regex::Regex::new(&matcher.value)
+                .ok()
+                .map(CommandBoundaryMatcher::Regex),
+            CommandCaptureMatcherKind::Contains
+            | CommandCaptureMatcherKind::ShellPrompt
+            | CommandCaptureMatcherKind::UbootPrompt => (!matcher.value.is_empty())
+                .then(|| CommandBoundaryMatcher::Literal(matcher.value.clone())),
+        })
+        .collect()
+}
+
+fn first_command_boundary(
+    entries: &[&DisplayLine],
+    start: usize,
+    eligible: impl Fn(&&DisplayLine) -> bool,
+    matchers: &[CommandBoundaryMatcher],
+) -> Option<usize> {
+    let mut received = String::new();
+    for (index, entry) in entries.iter().enumerate().skip(start) {
+        if !eligible(entry) {
+            break;
+        }
+        received.push_str(&entry.text);
+        received.push('\n');
+        if matchers.iter().any(|matcher| matcher.matches(&received)) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn command_payload(record: &RunCommandRecord) -> String {
+    record
+        .steps
+        .iter()
+        .map(|step| {
+            String::from_utf8_lossy(&step.data)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned()
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("  →  ")
+}
+
+fn command_capture(app: &App, entries: &[&DisplayLine]) -> Option<CommandCapture> {
+    if app.focus != PaneFocus::RunHistory {
+        return None;
+    }
+    let view = app.current();
+    let key = view.selected_run_command_key()?;
+    let record = view.run_command(key)?;
+    let payloads = record
+        .steps
+        .iter()
+        .map(|step| {
+            String::from_utf8_lossy(&step.data)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned()
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let next_command = view.next_run_command_seq(key);
+    let eligible = |entry: &&DisplayLine| {
+        entry.seq >= record.first_seq
+            && next_command.is_none_or(|next_sequence| entry.seq < next_sequence)
+            && entry.run_boundary.is_none()
+    };
+    let first_available = entries.iter().position(eligible);
+    let matched = entries.iter().position(|entry| {
+        eligible(entry)
+            && payloads
+                .iter()
+                .any(|payload| entry.text.contains(payload.as_str()))
+    });
+    let start = matched.or(first_available);
+    let matchers = command_boundary_matchers(record);
+    let boundary_start = entries
+        .iter()
+        .position(|entry| eligible(entry) && entry.seq >= record.last_seq)
+        .or(first_available);
+    let end = if matchers.is_empty() {
+        None
+    } else {
+        boundary_start.and_then(|index| {
+            first_command_boundary(entries, index, eligible, &matchers)
+                .filter(|end| start.is_some_and(|start| *end >= start))
+        })
+    };
+    let highlight_available = start.is_some() && end.is_some();
+    Some(CommandCapture {
+        start,
+        end,
+        command: command_payload(record),
+        highlight_available,
+        sequence: record.first_seq,
+    })
+}
+
+fn command_capture_line(mut line: Line<'static>) -> Line<'static> {
+    line.style = line.style.bg(Color::Rgb(28, 53, 66));
+    line
+}
+
+fn command_fallback_line(command: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("› {}", safe_inline(command)),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec<OutputVisualRow> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let view = app.current();
+    let capture = command_capture(app, entries);
+    let shell_prompt = view.effective_shell_prompt();
+    let uboot_prompt = view.effective_uboot_prompt();
+    let source_width = detailed_source_width(width as usize);
+    let mut rows = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if capture
+            .as_ref()
+            .is_some_and(|capture| !capture.highlight_available && capture.start == Some(index))
+        {
+            let capture = capture.as_ref().expect("capture was just checked");
+            rows.extend(
+                wrap_timeline_line(command_fallback_line(&capture.command), width)
+                    .into_iter()
+                    .map(|line| OutputVisualRow {
+                        line,
+                        seq: capture.sequence,
+                        operation_id: None,
+                    }),
+            );
+        }
+        let highlighted = capture.as_ref().is_some_and(|capture| {
+            capture.highlight_available
+                && capture
+                    .start
+                    .zip(capture.end)
+                    .is_some_and(|(start, end)| start <= index && index <= end)
+        });
+        let line = timeline_line(
+            entry,
+            app.detailed_timeline,
+            source_width,
+            shell_prompt,
+            uboot_prompt,
+            width as usize,
+        );
+        rows.extend(
+            wrap_timeline_line(
+                if highlighted {
+                    command_capture_line(line)
+                } else {
+                    line
+                },
+                width,
+            )
+            .into_iter()
+            .map(|line| OutputVisualRow {
+                line,
+                seq: entry.seq,
+                operation_id: entry.operation_id,
+            }),
+        );
+    }
+    if let Some(capture) = capture.filter(|capture| capture.start.is_none()) {
+        rows.extend(
+            wrap_timeline_line(command_fallback_line(&capture.command), width)
+                .into_iter()
+                .map(|line| OutputVisualRow {
+                    line,
+                    seq: capture.sequence,
+                    operation_id: None,
+                }),
+        );
+    }
+    rows
+}
+
 fn all_output_visual_rows(app: &App, width: u16) -> Vec<OutputVisualRow> {
     if width == 0 {
         return Vec::new();
     }
     let view = app.current();
     let truncation_line = view.local_truncation_line();
-    let shell_prompt = view.effective_shell_prompt();
-    let uboot_prompt = view.effective_uboot_prompt();
-    let source_width = detailed_source_width(width as usize);
-    truncation_line
+    let entries = truncation_line
         .iter()
         .chain(view.lines.iter().chain(view.pending_line.iter()))
-        .flat_map(|entry| {
-            let seq = entry.seq;
-            let operation_id = entry.operation_id;
-            wrap_timeline_line(
-                timeline_line(
-                    entry,
-                    app.detailed_timeline,
-                    source_width,
-                    shell_prompt,
-                    uboot_prompt,
-                    width as usize,
-                ),
-                width,
-            )
-            .into_iter()
-            .map(move |line| OutputVisualRow {
-                line,
-                seq,
-                operation_id,
-            })
-        })
-        .collect()
+        .collect::<Vec<_>>();
+    render_output_entries(app, &entries, width)
 }
 
 fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -8372,7 +7836,7 @@ fn line_with_selection(line: Line<'static>, from: u16, through: u16) -> Line<'st
 /// two-column marker is a colored "●" for TX/actor-attributed rows and two
 /// spaces otherwise; a TX row whose exact device echo was merged shows a
 /// softer unbolded "✓" in the same actor color instead. Detailed mode
-/// additionally shows the legacy `#seq` and source columns. Stream rows get
+/// additionally shows the event sequence and source columns. Stream rows get
 /// inline keyword/prompt highlighting; system and gap rows keep their
 /// whole-line style.
 fn timeline_line(
@@ -8504,8 +7968,7 @@ fn draw_queue(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     let height = inner.height as usize;
     let selected = app.queue_selection.as_ref().and_then(|selection| {
-        (selection.slot_id == app.selected_slot_id())
-            .then_some(selection.selected.min(cards.len() - 1))
+        (selection.port == app.selected_port()).then_some(selection.selected.min(cards.len() - 1))
     });
 
     let style_for = |card: &QueueCard| {
@@ -8580,7 +8043,7 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
         });
         return rows;
     }
-    for run in view.run_history_newest_first() {
+    for run in view.run_history_chronological() {
         let label = if run.label.trim().is_empty() {
             tr("ui.run.unknown").to_string()
         } else {
@@ -8600,7 +8063,7 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
             command: None,
         });
 
-        for command in run.commands.iter().rev() {
+        for command in &run.commands {
             let key = RunCommandKey {
                 run_id: run.id,
                 first_seq: command.first_seq,
@@ -8829,10 +8292,10 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn input_title(app: &App, mode: InputMode) -> String {
-    let slot_id = &app.current().snapshot.config.id;
+    let port = &app.current().snapshot.config.port;
     let Some(writes) = app
         .pending_writes
-        .get(slot_id)
+        .get(port)
         .filter(|writes| !writes.is_empty())
     else {
         return match mode {
@@ -8976,11 +8439,7 @@ fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
-    let scroll = if app.current_mode() == InputMode::Raw {
-        tr("ui.scroll.prefix")
-    } else {
-        tr("ui.scroll.plain")
-    };
+    let scroll = tr("ui.scroll.plain");
     frame.render_widget(
         Paragraph::new(trf("ui.helpline", &[scroll]))
             .alignment(Alignment::Center)
@@ -9119,25 +8578,24 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
     ])
     .split(inner);
 
-    let current_model = menu
-        .catalog
-        .as_ref()
-        .and_then(|catalog| slot_model_binding(catalog, &app.selected_slot_id()))
-        .map(|binding| binding.model_id.as_str())
-        .map(safe_inline)
-        .unwrap_or_else(|| tr("menu.value.unbound").into());
-    let slot_id = safe_inline(&app.selected_slot_id());
-    let transport = safe_inline(&app.current().snapshot.config.profile);
-    let device = app
+    let port = safe_inline(&app.selected_port());
+    let transport = app
         .current()
         .snapshot
         .config
-        .device_profile
+        .transport_profile
+        .as_deref()
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("menu.value.unbound").into());
+    let model = app
+        .current()
+        .snapshot
+        .config
+        .model_profile
         .as_deref()
         .map(safe_inline)
         .unwrap_or_else(|| tr("menu.value.generic").into());
-    let model = current_model;
-    let header = trf("menu.current", &[&slot_id, &transport, &device, &model]);
+    let header = trf("menu.current", &[&port, &transport, &model]);
     frame.render_widget(
         Paragraph::new(header).style(Style::default().fg(Color::LightCyan)),
         chunks[0],
@@ -9251,12 +8709,7 @@ fn draw_menu_prompt(
         .title(format!(" {} ", prompt.title))
         .border_style(Style::default().fg(Color::Yellow));
     let inner = block.inner(popup);
-    let visible = if prompt.secret {
-        vec!['•'; prompt.value.len()]
-    } else {
-        prompt.value.clone()
-    };
-    let (text, cursor) = line_input_projection(&visible, prompt.cursor, inner.width);
+    let (text, cursor) = line_input_projection(&prompt.value, prompt.cursor, inner.width);
     frame.render_widget(
         Paragraph::new(line_with_software_cursor(text, cursor, cursor_visible)).block(block),
         popup,
@@ -9268,9 +8721,7 @@ fn menu_page_title(page: MenuPage) -> &'static str {
         MenuPage::Root => tr("menu.title"),
         MenuPage::Profiles => tr("menu.profile.title"),
         MenuPage::TransportProfiles => tr("menu.transport.title"),
-        MenuPage::DeviceProfiles => tr("menu.device.title"),
-        MenuPage::Models => tr("menu.model.title"),
-        MenuPage::ModelParents => tr("menu.model.parent.title"),
+        MenuPage::ModelProfiles => tr("menu.device.title"),
         MenuPage::SerialSettings => tr("menu.serial.title"),
         MenuPage::DisplaySettings => tr("menu.display.title"),
         MenuPage::RunSettings => tr("menu.run.title"),
@@ -9281,7 +8732,6 @@ fn menu_page_title(page: MenuPage) -> &'static str {
 fn menu_footer(page: MenuPage) -> &'static str {
     match page {
         MenuPage::Profiles => tr("menu.footer.current"),
-        MenuPage::Models => tr("menu.footer.models"),
         MenuPage::DisplaySettings => tr("menu.footer.display"),
         MenuPage::RunSettings => tr("menu.footer.run"),
         MenuPage::Help => tr("menu.footer.help"),
@@ -9302,6 +8752,19 @@ fn selected_menu_line(index: usize, selected: usize, text: String) -> Line<'stat
         } else {
             Style::default().fg(Color::White)
         },
+    ))
+}
+
+fn indented_menu_line(index: usize, selected: usize, text: String) -> Line<'static> {
+    selected_menu_line(index, selected, format!("    {text}"))
+}
+
+fn menu_section_heading(key: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        tr(key),
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -9398,7 +8861,6 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
     match menu.page {
         MenuPage::Root => [
             tr("menu.root.profile"),
-            tr("menu.root.model"),
             tr("menu.root.serial"),
             tr("menu.root.display"),
             tr("menu.root.run"),
@@ -9409,23 +8871,13 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
         .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
         .collect(),
         MenuPage::Profiles => {
-            let (Some(editor), Some(catalog)) =
-                (menu.profile_editor.as_ref(), menu.catalog.as_ref())
-            else {
+            let Some(editor) = menu.profile_editor.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let slot_id = app.selected_slot_id();
-            let binding = slot_model_binding(catalog, &slot_id);
-            let model = binding.and_then(|binding| {
-                catalog
-                    .models
-                    .iter()
-                    .find(|model| model.id == binding.model_id)
-            });
             let changed = editor.port_update().is_some()
                 || editor.transport_update().is_some()
                 || editor.device_update().is_some();
-            [
+            let values = [
                 trf("menu.current.row.port", &[&safe_inline(&editor.port)]),
                 trf(
                     "menu.current.row.transport",
@@ -9490,41 +8942,46 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                     "menu.current.row.delay",
                     &[&optional_number(editor.device.write_chunk_delay_ms)],
                 ),
-                trf(
-                    "menu.current.row.model.binding",
-                    &[&binding
-                        .map(|binding| safe_inline(&binding.model_id))
-                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
-                ),
-                trf(
-                    "menu.current.row.model.name",
-                    &[&model
-                        .map(|model| safe_inline(&model.name))
-                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
-                ),
                 if changed {
                     tr("menu.current.row.apply.changed").into()
                 } else {
                     tr("menu.current.row.apply.clean").into()
                 },
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| selected_menu_line(index, menu.selected, text))
-            .collect()
+            ];
+            let mut rows = Vec::with_capacity(values.len() + 2);
+            rows.push(menu_section_heading("menu.current.section.serial"));
+            rows.extend(
+                values[..10]
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, text)| indented_menu_line(index, menu.selected, text)),
+            );
+            rows.push(menu_section_heading("menu.current.section.model"));
+            rows.extend(
+                values[10..]
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(offset, text)| {
+                        let index = offset + 10;
+                        indented_menu_line(index, menu.selected, text)
+                    }),
+            );
+            rows
         }
         MenuPage::TransportProfiles => {
             let Some(catalog) = menu.catalog.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let current = &app.current().snapshot.config.profile;
+            let current = app.current().snapshot.config.transport_profile.as_deref();
             catalog
                 .transport_profiles
                 .iter()
                 .map(|profile| {
                     format!(
                         "{}{}",
-                        if &profile.name == current {
+                        if current == Some(profile.name.as_str()) {
                             "✓ "
                         } else {
                             "  "
@@ -9537,17 +8994,17 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                 .map(|(index, text)| selected_menu_line(index, menu.selected, text))
                 .collect()
         }
-        MenuPage::DeviceProfiles => {
+        MenuPage::ModelProfiles => {
             let Some(catalog) = menu.catalog.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let current = app.current().snapshot.config.device_profile.as_deref();
+            let current = app.current().snapshot.config.model_profile.as_deref();
             std::iter::once(format!(
                 "{}{}",
                 if current.is_none() { "✓ " } else { "  " },
                 tr("menu.device.generic")
             ))
-            .chain(catalog.device_profiles.iter().map(|profile| {
+            .chain(catalog.model_profiles.iter().map(|profile| {
                 format!(
                     "{}{}",
                     if current == Some(profile.name.as_str()) {
@@ -9559,70 +9016,10 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                 )
             }))
             .chain(std::iter::once(tr("menu.device.new").into()))
-            .chain(DEVICE_PRESETS.iter().map(|preset| preset.label().into()))
+            .chain(MODEL_PRESETS.iter().map(|preset| preset.label().into()))
             .enumerate()
             .map(|(index, text)| selected_menu_line(index, menu.selected, text))
             .collect()
-        }
-        MenuPage::Models => {
-            let Some(catalog) = menu.catalog.as_ref() else {
-                return vec![Line::from(tr("menu.loading"))];
-            };
-            let bound = slot_model_binding(catalog, &app.selected_slot_id())
-                .map(|binding| binding.model_id.as_str());
-            let mut rows = vec![
-                selected_menu_line(0, menu.selected, tr("menu.model.add.root").into()),
-                selected_menu_line(1, menu.selected, tr("menu.model.add.child").into()),
-            ];
-            for (offset, row) in visible_model_rows(&catalog.models, &menu.expanded_models)
-                .into_iter()
-                .enumerate()
-            {
-                let model = &catalog.models[row.index];
-                let children = model_has_children(&catalog.models, &model.id);
-                let disclosure = if !children {
-                    "  "
-                } else if menu.expanded_models.contains(&model.id) {
-                    "▾ "
-                } else {
-                    "▸ "
-                };
-                let text = format!(
-                    "{}{}{}{} ({})",
-                    "  ".repeat(row.depth),
-                    disclosure,
-                    if bound == Some(model.id.as_str()) {
-                        "✓ "
-                    } else {
-                        "  "
-                    },
-                    safe_inline(&model.name),
-                    safe_inline(&model.id),
-                );
-                rows.push(selected_menu_line(offset + 2, menu.selected, text));
-            }
-            rows
-        }
-        MenuPage::ModelParents => {
-            let Some(catalog) = menu.catalog.as_ref() else {
-                return vec![Line::from(tr("menu.loading"))];
-            };
-            all_model_rows(&catalog.models)
-                .into_iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    selected_menu_line(
-                        index,
-                        menu.selected,
-                        format!(
-                            "{}{} ({})",
-                            "  ".repeat(row.depth),
-                            safe_inline(&catalog.models[row.index].name),
-                            safe_inline(&catalog.models[row.index].id),
-                        ),
-                    )
-                })
-                .collect()
         }
         MenuPage::SerialSettings => TRANSPORT_PRESETS
             .iter()
@@ -9665,7 +9062,13 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
 }
 
 fn menu_selected_visual_row(menu: &MenuState) -> Option<usize> {
-    (menu.page != MenuPage::Help && menu_item_count(menu) > 0).then_some(menu.selected)
+    (menu.page != MenuPage::Help && menu_item_count(menu) > 0).then(|| {
+        if menu.page == MenuPage::Profiles {
+            menu.selected + if menu.selected < 10 { 1 } else { 2 }
+        } else {
+            menu.selected
+        }
+    })
 }
 
 fn menu_detail(app: &App, menu: &MenuState) -> String {
@@ -9678,24 +9081,20 @@ fn menu_detail(app: &App, menu: &MenuState) -> String {
                 || tr("menu.transport.new.detail").into(),
                 transport_profile_detail,
             ),
-        MenuPage::DeviceProfiles => {
+        MenuPage::ModelProfiles => {
             if menu.selected == 0 {
                 tr("menu.device.generic.detail").into()
             } else {
                 menu.catalog
                     .as_ref()
-                    .and_then(|catalog| catalog.device_profiles.get(menu.selected - 1))
+                    .and_then(|catalog| catalog.model_profiles.get(menu.selected - 1))
                     .map_or_else(
                         || tr("menu.device.clone.detail").into(),
-                        device_profile_detail,
+                        model_profile_detail,
                     )
             }
         }
-        MenuPage::Models | MenuPage::ModelParents => tr("menu.model.verify").into(),
         MenuPage::Profiles => match CurrentProfileRow::from_index(menu.selected) {
-            Some(CurrentProfileRow::ModelBinding | CurrentProfileRow::ModelName) => {
-                tr("menu.current.model.detail").into()
-            }
             Some(CurrentProfileRow::Apply) => tr("menu.current.apply.detail").into(),
             _ => tr("menu.current.detail").into(),
         },
@@ -9778,7 +9177,7 @@ fn transport_profile_detail(profile: &TransportProfile) -> String {
     )
 }
 
-fn device_profile_detail(profile: &DeviceProfile) -> String {
+fn model_profile_detail(profile: &ModelProfile) -> String {
     let unset = tr("menu.value.unbound");
     let shell = trf(
         "menu.detail.prompt.shell",
@@ -9838,7 +9237,6 @@ fn menu_help_lines() -> Vec<Option<(&'static str, bool)>> {
         Some((tr("help.group.safety"), true)),
         Some((tr("menu.help.echo"), false)),
         Some((tr("menu.help.model"), false)),
-        Some((tr("menu.help.token"), false)),
     ]
 }
 
@@ -9931,11 +9329,14 @@ fn raw_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::Mutex,
+    };
 
     use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
-    use serial_protocol::{ActorKind, Direction, SerialSettings, SlotConfig, TriggerSpec};
+    use serial_protocol::{ActorKind, Direction, SlotConfig, TriggerSpec};
 
     use super::*;
 
@@ -9976,14 +9377,14 @@ mod tests {
     #[test]
     fn line_ctrl_c_sends_etx_to_cancel_remote_continuation() {
         let mut app = ready_app_with_control();
-        app.slots[0].snapshot.effective_write_eol = Some("\r\n".into());
-        app.slots[0].history.push("previous command".into());
-        app.slots[0].history_cursor = Some(0);
-        app.slots[0].draft = "echo 'unterminated".chars().collect();
-        app.slots[0].draft_cursor = app.slots[0].draft.len();
-        app.slots[0].scroll_from_bottom = 5;
-        app.slots[0].unseen = 2;
-        let control_id = app.slots[0]
+        app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
+        app.ports[0].history.push("previous command".into());
+        app.ports[0].history_cursor = Some(0);
+        app.ports[0].draft = "echo 'unterminated".chars().collect();
+        app.ports[0].draft_cursor = app.ports[0].draft.len();
+        app.ports[0].scroll_from_bottom = 5;
+        app.ports[0].unseen = 2;
+        let control_id = app.ports[0]
             .snapshot
             .control
             .as_ref()
@@ -10020,7 +9421,7 @@ mod tests {
     #[test]
     fn raw_mode_ctrl_c_is_forwarded_as_etx() {
         let mut app = ready_app_with_control();
-        app.slots[0].mode = InputMode::Raw;
+        app.ports[0].mode = InputMode::Raw;
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_key(
@@ -10044,15 +9445,15 @@ mod tests {
         let (commands, _) = mpsc::channel(4);
 
         let mut replay = event(EventKind::Rx, Direction::Rx, 1, b"boot\r\n");
-        replay.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        replay.daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         app.push_event(replay, true, &commands);
 
         assert_eq!(
-            app.slots[0].snapshot.target_activity,
+            app.ports[0].snapshot.target_activity,
             TargetActivity::Silent
         );
-        assert_eq!(app.slots[0].snapshot.last_rx_wall_time_ns, Some(1));
-        assert!(!app.slots[0].lines.is_empty());
+        assert_eq!(app.ports[0].snapshot.last_rx_wall_time_ns, Some(1));
+        assert!(!app.ports[0].lines.is_empty());
     }
 
     #[test]
@@ -10065,7 +9466,7 @@ mod tests {
         let mut persisted_tail = event(EventKind::Rx, Direction::Rx, 2, b"persisted\r\n");
         persisted_tail.daemon_epoch = epoch;
         let history = StartupHistory {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             epoch,
             head_seq: 3,
             events: vec![old, persisted_tail.clone()],
@@ -10083,48 +9484,48 @@ mod tests {
             .apply_startup_history(history)
             .expect("verified startup cursor");
         assert_eq!(cursor.after_seq, 2);
-        assert_eq!(app.slots[0].last_seq, 2);
-        assert_eq!(app.slots[0].lines.len(), 2);
+        assert_eq!(app.ports[0].last_seq, 2);
+        assert_eq!(app.ports[0].lines.len(), 2);
 
         let (commands, _) = mpsc::channel(4);
         app.push_event(persisted_tail, true, &commands);
-        assert_eq!(app.slots[0].lines.len(), 2);
+        assert_eq!(app.ports[0].lines.len(), 2);
         let mut non_durable_live_tail = event(EventKind::Rx, Direction::Rx, 3, b"live\r\n");
         non_durable_live_tail.daemon_epoch = epoch;
         non_durable_live_tail.durable = false;
         app.push_event(non_durable_live_tail, true, &commands);
 
-        assert_eq!(app.slots[0].last_seq, 3);
-        assert_eq!(app.slots[0].lines.len(), 3);
+        assert_eq!(app.ports[0].last_seq, 3);
+        assert_eq!(app.ports[0].lines.len(), 3);
     }
 
     #[test]
     fn provisional_live_event_does_not_claim_logging_is_degraded() {
         let mut app = App::new(vec![snapshot()], None);
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         let (commands, _) = mpsc::channel(4);
 
         let mut provisional = event(EventKind::Rx, Direction::Rx, 1, b"live");
         provisional.daemon_epoch = daemon_epoch;
         provisional.durable = false;
         app.push_event(provisional, false, &commands);
-        assert_eq!(app.slots[0].snapshot.logging, LoggingState::Healthy);
+        assert_eq!(app.ports[0].snapshot.logging, LoggingState::Healthy);
 
         let mut degraded = event(EventKind::LoggingDegraded, Direction::None, 2, &[]);
         degraded.daemon_epoch = daemon_epoch;
         degraded.durable = false;
         app.push_event(degraded, false, &commands);
-        assert_eq!(app.slots[0].snapshot.logging, LoggingState::Degraded);
+        assert_eq!(app.ports[0].snapshot.logging, LoggingState::Degraded);
     }
 
     #[test]
     fn serial_close_discards_queued_control_and_input() {
         let mut app = App::new(vec![snapshot()], None);
-        let slot_id = app.selected_slot_id();
-        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
-        app.slots[0].snapshot.active_trigger = Some(trigger);
+        let port = app.selected_port();
+        let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Running);
+        app.ports[0].snapshot.active_trigger = Some(trigger);
         app.pending_writes
-            .entry(slot_id.clone())
+            .entry(port.clone())
             .or_default()
             .push_back(PendingWrite {
                 data: b"version\r".to_vec(),
@@ -10134,19 +9535,19 @@ mod tests {
         app.pending_requests.insert(
             Uuid::new_v4(),
             PendingRequest::Acquire {
-                slot_id: slot_id.clone(),
+                port: port.clone(),
                 mode: ControlMode::Queue,
             },
         );
         let (commands, _) = mpsc::channel(4);
 
         let mut closed = event(EventKind::SerialClosed, Direction::None, 1, &[]);
-        closed.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        closed.daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         app.push_event(closed, false, &commands);
 
-        assert!(!app.pending_writes.contains_key(&slot_id));
+        assert!(!app.pending_writes.contains_key(&port));
         assert!(app.pending_requests.is_empty());
-        assert!(app.slots[0].snapshot.active_trigger.is_none());
+        assert!(app.ports[0].snapshot.active_trigger.is_none());
     }
 
     #[test]
@@ -10156,8 +9557,8 @@ mod tests {
         // process-global locale so parallel localization tests cannot race it.
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
-        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Armed);
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
+        let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Armed);
         let trigger_id = trigger.id;
         let (commands, _) = mpsc::channel(4);
 
@@ -10169,7 +9570,7 @@ mod tests {
             .insert("trigger".into(), serde_json::to_value(&trigger).unwrap());
         app.push_event(started, false, &commands);
 
-        let projected = app.slots[0]
+        let projected = app.ports[0]
             .snapshot
             .active_trigger
             .as_ref()
@@ -10191,7 +9592,7 @@ mod tests {
             .insert("partial".into(), serde_json::json!(false));
         app.push_event(fire, false, &commands);
 
-        let projected = app.slots[0]
+        let projected = app.ports[0]
             .snapshot
             .active_trigger
             .as_ref()
@@ -10207,9 +9608,9 @@ mod tests {
             .metadata
             .insert("status".into(), serde_json::json!("matched"));
         app.push_event(completed, false, &commands);
-        assert!(app.slots[0].snapshot.active_trigger.is_none());
+        assert!(app.ports[0].snapshot.active_trigger.is_none());
         assert!(
-            app.slots[0]
+            app.ports[0]
                 .lines
                 .iter()
                 .any(|line| line.text == "trigger_completed: matched")
@@ -10219,8 +9620,8 @@ mod tests {
     #[test]
     fn trigger_projection_matches_start_and_stop_literals_across_rx_events() {
         let mut app = App::new(vec![snapshot()], None);
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
-        let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::WaitingForStart);
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::WaitingForStart);
         trigger.spec.start_contains = Some(b"boot>".to_vec());
         trigger.spec.stop_contains = vec![b"SigmaStar #".to_vec()];
         let (commands, _) = mpsc::channel(4);
@@ -10238,7 +9639,7 @@ mod tests {
             app.push_event(rx, false, &commands);
         }
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10253,7 +9654,7 @@ mod tests {
             app.push_event(rx, false, &commands);
         }
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10278,7 +9679,7 @@ mod tests {
             .insert("fire_index".into(), serde_json::json!(1));
         app.push_event(in_flight, false, &commands);
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10291,8 +9692,8 @@ mod tests {
     #[test]
     fn max_fire_budget_keeps_observing_when_stop_literal_exists() {
         let mut app = App::new(vec![snapshot()], None);
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
-        let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Running);
         trigger.spec.max_fires = 1;
         trigger.spec.timeout_ms = 1;
         let trigger_id = trigger.id;
@@ -10315,7 +9716,7 @@ mod tests {
             .insert("fire_index".into(), serde_json::json!(1));
         app.push_event(fire, false, &commands);
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10330,7 +9731,7 @@ mod tests {
             app.push_event(rx, false, &commands);
         }
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10340,8 +9741,8 @@ mod tests {
         );
 
         let mut no_match_app = App::new(vec![snapshot()], None);
-        let daemon_epoch = no_match_app.slots[0].snapshot.daemon_epoch;
-        let mut trigger = trigger_info(&no_match_app.slots[0].snapshot, TriggerStatus::Running);
+        let daemon_epoch = no_match_app.ports[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&no_match_app.ports[0].snapshot, TriggerStatus::Running);
         trigger.spec.max_fires = 1;
         trigger.spec.stop_contains.clear();
         let trigger_id = trigger.id;
@@ -10361,7 +9762,7 @@ mod tests {
             .insert("fire_index".into(), serde_json::json!(1));
         no_match_app.push_event(fire, false, &commands);
         assert_eq!(
-            no_match_app.slots[0]
+            no_match_app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10371,8 +9772,8 @@ mod tests {
         );
 
         let mut timeout_app = App::new(vec![snapshot()], None);
-        let daemon_epoch = timeout_app.slots[0].snapshot.daemon_epoch;
-        let mut trigger = trigger_info(&timeout_app.slots[0].snapshot, TriggerStatus::Running);
+        let daemon_epoch = timeout_app.ports[0].snapshot.daemon_epoch;
+        let mut trigger = trigger_info(&timeout_app.ports[0].snapshot, TriggerStatus::Running);
         trigger.spec.timeout_ms = 1;
         let mut started = event(EventKind::TriggerStarted, Direction::None, 1, &[]);
         started.daemon_epoch = daemon_epoch;
@@ -10382,10 +9783,10 @@ mod tests {
         timeout_app.push_event(started, false, &commands);
 
         assert!(
-            timeout_app.slots[0].update_trigger_deadline(Instant::now() + Duration::from_millis(2))
+            timeout_app.ports[0].update_trigger_deadline(Instant::now() + Duration::from_millis(2))
         );
         assert_eq!(
-            timeout_app.slots[0]
+            timeout_app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
@@ -10405,7 +9806,7 @@ mod tests {
         let trigger_id = trigger.id;
         snapshot.active_trigger = Some(trigger);
         let mut app = App::new(vec![snapshot], None);
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         let (commands, _) = mpsc::channel(4);
 
         let mut initial = event(EventKind::Tx, Direction::Tx, 1, b"reboot\r");
@@ -10419,10 +9820,10 @@ mod tests {
         app.push_event(initial, false, &commands);
 
         assert_eq!(
-            app.slots[0].trigger_status_text(),
+            app.ports[0].trigger_status_text(),
             Some(tr("trigger.status.active"))
         );
-        assert!(app.slots[0].snapshot.active_trigger.is_some());
+        assert!(app.ports[0].snapshot.active_trigger.is_some());
     }
 
     #[test]
@@ -10436,9 +9837,9 @@ mod tests {
         .enumerate()
         {
             let mut app = App::new(vec![snapshot()], None);
-            let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
-            let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Stopping);
-            app.slots[0].snapshot.active_trigger = Some(trigger);
+            let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
+            let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Stopping);
+            app.ports[0].snapshot.active_trigger = Some(trigger);
             let (commands, _) = mpsc::channel(4);
             let mut terminal = event(kind, Direction::None, offset as u64 + 1, &[]);
             terminal.daemon_epoch = daemon_epoch;
@@ -10446,7 +9847,7 @@ mod tests {
             app.push_event(terminal, false, &commands);
 
             assert!(
-                app.slots[0].snapshot.active_trigger.is_none(),
+                app.ports[0].snapshot.active_trigger.is_none(),
                 "{kind:?} left a stale active Trigger"
             );
         }
@@ -10455,28 +9856,28 @@ mod tests {
     #[test]
     fn human_write_waits_for_trigger_terminal_after_takeover() {
         let mut app = ready_app_with_control();
-        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Stopping);
-        app.slots[0].snapshot.active_trigger = Some(trigger);
+        let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Stopping);
+        app.ports[0].snapshot.active_trigger = Some(trigger);
         app.pending_writes
-            .entry("slot-1".into())
+            .entry("COM3".into())
             .or_default()
             .push_back(PendingWrite {
                 data: b"version\r".to_vec(),
                 operation_id: None,
                 kind: PendingWriteKind::Line,
             });
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         let (commands, mut received) = mpsc::channel(4);
 
-        assert!(app.flush_pending_writes("slot-1", &commands));
+        assert!(app.flush_pending_writes("COM3", &commands));
         assert!(received.try_recv().is_err());
-        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+        assert_eq!(app.pending_writes["COM3"].len(), 1);
 
         let mut cancelled = event(EventKind::TriggerCancelled, Direction::None, 1, &[]);
         cancelled.daemon_epoch = daemon_epoch;
         app.push_event(cancelled, false, &commands);
 
-        assert!(app.slots[0].snapshot.active_trigger.is_none());
+        assert!(app.ports[0].snapshot.active_trigger.is_none());
         let (_, data, _) = take_write(&mut received);
         assert_eq!(data, b"version\r");
     }
@@ -10487,7 +9888,7 @@ mod tests {
         app.pending_requests.insert(
             Uuid::new_v4(),
             PendingRequest::Write {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 operation_id: Some(Uuid::new_v4()),
                 cooperative: false,
             },
@@ -10513,7 +9914,7 @@ mod tests {
     fn input_is_rejected_until_the_selected_slot_is_ready() {
         let mut app = App::new(vec![snapshot()], None);
         app.transport_connected = true;
-        app.authenticated = true;
+        app.hello_accepted = true;
         app.connection_generation = Some(1);
         let (commands, mut received) = mpsc::channel(4);
 
@@ -10561,12 +9962,12 @@ mod tests {
 
         app.remove_last_queued_line(true, &commands);
 
-        assert!(!app.pending_writes.contains_key("slot-1"));
-        assert_eq!(app.slots[0].draft.iter().collect::<String>(), "echo queued");
-        assert_eq!(app.slots[0].draft_cursor, "echo queued".chars().count());
-        assert_eq!(app.slots[0].mode, InputMode::Line);
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert_eq!(app.ports[0].draft.iter().collect::<String>(), "echo queued");
+        assert_eq!(app.ports[0].draft_cursor, "echo queued".chars().count());
+        assert_eq!(app.ports[0].mode, InputMode::Line);
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::CancelAcquire { slot_id } if slot_id == "slot-1")
+            |request| matches!(request, PendingRequest::CancelAcquire { port } if port == "COM3")
         ));
     }
 
@@ -10578,8 +9979,8 @@ mod tests {
 
         app.remove_last_queued_line(true, &commands);
 
-        assert_eq!(app.pending_writes["slot-1"][0].data, vec![0x03]);
-        assert!(app.slots[0].draft.is_empty());
+        assert_eq!(app.pending_writes["COM3"][0].data, vec![0x03]);
+        assert!(app.ports[0].draft.is_empty());
         assert_eq!(app.status, tr("st.queue.raw.only"));
     }
 
@@ -10595,7 +9996,7 @@ mod tests {
             assert!(app.request_raw_write(&commands, vec![byte]));
         }
 
-        let queued = app.pending_writes.get("slot-1").expect("queued RAW data");
+        let queued = app.pending_writes.get("COM3").expect("queued RAW data");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].data, expected);
         assert_eq!(queued[0].kind, PendingWriteKind::Raw);
@@ -10620,7 +10021,7 @@ mod tests {
         );
         let before = app
             .pending_writes
-            .get("slot-1")
+            .get("COM3")
             .expect("full bounded RAW queue")
             .iter()
             .map(|write| write.data.clone())
@@ -10630,7 +10031,7 @@ mod tests {
         assert!(!app.request_raw_write(&commands, vec![b'y']));
         let after = app
             .pending_writes
-            .get("slot-1")
+            .get("COM3")
             .expect("previous accepted RAW queue remains authoritative")
             .iter()
             .map(|write| write.data.clone())
@@ -10654,9 +10055,9 @@ mod tests {
         let (first_id, first_data, first_operation) = take_write(&mut received);
         assert_eq!(first_data.len(), MAX_WRITE_BYTES);
         assert_eq!(first_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["slot-1"].len(), 3);
+        assert_eq!(app.pending_writes["COM3"].len(), 3);
         assert_eq!(
-            queued_line_operations(&app.pending_writes["slot-1"])[0]
+            queued_line_operations(&app.pending_writes["COM3"])[0]
                 .data
                 .len(),
             MAX_WRITE_BYTES * 2 + 17
@@ -10672,9 +10073,9 @@ mod tests {
         assert_ne!(first_id, second_id);
         assert_eq!(second_data.len(), MAX_WRITE_BYTES);
         assert_eq!(second_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["slot-1"].len(), 3);
+        assert_eq!(app.pending_writes["COM3"].len(), 3);
         assert_eq!(
-            queued_line_operations(&app.pending_writes["slot-1"])[0]
+            queued_line_operations(&app.pending_writes["COM3"])[0]
                 .data
                 .len(),
             MAX_WRITE_BYTES * 2 + 17
@@ -10689,13 +10090,13 @@ mod tests {
         assert_ne!(second_id, third_id);
         assert_eq!(third_data.len(), 17);
         assert_eq!(third_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["slot-1"].len(), 3);
+        assert_eq!(app.pending_writes["COM3"].len(), 3);
         app.handle_result(
             third_id,
             CommandResult::WriteAccepted { event_seq: 3 },
             &commands,
         );
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
     }
 
     #[test]
@@ -10710,7 +10111,7 @@ mod tests {
         );
         let (request_id, first_data, _) = take_write(&mut received);
         assert_eq!(first_data.len(), MAX_WRITE_BYTES);
-        assert_eq!(app.pending_writes["slot-1"].len(), 2);
+        assert_eq!(app.pending_writes["COM3"].len(), 2);
 
         app.handle_server_message(
             ServerMessage::Error {
@@ -10722,7 +10123,7 @@ mod tests {
             &commands,
         );
 
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
         assert!(received.try_recv().is_err());
     }
 
@@ -10731,7 +10132,7 @@ mod tests {
         let mut app = ready_app_with_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             bytes: vec![b'x'; MAX_WRITE_BYTES + 1],
             raw: false,
         });
@@ -10741,7 +10142,7 @@ mod tests {
         let (first_id, first_data, operation_id) = take_write(&mut received);
         assert_eq!(first_data, vec![b'x'; MAX_WRITE_BYTES]);
         let operation_id = operation_id.expect("line paste operation ID");
-        assert_eq!(app.pending_writes["slot-1"].len(), 2);
+        assert_eq!(app.pending_writes["COM3"].len(), 2);
 
         app.handle_result(
             first_id,
@@ -10752,13 +10153,13 @@ mod tests {
         assert_ne!(first_id, second_id);
         assert_eq!(second_data, b"x\r");
         assert_eq!(second_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["slot-1"].len(), 2);
+        assert_eq!(app.pending_writes["COM3"].len(), 2);
         app.handle_result(
             second_id,
             CommandResult::WriteAccepted { event_seq: 2 },
             &commands,
         );
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
     }
 
     #[test]
@@ -10766,7 +10167,7 @@ mod tests {
         let mut app = ready_app_with_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             bytes: b"pwd\nversion\n".to_vec(),
             raw: false,
         });
@@ -10776,7 +10177,7 @@ mod tests {
         let (first_id, first_data, first_operation) = take_write(&mut received);
         let first_operation = first_operation.expect("first line paste operation ID");
         assert_eq!(first_data, b"pwd\r");
-        assert_eq!(app.pending_writes["slot-1"].len(), 2);
+        assert_eq!(app.pending_writes["COM3"].len(), 2);
 
         app.handle_result(
             first_id,
@@ -10787,7 +10188,7 @@ mod tests {
         assert_eq!(second_data, b"version\r");
         assert!(second_operation.is_some());
         assert_ne!(second_operation, Some(first_operation));
-        assert_eq!(app.pending_writes["slot-1"].len(), 1);
+        assert_eq!(app.pending_writes["COM3"].len(), 1);
     }
 
     #[test]
@@ -10795,7 +10196,7 @@ mod tests {
         let mut app = ready_app_with_foreign_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             bytes: b"first\nsecond\nthird\n".to_vec(),
             raw: false,
         });
@@ -10815,7 +10216,7 @@ mod tests {
         ));
         assert!(received.try_recv().is_err());
 
-        let operations = queued_line_operations(&app.pending_writes["slot-1"]);
+        let operations = queued_line_operations(&app.pending_writes["COM3"]);
         assert_eq!(operations.len(), 3);
         assert_eq!(operations[0].data, b"first\r");
         assert_eq!(operations[1].data, b"second\r");
@@ -10828,13 +10229,13 @@ mod tests {
 
         app.remove_queued_line_operation(1, true, &commands);
         assert_eq!(app.current().draft.iter().collect::<String>(), "second");
-        let remaining = queued_line_operations(&app.pending_writes["slot-1"])
+        let remaining = queued_line_operations(&app.pending_writes["COM3"])
             .into_iter()
             .map(|operation| operation.data)
             .collect::<Vec<_>>();
         assert_eq!(remaining, vec![b"first\r".to_vec(), b"third\r".to_vec()]);
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Acquire { slot_id, .. } if slot_id == "slot-1")
+            |request| matches!(request, PendingRequest::Acquire { port, .. } if port == "COM3")
         ));
     }
 
@@ -10843,7 +10244,7 @@ mod tests {
         let mut app = ready_app_with_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             bytes: b"pwd\nversion\n".to_vec(),
             raw: true,
         });
@@ -10853,7 +10254,7 @@ mod tests {
         let (_, data, operation_id) = take_write(&mut received);
         assert_eq!(data, b"pwd\nversion\n");
         assert_eq!(operation_id, None);
-        assert!(app.pending_writes.contains_key("slot-1"));
+        assert!(app.pending_writes.contains_key("COM3"));
     }
 
     #[test]
@@ -10865,20 +10266,20 @@ mod tests {
             &commands,
         );
         assert!(matches!(
-            app.slots[0].subscription,
+            app.ports[0].subscription,
             SubscriptionPhase::Attaching
         ));
 
         app.handle_server_message(
             ServerMessage::ReplayBegin {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 from_seq: 4,
                 through_seq: 9,
             },
             &commands,
         );
         assert!(matches!(
-            app.slots[0].subscription,
+            app.ports[0].subscription,
             SubscriptionPhase::Replaying {
                 from_seq: 4,
                 through_seq: 9
@@ -10887,7 +10288,7 @@ mod tests {
 
         app.handle_server_message(
             ServerMessage::Ready {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 head_seq: 9,
             },
             &commands,
@@ -10896,14 +10297,14 @@ mod tests {
 
         app.handle_server_message(
             ServerMessage::Lagged {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 from_seq: 10,
                 to_seq: 20,
             },
             &commands,
         );
         assert!(matches!(
-            app.slots[0].subscription,
+            app.ports[0].subscription,
             SubscriptionPhase::Lagged {
                 from_seq: 10,
                 to_seq: 20
@@ -10928,105 +10329,74 @@ mod tests {
     fn output_title_uses_exact_bound_model_name_without_slot_or_baud() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
-        let mut app = App::new(vec![snapshot()], None);
-        let slot_id = app.selected_slot_id();
-        let model = DeviceModel {
-            id: "tl-as7230-1-0".into(),
-            name: "TL-AS7230 1.0".into(),
-            parent_id: None,
-            aliases: Vec::new(),
-        };
-        let binding = SlotModelBinding {
-            slot_id,
-            model_id: model.id.clone(),
-            confirmation_method: ModelConfirmationMethod::Human,
-            note: None,
-            updated_wall_time_ns: 0,
-            source: "human:serialctl".into(),
-        };
-        app.update_device_model_names(&[model], &[binding]);
+        let mut current = snapshot();
+        current.config.model_profile = Some("TL-AS7230 1.0".into());
+        let mut app = App::new(vec![current], None);
 
         let title = output_title(&app);
         assert!(title.contains("TL-AS7230 1.0"));
-        assert!(!title.contains("tl-as7230-1-0"));
-        assert!(!title.contains(&app.current().snapshot.config.display_name));
+        assert!(!title.contains(&app.current().snapshot.config.port));
         assert!(!title.contains("115200"));
 
-        app.device_model_names.clear();
+        app.ports[0].snapshot.config.model_profile = None;
         let fallback = output_title(&app);
         assert!(fallback.contains(tr("ui.output.model.unconfigured")));
-        assert!(!fallback.contains(&app.current().snapshot.config.display_name));
+        assert!(!fallback.contains(&app.current().snapshot.config.port));
     }
 
     #[test]
-    fn model_label_refresh_is_deduplicated_and_applies_external_bindings() {
+    fn top_status_uses_only_port_name_and_session_state() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::En);
         let mut app = App::new(vec![snapshot()], None);
-        let slot_id = app.selected_slot_id();
-        let (menu_commands, mut received) = mpsc::channel(4);
-        app.menu_commands = Some(menu_commands);
+        app.ports[0].subscription = SubscriptionPhase::Ready { head_seq: 42 };
+        app.ports[0].unseen = 99;
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("tab test terminal");
 
-        app.request_model_labels_refresh();
-        app.request_model_labels_refresh();
-        assert!(matches!(
-            received.try_recv(),
-            Ok(MenuIoCommand::LoadModelLabels)
-        ));
-        assert!(matches!(
-            received.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-
-        let model = DeviceModel {
-            id: "external-model".into(),
-            name: "TL-AS7230 1.0".into(),
-            parent_id: None,
-            aliases: Vec::new(),
-        };
-        app.handle_menu_io_event(MenuIoEvent::ModelLabelsLoaded(DeviceModelListResponse {
-            models: vec![model.clone()],
-            bindings: vec![SlotModelBinding {
-                slot_id,
-                model_id: model.id,
-                confirmation_method: ModelConfirmationMethod::Serial,
-                note: None,
-                updated_wall_time_ns: 0,
-                source: "agent:mcp".into(),
-            }],
-            config_revision: 2,
-        }));
-        assert!(output_title(&app).contains("TL-AS7230 1.0"));
-
-        app.request_model_labels_refresh();
-        assert!(matches!(
-            received.try_recv(),
-            Ok(MenuIoCommand::LoadModelLabels)
-        ));
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_tabs(frame, &app, area);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("COM3 · ONLINE"));
+        assert!(!rendered.contains("Port 1"));
+        assert!(!rendered.contains("LIVE#"));
+        assert!(!rendered.contains("+99"));
     }
 
     #[test]
     fn live_profile_refresh_updates_effective_behavior_without_changing_config() {
         let mut app = App::new(vec![snapshot()], None);
         let (commands, _) = mpsc::channel(4);
-        let config = app.slots[0].snapshot.config.clone();
-        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        let config = app.ports[0].snapshot.config.clone();
+        let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Running);
         let trigger_id = trigger.id;
-        app.slots[0].snapshot.active_trigger = Some(trigger);
+        app.ports[0].snapshot.active_trigger = Some(trigger);
         app.pending_writes
-            .entry("slot-1".into())
+            .entry("COM3".into())
             .or_default()
             .push_back(PendingWrite {
                 data: b"queued".to_vec(),
                 operation_id: None,
                 kind: PendingWriteKind::Line,
             });
-        let mut reconfigured = event(EventKind::SlotReconfigured, Direction::None, 1, &[]);
-        reconfigured.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let mut reconfigured = event(EventKind::PortReconfigured, Direction::None, 1, &[]);
+        reconfigured.daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         reconfigured
             .metadata
             .insert("current".into(), serde_json::to_value(&config).unwrap());
         reconfigured.metadata.insert(
             "effective".into(),
-            serde_json::to_value(ResolvedDeviceSettings {
+            serde_json::to_value(ResolvedModelSettings {
                 shell_prompt: Some("]# ".into()),
                 uboot_prompt: Some("Luckfox #".into()),
                 write_eol: "\n".into(),
@@ -11044,57 +10414,56 @@ mod tests {
 
         app.push_event(reconfigured, false, &commands);
 
-        assert_eq!(app.slots[0].snapshot.config, config);
+        assert_eq!(app.ports[0].snapshot.config, config);
         assert_eq!(
-            app.slots[0].snapshot.effective_shell_prompt.as_deref(),
+            app.ports[0].snapshot.effective_shell_prompt.as_deref(),
             Some("]# ")
         );
         assert_eq!(
-            app.slots[0].snapshot.effective_uboot_prompt.as_deref(),
+            app.ports[0].snapshot.effective_uboot_prompt.as_deref(),
             Some("Luckfox #")
         );
         assert_eq!(
-            app.slots[0].snapshot.effective_write_eol.as_deref(),
+            app.ports[0].snapshot.effective_write_eol.as_deref(),
             Some("\n")
         );
-        assert_eq!(app.slots[0].snapshot.effective_echo, Some(EchoMode::Off));
+        assert_eq!(app.ports[0].snapshot.effective_echo, Some(EchoMode::Off));
         assert_eq!(
-            app.slots[0].snapshot.effective_write_pacing,
+            app.ports[0].snapshot.effective_write_pacing,
             Some(WritePacing {
                 chunk_size: 1,
                 chunk_delay_ms: 1,
             })
         );
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .snapshot
                 .active_trigger
                 .as_ref()
                 .map(|trigger| trigger.id),
             Some(trigger_id)
         );
-        assert!(app.pending_writes.contains_key("slot-1"));
+        assert!(app.pending_writes.contains_key("COM3"));
     }
 
     #[test]
     fn physical_reconfigure_updates_config_even_if_metadata_claims_profile_only() {
         let mut app = App::new(vec![snapshot()], None);
         let (commands, _) = mpsc::channel(4);
-        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
-        app.slots[0].snapshot.active_trigger = Some(trigger);
-        let mut config = app.slots[0].snapshot.config.clone();
-        config.display_name = "Renamed station".into();
-        config.settings.baud_rate = 57_600;
+        let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Running);
+        app.ports[0].snapshot.active_trigger = Some(trigger);
+        let mut config = app.ports[0].snapshot.config.clone();
+        config.transport_profile = Some("uart-57600".into());
         app.pending_writes
-            .entry("slot-1".into())
+            .entry("COM3".into())
             .or_default()
             .push_back(PendingWrite {
                 data: b"queued".to_vec(),
                 operation_id: None,
                 kind: PendingWriteKind::Line,
             });
-        let mut reconfigured = event(EventKind::SlotReconfigured, Direction::None, 1, &[]);
-        reconfigured.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let mut reconfigured = event(EventKind::PortReconfigured, Direction::None, 1, &[]);
+        reconfigured.daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         reconfigured
             .metadata
             .insert("current".into(), serde_json::to_value(&config).unwrap());
@@ -11104,9 +10473,9 @@ mod tests {
 
         app.push_event(reconfigured, false, &commands);
 
-        assert_eq!(app.slots[0].snapshot.config, config);
-        assert!(app.slots[0].snapshot.active_trigger.is_none());
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert_eq!(app.ports[0].snapshot.config, config);
+        assert!(app.ports[0].snapshot.active_trigger.is_none());
+        assert!(!app.pending_writes.contains_key("COM3"));
     }
 
     #[test]
@@ -11114,7 +10483,7 @@ mod tests {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
         let owner = app.actor.clone().unwrap();
-        app.slots[0].snapshot.active_run = Some(RunInfo {
+        app.ports[0].snapshot.active_run = Some(RunInfo {
             id: Uuid::new_v4(),
             owner,
             label: "active run".into(),
@@ -11123,15 +10492,15 @@ mod tests {
             end_seq: None,
             metadata: BTreeMap::new(),
         });
-        let trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
-        app.slots[0].snapshot.active_trigger = Some(trigger);
+        let trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Running);
+        app.ports[0].snapshot.active_trigger = Some(trigger);
         let (commands, _) = mpsc::channel(4);
-        let mut removed = event(EventKind::SlotRemoved, Direction::None, 2, &[]);
-        removed.daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        let mut removed = event(EventKind::PortRemoved, Direction::None, 2, &[]);
+        removed.daemon_epoch = app.ports[0].snapshot.daemon_epoch;
 
         app.push_event(removed, false, &commands);
 
-        let snapshot = &app.slots[0].snapshot;
+        let snapshot = &app.ports[0].snapshot;
         assert_eq!(snapshot.session_state, SessionState::Disabled);
         assert_eq!(snapshot.state_reason.as_deref(), Some(tr("state.removed")));
         assert_eq!(snapshot.target_activity, TargetActivity::Unknown);
@@ -11145,17 +10514,17 @@ mod tests {
     fn queued_control_cancel_is_directed_and_preserves_other_slots() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
-        let slot_id = app.selected_slot_id();
-        app.slots[0].snapshot.control = Some(ControlLease {
+        let port = app.selected_port();
+        app.ports[0].snapshot.control = Some(ControlLease {
             owner: Actor {
                 id: "agent:other".into(),
                 label: "other-agent".into(),
                 kind: ActorKind::Agent,
             },
-            ..app.slots[0].snapshot.control.clone().expect("test lease")
+            ..app.ports[0].snapshot.control.clone().expect("test lease")
         });
         app.pending_writes
-            .entry(slot_id.clone())
+            .entry(port.clone())
             .or_default()
             .push_back(PendingWrite {
                 data: b"reboot\r".to_vec(),
@@ -11163,7 +10532,7 @@ mod tests {
                 kind: PendingWriteKind::Line,
             });
         app.queued_controls.insert(
-            slot_id.clone(),
+            port.clone(),
             QueuedControl {
                 _position: 1,
                 since: Instant::now(),
@@ -11172,19 +10541,19 @@ mod tests {
         app.pending_requests.insert(
             Uuid::new_v4(),
             PendingRequest::Acquire {
-                slot_id: slot_id.clone(),
+                port: port.clone(),
                 mode: ControlMode::Queue,
             },
         );
         let mut other = snapshot();
-        other.config.id = "slot-2".into();
-        other.config.display_name = "Slot 2".into();
+        other.config.port = "COM4".into();
+        other.config.port = "Port 2".into();
         other.config.port = "COM4".into();
         let mut other = SlotView::new(other);
         other.subscription = SubscriptionPhase::Ready { head_seq: 0 };
-        app.slots.push(other);
+        app.ports.push(other);
         app.pending_writes.insert(
-            "slot-2".into(),
+            "COM4".into(),
             VecDeque::from([PendingWrite {
                 data: b"version\r".to_vec(),
                 operation_id: Some(Uuid::new_v4()),
@@ -11192,7 +10561,7 @@ mod tests {
             }]),
         );
         app.queued_controls.insert(
-            "slot-2".into(),
+            "COM4".into(),
             QueuedControl {
                 _position: 2,
                 since: Instant::now(),
@@ -11201,7 +10570,7 @@ mod tests {
         app.pending_requests.insert(
             Uuid::new_v4(),
             PendingRequest::Acquire {
-                slot_id: "slot-2".into(),
+                port: "COM4".into(),
                 mode: ControlMode::Queue,
             },
         );
@@ -11215,21 +10584,21 @@ mod tests {
         };
         assert!(matches!(
             message,
-            ClientMessage::CancelAcquire { slot_id, .. } if slot_id == "slot-1"
+            ClientMessage::CancelAcquire { port, .. } if port == "COM3"
         ));
-        assert!(!app.pending_writes.contains_key("slot-1"));
-        assert!(app.pending_writes.contains_key("slot-2"));
-        assert!(!app.queued_controls.contains_key("slot-1"));
-        assert!(app.queued_controls.contains_key("slot-2"));
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(app.pending_writes.contains_key("COM4"));
+        assert!(!app.queued_controls.contains_key("COM3"));
+        assert!(app.queued_controls.contains_key("COM4"));
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Acquire { slot_id, .. } if slot_id == "slot-2")
+            |request| matches!(request, PendingRequest::Acquire { port, .. } if port == "COM4")
         ));
     }
 
     #[test]
     fn idle_human_control_is_released_instead_of_renewed_forever() {
         let mut app = ready_app_with_control();
-        app.slots[0].last_manual_activity =
+        app.ports[0].last_manual_activity =
             Some(Instant::now() - app.human_idle_release - Duration::from_secs(1));
         let (commands, mut received) = mpsc::channel(4);
 
@@ -11245,7 +10614,7 @@ mod tests {
     #[test]
     fn recent_human_activity_renews_control() {
         let mut app = ready_app_with_control();
-        app.slots[0].last_manual_activity = Some(Instant::now());
+        app.ports[0].last_manual_activity = Some(Instant::now());
         let (commands, mut received) = mpsc::channel(4);
 
         app.maintain_controls(&commands);
@@ -11261,7 +10630,7 @@ mod tests {
     fn history_search_finds_newest_match_and_cycles_to_older() {
         let mut app = App::new(vec![snapshot()], None);
         {
-            let view = &mut app.slots[0];
+            let view = &mut app.ports[0];
             view.history = vec![
                 "show version".into(),
                 "reboot".into(),
@@ -11279,19 +10648,19 @@ mod tests {
             ));
         }
         assert_eq!(
-            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            app.ports[0].history_search.as_ref().map(|s| s.match_index),
             Some(Some(2))
         );
 
         // Ctrl-R cycles to the older match, then wraps back to the newest.
         app.handle_history_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(
-            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            app.ports[0].history_search.as_ref().map(|s| s.match_index),
             Some(Some(0))
         );
         app.handle_history_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(
-            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            app.ports[0].history_search.as_ref().map(|s| s.match_index),
             Some(Some(2))
         );
 
@@ -11300,7 +10669,7 @@ mod tests {
             app.handle_history_search_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         }
         assert_eq!(
-            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            app.ports[0].history_search.as_ref().map(|s| s.match_index),
             Some(None)
         );
         for character in "int".chars() {
@@ -11310,15 +10679,15 @@ mod tests {
             ));
         }
         assert_eq!(
-            app.slots[0].history_search.as_ref().map(|s| s.match_index),
+            app.ports[0].history_search.as_ref().map(|s| s.match_index),
             Some(Some(2))
         );
 
         // Enter accepts the current match into the draft.
         app.handle_history_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.slots[0].history_search.is_none());
+        assert!(app.ports[0].history_search.is_none());
         assert_eq!(
-            app.slots[0].draft.iter().collect::<String>(),
+            app.ports[0].draft.iter().collect::<String>(),
             "show interfaces"
         );
     }
@@ -11327,7 +10696,7 @@ mod tests {
     fn history_search_escape_restores_the_original_draft() {
         let mut app = App::new(vec![snapshot()], None);
         {
-            let view = &mut app.slots[0];
+            let view = &mut app.ports[0];
             view.history = vec!["reboot".into()];
             view.draft = "keep me".chars().collect();
             view.draft_cursor = 7;
@@ -11335,16 +10704,16 @@ mod tests {
         app.start_history_search();
         app.handle_history_search_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert!(
-            app.slots[0]
+            app.ports[0]
                 .history_search
                 .as_ref()
                 .is_some_and(|s| s.match_index == Some(0))
         );
 
         app.handle_history_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.slots[0].history_search.is_none());
-        assert_eq!(app.slots[0].draft.iter().collect::<String>(), "keep me");
-        assert_eq!(app.slots[0].draft_cursor, 7);
+        assert!(app.ports[0].history_search.is_none());
+        assert_eq!(app.ports[0].draft.iter().collect::<String>(), "keep me");
+        assert_eq!(app.ports[0].draft_cursor, 7);
     }
 
     #[test]
@@ -11667,7 +11036,7 @@ mod tests {
             search.query = "needle".chars().collect();
             search.cursor = search.query.len();
         }
-        app.slots[0].snapshot.head_seq = 101;
+        app.ports[0].snapshot.head_seq = 101;
 
         app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -11696,8 +11065,8 @@ mod tests {
             search.cursor = search.query.len();
         }
         let new_epoch = Uuid::new_v4();
-        app.slots[0].snapshot.daemon_epoch = new_epoch;
-        app.slots[0].snapshot.head_seq = 7;
+        app.ports[0].snapshot.daemon_epoch = new_epoch;
+        app.ports[0].snapshot.head_seq = 7;
 
         app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -11731,8 +11100,8 @@ mod tests {
         }
         let mut replacement = agent_run("replacement");
         replacement.start_seq = 105;
-        app.slots[0].snapshot.active_run = Some(replacement.clone());
-        app.slots[0].snapshot.head_seq = 120;
+        app.ports[0].snapshot.active_run = Some(replacement.clone());
+        app.ports[0].snapshot.head_seq = 120;
 
         app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -11803,7 +11172,7 @@ mod tests {
     fn tab_completion_cycles_deduplicated_newest_first_candidates() {
         let mut app = App::new(vec![snapshot()], None);
         {
-            let view = &mut app.slots[0];
+            let view = &mut app.ports[0];
             view.history = vec![
                 "show version".into(),
                 "reset".into(),
@@ -11817,7 +11186,7 @@ mod tests {
 
         for expected in ["show version", "show interfaces", "show version"] {
             app.handle_line_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commands);
-            assert_eq!(app.slots[0].draft.iter().collect::<String>(), expected);
+            assert_eq!(app.ports[0].draft.iter().collect::<String>(), expected);
         }
 
         // Any other key confirms the candidate and leaves completion mode.
@@ -11825,18 +11194,18 @@ mod tests {
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
             &commands,
         );
-        assert!(app.slots[0].completion.is_none());
+        assert!(app.ports[0].completion.is_none());
         assert_eq!(
-            app.slots[0].draft.iter().collect::<String>(),
+            app.ports[0].draft.iter().collect::<String>(),
             "show version "
         );
 
         // An empty draft completes from the full history, newest first.
-        app.slots[0].draft.clear();
-        app.slots[0].draft_cursor = 0;
+        app.ports[0].draft.clear();
+        app.ports[0].draft_cursor = 0;
         app.handle_line_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commands);
         assert_eq!(
-            app.slots[0].draft.iter().collect::<String>(),
+            app.ports[0].draft.iter().collect::<String>(),
             "show version"
         );
     }
@@ -11844,25 +11213,40 @@ mod tests {
     #[test]
     fn enter_send_returns_the_view_to_the_live_tail() {
         let mut app = ready_app_with_control();
-        app.slots[0].scroll_from_bottom = 5;
-        app.slots[0].unseen = 3;
-        app.slots[0].draft = "version".chars().collect();
-        app.slots[0].draft_cursor = 7;
+        app.ports[0].scroll_from_bottom = 5;
+        app.ports[0].unseen = 3;
+        app.ports[0].draft = "version".chars().collect();
+        app.ports[0].draft_cursor = 7;
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
 
-        assert_eq!(app.slots[0].scroll_from_bottom, 0);
-        assert_eq!(app.slots[0].unseen, 0);
+        assert_eq!(app.ports[0].scroll_from_bottom, 0);
+        assert_eq!(app.ports[0].unseen, 0);
         assert!(received.try_recv().is_ok());
     }
 
     #[test]
-    fn line_send_uses_the_device_profiles_effective_eol() {
+    fn empty_enter_follows_the_serial_tail_without_sending() {
         let mut app = ready_app_with_control();
-        app.slots[0].snapshot.effective_write_eol = Some("\n".into());
-        app.slots[0].draft = "version".chars().collect();
-        app.slots[0].draft_cursor = 7;
+        app.ports[0].scroll_from_bottom = 5;
+        app.ports[0].unseen = 3;
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert_eq!(app.current().scroll_from_bottom, 0);
+        assert_eq!(app.current().unseen, 0);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn line_send_uses_the_model_profiles_effective_eol() {
+        let mut app = ready_app_with_control();
+        app.ports[0].snapshot.effective_write_eol = Some("\n".into());
+        app.ports[0].draft = "version".chars().collect();
+        app.ports[0].draft_cursor = 7;
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
@@ -11872,33 +11256,15 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_promptless_profile_does_not_revive_legacy_slot_prompts() {
-        let mut current = snapshot();
-        current.config.settings.shell_prompt = Some("legacy# ".into());
-        current.config.settings.uboot_prompt = Some("legacy=> ".into());
-        let mut view = SlotView::new(current);
-
-        assert_eq!(view.effective_shell_prompt(), None);
-        assert_eq!(view.effective_uboot_prompt(), None);
-
-        // An older daemon omits the entire effective bundle, so compatibility
-        // fallback remains available only in that case.
-        view.snapshot.effective_write_eol = None;
-        view.snapshot.effective_echo = None;
-        assert_eq!(view.effective_shell_prompt(), Some("legacy# "));
-        assert_eq!(view.effective_uboot_prompt(), Some("legacy=> "));
-    }
-
-    #[test]
     fn input_mode_and_command_history_are_isolated_per_slot() {
         let first = snapshot();
         let mut second = snapshot();
-        second.config.id = "slot-2".into();
-        second.config.display_name = "Slot 2".into();
+        second.config.port = "COM4".into();
+        second.config.port = "Port 2".into();
         second.config.port = "COM4".into();
         let mut app = App::new(vec![first, second], None);
-        app.slots[0].mode = InputMode::Raw;
-        app.slots[0].history.push("slot-one-command".into());
+        app.ports[0].mode = InputMode::Raw;
+        app.ports[0].history.push("port-one-command".into());
 
         app.select(1);
         assert_eq!(app.current_mode(), InputMode::Line);
@@ -11910,20 +11276,17 @@ mod tests {
         app.history_previous();
         assert_eq!(
             app.current().draft.iter().collect::<String>(),
-            "slot-one-command"
+            "port-one-command"
         );
     }
 
     fn snapshot() -> SlotSnapshot {
         SlotSnapshot {
             config: SlotConfig {
-                id: "slot-1".into(),
-                display_name: "Slot 1".into(),
                 port: "COM3".into(),
-                profile: "generic-115200".into(),
+                transport_profile: Some("generic-115200".into()),
+                model_profile: None,
                 enabled: true,
-                settings: SerialSettings::default(),
-                device_profile: None,
             },
             daemon_epoch: Uuid::new_v4(),
             head_seq: 0,
@@ -11956,9 +11319,13 @@ mod tests {
 
     fn editable_profile_fixture() -> (SlotSnapshot, MenuCatalog) {
         let mut current = snapshot();
-        current.config.device_profile = Some("dut-console".into());
+        current.config.model_profile = Some("dut-console".into());
         let transport = TransportProfile {
-            name: current.config.profile.clone(),
+            name: current
+                .config
+                .transport_profile
+                .clone()
+                .expect("fixture transport profile"),
             baud_rate: 115_200,
             data_bits: DataBits::Eight,
             parity: Parity::None,
@@ -11968,7 +11335,7 @@ mod tests {
             rts: false,
             auto_open: true,
         };
-        let device = DeviceProfile {
+        let device = ModelProfile {
             name: "dut-console".into(),
             shell_prompt: Some("dut# ".into()),
             uboot_prompt: Some("dut=> ".into()),
@@ -11978,16 +11345,12 @@ mod tests {
             write_chunk_delay_ms: Some(1),
         };
         let catalog = MenuCatalog {
-            auth_required: false,
-            slots: vec![current.clone()],
+            ports: vec![current.clone()],
             config_revision: Some(41),
             transport_profiles: vec![transport],
             transport_revision: Some(41),
-            device_profiles: vec![device],
-            device_revision: Some(41),
-            models: Vec::new(),
-            model_bindings: Vec::new(),
-            model_revision: 41,
+            model_profiles: vec![device],
+            model_profile_revision: Some(41),
         };
         (current, catalog)
     }
@@ -12063,16 +11426,16 @@ mod tests {
         });
         let mut app = App::new(vec![snapshot], None);
         app.transport_connected = true;
-        app.authenticated = true;
+        app.hello_accepted = true;
         app.connection_generation = Some(1);
         app.actor = Some(actor);
-        app.slots[0].subscription = SubscriptionPhase::Ready { head_seq: 0 };
+        app.ports[0].subscription = SubscriptionPhase::Ready { head_seq: 0 };
         app
     }
 
     fn ready_app_with_foreign_control() -> App {
         let mut app = ready_app_with_control();
-        app.slots[0]
+        app.ports[0]
             .snapshot
             .control
             .as_mut()
@@ -12104,7 +11467,7 @@ mod tests {
 
     fn event(kind: EventKind, direction: Direction, seq: u64, data: &[u8]) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "COM3".into(),
             daemon_epoch: Uuid::new_v4(),
             seq,
             generation: 1,
@@ -12171,8 +11534,8 @@ mod tests {
     #[test]
     fn wrapped_live_output_keeps_the_latest_prompt_visible_at_eighty_columns() {
         let mut app = App::new(vec![snapshot()], None);
-        app.slots[0].push_line(stream_row(1, Direction::Rx, &"x".repeat(2_000)), true);
-        app.slots[0].pending_line = Some(stream_row(2, Direction::Rx, "__LATEST_PROMPT__ "));
+        app.ports[0].push_line(stream_row(1, Direction::Rx, &"x".repeat(2_000)), true);
+        app.ports[0].pending_line = Some(stream_row(2, Direction::Rx, "__LATEST_PROMPT__ "));
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
@@ -12194,10 +11557,10 @@ mod tests {
     fn visual_separators_do_not_repeat_trigger_or_control_details() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
-        let mut trigger = trigger_info(&app.slots[0].snapshot, TriggerStatus::Running);
+        let mut trigger = trigger_info(&app.ports[0].snapshot, TriggerStatus::Running);
         trigger.fires_confirmed = 7;
         let short_id = trigger.id.to_string().chars().take(8).collect::<String>();
-        app.slots[0].snapshot.active_trigger = Some(trigger);
+        app.ports[0].snapshot.active_trigger = Some(trigger);
         let backend = TestBackend::new(180, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
@@ -12317,7 +11680,7 @@ mod tests {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
         let mut app = ready_app_with_foreign_control();
-        app.slots[0].snapshot.active_run = Some(agent_run("升级固件"));
+        app.ports[0].snapshot.active_run = Some(agent_run("升级固件"));
         let (commands, mut received) = mpsc::channel(2);
 
         assert!(app.acquire_control(&commands, ControlMode::Takeover));
@@ -12344,8 +11707,8 @@ mod tests {
         let lease = ControlLease {
             id: Uuid::new_v4(),
             owner: app.actor.clone().expect("human actor"),
-            epoch: app.slots[0].snapshot.daemon_epoch,
-            generation: app.slots[0].snapshot.generation,
+            epoch: app.ports[0].snapshot.daemon_epoch,
+            generation: app.ports[0].snapshot.generation,
             fence: 2,
             issued_wall_time_ns: 2,
             expires_wall_time_ns: i64::MAX,
@@ -12364,8 +11727,8 @@ mod tests {
         i18n::set_lang(i18n::Lang::Zh);
         let mut app = ready_app_with_foreign_control();
         let run = agent_run("检查启动日志");
-        app.slots[0].snapshot.active_run = Some(run.clone());
-        let daemon_epoch = app.slots[0].snapshot.daemon_epoch;
+        app.ports[0].snapshot.active_run = Some(run.clone());
+        let daemon_epoch = app.ports[0].snapshot.daemon_epoch;
         let (commands, _) = mpsc::channel(2);
         let mut aborted = event(EventKind::RunAborted, Direction::None, 2, &[]);
         aborted.daemon_epoch = daemon_epoch;
@@ -12379,7 +11742,7 @@ mod tests {
 
         app.push_event(aborted, false, &commands);
 
-        assert!(app.slots[0].snapshot.active_run.is_none());
+        assert!(app.ports[0].snapshot.active_run.is_none());
         assert!(app.status.contains("Agent 任务已中止"));
         assert!(app.status.contains("检查启动日志"));
         assert!(app.status.contains("human takeover"));
@@ -12473,8 +11836,8 @@ mod tests {
             Some("读取系统版本")
         );
         assert_eq!(history.commands[1].steps[0].data, b"uname -a\r");
-        assert_eq!(view.run_command_keys()[0].first_seq, 4);
-        assert_eq!(view.run_command_keys()[1].first_seq, 2);
+        assert_eq!(view.run_command_keys()[0].first_seq, 2);
+        assert_eq!(view.run_command_keys()[1].first_seq, 4);
 
         let mut human_run = run.clone();
         human_run.id = Uuid::new_v4();
@@ -12531,7 +11894,7 @@ mod tests {
                 .insert("command_sequence_step_count".into(), serde_json::json!(2));
             tx.metadata
                 .insert("partial".into(), serde_json::json!(partial));
-            app.slots[0].push_event(tx, true);
+            app.ports[0].push_event(tx, true);
         }
 
         let history = &app.current().run_history[0];
@@ -12650,7 +12013,7 @@ mod tests {
         });
         let mut menu = MenuState::new();
         menu.busy = true;
-        menu.selected = 3;
+        menu.selected = 2;
 
         app.activate_menu_item(&mut menu);
         assert_eq!(menu.page, MenuPage::DisplaySettings);
@@ -12677,15 +12040,13 @@ mod tests {
     fn current_profile_page_edits_fields_and_submits_observed_revisions() {
         let (current, mut catalog) = editable_profile_fixture();
         let mut transport_peer = current.clone();
-        transport_peer.config.id = "slot-2".into();
-        transport_peer.config.display_name = "Peer UART".into();
-        transport_peer.config.device_profile = None;
+        transport_peer.config.port = "COM4".into();
+        transport_peer.config.model_profile = None;
         let mut device_peer = current.clone();
-        device_peer.config.id = "slot-3".into();
-        device_peer.config.display_name = "Peer DUT".into();
-        device_peer.config.profile = "other-uart".into();
+        device_peer.config.port = "COM5".into();
+        device_peer.config.transport_profile = Some("other-uart".into());
         catalog
-            .slots
+            .ports
             .extend([transport_peer.clone(), device_peer.clone()]);
         let mut app = App::new(vec![current], None);
         let (menu_commands, mut received) = mpsc::channel(2);
@@ -12700,7 +12061,11 @@ mod tests {
             .into_iter()
             .map(|line| line_plain_text(&line))
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT);
+        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT + 2);
+        assert_eq!(rows[0], tr("menu.current.section.serial"));
+        assert_eq!(rows[11], tr("menu.current.section.model"));
+        assert!(rows[1].starts_with("▶     "));
+        assert!(rows[12].starts_with("      "));
         for expected in [
             "COM3",
             "115200",
@@ -12752,10 +12117,10 @@ mod tests {
             .take()
             .expect("shared profile impact confirmation");
         let confirmation_text = confirmation.lines.join("\n");
-        for expected in ["slot-1", "slot-2", "slot-3", "Peer UART", "Peer DUT"] {
+        for expected in ["COM3", "COM4", "COM5"] {
             assert!(
                 confirmation_text.contains(expected),
-                "confirmation must list every affected Slot: {confirmation_text}"
+                "confirmation must list every affected Port: {confirmation_text}"
             );
         }
         app.handle_menu_confirmation_key(
@@ -12764,27 +12129,28 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
 
-        let MenuIoCommand::Admin {
-            token: None,
-            mutation:
-                MenuAdminMutation::UpdateCurrentProfiles {
-                    slot_id,
-                    port: Some(port),
-                    transport: Some(transport),
-                    device: Some(device),
-                    expected_config_revision,
-                    expected_transport_revision,
-                    expected_device_revision,
-                },
-        } = received.try_recv().expect("profile update command")
+        let MenuIoCommand::Mutation { mutation } =
+            received.try_recv().expect("profile update command")
         else {
             panic!("expected a trusted current-profile update")
         };
-        assert_eq!(slot_id, "slot-1");
-        assert_eq!(port, "/dev/ttyUSB7");
+        let MenuMutation::UpdateCurrentProfiles {
+            current_port,
+            new_port: Some(new_port),
+            transport: Some(transport),
+            device: Some(device),
+            expected_config_revision,
+            expected_transport_revision,
+            expected_model_profile_revision,
+        } = *mutation
+        else {
+            panic!("expected a current-profile update")
+        };
+        assert_eq!(current_port, "COM3");
+        assert_eq!(new_port, "/dev/ttyUSB7");
         assert_eq!(expected_config_revision, Some(41));
         assert_eq!(expected_transport_revision, Some(41));
-        assert_eq!(expected_device_revision, Some(41));
+        assert_eq!(expected_model_profile_revision, Some(41));
         assert_eq!(transport.baud_rate, 921_600);
         assert_eq!(transport.data_bits, DataBits::Five);
         assert_eq!(device.echo, Some(EchoMode::Off));
@@ -12794,14 +12160,12 @@ mod tests {
     fn shared_profile_impact_scans_transport_and_device_bindings_separately() {
         let (current, mut catalog) = editable_profile_fixture();
         let mut transport_peer = current.clone();
-        transport_peer.config.id = "a-transport-peer".into();
-        transport_peer.config.display_name = "Transport peer".into();
-        transport_peer.config.device_profile = None;
+        transport_peer.config.port = "COM4".into();
+        transport_peer.config.model_profile = None;
         let mut device_peer = current.clone();
-        device_peer.config.id = "z-device-peer".into();
-        device_peer.config.display_name = "Device peer".into();
-        device_peer.config.profile = "other-uart".into();
-        catalog.slots.extend([transport_peer, device_peer]);
+        device_peer.config.port = "COM5".into();
+        device_peer.config.transport_profile = Some("other-uart".into());
+        catalog.ports.extend([transport_peer, device_peer]);
 
         let editor = CurrentProfileEditor::new(&SlotView::new(current), &catalog);
         let impacts =
@@ -12810,118 +12174,22 @@ mod tests {
             impacts
                 .transport
                 .expect("transport impact")
-                .slots
+                .ports
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>(),
-            vec!["a-transport-peer", "slot-1"]
+            vec!["COM3", "COM4"]
         );
         assert_eq!(
             impacts
                 .device
                 .expect("device impact")
-                .slots
+                .ports
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>(),
-            vec!["slot-1", "z-device-peer"]
+            vec!["COM3", "COM5"]
         );
-    }
-
-    #[test]
-    fn bound_model_rename_lists_every_affected_slot_before_revision_guarded_command() {
-        let _guard = crate::i18n::lang_test_lock();
-        let (current, mut catalog) = editable_profile_fixture();
-        let model = DeviceModel {
-            id: "tl-as7230-1-0".into(),
-            name: "TL-AS7230 1.0".into(),
-            parent_id: None,
-            aliases: Vec::new(),
-        };
-        catalog.model_bindings.push(SlotModelBinding {
-            slot_id: current.config.id.clone(),
-            model_id: model.id.clone(),
-            confirmation_method: ModelConfirmationMethod::Human,
-            note: None,
-            updated_wall_time_ns: 0,
-            source: "human:test".into(),
-        });
-        let mut peer = current.clone();
-        peer.config.id = "slot-model-peer".into();
-        peer.config.display_name = "Peer DUT".into();
-        catalog.slots.push(peer.clone());
-        catalog.model_bindings.push(SlotModelBinding {
-            slot_id: peer.config.id.clone(),
-            model_id: model.id.clone(),
-            confirmation_method: ModelConfirmationMethod::Human,
-            note: None,
-            updated_wall_time_ns: 0,
-            source: "human:test".into(),
-        });
-        catalog.models.push(model);
-        catalog.model_revision = 77;
-        let mut app = App::new(vec![current], None);
-        let (menu_commands, mut received) = mpsc::channel(1);
-        app.menu_commands = Some(menu_commands);
-        let mut menu = MenuState::new();
-        menu.page = MenuPage::Profiles;
-        menu.catalog = Some(catalog);
-        menu.busy = false;
-        app.refresh_current_profile_editor(&mut menu);
-        menu.selected = CurrentProfileRow::ModelName as usize;
-
-        app.activate_current_profile_row(&mut menu);
-        let mut prompt = menu.prompt.take().expect("model-name editor");
-        prompt.value = "TL-AS7230 1.1".chars().collect();
-        prompt.cursor = prompt.value.len();
-        app.handle_menu_prompt_key(
-            &mut menu,
-            prompt,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
-
-        assert!(
-            received.try_recv().is_err(),
-            "a shared model rename must not submit before explicit confirmation"
-        );
-        let confirmation = menu
-            .confirmation
-            .take()
-            .expect("shared model impact confirmation");
-        let confirmation_text = confirmation.lines.join("\n");
-        for expected in ["slot-1", "slot-model-peer", "Peer DUT", "tl-as7230-1-0"] {
-            assert!(
-                confirmation_text.contains(expected),
-                "confirmation must list every affected Slot: {confirmation_text}"
-            );
-        }
-        app.handle_menu_confirmation_key(
-            &mut menu,
-            confirmation,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
-
-        assert!(matches!(
-            received.try_recv(),
-            Ok(MenuIoCommand::RenameBoundModel {
-                slot_id,
-                model_id,
-                name,
-                expected_revision: 77,
-                expected_current: Some(current),
-            }) if slot_id == "slot-1"
-                && model_id == "tl-as7230-1-0"
-                && name == "TL-AS7230 1.1"
-                && current == "tl-as7230-1-0"
-        ));
-
-        let message = menu_success_message(&MenuSuccess::ModelRenamed {
-            name: "TL-AS7230 1.1".into(),
-            affected_slots: vec!["slot-1".into(), "slot-model-peer".into()],
-        });
-        assert!(message.contains("2"));
-        assert!(message.contains("slot-1"));
-        assert!(message.contains("slot-model-peer"));
     }
 
     #[test]
@@ -12942,7 +12210,7 @@ mod tests {
         });
         let mut menu = MenuState::new();
         menu.busy = true;
-        menu.selected = 4;
+        menu.selected = 3;
 
         app.activate_menu_item(&mut menu);
         assert_eq!(menu.page, MenuPage::RunSettings);
@@ -13039,9 +12307,9 @@ mod tests {
             "the oldest start sequences, not the earliest insertions, are evicted"
         );
         assert_eq!(
-            view.run_history_newest_first()[0].id,
+            view.run_history_chronological().last().unwrap().id,
             active.id,
-            "the authoritative active Run stays at the top"
+            "the newest authoritative Run stays at the bottom"
         );
     }
 
@@ -13067,14 +12335,14 @@ mod tests {
                 .insert("command_description".into(), serde_json::json!(description));
             tx.metadata
                 .insert("partial".into(), serde_json::json!(seq == 2));
-            app.slots[0].push_event(tx, true);
+            app.ports[0].push_event(tx, true);
         }
 
-        assert_eq!(app.current().selected_run_command_index(), Some(0));
-        app.focus = PaneFocus::RunHistory;
-        app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.current().selected_run_command_index(), Some(1));
-        app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.current().selected_run_command_index(), Some(0));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(
             app.current().expanded_run_command,
             Some(RunCommandKey {
@@ -13160,6 +12428,268 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_browse_agent_history_and_printable_input_returns_to_editor() {
+        let mut current = snapshot();
+        let run = agent_run("方向键巡检");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for (seq, description, data) in [
+            (2, "第一条", b"first\r".as_slice()),
+            (3, "第二条", b"second\r".as_slice()),
+        ] {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, data);
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata
+                .insert("command_description".into(), serde_json::json!(description));
+            app.ports[0].push_event(tx, true);
+        }
+        let (commands, _) = mpsc::channel(1);
+
+        assert_eq!(app.current().selected_run_command_index(), Some(1));
+        let history = run_history_rows(&app, 80)
+            .into_iter()
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(history.find("第一条").unwrap() < history.find("第二条").unwrap());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
+        assert_eq!(app.focus, PaneFocus::RunHistory);
+        assert_eq!(app.current().selected_run_command_index(), Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.current().expanded_run_command,
+            Some(RunCommandKey {
+                run_id: run.id,
+                first_seq: 2,
+            })
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &commands,
+        );
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert_eq!(app.current().draft.iter().collect::<String>(), "x");
+        assert!(app.current().scroll_snapshot.is_none());
+    }
+
+    #[test]
+    fn selected_command_highlights_device_echo_through_the_prompt() {
+        let mut current = snapshot();
+        current.effective_shell_prompt = Some("dut# ".into());
+        let run = agent_run("匹配输出");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"show version\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata.insert(
+            "command_description".into(),
+            serde_json::json!("读取系统版本"),
+        );
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind": "shell_prompt", "value": "dut# "}]),
+        );
+        app.ports[0].push_event(tx, true);
+        let mut rx = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"show version\r\nfirmware 1.0\r\ndut# \r\n",
+        );
+        rx.daemon_epoch = epoch;
+        app.ports[0].push_event(rx, true);
+        app.ports[0].push_line(stream_row(4, Direction::Rx, "later output"), true);
+        app.focus = PaneFocus::RunHistory;
+
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+        let rows = render_output_entries(&app, &entries, 80);
+        let captured = rows
+            .iter()
+            .filter(|row| row.line.style.bg == Some(Color::Rgb(28, 53, 66)))
+            .map(|row| line_plain_text(&row.line))
+            .collect::<String>();
+        assert!(captured.contains("show version"));
+        assert!(captured.contains("firmware 1.0"));
+        assert!(captured.contains("dut#"));
+        assert!(!captured.contains("later output"));
+        assert!(
+            !rows
+                .iter()
+                .map(|row| line_plain_text(&row.line))
+                .any(|line| line.starts_with('›'))
+        );
+    }
+
+    #[test]
+    fn explicit_regex_capture_matcher_overrides_an_earlier_profile_prompt() {
+        let mut current = snapshot();
+        current.effective_shell_prompt = Some("dut# ".into());
+        let run = agent_run("等待显式结束条件");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"show status\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata
+            .insert("command_description".into(), serde_json::json!("读取状态"));
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind": "regex", "value": "DONE\\s+[0-9]+"}]),
+        );
+        app.ports[0].push_event(tx, true);
+
+        let mut rx = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"show status\r\ndut# early\r\nstill running\r\nDONE\r\n42\r\nafter\r\n",
+        );
+        rx.daemon_epoch = epoch;
+        app.ports[0].push_event(rx, true);
+        app.focus = PaneFocus::RunHistory;
+
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+        let rows = render_output_entries(&app, &entries, 80);
+        let captured = rows
+            .iter()
+            .filter(|row| row.line.style.bg == Some(Color::Rgb(28, 53, 66)))
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>();
+        assert!(captured.iter().any(|line| line.contains("dut# early")));
+        assert!(captured.iter().any(|line| line.contains("still running")));
+        assert!(captured.iter().any(|line| line.contains("42")));
+        assert!(!captured.iter().any(|line| line.contains("after")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| line_plain_text(&row.line).starts_with('›'))
+        );
+    }
+
+    #[test]
+    fn command_sequence_capture_ends_at_the_last_steps_matcher() {
+        let mut current = snapshot();
+        let run = agent_run("登录设备");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let sequence_id = Uuid::new_v4();
+        let mut app = App::new(vec![current], None);
+
+        for (seq, index, command, matcher) in [
+            (2, 0, b"login\r".as_slice(), "Username:"),
+            (4, 1, b"admin\r".as_slice(), "Password:"),
+        ] {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, command);
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata.insert(
+                "command_description".into(),
+                serde_json::json!(format!("登录步骤 {}", index + 1)),
+            );
+            tx.metadata.insert(
+                "command_sequence_description".into(),
+                serde_json::json!("登录设备"),
+            );
+            tx.metadata
+                .insert("command_sequence_id".into(), serde_json::json!(sequence_id));
+            tx.metadata.insert(
+                "command_sequence_step_index".into(),
+                serde_json::json!(index),
+            );
+            tx.metadata.insert(
+                "command_capture_matchers".into(),
+                serde_json::json!([{"kind": "contains", "value": matcher}]),
+            );
+            app.ports[0].push_event(tx, true);
+
+            let response = if index == 0 {
+                b"login\r\nUsername:\r\n".as_slice()
+            } else {
+                b"admin\r\nPassword:\r\n".as_slice()
+            };
+            let mut rx = event(EventKind::Rx, Direction::Rx, seq + 1, response);
+            rx.daemon_epoch = epoch;
+            app.ports[0].push_event(rx, true);
+        }
+        app.ports[0].push_line(stream_row(6, Direction::Rx, "after login"), true);
+        app.focus = PaneFocus::RunHistory;
+
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+        let rows = render_output_entries(&app, &entries, 80);
+        let captured = rows
+            .iter()
+            .filter(|row| row.line.style.bg == Some(Color::Rgb(28, 53, 66)))
+            .map(|row| line_plain_text(&row.line))
+            .collect::<String>();
+        assert!(captured.contains("login"));
+        assert!(captured.contains("Username:"));
+        assert!(captured.contains("admin"));
+        assert!(captured.contains("Password:"));
+        assert!(!captured.contains("after login"));
+    }
+
+    #[test]
+    fn unmatched_command_uses_a_temporary_overlay_only_while_history_is_selected() {
+        let mut current = snapshot();
+        current.effective_shell_prompt = Some("dut# ".into());
+        let run = agent_run("无回显输出");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"show version\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata.insert(
+            "command_description".into(),
+            serde_json::json!("读取系统版本"),
+        );
+        app.ports[0].push_event(tx, true);
+        let mut rx = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"show version\r\nfirmware 1.0\r\ndut# \r\n",
+        );
+        rx.daemon_epoch = epoch;
+        app.ports[0].push_event(rx, true);
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+
+        app.focus = PaneFocus::RunHistory;
+        let selected = render_output_entries(&app, &entries, 80)
+            .into_iter()
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>();
+        assert!(selected.iter().any(|line| line == "› show version"));
+
+        app.focus = PaneFocus::Input;
+        let ordinary = render_output_entries(&app, &entries, 80)
+            .into_iter()
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>();
+        assert!(!ordinary.iter().any(|line| line.starts_with('›')));
+        assert!(ordinary.iter().any(|line| line.contains("show version")));
+    }
+
+    #[test]
     fn expanding_command_history_jumps_serial_output_to_its_operation() {
         let mut current = snapshot();
         let run = agent_run("定位历史命令");
@@ -13167,7 +12697,7 @@ mod tests {
         let epoch = current.daemon_epoch;
         let mut app = App::new(vec![current], None);
         for seq in 1..30 {
-            app.slots[0].push_line(
+            app.ports[0].push_line(
                 stream_row(seq, Direction::Rx, &format!("before-{seq}")),
                 true,
             );
@@ -13182,12 +12712,12 @@ mod tests {
             "command_description".into(),
             serde_json::json!("读取系统版本"),
         );
-        app.slots[0].push_event(tx, true);
+        app.ports[0].push_event(tx, true);
         let mut echo = event(EventKind::Rx, Direction::Rx, 31, b"show version\r\n");
         echo.daemon_epoch = epoch;
-        app.slots[0].push_event(echo, true);
+        app.ports[0].push_event(echo, true);
         for seq in 32..70 {
-            app.slots[0].push_line(
+            app.ports[0].push_line(
                 stream_row(seq, Direction::Rx, &format!("after-{seq}")),
                 true,
             );
@@ -13197,7 +12727,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         app.focus = PaneFocus::RunHistory;
-        app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
         assert!(app.current().scroll_snapshot.is_some());
         assert!(app.current().scroll_from_bottom > 0);
@@ -13210,7 +12740,7 @@ mod tests {
         assert!(
             all_output_visual_rows(&app, inner.width)
                 .iter()
-                .any(|row| row.operation_id == Some(operation_id))
+                .all(|row| row.operation_id != Some(operation_id))
         );
     }
 
@@ -13232,11 +12762,11 @@ mod tests {
                 .insert("command_description".into(), serde_json::json!(description));
             tx
         };
-        app.slots[0].push_event(described_tx(2, "第一条命令", b"first command"), true);
+        app.ports[0].push_event(described_tx(2, "第一条命令", b"first command"), true);
         assert!(app.current().selected_run_command.is_none());
 
         app.focus = PaneFocus::RunHistory;
-        app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let pinned = RunCommandKey {
             run_id: run.id,
             first_seq: 2,
@@ -13244,7 +12774,7 @@ mod tests {
         assert_eq!(app.current().selected_run_command, Some(pinned));
         assert_eq!(app.current().expanded_run_command, Some(pinned));
 
-        app.slots[0].push_event(described_tx(3, "第二条命令", b"second command"), true);
+        app.ports[0].push_event(described_tx(3, "第二条命令", b"second command"), true);
         assert_eq!(app.current().selected_run_command_key(), Some(pinned));
         assert_eq!(app.current().expanded_run_command, Some(pinned));
 
@@ -13285,9 +12815,9 @@ mod tests {
             tx.operation_id = Some(Uuid::new_v4());
             tx.metadata
                 .insert("command_description".into(), serde_json::json!("用途"));
-            app.slots[0].push_event(tx, true);
+            app.ports[0].push_event(tx, true);
             app.focus = PaneFocus::RunHistory;
-            app.handle_run_history_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
 
             let width = 18;
             let key = app.current().selected_run_command_key().unwrap();
@@ -13333,7 +12863,7 @@ mod tests {
             "command_description".into(),
             serde_json::json!("读取完整配置"),
         );
-        app.slots[0].push_event(tx, true);
+        app.ports[0].push_event(tx, true);
         app.focus = PaneFocus::RunHistory;
         let key = app.current().selected_run_command_key().unwrap();
         app.current_mut().expanded_run_command = Some(key);
@@ -13423,7 +12953,7 @@ mod tests {
         assert!(!transport_text.contains("Hardware"));
         assert!(!transport_text.contains("true"));
 
-        let device = DeviceProfile {
+        let device = ModelProfile {
             name: "interaction-test".into(),
             shell_prompt: Some("dut# ".into()),
             uboot_prompt: Some("dut=> ".into()),
@@ -13432,11 +12962,11 @@ mod tests {
             write_chunk_size: Some(8),
             write_chunk_delay_ms: Some(10),
         };
-        let device_text = device_profile_detail(&device);
+        let device_text = model_profile_detail(&device);
         assert!(device_text.contains("Shell 提示符 dut#"));
         assert!(device_text.contains("U-Boot 提示符 dut=>"));
         assert!(device_text.contains("换行 CRLF"));
-        assert!(device_text.contains("回显自动"));
+        assert!(device_text.contains("自动判断"));
         assert!(device_text.contains("分段发送：每段 8 字节，间隔 10 毫秒"));
         assert!(!device_text.contains("Auto"));
     }
@@ -13463,7 +12993,7 @@ mod tests {
     fn visual_scroll_does_nothing_when_history_fits_the_viewport() {
         let mut app = App::new(vec![snapshot()], None);
         for seq in 0..3 {
-            app.slots[0].push_line(stream_row(seq, Direction::Rx, "short"), true);
+            app.ports[0].push_line(stream_row(seq, Direction::Rx, "short"), true);
         }
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -13480,7 +13010,7 @@ mod tests {
     #[test]
     fn visual_scroll_can_move_inside_one_wrapped_logical_line() {
         let mut app = App::new(vec![snapshot()], None);
-        app.slots[0].push_line(stream_row(1, Direction::Rx, &"x".repeat(2_000)), true);
+        app.ports[0].push_line(stream_row(1, Direction::Rx, &"x".repeat(2_000)), true);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
@@ -13497,7 +13027,7 @@ mod tests {
     fn paused_visual_snapshot_does_not_drift_when_live_rows_arrive() {
         let mut app = App::new(vec![snapshot()], None);
         for seq in 0..30 {
-            app.slots[0].push_line(stream_row(seq, Direction::Rx, &format!("row-{seq}")), true);
+            app.ports[0].push_line(stream_row(seq, Direction::Rx, &format!("row-{seq}")), true);
         }
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -13512,7 +13042,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for seq in 30..35 {
-            app.slots[0].push_line(stream_row(seq, Direction::Rx, &format!("live-{seq}")), true);
+            app.ports[0].push_line(stream_row(seq, Direction::Rx, &format!("live-{seq}")), true);
         }
         let after = visible_output_lines(&app, inner)
             .iter()
@@ -13535,10 +13065,10 @@ mod tests {
     #[test]
     fn detailed_view_change_releases_frozen_rows_for_every_slot() {
         let mut second = snapshot();
-        second.config.id = "slot-2".into();
-        second.config.display_name = "Slot 2".into();
+        second.config.port = "COM4".into();
+        second.config.port = "Port 2".into();
         let mut app = App::new(vec![snapshot(), second], None);
-        for slot in &mut app.slots {
+        for slot in &mut app.ports {
             slot.scroll_snapshot = Some(ScrollSnapshot {
                 rows: vec![Line::from("frozen")],
             });
@@ -13553,7 +13083,7 @@ mod tests {
         );
 
         assert!(app.detailed_timeline);
-        assert!(app.slots.iter().all(|slot| slot.scroll_snapshot.is_none()
+        assert!(app.ports.iter().all(|slot| slot.scroll_snapshot.is_none()
             && slot.scroll_from_bottom == 0
             && slot.unseen == 0));
     }
@@ -13612,7 +13142,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_view_keeps_prompt_command_and_echo_on_one_row() {
+    fn serial_pane_ignores_tx_and_shows_only_the_device_echo() {
         let mut view = SlotView::new(snapshot());
         let epoch = view.snapshot.daemon_epoch;
 
@@ -13630,7 +13160,7 @@ mod tests {
         view.push_event(tx, true);
         assert_eq!(
             view.pending_line.as_ref().map(|line| line.text.as_str()),
-            Some("[root@luckfox tmp]# cd")
+            Some("[root@luckfox tmp]# ")
         );
 
         let mut echoed = event(EventKind::Rx, Direction::Rx, 3, b"cd\r\n");
@@ -13639,13 +13169,13 @@ mod tests {
 
         assert_eq!(view.lines.len(), 1);
         assert_eq!(view.lines[0].text, "[root@luckfox tmp]# cd");
-        assert_eq!(view.lines[0].marker_color, Some(Color::Green));
-        assert!(view.lines[0].echoed);
+        assert_eq!(view.lines[0].marker_color, None);
+        assert!(!view.lines[0].echoed);
         assert!(view.pending_line.is_none());
     }
 
     #[test]
-    fn raw_mode_uses_the_same_inline_echo_projection() {
+    fn raw_mode_also_shows_only_bytes_echoed_by_the_device() {
         let mut view = SlotView::new(snapshot());
         view.mode = InputMode::Raw;
         let epoch = view.snapshot.daemon_epoch;
@@ -13675,12 +13205,12 @@ mod tests {
     #[test]
     fn stale_replay_tx_does_not_duplicate_a_later_live_raw_echo() {
         let mut app = App::new(vec![snapshot()], None);
-        let epoch = app.slots[0].snapshot.daemon_epoch;
+        let epoch = app.ports[0].snapshot.daemon_epoch;
         let (commands, _) = mpsc::channel(4);
 
         app.handle_server_message(
             ServerMessage::ReplayBegin {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 from_seq: 1,
                 through_seq: 3,
             },
@@ -13711,7 +13241,7 @@ mod tests {
 
         app.handle_server_message(
             ServerMessage::Ready {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 head_seq: 3,
             },
             &commands,
@@ -13737,17 +13267,17 @@ mod tests {
         response.daemon_epoch = epoch;
         app.push_event(response, false, &commands);
 
-        let pwd_rows = app.slots[0]
+        let pwd_rows = app.ports[0]
             .lines
             .iter()
             .filter(|line| line.text.contains("pwd"))
             .collect::<Vec<_>>();
         assert_eq!(pwd_rows.len(), 1);
         assert_eq!(pwd_rows[0].text, "[root@luckfox ~]# pwd");
-        assert!(pwd_rows[0].echoed);
-        assert!(app.slots[0].lines.iter().any(|line| line.text == "/oem"));
+        assert!(!pwd_rows[0].echoed);
+        assert!(app.ports[0].lines.iter().any(|line| line.text == "/oem"));
         assert_eq!(
-            app.slots[0]
+            app.ports[0]
                 .pending_line
                 .as_ref()
                 .map(|line| line.text.as_str()),
@@ -13756,9 +13286,9 @@ mod tests {
     }
 
     #[test]
-    fn ready_preserves_an_in_flight_replay_echo() {
+    fn ready_does_not_project_an_in_flight_tx_into_rx_output() {
         let mut app = App::new(vec![snapshot()], None);
-        let epoch = app.slots[0].snapshot.daemon_epoch;
+        let epoch = app.ports[0].snapshot.daemon_epoch;
         let (commands, _) = mpsc::channel(4);
 
         let mut prompt = event(EventKind::Rx, Direction::Rx, 1, b"[root@luckfox ~]# ");
@@ -13776,7 +13306,7 @@ mod tests {
 
         app.handle_server_message(
             ServerMessage::Ready {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 head_seq: 2,
             },
             &commands,
@@ -13791,15 +13321,15 @@ mod tests {
         live_echo.daemon_epoch = epoch;
         app.push_event(live_echo, false, &commands);
 
-        let pwd_rows = app.slots[0]
+        let pwd_rows = app.ports[0]
             .lines
             .iter()
             .filter(|line| line.text.contains("pwd"))
             .collect::<Vec<_>>();
         assert_eq!(pwd_rows.len(), 1);
         assert_eq!(pwd_rows[0].text, "[root@luckfox ~]# pwd");
-        assert!(pwd_rows[0].echoed);
-        assert!(app.slots[0].lines.iter().any(|line| line.text == "/oem"));
+        assert!(!pwd_rows[0].echoed);
+        assert!(app.ports[0].lines.iter().any(|line| line.text == "/oem"));
     }
 
     #[test]
@@ -13876,14 +13406,14 @@ mod tests {
     fn empty_enter_during_foreign_agent_run_only_follows_live_output() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_foreign_control();
-        app.slots[0].snapshot.active_run = Some(agent_run("diagnose boot"));
-        app.slots[0].scroll_from_bottom = 5;
+        app.ports[0].snapshot.active_run = Some(agent_run("diagnose boot"));
+        app.ports[0].scroll_from_bottom = 5;
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
 
         assert!(received.try_recv().is_err());
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
         assert_eq!(app.current().scroll_from_bottom, 0);
         assert!(app.status.contains("empty Enter"));
     }
@@ -13892,8 +13422,8 @@ mod tests {
     fn ordinary_enter_keeps_draft_when_local_enqueue_is_rejected() {
         let mut app = ready_app_with_foreign_control();
         app.transport_connected = false;
-        app.slots[0].draft = "must survive".chars().collect();
-        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        app.ports[0].draft = "must survive".chars().collect();
+        app.ports[0].draft_cursor = app.ports[0].draft.len();
         let (commands, mut received) = mpsc::channel(1);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
@@ -13903,7 +13433,7 @@ mod tests {
             "must survive"
         );
         assert!(app.current().history.is_empty());
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
         assert!(received.try_recv().is_err());
     }
 
@@ -13921,10 +13451,10 @@ mod tests {
         let mut run = agent_run("diagnose boot");
         run.owner = agent;
         let run_id = run.id;
-        app.slots[0].snapshot.active_run = Some(run);
-        app.slots[0].snapshot.effective_write_eol = Some("\r\n".into());
-        app.slots[0].draft = "show version".chars().collect();
-        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        app.ports[0].snapshot.active_run = Some(run);
+        app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
+        app.ports[0].draft = "show version".chars().collect();
+        app.ports[0].draft_cursor = app.ports[0].draft.len();
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &commands);
@@ -13955,14 +13485,14 @@ mod tests {
         assert_eq!(pacing, None);
         assert!(received.try_recv().is_err());
         assert!(app.current().draft.is_empty());
-        assert!(!app.pending_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
         assert!(app.pending_requests.values().any(|request| matches!(
             request,
             PendingRequest::Write {
-                slot_id,
+                port,
                 cooperative: true,
                 ..
-            } if slot_id == "slot-1"
+            } if port == "COM3"
         )));
     }
 
@@ -13979,11 +13509,11 @@ mod tests {
             .clone();
         let mut run = agent_run("lease boundary");
         run.owner = agent;
-        app.slots[0].snapshot.active_run = Some(run);
+        app.ports[0].snapshot.active_run = Some(run);
 
         let queued_operation = Uuid::new_v4();
         app.pending_writes.insert(
-            "slot-1".into(),
+            "COM3".into(),
             VecDeque::from([PendingWrite {
                 data: b"ordinary queued\r".to_vec(),
                 operation_id: Some(queued_operation),
@@ -13994,19 +13524,19 @@ mod tests {
         app.pending_requests.insert(
             acquire_request,
             PendingRequest::Acquire {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 mode: ControlMode::Queue,
             },
         );
         app.queued_controls.insert(
-            "slot-1".into(),
+            "COM3".into(),
             QueuedControl {
                 _position: 2,
                 since: Instant::now(),
             },
         );
-        app.slots[0].draft = "cooperative at expiry".chars().collect();
-        app.slots[0].draft_cursor = app.slots[0].draft.len();
+        app.ports[0].draft = "cooperative at expiry".chars().collect();
+        app.ports[0].draft_cursor = app.ports[0].draft.len();
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &commands);
@@ -14036,16 +13566,16 @@ mod tests {
 
         let queue = app
             .pending_writes
-            .get("slot-1")
+            .get("COM3")
             .expect("ordinary queue must survive");
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].data, b"ordinary queued\r");
         assert_eq!(queue[0].operation_id, Some(queued_operation));
         assert!(matches!(
             app.pending_requests.get(&acquire_request),
-            Some(PendingRequest::Acquire { slot_id, .. }) if slot_id == "slot-1"
+            Some(PendingRequest::Acquire { port, .. }) if port == "COM3"
         ));
-        assert_eq!(app.queued_controls["slot-1"]._position, 2);
+        assert_eq!(app.queued_controls["COM3"]._position, 2);
         assert!(!app.pending_requests.contains_key(&request_id));
     }
 
@@ -14053,7 +13583,7 @@ mod tests {
     fn agent_run_hint_tracks_empty_draft_and_active_run_without_sticky_dismissal() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
-        app.slots[0].snapshot.active_run = Some(agent_run("FIRST_AGENT_TASK"));
+        app.ports[0].snapshot.active_run = Some(agent_run("FIRST_AGENT_TASK"));
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
@@ -14129,7 +13659,7 @@ mod tests {
         assert!(rendered.contains("FIRST_AGENT_TASK"));
 
         // Once the Run is no longer active there is no placeholder to show.
-        app.slots[0].snapshot.active_run = None;
+        app.ports[0].snapshot.active_run = None;
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("render after Agent Run ended");
@@ -14177,7 +13707,7 @@ mod tests {
         );
         assert!(matches!(
             app.menu.as_ref().map(|menu| menu.page),
-            Some(MenuPage::Models)
+            Some(MenuPage::SerialSettings)
         ));
         app.handle_key(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -14229,108 +13759,7 @@ mod tests {
     }
 
     #[test]
-    fn administrator_token_prompt_is_rendered_only_as_masked_cells() {
-        let secret = "ADMIN_TOKEN_MUST_NOT_RENDER";
-        let mut app = App::new(vec![snapshot()], None);
-        let mut menu = MenuState::new();
-        menu.prompt = Some(MenuPrompt {
-            title: tr("menu.prompt.admin").into(),
-            value: secret.chars().collect(),
-            cursor: secret.chars().count(),
-            secret: true,
-            purpose: MenuPromptPurpose::Admin(MenuAdminMutation::BindDevice {
-                slot_id: "slot-1".into(),
-                profile_name: None,
-            }),
-        });
-        app.menu = Some(menu);
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("render masked administrator prompt");
-
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!rendered.contains(secret));
-        assert!(rendered.contains("••••"));
-    }
-
-    #[test]
-    fn trusted_local_catalog_skips_the_administrator_prompt() {
-        let mut app = App::new(vec![snapshot()], None);
-        let (menu_commands, mut menu_received) = mpsc::channel(1);
-        app.menu_commands = Some(menu_commands);
-        let mut menu = MenuState::new();
-        menu.catalog = Some(MenuCatalog {
-            auth_required: false,
-            slots: vec![snapshot()],
-            config_revision: None,
-            transport_profiles: Vec::new(),
-            device_profiles: Vec::new(),
-            transport_revision: None,
-            device_revision: None,
-            models: Vec::new(),
-            model_bindings: Vec::new(),
-            model_revision: 0,
-        });
-
-        app.begin_admin_prompt(
-            &mut menu,
-            MenuAdminMutation::BindDevice {
-                slot_id: "slot-1".into(),
-                profile_name: None,
-            },
-        );
-
-        assert!(menu.prompt.is_none());
-        assert!(menu.busy);
-        assert!(matches!(
-            menu_received.try_recv(),
-            Ok(MenuIoCommand::Admin {
-                token: None,
-                mutation: MenuAdminMutation::BindDevice { .. },
-            })
-        ));
-    }
-
-    #[test]
-    fn authenticated_catalog_still_requests_a_masked_one_time_token() {
-        let mut app = App::new(vec![snapshot()], None);
-        let mut menu = MenuState::new();
-        menu.catalog = Some(MenuCatalog {
-            auth_required: true,
-            slots: vec![snapshot()],
-            config_revision: None,
-            transport_profiles: Vec::new(),
-            device_profiles: Vec::new(),
-            transport_revision: None,
-            device_revision: None,
-            models: Vec::new(),
-            model_bindings: Vec::new(),
-            model_revision: 0,
-        });
-
-        app.begin_admin_prompt(
-            &mut menu,
-            MenuAdminMutation::BindDevice {
-                slot_id: "slot-1".into(),
-                profile_name: None,
-            },
-        );
-
-        assert!(menu.prompt.as_ref().is_some_and(|prompt| prompt.secret));
-        assert!(!menu.busy);
-    }
-
-    #[test]
-    fn new_device_profile_clones_effective_behavior_before_echo_or_eol_preset() {
+    fn new_model_profile_clones_effective_behavior_before_echo_or_eol_preset() {
         let mut current = snapshot();
         current.effective_shell_prompt = Some("dut# ".into());
         current.effective_uboot_prompt = Some("dut=> ".into());
@@ -14342,7 +13771,7 @@ mod tests {
         });
         let view = SlotView::new(current);
 
-        let cloned = current_device_template(&view);
+        let cloned = current_model_profile_template(&view);
         assert_eq!(cloned.name, "");
         assert_eq!(cloned.shell_prompt.as_deref(), Some("dut# "));
         assert_eq!(cloned.uboot_prompt.as_deref(), Some("dut=> "));
@@ -14352,81 +13781,17 @@ mod tests {
         assert_eq!(cloned.write_chunk_delay_ms, Some(13));
 
         let mut echo_off = cloned.clone();
-        DevicePreset::Echo(EchoMode::Off).apply(&mut echo_off);
+        ModelPreset::Echo(EchoMode::Off).apply(&mut echo_off);
         assert_eq!(echo_off.echo, Some(EchoMode::Off));
         assert_eq!(echo_off.write_eol, cloned.write_eol);
         assert_eq!(echo_off.shell_prompt, cloned.shell_prompt);
         assert_eq!(echo_off.write_chunk_size, cloned.write_chunk_size);
 
         let mut line_feed = cloned.clone();
-        DevicePreset::Eol("\n").apply(&mut line_feed);
+        ModelPreset::Eol("\n").apply(&mut line_feed);
         assert_eq!(line_feed.write_eol.as_deref(), Some("\n"));
         assert_eq!(line_feed.echo, cloned.echo);
         assert_eq!(line_feed.uboot_prompt, cloned.uboot_prompt);
-    }
-
-    #[test]
-    fn model_tree_only_reveals_children_of_expanded_parents() {
-        let models = vec![
-            DeviceModel {
-                id: "tl-as7230".into(),
-                name: "TL-AS7230".into(),
-                parent_id: None,
-                aliases: Vec::new(),
-            },
-            DeviceModel {
-                id: "tl-as7230-w".into(),
-                name: "TL-AS7230-W".into(),
-                parent_id: Some("tl-as7230".into()),
-                aliases: Vec::new(),
-            },
-            DeviceModel {
-                id: "tl-kdp712-d".into(),
-                name: "TL-KDP712-D".into(),
-                parent_id: Some("tl-as7230-w".into()),
-                aliases: Vec::new(),
-            },
-            DeviceModel {
-                id: "other".into(),
-                name: "Other".into(),
-                parent_id: None,
-                aliases: Vec::new(),
-            },
-        ];
-
-        let collapsed = visible_model_rows(&models, &HashSet::new());
-        assert_eq!(
-            collapsed
-                .iter()
-                .map(|row| models[row.index].id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["tl-as7230", "other"]
-        );
-
-        let root_expanded = HashSet::from(["tl-as7230".to_string()]);
-        let root_rows = visible_model_rows(&models, &root_expanded);
-        assert_eq!(
-            root_rows
-                .iter()
-                .map(|row| (models[row.index].id.as_str(), row.depth))
-                .collect::<Vec<_>>(),
-            vec![("tl-as7230", 0), ("tl-as7230-w", 1), ("other", 0)]
-        );
-
-        let fully_expanded = HashSet::from(["tl-as7230".to_string(), "tl-as7230-w".to_string()]);
-        let all_rows = visible_model_rows(&models, &fully_expanded);
-        assert_eq!(
-            all_rows
-                .iter()
-                .map(|row| (models[row.index].id.as_str(), row.depth))
-                .collect::<Vec<_>>(),
-            vec![
-                ("tl-as7230", 0),
-                ("tl-as7230-w", 1),
-                ("tl-kdp712-d", 2),
-                ("other", 0),
-            ]
-        );
     }
 
     #[test]
@@ -14434,7 +13799,7 @@ mod tests {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
         app.pending_writes.insert(
-            "slot-1".into(),
+            "COM3".into(),
             VecDeque::from([PendingWrite {
                 data: b"reboot\r".to_vec(),
                 operation_id: Some(Uuid::new_v4()),
@@ -14453,7 +13818,7 @@ mod tests {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
         let operations = ["first", "second", "third"];
-        let queue = app.pending_writes.entry("slot-1".into()).or_default();
+        let queue = app.pending_writes.entry("COM3".into()).or_default();
         for command in operations {
             append_pending_write(
                 queue,
@@ -14473,7 +13838,7 @@ mod tests {
 
         assert_eq!(app.current().draft.iter().collect::<String>(), "second");
         assert!(app.queue_selection.is_none());
-        let remaining = queued_line_operations(app.pending_writes.get("slot-1").unwrap())
+        let remaining = queued_line_operations(app.pending_writes.get("COM3").unwrap())
             .into_iter()
             .map(|operation| String::from_utf8(operation.data).unwrap())
             .collect::<Vec<_>>();
@@ -14483,7 +13848,7 @@ mod tests {
     #[test]
     fn queue_selector_is_reachable_from_the_prefix_shortcut() {
         let mut app = App::new(vec![snapshot()], None);
-        let queue = app.pending_writes.entry("slot-1".into()).or_default();
+        let queue = app.pending_writes.entry("COM3".into()).or_default();
         for command in ["first", "second"] {
             append_pending_write(
                 queue,
@@ -14519,7 +13884,7 @@ mod tests {
         let sending_id = Uuid::new_v4();
         let queued_id = Uuid::new_v4();
         app.pending_writes.insert(
-            "slot-1".into(),
+            "COM3".into(),
             VecDeque::from([
                 PendingWrite {
                     data: b"sending\r".to_vec(),
@@ -14536,7 +13901,7 @@ mod tests {
         app.pending_requests.insert(
             Uuid::new_v4(),
             PendingRequest::Write {
-                slot_id: "slot-1".into(),
+                port: "COM3".into(),
                 operation_id: Some(sending_id),
                 cooperative: false,
             },
@@ -14546,7 +13911,7 @@ mod tests {
         app.remove_queued_line_operation(0, true, &commands);
         assert!(app.current().draft.is_empty());
         assert_eq!(
-            queued_line_count(app.pending_writes.get("slot-1").unwrap()),
+            queued_line_count(app.pending_writes.get("COM3").unwrap()),
             2
         );
         assert_eq!(app.status, tr("st.queue.already.sending"));
@@ -14554,7 +13919,7 @@ mod tests {
         app.remove_queued_line_operation(1, true, &commands);
         assert_eq!(app.current().draft.iter().collect::<String>(), "editable");
         assert_eq!(
-            queued_line_count(app.pending_writes.get("slot-1").unwrap()),
+            queued_line_count(app.pending_writes.get("COM3").unwrap()),
             1
         );
     }
@@ -14568,7 +13933,7 @@ mod tests {
         assert!(app.request_write(&commands, b"REAL_INFLIGHT\r".to_vec(), Some(Uuid::new_v4()),));
         let (request_id, data, _) = take_write(&mut received);
         assert_eq!(data, b"REAL_INFLIGHT\r");
-        assert_eq!(queued_line_count(&app.pending_writes["slot-1"]), 1);
+        assert_eq!(queued_line_count(&app.pending_writes["COM3"]), 1);
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -14591,8 +13956,8 @@ mod tests {
             CommandResult::WriteAccepted { event_seq: 1 },
             &commands,
         );
-        assert!(!app.pending_writes.contains_key("slot-1"));
-        assert!(!app.inflight_writes.contains_key("slot-1"));
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(!app.inflight_writes.contains_key("COM3"));
     }
 
     #[test]
@@ -14606,7 +13971,7 @@ mod tests {
             b"retry after full\r".to_vec(),
             Some(Uuid::new_v4()),
         ));
-        assert_eq!(queued_line_count(&app.pending_writes["slot-1"]), 1);
+        assert_eq!(queued_line_count(&app.pending_writes["COM3"]), 1);
         assert!(app.inflight_writes.is_empty());
         assert!(matches!(received.try_recv(), Ok(NetworkCommand::Shutdown)));
 
@@ -14615,16 +13980,16 @@ mod tests {
         let (_, data, _) = take_write(&mut received);
         assert_eq!(data, b"retry after full\r");
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Write { slot_id, cooperative: false, .. } if slot_id == "slot-1")
+            |request| matches!(request, PendingRequest::Write { port, cooperative: false, .. } if port == "COM3")
         ));
-        assert_eq!(queued_line_count(&app.pending_writes["slot-1"]), 1);
+        assert_eq!(queued_line_count(&app.pending_writes["COM3"]), 1);
     }
 
     #[test]
     fn queue_panel_renders_operations_oldest_first() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
-        let queue = app.pending_writes.entry("slot-1".into()).or_default();
+        let queue = app.pending_writes.entry("COM3".into()).or_default();
         for command in ["FIRST_QUEUED", "SECOND_QUEUED", "THIRD_QUEUED"] {
             append_pending_write(
                 queue,
@@ -14658,7 +14023,7 @@ mod tests {
         let mut app = App::new(vec![snapshot()], None);
         let command = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         append_pending_write(
-            app.pending_writes.entry("slot-1".into()).or_default(),
+            app.pending_writes.entry("COM3".into()).or_default(),
             format!("{command}\r").as_bytes(),
             Some(Uuid::new_v4()),
             PendingWriteKind::Line,
@@ -14671,7 +14036,7 @@ mod tests {
         assert!(cards[0].command.ends_with('…'));
         assert!(UnicodeWidthStr::width(cards[0].command.as_str()) <= 9);
         assert_eq!(
-            queued_line_operations(&app.pending_writes["slot-1"])[0].data,
+            queued_line_operations(&app.pending_writes["COM3"])[0].data,
             format!("{command}\r").as_bytes()
         );
     }
@@ -14681,7 +14046,7 @@ mod tests {
         let mut app = App::new(vec![snapshot()], None);
         let command = "中文样机命令参数甲乙丙丁戊己庚辛";
         append_pending_write(
-            app.pending_writes.entry("slot-1".into()).or_default(),
+            app.pending_writes.entry("COM3".into()).or_default(),
             format!("{command}\r").as_bytes(),
             Some(Uuid::new_v4()),
             PendingWriteKind::Line,
@@ -14706,7 +14071,7 @@ mod tests {
             .chain(["F"; 30])
             .collect::<String>();
         append_pending_write(
-            app.pending_writes.entry("slot-1".into()).or_default(),
+            app.pending_writes.entry("COM3".into()).or_default(),
             format!("{command}\r").as_bytes(),
             Some(Uuid::new_v4()),
             PendingWriteKind::Line,
@@ -14752,6 +14117,7 @@ mod tests {
             anchor: SelectionPoint { row: 0, column: 2 },
             head: SelectionPoint { row: 1, column: 2 },
             word_selected: false,
+            completed: false,
             last_activity: Instant::now(),
         };
         assert_eq!(selection.selected_text(), "abc\n中d");
@@ -14796,7 +14162,7 @@ mod tests {
     fn double_click_word_selection_copies_the_whole_token() {
         let mut app = App::new(vec![snapshot()], None);
         app.clipboard_copy = accept_clipboard_copy;
-        app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
+        app.ports[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -14824,18 +14190,36 @@ mod tests {
             );
         }
 
-        assert!(app.selection.is_none());
+        assert!(
+            app.selection
+                .as_ref()
+                .is_some_and(|selection| selection.completed)
+        );
         assert_eq!(app.selection_copy.as_deref(), Some("abcdef"));
     }
 
     #[test]
-    fn mouse_wheel_scrolls_output_without_browsing_command_history() {
-        let mut app = App::new(vec![snapshot()], None);
+    fn mouse_wheel_pages_agent_history_without_mouse_focus_routing() {
+        let mut current = snapshot();
+        let run = agent_run("滚轮巡检");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
         for seq in 0..20 {
-            app.slots[0].push_line(stream_row(seq, Direction::Rx, "row"), true);
+            app.ports[0].push_line(stream_row(seq, Direction::Rx, "row"), true);
         }
-        app.slots[0].history = vec!["first".into(), "second".into()];
-        app.slots[0].history_cursor = None;
+        for seq in 21..27 {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, b"command\r");
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata.insert(
+                "command_description".into(),
+                serde_json::json!(format!("command-{seq}")),
+            );
+            app.ports[0].push_event(tx, true);
+        }
         let (commands, _) = mpsc::channel(1);
 
         app.handle_terminal_event(
@@ -14848,17 +14232,17 @@ mod tests {
             &commands,
         );
 
-        assert_eq!(app.slots[0].scroll_from_bottom, 3);
-        assert_eq!(app.slots[0].history_cursor, None);
-        assert!(app.slots[0].draft.is_empty());
+        assert_eq!(app.focus, PaneFocus::RunHistory);
+        assert_eq!(app.current().selected_run_command_index(), Some(1));
+        assert_eq!(app.current().scroll_from_bottom, 0);
     }
 
     #[test]
-    fn completed_selection_resumes_live_output_and_remains_copyable() {
+    fn completed_selection_stays_visibly_highlighted_and_remains_copyable() {
         let mut app = App::new(vec![snapshot()], None);
         app.clipboard_copy = record_clipboard_copy;
         TEST_CLIPBOARD.lock().expect("test clipboard lock").clear();
-        app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
+        app.ports[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
@@ -14895,8 +14279,12 @@ mod tests {
             &commands,
         );
 
-        assert_eq!(app.focus, PaneFocus::Output);
-        assert!(app.selection.is_none());
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert!(
+            app.selection
+                .as_ref()
+                .is_some_and(|selection| selection.completed)
+        );
         assert_eq!(app.selection_copy.as_deref(), Some("abcd"));
         assert_eq!(
             TEST_CLIPBOARD
@@ -14906,18 +14294,20 @@ mod tests {
             ["abcd"]
         );
 
-        app.slots[0].push_line(stream_row(2, Direction::Rx, "__AFTER_SELECTION__"), true);
         terminal
             .draw(|frame| draw(frame, &mut app))
-            .expect("render live output after selection");
-        let rendered = terminal
+            .expect("render completed selection");
+        let selected_cells = terminal
             .backend()
             .buffer()
             .content
             .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("__AFTER_SELECTION__"));
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert!(
+            selected_cells >= 4,
+            "selected text must remain visibly reversed"
+        );
         app.handle_terminal_event(
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Right),
@@ -14934,6 +14324,7 @@ mod tests {
                 .as_slice(),
             ["abcd", "abcd"]
         );
+        assert!(app.selection.is_none());
         assert!(app.selection_copy.is_none());
 
         app.handle_terminal_event(
@@ -14954,7 +14345,7 @@ mod tests {
     fn stale_mouse_drag_finishes_without_pinning_output_forever() {
         let mut app = App::new(vec![snapshot()], None);
         app.clipboard_copy = record_clipboard_copy;
-        app.slots[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
+        app.ports[0].push_line(stream_row(1, Direction::Rx, "abcdef"), true);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
@@ -14984,7 +14375,11 @@ mod tests {
         let last_activity = app.selection.as_ref().expect("active drag").last_activity;
 
         assert!(app.expire_mouse_selection(last_activity + MOUSE_SELECTION_TIMEOUT));
-        assert!(app.selection.is_none());
+        assert!(
+            app.selection
+                .as_ref()
+                .is_some_and(|selection| selection.completed)
+        );
         assert_eq!(app.selection_copy.as_deref(), Some("abcd"));
     }
 
@@ -14992,16 +14387,16 @@ mod tests {
     fn closed_network_event_channel_is_disabled_after_one_observation() {
         let mut app = App::new(vec![snapshot()], None);
         app.transport_connected = true;
-        app.authenticated = true;
+        app.hello_accepted = true;
         app.connection_generation = Some(7);
         let (commands, _) = mpsc::channel(1);
 
         assert!(!handle_network_channel_event(&mut app, None, &commands));
         assert!(!app.transport_connected);
-        assert!(!app.authenticated);
+        assert!(!app.hello_accepted);
         assert!(app.connection_generation.is_none());
         assert!(matches!(
-            app.slots[0].subscription,
+            app.ports[0].subscription,
             SubscriptionPhase::Disconnected
         ));
         assert!(app.dirty);

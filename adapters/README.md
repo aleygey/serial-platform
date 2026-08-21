@@ -1,347 +1,208 @@
-# Agent adapters
+# Agent Adapter Setup
 
-`serial-mcp` is the shared stdio MCP adapter for OpenCode, Codex, and other
-MCP-capable Agents. It connects directly to `seriald`; it does not wrap shell
-calls to `serialctl` and does not depend on an Agent SDK.
+`serial-mcp` 是 Serial Platform 面向 Codex、OpenCode 和其他 MCP host 的 adapter。它通过 HTTP/WebSocket 访问 `seriald`，不会调用 `serialctl` shell 命令，也不直接打开物理串口。
 
-## Topology and installation
+## 开始之前
 
-```text
-Windows host: serial card -> serial serve
-                                  ^
-                                  | HTTP + WebSocket on host-only network
-Linux VM: serial console + serial mcp -> OpenCode / Codex
+首次配置不需要运行后端：
+
+```sh
+serial setup
 ```
 
-Run `serial setup` once in the Agent environment. A fresh daemon is token-free
-and loopback-only, so `serial-mcp` omits Authorization. A remote host-only
-endpoint such as `http://192.168.56.1:3210` requires authentication;
-`serial-mcp` reads the operator-token file saved by setup, so the MCP host
-configuration itself contains no bearer token. You may instead pass
-`--config`, `--endpoint`, and `--token-file`; the token value itself is never a
-command argument. For authenticated setup automation, use
-`--admin-token-file` and `--operator-token-file` as inputs and
-`--save-operator-token-file` as the destination. Setup rejects global
-`--token-file` and refuses input/output path aliases so it cannot overwrite a
-supplied credential.
+如果 TUI 和 Agent 在同一台机器，最简单的启动方式是：
 
-The shared config key `orphan_run_timeout_seconds` defaults to `1800`. Zero
-selects unlimited mode; every finite value must be at least `300`, with no
-artificial maximum. `--orphan-run-timeout-seconds` or
-`SERIAL_MCP_ORPHAN_RUN_TIMEOUT_SECONDS` overrides it for one newly started
-adapter process. Existing adapter processes never hot-reload this setting.
+```sh
+serial
+```
 
-Use every component from the same release. v0.7.0 retains WebSocket protocol v3
-from v0.4.0; the existing realtime surface is wire-compatible with v0.4, while
-the core Monitor/Incident HTTP APIs and MCP tools require v0.5 components.
-v0.7 removes the retired Monitor delivery routes and `event_ttl_ms`; an older
-`[monitor_event_sink]` config table is ignored and disappears on the next save.
-Protocol-v2 builds from 0.3.x and protocol-v1 builds from 0.2.x are not
-compatible with v3.
+该命令一次启动：
 
-Ready-to-copy examples are under `opencode/` and `codex/`. They invoke the
-component executable directly; using the unified launcher is equivalent:
+```text
+seriald       http://127.0.0.1:3210
+serial-mcp    http://127.0.0.1:3211/mcp
+serialctl     foreground TUI
+```
+
+## 选择 MCP transport
+
+### Streamable HTTP
+
+支持 URL 型 MCP server 的 host 可直接配置：
+
+```text
+http://127.0.0.1:3211/mcp
+```
+
+这是 sessionless Streamable HTTP：host 对 `/mcp` 发送 JSON-RPC `POST`。`serial` 已经管理 adapter 进程，不需要 MCP host 再启动一个 stdio 进程。
+
+### stdio
+
+若 MCP host 只支持本地 command，配置它启动发行包内的统一入口：
 
 ```text
 command = serial
 args = ["mcp", "--actor-label", "codex:workstation"]
 ```
 
-The launcher starts only a sibling `serial-mcp` from the same release
-directory. It never falls back to a different executable on `PATH`.
+Windows 示例：
 
-When an OpenCode configuration explicitly lists permissions, allow the
-read-only tools (`devices`, `device_models`, `read`, `wait`, `search`, `monitor_list`,
-`monitor_status`, and `monitor_incidents`) and require confirmation for
-write/state-changing tools, including `command_sequence`, `input`, `signal`,
-`monitor_start`, and `monitor_stop`.
-OpenCode prefixes names as `serial_devices`, `serial_command`, and so on.
-Codex exposes them under the configured `serial` MCP server.
+```toml
+[mcp_servers.serial]
+enabled = true
+required = true
+command = 'C:\Tools\serial-platform\serial.exe'
+args = ["mcp", "--actor-label", "codex:workstation"]
+startup_timeout_sec = 10.0
+tool_timeout_sec = 130.0
+```
 
-## Core and Monitor tool surface
+Linux/macOS 示例：
 
-The original tool names remain stable. Run-scoped calls now require the opaque
-`run_handle` returned by `run_start`, so one LLM session cannot adopt a
-status-visible Run left by another session. The public `run_id` is audit
-identity and is not copied back into tool calls. Five additive
-Monitor tools manage persistent observation Jobs owned by `seriald`; restarting
-or closing the stdio MCP process does not stop them.
+```toml
+[mcp_servers.serial]
+enabled = true
+required = true
+command = "/usr/local/bin/serial"
+args = ["mcp", "--actor-label", "codex:workstation"]
+startup_timeout_sec = 10.0
+tool_timeout_sec = 130.0
+```
 
-| Tool | Required inputs | Optional inputs | Purpose |
-|---|---|---|---|
-| `devices` | — | `slot_id` | Authoritative Slot, Profile, state, ownership, Run, Trigger, and cursor head |
-| `device_models` | — | `slot_id` | Read the model hierarchy and current Slot bindings |
-| `device_model_set` | `slot_id`, `model_id`, `confirmation_method` | guarded create/update and confirmation context | Assign a confirmed model without exposing bulk Admin catalog replacement |
-| `read` | `slot_id` | `scope=tail|continue|archive`, archive `epoch`/`after_seq` | Bounded retained text and continuation cursor |
-| `command` | `run_handle`, `command`, `description` | one of `expect`/`regex`, `timeout_seconds` | Append effective EOL, write in the owned Run, capture post-TX RX, and retain its purpose |
-| `command_sequence` | `run_handle`, `description`, `steps` (1..8); each step has `command`/`description`, and every non-final step has `expect` or `regex` | Final-step matcher; per-step `timeout_seconds` | Execute a known dependent interaction in order; a failed step prevents all later writes |
-| `input` | `run_handle`, `text` | — | Exact UTF-8 bytes with no EOL |
-| `signal` | `run_handle`, `signal` | Break-only `duration_ms` | Ctrl-C/D/Z byte or physical serial Break |
-| `trigger` | `run_handle`, `action` | `kickoff`, `start_contains`, `stop_contains`, interval/timeout/fire bounds | One bounded daemon-side low-latency reaction |
-| `wait` | `run_handle` | one of `expect`/`regex`, `timeout_seconds` | Wait from the adapter's live cursor while pinning that Run |
-| `search` | `slot_id`, `query` | `regex`, scope, explicit continuation fields | Bounded search; current Run by default |
-| `monitor_start` | `slot_id`, exactly one of `contains`/`regex` | `description` | Create a persistent Monitor and return its ID immediately |
-| `monitor_list` | none | `slot_id` | List authoritative persistent Monitors |
-| `monitor_status` | `monitor_id` | none | Inspect one Monitor's state, cursor, counts, and last error |
-| `monitor_incidents` | `monitor_id` | opaque decimal `after` cursor | Read one bounded page of retained incidents and evidence references |
-| `monitor_stop` | `monitor_id` | none | Stop future detection without deleting retained incidents |
-| `run_start` | `slot_id`, `label` | — | Queue for Control and establish an evidence boundary |
-| `run_end` | `run_handle` | — | End the authorized Run and best-effort release Control |
-| `release` | either `slot_id`, or `run_handle` + `abort_run=true` | — | Release a no-Run lease by Slot, or explicitly abort/release the Run selected solely by its handle |
+仓库中的 `codex/` 和 `opencode/` 目录提供可复制的路径示例。发行包组件应保持在同一目录；`serial mcp` 只解析同包的 sibling `serial-mcp`。
 
-The adapter intentionally hides routine protocol mechanics: request and
-Operation UUIDs, Control ID/fence, generation validation, pacing, effective
-prompt selection, bounded capture settings, cursor memory, lease renewal, and
-cleanup. This keeps Agent calls small while `seriald` retains the complete
-auditable timeline.
+## Endpoint 与配置
 
-## Persistent Monitor Jobs
+stdio adapter 默认连接 `http://127.0.0.1:3210`。覆盖方式：
 
-`monitor_start` installs one literal or bounded-regex matcher in `seriald` and
-returns immediately. It is not a long-running MCP request and does not keep an
-Agent turn open. The daemon owns the Monitor state, live cursor, match window,
-and incident retention; those mechanics are deliberately absent from the Agent
-tool schema.
-The adapter generates the idempotent creation ID internally and reuses it for
-one transport retry, so a lost HTTP response cannot create a second Monitor.
+```sh
+serial mcp --endpoint http://192.168.56.1:3210
+```
 
-For example:
+或：
+
+```text
+SERIALD_ENDPOINT=http://192.168.56.1:3210
+```
+
+`--config` / `SERIALCTL_CONFIG` 可以指定共享 `serialctl.toml`。常用字段：
+
+```toml
+endpoint = "http://127.0.0.1:3210"
+orphan_run_timeout_seconds = 1800
+capture_max_events = 4096
+capture_max_bytes = 1048576
+```
+
+`orphan_run_timeout_seconds=0` 表示不限时；其他值至少 300 秒。命令行 `--orphan-run-timeout-seconds` 或环境变量 `SERIAL_MCP_ORPHAN_RUN_TIMEOUT_SECONDS` 对新启动进程优先。正常 Agent 工作流仍在最终回复前调用 `run_end`。
+
+## 工具发现
+
+adapter 暴露固定 19 项：
+
+```text
+devices              model_profiles       model_profile_set
+read                 command              command_sequence
+input                signal               trigger
+wait                 search
+monitor_start        monitor_list          monitor_status
+monitor_incidents    monitor_stop
+run_start            run_end               release
+```
+
+查看 host 实际应缓存的完整 schema：
+
+```sh
+serial mcp --dump-tools
+```
+
+更新 adapter 后，让 MCP host 重新执行 `tools/list`。所有设备参数统一使用 `port`。
+
+OpenCode 会把 server 名作为工具前缀，例如 `serial_devices`、`serial_command_sequence` 和 `serial_model_profile_set`。如果 OpenCode 配置显式列出 tool permission，需要覆盖全部 19 项；纯观察工具可以直接允许，物理写入和配置变化可以按使用习惯要求确认。
+
+纯观察工具：
+
+```text
+devices model_profiles read wait search
+monitor_list monitor_status monitor_incidents
+```
+
+改变配置、后端状态或物理设备的工具：
+
+```text
+model_profile_set command command_sequence input signal trigger
+monitor_start monitor_stop run_start run_end release
+```
+
+## Agent 指令建议
+
+MCP initialize 已提供服务器指令。若 host 支持附加 prompt，可以保持为以下短规则：
+
+```text
+先调用 devices 和 model_profiles，明确选择 port 并核对实际机型。
+写入前调用 run_start，并在同一工作流中保存 run_handle。
+普通命令用 command；账号/密码等已知依赖交互用一次 command_sequence。
+每个 command/step 都填写简洁 description。
+最终回复前调用 run_end。
+```
+
+不要让模型传底层 Control、fence、generation、operation 或续租状态；adapter 会处理这些细节。
+
+## 多步依赖交互
+
+当下一条命令依赖上一条设备提示时，不需要让 Agent 发起多次 MCP round trip。使用 `command_sequence`：
 
 ```json
 {
-  "slot_id": "slot-1",
+  "run_handle": "abcdefghijklmnopqrstuv",
+  "description": "登录设备控制台",
+  "steps": [
+    {
+      "command": "admin",
+      "description": "输入账号",
+      "expect": "Password:"
+    },
+    {
+      "command": "admin123",
+      "description": "输入密码",
+      "expect": "root@router:~# "
+    }
+  ]
+}
+```
+
+adapter 在发送下一步之前等待当前 matcher。任一步失败，所有剩余步骤不再写入。每步独立进入审计历史，并可在 TUI/App 中单独选择和定位 RX 输出。
+
+## Monitor
+
+`monitor_start` 在 `seriald` 中创建一个持久 literal/regex matcher，并立即返回。stdio 进程退出不停止 Monitor。
+
+```json
+{
+  "port": "COM4",
   "regex": "(?i)kernel panic|watchdog",
-  "description": "Capture an intermittent DUT crash"
+  "description": "观察设备异常复位"
 }
 ```
 
-Use `monitor_status` or `monitor_list` to inspect whether it is still running.
-`monitor_incidents` returns the recent bounded tail when `after` is omitted.
-Use `after="0"` to page from the oldest retained incident, or pass the returned
-decimal `next_after` back as `after` for the next forward page. Each incident includes a
-short preview plus `evidence_ref`, `evidence_cursor`, and the exact serial
-sequence range; fetch deeper serial evidence only when it is relevant instead
-of placing an unbounded UART history in Agent context. For an exact follow-up,
-call `read` with `scope=archive`, the incident Slot, and the returned
-`evidence_cursor` epoch/after-sequence pair, plus `through_seq=seq_end` from
-the Incident. That inclusive upper bound prevents output arriving after the
-Incident from being mixed into its evidence. `truncated=true` means the
-returned page is incomplete, not that no later incident exists.
-`next_after` is also the server's observed incident high-water mark, so it can
-advance even when a page is empty after ACK filtering; clients should persist
-it exactly as returned rather than deriving a cursor from the result array.
+后续用 `monitor_status` 或 `monitor_list` 查看状态；`monitor_incidents` 读取 incident tail，并将返回的十进制 `next_after` 原样用于下一页或后续轮询。`monitor_stop` 停止未来匹配，保留已有 incident。
 
-Incidents remain durable and queryable through the core Monitor tools. External
-delivery and Agent-turn routing are deliberately outside this adapter.
-`monitor_stop` durably stops future matching but preserves existing incidents
-for audit and later queries.
+## Cursor 与长时间运行
 
-## Normal workflow
+实时读取使用后端有界 replay ring：
 
-1. Call `devices`, choose a Slot explicitly, and inspect its online state and
-   effective Profiles.
-2. Call `run_start`, then retain its returned opaque `run_handle` in this LLM
-   session. The returned `run_id` is for audit only. A Run scopes evidence;
-   initialize the DUT state explicitly. Never adopt an active Run from
-   `devices`.
-3. Use `command` for an ordinary shell/bootloader command. Use
-   `command_sequence` when the next known command depends on an explicit RX
-   boundary from the previous one, such as username then password. Use `input`
-   or `signal` only when exact raw input is required. Use `trigger` for a
-   bounded timing-critical reaction that must run beside the serial actor.
-4. Use `wait`, `read`, or `search` for additional evidence. `wait` also needs
-   the handle and pins the Run throughout its complete call.
-5. Call `run_end` with the handle before the final Agent reply. `release` is
-   optional/idempotent cleanup; aborting this MCP's active Run requires
-   `abort_run=true` and the same handle.
-   With no local lease it ignores any foreign Run visible in status.
+- `read(scope=tail)` 最多读取最近 200 events；
+- `read(scope=continue)` 从 adapter live cursor 继续，最多 1000 events；
+- 二者不扫描持久 journal，不受历史段数量影响；
+- ring 淘汰或后端重启以 gap/truncation 明确返回；
+- 旧周期证据使用 `read(scope=archive, epoch=...)` 或 `search(scope=archive, epoch=...)`。
 
-The adapter queues for Control and cannot Takeover. A human can observe all
-Agent TX in `serial console` and may explicitly Takeover; that revokes the
-Agent's Control and aborts its Run. Agents cannot close the configured port.
+因此高流量端口运行很久后，普通 tail 不会因为 segment discovery 扫描超出 journal query budget。
 
-Only Runs started by this adapter process receive lease renewal. Each
-Run-scoped tool validates the private capability before waiting for the
-per-Slot write lock and the serialized session validates it again before any
-physical action. An active tool call pins the Run; after the last call returns,
-`orphan_run_timeout_seconds` permits 0 (unlimited) or any finite value of at
-least 300 seconds (default 1800, with no finite upper bound) before active
-release/abort at the next renewal tick. This is only a
-crash/abandonment fallback; normal completion uses `run_end`. The value is
-read when `serial-mcp` starts, so restart a running adapter after changing it.
-The underlying 60-second fenced lease continues to renew every 20 seconds
-during that window. Disconnect or renewal failure clears local ownership; the
-adapter never silently reacquires Control and continues an old task. One Slot has at most one
-active Run, and per-Slot write locks prevent concurrent MCP calls from
-interleaving bytes.
+## 并发与取消
 
-## Command capture and compact results
+stdio 可以并发处理独立请求，输出 frame 由单一 writer 完整写出。每个端口的物理 mutation 在 adapter 内串行化，`command_sequence` 整体持有该路径，bytes 不会和同一 adapter 的另一个命令交错。
 
-`command` attaches before TX, then `seriald` validates the adapter-owned Run,
-Control ID/fence, epoch, and generation before any byte reaches the port. The
-confirmed TX event sequence becomes the capture's lower bound, so replayed RX
-from before the write cannot complete the command.
+MCP cancellation 只中断纯观察调用。物理写入、Run transition 和 Monitor mutation 可能已经跨过副作用边界，会继续收敛到权威结果，避免 host 因看不到结果而错误重试。
 
-Completion is selected with a small rule:
-
-- `expect` waits for one literal.
-- `regex` waits for one regular expression and disables prompt/quiet fallback.
-- With neither, configured Device Profile Shell/U-Boot prompts are used.
-- With no configured prompt, completion requires post-TX RX followed by a
-  one-second quiet interval.
-
-`expect` and `regex` are mutually exclusive. A returned prompt, literal, regex,
-or quiet boundary is evidence that capture completed, not proof the command
-exited successfully. The generic adapter does not inject POSIX shell syntax or
-inspect `$?`; request a unique result sentinel when exit status matters.
-
-With effective `echo=on`, an exact adjacent command+EOL echo is removed from
-the returned text. Missing/incomplete echo, foreign TX, gaps, disconnects,
-timeout, and truncation lower confidence and add warnings. Writes with uncertain
-outcomes are never retried automatically.
-
-Normal `command` results are intentionally compact:
-
-```json
-{
-  "slot_id": "slot-1",
-  "write": "confirmed",
-  "capture": "prompt",
-  "execution": "unknown",
-  "confidence": "high",
-  "text": "Linux ...\n[root@dut ~]# ",
-  "truncated": false,
-  "gap": false,
-  "interfered": false,
-  "cursor": {"epoch": "…", "after_seq": 812}
-}
-```
-
-`warnings`, a summary/omitted count, and search continuation guidance appear
-only when needed. Internal request/operation/TX IDs, duplicate completion
-fields, and raw event arrays are not returned by default; they remain in
-`seriald`'s journal for exact human/diagnostic inspection.
-
-Rendered text is ANSI-cleaned, bounded, and folds only adjacent byte-identical
-lines. A differing timestamp or payload keeps a row distinct. Folding saves
-context but never changes cursor, gap, or durable event semantics.
-
-`command_sequence` reuses that capture contract for 1–8 commands whose order
-depends on device output. Every non-final step requires exactly one explicit
-`expect` or `regex`; only a matching boundary permits the next write. The final
-step may instead use the ordinary configured-prompt/quiet fallback. Each step
-has its own required description, the sequence has a required overall purpose,
-and each step has an optional 1..120-second timeout (10 seconds by default);
-effective timeouts may total at most 300 seconds. A step including effective
-EOL is at most 4096 bytes, and the complete planned write is at most 32768 bytes.
-
-The adapter validates the complete plan before writing, holds the Slot's
-serialized mutation path for the whole sequence, and stops before every
-remaining command when a step fails, times out, disconnects, loses evidence,
-or loses Run/Control. It does not branch, loop, or retry. Every confirmed or
-partially confirmed step remains an independent plaintext TX audit event with
-its description and exact command bytes. The result's `sequence_id` groups
-those steps beneath the overall purpose, and the terminal command-history bar
-can expand the individual bytes exactly as it does for `command`.
-
-## Read, wait, search, cursor, and epoch
-
-An epoch is the UUID for one `seriald` process lifetime. Restarting the daemon
-changes it. A continuation cursor is `(slot_id, epoch, after_seq)`, not a bare
-sequence number.
-
-- `read` defaults to a recent live-ring tail. `scope=continue` resumes the
-  adapter's process-local cursor through that same bounded ring, reports
-  eviction/restart gaps explicitly, and never scans the journal;
-  `scope=archive` requires an explicit epoch.
-- `wait` begins at the cursor remembered by `run_start`, `command`,
-  `command_sequence`, or the previous `wait`, avoiding a loss window between
-  calls. If no compatible cursor exists it begins at the current head.
-- `search` defaults to `current_run`, so an old boot/test match cannot be
-  mistaken for current evidence. `current_cursor` or `archive` must be
-  explicit; archive requires an epoch.
-- A truncated current-Run search returns a continuation containing the same
-  `run_id`, epoch, and `after_seq`. Page until `truncated=false` before treating
-  an empty result as absence.
-
-Set `search.regex=true` to interpret `query` as a bounded server-side regular
-expression. Literal and regex matches span adjacent same-direction RX/TX
-events, so an OS read boundary cannot hide a pattern. Pattern size, compiled
-automaton size, scanned bytes/time, and returned events/bytes remain bounded.
-Regex does not enable default global history. Against an older daemon that
-cannot advertise bounded server-side regex, MCP search fails closed and asks
-for an upgrade or literal search; it never performs an unbounded local scan.
-
-The adapter cursor is process-local. After restarting `serial-mcp`, pass an
-explicit returned cursor when an older exact boundary matters.
-
-## Raw input, control signals, and Break
-
-`input` sends the UTF-8 encoding of `text` exactly and appends no Device
-Profile EOL. `signal` accepts:
-
-| Value | Physical action |
-|---|---|
-| `ctrl_c` | one byte `0x03` |
-| `ctrl_d` | one byte `0x04` |
-| `ctrl_z` | one byte `0x1a` |
-| `break` | UART Break line condition, default 250 ms |
-
-Break is not an encoded byte. It still requires the adapter-owned Run and
-fenced Control, and success creates an audited `break` timeline event.
-Unsupported drivers fail with `break_unsupported`; the adapter never silently
-substitutes a NUL or another byte.
-
-## Trigger
-
-`trigger` is present in v0.4.0 and remains a generic daemon-native primitive.
-It is not tied to SigmaStar, U-Boot, or flashing. It avoids repeated
-Agent/VM/network round trips when a response window is shorter than one MCP
-tool call:
-
-```json
-{
-  "slot_id": "slot-1",
-  "kickoff": {"text": "reboot", "eol": "\r"},
-  "action": {"text": "slp", "eol": ""},
-  "interval_ms": 20,
-  "stop_contains": ["SigmaStar #"],
-  "timeout_ms": 5000,
-  "max_fires": 250
-}
-```
-
-The daemon arms live literal matchers before the optional one-time `kickoff`,
-then sends one `action` at a time. Normal calls omit `start_contains`, so a
-confirmed kickoff immediately enables the first action. Set `start_contains`
-only for the advanced case where a live RX literal must gate that action. Any
-`stop_contains` literal, timeout, or fire limit ends scheduling. Pacing and
-physical-write time are additional to `interval_ms`; missed ticks never create
-a catch-up burst.
-
-Every kickoff/action uses the ordinary confirmed, fenced, Run-bound, audited
-write path and inherits effective Device Profile pacing. The MCP schema exposes
-explicit text/EOL but not chunk size/delay. A Trigger never starts another
-physical write after Control/Run/generation loss, cancellation, terminal
-match, or an observation gap.
-
-The compact result reports `outcome`, `matched`, confirmed `fires`,
-`confidence`, bounded `text`, truncation/gap, cursor, and warnings when needed.
-`matched=true` proves only that one requested stop literal appeared, not that a
-larger flashing/debug workflow succeeded.
-
-## MCP transport behavior
-
-The executable speaks newline-delimited JSON-RPC over stdin/stdout. stdout is
-reserved for MCP frames; diagnostics go to stderr. Independent requests run
-concurrently and completed frames are serialized through one writer.
-`notifications/cancelled`/`$/cancelRequest` cancel only pure observations:
-`devices`, `read`, `wait`, `search`, `monitor_list`, `monitor_status`, and
-`monitor_incidents`. A command, command sequence, input, signal, Trigger,
-Monitor mutation, Run transition, or release may already have crossed a side-effect boundary, so it
-is allowed to reach an authoritative result rather than hiding the outcome and
-encouraging an unsafe retry. Per-Slot write serialization prevents physical
-byte interleaving.
-
-Supported MCP protocol versions are `2024-11-05`, `2025-03-26`, `2025-06-18`,
-and `2025-11-25`.
+完整输入 schema、结果、capture 与 recent context 语义见 [MCP 工具目录](../docs/MCP_TOOLS.md)。

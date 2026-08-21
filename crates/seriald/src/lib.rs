@@ -1,7 +1,6 @@
 //! `seriald` runtime library.
 
 pub mod api;
-pub mod auth;
 pub mod config;
 pub mod control;
 pub mod journal;
@@ -17,19 +16,16 @@ use crate::registry::SlotRegistry;
 use anyhow::Context as _;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt as _;
 
 pub async fn serve(
     store: ConfigStore,
     loaded: LoadedConfig,
     bind_override: Option<SocketAddr>,
+    managed: bool,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let bind = bind_override.unwrap_or(loaded.config.bind);
-    if !loaded.config.auth_required && !bind.ip().is_loopback() {
-        anyhow::bail!(
-            "authentication is disabled, so seriald may bind only to loopback (requested {bind})"
-        );
-    }
     let mut journal_config = JournalConfig::new(loaded.paths.journal_dir.clone());
     journal_config.max_total_bytes = loaded.config.logging.max_total_bytes;
     journal_config.cleanup_low_watermark =
@@ -41,9 +37,9 @@ pub async fn serve(
         loaded.daemon_epoch,
         started,
         journal.handle(),
-        loaded.config.slots.clone(),
+        loaded.config.ports.clone(),
         loaded.config.transport_profiles.clone(),
-        loaded.config.device_profiles.clone(),
+        loaded.config.model_profiles.clone(),
         loaded.config.control.limits(),
     );
     let state = AppState::try_new(
@@ -59,8 +55,8 @@ pub async fn serve(
         .await
         .with_context(|| format!("bind seriald to {bind}"))?;
     tracing::info!(%bind, epoch = %loaded.daemon_epoch, "seriald listening");
-    let server =
-        axum::serve(listener, api::router(state.clone())).with_graceful_shutdown(shutdown_signal());
+    let server = axum::serve(listener, api::router(state.clone()))
+        .with_graceful_shutdown(shutdown_signal(managed));
     let result = server.await.context("seriald HTTP server failed");
     state.shutdown().await;
     journal.shutdown().await.context("close serial journal")?;
@@ -68,8 +64,21 @@ pub async fn serve(
     result
 }
 
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
+async fn shutdown_signal(managed: bool) {
+    if managed {
+        let mut stdin = tokio::io::stdin();
+        let mut buffer = [0_u8; 256];
+        loop {
+            match stdin.read(&mut buffer).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "failed to read the managed shutdown pipe");
+                    return;
+                }
+            }
+        }
+    } else if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "failed to install Ctrl-C handler");
     }
 }

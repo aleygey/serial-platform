@@ -6,16 +6,14 @@
 //! and `0x03`. Raw serial bytes are never converted to text by this crate.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-/// WebSocket wire generation. v3 adds physical BREAK, stable serial error
-/// codes, effective Transport/Device settings, and bounded regex queries.
-/// Those enum additions are intentionally rejected by v2 peers instead of
-/// allowing a mixed-version connection to fail later while debugging.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// WebSocket wire generation for the port-addressed control, timeline, and
+/// configuration contract.
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -45,14 +43,6 @@ pub const MAX_PHYSICAL_WRITE_TIMEOUT_MS: u64 = 15_000;
 /// Maximum UTF-8 size of the human-readable purpose attached to one Agent
 /// command. The purpose is durable audit metadata, not serial payload.
 pub const MAX_COMMAND_DESCRIPTION_BYTES: usize = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Observer,
-    Operator,
-    Admin,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,9 +126,7 @@ pub struct SerialSettings {
     pub probe: Option<ProbeConfig>,
 }
 
-/// Reusable physical UART configuration. `SlotConfig::settings` remains a
-/// complete compatibility snapshot, while a matching catalog entry is the
-/// authoritative source for these transport fields.
+/// Reusable physical UART configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportProfile {
     pub name: String,
@@ -152,7 +140,7 @@ pub struct TransportProfile {
     pub auto_open: bool,
 }
 
-/// Physical UART settings after resolving a Slot's transport-profile binding.
+/// Physical UART settings after resolving a port's transport-profile binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedTransportSettings {
     pub baud_rate: u32,
@@ -193,8 +181,7 @@ pub fn resolve_transport_settings(
     }
 }
 
-/// Applies only physical UART fields, preserving the Slot's legacy
-/// device-behavior and write-pacing snapshot.
+/// Applies only physical UART fields and preserves model interaction settings.
 pub fn apply_transport_profile(
     settings: &SerialSettings,
     transport_profile: Option<&TransportProfile>,
@@ -246,9 +233,28 @@ pub struct CommandSequenceAuditContext {
     pub step_count: u8,
 }
 
+/// The concrete receive boundary used for one command write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandCaptureMatcherKind {
+    Contains,
+    Regex,
+    ShellPrompt,
+    UbootPrompt,
+}
+
+/// A matcher persisted with the authoritative TX event so user interfaces can
+/// recover the exact command/output region without guessing from current
+/// profile settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCaptureMatcher {
+    pub kind: CommandCaptureMatcherKind,
+    pub value: String,
+}
+
 /// Optional fail-closed boundary for one Agent physical serial action.
 ///
-/// The daemon validates this inside the Slot actor immediately before the
+/// The daemon validates this inside the port actor immediately before the
 /// write, BREAK, or Trigger enters the physical action boundary. RX and
 /// ordinary control events after `cursor` are allowed, but a changed serial
 /// generation, a changed TX offset, an explicit Gap event, or an evicted
@@ -262,7 +268,7 @@ pub struct SequenceWritePrecondition {
 
 impl WritePacing {
     /// Resolves the effective pacing for one write request: an explicit
-    /// per-request override wins over the Slot settings.
+    /// per-request override wins over the port settings.
     pub fn resolve(override_pacing: Option<Self>, settings: &SerialSettings) -> Self {
         override_pacing.unwrap_or(Self {
             chunk_size: settings.write_chunk_size,
@@ -276,7 +282,7 @@ impl WritePacing {
 /// The daemon arms its literal-byte matchers before performing the optional
 /// initial write. It then sends `action` at the requested interval, stopping
 /// when a `stop_contains` pattern is observed or either hard bound is reached.
-/// Device-model meaning and higher-level workflows deliberately remain in
+/// Model-specific meaning and higher-level workflows deliberately remain in
 /// clients; every byte field here is encoded as base64 on the JSON wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriggerSpec {
@@ -317,7 +323,7 @@ pub struct TriggerSpec {
     #[serde(default = "default_trigger_max_fires")]
     pub max_fires: u32,
     /// Optional pacing applied to both the initial write and every action
-    /// write. When absent, the Slot's effective write pacing is used.
+    /// write. When absent, the port's effective write pacing is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pacing: Option<WritePacing>,
 }
@@ -366,24 +372,22 @@ pub struct ProbeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotConfig {
-    pub id: String,
-    pub display_name: String,
+    /// Operating-system serial port name and the sole identity of this
+    /// logical connection (for example `COM4` or `/dev/cu.usbserial-210`).
     pub port: String,
-    pub profile: String,
-    /// Name of the device-model profile this Slot is attached to. Prompts and
-    /// similar device behavior belong to the device model and override the
-    /// generic/legacy behavior baseline stored in Slot settings.
+    /// Optional reusable physical UART profile. No profile means 115200 8N1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_profile: Option<String>,
+    pub transport_profile: Option<String>,
+    /// Optional model profile describing the connected device and its prompt
+    /// and input behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
     pub enabled: bool,
-    pub settings: SerialSettings,
 }
 
-/// A reusable device-model profile. Prompt and line-ending defaults describe
-/// the device connected behind any number of Slots, so they are configured
-/// once per model instead of being embedded in every Slot's settings.
+/// A reusable model identity and its serial interaction behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceProfile {
+pub struct ModelProfile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_prompt: Option<String>,
@@ -402,58 +406,10 @@ pub struct DeviceProfile {
     pub write_chunk_delay_ms: Option<u64>,
 }
 
-/// One node in the station-owned DUT model catalog.
-///
-/// Model identity is deliberately separate from [`DeviceProfile`]. A model
-/// name describes the hardware connected to a Slot, while a Device Profile
-/// changes prompts, line endings, echo handling, and write pacing. Keeping the
-/// two catalogs independent lets Human and Agent clients correct model
-/// identity without implicitly changing serial behavior.
+/// Device-interaction settings after applying the attached model profile.
+/// Generic defaults deliberately do not guess Shell or U-Boot prompts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceModel {
-    /// Stable catalog identity used by bindings and parent references.
-    pub id: String,
-    /// Human-readable model or family name. Names may repeat at different
-    /// levels (for example a family and its base variant can share a label).
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-}
-
-/// How the connected DUT's model identity was confirmed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelConfirmationMethod {
-    Serial,
-    Telnet,
-    Web,
-    Human,
-    Other,
-}
-
-/// Persisted assignment of one configured Slot to one catalog model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SlotModelBinding {
-    pub slot_id: String,
-    pub model_id: String,
-    pub confirmation_method: ModelConfirmationMethod,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    /// Wall-clock time of the latest assignment, in Unix nanoseconds.
-    pub updated_wall_time_ns: i64,
-    /// Bounded caller/audit label such as `human:serialctl` or
-    /// `agent:serial-mcp`. Authentication still comes from the bearer role;
-    /// this field records the declared workflow source only.
-    pub source: String,
-}
-
-/// Device-interaction settings after applying the attached device profile to
-/// the Slot's generic/legacy baseline. Generic transport defaults deliberately
-/// do not guess device-specific Shell or U-Boot prompts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedDeviceSettings {
+pub struct ResolvedModelSettings {
     pub shell_prompt: Option<String>,
     pub uboot_prompt: Option<String>,
     pub write_eol: String,
@@ -461,40 +417,34 @@ pub struct ResolvedDeviceSettings {
     pub write_pacing: WritePacing,
 }
 
-/// Resolves the effective device behavior for one Slot. An attached
-/// device-model profile owns Shell/U-Boot prompt presence as well as any
-/// provided EOL/echo overrides. Without a profile, old Slot prompt values
-/// remain compatible.
-///
-/// `shell_prompt`/`uboot_prompt` are optional in the Slot settings, so a
-/// profile can supply them when the Slot does not. `write_eol` and `echo`
-/// remain concrete in the Slot for backward-compatible generic defaults.
-pub fn resolve_device_settings(
+/// Resolves effective model behavior. A bound profile owns Shell/U-Boot
+/// prompts and any provided EOL, echo, and pacing overrides.
+pub fn resolve_model_settings(
     settings: &SerialSettings,
-    device_profile: Option<&DeviceProfile>,
-) -> ResolvedDeviceSettings {
-    let shell_prompt = match device_profile {
+    model_profile: Option<&ModelProfile>,
+) -> ResolvedModelSettings {
+    let shell_prompt = match model_profile {
         Some(profile) => profile.shell_prompt.clone(),
         None => settings.shell_prompt.clone(),
     };
-    let uboot_prompt = match device_profile {
+    let uboot_prompt = match model_profile {
         Some(profile) => profile.uboot_prompt.clone(),
         None => settings.uboot_prompt.clone(),
     };
-    ResolvedDeviceSettings {
+    ResolvedModelSettings {
         shell_prompt,
         uboot_prompt,
-        write_eol: device_profile
+        write_eol: model_profile
             .and_then(|profile| profile.write_eol.clone())
             .unwrap_or_else(|| settings.write_eol.clone()),
-        echo: device_profile
+        echo: model_profile
             .and_then(|profile| profile.echo)
             .unwrap_or(settings.echo),
         write_pacing: WritePacing {
-            chunk_size: device_profile
+            chunk_size: model_profile
                 .and_then(|profile| profile.write_chunk_size)
                 .unwrap_or(settings.write_chunk_size),
-            chunk_delay_ms: device_profile
+            chunk_delay_ms: model_profile
                 .and_then(|profile| profile.write_chunk_delay_ms)
                 .unwrap_or(settings.write_chunk_delay_ms),
         },
@@ -646,43 +596,36 @@ pub struct SlotSnapshot {
     pub endpoint_present: bool,
     pub session_state: SessionState,
     pub state_reason: Option<String>,
-    /// Stable classification for `state_reason`. Older daemons only expose
-    /// the human-readable text.
+    /// Stable classification for `state_reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_code: Option<ErrorCode>,
     pub target_activity: TargetActivity,
     pub last_rx_wall_time_ns: Option<i64>,
     pub rx_offset: u64,
     pub tx_offset: u64,
-    /// Total reader bytes dropped during this daemon epoch for this Slot.
+    /// Total reader bytes dropped during this daemon epoch for this port.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub rx_overflow_bytes: u64,
     pub control: Option<ControlLease>,
     pub active_run: Option<RunInfo>,
-    /// Current daemon-owned Trigger Job, if any. Older snapshots omit it.
+    /// Current daemon-owned Trigger Job, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_trigger: Option<TriggerInfo>,
     pub logging: LoggingState,
-    /// Authoritative prompts after resolving the attached device profile (or
-    /// legacy Slot values when no model is attached). Omitted on the wire when
-    /// unset; current clients use effective EOL/echo presence to distinguish
-    /// an authoritative `None` from an older daemon lacking this bundle.
+    /// Authoritative prompts after resolving the bound model profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_shell_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_uboot_prompt: Option<String>,
-    /// Effective line ending and echo policy after applying the attached
-    /// device-model profile. Optional on the wire for older-daemon
-    /// compatibility; current daemons always publish both.
+    /// Effective line ending and echo policy after applying the model profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_write_eol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_echo: Option<EchoMode>,
-    /// Authoritative physical UART settings. Present on current daemons;
-    /// optional on the wire so old persisted/test snapshots still decode.
+    /// Authoritative physical UART settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_transport: Option<ResolvedTransportSettings>,
-    /// Authoritative target-aware write pacing after Device Profile overrides.
+    /// Authoritative target-aware write pacing after model-profile overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_write_pacing: Option<WritePacing>,
 }
@@ -693,17 +636,6 @@ const fn is_zero_u64(value: &u64) -> bool {
 
 const fn is_false(value: &bool) -> bool {
     !*value
-}
-
-/// Deserializes an optional JSON property while preserving whether it was
-/// present with a `null` value. Serde normally maps both a missing property
-/// and an explicit `null` to `None` for `Option<Option<T>>`.
-fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,8 +655,8 @@ pub enum EventKind {
     SerialOpened,
     SerialOpenFailed,
     SerialClosed,
-    SlotReconfigured,
-    SlotRemoved,
+    PortReconfigured,
+    PortRemoved,
     ControlGranted,
     ControlReleased,
     ControlRevoked,
@@ -744,7 +676,7 @@ pub enum EventKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimelineEvent {
-    pub slot_id: String,
+    pub port: String,
     pub daemon_epoch: Uuid,
     pub seq: u64,
     pub generation: u64,
@@ -780,7 +712,7 @@ pub struct Cursor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
-    pub slot_id: String,
+    pub port: String,
     pub cursor: Option<Cursor>,
     #[serde(default = "default_tail_events")]
     pub tail_events: usize,
@@ -807,65 +739,65 @@ pub enum ClientMessage {
     },
     Detach {
         request_id: Uuid,
-        slots: Vec<String>,
+        ports: Vec<String>,
     },
     AcquireControl {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         mode: ControlMode,
         ttl_ms: u64,
     },
     RenewControl {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         ttl_ms: u64,
     },
     ReleaseControl {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
     },
     CancelAcquire {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
     },
     Write {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         operation_id: Option<Uuid>,
-        /// Optional optimistic Run boundary for one physical write. New Agent
-        /// adapters set this to the Run they own; ordinary human and legacy
-        /// clients may omit it and retain lease-only write authorization. A
+        /// Optional optimistic Run boundary for one physical write. Agent
+        /// adapters set this to the Run they own. A
         /// cooperative Human write must set it to the current Agent Run so its
         /// authorization and cross-connection idempotency remain Run-scoped.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_run_id: Option<Uuid>,
-        /// Per-write pacing override. Older clients omit the field and keep
-        /// using the Slot's configured pacing.
+        /// Per-write pacing override. Omission uses configured pacing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pacing: Option<WritePacing>,
         /// Optional human-readable purpose for this physical write. Agent
         /// adapters attach this to command writes so operators can review a
-        /// Run by intent before expanding the exact serial payload. Older
-        /// clients omit it and retain the original wire behavior.
+        /// Run by intent before expanding the exact serial payload.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        /// Receive boundaries used by the command capture that follows this
+        /// physical write. Empty for raw input and quiet-only commands.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        command_capture_matchers: Vec<CommandCaptureMatcher>,
         /// Optional durable grouping metadata for `command_sequence` writes.
-        /// Ordinary command, Human, and legacy writes omit this field.
+        /// Ordinary commands and Human writes omit this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command_sequence: Option<CommandSequenceAuditContext>,
         /// Optional daemon-enforced, fail-closed serial-context boundary.
         /// Agent adapters use it for ordinary commands and dependent sequence
-        /// writes. Human and legacy clients may omit it and retain their
-        /// existing behavior.
+        /// writes. Human clients omit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence_precondition: Option<SequenceWritePrecondition>,
         /// Explicit Human-only injection while an Agent owns control. This
@@ -879,7 +811,7 @@ pub enum ClientMessage {
     /// control byte; Ctrl-C/Ctrl-D/Ctrl-Z remain ordinary write payloads.
     SendBreak {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         duration_ms: u64,
@@ -893,7 +825,7 @@ pub enum ClientMessage {
     },
     TriggerStart {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         /// Explicit daemon identity prevents a delayed request from crossing a
@@ -915,14 +847,14 @@ pub enum ClientMessage {
     },
     TriggerStatus {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         daemon_epoch: Uuid,
         generation: u64,
         trigger_id: Uuid,
     },
     TriggerCancel {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         daemon_epoch: Uuid,
@@ -931,7 +863,7 @@ pub enum ClientMessage {
     },
     StartRun {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         label: String,
@@ -940,14 +872,14 @@ pub enum ClientMessage {
     },
     EndRun {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         run_id: Uuid,
     },
     Checkpoint {
         request_id: Uuid,
-        slot_id: String,
+        port: String,
         control_id: Uuid,
         fence: u64,
         label: String,
@@ -983,9 +915,9 @@ impl ClientMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResult {
-    HelloAccepted { actor: Actor, role: Role },
-    Attached { slots: Vec<String> },
-    Detached { slots: Vec<String> },
+    HelloAccepted { actor: Actor },
+    Attached { ports: Vec<String> },
+    Detached { ports: Vec<String> },
     ControlGranted { lease: ControlLease },
     ControlQueued { position: usize },
     ControlRenewed { lease: ControlLease },
@@ -1010,18 +942,17 @@ pub enum ServerMessage {
         daemon_epoch: Uuid,
         protocol_version: u16,
         actor: Actor,
-        role: Role,
     },
     Snapshot {
-        slot: Box<SlotSnapshot>,
+        port: Box<SlotSnapshot>,
     },
     ReplayBegin {
-        slot_id: String,
+        port: String,
         from_seq: u64,
         through_seq: u64,
     },
     Ready {
-        slot_id: String,
+        port: String,
         head_seq: u64,
     },
     Timeline {
@@ -1039,14 +970,14 @@ pub enum ServerMessage {
         retryable: bool,
     },
     Gap {
-        slot_id: String,
+        port: String,
         requested_after_seq: Option<u64>,
         first_available_seq: Option<u64>,
         head_seq: u64,
         reason: GapReason,
     },
     Lagged {
-        slot_id: String,
+        port: String,
         from_seq: u64,
         to_seq: u64,
     },
@@ -1056,8 +987,6 @@ pub enum ServerMessage {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     BadRequest,
-    Unauthorized,
-    Forbidden,
     NotFound,
     Conflict,
     ControlRequired,
@@ -1100,19 +1029,9 @@ pub struct HealthResponse {
     pub server_id: Uuid,
     pub daemon_epoch: Uuid,
     pub uptime_ms: u64,
-    /// WebSocket wire generation served by this daemon. Missing on pre-0.4
-    /// HTTP responses and decoded as zero by current clients.
+    /// WebSocket wire generation served by this daemon.
     #[serde(default)]
     pub protocol_version: u16,
-    /// Whether clients must send a bearer credential. Missing on older HTTP
-    /// responses and therefore decoded as `true` to preserve their secure
-    /// behavior.
-    #[serde(default = "default_auth_required")]
-    pub auth_required: bool,
-}
-
-const fn default_auth_required() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1125,28 +1044,29 @@ pub struct StatusResponse {
     #[serde(default)]
     pub config_revision: u64,
     /// True when guarded `command_sequence` writes are enforced atomically by
-    /// the Slot actor. Older daemons omit this additive capability and decode
-    /// as false, so a new MCP refuses the sequence before its first TX.
+    /// the port actor.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sequence_write_precondition_supported: bool,
     /// True when `sequence_precondition` is enforced atomically for every
-    /// Agent physical action: ordinary Write, BREAK, and Trigger start. Older
-    /// protocol-v3 daemons omit this additive capability and decode as false.
+    /// Agent physical action: ordinary Write, BREAK, and Trigger start.
     #[serde(default, skip_serializing_if = "is_false")]
     pub serial_context_precondition_supported: bool,
-    pub slots: Vec<SlotSnapshot>,
+    pub ports: Vec<SlotSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConfigureSlotsRequest {
-    pub slots: Vec<SlotConfig>,
+pub struct ConfigurePortsRequest {
+    pub ports: Vec<SlotConfig>,
+    /// Audit label for the local UI making the change, for example
+    /// `human:serialctl` or `human:desktop`.
+    pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConfigureSlotsResponse {
-    pub slots: Vec<SlotSnapshot>,
+pub struct ConfigurePortsResponse {
+    pub ports: Vec<SlotSnapshot>,
     #[serde(default)]
     pub config_revision: u64,
 }
@@ -1172,121 +1092,36 @@ pub struct ConfigureTransportProfilesResponse {
     pub config_revision: u64,
 }
 
-/// Read model for the configured device-model profile catalog.
+/// Read model for the configured model-profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceProfileListResponse {
-    pub profiles: Vec<DeviceProfile>,
+pub struct ModelProfileListResponse {
+    pub profiles: Vec<ModelProfile>,
     #[serde(default)]
     pub config_revision: u64,
 }
 
-/// Full replacement of the device-model profile catalog.
+/// Full replacement of the model-profile catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigureDeviceProfilesRequest {
-    pub profiles: Vec<DeviceProfile>,
+pub struct ConfigureModelProfilesRequest {
+    pub profiles: Vec<ModelProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigureDeviceProfilesResponse {
-    pub profiles: Vec<DeviceProfile>,
+pub struct ConfigureModelProfilesResponse {
+    pub profiles: Vec<ModelProfile>,
     #[serde(default)]
     pub config_revision: u64,
 }
 
-/// Authoritative model tree plus the current per-Slot assignments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceModelListResponse {
-    pub models: Vec<DeviceModel>,
-    pub bindings: Vec<SlotModelBinding>,
-    #[serde(default)]
-    pub config_revision: u64,
-}
-
-/// Full replacement of the model catalog. Existing bindings are retained and
-/// therefore prevent deletion of an assigned model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigureDeviceModelsRequest {
-    pub models: Vec<DeviceModel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_revision: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfigureDeviceModelsResponse {
-    pub models: Vec<DeviceModel>,
-    pub bindings: Vec<SlotModelBinding>,
-    #[serde(default)]
-    pub config_revision: u64,
-}
-
-/// Atomically attach, replace, or remove one Slot's model assignment.
-///
-/// `model_id = null` detaches. When `create_if_missing` is true, the remaining
-/// model fields describe a catalog leaf to create in the same configuration
-/// transaction before it is bound. `update_existing` instead patches the
-/// existing node currently bound to this Slot; it requires exact revision and
-/// binding guards. `expected_current` is intentionally a
-/// nested Option: an omitted key disables this guard, JSON `null` expects an
-/// unbound Slot, and a string expects that exact current model ID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetSlotDeviceModelRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub create_if_missing: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub update_existing: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub clear_parent: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub clear_aliases: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confirmation_method: Option<ModelConfirmationMethod>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_revision: Option<u64>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_present_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub expected_current: Option<Option<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetSlotDeviceModelResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding: Option<SlotModelBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<DeviceModel>,
-    #[serde(default)]
-    pub created: bool,
-    /// Slots whose bindings refer to the returned model after this transaction.
-    /// Updating one shared catalog node changes its metadata for every listed
-    /// Slot even though only the path Slot authorizes the mutation.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub affected_slots: Vec<String>,
-    #[serde(default)]
-    pub config_revision: u64,
-}
-
-/// One discoverable, retained Slot/daemon-epoch journal archive.
+/// One discoverable, retained port/daemon-epoch journal archive.
 ///
 /// Segment timestamps describe when the first and last retained segments were
 /// created. Event timestamps remain available from the bounded event query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveSummary {
-    pub slot_id: String,
+    pub port: String,
     pub epoch: Uuid,
     pub first_seq: u64,
     pub last_seq: u64,
@@ -1300,7 +1135,7 @@ pub struct ArchiveSummary {
 /// Bounded archive catalog returned by `seriald`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveListResponse {
-    /// Retained Slot/epoch summaries, newest archive first. The daemon orders
+    /// Retained port/epoch summaries, newest archive first. The daemon orders
     /// by `last_segment_wall_time_ns`; clients may preserve this order as a
     /// stable rank when sequence numbers cannot be compared across epochs.
     pub archives: Vec<ArchiveSummary>,
@@ -1331,21 +1166,21 @@ pub struct EventQuery {
     pub limit_bytes: Option<usize>,
 }
 
-/// A long-lived, daemon-owned matcher over one Slot's live RX stream.
+/// A long-lived, daemon-owned matcher over one port's live RX stream.
 ///
 /// `contains` and `regex` are mutually exclusive. They are strings rather
-/// than device-profile fields because monitors describe one observation job,
+/// than model-profile fields because monitors describe one observation job,
 /// not the DUT's shell protocol. Matching uses the byte representation of the
 /// UTF-8 strings and spans contiguous RX timeline events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorSpec {
-    pub slot_id: String,
+    pub port: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regex: Option<String>,
     /// First event considered is strictly after this cursor. When omitted,
-    /// seriald resolves it to the Slot head at creation/update time.
+    /// seriald resolves it to the port head at creation/update time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_cursor: Option<Cursor>,
     #[serde(default)]
@@ -1448,7 +1283,7 @@ pub struct MonitorIncident {
     /// Stable, monotonically increasing cursor within one Monitor Job.
     pub incident_seq: u64,
     pub monitor_id: Uuid,
-    pub slot_id: String,
+    pub port: String,
     pub daemon_epoch: Uuid,
     pub seq_start: u64,
     pub seq_end: u64,
@@ -1518,7 +1353,7 @@ pub struct DaemonDiagnosticsResponse {
     pub websocket_connections: usize,
     pub websocket_limit: usize,
     pub journal: JournalDiagnostics,
-    pub slots: Vec<SlotDiagnostics>,
+    pub ports: Vec<SlotDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1546,7 +1381,7 @@ pub struct GapRange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataFrameHeader {
     pub protocol_version: u16,
-    pub slot_id: String,
+    pub port: String,
     pub daemon_epoch: Uuid,
     pub seq: u64,
     pub generation: u64,
@@ -1570,7 +1405,7 @@ impl From<&TimelineEvent> for DataFrameHeader {
     fn from(event: &TimelineEvent) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            slot_id: event.slot_id.clone(),
+            port: event.port.clone(),
             daemon_epoch: event.daemon_epoch,
             seq: event.seq,
             generation: event.generation,
@@ -1593,7 +1428,7 @@ impl From<&TimelineEvent> for DataFrameHeader {
 impl DataFrameHeader {
     pub fn into_event(self, data: Vec<u8>) -> TimelineEvent {
         TimelineEvent {
-            slot_id: self.slot_id,
+            port: self.port,
             daemon_epoch: self.daemon_epoch,
             seq: self.seq,
             generation: self.generation,
@@ -1821,7 +1656,7 @@ mod tests {
 
     fn event(direction: Direction, kind: EventKind, data: Vec<u8>) -> TimelineEvent {
         TimelineEvent {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch: Uuid::new_v4(),
             seq: 42,
             generation: 3,
@@ -1854,7 +1689,7 @@ mod tests {
     #[test]
     fn control_round_trip() {
         let message = ServerMessage::Ready {
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             head_seq: 9,
         };
         assert_eq!(
@@ -1882,29 +1717,15 @@ mod tests {
         assert_eq!(settings.write_eol, "\r");
         assert_eq!(settings.echo, EchoMode::On);
         assert!(settings.shell_prompt.is_none());
-        // The built-in U-Boot prompt moved behind resolution so a device
-        // profile is not shadowed by the Slot default.
+        // Generic settings do not guess a model-specific U-Boot prompt.
         assert!(settings.uboot_prompt.is_none());
         assert_eq!(settings.write_chunk_size, 1);
         assert_eq!(settings.write_chunk_delay_ms, 1);
         assert!(settings.probe.is_none());
     }
 
-    #[test]
-    fn legacy_health_response_defaults_to_authentication_required() {
-        let health: HealthResponse = serde_json::from_value(serde_json::json!({
-            "status": "ok",
-            "server_id": Uuid::nil(),
-            "daemon_epoch": Uuid::nil(),
-            "uptime_ms": 1,
-            "protocol_version": PROTOCOL_VERSION
-        }))
-        .unwrap();
-        assert!(health.auth_required);
-    }
-
-    fn device_profile() -> DeviceProfile {
-        DeviceProfile {
+    fn model_profile() -> ModelProfile {
+        ModelProfile {
             name: "sigmastar-evb".into(),
             shell_prompt: Some("root@sigmastar:/# ".into()),
             uboot_prompt: Some("SigmaStar =>".into()),
@@ -1916,10 +1737,10 @@ mod tests {
     }
 
     #[test]
-    fn device_profile_overrides_generic_behavior_baseline() {
-        let profile = device_profile();
-        // Profile supplies everything the Slot leaves unset.
-        let resolved = resolve_device_settings(&SerialSettings::default(), Some(&profile));
+    fn model_profile_overrides_generic_behavior_baseline() {
+        let profile = model_profile();
+        // The model profile supplies all target-specific behavior.
+        let resolved = resolve_model_settings(&SerialSettings::default(), Some(&profile));
         assert_eq!(resolved.shell_prompt.as_deref(), Some("root@sigmastar:/# "));
         assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
         assert_eq!(resolved.write_eol, "\n");
@@ -1933,8 +1754,8 @@ mod tests {
         );
 
         // Once attached, the model owns prompts as well as line ending and
-        // echo behavior. This prevents a stale legacy Slot prompt from
-        // surviving when the physical station changes device models.
+        // echo behavior, so changing the bound model cannot retain stale
+        // prompt behavior from the previous device.
         let settings = SerialSettings {
             shell_prompt: Some("/ # ".into()),
             uboot_prompt: Some("U-Boot> ".into()),
@@ -1942,7 +1763,7 @@ mod tests {
             echo: EchoMode::Auto,
             ..SerialSettings::default()
         };
-        let resolved = resolve_device_settings(&settings, Some(&profile));
+        let resolved = resolve_model_settings(&settings, Some(&profile));
         assert_eq!(resolved.shell_prompt.as_deref(), Some("root@sigmastar:/# "));
         assert_eq!(resolved.uboot_prompt.as_deref(), Some("SigmaStar =>"));
         assert_eq!(resolved.write_eol, "\n");
@@ -1951,7 +1772,7 @@ mod tests {
         // Attaching a model makes that profile authoritative for prompt
         // presence too. An omitted prompt means "not configured", rather
         // than inheriting a stale prompt from the previously attached model.
-        let promptless = DeviceProfile {
+        let promptless = ModelProfile {
             name: "promptless".into(),
             shell_prompt: None,
             uboot_prompt: None,
@@ -1960,7 +1781,7 @@ mod tests {
             write_chunk_size: None,
             write_chunk_delay_ms: None,
         };
-        let resolved = resolve_device_settings(&settings, Some(&promptless));
+        let resolved = resolve_model_settings(&settings, Some(&promptless));
         assert!(resolved.shell_prompt.is_none());
         assert!(resolved.uboot_prompt.is_none());
         assert_eq!(resolved.write_eol, "\r\n");
@@ -2014,46 +1835,40 @@ mod tests {
     }
 
     #[test]
-    fn device_settings_without_profile_match_legacy_behavior() {
-        // Regression: a configuration without device profiles resolves to the
-        // same effective values as before profiles existed.
+    fn device_settings_without_profile_use_the_generic_baseline() {
         let settings = SerialSettings {
             shell_prompt: Some("/ # ".into()),
-            uboot_prompt: Some("legacy=> ".into()),
+            uboot_prompt: Some("boot=> ".into()),
             ..SerialSettings::default()
         };
-        let resolved = resolve_device_settings(&settings, None);
+        let resolved = resolve_model_settings(&settings, None);
         assert_eq!(resolved.shell_prompt.as_deref(), Some("/ # "));
-        assert_eq!(resolved.uboot_prompt.as_deref(), Some("legacy=> "));
+        assert_eq!(resolved.uboot_prompt.as_deref(), Some("boot=> "));
         assert_eq!(resolved.write_eol, "\r");
         assert_eq!(resolved.echo, EchoMode::On);
     }
 
     #[test]
-    fn legacy_slot_config_without_device_profile_still_decodes() {
-        let legacy = serde_json::json!({
-            "id": "slot-1",
-            "display_name": "Slot 1",
+    fn slot_config_uses_the_port_as_its_only_identity() {
+        let value = serde_json::json!({
             "port": "COM3",
-            "profile": "generic-115200",
+            "transport_profile": "generic-115200",
+            "model_profile": "TL-AS7230 1.0",
             "enabled": true,
-            "settings": SerialSettings::default(),
         });
-        let slot: SlotConfig = serde_json::from_value(legacy).unwrap();
-        assert!(slot.device_profile.is_none());
+        let slot: SlotConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(slot.port, "COM3");
+        assert_eq!(slot.model_profile.as_deref(), Some("TL-AS7230 1.0"));
     }
 
     #[test]
     fn snapshot_omits_unset_effective_prompts_on_the_wire() {
         let json = serde_json::to_value(SlotSnapshot {
             config: SlotConfig {
-                id: "slot-1".into(),
-                display_name: "Slot 1".into(),
                 port: "COM3".into(),
-                profile: "generic-115200".into(),
-                device_profile: None,
+                transport_profile: Some("generic-115200".into()),
+                model_profile: None,
                 enabled: true,
-                settings: SerialSettings::default(),
             },
             daemon_epoch: Uuid::new_v4(),
             head_seq: 0,
@@ -2085,7 +1900,6 @@ mod tests {
         assert!(!object.contains_key("effective_uboot_prompt"));
         assert!(!object.contains_key("effective_write_eol"));
         assert!(!object.contains_key("effective_echo"));
-        // ...and an older daemon's snapshot without the keys still decodes.
         let decoded: SlotSnapshot = serde_json::from_value(json).unwrap();
         assert!(decoded.effective_shell_prompt.is_none());
         assert!(decoded.effective_uboot_prompt.is_none());
@@ -2098,7 +1912,7 @@ mod tests {
         let expected_run_id = Uuid::new_v4();
         let message = ClientMessage::Write {
             request_id: Uuid::new_v4(),
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id: Uuid::new_v4(),
             fence: 7,
             data: b"reboot\r".to_vec(),
@@ -2109,6 +1923,7 @@ mod tests {
                 chunk_delay_ms: 10,
             }),
             description: Some("重启样机".into()),
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: false,
@@ -2118,11 +1933,11 @@ mod tests {
     }
 
     #[test]
-    fn command_sequence_context_and_precondition_round_trip_and_legacy_writes_omit_them() {
+    fn command_capture_sequence_context_and_precondition_round_trip() {
         let sequence_id = Uuid::new_v4();
         let message = ClientMessage::Write {
             request_id: Uuid::new_v4(),
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id: Uuid::new_v4(),
             fence: 7,
             data: b"admin\r".to_vec(),
@@ -2130,6 +1945,10 @@ mod tests {
             expected_run_id: Some(Uuid::new_v4()),
             pacing: None,
             description: Some("输入登录账号".into()),
+            command_capture_matchers: vec![CommandCaptureMatcher {
+                kind: CommandCaptureMatcherKind::Contains,
+                value: "Password:".into(),
+            }],
             command_sequence: Some(CommandSequenceAuditContext {
                 sequence_id,
                 description: "登录样机".into(),
@@ -2152,6 +1971,8 @@ mod tests {
             serde_json::json!(sequence_id)
         );
         assert_eq!(encoded["command_sequence"]["step_index"], 0);
+        assert_eq!(encoded["command_capture_matchers"][0]["kind"], "contains");
+        assert_eq!(encoded["command_capture_matchers"][0]["value"], "Password:");
         assert_eq!(encoded["sequence_precondition"]["expected_generation"], 3);
         assert_eq!(encoded["sequence_precondition"]["expected_tx_offset"], 17);
         assert_eq!(encoded["sequence_precondition"]["cursor"]["after_seq"], 41);
@@ -2159,32 +1980,15 @@ mod tests {
             serde_json::from_value::<ClientMessage>(encoded).unwrap(),
             message
         );
-
-        let mut legacy = serde_json::to_value(&message).unwrap();
-        legacy.as_object_mut().unwrap().remove("command_sequence");
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("sequence_precondition");
-        let ClientMessage::Write {
-            command_sequence,
-            sequence_precondition,
-            ..
-        } = serde_json::from_value(legacy).unwrap()
-        else {
-            panic!("expected write")
-        };
-        assert!(command_sequence.is_none());
-        assert!(sequence_precondition.is_none());
     }
 
     #[test]
-    fn legacy_status_defaults_sequence_precondition_capability_to_false() {
+    fn status_uses_ports_and_defaults_optional_capabilities() {
         let status: StatusResponse = serde_json::from_value(serde_json::json!({
             "server_id": Uuid::new_v4(),
             "daemon_epoch": Uuid::new_v4(),
             "protocol_version": PROTOCOL_VERSION,
-            "slots": []
+            "ports": []
         }))
         .unwrap();
         assert!(!status.sequence_write_precondition_supported);
@@ -2196,7 +2000,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         let message = ClientMessage::SendBreak {
             request_id,
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id: Uuid::new_v4(),
             fence: 7,
             duration_ms: 250,
@@ -2225,68 +2029,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_write_message_without_pacing_still_decodes() {
-        // A pre-pacing client serializes the Write variant without the
-        // optional pacing key; the daemon must keep accepting that shape.
+    fn cooperative_write_round_trips() {
         let request_id = Uuid::new_v4();
         let control_id = Uuid::new_v4();
-        let legacy = serde_json::json!({
-            "type": "write",
-            "request_id": request_id,
-            "slot_id": "slot-1",
-            "control_id": control_id,
-            "fence": 3,
-            "data": BASE64.encode(b"reboot\r"),
-            "operation_id": null,
-        });
-        let header = serde_json::to_vec(&legacy).unwrap();
-        let mut frame = vec![CONTROL_FRAME_TAG];
-        frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&header);
-        assert_eq!(
-            decode_client_control(&frame).unwrap(),
-            ClientMessage::Write {
-                request_id,
-                slot_id: "slot-1".into(),
-                control_id,
-                fence: 3,
-                data: b"reboot\r".to_vec(),
-                operation_id: None,
-                expected_run_id: None,
-                pacing: None,
-                description: None,
-                command_sequence: None,
-                sequence_precondition: None,
-                cooperative: false,
-            }
-        );
-    }
-
-    #[test]
-    fn cooperative_write_is_additive_and_legacy_writes_default_to_false() {
-        let request_id = Uuid::new_v4();
-        let control_id = Uuid::new_v4();
-        let legacy = serde_json::json!({
-            "type": "write",
-            "request_id": request_id,
-            "slot_id": "slot-1",
-            "control_id": control_id,
-            "fence": 3,
-            "data": BASE64.encode(b"status\r"),
-            "operation_id": null,
-        });
-        let decoded: ClientMessage = serde_json::from_value(legacy).unwrap();
-        assert!(matches!(
-            decoded,
-            ClientMessage::Write {
-                cooperative: false,
-                ..
-            }
-        ));
-
         let cooperative = ClientMessage::Write {
             request_id,
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id,
             fence: 3,
             data: b"status\r".to_vec(),
@@ -2294,6 +2042,7 @@ mod tests {
             expected_run_id: Some(Uuid::new_v4()),
             pacing: None,
             description: None,
+            command_capture_matchers: Vec::new(),
             command_sequence: None,
             sequence_precondition: None,
             cooperative: true,
@@ -2304,38 +2053,6 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ClientMessage>(encoded).unwrap(),
             cooperative
-        );
-    }
-
-    #[test]
-    fn slot_model_expected_current_preserves_three_states() {
-        let base = serde_json::json!({
-            "model_id": "tl-as7230-w",
-            "source": "human:serialctl"
-        });
-        let omitted: SetSlotDeviceModelRequest = serde_json::from_value(base.clone()).unwrap();
-        assert_eq!(omitted.expected_current, None);
-        assert!(
-            !serde_json::to_value(&omitted)
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .contains_key("expected_current")
-        );
-
-        let mut unbound = base.clone();
-        unbound["expected_current"] = serde_json::Value::Null;
-        let unbound: SetSlotDeviceModelRequest = serde_json::from_value(unbound).unwrap();
-        assert_eq!(unbound.expected_current, Some(None));
-        assert!(serde_json::to_value(&unbound).unwrap()["expected_current"].is_null());
-
-        let mut bound = base;
-        bound["expected_current"] = serde_json::json!("tl-as7230");
-        let bound: SetSlotDeviceModelRequest = serde_json::from_value(bound).unwrap();
-        assert_eq!(bound.expected_current, Some(Some("tl-as7230".into())));
-        assert_eq!(
-            serde_json::to_value(&bound).unwrap()["expected_current"],
-            serde_json::json!("tl-as7230")
         );
     }
 
@@ -2368,7 +2085,7 @@ mod tests {
         let request_id = Uuid::new_v4();
         let message = ClientMessage::CancelAcquire {
             request_id,
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id: Uuid::new_v4(),
         };
         assert_eq!(message.request_id(), request_id);
@@ -2430,8 +2147,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v3_exposes_trigger_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_v4_exposes_port_and_model_profile_contracts() {
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -2458,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_spec_defaults_are_bounded_and_backward_friendly() {
+    fn trigger_spec_defaults_are_bounded() {
         let decoded: TriggerSpec = serde_json::from_value(serde_json::json!({
             "action": BASE64.encode([0x00, 0xff]),
         }))
@@ -2482,7 +2199,7 @@ mod tests {
         let expected_run_id = Uuid::new_v4();
         let start = ClientMessage::TriggerStart {
             request_id,
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id,
             fence: 17,
             daemon_epoch,
@@ -2508,7 +2225,7 @@ mod tests {
         let trigger_id = Uuid::new_v4();
         let status = ClientMessage::TriggerStatus {
             request_id: Uuid::new_v4(),
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             daemon_epoch,
             generation: 5,
             trigger_id,
@@ -2520,7 +2237,7 @@ mod tests {
 
         let cancel = ClientMessage::TriggerCancel {
             request_id: Uuid::new_v4(),
-            slot_id: "slot-1".into(),
+            port: "slot-1".into(),
             control_id,
             fence: 17,
             daemon_epoch,

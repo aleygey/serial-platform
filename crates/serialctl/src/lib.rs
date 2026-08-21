@@ -6,7 +6,6 @@ mod display;
 mod doctor;
 mod history;
 mod i18n;
-mod model;
 mod profile;
 mod tui;
 mod ws;

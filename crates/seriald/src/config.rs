@@ -16,47 +16,32 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serial_protocol::{
-    DeviceModel, DeviceProfile, FlowControl, SlotConfig, SlotModelBinding, TransportProfile,
-};
+use serial_protocol::{FlowControl, ModelProfile, SlotConfig, TransportProfile};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::auth::{AuthConfig, AuthError, CredentialDisplay};
-#[cfg(test)]
-use crate::control::MIN_TTL_MS;
 use crate::control::{
     ControlLimits, MAX_CONTROL_TTL_MS, MAX_CONTROL_WAIT_TIMEOUT, MAX_TTL_MS, MAX_WAITERS,
     WAIT_TIMEOUT,
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 3210;
 pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * GIB;
 pub const DEFAULT_RETENTION_TARGET_PERCENT: u8 = 90;
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Hard bound for both one active configuration and the number of distinct
-/// Slot identities retained during one daemon epoch.
-pub const MAX_SLOT_IDENTITIES_PER_DAEMON: usize = 128;
-/// Hard bound for the device-model profile catalog.
-pub const MAX_DEVICE_PROFILES: usize = 128;
+/// Port identities retained during one daemon epoch.
+pub const MAX_PORT_IDENTITIES_PER_DAEMON: usize = 128;
+/// Hard bound for the model profile catalog.
+pub const MAX_MODEL_PROFILES: usize = 128;
 /// Hard bound for the physical UART profile catalog.
 pub const MAX_TRANSPORT_PROFILES: usize = 128;
-/// Hard bound for the station-owned DUT identity catalog.
-pub const MAX_DEVICE_MODELS: usize = 512;
-
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_SLOT_ID_BYTES: usize = 64;
-const MAX_DISPLAY_NAME_BYTES: usize = 128;
 const MAX_PORT_NAME_BYTES: usize = 512;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_PROMPT_PATTERN_BYTES: usize = 4096;
-const MAX_DEVICE_MODEL_ID_BYTES: usize = 128;
-const MAX_DEVICE_MODEL_NAME_BYTES: usize = 128;
-const MAX_DEVICE_MODEL_ALIASES: usize = 32;
-const MAX_MODEL_BINDING_NOTE_BYTES: usize = 2048;
-const MAX_MODEL_BINDING_SOURCE_BYTES: usize = 128;
 
 /// Files owned by one serial-platform installation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,8 +145,6 @@ impl ControlConfig {
 }
 
 /// Values persisted in `seriald.toml`.
-///
-/// `Debug` is safe because [`AuthConfig`] recursively redacts every token.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -176,63 +159,31 @@ pub struct DaemonConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub control: ControlConfig,
-    /// Parse-only compatibility for older configurations. The retired
-    /// external delivery adapter is ignored and omitted on the next save;
-    /// Monitor Incidents remain available through the core API/MCP.
-    #[allow(dead_code)]
-    #[serde(default, rename = "monitor_event_sink", skip_serializing)]
-    legacy_monitor_event_sink: Option<toml::Value>,
-    /// Whether HTTP and WebSocket clients must present one of the configured
-    /// bearer credentials. This defaults to `true` while deserializing so all
-    /// v1 configuration files written before this field existed retain their
-    /// authenticated behavior.
-    #[serde(default = "default_auth_required")]
-    pub auth_required: bool,
-    /// Three role credentials used only when `auth_required` is true. New
-    /// loopback-only personal installations omit this table completely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthConfig>,
     #[serde(default)]
-    pub slots: Vec<SlotConfig>,
+    pub ports: Vec<SlotConfig>,
     #[serde(default)]
     pub transport_profiles: Vec<TransportProfile>,
     #[serde(default)]
-    pub device_profiles: Vec<DeviceProfile>,
-    #[serde(default)]
-    pub device_models: Vec<DeviceModel>,
-    #[serde(default)]
-    pub slot_model_bindings: Vec<SlotModelBinding>,
+    pub model_profiles: Vec<ModelProfile>,
 }
 
 const fn default_config_revision() -> u64 {
     1
 }
 
-const fn default_auth_required() -> bool {
-    true
-}
-
 impl DaemonConfig {
-    fn generate() -> (Self, Option<CredentialDisplay>) {
-        (
-            Self {
-                schema_version: CONFIG_SCHEMA_VERSION,
-                config_revision: default_config_revision(),
-                server_id: Uuid::new_v4(),
-                bind: default_bind_address(),
-                logging: LoggingConfig::default(),
-                control: ControlConfig::default(),
-                legacy_monitor_event_sink: None,
-                auth_required: false,
-                auth: None,
-                slots: Vec::new(),
-                transport_profiles: Vec::new(),
-                device_profiles: Vec::new(),
-                device_models: Vec::new(),
-                slot_model_bindings: Vec::new(),
-            },
-            None,
-        )
+    pub fn generate() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            config_revision: default_config_revision(),
+            server_id: Uuid::new_v4(),
+            bind: default_bind_address(),
+            logging: LoggingConfig::default(),
+            control: ControlConfig::default(),
+            ports: Vec::new(),
+            transport_profiles: Vec::new(),
+            model_profiles: Vec::new(),
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
@@ -249,39 +200,16 @@ impl DaemonConfig {
         }
         validate_logging(&self.logging)?;
         validate_control(&self.control)?;
-        match (self.auth_required, self.auth.as_ref()) {
-            (true, Some(auth)) => auth.validate()?,
-            (true, None) => return Err(ConfigValidationError::MissingAuthentication),
-            (false, Some(_)) => return Err(ConfigValidationError::UnexpectedAuthentication),
-            (false, None) if !self.bind.ip().is_loopback() => {
-                return Err(ConfigValidationError::UnauthenticatedNonLoopbackBind {
-                    bind: self.bind,
-                });
-            }
-            (false, None) => {}
-        }
         validate_transport_profiles(&self.transport_profiles)?;
-        validate_device_profiles(&self.device_profiles)?;
-        validate_slots(&self.slots, &self.transport_profiles, &self.device_profiles)?;
-        validate_device_models(&self.device_models)?;
-        validate_slot_model_bindings(&self.slot_model_bindings, &self.slots, &self.device_models)
+        validate_model_profiles(&self.model_profiles)?;
+        validate_ports(&self.ports, &self.transport_profiles, &self.model_profiles)
     }
 
-    /// Replaces all Slot configuration in memory after validating the complete
-    /// resulting daemon configuration.
-    pub fn replace_slots(&mut self, slots: Vec<SlotConfig>) -> Result<(), ConfigValidationError> {
-        let previous = std::mem::replace(&mut self.slots, slots);
-        let previous_bindings = self.slot_model_bindings.clone();
-        let retained_slot_ids = self
-            .slots
-            .iter()
-            .map(|slot| slot.id.as_str())
-            .collect::<HashSet<_>>();
-        self.slot_model_bindings
-            .retain(|binding| retained_slot_ids.contains(binding.slot_id.as_str()));
+    /// Replaces every configured port after validating the complete result.
+    pub fn replace_ports(&mut self, ports: Vec<SlotConfig>) -> Result<(), ConfigValidationError> {
+        let previous = std::mem::replace(&mut self.ports, ports);
         if let Err(error) = self.validate() {
-            self.slots = previous;
-            self.slot_model_bindings = previous_bindings;
+            self.ports = previous;
             return Err(error);
         }
         Ok(())
@@ -290,21 +218,10 @@ impl DaemonConfig {
     /// Builds a fully validated candidate without changing the live in-memory
     /// configuration. Runtime and persistence layers can then commit it in
     /// their own transaction order.
-    pub fn staged_with_slots(&self, slots: Vec<SlotConfig>) -> Result<Self, ConfigValidationError> {
+    pub fn staged_with_ports(&self, ports: Vec<SlotConfig>) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
-        staged.replace_slots(slots)?;
+        staged.replace_ports(ports)?;
         staged.bump_revision()?;
-        Ok(staged)
-    }
-
-    /// Returns a validated migration candidate that removes all bearer
-    /// credentials. Persist this atomically while seriald is stopped.
-    pub fn staged_without_authentication(&self) -> Result<Self, ConfigValidationError> {
-        let mut staged = self.clone();
-        staged.auth_required = false;
-        staged.auth = None;
-        staged.bump_revision()?;
-        staged.validate()?;
         Ok(staged)
     }
 
@@ -330,69 +247,29 @@ impl DaemonConfig {
         Ok(staged)
     }
 
-    /// Replaces the device profile catalog in memory after validating the
-    /// complete resulting daemon configuration, including every Slot's
+    /// Replaces the model profile catalog in memory after validating the
+    /// complete resulting daemon configuration, including every port's
     /// profile reference.
-    pub fn replace_device_profiles(
+    pub fn replace_model_profiles(
         &mut self,
-        device_profiles: Vec<DeviceProfile>,
+        model_profiles: Vec<ModelProfile>,
     ) -> Result<(), ConfigValidationError> {
-        let previous = std::mem::replace(&mut self.device_profiles, device_profiles);
+        let previous = std::mem::replace(&mut self.model_profiles, model_profiles);
         if let Err(error) = self.validate() {
-            self.device_profiles = previous;
+            self.model_profiles = previous;
             return Err(error);
         }
         Ok(())
     }
 
-    /// Builds a fully validated candidate with a replaced device profile
+    /// Builds a fully validated candidate with a replaced model profile
     /// catalog without changing the live in-memory configuration.
-    pub fn staged_with_device_profiles(
+    pub fn staged_with_model_profiles(
         &self,
-        device_profiles: Vec<DeviceProfile>,
+        model_profiles: Vec<ModelProfile>,
     ) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
-        staged.replace_device_profiles(device_profiles)?;
-        staged.bump_revision()?;
-        Ok(staged)
-    }
-
-    /// Replaces the model identity tree without touching Device Profiles or
-    /// current Slot bindings. Removing a referenced model therefore fails
-    /// whole-configuration validation.
-    pub fn replace_device_models(
-        &mut self,
-        device_models: Vec<DeviceModel>,
-    ) -> Result<(), ConfigValidationError> {
-        let previous = std::mem::replace(&mut self.device_models, device_models);
-        if let Err(error) = self.validate() {
-            self.device_models = previous;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn staged_with_device_models(
-        &self,
-        device_models: Vec<DeviceModel>,
-    ) -> Result<Self, ConfigValidationError> {
-        let mut staged = self.clone();
-        staged.replace_device_models(device_models)?;
-        staged.bump_revision()?;
-        Ok(staged)
-    }
-
-    /// Builds one atomic candidate for a possible catalog-leaf creation plus
-    /// the resulting Slot binding replacement.
-    pub fn staged_with_model_state(
-        &self,
-        device_models: Vec<DeviceModel>,
-        slot_model_bindings: Vec<SlotModelBinding>,
-    ) -> Result<Self, ConfigValidationError> {
-        let mut staged = self.clone();
-        staged.device_models = device_models;
-        staged.slot_model_bindings = slot_model_bindings;
-        staged.validate()?;
+        staged.replace_model_profiles(model_profiles)?;
         staged.bump_revision()?;
         Ok(staged)
     }
@@ -416,8 +293,6 @@ pub struct LoadedConfig {
     pub config: DaemonConfig,
     pub daemon_epoch: Uuid,
     pub paths: ConfigPaths,
-    /// Present only when this call created the first configuration file.
-    pub initial_credentials: Option<CredentialDisplay>,
 }
 
 impl fmt::Debug for LoadedConfig {
@@ -427,10 +302,6 @@ impl fmt::Debug for LoadedConfig {
             .field("config", &self.config)
             .field("daemon_epoch", &self.daemon_epoch)
             .field("paths", &self.paths)
-            .field(
-                "initial_credentials",
-                &self.initial_credentials.as_ref().map(|_| "[REDACTED]"),
-            )
             .finish()
     }
 }
@@ -439,8 +310,6 @@ impl fmt::Debug for LoadedConfig {
 #[derive(Clone, Debug)]
 pub struct ConfigStore {
     paths: ConfigPaths,
-    #[cfg(test)]
-    fail_saves: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConfigStore {
@@ -450,11 +319,7 @@ impl ConfigStore {
 
     #[must_use]
     pub fn new(paths: ConfigPaths) -> Self {
-        Self {
-            paths,
-            #[cfg(test)]
-            fail_saves: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+        Self { paths }
     }
 
     #[must_use]
@@ -467,20 +332,19 @@ impl ConfigStore {
     pub fn load_or_create(&self) -> Result<LoadedConfig, ConfigError> {
         self.ensure_directories()?;
 
-        let (config, initial_credentials) = if self.paths.config_file.exists() {
-            (self.load()?, None)
+        let config = if self.paths.config_file.exists() {
+            self.load()?
         } else {
-            let (config, credentials) = DaemonConfig::generate();
+            let config = DaemonConfig::generate();
             config.validate()?;
             self.save(&config)?;
-            (config, credentials)
+            config
         };
 
         Ok(LoadedConfig {
             config,
             daemon_epoch: Uuid::new_v4(),
             paths: self.paths.clone(),
-            initial_credentials,
         })
     }
 
@@ -498,8 +362,6 @@ impl ConfigStore {
             .map_err(|source| io_error(&self.paths.config_file, source))?;
         let serialized = fs::read_to_string(&self.paths.config_file)
             .map_err(|source| io_error(&self.paths.config_file, source))?;
-        // Do not retain the parser's source error: TOML diagnostics can include
-        // the offending line, which could be a plaintext bearer token.
         let config: DaemonConfig =
             toml::from_str(&serialized).map_err(|_| ConfigError::InvalidToml {
                 path: self.paths.config_file.clone(),
@@ -511,42 +373,33 @@ impl ConfigStore {
     /// Validates and atomically replaces the persisted configuration.
     pub fn save(&self, config: &DaemonConfig) -> Result<(), ConfigError> {
         config.validate()?;
-        #[cfg(test)]
-        if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(io_error(
-                &self.paths.config_file,
-                io::Error::other("forced configuration save failure"),
-            ));
-        }
         self.ensure_directories()?;
-        // Serialization errors are deliberately sanitized for the same reason
-        // as parse errors: configuration contains bearer credentials.
         let serialized = toml::to_string_pretty(config).map_err(|_| ConfigError::Serialization)?;
         atomic_write(&self.paths.config_file, serialized.as_bytes())
             .map_err(|source| io_error(&self.paths.config_file, source))
     }
 
-    /// Persists a validated Slot replacement and only then commits it to the
+    /// Persists a validated port replacement and only then commits it to the
     /// caller's in-memory configuration. A failed write leaves both unchanged.
-    pub fn update_slots(
+    pub fn update_ports(
         &self,
         current: &mut DaemonConfig,
-        slots: Vec<SlotConfig>,
+        ports: Vec<SlotConfig>,
     ) -> Result<(), ConfigError> {
-        let updated = current.staged_with_slots(slots)?;
+        let updated = current.staged_with_ports(ports)?;
         self.save(&updated)?;
         *current = updated;
         Ok(())
     }
 
-    /// Persists a validated device profile catalog replacement and only then
+    /// Persists a validated model profile catalog replacement and only then
     /// commits it to the caller's in-memory configuration.
-    pub fn update_device_profiles(
+    pub fn update_model_profiles(
         &self,
         current: &mut DaemonConfig,
-        device_profiles: Vec<DeviceProfile>,
+        model_profiles: Vec<ModelProfile>,
     ) -> Result<(), ConfigError> {
-        let updated = current.staged_with_device_profiles(device_profiles)?;
+        let updated = current.staged_with_model_profiles(model_profiles)?;
         self.save(&updated)?;
         *current = updated;
         Ok(())
@@ -561,12 +414,6 @@ impl ConfigStore {
         self.save(&updated)?;
         *current = updated;
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_save_failure(&self, fail: bool) {
-        self.fail_saves
-            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn ensure_directories(&self) -> Result<(), ConfigError> {
@@ -613,12 +460,6 @@ pub enum ConfigValidationError {
     NilServerId,
     #[error("bind port must be non-zero")]
     InvalidBindPort,
-    #[error("auth_required=true requires an [auth] credential table")]
-    MissingAuthentication,
-    #[error("auth_required=false requires the [auth] credential table to be removed")]
-    UnexpectedAuthentication,
-    #[error("authentication can be disabled only for a loopback bind, not {bind}")]
-    UnauthenticatedNonLoopbackBind { bind: SocketAddr },
     #[error("configuration revision is exhausted")]
     RevisionExhausted,
     #[error("max_total_bytes must be non-zero")]
@@ -633,30 +474,26 @@ pub enum ConfigValidationError {
         "control.wait_timeout_ms is {actual}, exceeding the queued-acquire ceiling of {limit} ms"
     )]
     ControlWaitTimeoutTooLarge { actual: u64, limit: u64 },
-    #[error("authentication configuration is invalid: {0}")]
-    Authentication(#[from] AuthError),
-    #[error("Slot at index {index} has invalid field {field}: {reason}")]
-    InvalidSlot {
+    #[error("port at index {index} has invalid field {field}: {reason}")]
+    InvalidPort {
         index: usize,
         field: &'static str,
         reason: &'static str,
     },
-    #[error("Slots at indexes {first} and {second} use the same id")]
-    DuplicateSlotId { first: usize, second: usize },
-    #[error("Slots at indexes {first} and {second} use the same physical port")]
+    #[error("ports at indexes {first} and {second} refer to the same serial port")]
     DuplicatePort { first: usize, second: usize },
-    #[error("configuration contains {actual} Slots; the maximum is {limit}")]
-    TooManySlots { actual: usize, limit: usize },
-    #[error("device profile at index {index} has invalid field {field}: {reason}")]
-    InvalidDeviceProfile {
+    #[error("configuration contains {actual} ports; the maximum is {limit}")]
+    TooManyPorts { actual: usize, limit: usize },
+    #[error("model profile at index {index} has invalid field {field}: {reason}")]
+    InvalidModelProfile {
         index: usize,
         field: &'static str,
         reason: &'static str,
     },
-    #[error("device profiles at indexes {first} and {second} use the same name")]
-    DuplicateDeviceProfileName { first: usize, second: usize },
-    #[error("configuration contains {actual} device profiles; the maximum is {limit}")]
-    TooManyDeviceProfiles { actual: usize, limit: usize },
+    #[error("model profiles at indexes {first} and {second} use the same name")]
+    DuplicateModelProfileName { first: usize, second: usize },
+    #[error("configuration contains {actual} model profiles; the maximum is {limit}")]
+    TooManyModelProfiles { actual: usize, limit: usize },
     #[error("transport profile at index {index} has invalid field {field}: {reason}")]
     InvalidTransportProfile {
         index: usize,
@@ -668,55 +505,21 @@ pub enum ConfigValidationError {
     #[error("configuration contains {actual} transport profiles; the maximum is {limit}")]
     TooManyTransportProfiles { actual: usize, limit: usize },
     #[error(
-        "Slot {slot_id} references unknown transport profile {name:?}; available profiles: {available}"
+        "port {port} references unknown transport profile {name:?}; available profiles: {available}"
     )]
     UnknownTransportProfile {
-        slot_id: String,
+        port: String,
         name: String,
         available: String,
     },
     #[error(
-        "Slot {slot_id} references unknown device profile {name:?}; available profiles: {available}"
+        "port {port} references unknown model profile {name:?}; available profiles: {available}"
     )]
-    UnknownDeviceProfile {
-        slot_id: String,
+    UnknownModelProfile {
+        port: String,
         name: String,
         available: String,
     },
-    #[error("device model at index {index} has invalid field {field}: {reason}")]
-    InvalidDeviceModel {
-        index: usize,
-        field: &'static str,
-        reason: &'static str,
-    },
-    #[error("device models at indexes {first} and {second} use the same id")]
-    DuplicateDeviceModelId { first: usize, second: usize },
-    #[error(
-        "device models at indexes {first} and {second} use the same alias {alias:?} (case-insensitive)"
-    )]
-    DuplicateDeviceModelAlias {
-        first: usize,
-        second: usize,
-        alias: String,
-    },
-    #[error("configuration contains {actual} device models; the maximum is {limit}")]
-    TooManyDeviceModels { actual: usize, limit: usize },
-    #[error("device model {model_id:?} references unknown parent {parent_id:?}")]
-    UnknownDeviceModelParent { model_id: String, parent_id: String },
-    #[error("device model hierarchy contains a cycle through {model_id:?}")]
-    DeviceModelCycle { model_id: String },
-    #[error("Slot model binding at index {index} has invalid field {field}: {reason}")]
-    InvalidSlotModelBinding {
-        index: usize,
-        field: &'static str,
-        reason: &'static str,
-    },
-    #[error("Slot model bindings at indexes {first} and {second} use the same Slot")]
-    DuplicateSlotModelBinding { first: usize, second: usize },
-    #[error("Slot model binding references unknown Slot {slot_id:?}")]
-    UnknownModelBindingSlot { slot_id: String },
-    #[error("Slot {slot_id:?} references unknown device model {model_id:?}")]
-    UnknownBoundDeviceModel { slot_id: String, model_id: String },
 }
 
 fn validate_logging(logging: &LoggingConfig) -> Result<(), ConfigValidationError> {
@@ -749,83 +552,59 @@ fn validate_control(control: &ControlConfig) -> Result<(), ConfigValidationError
     Ok(())
 }
 
-pub(crate) fn validate_slots(
-    slots: &[SlotConfig],
+pub(crate) fn validate_ports(
+    ports: &[SlotConfig],
     transport_profiles: &[TransportProfile],
-    device_profiles: &[DeviceProfile],
+    model_profiles: &[ModelProfile],
 ) -> Result<(), ConfigValidationError> {
-    if slots.len() > MAX_SLOT_IDENTITIES_PER_DAEMON {
-        return Err(ConfigValidationError::TooManySlots {
-            actual: slots.len(),
-            limit: MAX_SLOT_IDENTITIES_PER_DAEMON,
+    if ports.len() > MAX_PORT_IDENTITIES_PER_DAEMON {
+        return Err(ConfigValidationError::TooManyPorts {
+            actual: ports.len(),
+            limit: MAX_PORT_IDENTITIES_PER_DAEMON,
         });
     }
-    let mut ids: HashMap<&str, usize> = HashMap::new();
-    let mut ports: HashMap<String, usize> = HashMap::new();
+    let mut seen_ports: HashMap<String, usize> = HashMap::new();
 
-    for (index, slot) in slots.iter().enumerate() {
-        validate_slot_id(index, &slot.id)?;
-        validate_text_field(
-            index,
-            "display_name",
-            &slot.display_name,
-            MAX_DISPLAY_NAME_BYTES,
-        )?;
+    for (index, slot) in ports.iter().enumerate() {
         validate_text_field(index, "port", &slot.port, MAX_PORT_NAME_BYTES)?;
-        validate_profile(index, &slot.profile)?;
-        validate_serial_settings(index, slot)?;
-
-        // A catalog-free file is a legacy configuration: the complete Slot
-        // settings snapshot stays authoritative. Once a catalog is created,
-        // every Slot binding must resolve so a typo cannot silently fall back.
-        if !transport_profiles.is_empty()
-            && !transport_profiles
+        if let Some(transport_profile) = slot.transport_profile.as_deref() {
+            validate_profile(index, transport_profile)?;
+            if !transport_profiles
                 .iter()
-                .any(|profile| profile.name == slot.profile)
+                .any(|profile| profile.name == transport_profile)
+            {
+                let available = transport_profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ConfigValidationError::UnknownTransportProfile {
+                    port: slot.port.clone(),
+                    name: transport_profile.to_owned(),
+                    available: catalog_summary(available),
+                });
+            }
+        }
+
+        if let Some(model_profile) = slot.model_profile.as_deref()
+            && !model_profiles
+                .iter()
+                .any(|profile| profile.name == model_profile)
         {
-            let available = transport_profiles
+            let available = model_profiles
                 .iter()
                 .map(|profile| profile.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(ConfigValidationError::UnknownTransportProfile {
-                slot_id: slot.id.clone(),
-                name: slot.profile.clone(),
-                available,
+            return Err(ConfigValidationError::UnknownModelProfile {
+                port: slot.port.clone(),
+                name: model_profile.to_owned(),
+                available: catalog_summary(available),
             });
         }
 
-        if let Some(device_profile) = slot.device_profile.as_deref()
-            && !device_profiles
-                .iter()
-                .any(|profile| profile.name == device_profile)
-        {
-            let available = device_profiles
-                .iter()
-                .map(|profile| profile.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ConfigValidationError::UnknownDeviceProfile {
-                slot_id: slot.id.clone(),
-                name: device_profile.to_owned(),
-                available: if available.is_empty() {
-                    "(none configured)".to_owned()
-                } else {
-                    available
-                },
-            });
-        }
-
-        if let Some(first) = ids.insert(&slot.id, index) {
-            return Err(ConfigValidationError::DuplicateSlotId {
-                first,
-                second: index,
-            });
-        }
-        // Windows COM names are case-insensitive. Applying the same rule on
-        // every platform keeps portable configuration deterministic.
-        let port_key = slot.port.to_ascii_lowercase();
-        if let Some(first) = ports.insert(port_key, index) {
+        let port_key = port_identity_key(&slot.port);
+        if let Some(first) = seen_ports.insert(port_key, index) {
             return Err(ConfigValidationError::DuplicatePort {
                 first,
                 second: index,
@@ -833,6 +612,26 @@ pub(crate) fn validate_slots(
         }
     }
     Ok(())
+}
+
+fn catalog_summary(names: String) -> String {
+    if names.is_empty() {
+        "(none configured)".to_owned()
+    } else {
+        names
+    }
+}
+
+fn port_identity_key(port: &str) -> String {
+    port_identity_key_for_platform(port, cfg!(windows))
+}
+
+fn port_identity_key_for_platform(port: &str, windows: bool) -> String {
+    if windows {
+        port.to_ascii_lowercase()
+    } else {
+        port.to_owned()
+    }
 }
 
 pub(crate) fn validate_transport_profiles(
@@ -881,13 +680,13 @@ pub(crate) fn validate_transport_profiles(
     Ok(())
 }
 
-pub(crate) fn validate_device_profiles(
-    profiles: &[DeviceProfile],
+pub(crate) fn validate_model_profiles(
+    profiles: &[ModelProfile],
 ) -> Result<(), ConfigValidationError> {
-    if profiles.len() > MAX_DEVICE_PROFILES {
-        return Err(ConfigValidationError::TooManyDeviceProfiles {
+    if profiles.len() > MAX_MODEL_PROFILES {
+        return Err(ConfigValidationError::TooManyModelProfiles {
             actual: profiles.len(),
-            limit: MAX_DEVICE_PROFILES,
+            limit: MAX_MODEL_PROFILES,
         });
     }
     let mut names: HashMap<&str, usize> = HashMap::new();
@@ -897,14 +696,14 @@ pub(crate) fn validate_device_profiles(
             || profile.name != profile.name.trim()
             || profile.name.chars().any(char::is_control)
         {
-            return Err(ConfigValidationError::InvalidDeviceProfile {
+            return Err(ConfigValidationError::InvalidModelProfile {
                 index,
                 field: "name",
                 reason: "must be a non-empty, trimmed name of at most 64 bytes",
             });
         }
         if let Some(first) = names.insert(&profile.name, index) {
-            return Err(ConfigValidationError::DuplicateDeviceProfileName {
+            return Err(ConfigValidationError::DuplicateModelProfileName {
                 first,
                 second: index,
             });
@@ -918,7 +717,7 @@ pub(crate) fn validate_device_profiles(
                     || pattern.len() > MAX_PROMPT_PATTERN_BYTES
                     || pattern.contains('\0')
             }) {
-                return Err(ConfigValidationError::InvalidDeviceProfile {
+                return Err(ConfigValidationError::InvalidModelProfile {
                     index,
                     field,
                     reason: "must be non-empty, at most 4096 bytes, and contain no NUL",
@@ -930,14 +729,14 @@ pub(crate) fn validate_device_profiles(
             .as_deref()
             .is_some_and(|eol| !matches!(eol, "" | "\r" | "\n" | "\r\n"))
         {
-            return Err(ConfigValidationError::InvalidDeviceProfile {
+            return Err(ConfigValidationError::InvalidModelProfile {
                 index,
                 field: "write_eol",
                 reason: "must be empty, CR, LF, or CRLF",
             });
         }
         if profile.write_chunk_size == Some(0) {
-            return Err(ConfigValidationError::InvalidDeviceProfile {
+            return Err(ConfigValidationError::InvalidModelProfile {
                 index,
                 field: "write_chunk_size",
                 reason: "must be greater than zero when configured",
@@ -947,7 +746,7 @@ pub(crate) fn validate_device_profiles(
             .write_chunk_delay_ms
             .is_some_and(|delay| delay > 10_000)
         {
-            return Err(ConfigValidationError::InvalidDeviceProfile {
+            return Err(ConfigValidationError::InvalidModelProfile {
                 index,
                 field: "write_chunk_delay_ms",
                 reason: "must not exceed 10000 ms",
@@ -957,186 +756,13 @@ pub(crate) fn validate_device_profiles(
     Ok(())
 }
 
-pub(crate) fn validate_device_models(models: &[DeviceModel]) -> Result<(), ConfigValidationError> {
-    if models.len() > MAX_DEVICE_MODELS {
-        return Err(ConfigValidationError::TooManyDeviceModels {
-            actual: models.len(),
-            limit: MAX_DEVICE_MODELS,
-        });
-    }
-
-    let mut ids: HashMap<&str, usize> = HashMap::new();
-    let mut aliases: HashMap<String, usize> = HashMap::new();
-    for (index, model) in models.iter().enumerate() {
-        validate_device_model_text(index, "id", &model.id, MAX_DEVICE_MODEL_ID_BYTES)?;
-        validate_device_model_text(index, "name", &model.name, MAX_DEVICE_MODEL_NAME_BYTES)?;
-        if let Some(parent_id) = model.parent_id.as_deref() {
-            validate_device_model_text(index, "parent_id", parent_id, MAX_DEVICE_MODEL_ID_BYTES)?;
-        }
-        if let Some(first) = ids.insert(&model.id, index) {
-            return Err(ConfigValidationError::DuplicateDeviceModelId {
-                first,
-                second: index,
-            });
-        }
-        if model.aliases.len() > MAX_DEVICE_MODEL_ALIASES {
-            return Err(ConfigValidationError::InvalidDeviceModel {
-                index,
-                field: "aliases",
-                reason: "must contain at most 32 entries",
-            });
-        }
-        for alias in &model.aliases {
-            validate_device_model_text(index, "aliases", alias, MAX_DEVICE_MODEL_NAME_BYTES)?;
-            let key = alias.to_lowercase();
-            if let Some(first) = aliases.insert(key, index) {
-                return Err(ConfigValidationError::DuplicateDeviceModelAlias {
-                    first,
-                    second: index,
-                    alias: alias.clone(),
-                });
-            }
-        }
-    }
-
-    for model in models {
-        if let Some(parent_id) = model.parent_id.as_deref()
-            && !ids.contains_key(parent_id)
-        {
-            return Err(ConfigValidationError::UnknownDeviceModelParent {
-                model_id: model.id.clone(),
-                parent_id: parent_id.to_owned(),
-            });
-        }
-
-        let mut path = HashSet::new();
-        let mut current = Some(model.id.as_str());
-        while let Some(id) = current {
-            if !path.insert(id) {
-                return Err(ConfigValidationError::DeviceModelCycle {
-                    model_id: id.to_owned(),
-                });
-            }
-            current = ids
-                .get(id)
-                .and_then(|index| models[*index].parent_id.as_deref());
-        }
-    }
-    Ok(())
-}
-
-fn validate_device_model_text(
-    index: usize,
-    field: &'static str,
-    value: &str,
-    max_bytes: usize,
-) -> Result<(), ConfigValidationError> {
-    if value.is_empty()
-        || value.len() > max_bytes
-        || value != value.trim()
-        || value.chars().any(char::is_control)
-    {
-        return Err(ConfigValidationError::InvalidDeviceModel {
-            index,
-            field,
-            reason: "must be non-empty, trimmed, bounded text without control characters",
-        });
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_slot_model_bindings(
-    bindings: &[SlotModelBinding],
-    slots: &[SlotConfig],
-    models: &[DeviceModel],
-) -> Result<(), ConfigValidationError> {
-    let slot_ids = slots
-        .iter()
-        .map(|slot| slot.id.as_str())
-        .collect::<HashSet<_>>();
-    let model_ids = models
-        .iter()
-        .map(|model| model.id.as_str())
-        .collect::<HashSet<_>>();
-    let mut bound_slots: HashMap<&str, usize> = HashMap::new();
-
-    for (index, binding) in bindings.iter().enumerate() {
-        if let Some(first) = bound_slots.insert(&binding.slot_id, index) {
-            return Err(ConfigValidationError::DuplicateSlotModelBinding {
-                first,
-                second: index,
-            });
-        }
-        if !slot_ids.contains(binding.slot_id.as_str()) {
-            return Err(ConfigValidationError::UnknownModelBindingSlot {
-                slot_id: binding.slot_id.clone(),
-            });
-        }
-        if !model_ids.contains(binding.model_id.as_str()) {
-            return Err(ConfigValidationError::UnknownBoundDeviceModel {
-                slot_id: binding.slot_id.clone(),
-                model_id: binding.model_id.clone(),
-            });
-        }
-        if binding.updated_wall_time_ns <= 0 {
-            return Err(ConfigValidationError::InvalidSlotModelBinding {
-                index,
-                field: "updated_wall_time_ns",
-                reason: "must be a positive Unix-nanosecond timestamp",
-            });
-        }
-        if binding.source.is_empty()
-            || binding.source.len() > MAX_MODEL_BINDING_SOURCE_BYTES
-            || binding.source != binding.source.trim()
-            || binding.source.chars().any(char::is_control)
-        {
-            return Err(ConfigValidationError::InvalidSlotModelBinding {
-                index,
-                field: "source",
-                reason: "must be non-empty, trimmed text of at most 128 bytes",
-            });
-        }
-        if binding
-            .note
-            .as_deref()
-            .is_some_and(|note| note.len() > MAX_MODEL_BINDING_NOTE_BYTES || note.contains('\0'))
-        {
-            return Err(ConfigValidationError::InvalidSlotModelBinding {
-                index,
-                field: "note",
-                reason: "must be at most 2048 bytes and contain no NUL",
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_slot_id(index: usize, id: &str) -> Result<(), ConfigValidationError> {
-    let valid = !id.is_empty()
-        && id.len() <= MAX_SLOT_ID_BYTES
-        && id.bytes().enumerate().all(|(position, byte)| match byte {
-            b'a'..=b'z' | b'0'..=b'9' => true,
-            b'-' | b'_' => position > 0,
-            _ => false,
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(invalid_slot(
-            index,
-            "id",
-            "use 1-64 lowercase ASCII letters, digits, '-' or '_'",
-        ))
-    }
-}
-
 fn validate_profile(index: usize, profile: &str) -> Result<(), ConfigValidationError> {
     if profile.is_empty()
         || profile.len() > MAX_PROFILE_NAME_BYTES
         || profile != profile.trim()
         || profile.chars().any(char::is_control)
     {
-        Err(invalid_slot(
+        Err(invalid_port(
             index,
             "profile",
             "must be a non-empty, trimmed name of at most 64 bytes",
@@ -1157,7 +783,7 @@ fn validate_text_field(
         || value != value.trim()
         || value.chars().any(char::is_control)
     {
-        Err(invalid_slot(
+        Err(invalid_port(
             index,
             field,
             "must be non-empty, trimmed, bounded text without control characters",
@@ -1167,69 +793,8 @@ fn validate_text_field(
     }
 }
 
-fn validate_serial_settings(index: usize, slot: &SlotConfig) -> Result<(), ConfigValidationError> {
-    let settings = &slot.settings;
-    if !(50..=12_000_000).contains(&settings.baud_rate) {
-        return Err(invalid_slot(
-            index,
-            "settings.baud_rate",
-            "must be between 50 and 12000000",
-        ));
-    }
-    if !matches!(settings.write_eol.as_str(), "" | "\r" | "\n" | "\r\n") {
-        return Err(invalid_slot(
-            index,
-            "settings.write_eol",
-            "must be empty, CR, LF, or CRLF",
-        ));
-    }
-    if settings.flow_control == FlowControl::Hardware && settings.rts {
-        return Err(invalid_slot(
-            index,
-            "settings.rts",
-            "must be false when hardware flow control owns RTS",
-        ));
-    }
-    if settings.write_chunk_size == 0 {
-        return Err(invalid_slot(
-            index,
-            "settings.write_chunk_size",
-            "must be greater than zero",
-        ));
-    }
-    if settings.write_chunk_delay_ms > 10_000 {
-        return Err(invalid_slot(
-            index,
-            "settings.write_chunk_delay_ms",
-            "must not exceed 10000 ms",
-        ));
-    }
-    for (field, pattern) in [
-        ("settings.shell_prompt", settings.shell_prompt.as_deref()),
-        ("settings.uboot_prompt", settings.uboot_prompt.as_deref()),
-    ] {
-        if pattern.is_some_and(|pattern| {
-            pattern.is_empty() || pattern.len() > MAX_PROMPT_PATTERN_BYTES || pattern.contains('\0')
-        }) {
-            return Err(invalid_slot(
-                index,
-                field,
-                "must be non-empty, at most 4096 bytes, and contain no NUL",
-            ));
-        }
-    }
-    if settings.probe.is_some() {
-        return Err(invalid_slot(
-            index,
-            "settings.probe",
-            "automatic probes are not supported in v1; use null",
-        ));
-    }
-    Ok(())
-}
-
-fn invalid_slot(index: usize, field: &'static str, reason: &'static str) -> ConfigValidationError {
-    ConfigValidationError::InvalidSlot {
+fn invalid_port(index: usize, field: &'static str, reason: &'static str) -> ConfigValidationError {
+    ConfigValidationError::InvalidPort {
         index,
         field,
         reason,
@@ -1376,683 +941,109 @@ fn restrict_config_file_permissions(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_protocol::SerialSettings;
-
-    fn slot(id: &str, port: &str) -> SlotConfig {
-        SlotConfig {
-            id: id.to_owned(),
-            display_name: id.to_owned(),
-            port: port.to_owned(),
-            profile: "generic-115200".to_owned(),
-            device_profile: None,
-            enabled: true,
-            settings: SerialSettings::default(),
-        }
-    }
-
-    fn device_profile(name: &str) -> DeviceProfile {
-        DeviceProfile {
-            name: name.to_owned(),
-            shell_prompt: Some("root@dut:/# ".to_owned()),
-            uboot_prompt: Some("SigmaStar =>".to_owned()),
-            write_eol: None,
-            echo: None,
-            write_chunk_size: None,
-            write_chunk_delay_ms: None,
-        }
-    }
+    use serial_protocol::{DataBits, EchoMode, Parity, StopBits};
 
     fn transport_profile(name: &str) -> TransportProfile {
-        let settings = SerialSettings::default();
         TransportProfile {
-            name: name.to_owned(),
-            baud_rate: settings.baud_rate,
-            data_bits: settings.data_bits,
-            parity: settings.parity,
-            stop_bits: settings.stop_bits,
-            flow_control: settings.flow_control,
-            dtr: settings.dtr,
-            rts: settings.rts,
-            auto_open: settings.auto_open,
+            name: name.into(),
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
+            dtr: false,
+            rts: false,
+            auto_open: true,
         }
     }
 
-    fn device_model(id: &str, name: &str, parent_id: Option<&str>) -> DeviceModel {
-        DeviceModel {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            parent_id: parent_id.map(str::to_owned),
-            aliases: Vec::new(),
+    fn model_profile(name: &str) -> ModelProfile {
+        ModelProfile {
+            name: name.into(),
+            shell_prompt: Some("/ # ".into()),
+            uboot_prompt: Some("U-Boot> ".into()),
+            write_eol: Some("\r".into()),
+            echo: Some(EchoMode::Auto),
+            write_chunk_size: Some(1),
+            write_chunk_delay_ms: Some(1),
         }
     }
 
-    fn model_binding(slot_id: &str, model_id: &str) -> SlotModelBinding {
-        SlotModelBinding {
-            slot_id: slot_id.to_owned(),
-            model_id: model_id.to_owned(),
-            confirmation_method: serial_protocol::ModelConfirmationMethod::Human,
-            note: Some("confirmed on bench label".into()),
-            updated_wall_time_ns: 1,
-            source: "human:test".into(),
+    fn slot(port: &str) -> SlotConfig {
+        SlotConfig {
+            port: port.into(),
+            transport_profile: None,
+            model_profile: None,
+            enabled: false,
         }
     }
 
     #[test]
-    fn first_load_creates_defaults_and_reload_preserves_server_identity() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-
-        let first = store.load_or_create().unwrap();
-        assert!(first.initial_credentials.is_none());
-        assert_eq!(first.config.bind, "127.0.0.1:3210".parse().unwrap());
-        assert!(!first.config.auth_required);
-        assert!(first.config.auth.is_none());
-        assert_eq!(first.config.logging.max_total_bytes, 10 * GIB);
-        assert_eq!(first.config.logging.retention_target_percent, 90);
-        assert_eq!(
-            first.config.logging.segment_max_bytes,
-            DEFAULT_SEGMENT_MAX_BYTES
-        );
-        assert!(first.config.slots.is_empty());
-        let first_server = first.config.server_id;
-        let first_epoch = first.daemon_epoch;
-        let second = store.load_or_create().unwrap();
-        assert!(second.initial_credentials.is_none());
-        assert_eq!(second.config.server_id, first_server);
-        assert_ne!(second.daemon_epoch, first_epoch);
-
-        let persisted = fs::read_to_string(&store.paths().config_file).unwrap();
-        assert!(!persisted.contains("daemon_epoch"));
-        assert!(persisted.contains("auth_required = false"));
-        assert!(!persisted.contains("[auth]"));
-    }
-
-    #[test]
-    fn legacy_config_without_auth_required_keeps_token_authentication() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let (auth, credentials) = AuthConfig::generate();
-        let mut config = DaemonConfig::generate().0;
-        config.auth_required = true;
-        config.auth = Some(auth);
-        let mut serialized = toml::to_string_pretty(&config).unwrap();
-        serialized = serialized.replace("auth_required = true\n", "");
-        fs::create_dir_all(&store.paths().config_dir).unwrap();
-        fs::write(&store.paths().config_file, serialized).unwrap();
-
-        let loaded = store.load().unwrap();
-        assert!(loaded.auth_required);
-        assert_eq!(
-            loaded
-                .auth
-                .as_ref()
-                .unwrap()
-                .authenticate_bearer(credentials.operator_token())
-                .unwrap()
-                .role(),
-            serial_protocol::Role::Operator
-        );
-    }
-
-    #[test]
-    fn unauthenticated_mode_rejects_credentials_and_non_loopback_bind() {
-        let mut config = DaemonConfig::generate().0;
+    fn fresh_configuration_is_token_free_and_works_on_lan_bindings() {
+        let mut config = DaemonConfig::generate();
         config.bind = "0.0.0.0:3210".parse().unwrap();
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::UnauthenticatedNonLoopbackBind { .. })
-        ));
-
-        config.bind = default_bind_address();
-        config.auth = Some(AuthConfig::generate().0);
-        assert_eq!(
-            config.validate(),
-            Err(ConfigValidationError::UnexpectedAuthentication)
-        );
-    }
-
-    #[test]
-    fn authenticated_loopback_config_can_be_staged_without_tokens() {
-        let (auth, _) = AuthConfig::generate();
-        let mut config = DaemonConfig::generate().0;
-        config.auth_required = true;
-        config.auth = Some(auth);
-        let previous_revision = config.config_revision;
-        let staged = config.staged_without_authentication().unwrap();
-        assert!(!staged.auth_required);
-        assert!(staged.auth.is_none());
-        assert_eq!(staged.config_revision, previous_revision + 1);
-        assert!(config.auth_required);
-        assert!(config.auth.is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persisted_configuration_is_private_to_the_user() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        store.load_or_create().unwrap();
-        let mode = fs::metadata(&store.paths().config_file)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    #[test]
-    fn updating_slots_commits_only_after_validation_and_persistence() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let mut loaded = store.load_or_create().unwrap();
-
-        store
-            .update_slots(
-                &mut loaded.config,
-                vec![slot("slot-1", "COM3"), slot("slot-2", "COM4")],
-            )
-            .unwrap();
-        assert_eq!(loaded.config.slots.len(), 2);
-        assert_eq!(store.load().unwrap().slots, loaded.config.slots);
-
-        let before = loaded.config.slots.clone();
-        let error = store
-            .update_slots(
-                &mut loaded.config,
-                vec![slot("replacement", "COM8"), slot("duplicate", "com8")],
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigError::Validation(ConfigValidationError::DuplicatePort { .. })
-        ));
-        assert_eq!(loaded.config.slots, before);
-        assert_eq!(store.load().unwrap().slots, before);
-    }
-
-    #[test]
-    fn invalid_existing_toml_is_not_overwritten_or_regenerated() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        fs::create_dir_all(&store.paths().config_dir).unwrap();
-        let invalid = "this is not valid = [ toml";
-        fs::write(&store.paths().config_file, invalid).unwrap();
-
-        assert!(matches!(
-            store.load_or_create(),
-            Err(ConfigError::InvalidToml { .. })
-        ));
-        assert_eq!(
-            fs::read_to_string(&store.paths().config_file).unwrap(),
-            invalid
-        );
-    }
-
-    #[test]
-    fn validation_rejects_duplicate_ids_and_invalid_serial_settings() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.slots = vec![slot("slot-1", "COM3"), slot("slot-1", "COM4")];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DuplicateSlotId { .. })
-        ));
-
-        let mut invalid = slot("slot-2", "COM5");
-        invalid.settings.baud_rate = 0;
-        config.slots = vec![invalid];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidSlot {
-                field: "settings.baud_rate",
-                ..
-            })
-        ));
-
-        let mut with_probe = slot("slot-3", "COM6");
-        with_probe.settings.probe = Some(serial_protocol::ProbeConfig {
-            request: b"status\r".to_vec(),
-            response_pattern: "ready".to_owned(),
-            timeout_ms: 1_000,
-        });
-        config.slots = vec![with_probe];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidSlot {
-                field: "settings.probe",
-                ..
-            })
-        ));
-
-        let mut hardware_flow = slot("slot-4", "COM7");
-        hardware_flow.settings.flow_control = FlowControl::Hardware;
-        hardware_flow.settings.rts = true;
-        config.slots = vec![hardware_flow];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidSlot {
-                field: "settings.rts",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn legacy_monitor_sink_is_accepted_but_ignored_and_not_reserialized() {
-        let (config, _) = DaemonConfig::generate();
-        let legacy = format!(
-            "{}\n[monitor_event_sink]\nendpoint = \"http://127.0.0.1:3000/events\"\n",
-            toml::to_string(&config).unwrap()
-        );
-        let parsed: DaemonConfig = toml::from_str(&legacy).unwrap();
-        parsed.validate().unwrap();
-        assert!(
-            !toml::to_string(&parsed)
-                .unwrap()
-                .contains("monitor_event_sink")
-        );
-    }
-
-    #[test]
-    fn failed_in_memory_replacement_rolls_back() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.replace_slots(vec![slot("slot-1", "COM3")]).unwrap();
-        let before = config.slots.clone();
-        let error = config
-            .replace_slots(vec![slot("Bad ID", "COM4")])
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigValidationError::InvalidSlot { field: "id", .. }
-        ));
-        assert_eq!(config.slots, before);
-    }
-
-    #[test]
-    fn staged_replacement_keeps_source_unchanged_and_limits_active_slots() {
-        let (config, _) = DaemonConfig::generate();
-        let staged = config
-            .staged_with_slots(vec![slot("slot-1", "COM3")])
-            .unwrap();
-        assert!(config.slots.is_empty());
-        assert_eq!(staged.slots.len(), 1);
-
-        let too_many = (0..=MAX_SLOT_IDENTITIES_PER_DAEMON)
-            .map(|index| slot(&format!("slot-{index}"), &format!("COM{index}")))
-            .collect();
-        assert_eq!(
-            config.staged_with_slots(too_many).unwrap_err(),
-            ConfigValidationError::TooManySlots {
-                actual: MAX_SLOT_IDENTITIES_PER_DAEMON + 1,
-                limit: MAX_SLOT_IDENTITIES_PER_DAEMON,
-            }
-        );
-    }
-
-    #[test]
-    fn loaded_debug_output_does_not_contain_credentials() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let (auth, credentials) = AuthConfig::generate();
-        let mut config = DaemonConfig::generate().0;
-        config.auth_required = true;
-        config.auth = Some(auth);
-        store.save(&config).unwrap();
-        let loaded = store.load_or_create().unwrap();
-        let admin = credentials.admin_token().to_owned();
-        let debug = format!("{loaded:?}");
-        assert!(debug.contains("BearerToken([REDACTED])"));
-        assert!(!debug.contains(&admin));
-    }
-
-    #[test]
-    fn device_profile_catalog_is_validated_as_a_whole() {
-        let (mut config, _) = DaemonConfig::generate();
-
-        // Duplicate names are rejected.
-        config.device_profiles = vec![device_profile("evb"), device_profile("evb")];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DuplicateDeviceProfileName { .. })
-        ));
-
-        // Invalid names follow the same rules as Slot profile names.
-        config.device_profiles = vec![device_profile(" padded ")];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidDeviceProfile { field: "name", .. })
-        ));
-
-        // Invalid prompt patterns and line endings are rejected.
-        let mut invalid = device_profile("evb");
-        invalid.uboot_prompt = Some(String::new());
-        config.device_profiles = vec![invalid];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidDeviceProfile {
-                field: "uboot_prompt",
-                ..
-            })
-        ));
-        let mut invalid = device_profile("evb");
-        invalid.write_eol = Some("\r\r".to_owned());
-        config.device_profiles = vec![invalid];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidDeviceProfile {
-                field: "write_eol",
-                ..
-            })
-        ));
-        let mut invalid = device_profile("evb");
-        invalid.write_chunk_size = Some(0);
-        config.device_profiles = vec![invalid];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidDeviceProfile {
-                field: "write_chunk_size",
-                ..
-            })
-        ));
-        let mut invalid = device_profile("evb");
-        invalid.write_chunk_delay_ms = Some(10_001);
-        config.device_profiles = vec![invalid];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidDeviceProfile {
-                field: "write_chunk_delay_ms",
-                ..
-            })
-        ));
-
-        // The catalog is bounded.
-        config.device_profiles = (0..=MAX_DEVICE_PROFILES)
-            .map(|index| device_profile(&format!("profile-{index}")))
-            .collect();
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::TooManyDeviceProfiles { .. })
-        ));
-    }
-
-    #[test]
-    fn device_model_tree_rejects_unknown_parents_cycles_and_duplicate_ids() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.device_models = vec![device_model("child", "Child", Some("missing"))];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::UnknownDeviceModelParent { .. })
-        ));
-
-        config.device_models = vec![
-            device_model("a", "A", Some("b")),
-            device_model("b", "B", Some("a")),
-        ];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DeviceModelCycle { .. })
-        ));
-
-        config.device_models = vec![
-            device_model("same", "Family", None),
-            device_model("same", "Variant", None),
-        ];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DuplicateDeviceModelId { .. })
-        ));
-    }
-
-    #[test]
-    fn model_names_may_repeat_across_hierarchy_but_aliases_may_not_repeat_per_node() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.device_models = vec![
-            device_model("tl-as7230-family", "TL-AS7230", None),
-            device_model("tl-as7230", "TL-AS7230", Some("tl-as7230-family")),
-        ];
         config.validate().unwrap();
-
-        config.device_models[0].aliases = vec!["7230".into()];
-        config.device_models[1].aliases = vec!["7230".into()];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DuplicateDeviceModelAlias { .. })
-        ));
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(!serialized.contains("auth"));
+        assert!(!serialized.contains("token"));
     }
 
     #[test]
-    fn slot_model_bindings_validate_references_and_slot_replacement_cleans_removed_bindings() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.slots = vec![slot("slot-1", "COM3"), slot("slot-2", "COM4")];
-        config.device_models = vec![device_model("tl-as7230", "TL-AS7230", None)];
-        config.slot_model_bindings = vec![
-            model_binding("slot-1", "tl-as7230"),
-            model_binding("slot-2", "tl-as7230"),
-        ];
+    fn port_is_the_only_identity_and_unix_device_paths_are_valid() {
+        let mut config = DaemonConfig::generate();
+        config.ports = vec![slot("/dev/cu.usbserial-210")];
         config.validate().unwrap();
-
-        config.replace_slots(vec![slot("slot-1", "COM3")]).unwrap();
-        assert_eq!(config.slot_model_bindings.len(), 1);
-        assert_eq!(config.slot_model_bindings[0].slot_id, "slot-1");
-
-        config.slot_model_bindings[0].model_id = "missing".into();
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::UnknownBoundDeviceModel { .. })
-        ));
+        assert_eq!(config.ports[0].port, "/dev/cu.usbserial-210");
     }
 
     #[test]
-    fn transport_profile_catalog_is_explicit_and_validated_as_a_whole() {
-        let (mut config, _) = DaemonConfig::generate();
-        let mut configured_slot = slot("slot-1", "COM3");
-
-        // A catalog-free legacy configuration keeps the Slot snapshot
-        // authoritative even though its historical profile label is not
-        // separately materialized.
-        config.slots = vec![configured_slot.clone()];
-        config.validate().unwrap();
-
-        config.transport_profiles = vec![transport_profile("station-a")];
-        let error = config.validate().unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigValidationError::UnknownTransportProfile { .. }
-        ));
-
-        configured_slot.profile = "station-a".into();
-        config.slots = vec![configured_slot];
-        config.validate().unwrap();
-
-        config.transport_profiles = vec![
-            transport_profile("station-a"),
-            transport_profile("station-a"),
-        ];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::DuplicateTransportProfileName { .. })
-        ));
-
-        let mut invalid = transport_profile("station-a");
-        invalid.baud_rate = 0;
-        config.transport_profiles = vec![invalid];
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigValidationError::InvalidTransportProfile {
-                field: "baud_rate",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn every_staged_configuration_replacement_advances_revision_once() {
-        let (config, _) = DaemonConfig::generate();
-        assert_eq!(config.config_revision, 1);
-
-        let with_slots = config
-            .staged_with_slots(vec![slot("slot-1", "COM3")])
-            .unwrap();
-        assert_eq!(with_slots.config_revision, 2);
-        assert_eq!(config.config_revision, 1);
-
-        let with_transport = with_slots
-            .staged_with_transport_profiles(vec![transport_profile("generic-115200")])
-            .unwrap();
-        assert_eq!(with_transport.config_revision, 3);
-
-        let with_device = with_transport
-            .staged_with_device_profiles(vec![device_profile("dut")])
-            .unwrap();
-        assert_eq!(with_device.config_revision, 4);
-    }
-
-    #[test]
-    fn slot_device_profile_references_must_exist() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.device_profiles = vec![device_profile("sigmastar-evb")];
-        let mut referencing = slot("slot-1", "COM3");
-        referencing.device_profile = Some("missing-model".to_owned());
-        config.slots = vec![referencing];
-        let error = config.validate().unwrap_err();
-        let message = error.to_string();
-        assert!(matches!(
-            error,
-            ConfigValidationError::UnknownDeviceProfile { .. }
-        ));
-        assert!(message.contains("missing-model"));
-        assert!(message.contains("sigmastar-evb"));
-
-        // A valid reference passes.
-        let mut valid = slot("slot-2", "COM4");
-        valid.device_profile = Some("sigmastar-evb".to_owned());
-        config.slots = vec![valid];
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn device_profile_replacement_rolls_back_on_validation_failure() {
-        let (mut config, _) = DaemonConfig::generate();
-        let mut referencing = slot("slot-1", "COM3");
-        referencing.device_profile = Some("sigmastar-evb".to_owned());
-        config.slots = vec![referencing];
-        config
-            .replace_device_profiles(vec![device_profile("sigmastar-evb")])
-            .unwrap();
-
-        // Removing a profile that a Slot still references is rejected and
-        // leaves the previous catalog in place.
-        let error = config.replace_device_profiles(Vec::new()).unwrap_err();
-        assert!(matches!(
-            error,
-            ConfigValidationError::UnknownDeviceProfile { .. }
-        ));
-        assert_eq!(config.device_profiles.len(), 1);
-
-        let staged = config
-            .staged_with_device_profiles(vec![
-                device_profile("sigmastar-evb"),
-                device_profile("rk"),
-            ])
-            .unwrap();
-        assert_eq!(config.device_profiles.len(), 1);
-        assert_eq!(staged.device_profiles.len(), 2);
-    }
-
-    #[test]
-    fn legacy_toml_without_revision_or_profile_catalogs_uses_safe_defaults() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-
-        // Rewrite the persisted configuration without fields introduced
-        // after the initial schema, as an older daemon would have written it.
-        let persisted = fs::read_to_string(&store.paths().config_file).unwrap();
-        let without_profiles = persisted
-            .lines()
-            .filter(|line| {
-                !line.starts_with("config_revision")
-                    && !line.starts_with("transport_profiles")
-                    && !line.starts_with("device_profiles")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&store.paths().config_file, without_profiles).unwrap();
-
-        let reloaded = store.load().unwrap();
-        assert_eq!(reloaded.config_revision, 1);
-        assert!(reloaded.transport_profiles.is_empty());
-        assert!(reloaded.device_profiles.is_empty());
-        assert_eq!(reloaded.server_id, loaded.config.server_id);
-    }
-
-    #[test]
-    fn control_config_defaults_match_the_builtin_limits() {
-        assert_eq!(ControlConfig::default().limits(), ControlLimits::default());
-
-        // A persisted configuration without a [control] section keeps the
-        // built-in bounds.
-        let empty: ControlConfig = toml::from_str("").unwrap();
-        assert_eq!(empty, ControlConfig::default());
-    }
-
-    #[test]
-    fn control_limits_clamp_the_ttl_ceiling_to_the_protocol_minimum() {
-        let config = ControlConfig {
-            max_ttl_ms: 1,
-            ..ControlConfig::default()
-        };
-        assert_eq!(config.limits().max_ttl_ms, MIN_TTL_MS);
-
-        let config = ControlConfig {
-            max_ttl_ms: 120_000,
-            wait_timeout_ms: 5_000,
-            max_waiters: 4,
-        };
-        let limits = config.limits();
-        assert_eq!(limits.max_ttl_ms, 120_000);
-        assert_eq!(limits.wait_timeout, Duration::from_millis(5_000));
-        assert_eq!(limits.max_waiters, 4);
-    }
-
-    #[test]
-    fn control_config_rejects_unbounded_ttl_and_wait_deadlines() {
-        let (mut config, _) = DaemonConfig::generate();
-        config.control.max_ttl_ms = MAX_CONTROL_TTL_MS + 1;
+    fn port_identity_is_case_insensitive_on_windows_and_exact_on_unix() {
         assert_eq!(
-            config.validate(),
-            Err(ConfigValidationError::ControlMaxTtlTooLarge {
-                actual: MAX_CONTROL_TTL_MS + 1,
-                limit: MAX_CONTROL_TTL_MS,
-            })
+            port_identity_key_for_platform("COM4", true),
+            port_identity_key_for_platform("com4", true)
+        );
+        assert_ne!(
+            port_identity_key_for_platform("COM4", false),
+            port_identity_key_for_platform("com4", false)
         );
 
-        config.control.max_ttl_ms = MAX_CONTROL_TTL_MS;
-        config.control.wait_timeout_ms = u64::MAX;
-        let wait_limit_ms = MAX_CONTROL_WAIT_TIMEOUT.as_millis() as u64;
-        assert_eq!(
-            config.validate(),
-            Err(ConfigValidationError::ControlWaitTimeoutTooLarge {
-                actual: u64::MAX,
-                limit: wait_limit_ms,
-            })
-        );
-
-        config.control.wait_timeout_ms = wait_limit_ms;
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn direct_control_limit_conversion_is_defensively_bounded() {
-        let limits = ControlConfig {
-            max_ttl_ms: u64::MAX,
-            wait_timeout_ms: u64::MAX,
-            max_waiters: 7,
+        let mut config = DaemonConfig::generate();
+        config.ports = vec![slot("COM4"), slot("com4")];
+        if cfg!(windows) {
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigValidationError::DuplicatePort { .. })
+            ));
+        } else {
+            config.validate().unwrap();
         }
-        .limits();
-        assert_eq!(limits.max_ttl_ms, MAX_CONTROL_TTL_MS);
-        assert_eq!(limits.wait_timeout, MAX_CONTROL_WAIT_TIMEOUT);
-        assert_eq!(limits.max_waiters, 7);
+    }
+
+    #[test]
+    fn port_profile_references_must_resolve() {
+        let mut config = DaemonConfig::generate();
+        config.transport_profiles = vec![transport_profile("uart")];
+        config.model_profiles = vec![model_profile("TL-AS7230 1.0")];
+        let mut configured = slot("COM4");
+        configured.transport_profile = Some("uart".into());
+        configured.model_profile = Some("TL-AS7230 1.0".into());
+        config.ports = vec![configured];
+        config.validate().unwrap();
+
+        config.ports[0].model_profile = Some("missing".into());
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::UnknownModelProfile { .. })
+        ));
+    }
+
+    #[test]
+    fn store_creates_and_reloads_the_clean_schema() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let created = store.load_or_create().unwrap();
+        assert_eq!(created.config.schema_version, CONFIG_SCHEMA_VERSION);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.server_id, created.config.server_id);
     }
 }

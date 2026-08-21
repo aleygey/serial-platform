@@ -1,4 +1,3 @@
-use crate::auth::{AuthError, Principal, role_allows};
 use crate::config::{ConfigError, ConfigStore, DaemonConfig};
 use crate::journal::{JournalError, JournalHandle};
 use crate::monitor::{MonitorError, MonitorManager};
@@ -8,21 +7,20 @@ use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
-    Actor, ArchiveListResponse, ClientMessage, CommandResult, ConfigureDeviceModelsRequest,
-    ConfigureDeviceModelsResponse, ConfigureDeviceProfilesRequest, ConfigureDeviceProfilesResponse,
-    ConfigureSlotsRequest, ConfigureSlotsResponse, ConfigureTransportProfilesRequest,
-    ConfigureTransportProfilesResponse, CreateMonitorRequest, Cursor, DaemonDiagnosticsResponse,
-    DeviceModel, DeviceModelListResponse, DeviceProfileListResponse, ErrorCode, EventQuery,
-    EventQueryResponse, GapRange, HealthResponse, MonitorIncidentListResponse,
-    MonitorIncidentResponse, MonitorListResponse, MonitorResponse, MonitorStatus, PROTOCOL_VERSION,
-    PortDescriptor, Role, ServerMessage, SetSlotDeviceModelRequest, SetSlotDeviceModelResponse,
-    SlotDiagnostics, SlotModelBinding, StatusResponse, StorageDiagnosticsResponse,
-    TransportProfileListResponse, UpdateMonitorRequest, encode_control, encode_event,
+    Actor, ActorKind, ArchiveListResponse, ClientMessage, CommandResult,
+    ConfigureModelProfilesRequest, ConfigureModelProfilesResponse, ConfigurePortsRequest,
+    ConfigurePortsResponse, ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse,
+    CreateMonitorRequest, Cursor, DaemonDiagnosticsResponse, ErrorCode, EventQuery,
+    EventQueryResponse, GapRange, HealthResponse, ModelProfileListResponse,
+    MonitorIncidentListResponse, MonitorIncidentResponse, MonitorListResponse, MonitorResponse,
+    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, ServerMessage, SlotDiagnostics,
+    StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse, UpdateMonitorRequest,
+    encode_control, encode_event,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,24 +105,26 @@ impl AppState {
         self.inner.registry.shutdown().await;
     }
 
-    async fn configure_slots_transaction(
+    async fn configure_ports_transaction(
         &self,
         requested: Vec<serial_protocol::SlotConfig>,
+        source: String,
         expected_revision: Option<u64>,
     ) -> Result<(Vec<serial_protocol::SlotSnapshot>, u64), ApiError> {
         let _update = self.inner.config_updates.lock().await;
         let current = self.inner.config.read().await.clone();
         ensure_expected_revision(expected_revision, current.config_revision)?;
         let staged = current
-            .staged_with_slots(requested)
+            .staged_with_ports(requested)
             .map_err(ConfigError::from)?;
         let applied = self
             .inner
             .registry
-            .apply_replacement(
-                staged.slots.clone(),
+            .apply_replacement_with_source(
+                staged.ports.clone(),
                 staged.transport_profiles.clone(),
-                staged.device_profiles.clone(),
+                staged.model_profiles.clone(),
+                source,
             )
             .await?;
 
@@ -154,21 +154,21 @@ impl AppState {
     /// Validates and stages every affected actor before persistence. Staging
     /// is inert, so an unavailable actor or save failure can roll back without
     /// publishing a mixed runtime catalog or changing the in-memory config.
-    async fn configure_device_profiles_transaction(
+    async fn configure_model_profiles_transaction(
         &self,
-        requested: Vec<serial_protocol::DeviceProfile>,
+        requested: Vec<serial_protocol::ModelProfile>,
         expected_revision: Option<u64>,
-    ) -> Result<(Vec<serial_protocol::DeviceProfile>, u64), ApiError> {
+    ) -> Result<(Vec<serial_protocol::ModelProfile>, u64), ApiError> {
         let _update = self.inner.config_updates.lock().await;
         let current = self.inner.config.read().await.clone();
         ensure_expected_revision(expected_revision, current.config_revision)?;
         let staged = current
-            .staged_with_device_profiles(requested)
+            .staged_with_model_profiles(requested)
             .map_err(ConfigError::from)?;
         let applied = self
             .inner
             .registry
-            .stage_device_profiles(staged.device_profiles.clone())
+            .stage_model_profiles(staged.model_profiles.clone())
             .await?;
 
         match self.inner.config_store.save(&staged) {
@@ -182,7 +182,7 @@ impl AppState {
                 }
                 let revision = staged.config_revision;
                 *self.inner.config.write().await = staged.clone();
-                Ok((staged.device_profiles, revision))
+                Ok((staged.model_profiles, revision))
             }
             Err(save) => match applied.rollback().await {
                 Ok(()) => Err(ApiError::Config(save)),
@@ -205,10 +205,11 @@ impl AppState {
         let applied = self
             .inner
             .registry
-            .apply_replacement(
-                staged.slots.clone(),
+            .apply_replacement_with_source(
+                staged.ports.clone(),
                 staged.transport_profiles.clone(),
-                staged.device_profiles.clone(),
+                staged.model_profiles.clone(),
+                "system:transport-profile".to_owned(),
             )
             .await?;
 
@@ -230,288 +231,6 @@ impl AppState {
                 Err(rollback) => Err(ApiError::ConfigRollback { save, rollback }),
             },
         }
-    }
-
-    async fn configure_device_models_transaction(
-        &self,
-        requested: Vec<DeviceModel>,
-        expected_revision: Option<u64>,
-    ) -> Result<(Vec<DeviceModel>, Vec<SlotModelBinding>, u64), ApiError> {
-        let _update = self.inner.config_updates.lock().await;
-        let current = self.inner.config.read().await.clone();
-        ensure_expected_revision(expected_revision, current.config_revision)?;
-        let staged = current
-            .staged_with_device_models(requested)
-            .map_err(ConfigError::from)?;
-        self.inner.config_store.save(&staged)?;
-        let revision = staged.config_revision;
-        let models = staged.device_models.clone();
-        let bindings = staged.slot_model_bindings.clone();
-        *self.inner.config.write().await = staged;
-        Ok((models, bindings, revision))
-    }
-
-    async fn set_slot_device_model_transaction(
-        &self,
-        slot_id: String,
-        request: SetSlotDeviceModelRequest,
-    ) -> Result<SetSlotDeviceModelResponse, ApiError> {
-        let _update = self.inner.config_updates.lock().await;
-        let current = self.inner.config.read().await.clone();
-        ensure_expected_revision(request.expected_revision, current.config_revision)?;
-        if !current.slots.iter().any(|slot| slot.id == slot_id) {
-            return Err(ApiError::NotFound(format!("unknown Slot {slot_id:?}")));
-        }
-        if request.source.is_empty()
-            || request.source.len() > 128
-            || request.source != request.source.trim()
-            || request.source.chars().any(char::is_control)
-        {
-            return Err(ApiError::BadRequest(
-                "source must be non-empty, trimmed text of at most 128 bytes".into(),
-            ));
-        }
-
-        let current_model = current
-            .slot_model_bindings
-            .iter()
-            .find(|binding| binding.slot_id == slot_id)
-            .map(|binding| binding.model_id.clone());
-        let has_expected_revision = request.expected_revision.is_some();
-        let expected_current_guard = request.expected_current.clone();
-        if let Some(expected) = request.expected_current.clone() {
-            if expected.as_deref() != current_model.as_deref() {
-                return Err(ApiError::ModelBindingMismatch {
-                    expected,
-                    actual: current_model,
-                });
-            }
-        }
-
-        let SetSlotDeviceModelRequest {
-            model_id,
-            create_if_missing,
-            update_existing,
-            name,
-            parent_id,
-            clear_parent,
-            aliases,
-            clear_aliases,
-            confirmation_method,
-            note,
-            source,
-            expected_revision: _,
-            expected_current: _,
-        } = request;
-        let mut models = current.device_models.clone();
-        let mut bindings = current.slot_model_bindings.clone();
-        bindings.retain(|binding| binding.slot_id != slot_id);
-
-        if create_if_missing && update_existing {
-            return Err(ApiError::BadRequest(
-                "create_if_missing and update_existing are mutually exclusive".into(),
-            ));
-        }
-
-        let (binding, model, created) = match model_id {
-            None => {
-                if create_if_missing
-                    || update_existing
-                    || name.is_some()
-                    || parent_id.is_some()
-                    || clear_parent
-                    || !aliases.is_empty()
-                    || clear_aliases
-                    || confirmation_method.is_some()
-                    || note.is_some()
-                {
-                    return Err(ApiError::BadRequest(
-                        "detaching a Slot cannot include model definition, confirmation, or note fields"
-                            .into(),
-                    ));
-                }
-                (None, None, false)
-            }
-            Some(model_id) => {
-                let existing_index = models.iter().position(|model| model.id == model_id);
-                let existing = existing_index.map(|index| models[index].clone());
-                let (model, created) = match existing {
-                    Some(existing) => {
-                        if create_if_missing {
-                            if clear_parent || clear_aliases {
-                                return Err(ApiError::BadRequest(
-                                    "clear_parent and clear_aliases require update_existing".into(),
-                                ));
-                            }
-                            let candidate = DeviceModel {
-                                id: model_id.clone(),
-                                name: name.clone().ok_or_else(|| {
-                                    ApiError::BadRequest(
-                                        "create_if_missing requires the model name".into(),
-                                    )
-                                })?,
-                                parent_id: parent_id.clone(),
-                                aliases: aliases.clone(),
-                            };
-                            if candidate != existing {
-                                return Err(ApiError::ModelDefinitionConflict { model_id });
-                            }
-                            (existing, false)
-                        } else if update_existing {
-                            if !has_expected_revision
-                                || expected_current_guard.as_ref() != Some(&Some(model_id.clone()))
-                                || current_model.as_deref() != Some(model_id.as_str())
-                            {
-                                return Err(ApiError::BadRequest(
-                                    "update_existing requires expected_revision and expected_current equal to the model currently bound to this Slot"
-                                        .into(),
-                                ));
-                            }
-                            if parent_id.is_some() && clear_parent {
-                                return Err(ApiError::BadRequest(
-                                    "parent_id and clear_parent are mutually exclusive".into(),
-                                ));
-                            }
-                            if !aliases.is_empty() && clear_aliases {
-                                return Err(ApiError::BadRequest(
-                                    "aliases and clear_aliases are mutually exclusive".into(),
-                                ));
-                            }
-                            if name.is_none()
-                                && parent_id.is_none()
-                                && !clear_parent
-                                && aliases.is_empty()
-                                && !clear_aliases
-                            {
-                                return Err(ApiError::BadRequest(
-                                    "update_existing requires at least one model field change"
-                                        .into(),
-                                ));
-                            }
-                            let mut updated = existing;
-                            if let Some(name) = name {
-                                updated.name = name;
-                            }
-                            if let Some(parent_id) = parent_id {
-                                updated.parent_id = Some(parent_id);
-                            } else if clear_parent {
-                                updated.parent_id = None;
-                            }
-                            if !aliases.is_empty() {
-                                updated.aliases = aliases;
-                            } else if clear_aliases {
-                                updated.aliases.clear();
-                            }
-                            models[existing_index.expect("existing index is present")] =
-                                updated.clone();
-                            (updated, false)
-                        } else if name.is_some()
-                            || parent_id.is_some()
-                            || clear_parent
-                            || !aliases.is_empty()
-                            || clear_aliases
-                        {
-                            return Err(ApiError::BadRequest(
-                                "model definition fields require create_if_missing or update_existing"
-                                    .into(),
-                            ));
-                        } else {
-                            (existing, false)
-                        }
-                    }
-                    None if create_if_missing => {
-                        if clear_parent || clear_aliases {
-                            return Err(ApiError::BadRequest(
-                                "clear_parent and clear_aliases require update_existing".into(),
-                            ));
-                        }
-                        let candidate = DeviceModel {
-                            id: model_id.clone(),
-                            name: name.ok_or_else(|| {
-                                ApiError::BadRequest(
-                                    "create_if_missing requires the model name".into(),
-                                )
-                            })?,
-                            parent_id,
-                            aliases,
-                        };
-                        models.push(candidate.clone());
-                        (candidate, true)
-                    }
-                    None if update_existing => {
-                        return Err(ApiError::NotFound(format!(
-                            "cannot update unknown device model {model_id:?}"
-                        )));
-                    }
-                    None => {
-                        return Err(ApiError::NotFound(format!(
-                            "unknown device model {model_id:?}"
-                        )));
-                    }
-                };
-                let confirmation_method = confirmation_method.ok_or_else(|| {
-                    ApiError::BadRequest(
-                        "attaching a device model requires confirmation_method".into(),
-                    )
-                })?;
-                let binding = SlotModelBinding {
-                    slot_id,
-                    model_id: model.id.clone(),
-                    confirmation_method,
-                    note,
-                    updated_wall_time_ns: wall_time_ns(),
-                    source,
-                };
-                bindings.push(binding.clone());
-                (Some(binding), Some(model), created)
-            }
-        };
-
-        let staged = current
-            .staged_with_model_state(models, bindings)
-            .map_err(ConfigError::from)?;
-        self.inner.config_store.save(&staged)?;
-        let config_revision = staged.config_revision;
-        let mut affected_slots = model.as_ref().map_or_else(Vec::new, |model| {
-            staged
-                .slot_model_bindings
-                .iter()
-                .filter(|binding| binding.model_id == model.id)
-                .map(|binding| binding.slot_id.clone())
-                .collect::<Vec<_>>()
-        });
-        affected_slots.sort();
-        *self.inner.config.write().await = staged;
-        Ok(SetSlotDeviceModelResponse {
-            binding,
-            model,
-            created,
-            affected_slots,
-            config_revision,
-        })
-    }
-
-    async fn authenticate(
-        &self,
-        headers: &HeaderMap,
-        required: Role,
-    ) -> Result<Principal, ApiError> {
-        let authorization = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok());
-        let config = self.inner.config.read().await;
-        let principal = if config.auth_required {
-            config
-                .auth
-                .as_ref()
-                .ok_or(ApiError::Auth(AuthError::MissingAuthorization))?
-                .authenticate_authorization(authorization)
-                .map_err(ApiError::Auth)?
-        } else {
-            Principal::trusted_local_admin()
-        };
-        principal.require_role(required).map_err(ApiError::Auth)?;
-        Ok(principal)
     }
 }
 
@@ -543,33 +262,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/ports", get(ports))
-        .route("/api/v1/config/slots", put(configure_slots))
+        .route("/api/v1/config/ports", put(configure_ports))
         .route(
             "/api/v1/config/transport-profiles",
             get(list_transport_profiles).put(configure_transport_profiles),
         )
         .route(
-            "/api/v1/config/device-profiles",
-            get(list_device_profiles).put(configure_device_profiles),
-        )
-        .route(
-            "/api/v1/config/device-models",
-            get(list_device_models).put(configure_device_models),
-        )
-        .route(
-            "/api/v1/slots/{slot_id}/device-model",
-            put(set_slot_device_model),
+            "/api/v1/config/model-profiles",
+            get(list_model_profiles).put(configure_model_profiles),
         )
         .route("/api/v1/archives", get(archives))
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/diagnostics/storage", get(storage_diagnostics))
-        .route("/api/v1/slots/{slot_id}/diagnostics", get(slot_diagnostics))
-        .route("/api/v1/slots/{slot_id}/tail", get(live_tail))
-        .route(
-            "/api/v1/slots/{slot_id}/recent-activity",
-            get(recent_activity),
-        )
-        .route("/api/v1/slots/{slot_id}/events", get(events))
+        .route("/api/v1/ports/{port}/diagnostics", get(port_diagnostics))
+        .route("/api/v1/ports/{port}/tail", get(live_tail))
+        .route("/api/v1/ports/{port}/recent-activity", get(recent_activity))
+        .route("/api/v1/ports/{port}/events", get(events))
         .route("/api/v1/monitors", get(list_monitors).post(create_monitor))
         .route(
             "/api/v1/monitors/{monitor_id}",
@@ -587,11 +295,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<HealthResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
+async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let config = state.inner.config.read().await;
     Ok(Json(HealthResponse {
         status: "ok".into(),
@@ -604,15 +308,10 @@ async fn health(
             .as_millis()
             .min(u64::MAX as u128) as u64,
         protocol_version: PROTOCOL_VERSION,
-        auth_required: config.auth_required,
     }))
 }
 
-async fn status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<StatusResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
+async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, ApiError> {
     let config = state.inner.config.read().await;
     Ok(Json(StatusResponse {
         server_id: config.server_id,
@@ -621,15 +320,11 @@ async fn status(
         config_revision: config.config_revision,
         sequence_write_precondition_supported: true,
         serial_context_precondition_supported: true,
-        slots: state.inner.registry.snapshots().await,
+        ports: state.inner.registry.snapshots().await,
     }))
 }
 
-async fn ports(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<PortDescriptor>>, ApiError> {
-    state.authenticate(&headers, Role::Admin).await?;
+async fn ports() -> Result<Json<Vec<PortDescriptor>>, ApiError> {
     let ports = tokio::task::spawn_blocking(serialport::available_ports)
         .await
         .map_err(|_| ApiError::Internal("serial enumeration task failed".into()))?
@@ -663,34 +358,44 @@ async fn ports(
     ))
 }
 
-async fn configure_slots(
+async fn configure_ports(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ConfigureSlotsRequest>,
-) -> Result<Json<ConfigureSlotsResponse>, ApiError> {
-    state.authenticate(&headers, Role::Admin).await?;
+    Json(request): Json<ConfigurePortsRequest>,
+) -> Result<Json<ConfigurePortsResponse>, ApiError> {
+    validate_source(&request.source)?;
     // Keep the transaction alive even if the HTTP request is cancelled after
     // physical actors were staged. The spawned task must either commit all
     // three views or run the compensating rollback.
     let transaction = state.clone();
-    let (slots, config_revision) = tokio::spawn(async move {
+    let (ports, config_revision) = tokio::spawn(async move {
         transaction
-            .configure_slots_transaction(request.slots, request.expected_revision)
+            .configure_ports_transaction(request.ports, request.source, request.expected_revision)
             .await
     })
     .await
     .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
-    Ok(Json(ConfigureSlotsResponse {
-        slots,
+    Ok(Json(ConfigurePortsResponse {
+        ports,
         config_revision,
     }))
 }
 
+fn validate_source(source: &str) -> Result<(), ApiError> {
+    if source.is_empty()
+        || source.len() > 128
+        || source != source.trim()
+        || source.chars().any(char::is_control)
+    {
+        return Err(ApiError::BadRequest(
+            "source must contain 1-128 trimmed, non-control UTF-8 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn list_transport_profiles(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<TransportProfileListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     let config = state.inner.config.read().await;
     Ok(Json(TransportProfileListResponse {
         profiles: config.transport_profiles.clone(),
@@ -700,10 +405,8 @@ async fn list_transport_profiles(
 
 async fn configure_transport_profiles(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<ConfigureTransportProfilesRequest>,
 ) -> Result<Json<ConfigureTransportProfilesResponse>, ApiError> {
-    state.authenticate(&headers, Role::Admin).await?;
     let transaction = state.clone();
     let (profiles, config_revision) = tokio::spawn(async move {
         transaction
@@ -718,116 +421,54 @@ async fn configure_transport_profiles(
     }))
 }
 
-async fn list_device_profiles(
+async fn list_model_profiles(
     State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<DeviceProfileListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
+) -> Result<Json<ModelProfileListResponse>, ApiError> {
     let config = state.inner.config.read().await;
-    Ok(Json(DeviceProfileListResponse {
-        profiles: config.device_profiles.clone(),
+    Ok(Json(ModelProfileListResponse {
+        profiles: config.model_profiles.clone(),
         config_revision: config.config_revision,
     }))
 }
 
-async fn configure_device_profiles(
+async fn configure_model_profiles(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ConfigureDeviceProfilesRequest>,
-) -> Result<Json<ConfigureDeviceProfilesResponse>, ApiError> {
-    state.authenticate(&headers, Role::Admin).await?;
-    // Mirror the Slot transaction: the spawned task completes the validate /
+    Json(request): Json<ConfigureModelProfilesRequest>,
+) -> Result<Json<ConfigureModelProfilesResponse>, ApiError> {
+    // Mirror the port transaction: the spawned task completes the validate /
     // persist / publish sequence even if the HTTP request is cancelled.
     let transaction = state.clone();
     let (profiles, config_revision) = tokio::spawn(async move {
         transaction
-            .configure_device_profiles_transaction(request.profiles, request.expected_revision)
+            .configure_model_profiles_transaction(request.profiles, request.expected_revision)
             .await
     })
     .await
     .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
-    Ok(Json(ConfigureDeviceProfilesResponse {
+    Ok(Json(ConfigureModelProfilesResponse {
         profiles,
         config_revision,
     }))
 }
 
-async fn list_device_models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<DeviceModelListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
-    let config = state.inner.config.read().await;
-    Ok(Json(DeviceModelListResponse {
-        models: config.device_models.clone(),
-        bindings: config.slot_model_bindings.clone(),
-        config_revision: config.config_revision,
-    }))
-}
-
-async fn configure_device_models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ConfigureDeviceModelsRequest>,
-) -> Result<Json<ConfigureDeviceModelsResponse>, ApiError> {
-    state.authenticate(&headers, Role::Admin).await?;
-    let transaction = state.clone();
-    let (models, bindings, config_revision) = tokio::spawn(async move {
-        transaction
-            .configure_device_models_transaction(request.models, request.expected_revision)
-            .await
-    })
-    .await
-    .map_err(|_| ApiError::Internal("device model transaction task failed".into()))??;
-    Ok(Json(ConfigureDeviceModelsResponse {
-        models,
-        bindings,
-        config_revision,
-    }))
-}
-
-async fn set_slot_device_model(
-    State(state): State<AppState>,
-    Path(slot_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<SetSlotDeviceModelRequest>,
-) -> Result<Json<SetSlotDeviceModelResponse>, ApiError> {
-    state.authenticate(&headers, Role::Operator).await?;
-    let transaction = state.clone();
-    let response = tokio::spawn(async move {
-        transaction
-            .set_slot_device_model_transaction(slot_id, request)
-            .await
-    })
-    .await
-    .map_err(|_| ApiError::Internal("Slot model binding transaction task failed".into()))??;
-    Ok(Json(response))
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct ArchiveListQuery {
-    slot_id: Option<String>,
+    port: Option<String>,
 }
 
 async fn archives(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<ArchiveListQuery>,
 ) -> Result<Json<ArchiveListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
-    Ok(Json(
-        state.inner.journal.list_archives(query.slot_id).await?,
-    ))
+    Ok(Json(state.inner.journal.list_archives(query.port).await?))
 }
 
 async fn diagnostics(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<DaemonDiagnosticsResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     let config = state.inner.config.read().await.clone();
     let handles = state.inner.registry.handles().await;
-    let slots = handles
+    let ports = handles
         .into_iter()
         .map(|handle| SlotDiagnostics {
             snapshot: handle.snapshot(),
@@ -836,7 +477,7 @@ async fn diagnostics(
         })
         .collect::<Vec<_>>();
     let mut journal = state.inner.journal.diagnostics().await?;
-    if slots
+    if ports
         .iter()
         .any(|slot| slot.snapshot.logging == serial_protocol::LoggingState::Degraded)
     {
@@ -856,15 +497,13 @@ async fn diagnostics(
             .saturating_sub(state.inner.ws_connections.available_permits()),
         websocket_limit: MAX_WS_CONNECTIONS,
         journal,
-        slots,
+        ports,
     }))
 }
 
 async fn storage_diagnostics(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<StorageDiagnosticsResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     let mut journal = state.inner.journal.diagnostics().await?;
     if state
         .inner
@@ -879,18 +518,16 @@ async fn storage_diagnostics(
     Ok(Json(StorageDiagnosticsResponse { journal }))
 }
 
-async fn slot_diagnostics(
+async fn port_diagnostics(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(slot_id): Path<String>,
+    Path(port): Path<String>,
 ) -> Result<Json<SlotDiagnostics>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     let handle = state
         .inner
         .registry
-        .get(&slot_id)
+        .get(&port)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id}")))?;
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port {port}")))?;
     Ok(Json(SlotDiagnostics {
         snapshot: handle.snapshot(),
         subscriber_count: handle.subscriber_count(),
@@ -900,16 +537,14 @@ async fn slot_diagnostics(
 
 async fn events(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(slot_id): Path<String>,
+    Path(port): Path<String>,
     Query(mut query): Query<EventQuery>,
 ) -> Result<Json<EventQueryResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     // Normal history reads are scoped to this daemon run so an omitted epoch
     // can never surface a matching log from an earlier test cycle. Archived
     // history remains available by explicitly supplying its epoch.
     query.epoch.get_or_insert(state.inner.daemon_epoch);
-    Ok(Json(state.inner.journal.query(slot_id, query).await?))
+    Ok(Json(state.inner.journal.query(port, query).await?))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -919,16 +554,14 @@ struct LiveTailQuery {
     after_seq: Option<u64>,
 }
 
-/// Returns a bounded snapshot from the Slot's in-memory replay ring. This is
+/// Returns a bounded snapshot from the port's in-memory replay ring. This is
 /// the low-latency current-tail path; unlike `/events`, its work is independent
 /// of retained journal epochs and the size of the active `.open` segment.
 async fn live_tail(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(slot_id): Path<String>,
+    Path(port): Path<String>,
     Query(query): Query<LiveTailQuery>,
 ) -> Result<Json<EventQueryResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     let cursor = match (query.epoch, query.after_seq) {
         (Some(epoch), Some(after_seq)) => Some(Cursor { epoch, after_seq }),
         (None, None) => None,
@@ -942,9 +575,9 @@ async fn live_tail(
     let handle = state
         .inner
         .registry
-        .get(&slot_id)
+        .get(&port)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id}")))?;
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port {port}")))?;
     // Cursor pagination must begin at the oldest still-retained event after
     // the cursor. If EventRing received only `tail_events` here, RingEvicted
     // recovery would select the newest N events and silently skip an older,
@@ -1028,11 +661,9 @@ struct RecentActivityQuery {
 /// so a noisy target cannot inflate normal tool results or force a disk scan.
 async fn recent_activity(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(slot_id): Path<String>,
+    Path(port): Path<String>,
     Query(query): Query<RecentActivityQuery>,
 ) -> Result<Json<EventQueryResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     if query.after_seq > query.through_seq {
         return Err(ApiError::BadRequest(
             "after_seq must not exceed through_seq".into(),
@@ -1041,9 +672,9 @@ async fn recent_activity(
     let handle = state
         .inner
         .registry
-        .get(&slot_id)
+        .get(&port)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("unknown Slot {slot_id}")))?;
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port {port}")))?;
     let attach = handle
         .attach(
             Some(&serial_protocol::Cursor {
@@ -1065,6 +696,8 @@ async fn recent_activity(
                         serial_protocol::EventKind::ControlRevoked
                             | serial_protocol::EventKind::ControlExpired
                             | serial_protocol::EventKind::RunAborted
+                            | serial_protocol::EventKind::PortReconfigured
+                            | serial_protocol::EventKind::PortRemoved
                     ))
         })
         .collect::<Vec<_>>();
@@ -1086,50 +719,42 @@ async fn recent_activity(
 
 #[derive(Debug, serde::Deserialize)]
 struct MonitorListQuery {
-    slot_id: Option<String>,
+    port: Option<String>,
     status: Option<MonitorStatus>,
 }
 
 async fn create_monitor(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<CreateMonitorRequest>,
 ) -> Result<Json<MonitorResponse>, ApiError> {
-    state.authenticate(&headers, Role::Operator).await?;
     Ok(Json(state.inner.monitors.create(request).await?))
 }
 
 async fn list_monitors(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<MonitorListQuery>,
 ) -> Result<Json<MonitorListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     Ok(Json(
         state
             .inner
             .monitors
-            .list(query.slot_id.as_deref(), query.status)
+            .list(query.port.as_deref(), query.status)
             .await,
     ))
 }
 
 async fn get_monitor(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(monitor_id): Path<Uuid>,
 ) -> Result<Json<MonitorResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     Ok(Json(state.inner.monitors.get(monitor_id).await?))
 }
 
 async fn update_monitor(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(monitor_id): Path<Uuid>,
     Json(request): Json<UpdateMonitorRequest>,
 ) -> Result<Json<MonitorResponse>, ApiError> {
-    state.authenticate(&headers, Role::Operator).await?;
     Ok(Json(
         state.inner.monitors.update(monitor_id, request).await?,
     ))
@@ -1137,11 +762,9 @@ async fn update_monitor(
 
 async fn stop_monitor(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(monitor_id): Path<Uuid>,
     Query(query): Query<MonitorMutationQuery>,
 ) -> Result<Json<MonitorResponse>, ApiError> {
-    state.authenticate(&headers, Role::Operator).await?;
     Ok(Json(
         state
             .inner
@@ -1166,11 +789,9 @@ struct MonitorIncidentQuery {
 
 async fn list_monitor_incidents(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(monitor_id): Path<Uuid>,
     Query(query): Query<MonitorIncidentQuery>,
 ) -> Result<Json<MonitorIncidentListResponse>, ApiError> {
-    state.authenticate(&headers, Role::Observer).await?;
     Ok(Json(
         state
             .inner
@@ -1187,10 +808,8 @@ async fn list_monitor_incidents(
 
 async fn acknowledge_monitor_incident(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path((monitor_id, incident_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MonitorIncidentResponse>, ApiError> {
-    state.authenticate(&headers, Role::Operator).await?;
     Ok(Json(MonitorIncidentResponse {
         incident: state
             .inner
@@ -1202,10 +821,8 @@ async fn acknowledge_monitor_incident(
 
 async fn websocket(
     State(state): State<AppState>,
-    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let principal = state.authenticate(&headers, Role::Observer).await?;
     let connection_permit = state
         .inner
         .ws_connections
@@ -1217,12 +834,12 @@ async fn websocket(
         .max_frame_size(MAX_WS_INCOMING_BYTES)
         .on_upgrade(move |socket| async move {
             let _connection_permit = connection_permit;
-            serve_socket(socket, state, principal).await;
+            serve_socket(socket, state).await;
         })
         .into_response())
 }
 
-async fn serve_socket(socket: WebSocket, state: AppState, principal: Principal) {
+async fn serve_socket(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
     let (outbound, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE);
     let writer = tokio::spawn(async move {
@@ -1233,7 +850,7 @@ async fn serve_socket(socket: WebSocket, state: AppState, principal: Principal) 
         }
     });
 
-    let actor = match receive_hello(&mut stream, &outbound, &state, principal).await {
+    let actor = match receive_hello(&mut stream, &outbound, &state).await {
         Ok(actor) => actor,
         Err(()) => {
             drop(outbound);
@@ -1270,15 +887,8 @@ async fn serve_socket(socket: WebSocket, state: AppState, principal: Principal) 
             }
         };
         let request_id = message.request_id();
-        if let Err(error) = dispatch_message(
-            message,
-            &actor,
-            principal,
-            &state,
-            &outbound,
-            &mut subscriptions,
-        )
-        .await
+        if let Err(error) =
+            dispatch_message(message, &actor, &state, &outbound, &mut subscriptions).await
         {
             let (code, retryable) = error.protocol_code();
             send_error(
@@ -1304,7 +914,6 @@ async fn receive_hello(
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
     outbound: &mpsc::Sender<Message>,
     state: &AppState,
-    principal: Principal,
 ) -> Result<Actor, ()> {
     let message = match tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
         Ok(Some(Ok(Message::Binary(bytes)))) => {
@@ -1345,8 +954,8 @@ async fn receive_hello(
         .await;
         return Err(());
     }
-    let authenticated = match principal.issue_actor(actor_kind, &client_name) {
-        Ok(authenticated) => authenticated,
+    let actor = match issue_actor(actor_kind, &client_name) {
+        Ok(actor) => actor,
         Err(error) => {
             send_error(
                 outbound,
@@ -1359,7 +968,6 @@ async fn receive_hello(
             return Err(());
         }
     };
-    let actor = authenticated.actor().clone();
     let server_id = state.inner.config.read().await.server_id;
     send_control(
         outbound,
@@ -1368,7 +976,6 @@ async fn receive_hello(
             daemon_epoch: state.inner.daemon_epoch,
             protocol_version: PROTOCOL_VERSION,
             actor: actor.clone(),
-            role: principal.role(),
         },
     )
     .await?;
@@ -1378,7 +985,6 @@ async fn receive_hello(
             request_id,
             result: CommandResult::HelloAccepted {
                 actor: actor.clone(),
-                role: principal.role(),
             },
         },
     )
@@ -1386,11 +992,31 @@ async fn receive_hello(
     Ok(actor)
 }
 
+fn issue_actor(kind: ActorKind, requested_label: &str) -> Result<Actor, &'static str> {
+    if kind == ActorKind::System {
+        return Err("the system actor kind is reserved for seriald");
+    }
+    let label = requested_label.trim();
+    if label.is_empty() || label.len() > 128 || label.chars().any(char::is_control) {
+        return Err("actor label must contain 1-128 non-control UTF-8 bytes");
+    }
+    let prefix = match kind {
+        ActorKind::Human => "human",
+        ActorKind::Agent => "agent",
+        ActorKind::Script => "script",
+        ActorKind::System => unreachable!(),
+    };
+    Ok(Actor {
+        id: format!("{prefix}:{}", Uuid::new_v4().simple()),
+        label: label.to_owned(),
+        kind,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_message(
     message: ClientMessage,
     actor: &Actor,
-    principal: Principal,
     state: &AppState,
     outbound: &mpsc::Sender<Message>,
     subscriptions: &mut HashMap<String, JoinHandle<()>>,
@@ -1408,33 +1034,33 @@ async fn dispatch_message(
                 let handle = state
                     .inner
                     .registry
-                    .get(&request.slot_id)
+                    .get(&request.port)
                     .await
-                    .ok_or_else(|| WsError::NotFound(request.slot_id.clone()))?;
-                if let Some(old) = subscriptions.remove(&request.slot_id) {
+                    .ok_or_else(|| WsError::NotFound(request.port.clone()))?;
+                if let Some(old) = subscriptions.remove(&request.port) {
                     old.abort();
                 }
                 let attach = handle
                     .attach(request.cursor.as_ref(), request.tail_events)
                     .await?;
                 send_attach(outbound, &handle, &attach).await?;
-                let slot_id = request.slot_id;
+                let port = request.port;
                 subscriptions.insert(
-                    slot_id.clone(),
+                    port.clone(),
                     spawn_live_forwarder(outbound.clone(), handle, attach),
                 );
-                attached.push(slot_id);
+                attached.push(port);
             }
             send_result(
                 outbound,
                 request_id,
-                CommandResult::Attached { slots: attached },
+                CommandResult::Attached { ports: attached },
             )
             .await
         }
-        ClientMessage::Detach { request_id, slots } => {
+        ClientMessage::Detach { request_id, ports } => {
             let mut detached = Vec::new();
-            for slot in slots {
+            for slot in ports {
                 if let Some(task) = subscriptions.remove(&slot) {
                     task.abort();
                     detached.push(slot);
@@ -1443,7 +1069,7 @@ async fn dispatch_message(
             send_result(
                 outbound,
                 request_id,
-                CommandResult::Detached { slots: detached },
+                CommandResult::Detached { ports: detached },
             )
             .await
         }
@@ -1458,17 +1084,14 @@ async fn dispatch_message(
             .await
         }
         other => {
-            if !role_allows(principal.role(), Role::Operator) {
-                return Err(WsError::Forbidden);
-            }
-            let slot_id = command_slot(&other)
-                .ok_or_else(|| WsError::BadRequest("message has no Slot".into()))?;
+            let port = command_slot(&other)
+                .ok_or_else(|| WsError::BadRequest("message has no port".into()))?;
             let handle = state
                 .inner
                 .registry
-                .get(slot_id)
+                .get(port)
                 .await
-                .ok_or_else(|| WsError::NotFound(slot_id.into()))?;
+                .ok_or_else(|| WsError::NotFound(port.into()))?;
             let (request_id, result) = dispatch_slot_command(other, handle, actor.clone()).await?;
             send_result(outbound, request_id, result).await
         }
@@ -1515,6 +1138,7 @@ async fn dispatch_slot_command(
             expected_run_id,
             pacing,
             description,
+            command_capture_matchers,
             command_sequence,
             sequence_precondition,
             cooperative,
@@ -1531,6 +1155,7 @@ async fn dispatch_slot_command(
                     expected_run_id,
                     pacing,
                     description,
+                    command_capture_matchers,
                     command_sequence,
                     sequence_precondition,
                     cooperative,
@@ -1659,7 +1284,7 @@ async fn send_attach(
     send_control(
         outbound,
         ServerMessage::Snapshot {
-            slot: Box::new(attach.snapshot.clone()),
+            port: Box::new(attach.snapshot.clone()),
         },
     )
     .await
@@ -1668,7 +1293,7 @@ async fn send_attach(
         send_control(
             outbound,
             ServerMessage::Gap {
-                slot_id: handle.id().into(),
+                port: handle.id().into(),
                 requested_after_seq: gap.requested_after_seq,
                 first_available_seq: gap.first_available_seq,
                 head_seq: attach.snapshot.head_seq,
@@ -1682,7 +1307,7 @@ async fn send_attach(
         send_control(
             outbound,
             ServerMessage::ReplayBegin {
-                slot_id: handle.id().into(),
+                port: handle.id().into(),
                 from_seq: first.seq,
                 through_seq: last.seq,
             },
@@ -1703,7 +1328,7 @@ async fn send_attach(
     send_control(
         outbound,
         ServerMessage::Ready {
-            slot_id: handle.id().into(),
+            port: handle.id().into(),
             head_seq: attach.snapshot.head_seq,
         },
     )
@@ -1736,14 +1361,14 @@ fn spawn_live_forwarder(
                     handle.record_subscriber_lag(skipped);
                     let head = handle.snapshot().head_seq;
                     let message = ServerMessage::Lagged {
-                        slot_id: handle.id().into(),
+                        port: handle.id().into(),
                         from_seq: last_seq.saturating_add(1),
                         to_seq: head.max(last_seq.saturating_add(skipped)),
                     };
                     if send_control(&outbound, message).await.is_err() {
                         break;
                     }
-                    // Detach only this Slot. The caller can recover via the
+                    // Detach only this port. The caller can recover via the
                     // history endpoint and attach again with a cursor.
                     break;
                 }
@@ -1755,18 +1380,18 @@ fn spawn_live_forwarder(
 
 fn command_slot(message: &ClientMessage) -> Option<&str> {
     match message {
-        ClientMessage::AcquireControl { slot_id, .. }
-        | ClientMessage::RenewControl { slot_id, .. }
-        | ClientMessage::ReleaseControl { slot_id, .. }
-        | ClientMessage::CancelAcquire { slot_id, .. }
-        | ClientMessage::Write { slot_id, .. }
-        | ClientMessage::SendBreak { slot_id, .. }
-        | ClientMessage::TriggerStart { slot_id, .. }
-        | ClientMessage::TriggerStatus { slot_id, .. }
-        | ClientMessage::TriggerCancel { slot_id, .. }
-        | ClientMessage::StartRun { slot_id, .. }
-        | ClientMessage::EndRun { slot_id, .. }
-        | ClientMessage::Checkpoint { slot_id, .. } => Some(slot_id),
+        ClientMessage::AcquireControl { port, .. }
+        | ClientMessage::RenewControl { port, .. }
+        | ClientMessage::ReleaseControl { port, .. }
+        | ClientMessage::CancelAcquire { port, .. }
+        | ClientMessage::Write { port, .. }
+        | ClientMessage::SendBreak { port, .. }
+        | ClientMessage::TriggerStart { port, .. }
+        | ClientMessage::TriggerStatus { port, .. }
+        | ClientMessage::TriggerCancel { port, .. }
+        | ClientMessage::StartRun { port, .. }
+        | ClientMessage::EndRun { port, .. }
+        | ClientMessage::Checkpoint { port, .. } => Some(port),
         _ => None,
     }
 }
@@ -1812,9 +1437,7 @@ async fn send_error(
 enum WsError {
     #[error("request is invalid: {0}")]
     BadRequest(String),
-    #[error("the authenticated role may not write serial data")]
-    Forbidden,
-    #[error("unknown Slot {0}")]
+    #[error("unknown port {0}")]
     NotFound(String),
     #[error("connection output is closed")]
     Closed,
@@ -1828,7 +1451,6 @@ impl WsError {
     fn protocol_code(&self) -> (ErrorCode, bool) {
         match self {
             Self::BadRequest(_) | Self::Codec(_) => (ErrorCode::BadRequest, false),
-            Self::Forbidden => (ErrorCode::Forbidden, false),
             Self::NotFound(_) => (ErrorCode::NotFound, false),
             Self::Closed => (ErrorCode::Internal, true),
             Self::Slot(error) => match error {
@@ -1888,8 +1510,6 @@ impl WsError {
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error(transparent)]
-    Auth(#[from] AuthError),
-    #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
@@ -1919,13 +1539,6 @@ pub enum ApiError {
     TooManyConnections,
     #[error("configuration revision mismatch: expected {expected}, current {actual}")]
     ConfigRevisionMismatch { expected: u64, actual: u64 },
-    #[error("Slot model binding changed: expected {expected:?}, current {actual:?}")]
-    ModelBindingMismatch {
-        expected: Option<String>,
-        actual: Option<String>,
-    },
-    #[error("device model {model_id:?} already exists with a different definition")]
-    ModelDefinitionConflict { model_id: String },
     #[error("{0}")]
     Internal(String),
 }
@@ -1953,8 +1566,6 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
         let (status, code) = match &self {
-            Self::Auth(AuthError::Forbidden) => (StatusCode::FORBIDDEN, ErrorCode::Forbidden),
-            Self::Auth(_) => (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized),
             Self::Config(ConfigError::Validation(_)) => {
                 (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
             }
@@ -1967,7 +1578,7 @@ impl IntoResponse for ApiError {
             Self::Registry(RegistryError::Shutdown | RegistryError::Degraded) => {
                 (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable)
             }
-            Self::Journal(JournalError::InvalidConfig(_) | JournalError::InvalidSlotId) => {
+            Self::Journal(JournalError::InvalidConfig(_) | JournalError::InvalidPortId) => {
                 (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
             }
             Self::Journal(JournalError::InvalidRegex(_)) => {
@@ -1997,9 +1608,6 @@ impl IntoResponse for ApiError {
             Self::ConfigRevisionMismatch { .. } => {
                 (StatusCode::CONFLICT, ErrorCode::ConfigRevisionMismatch)
             }
-            Self::ModelBindingMismatch { .. } | Self::ModelDefinitionConflict { .. } => {
-                (StatusCode::CONFLICT, ErrorCode::Conflict)
-            }
             Self::Config(_)
             | Self::Registry(_)
             | Self::ConfigRollback { .. }
@@ -2027,1132 +1635,35 @@ fn wall_time_ns() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::{ConfigPaths, ConfigStore};
-    use crate::control::ControlLimits;
-    use crate::journal::{JournalConfig, JournalManager};
-    use crate::ring::{ReplayGap, ReplayWindow};
-    use serial_protocol::{
-        Direction, EventKind, GapReason, ModelConfirmationMethod, SerialSettings, SlotConfig,
-        SlotSnapshot, TimelineEvent, TransportProfile,
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        extract::Path,
+        http::{Request, StatusCode},
+        routing::get,
     };
+    use tower::ServiceExt;
 
-    fn disabled_slot(id: &str, display_name: &str, port: &str) -> SlotConfig {
-        SlotConfig {
-            id: id.into(),
-            display_name: display_name.into(),
-            port: port.into(),
-            profile: "generic-115200".into(),
-            device_profile: None,
-            enabled: false,
-            settings: SerialSettings {
-                auto_open: false,
-                ..SerialSettings::default()
-            },
+    #[tokio::test]
+    async fn encoded_macos_device_path_round_trips_through_port_route() {
+        async fn echo_port(Path(port): Path<String>) -> String {
+            port
         }
-    }
 
-    fn live_snapshot(epoch: Uuid, head_seq: u64, oldest_seq: u64) -> SlotSnapshot {
-        serde_json::from_value(serde_json::json!({
-            "config": disabled_slot("slot-1", "Slot 1", "COM3"),
-            "daemon_epoch": epoch,
-            "head_seq": head_seq,
-            "ring_oldest_seq": oldest_seq,
-            "generation": 1,
-            "endpoint_present": true,
-            "session_state": "online",
-            "state_reason": null,
-            "target_activity": "active",
-            "last_rx_wall_time_ns": null,
-            "rx_offset": head_seq,
-            "tx_offset": 0,
-            "control": null,
-            "active_run": null,
-            "logging": "healthy"
-        }))
-        .unwrap()
-    }
-
-    fn live_event(epoch: Uuid, seq: u64) -> TimelineEvent {
-        TimelineEvent {
-            slot_id: "slot-1".into(),
-            daemon_epoch: epoch,
-            seq,
-            generation: 1,
-            wall_time_ns: seq as i64,
-            monotonic_time_ns: seq,
-            kind: EventKind::Rx,
-            direction: Direction::Rx,
-            actor: None,
-            run_id: None,
-            operation_id: None,
-            stream_offset_start: Some(seq - 1),
-            stream_offset_end: Some(seq),
-            data: vec![b'x'],
-            metadata: Default::default(),
-            durable: true,
-        }
-    }
-
-    fn attach_state(
-        snapshot: SlotSnapshot,
-        events: Vec<TimelineEvent>,
-        gap: Option<ReplayGap>,
-    ) -> AttachState {
-        let (_live_tx, live) = broadcast::channel(1);
-        AttachState {
-            snapshot,
-            replay: ReplayWindow { events, gap },
-            live,
-        }
-    }
-
-    #[test]
-    fn live_tail_keeps_the_intentional_newest_window_distinct_from_retention_loss() {
-        let epoch = Uuid::new_v4();
-        // EventRing already selected the requested newest window before this
-        // response helper is called.
-        let response = bounded_live_response(
-            attach_state(
-                live_snapshot(epoch, 5, 1),
-                vec![live_event(epoch, 4), live_event(epoch, 5)],
-                None,
-            ),
-            None,
-            2,
-        );
-        assert_eq!(
-            response
-                .events
-                .iter()
-                .map(|event| event.seq)
-                .collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-        assert_eq!(response.first_available_seq, Some(1));
-        assert_eq!(response.next_cursor.unwrap().after_seq, 5);
-        assert!(!response.truncated);
-        assert!(response.gaps.is_empty());
-    }
-
-    #[test]
-    fn live_continue_returns_the_oldest_bounded_page_and_resumable_cursor() {
-        let epoch = Uuid::new_v4();
-        let cursor = Cursor {
-            epoch,
-            after_seq: 0,
-        };
-        let response = bounded_live_response(
-            attach_state(
-                live_snapshot(epoch, 5, 1),
-                (1..=5).map(|seq| live_event(epoch, seq)).collect(),
-                None,
-            ),
-            Some(&cursor),
-            2,
-        );
-        assert_eq!(
-            response
-                .events
-                .iter()
-                .map(|event| event.seq)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(response.next_cursor.unwrap().after_seq, 2);
-        assert!(response.truncated);
-        assert!(response.gaps.is_empty());
-    }
-
-    #[test]
-    fn live_continue_surfaces_ring_eviction_as_a_gap_and_partial_result() {
-        let epoch = Uuid::new_v4();
-        let cursor = Cursor {
-            epoch,
-            after_seq: 1,
-        };
-        let response = bounded_live_response(
-            attach_state(
-                live_snapshot(epoch, 7, 4),
-                (4..=7).map(|seq| live_event(epoch, seq)).collect(),
-                Some(ReplayGap {
-                    reason: GapReason::RingEvicted,
-                    requested_after_seq: Some(1),
-                    first_available_seq: Some(4),
-                }),
-            ),
-            Some(&cursor),
-            2,
-        );
-        assert_eq!(
-            response
-                .events
-                .iter()
-                .map(|event| event.seq)
-                .collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-        assert_eq!(response.next_cursor.unwrap().after_seq, 5);
-        assert!(response.truncated);
-        assert_eq!(response.gaps.len(), 1);
-        assert_eq!(response.gaps[0].first_seq, 2);
-        assert_eq!(response.gaps[0].last_seq, 3);
-        assert_eq!(response.gaps[0].reason, GapReason::RingEvicted);
-    }
-
-    #[test]
-    fn live_continue_keeps_daemon_restart_as_an_explicit_epoch_gap() {
-        let old_epoch = Uuid::new_v4();
-        let new_epoch = Uuid::new_v4();
-        let cursor = Cursor {
-            epoch: old_epoch,
-            after_seq: 80,
-        };
-        let response = bounded_live_response(
-            attach_state(
-                live_snapshot(new_epoch, 3, 1),
-                (1..=3).map(|seq| live_event(new_epoch, seq)).collect(),
-                Some(ReplayGap {
-                    reason: GapReason::EpochChanged,
-                    requested_after_seq: Some(80),
-                    first_available_seq: Some(1),
-                }),
-            ),
-            Some(&cursor),
-            2,
-        );
-        assert_eq!(
-            response
-                .events
-                .iter()
-                .map(|event| event.seq)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(
-            response.next_cursor.unwrap(),
-            Cursor {
-                epoch: new_epoch,
-                after_seq: 2,
-            }
-        );
-        assert!(response.truncated);
-        assert_eq!(response.gaps.len(), 1);
-        assert_eq!(response.gaps[0].epoch, old_epoch);
-        assert_eq!(response.gaps[0].reason, GapReason::EpochChanged);
-    }
-
-    fn transport_profile(name: &str, baud_rate: u32) -> TransportProfile {
-        let settings = SerialSettings::default();
-        TransportProfile {
-            name: name.into(),
-            baud_rate,
-            data_bits: settings.data_bits,
-            parity: settings.parity,
-            stop_bits: settings.stop_bits,
-            flow_control: settings.flow_control,
-            dtr: settings.dtr,
-            rts: settings.rts,
-            auto_open: settings.auto_open,
-        }
-    }
-
-    #[test]
-    fn insufficient_write_lease_is_a_retryable_conflict() {
-        let error = WsError::Slot(SlotError::WriteLeaseTooShort {
-            remaining_ms: 2_099,
-            write_ms: 2_000,
-            margin_ms: 100,
-        });
-        assert_eq!(error.protocol_code(), (ErrorCode::Conflict, true));
-        assert!(error.to_string().contains("renew control"));
-    }
-
-    #[test]
-    fn expected_run_write_rejection_is_a_definite_nonretryable_conflict() {
-        let run_id = Uuid::new_v4();
-        let error = WsError::Slot(SlotError::WriteRunMissing {
-            expected_run_id: run_id,
-        });
-        assert_eq!(error.protocol_code(), (ErrorCode::Conflict, false));
-        assert!(error.to_string().contains(&run_id.to_string()));
-        assert!(error.to_string().contains("(no bytes were written)"));
-    }
-
-    #[tokio::test]
-    async fn successful_slot_update_commits_runtime_disk_and_memory() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let initial_revision = loaded.config.config_revision;
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            loaded.config.slots.clone(),
-            loaded.config.transport_profiles.clone(),
-            loaded.config.device_profiles.clone(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-        let requested = vec![disabled_slot("slot-1", "Slot 1", "COM3")];
-
-        let (snapshots, revision) = state
-            .configure_slots_transaction(requested.clone(), None)
-            .await
-            .unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].config, requested[0]);
-        assert_eq!(revision, initial_revision + 1);
-        assert_eq!(state.inner.config.read().await.slots, requested);
-        assert_eq!(store.load().unwrap().slots, requested);
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn stale_configuration_revision_is_rejected_before_any_mutation() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let revision = loaded.config.config_revision;
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-
-        let error = state
-            .configure_slots_transaction(
-                vec![disabled_slot("slot-1", "Slot 1", "COM3")],
-                Some(revision + 1),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ApiError::ConfigRevisionMismatch {
-                expected,
-                actual
-            } if expected == revision + 1 && actual == revision
-        ));
-        assert!(state.inner.registry.snapshots().await.is_empty());
-        assert_eq!(state.inner.config.read().await.config_revision, revision);
-        assert_eq!(store.load().unwrap().config_revision, revision);
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn transport_profile_update_publishes_effective_uart_settings_and_revision() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let mut loaded = store.load_or_create().unwrap();
-        let configured_slot = disabled_slot("slot-1", "Slot 1", "COM3");
-        store
-            .update_slots(&mut loaded.config, vec![configured_slot.clone()])
-            .unwrap();
-        let revision = loaded.config.config_revision;
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            vec![configured_slot],
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-        let profile = transport_profile("generic-115200", 230_400);
-
-        let (profiles, updated_revision) = state
-            .configure_transport_profiles_transaction(vec![profile.clone()], Some(revision))
-            .await
-            .unwrap();
-        assert_eq!(profiles, vec![profile.clone()]);
-        assert_eq!(updated_revision, revision + 1);
-        assert_eq!(
-            store.load().unwrap().transport_profiles,
-            vec![profile.clone()]
-        );
-        let snapshot = state.inner.registry.get("slot-1").await.unwrap().snapshot();
-        assert_eq!(
-            snapshot.effective_transport.unwrap().baud_rate,
-            profile.baud_rate
-        );
-        // The Slot snapshot remains backward compatible; the effective bundle
-        // is authoritative when a transport catalog is attached.
-        assert_eq!(snapshot.config.settings.baud_rate, 115_200);
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn model_creation_and_slot_binding_commit_atomically_and_honor_current_guard() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let mut loaded = store.load_or_create().unwrap();
-        let configured_slot = disabled_slot("slot-1", "Slot 1", "COM3");
-        store
-            .update_slots(&mut loaded.config, vec![configured_slot.clone()])
-            .unwrap();
-        let revision = loaded.config.config_revision;
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            vec![configured_slot],
-            loaded.config.transport_profiles.clone(),
-            loaded.config.device_profiles.clone(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-
-        let response = state
-            .set_slot_device_model_transaction(
-                "slot-1".into(),
-                SetSlotDeviceModelRequest {
-                    model_id: Some("tl-as7230-w".into()),
-                    create_if_missing: true,
-                    update_existing: false,
-                    name: Some("TL-AS7230-W".into()),
-                    parent_id: None,
-                    clear_parent: false,
-                    aliases: vec!["7230W".into()],
-                    clear_aliases: false,
-                    confirmation_method: Some(ModelConfirmationMethod::Serial),
-                    note: Some("confirmed with show version".into()),
-                    source: "human:test".into(),
-                    expected_revision: Some(revision),
-                    expected_current: Some(None),
-                },
+        let app = Router::new().route("/api/v1/ports/{port}/events", get(echo_port));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ports/%2Fdev%2Fcu.usbserial-210/events")
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await
             .unwrap();
-        assert!(response.created);
-        assert_eq!(response.config_revision, revision + 1);
-        assert_eq!(response.model.unwrap().id, "tl-as7230-w");
-        assert_eq!(response.binding.unwrap().model_id, "tl-as7230-w");
-
-        let persisted = store.load().unwrap();
-        assert_eq!(persisted.device_models.len(), 1);
-        assert_eq!(persisted.slot_model_bindings.len(), 1);
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            state.inner.config.read().await.slot_model_bindings,
-            persisted.slot_model_bindings
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "/dev/cu.usbserial-210"
         );
-
-        let error = state
-            .set_slot_device_model_transaction(
-                "slot-1".into(),
-                SetSlotDeviceModelRequest {
-                    model_id: None,
-                    create_if_missing: false,
-                    update_existing: false,
-                    name: None,
-                    parent_id: None,
-                    clear_parent: false,
-                    aliases: Vec::new(),
-                    clear_aliases: false,
-                    confirmation_method: None,
-                    note: None,
-                    source: "human:test".into(),
-                    expected_revision: Some(response.config_revision),
-                    expected_current: Some(Some("different-model".into())),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ApiError::ModelBindingMismatch { .. }));
-        assert_eq!(
-            state.inner.config.read().await.config_revision,
-            response.config_revision
-        );
-        assert_eq!(
-            store.load().unwrap().config_revision,
-            response.config_revision
-        );
-
-        let malformed_detach = state
-            .set_slot_device_model_transaction(
-                "slot-1".into(),
-                SetSlotDeviceModelRequest {
-                    model_id: None,
-                    create_if_missing: false,
-                    update_existing: false,
-                    name: None,
-                    parent_id: None,
-                    clear_parent: false,
-                    aliases: Vec::new(),
-                    clear_aliases: false,
-                    confirmation_method: Some(ModelConfirmationMethod::Human),
-                    note: Some("irrelevant on detach".into()),
-                    source: "human:test".into(),
-                    expected_revision: Some(response.config_revision),
-                    expected_current: Some(Some("tl-as7230-w".into())),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(malformed_detach, ApiError::BadRequest(_)));
-        assert_eq!(
-            store.load().unwrap().config_revision,
-            response.config_revision
-        );
-
-        let updated = state
-            .set_slot_device_model_transaction(
-                "slot-1".into(),
-                SetSlotDeviceModelRequest {
-                    model_id: Some("tl-as7230-w".into()),
-                    create_if_missing: false,
-                    update_existing: true,
-                    name: Some("TL-AS7230-W rev2".into()),
-                    parent_id: None,
-                    clear_parent: false,
-                    aliases: vec!["7230-W".into()],
-                    clear_aliases: false,
-                    confirmation_method: Some(ModelConfirmationMethod::Web),
-                    note: Some("confirmed in device web UI".into()),
-                    source: "agent:test".into(),
-                    expected_revision: Some(response.config_revision),
-                    expected_current: Some(Some("tl-as7230-w".into())),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(updated.model.as_ref().unwrap().name, "TL-AS7230-W rev2");
-        assert_eq!(updated.model.as_ref().unwrap().aliases, ["7230-W"]);
-        assert_eq!(updated.affected_slots, ["slot-1"]);
-        assert!(!updated.created);
-
-        let cycle = state
-            .set_slot_device_model_transaction(
-                "slot-1".into(),
-                SetSlotDeviceModelRequest {
-                    model_id: Some("tl-as7230-w".into()),
-                    create_if_missing: false,
-                    update_existing: true,
-                    name: None,
-                    parent_id: Some("tl-as7230-w".into()),
-                    clear_parent: false,
-                    aliases: Vec::new(),
-                    clear_aliases: false,
-                    confirmation_method: Some(ModelConfirmationMethod::Serial),
-                    note: None,
-                    source: "agent:test".into(),
-                    expected_revision: Some(updated.config_revision),
-                    expected_current: Some(Some("tl-as7230-w".into())),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            cycle,
-            ApiError::Config(ConfigError::Validation(
-                crate::config::ConfigValidationError::DeviceModelCycle { .. }
-            ))
-        ));
-        assert_eq!(
-            store.load().unwrap().config_revision,
-            updated.config_revision
-        );
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_slot_update_changes_no_authoritative_view() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-
-        let error = state
-            .configure_slots_transaction(
-                vec![
-                    disabled_slot("slot-1", "One", "COM3"),
-                    disabled_slot("slot-1", "Duplicate", "COM4"),
-                ],
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ApiError::Config(ConfigError::Validation(_))
-        ));
-        assert!(state.inner.registry.snapshots().await.is_empty());
-        assert!(state.inner.config.read().await.slots.is_empty());
-        assert!(store.load().unwrap().slots.is_empty());
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn concurrent_slot_updates_commit_as_whole_transactions() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-        let first_state = state.clone();
-        let second_state = state.clone();
-        let first = async move {
-            first_state
-                .configure_slots_transaction(vec![disabled_slot("slot-1", "First", "COM3")], None)
-                .await
-        };
-        let second = async move {
-            second_state
-                .configure_slots_transaction(vec![disabled_slot("slot-1", "Second", "COM4")], None)
-                .await
-        };
-        let (first, second) = tokio::join!(first, second);
-        first.unwrap();
-        second.unwrap();
-
-        let memory = state.inner.config.read().await.slots.clone();
-        let disk = store.load().unwrap().slots;
-        let runtime = state
-            .inner
-            .registry
-            .snapshots()
-            .await
-            .into_iter()
-            .map(|snapshot| snapshot.config)
-            .collect::<Vec<_>>();
-        assert_eq!(memory, disk);
-        assert_eq!(memory, runtime);
-        assert_eq!(
-            state
-                .inner
-                .registry
-                .get("slot-1")
-                .await
-                .unwrap()
-                .snapshot()
-                .head_seq,
-            1
-        );
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn save_failure_restores_runtime_and_keeps_disk_and_memory_old() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let mut loaded = store.load_or_create().unwrap();
-        let old_slots = vec![disabled_slot("slot-old", "Old", "COM3")];
-        store
-            .update_slots(&mut loaded.config, old_slots.clone())
-            .unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            old_slots.clone(),
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-        let old_handle = state.inner.registry.get("slot-old").await.unwrap();
-        let mut old_live = old_handle.attach(None, 10).await.unwrap().live;
-        store.set_save_failure(true);
-
-        let error = state
-            .configure_slots_transaction(vec![disabled_slot("slot-new", "New", "COM4")], None)
-            .await
-            .unwrap_err();
-        assert!(matches!(&error, ApiError::Config(ConfigError::Io { .. })));
-        assert_eq!(
-            error.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(state.inner.config.read().await.slots, old_slots);
-        assert_eq!(store.load().unwrap().slots, old_slots);
-        assert_eq!(
-            state
-                .inner
-                .registry
-                .get("slot-old")
-                .await
-                .unwrap()
-                .snapshot()
-                .config,
-            old_slots[0]
-        );
-        assert!(state.inner.registry.get("slot-new").await.is_none());
-        assert_eq!(old_handle.snapshot().config, old_slots[0]);
-        assert_eq!(old_handle.snapshot().head_seq, 0);
-        assert!(matches!(
-            old_live.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-
-        store.set_save_failure(false);
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn runtime_commit_failure_restores_previous_persisted_configuration() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let previous = loaded.config;
-        let staged = previous
-            .staged_with_slots(vec![disabled_slot("slot-1", "Slot 1", "COM3")])
-            .unwrap();
-        store.save(&staged).unwrap();
-        assert_eq!(
-            store.load().unwrap().config_revision,
-            staged.config_revision
-        );
-
-        let error = compensate_commit_failure(&store, &previous, RegistryError::Shutdown);
-        assert!(matches!(error, ApiError::Registry(RegistryError::Shutdown)));
-        let restored = store.load().unwrap();
-        assert_eq!(restored.config_revision, previous.config_revision);
-        assert!(restored.slots.is_empty());
-    }
-
-    fn sigmastar_profile() -> serial_protocol::DeviceProfile {
-        serial_protocol::DeviceProfile {
-            name: "sigmastar-evb".into(),
-            shell_prompt: Some("root@sigmastar:/# ".into()),
-            uboot_prompt: Some("SigmaStar =>".into()),
-            write_eol: Some("\n".into()),
-            echo: Some(serial_protocol::EchoMode::Off),
-            write_chunk_size: None,
-            write_chunk_delay_ms: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn device_profile_update_commits_memory_disk_and_live_snapshots() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let mut referencing = disabled_slot("slot-1", "Slot 1", "COM3");
-        referencing.device_profile = Some("sigmastar-evb".into());
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            vec![referencing.clone()],
-            Vec::new(),
-            vec![sigmastar_profile()],
-            ControlLimits::default(),
-        );
-        // The catalog must be present in memory for validation to pass; the
-        // registry was built with it directly above.
-        let mut config = loaded.config.clone();
-        config.slots = vec![referencing];
-        config.device_profiles = vec![sigmastar_profile()];
-        store.save(&config).unwrap();
-        let state = AppState::new(
-            store.clone(),
-            config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-
-        let handle = state.inner.registry.get("slot-1").await.unwrap();
-        let mut live = handle.attach(None, 0).await.unwrap().live;
-        let snapshot = handle.snapshot();
-        assert_eq!(
-            snapshot.effective_shell_prompt.as_deref(),
-            Some("root@sigmastar:/# ")
-        );
-        assert_eq!(
-            snapshot.effective_uboot_prompt.as_deref(),
-            Some("SigmaStar =>")
-        );
-        assert_eq!(snapshot.effective_write_eol.as_deref(), Some("\n"));
-        assert_eq!(
-            snapshot.effective_echo,
-            Some(serial_protocol::EchoMode::Off)
-        );
-
-        // Replacing the catalog validates against existing Slots, persists,
-        // and refreshes live snapshots without touching ports.
-        let mut updated = sigmastar_profile();
-        updated.uboot_prompt = Some("SigmaStar #".into());
-        let (profiles, revision) = state
-            .configure_device_profiles_transaction(vec![updated.clone()], None)
-            .await
-            .unwrap();
-        assert_eq!(profiles, vec![updated.clone()]);
-        assert_eq!(revision, state.inner.config.read().await.config_revision);
-        assert_eq!(
-            state.inner.config.read().await.device_profiles,
-            vec![updated.clone()]
-        );
-        assert_eq!(store.load().unwrap().device_profiles, vec![updated]);
-        let snapshot = state.inner.registry.get("slot-1").await.unwrap().snapshot();
-        assert_eq!(
-            snapshot.effective_uboot_prompt.as_deref(),
-            Some("SigmaStar #")
-        );
-        let event = tokio::time::timeout(Duration::from_secs(1), live.recv())
-            .await
-            .expect("attached consumer should receive the profile refresh")
-            .unwrap();
-        assert_eq!(event.kind, serial_protocol::EventKind::SlotReconfigured);
-        assert_eq!(
-            event
-                .metadata
-                .get("profile_only")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        let effective: serial_protocol::ResolvedDeviceSettings = serde_json::from_value(
-            event
-                .metadata
-                .get("effective")
-                .cloned()
-                .expect("effective settings metadata"),
-        )
-        .unwrap();
-        assert_eq!(effective.uboot_prompt.as_deref(), Some("SigmaStar #"));
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn device_profile_stage_failure_leaves_every_committed_view_unchanged() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let mut healthy = disabled_slot("slot-a", "Healthy", "COM3");
-        healthy.device_profile = Some("sigmastar-evb".into());
-        let mut stopped = disabled_slot("slot-z", "Stopped", "COM4");
-        stopped.device_profile = Some("sigmastar-evb".into());
-        let slots = vec![healthy, stopped];
-        let old_profile = sigmastar_profile();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            slots.clone(),
-            Vec::new(),
-            vec![old_profile.clone()],
-            ControlLimits::default(),
-        );
-        let mut config = loaded.config.clone();
-        config.slots = slots;
-        config.device_profiles = vec![old_profile.clone()];
-        store.save(&config).unwrap();
-        let state = AppState::new(
-            store.clone(),
-            config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-
-        let healthy = state.inner.registry.get("slot-a").await.unwrap();
-        let mut live = healthy.attach(None, 0).await.unwrap().live;
-        state
-            .inner
-            .registry
-            .get("slot-z")
-            .await
-            .unwrap()
-            .shutdown()
-            .await;
-        let mut updated = old_profile.clone();
-        updated.uboot_prompt = Some("SigmaStar #".into());
-
-        let error = state
-            .configure_device_profiles_transaction(vec![updated], None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ApiError::Registry(RegistryError::Slot(SlotError::Closed))
-        ));
-        assert_eq!(
-            state.inner.config.read().await.device_profiles,
-            vec![old_profile.clone()]
-        );
-        assert_eq!(
-            store.load().unwrap().device_profiles,
-            vec![old_profile.clone()]
-        );
-        let snapshot = healthy.snapshot();
-        assert_eq!(
-            snapshot.effective_uboot_prompt,
-            old_profile.uboot_prompt.clone()
-        );
-        assert_eq!(snapshot.head_seq, 0);
-        assert!(matches!(
-            live.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn orphaned_device_profile_update_is_rejected_everywhere() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let mut referencing = disabled_slot("slot-1", "Slot 1", "COM3");
-        referencing.device_profile = Some("sigmastar-evb".into());
-        let mut config = loaded.config.clone();
-        config.slots = vec![referencing.clone()];
-        config.device_profiles = vec![sigmastar_profile()];
-        store.save(&config).unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            vec![referencing],
-            Vec::new(),
-            vec![sigmastar_profile()],
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store.clone(),
-            config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-
-        // Deleting a profile that a Slot still references fails validation.
-        let error = state
-            .configure_device_profiles_transaction(Vec::new(), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ApiError::Config(ConfigError::Validation(
-                crate::config::ConfigValidationError::UnknownDeviceProfile { .. }
-            ))
-        ));
-        assert_eq!(
-            state.inner.config.read().await.device_profiles,
-            vec![sigmastar_profile()]
-        );
-        assert_eq!(
-            store.load().unwrap().device_profiles,
-            vec![sigmastar_profile()]
-        );
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn slot_without_device_profile_does_not_guess_device_prompts() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            vec![disabled_slot("slot-1", "Slot 1", "COM3")],
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let snapshot = registry.get("slot-1").await.unwrap().snapshot();
-        assert!(snapshot.effective_shell_prompt.is_none());
-        assert!(snapshot.effective_uboot_prompt.is_none());
-
-        registry.shutdown().await;
-        journal.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn diagnostics_are_read_only_for_slots_and_journal() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
-        let loaded = store.load_or_create().unwrap();
-        let started = Instant::now();
-        let journal =
-            JournalManager::open(JournalConfig::new(temporary.path().join("runtime-journal")))
-                .unwrap();
-        let registry = SlotRegistry::new(
-            loaded.daemon_epoch,
-            started,
-            journal.handle(),
-            vec![disabled_slot("slot-1", "Slot 1", "COM3")],
-            Vec::new(),
-            Vec::new(),
-            ControlLimits::default(),
-        );
-        let state = AppState::new(
-            store,
-            loaded.config,
-            registry,
-            journal.handle(),
-            loaded.daemon_epoch,
-            started,
-        );
-        let handle = state.inner.registry.get("slot-1").await.unwrap();
-        let before = handle.snapshot();
-        let headers = HeaderMap::new();
-
-        let daemon = diagnostics(State(state.clone()), headers.clone())
-            .await
-            .unwrap()
-            .0;
-        let storage = storage_diagnostics(State(state.clone()), headers.clone())
-            .await
-            .unwrap()
-            .0;
-        let slot = slot_diagnostics(State(state.clone()), headers, Path("slot-1".to_owned()))
-            .await
-            .unwrap()
-            .0;
-
-        assert_eq!(daemon.slots.len(), 1);
-        assert_eq!(
-            daemon.config_revision,
-            state.inner.config.read().await.config_revision
-        );
-        assert_eq!(daemon.journal, storage.journal);
-        assert_eq!(slot.snapshot, before);
-        assert_eq!(slot.subscriber_count, 0);
-        assert_eq!(slot.subscriber_lag_events, 0);
-        assert_eq!(handle.snapshot(), before);
-
-        state.shutdown().await;
-        journal.shutdown().await.unwrap();
     }
 }
