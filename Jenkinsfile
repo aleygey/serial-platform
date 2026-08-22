@@ -1,3 +1,51 @@
+def restorePinnedSource() {
+    deleteDir()
+    unstash 'pinned-source-bundle'
+    sh '''
+        set -eu
+
+        bundle_path='jenkins-source/pinned-source.bundle'
+        commit_path='jenkins-source/SOURCE_GIT_COMMIT'
+        checksum_path='jenkins-source/pinned-source.bundle.sha256'
+
+        expected_commit="$(sed -n '1p' "$commit_path")"
+        expected_checksum="$(sed -n '1p' "$checksum_path")"
+        test "$expected_commit" = "$SOURCE_GIT_COMMIT"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual_checksum="$(sha256sum "$bundle_path" | awk '{print $1}')"
+        elif command -v shasum >/dev/null 2>&1; then
+            actual_checksum="$(LC_ALL=C LANG=C shasum -a 256 "$bundle_path" | awk '{print $1}')"
+        else
+            printf 'sha256sum or shasum is required to verify the pinned source bundle.\n' >&2
+            exit 1
+        fi
+        test "$actual_checksum" = "$expected_checksum"
+
+        bundle_commit="$(git bundle list-heads "$bundle_path" HEAD | awk '$2 == "HEAD" { print $1 }')"
+        test "$bundle_commit" = "$SOURCE_GIT_COMMIT"
+
+        git init -q .
+        git bundle verify "$bundle_path" >/dev/null
+        git fetch --quiet --tags "$bundle_path" HEAD:refs/ci/pinned-source
+        git -c advice.detachedHead=false checkout --quiet --detach "$SOURCE_GIT_COMMIT"
+        test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
+        test "$(git rev-parse refs/ci/pinned-source)" = "$SOURCE_GIT_COMMIT"
+
+        if test "$AUTOMATIC_RELEASE" = 'true'; then
+            test "$(git cat-file -t "$RELEASE_TAG")" = 'tag'
+            test "$(git rev-parse "$RELEASE_TAG^{}")" = "$SOURCE_GIT_COMMIT"
+        fi
+
+        git update-ref -d refs/ci/pinned-source
+        rm -f jenkins-source/pinned-source.bundle \
+            jenkins-source/SOURCE_GIT_COMMIT \
+            jenkins-source/pinned-source.bundle.sha256
+        rmdir jenkins-source
+        printf 'Restored pinned source commit: %s\n' "$SOURCE_GIT_COMMIT"
+    '''
+}
+
 pipeline {
     agent none
 
@@ -35,6 +83,7 @@ pipeline {
                     if (!(env.SOURCE_GIT_COMMIT ==~ /[0-9a-f]{40}/)) {
                         error("无法确定本次构建的完整 Git commit：${env.SOURCE_GIT_COMMIT}")
                     }
+                    sh 'git -c advice.detachedHead=false checkout --quiet --detach "$SOURCE_GIT_COMMIT"'
                     def packageVersion = sh(
                         returnStdout: true,
                         script: "sed -n 's/^version = \\\"\\(.*\\)\\\"/\\1/p' Cargo.toml | head -n 1"
@@ -76,6 +125,30 @@ pipeline {
                     printf 'Build profile: %s\n' "$EFFECTIVE_BUILD_PROFILE"
                     printf 'Release tag: %s (%s)\n' "$RELEASE_TAG" "$AUTOMATIC_RELEASE"
                 '''
+                sh '''
+                    set -eu
+                    mkdir -p jenkins-source
+                    git bundle create jenkins-source/pinned-source.bundle HEAD --tags
+                    printf '%s\n' "$SOURCE_GIT_COMMIT" >jenkins-source/SOURCE_GIT_COMMIT
+
+                    if command -v sha256sum >/dev/null 2>&1; then
+                        bundle_checksum="$(sha256sum jenkins-source/pinned-source.bundle | awk '{print $1}')"
+                    elif command -v shasum >/dev/null 2>&1; then
+                        bundle_checksum="$(LC_ALL=C LANG=C shasum -a 256 jenkins-source/pinned-source.bundle | awk '{print $1}')"
+                    else
+                        printf 'sha256sum or shasum is required to seal the pinned source bundle.\n' >&2
+                        exit 1
+                    fi
+                    printf '%s\n' "$bundle_checksum" >jenkins-source/pinned-source.bundle.sha256
+
+                    test "$(git bundle list-heads jenkins-source/pinned-source.bundle HEAD | awk '$2 == "HEAD" { print $1 }')" = "$SOURCE_GIT_COMMIT"
+                    git bundle verify jenkins-source/pinned-source.bundle >/dev/null
+                '''
+                stash(
+                    name: 'pinned-source-bundle',
+                    includes: 'jenkins-source/pinned-source.bundle,jenkins-source/SOURCE_GIT_COMMIT,jenkins-source/pinned-source.bundle.sha256',
+                    allowEmpty: false
+                )
             }
         }
 
@@ -85,14 +158,11 @@ pipeline {
             }
 
             stages {
-                stage('Linux checkout') {
+                stage('Linux source restore') {
                     steps {
-                        deleteDir()
-                        checkout scm
-                        sh '''
-                            git -c advice.detachedHead=false checkout --detach "$SOURCE_GIT_COMMIT"
-                            test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
-                        '''
+                        script {
+                            restorePinnedSource()
+                        }
                     }
                 }
 
@@ -170,14 +240,11 @@ pipeline {
             }
 
             stages {
-                stage('macOS checkout') {
+                stage('macOS source restore') {
                     steps {
-                        deleteDir()
-                        checkout scm
-                        sh '''
-                            git -c advice.detachedHead=false checkout --detach "$SOURCE_GIT_COMMIT"
-                            test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
-                        '''
+                        script {
+                            restorePinnedSource()
+                        }
                     }
                 }
 
@@ -226,12 +293,9 @@ pipeline {
             }
 
             steps {
-                deleteDir()
-                checkout scm
-                sh '''
-                    git -c advice.detachedHead=false checkout --detach "$SOURCE_GIT_COMMIT"
-                    test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
-                '''
+                script {
+                    restorePinnedSource()
+                }
                 unstash 'linux-windows-packages'
                 unstash 'macos-packages'
                 sh '''
@@ -265,12 +329,9 @@ pipeline {
             }
 
             steps {
-                deleteDir()
-                checkout scm
-                sh '''
-                    git -c advice.detachedHead=false checkout --detach "$SOURCE_GIT_COMMIT"
-                    test "$(git rev-parse HEAD)" = "$SOURCE_GIT_COMMIT"
-                '''
+                script {
+                    restorePinnedSource()
+                }
                 unstash 'collected-packages'
                 withCredentials([
                     string(credentialsId: 'github-release-token', variable: 'GH_TOKEN')

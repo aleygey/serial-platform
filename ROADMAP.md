@@ -78,7 +78,7 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 
 - 裸 `serial` 一次提供 `seriald`、HTTP MCP 和前台 TUI；App 与 `serial` 在默认或自定义 endpoint 下都复用同一 data root 的已验证活动后端，只管理自己启动的子进程，不对后来消失的外部后端自动 failover。
 - 四个平台包都包含 `serial`、`seriald`、`serialctl`、`serial-mcp` 和 Electron App。
-- Jenkins 在 workspace 版本 tag 不存在时构建 Debug；当前 commit 的 annotated version tag 自动触发 Release 与 GitHub 发布；tag 类型或 commit 不匹配时仅构建 Debug，不发布。
+- Jenkins 只在 Prepare/Rust 节点 checkout GitHub 一次；后续 Linux、macOS、归档与发布节点消费并校验同一份 pinned source bundle，macOS 不再独立拉取仓库源码。workspace 版本 tag 不存在时构建 Debug；当前 commit 的 annotated version tag 自动触发 Release 与 GitHub 发布；tag 类型或 commit 不匹配时仅构建 Debug，不发布。
 - GitHub Actions 负责 Rust 多平台检查和 Electron typecheck/test/build/原生打包验证，不承担发布。
 
 ## 发布前必须验证

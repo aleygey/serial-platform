@@ -289,7 +289,9 @@ serial mcp --endpoint http://127.0.0.1:3210
 
 ## 发布结构
 
-Jenkins 从一个确定 commit 构建：
+Jenkins 从一个确定 commit 构建。Prepare 阶段只在 Rust 节点向 GitHub checkout 一次，将本次 SCM commit 固定为完整 commit，完成 tag 判定后生成带 SHA-256 的 Git bundle。Linux、macOS、归档和发布阶段都从 Jenkins stash 恢复同一 bundle，并校验 bundle 校验和、HEAD commit 以及 Release tag 归属。macOS 节点不再单独向 GitHub 拉取仓库源码。
+
+构建模式仍只由固定源码的版本 tag 决定：
 
 - workspace 版本 tag 不存在：Debug 包，不发布 GitHub Release；
 - 当前 commit 存在与 workspace 版本一致的 annotated `vX.Y.Z` tag：Release 包并自动发布。

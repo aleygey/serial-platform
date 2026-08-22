@@ -241,7 +241,7 @@ npm ci --no-audit --no-fund
 npm run build
 ```
 
-Jenkins 是发布构建与 GitHub Release 发布入口。workspace 版本 tag 尚不存在时构建 Debug 包；当当前提交存在与 `Cargo.toml` 版本一致的 annotated `vX.Y.Z` tag 时，Jenkins 自动切换 Release、构建四个平台、生成校验和并发布 GitHub Release，不需要填写发布参数。若同名 tag 不是 annotated tag 或没有指向本次 commit，本次仅按 Debug 构建且不发布。
+Jenkins 是发布构建与 GitHub Release 发布入口。Prepare 阶段只在 Rust 节点向 GitHub checkout 一次，固定并校验完整 commit 后生成带 SHA-256 的源码 bundle；Linux、macOS、归档和发布阶段均恢复并复验这一份源码，macOS 节点不再独立向 GitHub 拉取仓库。workspace 版本 tag 尚不存在时构建 Debug 包；当当前提交存在与 `Cargo.toml` 版本一致的 annotated `vX.Y.Z` tag 时，Jenkins 自动切换 Release、构建四个平台、生成校验和并发布 GitHub Release，不需要填写发布参数。若同名 tag 不是 annotated tag 或没有指向本次 commit，本次仅按 Debug 构建且不发布。
 
 发布矩阵：
 
