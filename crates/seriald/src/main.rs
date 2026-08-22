@@ -28,6 +28,13 @@ enum Command {
     },
     /// Print the resolved configuration and data paths.
     Paths,
+    /// Print the verified endpoint currently owning this data root.
+    #[command(hide = true)]
+    Discover {
+        /// Emit the complete active-endpoint record as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -50,15 +57,33 @@ async fn main() -> anyhow::Result<()> {
         managed: false,
     }) {
         Command::Serve { bind, managed } => {
+            let instance = seriald::runtime::ActiveInstance::acquire(store.paths())
+                .context("claim the seriald data root")?;
             let loaded = store
                 .load_or_create()
                 .context("load seriald configuration")?;
-            seriald::serve(store, loaded, bind, managed).await
+            seriald::serve(store, loaded, bind, managed, instance).await
         }
         Command::Paths => {
             println!("config={}", store.paths().config_file.display());
             println!("data={}", store.paths().data_dir.display());
             println!("journal={}", store.paths().journal_dir.display());
+            Ok(())
+        }
+        Command::Discover { json } => {
+            if !store.paths().config_file.exists() {
+                return Ok(());
+            }
+            let config = store.load().context("load seriald configuration")?;
+            if let Some(active) = seriald::runtime::discover_active(store.paths(), config.server_id)
+                .context("discover the active seriald endpoint")?
+            {
+                if json {
+                    println!("{}", serde_json::to_string(&active)?);
+                } else {
+                    println!("{}", active.endpoint);
+                }
+            }
             Ok(())
         }
     }
@@ -86,6 +111,17 @@ mod tests {
         assert!(matches!(
             parsed.command,
             Some(Command::Serve { managed: true, .. })
+        ));
+    }
+
+    #[test]
+    fn discovery_is_scoped_by_the_global_portable_root() {
+        let parsed =
+            Cli::try_parse_from(["seriald", "--root", "portable", "discover", "--json"]).unwrap();
+        assert_eq!(parsed.root, Some(PathBuf::from("portable")));
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Discover { json: true })
         ));
     }
 }

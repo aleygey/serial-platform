@@ -7,12 +7,14 @@ pub mod journal;
 pub mod monitor;
 pub mod registry;
 pub mod ring;
+pub mod runtime;
 pub mod slot;
 
 use crate::api::AppState;
 use crate::config::{ConfigStore, LoadedConfig};
 use crate::journal::{JournalConfig, JournalManager};
 use crate::registry::SlotRegistry;
+use crate::runtime::{ActiveEndpoint, ActiveInstance};
 use anyhow::Context as _;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -23,9 +25,17 @@ pub async fn serve(
     loaded: LoadedConfig,
     bind_override: Option<SocketAddr>,
     managed: bool,
+    mut instance: ActiveInstance,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
     let bind = bind_override.unwrap_or(loaded.config.bind);
+    let server_id = loaded.config.server_id;
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind seriald to {bind}"))?;
+    let actual_bind = listener
+        .local_addr()
+        .context("read the bound seriald address")?;
     let mut journal_config = JournalConfig::new(loaded.paths.journal_dir.clone());
     journal_config.max_total_bytes = loaded.config.logging.max_total_bytes;
     journal_config.cleanup_low_watermark =
@@ -51,15 +61,22 @@ pub async fn serve(
         started,
     )
     .context("open durable Monitor state")?;
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind seriald to {bind}"))?;
-    tracing::info!(%bind, epoch = %loaded.daemon_epoch, "seriald listening");
+    let endpoint = ActiveEndpoint::new(
+        actual_bind,
+        server_id,
+        loaded.daemon_epoch,
+        std::process::id(),
+    );
+    instance
+        .publish(&endpoint)
+        .context("publish the active seriald endpoint")?;
+    tracing::info!(requested_bind = %bind, actual_bind = %actual_bind, endpoint = %endpoint.endpoint, epoch = %loaded.daemon_epoch, "seriald listening");
     let server = axum::serve(listener, api::router(state.clone()))
         .with_graceful_shutdown(shutdown_signal(managed));
     let result = server.await.context("seriald HTTP server failed");
     state.shutdown().await;
     journal.shutdown().await.context("close serial journal")?;
+    instance.clear_marker();
     tracing::info!("seriald shutdown complete");
     result
 }

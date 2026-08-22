@@ -16,6 +16,7 @@ export interface TransportProfile {
 
 export interface ModelProfile {
   name: string
+  model_names: string[]
   shell_prompt?: string | null
   uboot_prompt?: string | null
   write_eol?: string | null
@@ -28,6 +29,7 @@ export interface PortConfig {
   port: string
   transport_profile?: string | null
   model_profile?: string | null
+  model_name?: string | null
   enabled: boolean
 }
 
@@ -110,6 +112,7 @@ export interface SerialConfigurationDraft {
   enabled: boolean
   transportProfile: TransportProfile
   modelProfile?: string | null
+  modelName?: string | null
 }
 
 export interface DesktopBridge {

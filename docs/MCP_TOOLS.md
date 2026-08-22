@@ -28,6 +28,10 @@ http://127.0.0.1:3211/mcp
 
 MCP host 对该 URL 发送 JSON-RPC `POST`。notification 返回 HTTP 202；没有持久 HTTP session 或 SSE GET channel。
 
+统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 再保证本地 HTTP MCP `127.0.0.1:3211` 可用；Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
+
+App→`serial` 与 `serial`→App 都会复用同一后端。两者只停止自己启动的进程；外部 owner 退出时，仍在运行的客户端不会自动 failover，重新启动后才重新发现或创建后端。
+
 ### stdio MCP
 
 MCP host 也可以直接启动：
@@ -46,7 +50,7 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 |---|---|---|---|
 | `devices` | — | `port` | 读取端口、Profile、生效参数、连接、Control、Run、Trigger 和 cursor head |
 | `model_profiles` | — | `port` | 读取 Model Profile catalog 与端口绑定 |
-| `model_profile_set` | `port`, `profile` | — | 创建/更新一个完整 Model Profile 并绑定；`profile:null` 解绑 |
+| `model_profile_set` | `port`, `profile` | `model_name` | 创建/更新机型系列 Profile，并绑定具体机型名；`profile:null` 同时解绑 |
 | `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq` | 从实时 ring 或指定历史周期读取有界文本 |
 | `command` | `run_handle`, `command`, `description` | `expect`, `regex`, `timeout_seconds` | 追加有效 EOL、写入、捕获 RX 并保留任务说明 |
 | `command_sequence` | `run_handle`, `description`, `steps` | 每步 matcher/timeout | 一次完成 1–8 步已知依赖交互 |
@@ -55,7 +59,7 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 | `trigger` | `run_handle`, `action` | `kickoff`, start/stop matcher 与硬上限 | 在后端执行一次有界低延迟反应 |
 | `wait` | `run_handle` | `expect`, `regex`, `timeout_seconds` | 从 live cursor 等待 RX 边界 |
 | `search` | `port`, `query` | `regex`, `scope`, `run_id`, `epoch`, `after_seq` | 搜索当前 Run、当前 cursor 或归档 |
-| `monitor_start` | `port` + `contains`/`regex` 二选一 | `description`, `idempotency_key` | 创建持久 Monitor并立即返回 |
+| `monitor_start` | `port`, `matchers` | `description`, `idempotency_key` | 用一组 OR 条件创建持久 Monitor 并立即返回 |
 | `monitor_list` | — | `port` | 列出 Monitor |
 | `monitor_status` | `monitor_id` | — | 读取一个 Monitor 的权威状态 |
 | `monitor_incidents` | `monitor_id` | `after` | 读取 incident tail 或向前分页 |
@@ -66,7 +70,7 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 
 ## 标准工作流
 
-1. 调用 `devices`，明确选择 `port`，核对 `model_profile` 与实际设备。
+1. 调用 `devices`，明确选择 `port`，核对 `model_profile`、`model_name` 与实际设备。
 2. 调用 `run_start`，在本次 Agent 工作流中保存返回的 `run_handle`。`run_id` 只用于审计和查询。
 3. 普通 Shell/Bootloader 命令使用 `command`；已知的多轮依赖交互使用一次 `command_sequence`。
 4. 需要补充观察时使用 `wait`、`read`、`search` 或 Monitor。
@@ -99,7 +103,7 @@ Run 只界定证据，不复位设备，也不证明当前状态干净。Agent �
 3. 共享 `serialctl.toml`
 4. 默认 1800 秒
 
-已运行的 adapter 不热加载该值。
+没有使用命令行 override 时，运行中的 adapter 会监视共享 `serialctl.toml` 并热加载该值。TUI 的 “serial MCP 设置” 保存后会自动生效，不需要人工重启 MCP；命令行 override 会固定当前进程的值。
 
 ## `devices`
 
@@ -115,7 +119,7 @@ Input：
 {"port":"COM4"}
 ```
 
-结果包含 `daemon_epoch`、`config_revision`、`ports` 和设备选择提示。每个端口项包含配置、session state、generation、head/ring cursor、有效 Transport/Model 参数、Control、active Run、active Trigger、logging 和 RX overflow。
+结果包含 `daemon_epoch`、`config_revision`、`ports` 和设备选择提示。每个端口项包含 `model_profile`、具体 `model_name`、session state、generation、head/ring cursor、有效 Transport/Model 参数、Control、active Run、active Trigger、logging 和 RX overflow。
 
 指定未知 `port` 会失败；工具不会静默选择另一个端口。
 
@@ -130,9 +134,18 @@ Input：
 ```json
 {
   "config_revision": 12,
-  "profiles": [],
+  "profiles": [
+    {
+      "name": "TL-AS7230",
+      "model_names": ["TL-AS7230-W 1.0", "TL-AS7230-F4GE 1.0"]
+    }
+  ],
   "bindings": [
-    {"port":"COM4","model_profile":"TL-AS7230 1.0"}
+    {
+      "port":"COM4",
+      "model_profile":"TL-AS7230",
+      "model_name":"TL-AS7230-W 1.0"
+    }
   ],
   "port_filter": "COM4"
 }
@@ -140,31 +153,43 @@ Input：
 
 ## `model_profile_set`
 
-创建或替换一个完整 Profile 并绑定端口：
+创建或替换一个完整机型系列 Profile，并把系列和具体机型名绑定到端口：
 
 ```json
 {
   "port": "COM4",
   "profile": {
-    "name": "TL-AS7230 1.0",
+    "name": "TL-AS7230",
+    "model_names": [
+      "TL-AS7230-W 1.0",
+      "TL-AS7230-F4GE 1.0"
+    ],
     "shell_prompt": "root@router:~# ",
     "uboot_prompt": "=> ",
     "write_eol": "\r",
     "echo": "auto",
     "write_chunk_size": 1,
     "write_chunk_delay_ms": 1
-  }
+  },
+  "model_name": "TL-AS7230-W 1.0"
 }
 ```
 
 Profile 字段：
 
-- `name`：必填，不含首尾空白，1–64 UTF-8 bytes；
+- `name`：机型系列/Profile 名称，必填，不含首尾空白，1–64 UTF-8 bytes；
+- `model_names`：该系列的具体机型名，最多 128 项，每项最多 128 UTF-8 bytes，不能重复；
 - `shell_prompt` / `uboot_prompt`：string 或 null，非空时最大 4096 UTF-8 bytes 且不能包含 NUL；
 - `write_eol`：`""`、`"\r"`、`"\n"`、`"\r\n"` 或 null；
 - `echo`：`on` / `off` / `auto` / null；
 - `write_chunk_size`：正整数或 null；
 - `write_chunk_delay_ms`：0–10000 或 null。
+
+`model_name` 省略、传字符串和传 `null` 的含义不同：
+
+- 字符串必须存在于本次 `profile.model_names`，并成为当前端口的具体机型名；
+- `null` 清除具体机型名，但保留机型 Profile；
+- 省略时，若端口仍绑定同名 Profile 且原具体机型名仍在新列表中，则保留原值；其他情况清除。
 
 解绑：
 
@@ -172,7 +197,7 @@ Profile 字段：
 {"port":"COM4","profile":null}
 ```
 
-结果返回 `previous_model_profile`、当前 `model_profile` 与新 `config_revision`。Profile 名称按输入原样保存。
+结果返回 `previous_model_profile`、`previous_model_name`、当前 `model_profile`、`model_name` 与新 `config_revision`。名称按输入原样保存。
 
 ## `read`
 
@@ -288,7 +313,7 @@ effective `echo=on` 时，adapter 识别并移除设备自身的 command+EOL ech
 
 adapter 在写第一步前验证完整计划，并为整个 sequence 持有该端口的 mutation lock。只有当前步骤到达 matcher 才发送下一步；timeout、disconnect、gap、Run/Control 丢失或上下文变化都会停止所有剩余写入。工具不分支、不循环、不重试。
 
-每个已确认步骤保留独立 TX、description 和 matcher，整体由 `sequence_id` 与 sequence description 分组。结果包含 `requested_steps`、`completed_steps`、逐步结果、最终 cursor 和 Run 状态。
+每个已确认步骤保留独立 TX、description 和 matcher，整体由 `sequence_id` 与 sequence description 分组。结果包含 `requested_steps`、`completed_steps`、逐步结果、最终 cursor 和 Run 状态。TUI 先把这次 `command_sequence` 显示为一个 action；展开后可逐步选择、跳转并高亮每一步自己的 RX 捕获范围。
 
 ## `input`
 
@@ -374,12 +399,15 @@ scope：
 ```json
 {
   "port": "COM4",
-  "regex": "(?i)kernel panic|watchdog",
+  "matchers": [
+    {"kind":"contains","value":"watchdog"},
+    {"kind":"regex","value":"(?i)kernel panic|oops"}
+  ],
   "description": "观察间歇性设备崩溃"
 }
 ```
 
-`contains` 和 `regex` 二选一，最大 4096。可传 UUID `idempotency_key` 复用创建意图。调用立即返回；Monitor 在 `seriald` 中继续运行。
+`matchers` 包含 1–16 个条件，每项为 `contains` 或 bounded `regex`，按 OR 计算。每项最多 4096 UTF-8 bytes，全部条件合计最多 16384 bytes。可传 UUID `idempotency_key` 复用创建意图。调用立即返回；Monitor 在 `seriald` 中继续运行。
 
 ### `monitor_list` / `monitor_status`
 
@@ -389,7 +417,7 @@ scope：
 {"monitor_id":"uuid"}
 ```
 
-状态包含 matcher、cursor、incident/gap count 和 last error。
+状态包含 `matchers`、cursor、incident/gap count 和 last error。
 
 ### `monitor_incidents`
 
@@ -397,9 +425,13 @@ scope：
 {"monitor_id":"uuid"}
 ```
 
-省略 `after` 返回 recent tail；`after:"0"` 从最早保留 incident 开始；继续时原样传回十进制字符串 `next_after`。每个 incident 包含 preview、port、epoch、seq range、evidence cursor/ref 和 acknowledge 信息。
+省略 `after` 返回 recent tail；`after:"0"` 从最早保留 incident 开始；继续时原样传回十进制字符串 `next_after`。每个 incident 包含：
 
-若需要完整证据，调用 `read(scope=archive)`，传 incident 的 epoch/after seq，并用 `through_seq=seq_end` 锁定包含式上界。
+- `matches`：本次 incident 命中的去重条件，每项带原 `matchers` 下标和条件内容；
+- `serial_range`：`epoch`、`seq_start`、`seq_end` 组成的精确串口范围；
+- preview、evidence cursor/ref、时间和 acknowledge 状态。
+
+若需要完整证据，调用 `read(scope=archive)`：使用 `serial_range.epoch`，令 `after_seq=seq_start-1`，并用 `through_seq=seq_end` 锁定包含式上界。确认 `gap=false`、`truncated=false` 且返回 cursor 已到达 `seq_end`；若页面有界截断，则从返回 cursor 继续读取同一上界。TUI 在 incident 属于旧后端周期或本地窗口已淘汰时会自动从 journal 回取，并在完整连续区间校验失败时只提示缺口，不显示局部证据。
 
 ### `monitor_stop`
 
@@ -435,7 +467,7 @@ scope：
 
 ## Recent context 与 physical action guard
 
-adapter 记住每端口上次成功操作的 cursor。两个操作之间出现其他 actor 的 TX、用户 Takeover、Control/Run 中止、端口重配或机型切换时，相关工具结果才附加：
+adapter 记住每端口上次成功操作的 cursor。两个操作之间出现其他 actor 的 TX、用户 Takeover、Control/Run 中止、机型 Profile 或具体机型名变化时，相关工具结果才附加：
 
 ```json
 {
@@ -444,7 +476,20 @@ adapter 记住每端口上次成功操作的 cursor。两个操作之间出现�
     "complete": true,
     "after_seq": 800,
     "through_seq": 812,
-    "events": []
+    "events": [
+      {
+        "seq": 808,
+        "kind": "port_reconfigured",
+        "actor": {"kind": "system", "label": "seriald"},
+        "port": "COM4",
+        "source": "human:serialctl",
+        "previous_model_profile": "TL-AS7230",
+        "new_model_profile": "TL-AS7230",
+        "previous_model_name": "TL-AS7230-W 1.0",
+        "new_model_name": "TL-AS7230-F4GE 1.0"
+      }
+    ],
+    "truncated": false
   }
 }
 ```
@@ -464,7 +509,7 @@ adapter 记住每端口上次成功操作的 cursor。两个操作之间出现�
 }
 ```
 
-Agent 应先读取并确认新状态，再决定是否重试。
+这也是人工在 Agent 占用串口时使用 `Alt+Enter` cooperative write 后的语义：下一次 Agent 物理写不会暗中继续执行，而是以 MCP tool error 返回上述结构，且 `no_bytes_written=true`。Agent 应先调用 `read(scope=tail)` 或 `wait` 阅读并确认新状态；该观察调用是确认边界，之后再决定是否重试。没有第三方变化时省略 `recent_context`。
 
 ## 结果、截断与取消
 

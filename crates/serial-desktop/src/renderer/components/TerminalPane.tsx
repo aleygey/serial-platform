@@ -40,7 +40,7 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  const modelName = configuredPort?.config.model_profile || '未配置机型'
+  const modelName = configuredPort?.config.model_name || configuredPort?.config.model_profile || '未配置机型'
   return (
     <section className="terminal-pane">
       <header className="terminal-header">

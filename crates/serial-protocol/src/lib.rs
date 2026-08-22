@@ -11,9 +11,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-/// WebSocket wire generation for the port-addressed control, timeline, and
-/// configuration contract.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Shared protocol generation for HTTP DTOs, WebSocket control/timeline
+/// frames, and cross-component compatibility checks.
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -382,13 +382,25 @@ pub struct SlotConfig {
     /// and input behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile: Option<String>,
+    /// Optional concrete product name within the bound model profile. The
+    /// profile owns reusable interaction behavior; this field identifies the
+    /// exact device attached to this port for humans and Agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
     pub enabled: bool,
 }
 
-/// A reusable model identity and its serial interaction behavior.
+/// Maximum concrete product names in one model-family profile.
+pub const MAX_MODEL_NAMES_PER_PROFILE: usize = 128;
+
+/// Reusable interaction behavior for one model family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub name: String,
+    /// Concrete product names belonging to this family, displayed as the
+    /// second level of the model selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1029,16 +1041,30 @@ pub struct HealthResponse {
     pub server_id: Uuid,
     pub daemon_epoch: Uuid,
     pub uptime_ms: u64,
-    /// WebSocket wire generation served by this daemon.
+    /// Shared component protocol generation served by this daemon.
     #[serde(default)]
     pub protocol_version: u16,
+}
+
+/// Local identity exposed by the HTTP MCP adapter so the unified launcher can
+/// distinguish the matching adapter from an unrelated listener on its fixed
+/// loopback port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpHealthResponse {
+    pub status: String,
+    pub service: String,
+    pub protocol_version: u16,
+    pub pid: u32,
+    pub seriald_endpoint: String,
+    pub seriald_server_id: Uuid,
+    pub seriald_daemon_epoch: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub server_id: Uuid,
     pub daemon_epoch: Uuid,
-    /// WebSocket wire generation served by this daemon.
+    /// Shared component protocol generation served by this daemon.
     #[serde(default)]
     pub protocol_version: u16,
     #[serde(default)]
@@ -1166,19 +1192,34 @@ pub struct EventQuery {
     pub limit_bytes: Option<usize>,
 }
 
-/// A long-lived, daemon-owned matcher over one port's live RX stream.
-///
-/// `contains` and `regex` are mutually exclusive. They are strings rather
-/// than model-profile fields because monitors describe one observation job,
-/// not the DUT's shell protocol. Matching uses the byte representation of the
-/// UTF-8 strings and spans contiguous RX timeline events.
+/// Maximum number of OR-ed conditions in one Monitor Job.
+pub const MAX_MONITOR_MATCHERS: usize = 16;
+/// Maximum UTF-8 bytes in one Monitor condition.
+pub const MAX_MONITOR_PATTERN_BYTES: usize = 4_096;
+/// Maximum UTF-8 bytes across all conditions in one Monitor Job.
+pub const MAX_MONITOR_TOTAL_PATTERN_BYTES: usize = 16_384;
+
+/// One condition in a long-lived Monitor Job. Conditions are evaluated over
+/// contiguous live RX bytes and all conditions in a Job have OR semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum MonitorMatcher {
+    Contains(String),
+    Regex(String),
+}
+
+/// Identifies the configured condition that contributed to one Incident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorMatch {
+    pub index: usize,
+    pub matcher: MonitorMatcher,
+}
+
+/// A long-lived, daemon-owned OR matcher over one port's live RX stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorSpec {
     pub port: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contains: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub regex: Option<String>,
+    pub matchers: Vec<MonitorMatcher>,
     /// First event considered is strictly after this cursor. When omitted,
     /// seriald resolves it to the port head at creation/update time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1292,6 +1333,9 @@ pub struct MonitorIncident {
     pub severity: MonitorSeverity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Distinct configured conditions observed while this Incident was
+    /// grouped. Their indexes refer to `MonitorSpec.matchers`.
+    pub matches: Vec<MonitorMatch>,
     pub preview: String,
     pub evidence_cursor: Cursor,
     pub evidence_ref: String,
@@ -1727,6 +1771,7 @@ mod tests {
     fn model_profile() -> ModelProfile {
         ModelProfile {
             name: "sigmastar-evb".into(),
+            model_names: vec!["SigmaStar EVB 1.0".into()],
             shell_prompt: Some("root@sigmastar:/# ".into()),
             uboot_prompt: Some("SigmaStar =>".into()),
             write_eol: Some("\n".into()),
@@ -1774,6 +1819,7 @@ mod tests {
         // than inheriting a stale prompt from the previously attached model.
         let promptless = ModelProfile {
             name: "promptless".into(),
+            model_names: Vec::new(),
             shell_prompt: None,
             uboot_prompt: None,
             write_eol: None,
@@ -1853,12 +1899,14 @@ mod tests {
         let value = serde_json::json!({
             "port": "COM3",
             "transport_profile": "generic-115200",
-            "model_profile": "TL-AS7230 1.0",
+            "model_profile": "TL-AS7230",
+            "model_name": "TL-AS7230-W 1.0",
             "enabled": true,
         });
         let slot: SlotConfig = serde_json::from_value(value).unwrap();
         assert_eq!(slot.port, "COM3");
-        assert_eq!(slot.model_profile.as_deref(), Some("TL-AS7230 1.0"));
+        assert_eq!(slot.model_profile.as_deref(), Some("TL-AS7230"));
+        assert_eq!(slot.model_name.as_deref(), Some("TL-AS7230-W 1.0"));
     }
 
     #[test]
@@ -1868,6 +1916,7 @@ mod tests {
                 port: "COM3".into(),
                 transport_profile: Some("generic-115200".into()),
                 model_profile: None,
+                model_name: None,
                 enabled: true,
             },
             daemon_epoch: Uuid::new_v4(),
@@ -2147,8 +2196,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v4_exposes_port_and_model_profile_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_v5_exposes_multi_match_monitor_and_model_name_contracts() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]

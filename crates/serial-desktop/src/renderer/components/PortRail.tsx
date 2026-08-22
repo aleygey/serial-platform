@@ -44,7 +44,7 @@ export function PortRail({ configuredPorts, availablePorts, selectedPort, onSele
               </span>
               <span className="port-copy">
                 <strong>{port}</strong>
-                <small>{configured?.config.model_profile || descriptor?.product || '未配置机型'}</small>
+                <small>{configured?.config.model_name || configured?.config.model_profile || descriptor?.product || '未配置机型'}</small>
               </span>
               <span className={`status-dot ${open ? 'is-open' : available ? 'is-idle' : 'is-offline'}`} />
               {configured && (

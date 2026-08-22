@@ -94,6 +94,7 @@ function SerialEditor({
   const updateProfile = <K extends keyof TransportProfile>(key: K, next: TransportProfile[K]): void => {
     setValue((current) => ({ ...current, transportProfile: { ...current.transportProfile, [key]: next } }))
   }
+  const selectedModelProfile = modelProfiles.find((profile) => profile.name === value.modelProfile)
 
   return (
     <div className="editor-shell">
@@ -112,7 +113,7 @@ function SerialEditor({
             return (
               <button className={selectedPort === port ? 'is-active' : ''} key={port} onClick={() => setSelectedPort(port)} type="button">
                 <span className={`status-dot ${configured?.session_state === 'online' ? 'is-open' : 'is-idle'}`} />
-                <span><strong>{port}</strong><small>{descriptor?.product || configured?.config.model_profile || '可用串口'}</small></span>
+                <span><strong>{port}</strong><small>{configured?.config.model_name || descriptor?.product || configured?.config.model_profile || '可用串口'}</small></span>
               </button>
             )
           })}
@@ -120,16 +121,26 @@ function SerialEditor({
         </div>
         <div className="form-card">
           <div className="form-section-title"><span>01</span><div><strong>端口绑定</strong><small>物理端口就是唯一设备位</small></div></div>
-          <div className="field-grid two">
+          <div className="field-grid three">
             <Field label="串口">
               <select value={value.port} onChange={(event) => { setSelectedPort(event.target.value); setValue((current) => ({ ...current, port: event.target.value })) }}>
                 {allPorts.map((port) => <option key={port}>{port}</option>)}
               </select>
             </Field>
             <Field label="机型 Profile">
-              <select value={value.modelProfile ?? ''} onChange={(event) => setValue((current) => ({ ...current, modelProfile: event.target.value || null }))}>
+              <select value={value.modelProfile ?? ''} onChange={(event) => setValue((current) => selectModelProfile(current, event.target.value || null, modelProfiles))}>
                 <option value="">未关联机型</option>
-                {modelProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}
+                {modelProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.name}</option>)}
+              </select>
+            </Field>
+            <Field label="具体型号">
+              <select
+                disabled={!selectedModelProfile || selectedModelProfile.model_names.length === 0}
+                value={value.modelName ?? ''}
+                onChange={(event) => setValue((current) => ({ ...current, modelName: event.target.value || null }))}
+              >
+                <option value="">{selectedModelProfile && selectedModelProfile.model_names.length === 0 ? '该 Profile 暂无具体型号' : '暂不指定具体型号'}</option>
+                {selectedModelProfile?.model_names.map((name) => <option key={name} value={name}>{name}</option>)}
               </select>
             </Field>
           </div>
@@ -187,6 +198,8 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
     ? configuredPorts.filter((item) => item.config.model_profile === profile.name).map((item) => item.config.port)
     : []
   const policy = resolveModelProfilePolicy(draft?.persisted ?? false, affectedPorts)
+  const catalog = items.map((item) => item.profile)
+  const validationIssue = validateModelProfileCatalog(catalog, configuredPorts)
   const update = <K extends keyof ModelProfile>(key: K, value: ModelProfile[K]): void => {
     setItems((current) => current.map((item, index) => index === selected
       ? { ...item, profile: { ...item.profile, [key]: value } }
@@ -196,12 +209,12 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
   return (
     <div className="editor-shell">
       <div className="editor-heading">
-        <div><span className="eyebrow">DEVICE BEHAVIOR</span><h1>机型 Profile</h1><p>机型名、命令提示符和写入节奏只配置一次，可关联多个串口。</p></div>
-        <button className="primary-button" type="button" disabled={!items.length || items.some((item) => !item.profile.name.trim())} onClick={() => onSave(items.map((item) => item.profile))}><Save size={16} /> 保存机型配置</button>
+        <div><span className="eyebrow">DEVICE BEHAVIOR</span><h1>机型 Profile</h1><p>Profile 复用交互行为，具体型号用于标记每个串口实际连接的设备。</p></div>
+        <button className="primary-button" title={validationIssue} type="button" disabled={!items.length || Boolean(validationIssue)} onClick={() => onSave(catalog)}><Save size={16} /> 保存机型配置</button>
       </div>
       <div className="serial-editor-grid">
         <div className="device-picker profile-picker">
-          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.profile.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.profile.name || '未命名机型'}</strong><small>{item.profile.shell_prompt || '未配置 Shell 提示符'}</small></span></button>)}
+          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.profile.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.profile.name || '未命名 Profile'}</strong><small>{item.profile.model_names.length ? `${item.profile.model_names.length} 个具体型号` : '未配置具体型号'}</small></span></button>)}
           <button className="add-profile" type="button" onClick={() => {
             const index = items.length
             const id = nextDraftId.current++
@@ -220,13 +233,46 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
               title={policy.deleteDisabled ? '请先在串口配置中改绑或解绑' : '删除 Profile'}
               onClick={() => { setItems((current) => current.filter((_, index) => index !== selected)); setSelected((current) => Math.max(0, current - 1)) }}
             ><Trash2 size={16} /></button></div>
-            <Field label="机型名称"><input readOnly={policy.nameReadOnly} title={policy.nameReadOnly ? '已有 Profile 名称是稳定标识' : undefined} value={profile.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230 1.0" /></Field>
+            <Field label="Profile 名称"><input readOnly={policy.nameReadOnly} title={policy.nameReadOnly ? '已有 Profile 名称是稳定标识' : undefined} value={profile.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230 Family" /></Field>
             {policy.nameReadOnly && <div className="field-note">已有 Profile 名称是稳定标识；如需使用新名称，请新建 Profile。</div>}
             {affectedPorts.length > 0 && (
               <div className="impact-notice">
                 已关联端口：<strong>{affectedPorts.join('、')}</strong>。如需删除，请先在“串口配置”改绑或解绑。
               </div>
             )}
+            <div className="model-name-editor">
+              <div className="model-name-heading">
+                <div><strong>具体型号</strong><small>保留原始空格和大小写；串口将在这里选择实际设备型号</small></div>
+                <button type="button" onClick={() => update('model_names', [...profile.model_names, nextConcreteModelName(profile.model_names)])}><Plus size={14} /> 添加型号</button>
+              </div>
+              {profile.model_names.map((name, index) => {
+                const boundPorts = configuredPorts
+                  .filter((item) => item.config.model_profile === profile.name && item.config.model_name === name)
+                  .map((item) => item.config.port)
+                const bound = boundPorts.length > 0
+                return (
+                  <div className="model-name-row" key={index}>
+                    <input
+                      aria-label={`具体型号 ${index + 1}`}
+                      readOnly={bound}
+                      title={bound ? `已绑定端口 ${boundPorts.join('、')}，请先改绑` : undefined}
+                      value={name}
+                      onChange={(event) => update('model_names', profile.model_names.map((value, itemIndex) => itemIndex === index ? event.target.value : value))}
+                    />
+                    {bound && <span title={boundPorts.join('、')}>已绑定 {boundPorts.join('、')}</span>}
+                    <button
+                      aria-label={`删除具体型号 ${name}`}
+                      disabled={bound}
+                      title={bound ? '请先在串口配置中改绑或清除具体型号' : '删除具体型号'}
+                      type="button"
+                      onClick={() => update('model_names', profile.model_names.filter((_, itemIndex) => itemIndex !== index))}
+                    ><Trash2 size={14} /></button>
+                  </div>
+                )
+              })}
+              {profile.model_names.length === 0 && <div className="empty-model-names">暂未配置具体型号；Profile 仍可保存并复用交互行为。</div>}
+            </div>
+            {validationIssue && <div className="validation-notice" role="alert">{validationIssue}</div>}
             <div className="form-divider" />
             <div className="form-section-title"><span>02</span><div><strong>命令提示符</strong><small>用于识别命令输出的完整边界</small></div></div>
             <div className="field-grid two">
@@ -281,7 +327,13 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 function serialDraft(port: string, configuredPorts: PortSnapshot[], profiles: TransportProfile[]): SerialConfigurationDraft {
   const configured = configuredPorts.find((item) => item.config.port === port)
   const profile = profiles.find((item) => item.name === configured?.config.transport_profile) ?? profiles[0] ?? defaultTransport()
-  return { port, enabled: configured?.config.enabled ?? true, modelProfile: configured?.config.model_profile, transportProfile: { ...profile } }
+  return {
+    port,
+    enabled: configured?.config.enabled ?? true,
+    modelProfile: configured?.config.model_profile,
+    modelName: configured?.config.model_name,
+    transportProfile: { ...profile }
+  }
 }
 
 function defaultTransport(): TransportProfile {
@@ -291,7 +343,7 @@ function defaultTransport(): TransportProfile {
 function persistedModelDrafts(profiles: ModelProfile[]): ModelDraft[] {
   return profiles.map((profile) => ({
     key: `persisted:${profile.name}`,
-    profile: { ...profile },
+    profile: { ...profile, model_names: [...profile.model_names] },
     persisted: true
   }))
 }
@@ -304,7 +356,52 @@ function nextModelName(items: ModelDraft[]): string {
 }
 
 function defaultModel(name: string): ModelProfile {
-  return { name, shell_prompt: null, uboot_prompt: '=> ', write_eol: '\r', echo: 'auto', write_chunk_size: 1, write_chunk_delay_ms: 0 }
+  return { name, model_names: [], shell_prompt: null, uboot_prompt: '=> ', write_eol: '\r', echo: 'auto', write_chunk_size: 1, write_chunk_delay_ms: 0 }
+}
+
+export function selectModelProfile(
+  draft: SerialConfigurationDraft,
+  modelProfile: string | null,
+  profiles: ModelProfile[]
+): SerialConfigurationDraft {
+  if (!modelProfile) return { ...draft, modelProfile: null, modelName: null }
+  const selected = profiles.find((profile) => profile.name === modelProfile)
+  const modelName = draft.modelName && selected?.model_names.includes(draft.modelName) ? draft.modelName : null
+  return { ...draft, modelProfile, modelName }
+}
+
+export function validateModelProfileCatalog(profiles: ModelProfile[], configuredPorts: PortSnapshot[]): string | undefined {
+  const profileNames = new Set<string>()
+  for (const profile of profiles) {
+    if (!profile.name.trim()) return 'Profile 名称不能为空。'
+    if (profile.name !== profile.name.trim()) return `Profile “${profile.name}” 名称首尾不能有空格。`
+    if (profileNames.has(profile.name)) return `Profile 名称“${profile.name}”重复。`
+    profileNames.add(profile.name)
+    const modelNames = new Set<string>()
+    for (const name of profile.model_names) {
+      if (!name.trim()) return `Profile “${profile.name}”包含空的具体型号。`
+      if (name !== name.trim()) return `具体型号“${name}”首尾不能有空格。`
+      if (modelNames.has(name)) return `Profile “${profile.name}”中的具体型号“${name}”重复。`
+      modelNames.add(name)
+    }
+  }
+  for (const item of configuredPorts) {
+    const profileName = item.config.model_profile
+    const modelName = item.config.model_name
+    if (!profileName || !modelName) continue
+    const profile = profiles.find((candidate) => candidate.name === profileName)
+    if (!profile?.model_names.includes(modelName)) {
+      return `端口 ${item.config.port} 正在使用具体型号“${modelName}”；请先在“串口配置”改绑，再删除该型号。`
+    }
+  }
+  return undefined
+}
+
+function nextConcreteModelName(names: string[]): string {
+  const existing = new Set(names)
+  let suffix = 1
+  while (existing.has(`新型号 ${suffix}`)) suffix += 1
+  return `新型号 ${suffix}`
 }
 
 function optionLabel(value: string): string {

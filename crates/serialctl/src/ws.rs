@@ -30,6 +30,11 @@ pub enum NetworkCommand {
     Reconnect {
         reason: String,
     },
+    /// Replace the attached Port set and reconnect so the first frame on the
+    /// new socket is a coherent Hello + Attach for that exact configuration.
+    Reconfigure {
+        ports: Vec<String>,
+    },
     Shutdown,
 }
 
@@ -79,7 +84,7 @@ pub fn spawn(
 
 async fn run_worker(
     endpoint: String,
-    ports: Vec<String>,
+    mut ports: Vec<String>,
     initial_cursors: HashMap<String, Cursor>,
     mut commands: mpsc::Receiver<NetworkCommand>,
     events: mpsc::Sender<NetworkEvent>,
@@ -99,6 +104,12 @@ async fn run_worker(
                 match command {
                     Some(NetworkCommand::Shutdown) | None => break 'reconnect,
                     Some(NetworkCommand::Reconnect { .. }) => continue 'reconnect,
+                    Some(NetworkCommand::Reconfigure { ports: replacement }) => {
+                        ports = replacement;
+                        cursors.retain(|port, _| ports.contains(port));
+                        slot_epochs.retain(|port, _| ports.contains(port));
+                        continue 'reconnect;
+                    }
                     Some(NetworkCommand::Send { .. }) => {
                         let _ = events.send(NetworkEvent::SendRejected {
                             reason: "not connected; input was not queued".into(),
@@ -125,6 +136,12 @@ async fn run_worker(
                         command = commands.recv() => match command {
                             Some(NetworkCommand::Shutdown) | None => break 'reconnect,
                             Some(NetworkCommand::Reconnect { .. }) => break,
+                            Some(NetworkCommand::Reconfigure { ports: replacement }) => {
+                                ports = replacement;
+                                cursors.retain(|port, _| ports.contains(port));
+                                slot_epochs.retain(|port, _| ports.contains(port));
+                                break;
+                            }
                             Some(NetworkCommand::Send { .. }) => {
                                 let _ = events.send(NetworkEvent::SendRejected {
                                     reason: "not connected; input was not queued".into(),
@@ -237,6 +254,13 @@ async fn run_worker(
                             let _ = socket.close(None).await;
                             break reason;
                         }
+                        Some(NetworkCommand::Reconfigure { ports: replacement }) => {
+                            ports = replacement;
+                            cursors.retain(|port, _| ports.contains(port));
+                            slot_epochs.retain(|port, _| ports.contains(port));
+                            let _ = socket.close(None).await;
+                            break "configured Port set changed".into();
+                        }
                         Some(NetworkCommand::Send { generation: expected, message }) => {
                             if expected != generation {
                                 let _ = events.send(NetworkEvent::SendRejected {
@@ -261,6 +285,11 @@ async fn run_worker(
             match command {
                 NetworkCommand::Shutdown => return,
                 NetworkCommand::Reconnect { .. } => {}
+                NetworkCommand::Reconfigure { ports: replacement } => {
+                    ports = replacement;
+                    cursors.retain(|port, _| ports.contains(port));
+                    slot_epochs.retain(|port, _| ports.contains(port));
+                }
                 NetworkCommand::Send { .. } => {
                     let _ = events
                         .send(NetworkEvent::SendRejected {

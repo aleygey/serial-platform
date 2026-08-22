@@ -12,15 +12,17 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, header::ORIGIN},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
     DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
-    MAX_COMMAND_DESCRIPTION_BYTES, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_COMMAND_DESCRIPTION_BYTES, MAX_MODEL_NAMES_PER_PROFILE, MAX_MONITOR_MATCHERS,
+    MAX_MONITOR_PATTERN_BYTES, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
     MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
     MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
+    McpHealthResponse,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -181,9 +183,15 @@ struct HttpState {
     tools: AgentTools,
     active_requests: ActiveRequests,
     listen: SocketAddr,
+    health: McpHealthResponse,
 }
 
-pub async fn serve_http(tools: AgentTools, listen: SocketAddr, managed: bool) -> Result<()> {
+pub async fn serve_http(
+    tools: AgentTools,
+    listen: SocketAddr,
+    managed: bool,
+    health: McpHealthResponse,
+) -> Result<()> {
     if listen.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         anyhow::bail!("Streamable HTTP MCP must listen on 127.0.0.1");
     }
@@ -192,16 +200,22 @@ pub async fn serve_http(tools: AgentTools, listen: SocketAddr, managed: bool) ->
         tools,
         active_requests: Arc::new(Mutex::new(HashMap::new())),
         listen,
+        health,
     };
     axum::serve(
         listener,
         Router::new()
+            .route("/health", get(http_health))
             .route("/mcp", post(http_post))
             .with_state(state),
     )
     .with_graceful_shutdown(http_shutdown_signal(managed))
     .await?;
     Ok(())
+}
+
+async fn http_health(State(state): State<HttpState>) -> Json<McpHealthResponse> {
+    Json(state.health)
 }
 
 async fn http_shutdown_signal(managed: bool) {
@@ -430,9 +444,8 @@ async fn dispatch_request(tools: &AgentTools, request: RpcRequest, id: Value) ->
 }
 
 fn tool_result(value: Value, is_error: bool) -> Value {
-    // Keep the compatibility text for hosts that do not read
-    // structuredContent, but avoid charging the Agent for pretty-print
-    // whitespace on a duplicated representation.
+    // Mirror the compact result in `content` for MCP hosts while keeping the
+    // typed value in `structuredContent`.
     let text = if is_error {
         value
             .pointer("/error/message")
@@ -525,13 +538,14 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "model_profile_set",
-            "Create or update one model profile and bind it to a port; pass null to detach the port.",
+            "Create or update one model-family profile and bind it, plus an optional concrete model name, to a port; pass profile=null to detach both.",
             object(
                 json!({
                     "port":{"type":"string","minLength":1},
                     "profile":{"description":"Complete model profile, or null to detach.","anyOf":[
                         {"type":"object","additionalProperties":false,"required":["name"],"properties":{
                             "name":{"type":"string","minLength":1,"maxLength":64},
+                            "model_names":{"type":"array","maxItems":MAX_MODEL_NAMES_PER_PROFILE,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}},
                             "shell_prompt":{"type":["string","null"],"minLength":1,"maxLength":4096},
                             "uboot_prompt":{"type":["string","null"],"minLength":1,"maxLength":4096},
                             "write_eol":{"type":["string","null"]},
@@ -540,7 +554,8 @@ pub fn tool_definitions() -> Vec<Value> {
                             "write_chunk_delay_ms":{"type":["integer","null"],"minimum":0,"maximum":10000}
                         }},
                         {"type":"null"}
-                    ]}
+                    ]},
+                    "model_name":{"description":"A name from profile.model_names; null clears it. When omitted for the same profile, a still-valid existing binding is retained; otherwise it is cleared.","anyOf":[{"type":"string","minLength":1,"maxLength":128},{"type":"null"}]}
                 }),
                 &["port", "profile"],
             ),
@@ -683,24 +698,43 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "monitor_start",
-            "Start a persistent Monitor with one literal or regex matcher.",
-            {
-                let mut schema = object(
-                    json!({
+            "Start one persistent Monitor whose bounded conditions have OR semantics.",
+            object(
+                json!({
                     "port":{"type":"string"},
-                    "contains":{"type":"string","minLength":1,"maxLength":4096},
-                    "regex":{"type":"string","minLength":1,"maxLength":4096},
+                    "matchers":{
+                        "type":"array",
+                        "minItems":1,
+                        "maxItems":MAX_MONITOR_MATCHERS,
+                        "description":"OR conditions. Each Incident reports which configured conditions matched.",
+                        "items":{
+                            "oneOf":[
+                                {
+                                    "type":"object",
+                                    "additionalProperties":false,
+                                    "properties":{
+                                        "kind":{"const":"contains"},
+                                        "value":{"type":"string","minLength":1,"maxLength":MAX_MONITOR_PATTERN_BYTES}
+                                    },
+                                    "required":["kind","value"]
+                                },
+                                {
+                                    "type":"object",
+                                    "additionalProperties":false,
+                                    "properties":{
+                                        "kind":{"const":"regex"},
+                                        "value":{"type":"string","minLength":1,"maxLength":MAX_MONITOR_PATTERN_BYTES}
+                                    },
+                                    "required":["kind","value"]
+                                }
+                            ]
+                        }
+                    },
                     "description":{"type":"string","minLength":1,"maxLength":1024},
                     "idempotency_key":{"type":"string","format":"uuid","description":"Reuse on retry."}
-                    }),
-                    &["port"],
-                );
-                schema["oneOf"] = json!([
-                    {"required":["contains"]},
-                    {"required":["regex"]}
-                ]);
-                schema
-            },
+                }),
+                &["port", "matchers"],
+            ),
             false,
         ),
         tool(
@@ -830,6 +864,7 @@ mod tests {
                 endpoint,
                 "test-agent".into(),
                 Some(std::time::Duration::from_secs(1_800)),
+                None,
             ),
             "test-agent".into(),
             crate::config::CaptureLimits::default(),
@@ -838,14 +873,37 @@ mod tests {
             tools,
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             listen: "127.0.0.1:3211".parse().unwrap(),
+            health: McpHealthResponse {
+                status: "ok".into(),
+                service: "serial-mcp".into(),
+                protocol_version: serial_protocol::PROTOCOL_VERSION,
+                pid: 42,
+                seriald_endpoint: "http://127.0.0.1:1".into(),
+                seriald_server_id: uuid::Uuid::nil(),
+                seriald_daemon_epoch: uuid::Uuid::nil(),
+            },
         };
         Router::new()
+            .route("/health", get(http_health))
             .route("/mcp", post(http_post))
             .with_state(state)
     }
 
     #[tokio::test]
     async fn streamable_http_request_notification_and_get_contract() {
+        let health = test_http_app()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let payload: McpHealthResponse =
+            serde_json::from_slice(&to_bytes(health.into_body(), 16 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(payload.service, "serial-mcp");
+        assert_eq!(payload.protocol_version, serial_protocol::PROTOCOL_VERSION);
+        assert_eq!(payload.pid, 42);
+        assert_eq!(payload.seriald_endpoint, "http://127.0.0.1:1");
+
         let initialize = test_http_app()
             .oneshot(
                 Request::post("/mcp")
@@ -1042,10 +1100,18 @@ mod tests {
         let properties = set["inputSchema"]["properties"].as_object().unwrap();
         assert!(properties.contains_key("port"));
         assert!(properties.contains_key("profile"));
-        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("model_name"));
+        assert_eq!(properties.len(), 3);
         let profile = &properties["profile"]["anyOf"][0];
         assert_eq!(profile["required"], json!(["name"]));
-        for field in ["name", "shell_prompt", "uboot_prompt", "write_eol", "echo"] {
+        for field in [
+            "name",
+            "model_names",
+            "shell_prompt",
+            "uboot_prompt",
+            "write_eol",
+            "echo",
+        ] {
             assert!(
                 profile["properties"].get(field).is_some(),
                 "missing {field}"
@@ -1218,17 +1284,22 @@ mod tests {
             .find(|tool| tool["name"] == "monitor_start")
             .unwrap();
         let properties = start["inputSchema"]["properties"].as_object().unwrap();
-        assert_eq!(start["inputSchema"]["required"], json!(["port"]));
-        for expected in [
-            "port",
-            "contains",
-            "regex",
-            "description",
-            "idempotency_key",
-        ] {
+        assert_eq!(
+            start["inputSchema"]["required"],
+            json!(["port", "matchers"])
+        );
+        for expected in ["port", "matchers", "description", "idempotency_key"] {
             assert!(properties.contains_key(expected));
         }
-        assert_eq!(start["inputSchema"]["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(properties["matchers"]["minItems"], 1);
+        assert_eq!(properties["matchers"]["maxItems"], MAX_MONITOR_MATCHERS);
+        assert_eq!(
+            properties["matchers"]["items"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         for hidden in [
             "delivery_mode",
             "cooldown_seconds",

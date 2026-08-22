@@ -10,9 +10,14 @@ import type {
 import { createQaSnapshot } from '../shared/qa-fixture'
 import { createOfflineSnapshot } from '../shared/offline-snapshot'
 import { LocalService } from './local-service'
-import { SerialClient, type ServerData } from './serial-client'
+import { SerialClient, serialdIdentityMatches, type ServerData } from './serial-client'
+import { selectLocalEndpoint, type DiscoveredSeriald } from './service-command'
 import { SettingsStore } from './settings'
-import { startAndVerifyService } from './service-startup'
+import {
+  recoverConcurrentWinner,
+  startAndVerifyService,
+  waitForOwnedServiceIdentity
+} from './service-startup'
 
 export class DesktopCoordinator {
   private readonly emit: (event: DesktopEvent) => void
@@ -85,6 +90,7 @@ export class DesktopCoordinator {
     if (endpointChanged) {
       await this.client?.stop()
       this.client = undefined
+      if (this.service.state().owned) await this.service.stop()
       const snapshot = await this.connectOrOffline(preferences.autoStartLocal)
       this.emit({ type: 'snapshot', snapshot })
     } else {
@@ -95,11 +101,11 @@ export class DesktopCoordinator {
   async startLocalService(): Promise<void> {
     if (this.qaMode) return
     const preferences = this.preferences ?? (await this.settings.load())
-    const probe = new SerialClient(preferences.endpoint)
-    if (await probe.healthReachable()) {
+    const existing = await this.findExistingLocalClient(preferences.endpoint, true)
+    if (existing) {
       this.emit({ type: 'notice', message: '已连接该地址上的现有服务，App 不会接管它的进程' })
     } else {
-      await startAndVerifyService(this.service, preferences.endpoint, () => this.waitUntilReachable(probe))
+      await this.startServiceOrRecoverWinner(preferences.endpoint)
     }
     if (!this.client) {
       const snapshot = await this.connectOrOffline(false)
@@ -131,10 +137,10 @@ export class DesktopCoordinator {
     this.setConnection('starting', '正在连接 Serial Platform…')
     let client: SerialClient | undefined
     try {
-      client = new SerialClient(preferences.endpoint)
-      if (!(await client.healthReachable())) {
+      client = await this.findExistingLocalClient(preferences.endpoint, startLocal)
+      if (!client) {
         if (!startLocal) throw new Error(`无法连接后端 ${preferences.endpoint}`)
-        await startAndVerifyService(this.service, preferences.endpoint, () => this.waitUntilReachable(client!))
+        client = await this.startServiceOrRecoverWinner(preferences.endpoint)
       }
       this.bindClient(client)
       this.client = client
@@ -170,12 +176,95 @@ export class DesktopCoordinator {
     client.on('error', (error: unknown) => this.emit({ type: 'error', message: errorMessage(error) }))
   }
 
-  private async waitUntilReachable(probe: SerialClient): Promise<void> {
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (await probe.healthReachable()) return
-      await delay(150)
+  private async findExistingLocalClient(
+    preferred: string,
+    discoverActive: boolean
+  ): Promise<SerialClient | undefined> {
+    const clients = new Map<string, SerialClient>()
+    let preferredError: unknown
+    const reachable = async (endpoint: string, expected?: DiscoveredSeriald): Promise<boolean> => {
+      try {
+        const client = clients.get(endpoint) ?? new SerialClient(endpoint)
+        clients.set(endpoint, client)
+        const identity = await client.healthIdentity()
+        if (expected && !serialdIdentityMatches(identity, expected)) {
+          throw new Error(`发现记录与 ${endpoint} 的后端身份不一致`)
+        }
+        return true
+      } catch (error) {
+        if (endpoint !== preferred) throw error
+        preferredError = error
+        return false
+      }
     }
-    throw new Error('本地后端启动后未能响应')
+    const selection = discoverActive
+      ? await selectLocalEndpoint(preferred, reachable, () => this.service.discoverEndpoint())
+      : (await reachable(preferred) ? { endpoint: preferred, discovered: false } : undefined)
+    if (!selection) {
+      if (preferredError) throw preferredError
+      return undefined
+    }
+    if (selection.discovered) {
+      this.preferences = { ...(this.preferences ?? (await this.settings.load())), endpoint: selection.endpoint }
+      await this.settings.save(this.preferences)
+      this.emit({
+        type: 'notice',
+        message: `发现当前数据目录的 seriald，已改用 ${selection.endpoint}`
+      })
+    }
+    return clients.get(selection.endpoint)
+  }
+
+  private async startServiceOrRecoverWinner(preferred: string): Promise<SerialClient> {
+    const probe = new SerialClient(preferred)
+    try {
+      await startAndVerifyService(this.service, preferred, () => this.waitUntilOwnedService(probe))
+      return probe
+    } catch (error) {
+      const winner = await recoverConcurrentWinner(error, () => (
+        this.findDiscoveredLocalClient(preferred)
+      ))
+      this.emit({
+        type: 'notice',
+        message: `另一启动器已先启动 seriald，App 已连接 ${winner.endpoint}`
+      })
+      return winner
+    }
+  }
+
+  private async findDiscoveredLocalClient(preferred: string): Promise<SerialClient | undefined> {
+    const discovered = await this.service.discoverEndpoint()
+    if (!discovered) return undefined
+    const client = new SerialClient(discovered.endpoint)
+    const identity = await client.healthIdentity()
+    if (!serialdIdentityMatches(identity, discovered)) {
+      throw new Error(`发现记录与 ${discovered.endpoint} 的后端身份不一致`)
+    }
+    if (discovered.endpoint !== preferred) {
+      this.preferences = {
+        ...(this.preferences ?? (await this.settings.load())),
+        endpoint: discovered.endpoint
+      }
+      await this.settings.save(this.preferences)
+    }
+    return client
+  }
+
+  private async waitUntilOwnedService(probe: SerialClient): Promise<void> {
+    await waitForOwnedServiceIdentity(
+      this.service,
+      () => this.service.discoverEndpoint(),
+      async (discovered) => {
+        if (discovered.endpoint !== probe.endpoint) return false
+        try {
+          return serialdIdentityMatches(await probe.healthIdentity(), discovered)
+        } catch {
+          return false
+        }
+      },
+      40,
+      () => delay(150)
+    )
   }
 
   private setConnection(state: DesktopSnapshot['connection'], message: string): void {

@@ -62,12 +62,6 @@ pub(crate) fn lang_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// (key, English, 简体中文)
 static STRINGS: &[(&str, &str, &str)] = &[
-    // ---- Subscription phase labels (tab bar) ----
-    ("phase.off", "OFF", "离线"),
-    ("phase.attach", "ATTACH", "接入中"),
-    ("phase.replay", "REPLAY#{}-#{}", "补齐历史#{}-#{}"),
-    ("phase.live", "LIVE#{}", "实时#{}"),
-    ("phase.lagged", "LAGGED#{}-#{}", "历史缺失#{}-#{}"),
     // ---- Session state / target activity (tab bar) ----
     ("state.disabled", "DISABLED", "已禁用"),
     ("state.waiting", "WAITING", "等待串口"),
@@ -83,36 +77,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("conn.handshaking", "◐ handshaking", "◐ 建立会话"),
     ("conn.live", "● live", "● 已连接"),
     ("conn.attaching", "◐ attaching", "◐ 接入中"),
-    // ---- Status bar ----
-    ("ui.control.none", "none", "无"),
-    ("ui.prefix", " · PREFIX", " · 前缀"),
-    (
-        "ui.uncertain",
-        " · {} WRITE OUTCOME(S) UNCERTAIN: inspect TX before retrying",
-        " · 有 {} 次发送结果未确认；重试前请先检查发送记录",
-    ),
-    (
-        "ui.queued",
-        " · QUEUED #{} ({}s, {} chunk(s); d/e edits LINE, c cancels)",
-        " · 控制权排队第 {} 位（已等待 {} 秒，{} 个待发送分段；d/e 编辑 LINE，c 取消）",
-    ),
-    (
-        "ui.control.pending",
-        " · CONTROL REQUEST PENDING (Ctrl-] c cancels)",
-        " · 正在请求控制权（Ctrl-] c 取消）",
-    ),
-    (
-        "ui.idle.release",
-        " · idle release in {}s",
-        " · 空闲 {} 秒后自动释放控制权",
-    ),
-    (
-        "ui.trigger",
-        " · trigger {} {} · {} fire(s)",
-        " · 触发任务 {} {} · 已发送 {} 次",
-    ),
-    ("ui.status.control", "control:", "控制权："),
-    ("ui.paused", " · PAUSED", " · 已暂停"),
     // ---- Input box ----
     ("ui.input.title.line", " command ", " 命令 "),
     (
@@ -151,17 +115,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "… {} more visual row(s) · Ctrl-] u to inspect full commands",
         "… 还有 {} 行未显示 · Ctrl-] u 查看完整命令",
     ),
-    (
-        "ui.queue.page",
-        "{} · text rows {}-{}/{} · PgUp/PgDn",
-        "{} · 内容第 {}–{} 行，共 {} 行 · PgUp/PgDn",
-    ),
     ("ui.queue.empty", "<empty command>", "<空命令>"),
-    (
-        "ui.queue.sending",
-        " · SENDING (locked)",
-        " · 发送中（已锁定）",
-    ),
     // ---- Run / described Agent command history bar ----
     (
         "ui.run.title",
@@ -178,49 +132,74 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "No Agent task appears in the available records.",
         "当前可用记录中未发现 Agent 任务。",
     ),
-    (
-        "ui.run.history.limited",
-        "Recent records only; startup recovery and search are bounded. Use persistent logs for complete history.",
-        "这里只显示最近记录；启动回填和搜索均有边界，完整历史请查看持久日志。",
-    ),
     ("ui.run.status.active", "running", "执行中"),
     ("ui.run.status.completed", "completed", "已完成"),
     ("ui.run.status.aborted", "aborted", "已中止"),
     ("ui.run.unknown", "unnamed Run", "未命名 Agent 任务"),
-    ("ui.run.owner.unknown", "unknown owner", "未知执行者"),
     ("ui.run.header", "{} · {}", "{} · {}"),
-    (
-        "ui.run.no.described.commands",
-        "No described Agent command yet",
-        "暂无带用途说明的 Agent 命令",
-    ),
     (
         "ui.run.description.missing",
         "purpose not provided",
         "未提供命令用途",
     ),
-    (
-        "ui.run.command.meta",
-        "confirmed TX · sequence #{}-#{} · {}",
-        "已确认发送 · 序号 #{}–#{} · {}",
-    ),
-    (
-        "ui.run.command.meta.partial",
-        "partially confirmed TX · sequence #{}-#{} · {}",
-        "仅部分确认发送 · 序号 #{}–#{} · {}",
-    ),
     ("ui.run.command.empty", "<empty TX>", "<空发送内容>"),
+    ("ui.monitor.status.running", "monitoring", "监控中"),
+    ("ui.monitor.status.completed", "completed", "已完成"),
+    ("ui.monitor.status.stopped", "stopped", "已停止"),
+    ("ui.monitor.status.failed", "failed", "失败"),
+    ("ui.monitor.unnamed", "Monitor", "Monitor 任务"),
     (
-        "ui.run.command.partial",
-        "Only part of the bytes were confirmed; the content above is the confirmed prefix",
-        "仅部分字节确认发送；上方内容是已确认的前缀",
+        "ui.monitor.header",
+        "{} {} {} · {} · {} incident(s)",
+        "{} {} {} · {} · {} 个事件",
+    ),
+    ("ui.monitor.matcher.contains", "contains {}", "包含 {}"),
+    ("ui.monitor.matcher.regex", "regex {}", "正则 {}"),
+    (
+        "st.monitor.jump",
+        "Monitor Incident #{}-#{} selected",
+        "已定位 Monitor 事件 #{}–#{}",
     ),
     (
-        "ui.run.command.truncated",
-        "… command display truncated",
-        "… 命令内容过长，已截断显示",
+        "st.monitor.jump.loading",
+        "Loading Monitor Incident evidence #{}-#{} from the journal",
+        "正在从日志加载 Monitor 事件证据 #{}–#{}",
     ),
-    ("ui.run.abort.reason", "abort reason: {}", "中止原因：{}"),
+    (
+        "st.monitor.jump.journal",
+        "Monitor Incident evidence #{}-#{} loaded from the journal",
+        "已从日志定位 Monitor 事件证据 #{}–#{}",
+    ),
+    (
+        "st.monitor.jump.gap",
+        "Monitor Incident #{}-#{} is unavailable: journal gap #{}-#{} ({})",
+        "无法定位 Monitor 事件 #{}–#{}：日志缺失 #{}–#{}（{}）",
+    ),
+    (
+        "st.monitor.jump.incomplete",
+        "Monitor Incident evidence #{}-#{} is no longer fully retained",
+        "Monitor 事件证据 #{}–#{} 已无法完整读取",
+    ),
+    (
+        "st.monitor.jump.limit",
+        "Monitor Incident evidence #{}-#{} exceeds the bounded display query",
+        "Monitor 事件证据 #{}–#{} 超出单次显示查询上限",
+    ),
+    (
+        "st.monitor.jump.query.failed",
+        "Monitor Incident evidence query failed: {}",
+        "Monitor 事件证据查询失败：{}",
+    ),
+    (
+        "st.monitor.jump.query.busy",
+        "Another Monitor evidence query is still queued",
+        "已有 Monitor 证据查询正在排队",
+    ),
+    (
+        "st.monitor.jump.query.unavailable",
+        "Monitor evidence query is unavailable",
+        "Monitor 证据查询当前不可用",
+    ),
     // ---- Dynamic protocol state labels ----
     ("trigger.status.active", "active", "活动中"),
     ("trigger.status.armed", "armed", "已就绪"),
@@ -288,7 +267,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "error.profile_change_busy",
         "profile_change_busy",
-        "方案正在使用",
+        "Profile 正在使用",
     ),
     ("error.port_not_found", "port_not_found", "未找到串口"),
     ("error.port_busy", "port_busy", "串口被占用"),
@@ -321,11 +300,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "history.local.truncated",
         "Local display history was truncated; use `serialctl logs` for the complete history.",
         "本地显示历史已截断；请使用 `serialctl logs` 查询完整历史。",
-    ),
-    (
-        "history.local.truncated.title",
-        " · LOCAL HISTORY TRUNCATED",
-        " · 本地历史已截断",
     ),
     (
         "history.startup.failed",
@@ -371,13 +345,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current",
-        "Current port {} · Serial Profile {} · Model Profile {}",
-        "当前串口：{} · 串口 Profile：{} · 机型 Profile：{}",
+        "Port {} · Serial Profile {} · Model Profile {} · Model {}",
+        "串口：{} · 串口 Profile：{} · 机型 Profile：{} · 机型名：{}",
     ),
     (
         "menu.value.generic",
         "Generic (no interaction profile)",
-        "通用交互设置（不使用样机交互方案）",
+        "通用交互设置（不使用机型 Profile）",
     ),
     ("menu.value.unbound", "Unbound", "未绑定"),
     ("menu.value.enabled", "enabled", "启用"),
@@ -386,44 +360,81 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.value.off", "off", "关闭"),
     (
         "menu.root.profile",
-        "Current port configuration",
-        "当前串口完整配置",
+        "Edit current port configuration",
+        "修改当前串口配置",
     ),
     (
-        "menu.root.serial",
-        "Quickly change UART hardware parameters",
-        "快速创建串口参数方案",
+        "menu.root.create",
+        "Create configuration Profile",
+        "创建配置 Profile",
     ),
+    ("menu.root.settings", "Settings", "设置"),
     (
         "menu.root.display",
         "Terminal display settings",
         "终端界面显示设置",
     ),
-    (
-        "menu.root.run",
-        "Agent Run lifecycle settings",
-        "Agent 任务生命周期设置",
-    ),
+    ("menu.root.mcp", "serial MCP settings", "serial MCP 设置"),
     ("menu.root.help", "Help", "帮助"),
+    ("menu.settings.title", "Settings", "设置"),
     (
-        "menu.root.detail",
-        "Choose the serial and model profiles for this port, terminal display settings, or local Agent runtime preferences.",
-        "可配置当前串口的串口 Profile、机型 Profile、终端显示及本机 Agent 运行参数。",
+        "menu.create.title",
+        "Create configuration Profile",
+        "创建配置 Profile",
+    ),
+    (
+        "menu.create.transport",
+        "Create Serial Profile",
+        "创建串口 Profile",
+    ),
+    (
+        "menu.create.model",
+        "Create Model Profile",
+        "创建机型 Profile",
+    ),
+    (
+        "menu.create.transport.title",
+        "Create Serial Profile",
+        "创建串口 Profile",
+    ),
+    (
+        "menu.create.model.title",
+        "Create Model Profile",
+        "创建机型 Profile",
+    ),
+    (
+        "menu.create.row.name",
+        "Profile name: {}",
+        "Profile 名称：{}",
+    ),
+    (
+        "menu.create.row.model.names",
+        "Concrete model names: {}",
+        "具体机型名：{}",
+    ),
+    ("menu.create.row.save", "Create Profile", "创建 Profile"),
+    (
+        "menu.model.family.title",
+        "Choose model family",
+        "选择机型系列",
+    ),
+    (
+        "menu.model.name.title",
+        "Choose concrete model",
+        "选择具体机型名",
+    ),
+    ("menu.current.section.actions", "Apply", "应用配置"),
+    ("menu.choice.open", "options expanded", "选项已展开"),
+    ("menu.choice.closed", "options collapsed", "选项已折叠"),
+    (
+        "menu.choice.empty",
+        "no configured option is available",
+        "暂无可用的已配置选项",
     ),
     (
         "menu.profile.title",
-        "Current port configuration",
-        "当前串口完整配置",
-    ),
-    (
-        "menu.profile.detail",
-        "Review and edit every active serial and model-profile field here. Changes remain a local draft until Apply is selected. Reusable profile edits affect every bound port and require a separate impact confirmation.",
-        "可在此查看并修改当前串口参数与样机交互参数；选择“保存并应用”前，修改只保存在本页草稿中。修改可复用方案会影响所有绑定它的串口通道，提交前会另行展示影响范围并要求确认。",
-    ),
-    (
-        "menu.current.detail",
-        "Enter edits or cycles the selected field. Port and profile identities are explicit; use their rows to bind another profile. Unsaved values remain local to this page.",
-        "按 Enter 可编辑或切换当前字段。端口与方案名称会明确显示；如需更换方案，请进入对应方案行。未保存的值只存在于本页。",
+        "Edit current port configuration",
+        "修改当前串口配置",
     ),
     (
         "menu.current.section.serial",
@@ -435,25 +446,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Device model profile",
         "机型 Profile 配置",
     ),
-    (
-        "menu.current.apply.detail",
-        "Shared Serial and Model Profiles are updated in place, so Apply first lists every bound port and asks again. Save uses the profile revision shown when editing began and fails if configuration changed. Physical serial changes still use seriald's busy/reopen boundary.",
-        "共享串口 Profile 和机型 Profile 会原地修改，因此“保存并应用”会先列出所有绑定串口并再次确认。保存会校验开始编辑时的 Profile 版本；若配置已变化则拒绝覆盖，物理串口参数仍经过 seriald 的占用检查与安全重开边界。",
-    ),
-    (
-        "menu.current.model.detail",
-        "Model binding and name changes are submitted immediately (not part of the profile draft). A successful response refreshes the serial-output title at once.",
-        "机型绑定与机型名称修改会立即提交，不属于方案草稿；服务端确认成功后，串口输出标题会立即刷新。",
-    ),
-    (
-        "menu.current.row.port",
-        "Port: {} (Enter edits)",
-        "端口：{}（Enter 修改）",
-    ),
+    ("menu.current.row.port", "Port: {}", "端口：{}"),
     (
         "menu.current.row.transport",
-        "Serial Profile: {} (Enter browses)",
-        "串口 Profile：{}（Enter 更换）",
+        "Serial Profile: {}",
+        "串口 Profile：{}",
     ),
     ("menu.current.row.baud", "Baud rate: {}", "波特率：{}"),
     ("menu.current.row.data", "Data bits: {}", "数据位：{}"),
@@ -465,8 +462,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.current.row.auto", "Auto-open: {}", "自动打开串口：{}"),
     (
         "menu.current.row.device",
-        "Model Profile: {} (Enter browses)",
-        "机型 Profile：{}（Enter 更换）",
+        "Model Profile: {}",
+        "机型 Profile：{}",
+    ),
+    (
+        "menu.current.row.model.name",
+        "Model name: {}",
+        "机型名：{}",
     ),
     (
         "menu.current.row.eol",
@@ -505,8 +507,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current.row.apply.clean",
-        "Save and apply configuration changes (no changes)",
-        "保存并应用配置修改（暂无修改）",
+        "Save and apply configuration changes",
+        "保存并应用配置修改",
     ),
     (
         "menu.current.modified",
@@ -521,7 +523,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "menu.profile.shared.title",
         "Confirm shared profile update",
-        "确认修改共享方案",
+        "确认修改共享 Profile",
     ),
     (
         "menu.profile.shared.warning",
@@ -531,7 +533,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "menu.profile.shared.transport",
         "Shared Serial Profile “{}” — {} affected port(s):",
-        "共享串口参数方案“{}”——影响 {} 个串口通道：",
+        "共享串口 Profile“{}”——影响 {} 个串口：",
     ),
     (
         "menu.profile.shared.device",
@@ -542,7 +544,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "menu.profile.shared.revision",
         "A binding or catalog change before submission is rejected by the revision guard; reload and review the new impact list.",
-        "若提交前方案绑定或目录版本发生变化，版本保护会拒绝写入；请重新加载并核对新的影响列表。",
+        "若提交前 Profile 绑定或目录版本发生变化，版本保护会拒绝写入；请重新加载并核对新的影响列表。",
     ),
     (
         "menu.profile.shared.pending",
@@ -557,12 +559,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "menu.profile.shared.cancelled",
         "Shared profile update cancelled; the draft remains on this page",
-        "已取消共享方案修改；草稿仍保留在本页",
+        "已取消共享 Profile 修改；草稿仍保留在本页",
     ),
     (
         "menu.current.transport.missing",
         "The bound UART profile is missing from the catalog; bind an existing profile first",
-        "当前串口参数方案已不在方案列表中；请先绑定一个现有方案",
+        "当前串口 Profile 已不在列表中；请先绑定一个现有 Profile",
     ),
     (
         "menu.current.device.unbound",
@@ -570,19 +572,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "请先绑定机型 Profile，再修改其字段",
     ),
     (
-        "menu.current.prompt.port",
-        "Serial port path/name",
-        "串口端口路径或名称",
-    ),
-    (
         "menu.current.value.invalid",
         "Invalid value; port must be non-empty, baud/chunk size must be positive integers, and delay must be a non-negative integer",
         "输入无效：端口不能为空，波特率和分段大小必须为正整数，分段间隔必须为非负整数",
-    ),
-    (
-        "menu.current.prompt.baud",
-        "Baud rate (> 0)",
-        "波特率（大于 0）",
     ),
     (
         "menu.current.prompt.shell",
@@ -606,8 +598,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.profile.updated",
-        "Current profiles saved and applied",
-        "当前方案已保存并应用",
+        "Current Profiles saved and applied",
+        "当前 Profile 已保存并应用",
     ),
     (
         "menu.profile.revision.conflict",
@@ -617,83 +609,22 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "menu.profile.binding.changed",
         "the port profile binding changed while this form was open; reload before saving",
-        "本页打开后串口通道的方案绑定已变化；请重新加载后再保存",
-    ),
-    (
-        "menu.profile.transport",
-        "UART hardware profiles (baud/parity/flow)",
-        "串口参数方案（波特率/校验/流控）",
-    ),
-    (
-        "menu.profile.device",
-        "Model Profiles (model name/prompt/EOL/echo/pacing)",
-        "机型 Profile（机型名/提示符/换行/回显/分段发送）",
-    ),
-    (
-        "menu.transport.title",
-        "UART hardware profiles",
-        "串口参数方案",
-    ),
-    (
-        "menu.transport.new",
-        "+ Create and bind safe 115200 8N1 profile",
-        "+ 新建并绑定常用的 115200 8N1 方案",
-    ),
-    (
-        "menu.transport.new.detail",
-        "Creates a reusable 115200/8N1/no-flow UART hardware profile and binds it to this serial port.",
-        "创建可复用的 115200/8N1/无流控串口参数方案，并绑定到当前串口通道。",
-    ),
-    (
-        "menu.transport.bound",
-        "UART hardware profile {} bound to the current port",
-        "串口参数方案 {} 已绑定到当前串口通道",
+        "本页打开后串口的 Profile 绑定已变化；请重新加载后再保存",
     ),
     (
         "menu.transport.created",
-        "UART hardware profile {} created and bound",
-        "串口参数方案 {} 已创建并绑定",
+        "Serial Profile {} created",
+        "串口 Profile {} 已创建",
     ),
     (
         "menu.transport.missing",
-        "UART hardware profile {} no longer exists",
-        "串口参数方案 {} 已不存在",
-    ),
-    ("menu.device.title", "Model Profiles", "机型 Profile"),
-    (
-        "menu.device.generic",
-        "Generic settings (unbind profile)",
-        "通用设置（解除机型 Profile 绑定）",
-    ),
-    (
-        "menu.device.new",
-        "+ Clone the current effective Model Profile and bind",
-        "+ 复制当前生效的机型 Profile 并绑定",
-    ),
-    (
-        "menu.device.clone.detail",
-        "The new Model Profile clones the current prompts, line ending, echo policy and write pacing; each preset changes only its named field.",
-        "新机型 Profile 会复制当前的提示符、换行符、回显策略和分段发送设置；每个预设只修改标出的项目。",
-    ),
-    (
-        "menu.device.generic.detail",
-        "Unbinds the Model Profile and returns this port to generic settings.",
-        "解除机型 Profile 绑定，让当前串口使用通用设置。",
-    ),
-    (
-        "menu.device.bound",
-        "Model Profile {} bound to the current port",
-        "机型 Profile {} 已绑定到当前串口",
-    ),
-    (
-        "menu.device.generic.bound",
-        "Model Profile unbound; generic settings are active",
-        "已解除机型 Profile；当前使用通用设置",
+        "Serial Profile {} no longer exists",
+        "串口 Profile {} 已不存在",
     ),
     (
         "menu.device.created",
-        "Model Profile {} created from effective settings and bound",
-        "机型 Profile {} 已复制当前生效设置并绑定",
+        "Model Profile {} created",
+        "机型 Profile {} 已创建",
     ),
     (
         "menu.device.missing",
@@ -701,49 +632,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "机型 Profile {} 已不存在",
     ),
     (
-        "menu.device.echo.on",
-        "+ Clone: device echoes input (Agent capture)",
-        "+ 复制当前设置：设备会回显（Agent 捕获解析）",
-    ),
-    (
-        "menu.device.echo.off",
-        "+ Clone: device does not echo (Agent capture)",
-        "+ 复制当前设置：设备不回显（Agent 捕获解析）",
-    ),
-    (
-        "menu.device.echo.auto",
-        "+ Clone: auto-detect device echo (Agent capture)",
-        "+ 复制当前设置：自动判断设备回显（Agent 捕获解析）",
-    ),
-    (
-        "menu.device.eol.cr",
-        "+ Clone with EOL CR",
-        "+ 复制当前设置并使用 CR 换行",
-    ),
-    (
-        "menu.device.eol.lf",
-        "+ Clone with EOL LF",
-        "+ 复制当前设置并使用 LF 换行",
-    ),
-    (
-        "menu.device.eol.crlf",
-        "+ Clone with EOL CRLF",
-        "+ 复制当前设置并使用 CRLF 换行",
-    ),
-    (
-        "menu.device.eol.custom",
-        "+ Clone with custom EOL",
-        "+ 复制当前设置并使用自定义换行符",
-    ),
-    (
         "menu.profile.exists",
         "profile {} already exists; choose another name",
-        "配置方案 {} 已存在；请选择其他名称",
-    ),
-    (
-        "menu.serial.title",
-        "Quickly change UART hardware parameters",
-        "串口参数快捷设置",
+        "Profile {} 已存在；请选择其他名称",
     ),
     (
         "menu.display.title",
@@ -766,11 +657,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "请输入 {} 到 {} 之间的整数",
     ),
     (
-        "menu.display.detail",
-        "The Agent task/command-history bar currently uses {} content rows. Press Enter to type an exact value from 3 through 20. A short terminal still uses the focused popup so serial output keeps enough room.",
-        "Agent 任务与命令记录栏当前显示 {} 行内容。按 Enter 可输入 3 到 20 之间的精确行数；终端窗口过矮时仍会改用聚焦弹窗，避免挤占串口输出区域。",
-    ),
-    (
         "menu.display.saved",
         "Agent task/command-history height saved as {} rows",
         "Agent 任务与命令记录栏高度已保存为 {} 行",
@@ -785,11 +671,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "height applied for this session, but saving failed: {}",
         "高度已在本次会话中生效，但保存失败：{}",
     ),
-    (
-        "menu.run.title",
-        "Agent Run lifecycle settings",
-        "Agent 任务生命周期设置",
-    ),
+    ("menu.mcp.title", "serial MCP settings", "serial MCP 设置"),
     (
         "menu.run.timeout.row",
         "Orphan Run cleanup: {}",
@@ -797,11 +679,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     ("menu.run.timeout.seconds", "{} seconds", "{} 秒"),
     ("menu.run.timeout.unlimited", "unlimited", "无限"),
-    (
-        "menu.run.detail",
-        "Current: {}; default: {}. Set 0 for unlimited or at least 300 seconds. Unlimited Runs release only through explicit run_end, MCP process exit, or Human takeover. Running serial-mcp processes must be restarted after saving.",
-        "当前为 {}，默认为 {}。可设为 0（无限）或不少于 300 秒；无限任务只会在明确调用 run_end、MCP 进程退出或人工接管时释放。保存后需重启正在运行的 serial-mcp。",
-    ),
     (
         "menu.run.timeout.prompt",
         "Orphan Run timeout: 0 = unlimited, otherwise >= {} seconds",
@@ -814,8 +691,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.run.timeout.saved",
-        "Orphan Run cleanup saved as {}; restart running serial-mcp processes to apply it",
-        "Agent 任务回收设置已保存为 {}；请重启正在运行的 serial-mcp 后生效",
+        "Orphan Run cleanup saved as {} and automatically applied",
+        "Agent 任务回收设置已保存为 {}，并已自动应用",
     ),
     (
         "menu.run.timeout.saved.session",
@@ -827,64 +704,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "timeout was selected for this console session, but saving failed: {}",
         "本次终端会话已选择该回收时间，但保存失败：{}",
     ),
-    (
-        "menu.serial.current",
-        "Current UART hardware profile: {}. Applying a preset clones it as a new reusable profile.",
-        "当前串口参数方案：{}。选择下方预设会基于它新建方案，并应用到当前串口通道。",
-    ),
-    (
-        "menu.serial.baud",
-        "Clone current profile · baud rate {}",
-        "基于当前方案 · 波特率 {}",
-    ),
-    (
-        "menu.serial.8n1",
-        "Clone · 8 data / no parity / 1 stop",
-        "基于当前方案 · 8 数据位 / 无校验 / 1 停止位",
-    ),
-    (
-        "menu.serial.8e1",
-        "Clone · 8 data / even parity / 1 stop",
-        "基于当前方案 · 8 数据位 / 偶校验 / 1 停止位",
-    ),
-    (
-        "menu.serial.8o1",
-        "Clone · 8 data / odd parity / 1 stop",
-        "基于当前方案 · 8 数据位 / 奇校验 / 1 停止位",
-    ),
-    (
-        "menu.serial.8n2",
-        "Clone · 8 data / no parity / 2 stop",
-        "基于当前方案 · 8 数据位 / 无校验 / 2 停止位",
-    ),
-    (
-        "menu.serial.flow.none",
-        "Clone · no flow control",
-        "基于当前方案 · 无流控",
-    ),
-    (
-        "menu.serial.flow.hardware",
-        "Clone · hardware flow control",
-        "基于当前方案 · 硬件流控",
-    ),
-    (
-        "menu.serial.dtr",
-        "Clone · toggle DTR line",
-        "基于当前方案 · 切换 DTR 控制线",
-    ),
-    (
-        "menu.serial.rts",
-        "Clone · toggle RTS line",
-        "基于当前方案 · 切换 RTS 控制线",
-    ),
-    (
-        "menu.serial.auto",
-        "Clone · toggle automatic port opening",
-        "基于当前方案 · 切换自动打开串口",
-    ),
-    ("menu.detail.baud", "baud {}", "波特率 {}"),
-    ("menu.detail.data_bits", "{} data bits", "{} 数据位"),
-    ("menu.detail.stop_bits", "{} stop bits", "{} 停止位"),
     ("menu.detail.parity.none", "no parity", "无校验"),
     ("menu.detail.parity.odd", "odd parity", "奇校验"),
     ("menu.detail.parity.even", "even parity", "偶校验"),
@@ -899,97 +718,20 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "hardware flow control",
         "硬件流控",
     ),
-    (
-        "menu.detail.transport",
-        "{} · {} · {} · {} · {} · DTR {} · RTS {} · automatic open {}",
-        "{} · {} · {} · {} · {} · DTR {} · RTS {} · 自动打开 {}",
-    ),
-    (
-        "menu.detail.prompt.shell",
-        "shell prompt {}",
-        "Shell 提示符 {}",
-    ),
-    (
-        "menu.detail.prompt.uboot",
-        "U-Boot prompt {}",
-        "U-Boot 提示符 {}",
-    ),
-    ("menu.detail.eol", "line ending {}", "换行 {}"),
     ("menu.detail.eol.none", "none", "无"),
-    ("menu.detail.eol.custom", "custom", "自定义"),
     ("menu.detail.eol.inherit", "inherit", "继承"),
     ("menu.detail.echo.on", "device echoes", "设备会回显"),
     ("menu.detail.echo.off", "device does not echo", "设备不回显"),
     ("menu.detail.echo.auto", "auto-detect", "自动判断"),
-    (
-        "menu.detail.pacing",
-        "write pacing {} byte(s) / {} ms",
-        "分段发送：每段 {} 字节，间隔 {} 毫秒",
-    ),
-    (
-        "menu.detail.device",
-        "{} · {} · {} · {} · {}",
-        "{} · {} · {} · {} · {}",
-    ),
     (
         "menu.help.title",
         "Terminal workflow help",
         "终端工作流帮助",
     ),
     (
-        "menu.help.menu",
-        "Ctrl-] m opens this extensible menu; Up/Down, Enter and Esc navigate it.",
-        "Ctrl-] m 打开此可扩展菜单；使用上下、Enter 和 Esc 导航。",
-    ),
-    (
-        "menu.help.queue",
-        "Ordinary Enter queues a non-empty LINE operation without takeover; Ctrl-] u selects queued cards.",
-        "直接按 Enter 会在不接管控制权的情况下排队非空 LINE 命令；Ctrl-] u 可选择待发送命令。",
-    ),
-    (
-        "menu.help.enter",
-        "While an Agent Run is active, empty Enter never queues bytes; it only returns output to the live tail.",
-        "Agent 任务执行期间，空 Enter 不会进入队列，只会回到最新输出。",
-    ),
-    (
-        "menu.help.cooperative",
-        "Alt+Enter sends direct input bound to the exact matching Agent Run while that Agent keeps its lease.",
-        "Alt+Enter 将输入直接发送到当前 Agent 任务，Agent 仍保留控制权。",
-    ),
-    (
-        "menu.help.takeover",
-        "Ctrl-] t is the separate explicit takeover path and may abort the Agent's current Run.",
-        "Ctrl-] t 由人工接管控制权，并可能中止当前 Agent 任务。",
-    ),
-    (
-        "menu.help.echo",
-        "The serial pane shows device RX only. A command appears there only when the device itself echoes it.",
-        "串口显示区只显示设备 RX；只有样机实际回显时，命令才会出现在串口内容中。",
-    ),
-    (
-        "menu.help.model",
-        "Confirm the connected model through serial, Telnet, Web, or a Human before Human or Agent operations.",
-        "人工或 Agent 操作前，应通过串口、Telnet、Web 或向使用者确认当前连接的样机机型。",
-    ),
-    (
         "menu.footer",
-        "↑/↓ select · Enter open/apply · Esc back · r reload",
-        "↑/↓ 选择 · Enter 打开/应用 · Esc 返回 · r 重载",
-    ),
-    (
-        "menu.footer.current",
-        "↑/↓ field · Enter edit/cycle/open · Save and apply submits draft · Esc back",
-        "↑/↓ 选择字段 · Enter 编辑/切换/打开 · “保存并应用”提交草稿 · Esc 返回",
-    ),
-    (
-        "menu.footer.display",
-        "Enter edits the exact row count and saves · Esc back",
-        "Enter 输入精确行数并保存 · Esc 返回",
-    ),
-    (
-        "menu.footer.run",
-        "Enter edit and save · Esc back",
-        "Enter 修改并保存 · Esc 返回",
+        "↑/↓ select · → expand · ← collapse/back · Enter confirm · ? help",
+        "↑/↓ 选择 · → 展开 · ← 折叠/返回 · Enter 确认 · ? 说明",
     ),
     (
         "menu.footer.help",
@@ -998,13 +740,85 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.prompt.transport.name",
-        "New UART hardware profile name",
-        "新串口参数方案名称",
+        "New Serial Profile name",
+        "新串口 Profile 名称",
     ),
     (
         "menu.prompt.device.name",
         "New Model Profile name",
         "新机型 Profile 名称",
+    ),
+    (
+        "menu.prompt.model.names",
+        "Concrete model names, separated by commas",
+        "具体机型名（使用逗号分隔）",
+    ),
+    ("menu.field.help.title", "Field description", "配置项说明"),
+    ("menu.field.help.close", "any key closes", "按任意键关闭"),
+    (
+        "menu.help.field.port",
+        "Select a detected or already configured operating-system serial port.",
+        "选择系统检测到或已经配置的串口。",
+    ),
+    (
+        "menu.help.field.transport",
+        "Select an existing Serial Profile. New Profiles are created from the separate Create configuration Profile menu.",
+        "选择已经创建的串口 Profile；新增 Profile 请使用独立的“创建配置 Profile”。",
+    ),
+    (
+        "menu.help.field.model.profile",
+        "A Model Profile describes one model family's prompts, line ending and write pacing.",
+        "机型 Profile 描述一类机型共用的提示符、换行和分段发送参数。",
+    ),
+    (
+        "menu.help.field.model.name",
+        "Choose the family first, then the concrete model name attached to this port.",
+        "先选择机型系列，再选择当前串口连接的具体机型名。",
+    ),
+    (
+        "menu.help.field.shell",
+        "The Shell prompt marks the end of a completed Shell command response.",
+        "Shell 提示符用于识别 Shell 命令返回结束位置。",
+    ),
+    (
+        "menu.help.field.uboot",
+        "The U-Boot prompt marks the end of a completed U-Boot command response.",
+        "U-Boot 提示符用于识别 U-Boot 命令返回结束位置。",
+    ),
+    (
+        "menu.help.field.pacing",
+        "Write pacing splits one command into bounded chunks with a delay between chunks.",
+        "分段发送会把命令按指定字节数拆分，并在相邻分段之间等待。",
+    ),
+    (
+        "menu.help.field.apply",
+        "Save the draft and apply it to the selected serial port.",
+        "保存当前草稿并应用到所选串口。",
+    ),
+    (
+        "menu.help.field.serial",
+        "Press Right or Enter to expand this field's available values.",
+        "按右方向键或 Enter 展开当前配置项的可选值。",
+    ),
+    (
+        "menu.help.field.create",
+        "Create a reusable Serial Profile or Model Profile without changing the current port binding.",
+        "创建可复用的串口 Profile 或机型 Profile，不会自动修改当前串口绑定。",
+    ),
+    (
+        "menu.help.field.display",
+        "Sets the number of content rows in the Agent task and command history pane.",
+        "设置 Agent 任务与命令记录栏显示的内容行数。",
+    ),
+    (
+        "menu.help.field.mcp",
+        "Sets how long an abandoned Agent Run remains active. Zero means unlimited.",
+        "设置无人继续使用的 Agent Run 自动回收时间；0 表示无限。",
+    ),
+    (
+        "menu.help.field.navigation",
+        "Use Up and Down to select, Right to enter, and Left to return.",
+        "按 ↑/↓ 选择、→ 进入、← 返回。",
     ),
     ("menu.prompt.cancelled", "input cancelled", "已取消输入"),
     (
@@ -1196,7 +1010,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "history search exceeded the {}-second total deadline",
         "串口历史搜索超过 {} 秒总时限",
     ),
-    ("ui.output.baud", "{} baud", "波特率 {}"),
     (
         "ui.output.model.unconfigured",
         "device model not configured",
@@ -1217,12 +1030,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "ui.helpline",
         " Ctrl-] m menu · o profiles · h command purposes · ? help · {} · q quit ",
-        " Ctrl-] m 菜单 · o 配置方案 · h 命令用途 · ? 帮助 · {} · q 退出 ",
-    ),
-    (
-        "ui.scroll.prefix",
-        "Ctrl-] PgUp/PgDn scroll",
-        "Ctrl-] PgUp/PgDn 滚动",
+        " Ctrl-] m 菜单 · o Profile · h 命令用途 · ? 帮助 · {} · q 退出 ",
     ),
     (
         "ui.scroll.plain",
@@ -1241,195 +1049,119 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Control and Agent cooperation",
         "控制权与 Agent 协作",
     ),
-    ("help.group.queue", "Queued input", "排队输入"),
     ("help.group.line", "LINE mode", "LINE 模式"),
-    ("help.group.raw", "RAW mode", "RAW 模式"),
-    ("help.group.safety", "Safety and history", "安全与历史"),
     (
-        "help.switch",
-        "  Alt-1..9 / Ctrl-] 1..9   switch port",
-        "  Alt-1..9 / Ctrl-] 1..9   切换串口",
+        "help.key.switch",
+        "Alt-1..9 / Ctrl-] 1..9",
+        "Alt-1..9 / Ctrl-] 1..9",
+    ),
+    ("help.desc.switch", "Switch serial port", "切换串口"),
+    ("help.key.history.select", "Up / Down", "上 / 下"),
+    (
+        "help.desc.history.select",
+        "Select an Agent action or child command",
+        "选择 Agent 动作或子命令",
+    ),
+    ("help.key.history.expand", "Right / Left", "右 / 左"),
+    (
+        "help.desc.history.expand",
+        "Expand or return one history level",
+        "展开或返回上一层记录",
+    ),
+    ("help.key.history.panel", "Ctrl-] h", "Ctrl-] h"),
+    (
+        "help.desc.history.panel",
+        "Show or hide Agent history",
+        "显示或隐藏 Agent 历史",
     ),
     (
-        "help.next",
-        "  Ctrl-] s                 next port",
-        "  Ctrl-] s                 下一个串口",
+        "help.key.scroll",
+        "Wheel / PgUp / PgDn",
+        "滚轮 / PgUp / PgDn",
     ),
     (
-        "help.mode",
-        "  Ctrl-] l / r             LINE / RAW mode",
-        "  Ctrl-] l / r             LINE / RAW 模式",
+        "help.desc.scroll",
+        "Browse the current Agent-history level",
+        "浏览当前 Agent 历史层级",
     ),
+    ("help.key.follow", "Ctrl-] f", "Ctrl-] f"),
     (
-        "help.view",
-        "  Ctrl-] v                 compact / detailed timeline",
-        "  Ctrl-] v                 紧凑/详细时间线",
+        "help.desc.follow",
+        "Return to live serial output",
+        "回到最新串口输出",
     ),
+    ("help.key.menu", "Ctrl-] m", "Ctrl-] m"),
+    ("help.desc.menu", "Open configuration", "打开配置"),
+    ("help.key.profile", "Ctrl-] o", "Ctrl-] o"),
     (
-        "help.lang",
-        "  Ctrl-] g                 switch language (中文/EN)",
-        "  Ctrl-] g                 切换语言（中文/EN）",
+        "help.desc.profile",
+        "Edit current serial configuration",
+        "修改当前串口配置",
     ),
+    ("help.key.search.output", "Ctrl-] /", "Ctrl-] /"),
     (
-        "help.scroll",
-        "  Ctrl-] PgUp / PgDn       local scroll (especially in RAW)",
-        "  Ctrl-] PgUp / PgDn       滚动本地历史（RAW 模式下尤其有用）",
+        "help.desc.search.output",
+        "Search persistent serial history",
+        "搜索持久串口历史",
     ),
+    ("help.key.enter", "Enter", "Enter"),
     (
-        "help.wheel",
-        "  wheel / left drag / right click   Agent history / select+copy / copy again",
-        "  滚轮 / 左键拖动 / 右键       Agent 历史 / 拖选后自动复制 / 再次复制",
+        "help.desc.enter",
+        "Send non-empty input; empty input follows the live tail",
+        "发送非空命令；空输入回到串口底部",
     ),
+    ("help.key.alt.enter", "Alt-Enter", "Alt-Enter"),
     (
-        "help.selection",
-        "  mouse                    handled by terminal (serialctl wheel is off)",
-        "  鼠标                     由终端处理（serialctl 滚轮已关闭）",
+        "help.desc.alt.enter",
+        "Send cooperative input during an Agent Run",
+        "Agent 任务中协同发送输入",
     ),
+    ("help.key.input.search", "Ctrl-R", "Ctrl-R"),
     (
-        "help.mouse.paste",
-        "  input right click / Ctrl-Shift-V   paste (right click is Windows-native)",
-        "  输入框右键 / Ctrl-Shift-V      粘贴（右键使用 Windows 原生行为）",
+        "help.desc.input.search",
+        "Search input history",
+        "搜索输入历史",
     ),
+    ("help.key.complete", "Tab", "Tab"),
     (
-        "help.menu",
-        "  Ctrl-] m                 Serial Profile / Model Profile / quick serial settings",
-        "  Ctrl-] m                 串口 Profile / 机型 Profile / 快速串口设置",
+        "help.desc.complete",
+        "Complete from input history",
+        "从输入历史补全",
     ),
+    ("help.key.paste", "Ctrl-Shift-V", "Ctrl-Shift-V"),
     (
-        "help.profile",
-        "  Ctrl-] o                 open profile selection directly",
-        "  Ctrl-] o                 直接选择串口参数或样机交互方案",
+        "help.desc.paste",
+        "Paste into the command input",
+        "粘贴到命令输入栏",
     ),
+    ("help.key.takeover", "Ctrl-] t", "Ctrl-] t"),
     (
-        "help.run.history",
-        "  Arrow keys / Ctrl-] h     browse command history / toggle its bar",
-        "  方向键 / Ctrl-] h         浏览命令记录 / 显示或隐藏横栏",
+        "help.desc.takeover",
+        "Take over the current serial port",
+        "接管当前串口",
     ),
+    ("help.key.release", "Ctrl-] c", "Ctrl-] c"),
     (
-        "help.run.keys",
-        "  Up/Down · Right/Left · Pg/wheel   select / expand / collapse / page",
-        "  上下 · 右/左 · Pg/滚轮     选择 / 展开 / 收起 / 翻页",
+        "help.desc.release",
+        "Release control or queued input",
+        "释放控制权或排队输入",
     ),
+    ("help.key.mode", "Ctrl-] l / r", "Ctrl-] l / r"),
     (
-        "help.takeover",
-        "  Ctrl-] t                 force Human takeover; active Agent Run is aborted",
-        "  Ctrl-] t                 强制人工接管控制权；当前 Agent 任务会被中止",
+        "help.desc.mode",
+        "Switch LINE or RAW input",
+        "切换 LINE 或 RAW 输入",
     ),
+    ("help.key.interrupt", "Ctrl-C", "Ctrl-C"),
+    ("help.desc.interrupt", "Send ETX (0x03)", "发送 ETX（0x03）"),
+    ("help.key.lang", "Ctrl-] g", "Ctrl-] g"),
     (
-        "help.cooperative",
-        "  Alt-Enter                direct LINE bound to matching Agent Run; lease stays",
-        "  Alt-Enter                向当前 Agent 任务直接发送；Agent 保留控制权",
+        "help.desc.lang",
+        "Switch Chinese or English",
+        "切换中文或英文",
     ),
-    (
-        "help.release",
-        "  Ctrl-] c                 release control or cancel queued input",
-        "  Ctrl-] c                 释放控制权或取消排队输入",
-    ),
-    (
-        "help.queue.delete",
-        "  Ctrl-] d                 delete newest queued LINE command",
-        "  Ctrl-] d                 删除最新一条排队 LINE 命令",
-    ),
-    (
-        "help.queue.edit",
-        "  Ctrl-] e                 return newest LINE to editor; Enter requeues at tail",
-        "  Ctrl-] e                 将最新 LINE 取回编辑；Enter 后重新排到队尾",
-    ),
-    (
-        "help.queue.select",
-        "  Ctrl-] u                 select command; ↑/↓ cards, PgUp/PgDn text, d/e",
-        "  Ctrl-] u                 选择命令；↑/↓ 选择，PgUp/PgDn 查看全文，d/e",
-    ),
-    (
-        "help.queue.behavior",
-        "  ordinary Enter           send non-empty LINE; empty Enter follows latest output",
-        "  直接按 Enter             发送非空命令；空输入时回到最新串口输出",
-    ),
-    (
-        "help.follow",
-        "  Ctrl-] f                 follow live output",
-        "  Ctrl-] f                 跟随实时输出",
-    ),
-    (
-        "help.echo",
-        "  Serial pane              device output only; commands appear only when the device echoes them",
-        "  串口显示区               只显示设备输出；命令仅在设备实际回显时出现",
-    ),
-    (
-        "help.paste",
-        "  Ctrl-] p                 confirm blocked paste",
-        "  Ctrl-] p                 确认待发送的多行或大段粘贴",
-    ),
-    (
-        "help.byte",
-        "  Ctrl-] Ctrl-]            send byte 0x1d",
-        "  Ctrl-] Ctrl-]            发送字节 0x1d",
-    ),
-    (
-        "help.interrupt",
-        "  Ctrl-C                   send ETX (0x03); LINE draft is cleared",
-        "  Ctrl-C                   发送 ETX (0x03)；LINE 草稿会清空",
-    ),
-    (
-        "help.quit",
-        "  Ctrl-] q                 quit",
-        "  Ctrl-] q                 退出",
-    ),
-    (
-        "help.line1",
-        "  Enter                    queue command + interaction-profile line ending",
-        "  Enter                    排队命令并附加样机交互方案的换行符",
-    ),
-    (
-        "help.line2",
-        "  Alt-Enter                cooperative direct input; does not take control",
-        "  Alt-Enter                向当前 Agent 任务直接发送，不抢占控制权",
-    ),
-    (
-        "help.line3",
-        "  Up/Down · Ctrl-R · Tab   history / search / complete; empty Agent Enter follows",
-        "  上/下 · Ctrl-R · Tab     历史 / 搜索 / 补全；Agent 任务中空回车只回到最新输出",
-    ),
-    (
-        "help.search.scope",
-        "  Ctrl-R                   search LINE input history",
-        "  Ctrl-R                   搜索 LINE 输入历史",
-    ),
-    (
-        "help.output.search",
-        "  Ctrl-] /                 search durable serial history (text/regex, case, RX/TX, scope)",
-        "  Ctrl-] /                 搜索持久串口历史（文本/正则、大小写、收发方向、范围）",
-    ),
-    (
-        "help.raw1",
-        "  keys / Ctrl-C            send bytes directly; Ctrl-C does not quit",
-        "  按键 / Ctrl-C            直接发送字节；Ctrl-C 不会退出",
-    ),
-    (
-        "help.raw2",
-        "  PageUp/PageDown          sent to device; prefix them for local scroll",
-        "  PageUp/PageDown          发往样机；加前缀才滚动本地历史",
-    ),
-    (
-        "help.paste.note",
-        "Large or multi-line paste is always held for explicit confirmation.",
-        "大段或多行粘贴始终需要手动确认。",
-    ),
-    (
-        "help.expire",
-        "Queued input expires after {}s idle; cancel reconnects and releases this terminal's controls.",
-        "排队输入在 {} 秒无操作后过期；取消时会重新连接，并释放本终端持有的控制权。",
-    ),
-    (
-        "help.replay",
-        "Disconnected input is never replayed after reconnect.",
-        "断线期间的输入不会在重连后补发。",
-    ),
-    (
-        "help.uncertain",
-        "Sent writes without an acknowledgement are uncertain; inspect TX before retrying.",
-        "发送后未收到确认的结果并不确定；重试前请先检查发送记录。",
-    ),
+    ("help.key.quit", "Ctrl-] q", "Ctrl-] q"),
+    ("help.desc.quit", "Quit serialctl", "退出 serialctl"),
     (
         "help.close",
         "PgUp/PgDn scroll · Home/End jump · Esc or ? closes help.",
@@ -1645,16 +1377,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "{}（{}）；重新连接会取消当前操作方的队列，并释放其在所有串口上的控制权",
     ),
     (
-        "st.cancel.full",
-        "cannot cancel queued control: outbound queue is full",
-        "无法取消控制权排队请求：发送队列已满",
-    ),
-    (
-        "st.cancel.stopped",
-        "cannot cancel queued control: network worker stopped",
-        "无法取消控制权排队请求：网络任务已停止",
-    ),
-    (
         "st.idle.release",
         "{}: releasing idle human control after {} seconds",
         "{}：人工控制权已空闲 {} 秒，正在释放",
@@ -1667,12 +1389,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "st.prefix.hint",
         "command prefix: 1-9 serial port, m menu, o profiles, h command purposes, l/r mode, PgUp/PgDn scroll, t takeover, u queue, c release/cancel, ? help",
-        "快捷键前缀：1-9 串口，m 菜单，o 配置方案，h 命令用途，l/r 模式，PgUp/PgDn 滚动，t 接管，u 队列，c 释放/取消，? 帮助",
+        "快捷键前缀：1-9 串口，m 菜单，o Profile，h 命令用途，l/r 模式，PgUp/PgDn 滚动，t 接管，u 队列，c 释放/取消，? 帮助",
     ),
     (
         "st.line.mode",
         "LINE mode: Enter sends the line plus the interaction-profile line ending",
-        "LINE 模式：回车发送该行，并附加样机交互方案的换行符",
+        "LINE 模式：回车发送该行，并附加机型 Profile 的换行符",
     ),
     (
         "st.raw.mode",
@@ -1689,11 +1411,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "st.compact",
         "compact timeline: markers and inline highlighting",
         "紧凑时间线：显示标记和行内高亮",
-    ),
-    (
-        "st.logs.hint",
-        "use `serialctl logs --contains TEXT` for durable history search",
-        "使用 `serialctl logs --contains TEXT` 进行持久历史搜索",
     ),
     (
         "st.output.search.open",
@@ -1768,7 +1485,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     (
         "st.menu.profile.open",
         "profile selection opened",
-        "已打开配置方案选择",
+        "已打开 Profile 选择",
     ),
     (
         "st.menu.closed",
@@ -1806,9 +1523,49 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "串口输出已定位到命令序号 #{}",
     ),
     (
-        "st.run.jump.missing",
-        "command sequence #{} is outside the retained local display; use persistent history search",
-        "命令序号 #{} 已不在本地显示历史中；请使用持久串口历史搜索",
+        "st.run.jump.overlay",
+        "command sequence #{} has no verifiable output boundary; showing the command only",
+        "命令序号 #{} 没有可验证的输出边界，仅显示命令本身",
+    ),
+    (
+        "st.run.jump.loading",
+        "loading exact command evidence from the journal at sequence #{}",
+        "正在从日志加载命令序号 #{} 的完整证据",
+    ),
+    (
+        "st.run.jump.journal",
+        "exact command evidence loaded from the journal at sequence #{}",
+        "已从日志定位命令序号 #{} 的完整证据",
+    ),
+    (
+        "st.run.jump.gap",
+        "command sequence #{} is unavailable: journal gap #{}-#{} ({})",
+        "无法定位命令序号 #{}：日志缺失 #{}–#{}（{}）",
+    ),
+    (
+        "st.run.jump.incomplete",
+        "command evidence #{}-#{} is no longer fully retained or has no verified boundary",
+        "命令证据 #{}–#{} 已无法完整读取或没有可验证的结束边界",
+    ),
+    (
+        "st.run.jump.limit",
+        "command evidence at sequence #{} exceeds the bounded display query",
+        "命令序号 #{} 的证据超出单次显示查询上限",
+    ),
+    (
+        "st.run.jump.query.failed",
+        "command evidence query failed: {}",
+        "命令证据查询失败：{}",
+    ),
+    (
+        "st.run.jump.query.busy",
+        "another exact evidence query is still queued",
+        "已有完整证据查询正在排队",
+    ),
+    (
+        "st.run.jump.query.unavailable",
+        "exact command evidence query is unavailable",
+        "命令完整证据查询当前不可用",
     ),
     (
         "st.clipboard.copy.failed",
@@ -1991,7 +1748,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("doctor.field.control", "Control", "控制权"),
     ("doctor.field.run", "Agent Run", "Agent 任务"),
     ("doctor.field.trigger", "Trigger", "触发任务"),
-    ("doctor.field.profiles", "Profiles", "配置方案"),
+    ("doctor.field.profiles", "Profiles", "Profile"),
     ("doctor.field.transport", "Effective UART", "生效串口参数"),
     ("doctor.field.pacing", "Write pacing", "分段发送"),
     ("doctor.field.eol", "Write EOL", "发送换行符"),
@@ -2074,8 +1831,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("doctor.value.trigger", "{} · {}", "{} · {}"),
     (
         "doctor.value.profiles",
-        "UART={} · DUT interaction={}",
-        "串口参数方案={} · 样机交互方案={}",
+        "Serial Profile={} · Model Profile={}",
+        "串口 Profile={} · 机型 Profile={}",
     ),
     (
         "doctor.value.transport",
@@ -2373,39 +2130,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "选择要配置的串口（使用逗号分隔编号）",
     ),
     (
-        "i.profile.note",
-        "\nNew ports use: 115200 8N1, no flow control, DTR/RTS low, TX EOL \\r, echo on, no guessed device prompt, probe disabled, auto-open.",
-        "\n新串口通道默认使用：115200 8N1、无流控、DTR/RTS 低电平、TX 换行符 \\r、开启回显、不猜测样机提示符、关闭探测、自动打开。",
-    ),
-    (
-        "i.existing.keep",
-        "Previously configured ports keep their Profile and serial settings.",
-        "此前配置过的端口会保留原串口参数方案和样机交互方案。",
-    ),
-    (
         "i.omitted.header",
         "\nExisting ports not selected in this scan:",
         "\n本次扫描未选择的已有串口：",
     ),
     (
-        "i.omitted.note",
-        "  {} → {} (kept by default, including when the COM port is temporarily absent)",
-        "  {} → {}（默认保留，即使 COM 口暂时不可用）",
-    ),
-    (
         "i.omitted.delete",
         "Explicitly delete these omitted ports from seriald configuration?",
         "是否从 seriald 配置中删除这些未选择的串口？",
-    ),
-    (
-        "i.omitted.deleting",
-        "Deleting {} explicitly omitted port(s).",
-        "正在删除 {} 个未选择的串口。",
-    ),
-    (
-        "i.omitted.keeping",
-        "Keeping {} existing port(s).",
-        "保留 {} 个已有串口。",
     ),
     (
         "i.configured",
@@ -2421,11 +2153,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "i.open.console",
         "Run `serialctl` to open the multi-port console.",
         "运行 `serialctl` 打开多串口控制台。",
-    ),
-    (
-        "i.interactive",
-        "this command requires an interactive terminal",
-        "此命令需要交互式终端",
     ),
     (
         "i.invalid.selection",
@@ -2493,9 +2220,9 @@ mod tests {
     #[test]
     fn language_switch_picks_the_matching_column() {
         let _guard = lang_test_lock();
-        assert_eq!(tr("ui.paused"), " · PAUSED");
+        assert_eq!(tr("state.online"), "ONLINE");
         set_lang(Lang::Zh);
-        assert_eq!(tr("ui.paused"), " · 已暂停");
+        assert_eq!(tr("state.online"), "在线");
         set_lang(Lang::En);
     }
 
@@ -2532,12 +2259,14 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_chinese_names_use_the_two_profile_sections() {
+    fn main_menu_chinese_names_match_the_current_configuration_flow() {
         let _guard = lang_test_lock();
         set_lang(Lang::Zh);
-        assert_eq!(tr("menu.root.profile"), "当前串口完整配置");
-        assert_eq!(tr("menu.root.serial"), "快速创建串口参数方案");
-        assert!(tr("menu.current").contains("当前串口"));
+        assert_eq!(tr("menu.root.profile"), "修改当前串口配置");
+        assert_eq!(tr("menu.root.create"), "创建配置 Profile");
+        assert_eq!(tr("menu.root.settings"), "设置");
+        assert_eq!(tr("menu.root.help"), "帮助");
+        assert!(tr("menu.current").contains("串口："));
         assert!(tr("menu.current").contains("串口 Profile"));
         assert!(tr("menu.current").contains("机型 Profile"));
         assert!(!tr("menu.current").contains("Transport"));

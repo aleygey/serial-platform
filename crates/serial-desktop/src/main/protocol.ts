@@ -4,6 +4,8 @@ const CONTROL = 0x01
 const RX = 0x02
 const TX = 0x03
 
+export const SERIAL_PROTOCOL_VERSION = 5
+
 export interface WireControl {
   type: string
   [key: string]: unknown

@@ -16,7 +16,9 @@ use std::{
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use serial_protocol::{FlowControl, ModelProfile, SlotConfig, TransportProfile};
+use serial_protocol::{
+    FlowControl, MAX_MODEL_NAMES_PER_PROFILE, ModelProfile, SlotConfig, TransportProfile,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -41,6 +43,7 @@ pub const MAX_TRANSPORT_PROFILES: usize = 128;
 const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PORT_NAME_BYTES: usize = 512;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
+const MAX_MODEL_NAME_BYTES: usize = 128;
 const MAX_PROMPT_PATTERN_BYTES: usize = 4096;
 
 /// Files owned by one serial-platform installation.
@@ -337,8 +340,15 @@ impl ConfigStore {
         } else {
             let config = DaemonConfig::generate();
             config.validate()?;
-            self.save(&config)?;
-            config
+            let serialized =
+                toml::to_string_pretty(&config).map_err(|_| ConfigError::Serialization)?;
+            if atomic_create(&self.paths.config_file, serialized.as_bytes())
+                .map_err(|source| io_error(&self.paths.config_file, source))?
+            {
+                config
+            } else {
+                self.load()?
+            }
         };
 
         Ok(LoadedConfig {
@@ -520,6 +530,17 @@ pub enum ConfigValidationError {
         name: String,
         available: String,
     },
+    #[error("port {port} cannot bind concrete model {name:?} without a model profile")]
+    ModelNameWithoutProfile { port: String, name: String },
+    #[error(
+        "port {port} references model {name:?}, which is not in profile {profile:?}; available models: {available}"
+    )]
+    UnknownModelName {
+        port: String,
+        profile: String,
+        name: String,
+        available: String,
+    },
 }
 
 fn validate_logging(logging: &LoggingConfig) -> Result<(), ConfigValidationError> {
@@ -586,21 +607,43 @@ pub(crate) fn validate_ports(
             }
         }
 
-        if let Some(model_profile) = slot.model_profile.as_deref()
-            && !model_profiles
-                .iter()
-                .any(|profile| profile.name == model_profile)
-        {
-            let available = model_profiles
-                .iter()
-                .map(|profile| profile.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ConfigValidationError::UnknownModelProfile {
-                port: slot.port.clone(),
-                name: model_profile.to_owned(),
-                available: catalog_summary(available),
-            });
+        let bound_model_profile = match slot.model_profile.as_deref() {
+            Some(model_profile) => {
+                let Some(profile) = model_profiles
+                    .iter()
+                    .find(|profile| profile.name == model_profile)
+                else {
+                    let available = model_profiles
+                        .iter()
+                        .map(|profile| profile.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(ConfigValidationError::UnknownModelProfile {
+                        port: slot.port.clone(),
+                        name: model_profile.to_owned(),
+                        available: catalog_summary(available),
+                    });
+                };
+                Some(profile)
+            }
+            None => None,
+        };
+        if let Some(model_name) = slot.model_name.as_deref() {
+            validate_text_field(index, "model_name", model_name, MAX_MODEL_NAME_BYTES)?;
+            let Some(profile) = bound_model_profile else {
+                return Err(ConfigValidationError::ModelNameWithoutProfile {
+                    port: slot.port.clone(),
+                    name: model_name.to_owned(),
+                });
+            };
+            if !profile.model_names.iter().any(|name| name == model_name) {
+                return Err(ConfigValidationError::UnknownModelName {
+                    port: slot.port.clone(),
+                    profile: profile.name.clone(),
+                    name: model_name.to_owned(),
+                    available: catalog_summary(profile.model_names.join(", ")),
+                });
+            }
         }
 
         let port_key = port_identity_key(&slot.port);
@@ -707,6 +750,28 @@ pub(crate) fn validate_model_profiles(
                 first,
                 second: index,
             });
+        }
+        if profile.model_names.len() > MAX_MODEL_NAMES_PER_PROFILE {
+            return Err(ConfigValidationError::InvalidModelProfile {
+                index,
+                field: "model_names",
+                reason: "must contain at most 128 concrete model names",
+            });
+        }
+        let mut model_names = HashSet::new();
+        for model_name in &profile.model_names {
+            if model_name.is_empty()
+                || model_name.len() > MAX_MODEL_NAME_BYTES
+                || model_name != model_name.trim()
+                || model_name.chars().any(char::is_control)
+                || !model_names.insert(model_name)
+            {
+                return Err(ConfigValidationError::InvalidModelProfile {
+                    index,
+                    field: "model_names",
+                    reason: "each model name must be non-empty, trimmed, unique, and at most 128 bytes",
+                });
+            }
         }
         for (field, pattern) in [
             ("shell_prompt", profile.shell_prompt.as_deref()),
@@ -845,6 +910,36 @@ pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Publishes fully-written contents only when the target is still absent.
+/// Hard-link creation is atomic within one directory, so concurrent first
+/// launchers all load the one winning installation identity.
+fn atomic_create(target: &Path, contents: &[u8]) -> io::Result<bool> {
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "configuration has no parent")
+    })?;
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("seriald.toml");
+    let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    let mut temporary = open_private_temporary(&temporary_path)?;
+    let result = (|| {
+        temporary.write_all(contents)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        match fs::hard_link(&temporary_path, target) {
+            Ok(()) => {
+                sync_parent_directory(parent)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = fs::remove_file(&temporary_path);
+    result
+}
+
 fn open_private_temporary(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -960,6 +1055,7 @@ mod tests {
     fn model_profile(name: &str) -> ModelProfile {
         ModelProfile {
             name: name.into(),
+            model_names: vec!["TL-AS7230-W 1.0".into(), "TL-AS7230-F4GE 1.0".into()],
             shell_prompt: Some("/ # ".into()),
             uboot_prompt: Some("U-Boot> ".into()),
             write_eol: Some("\r".into()),
@@ -974,6 +1070,7 @@ mod tests {
             port: port.into(),
             transport_profile: None,
             model_profile: None,
+            model_name: None,
             enabled: false,
         }
     }
@@ -1027,6 +1124,7 @@ mod tests {
         let mut configured = slot("COM4");
         configured.transport_profile = Some("uart".into());
         configured.model_profile = Some("TL-AS7230 1.0".into());
+        configured.model_name = Some("TL-AS7230-W 1.0".into());
         config.ports = vec![configured];
         config.validate().unwrap();
 
@@ -1038,6 +1136,29 @@ mod tests {
     }
 
     #[test]
+    fn concrete_model_name_must_belong_to_the_bound_profile() {
+        let mut config = DaemonConfig::generate();
+        config.model_profiles = vec![model_profile("TL-AS7230")];
+        let mut configured = slot("COM4");
+        configured.model_profile = Some("TL-AS7230".into());
+        configured.model_name = Some("TL-AS7230-W 1.0".into());
+        config.ports = vec![configured];
+        config.validate().unwrap();
+
+        config.ports[0].model_name = Some("TL-AS9999".into());
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::UnknownModelName { .. })
+        ));
+
+        config.ports[0].model_profile = None;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::ModelNameWithoutProfile { .. })
+        ));
+    }
+
+    #[test]
     fn store_creates_and_reloads_the_clean_schema() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
@@ -1045,5 +1166,33 @@ mod tests {
         assert_eq!(created.config.schema_version, CONFIG_SCHEMA_VERSION);
         let loaded = store.load().unwrap();
         assert_eq!(loaded.server_id, created.config.server_id);
+    }
+
+    #[test]
+    fn concurrent_first_loaders_share_one_generated_server_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let workers = 12;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.load_or_create().unwrap().config.server_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            identities
+                .iter()
+                .all(|server_id| *server_id == identities[0])
+        );
+        assert_eq!(store.load().unwrap().server_id, identities[0]);
     }
 }

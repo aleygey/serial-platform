@@ -10,7 +10,13 @@ import type {
   TimelineEvent,
   TransportProfile
 } from '../shared/contracts'
-import { decodeFrame, encodeControl, normalizeTimelineEvent, type WireControl } from './protocol'
+import {
+  decodeFrame,
+  encodeControl,
+  normalizeTimelineEvent,
+  SERIAL_PROTOCOL_VERSION,
+  type WireControl
+} from './protocol'
 import { ReconnectLoop } from './reconnect-loop'
 
 interface StatusResponse {
@@ -19,6 +25,12 @@ interface StatusResponse {
   protocol_version: number
   config_revision: number
   ports: PortSnapshot[]
+}
+
+export interface SerialdHealthIdentity {
+  serverId: string
+  daemonEpoch: string
+  protocolVersion: number
 }
 
 interface ProfileList<T> {
@@ -85,11 +97,17 @@ export class SerialClient extends EventEmitter {
 
   async healthReachable(): Promise<boolean> {
     try {
-      await this.request('/api/v1/health', { timeout: 1_500 })
+      await this.healthIdentity()
       return true
     } catch {
       return false
     }
+  }
+
+  async healthIdentity(): Promise<SerialdHealthIdentity> {
+    return parseSerialdHealth(
+      await this.request('/api/v1/health', { timeout: 1_500 })
+    )
   }
 
   async start(): Promise<ServerData> {
@@ -108,10 +126,14 @@ export class SerialClient extends EventEmitter {
       this.get<ProfileList<TransportProfile>>('/api/v1/config/transport-profiles'),
       this.get<ProfileList<ModelProfile>>('/api/v1/config/model-profiles')
     ])
+    assertCompatibleProtocol(status.protocol_version)
     this.status = status
     this.availablePorts = availablePorts
     this.transportProfiles = transport.profiles
-    this.modelProfiles = models.profiles
+    this.modelProfiles = models.profiles.map((profile) => ({
+      ...profile,
+      model_names: profile.model_names ?? []
+    }))
     if (loadHistory) {
       await Promise.all(status.ports.map((configured) => this.loadHistory(configured)))
     }
@@ -156,12 +178,8 @@ export class SerialClient extends EventEmitter {
           profiles: stage.profiles,
           expected_revision: status.config_revision
         })
-    const next = {
-      port: draft.port,
-      enabled: draft.enabled,
-      transport_profile: stage.selected.name,
-      model_profile: draft.modelProfile ?? null
-    }
+    const existing = status.ports.find((configured) => configured.config.port === draft.port)?.config
+    const next = configuredPortFromDraft(draft, stage.selected.name, existing)
     const ports = status.ports.some((configured) => configured.config.port === draft.port)
       ? status.ports.map((configured) => (configured.config.port === draft.port ? next : configured.config))
       : [...status.ports.map((configured) => configured.config), next]
@@ -297,7 +315,7 @@ export class SerialClient extends EventEmitter {
       encodeControl({
         type: 'hello',
         request_id: randomUUID(),
-        protocol_version: 4,
+        protocol_version: SERIAL_PROTOCOL_VERSION,
         client_name: 'serial-platform-desktop',
         actor_kind: 'human'
       })
@@ -539,6 +557,46 @@ export class SerialClient extends EventEmitter {
   }
 }
 
+export function assertCompatibleProtocol(actual: number): void {
+  if (actual !== SERIAL_PROTOCOL_VERSION) {
+    throw new Error(
+      `组件协议不兼容：App 需要 v${SERIAL_PROTOCOL_VERSION}，后端提供 v${actual}。请使用同一版本的 serial 与 App。`
+    )
+  }
+}
+
+export function parseSerialdHealth(value: unknown): SerialdHealthIdentity {
+  if (!value || typeof value !== 'object') throw new Error('后端健康响应格式无效')
+  const health = value as Record<string, unknown>
+  if (health.status !== 'ok') throw new Error(`后端健康状态无效：${String(health.status)}`)
+  if (!validUuid(health.server_id) || !validUuid(health.daemon_epoch)) {
+    throw new Error('后端健康响应缺少有效的服务身份')
+  }
+  if (typeof health.protocol_version !== 'number') {
+    throw new Error('后端健康响应缺少组件协议版本')
+  }
+  assertCompatibleProtocol(health.protocol_version)
+  return {
+    serverId: health.server_id,
+    daemonEpoch: health.daemon_epoch,
+    protocolVersion: health.protocol_version
+  }
+}
+
+export function serialdIdentityMatches(
+  actual: SerialdHealthIdentity,
+  expected: SerialdHealthIdentity
+): boolean {
+  return actual.protocolVersion === expected.protocolVersion
+    && actual.serverId === expected.serverId
+    && actual.daemonEpoch === expected.daemonEpoch
+}
+
+function validUuid(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+}
+
 export function contentAddressedTransportProfile(port: string, profile: TransportProfile): TransportProfile {
   const settings = transportSettings(profile)
   const hash = createHash('sha256').update(JSON.stringify(settings)).digest('hex').slice(0, 10)
@@ -557,6 +615,28 @@ export function stageTransportCatalog(
   const selected = retained.find((item) => sameTransportSettings(item, candidate)) ?? candidate
   const profiles = retained.some((item) => item.name === selected.name) ? retained : [...retained, selected]
   return { selected, profiles }
+}
+
+export function configuredPortFromDraft(
+  draft: SerialConfigurationDraft,
+  transportProfile: string,
+  existing?: PortSnapshot['config']
+): PortSnapshot['config'] {
+  const modelProfile = draft.modelProfile ?? null
+  const modelName = modelProfile === null
+    ? null
+    : draft.modelName !== undefined
+      ? draft.modelName
+      : existing?.model_profile === modelProfile
+        ? existing.model_name ?? null
+        : null
+  return {
+    port: draft.port,
+    enabled: draft.enabled,
+    transport_profile: transportProfile,
+    model_profile: modelProfile,
+    model_name: modelName
+  }
 }
 
 function transportCandidatePrefix(port: string): string {

@@ -32,12 +32,16 @@ export function createQaSnapshot(preferences: DesktopPreferences = {
       stop_bits: 'one', flow_control: 'none', dtr: false, rts: false, auto_open: true
     }],
     modelProfiles: [{
-      name: 'TL-AS7230 1.0', shell_prompt: 'root@router:~# ', uboot_prompt: '=> ',
+      name: 'TL-AS7230 Family', model_names: ['TL-AS7230-W 1.0', 'TL-AS7230-F4GE 2.0'],
+      shell_prompt: 'root@router:~# ', uboot_prompt: '=> ',
       write_eol: '\r', echo: 'auto', write_chunk_size: 1, write_chunk_delay_ms: 2
     }],
     configuredPorts: [
       {
-        config: { port: 'COM6', transport_profile: '115200-8N1', model_profile: 'TL-AS7230 1.0', enabled: true },
+        config: {
+          port: 'COM6', transport_profile: '115200-8N1', model_profile: 'TL-AS7230 Family',
+          model_name: 'TL-AS7230-W 1.0', enabled: true
+        },
         daemon_epoch: 'qa-epoch', head_seq: 119, generation: 2, endpoint_present: true,
         session_state: 'online', effective_shell_prompt: 'root@router:~# ',
         effective_uboot_prompt: '=> ', effective_write_eol: '\r'

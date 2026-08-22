@@ -1,4 +1,4 @@
-# Serial Platform Protocol v4
+# Serial Platform Protocol v5
 
 本文是 `seriald` HTTP/WebSocket 和 `serial-mcp` transport 的当前线协议说明。Rust DTO 与编码实现位于 `serial-protocol`；Agent 工具参数见 [MCP_TOOLS.md](./MCP_TOOLS.md)。
 
@@ -20,7 +20,27 @@ MCP Streamable HTTP:    http://127.0.0.1:3211/mcp
 
 JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端口字符串。
 
+## 本地活动端点
+
+同一 resolved data root 中，`data/seriald.lock` 在 journal 打开前只允许一个 `seriald` 实例进入；监听成功后，该实例发布 `data/active-endpoint.json`：
+
+```json
+{
+  "schema_version": 1,
+  "endpoint": "http://127.0.0.1:3210",
+  "address": "127.0.0.1:3210",
+  "server_id": "uuid",
+  "daemon_epoch": "uuid",
+  "protocol_version": 5,
+  "pid": 12345
+}
+```
+
+记录只是发现入口。客户端必须调用其中 endpoint 的 `GET /api/v1/health`，并确认 `status=ok`、`server_id`、`daemon_epoch` 和 `protocol_version` 全部与记录一致后才能复用。`address` 来自实际 listener 地址，通配 bind 会转换为本机可连接的 loopback。失效记录不会阻止新实例取得 OS lock 并覆写；拥有进程正常退出时只清理与自身 `server_id`、`daemon_epoch` 一致的记录。
+
 ## HTTP v1
+
+`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=5`；路由仍保持 `/api/v1/...`。
 
 ### 路由
 
@@ -43,7 +63,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `GET` / `PUT` / `DELETE` | `/api/v1/monitors/{monitor_id}` | 读取/更新/停止 Monitor |
 | `GET` | `/api/v1/monitors/{monitor_id}/incidents` | 分页读取 incident |
 | `POST` | `/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | 确认 incident |
-| `GET` | `/api/v1/ws` | WebSocket protocol v4 |
+| `GET` | `/api/v1/ws` | WebSocket protocol v5 |
 
 ### Health
 
@@ -53,7 +73,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "server_id": "uuid",
   "daemon_epoch": "uuid",
   "uptime_ms": 1200,
-  "protocol_version": 4
+  "protocol_version": 5
 }
 ```
 
@@ -65,7 +85,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 {
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 4,
+  "protocol_version": 5,
   "config_revision": 12,
   "sequence_write_precondition_supported": true,
   "serial_context_precondition_supported": true,
@@ -80,7 +100,8 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "config": {
     "port": "COM4",
     "transport_profile": "uart-115200",
-    "model_profile": "TL-AS7230 1.0",
+    "model_profile": "TL-AS7230",
+    "model_name": "TL-AS7230-W 1.0",
     "enabled": true
   },
   "daemon_epoch": "uuid",
@@ -132,7 +153,8 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
     {
       "port": "COM4",
       "transport_profile": "uart-115200",
-      "model_profile": "TL-AS7230 1.0",
+      "model_profile": "TL-AS7230",
+      "model_name": "TL-AS7230-W 1.0",
       "enabled": true
     }
   ],
@@ -163,7 +185,11 @@ Model Profile：
 
 ```json
 {
-  "name": "TL-AS7230 1.0",
+  "name": "TL-AS7230",
+  "model_names": [
+    "TL-AS7230-W 1.0",
+    "TL-AS7230-F4GE 1.0"
+  ],
   "shell_prompt": "root@router:~# ",
   "uboot_prompt": "=> ",
   "write_eol": "\r",
@@ -173,7 +199,9 @@ Model Profile：
 }
 ```
 
-Profile catalog GET 响应是 `{profiles, config_revision}`；PUT body 是 `{profiles, expected_revision?}`，表示完整替换。Profile 名称按原字符串比较和显示。
+`ModelProfile.name` 是可复用的机型系列/交互 Profile 名称，`model_names` 是该系列允许绑定的具体机型名。端口的 `model_name` 必须来自当前 `model_profile.model_names`；未绑定机型 Profile 时不能保留具体机型名。两者都按原字符串比较和显示。
+
+Profile catalog GET 响应是 `{profiles, config_revision}`；PUT body 是 `{profiles, expected_revision?}`，表示完整替换。
 
 ### TimelineEvent
 
@@ -231,7 +259,7 @@ Agent command TX 的 metadata 可以包含：
 
 matcher kind 为 `contains`、`regex`、`shell_prompt` 或 `uboot_prompt`。数组为空时省略。
 
-端口机型变化的 `port_reconfigured` metadata 包含 `source`、`previous_model_profile` 和 `new_model_profile`。
+端口机型变化的 `port_reconfigured` metadata 包含 `source`、`previous_model_profile`、`new_model_profile`、`previous_model_name` 和 `new_model_name`。
 
 ### Archive 与 events
 
@@ -298,7 +326,7 @@ tail 使用 `EventQueryResponse` 结构。`truncated` 或 `gaps` 明确表示 ri
 
 ### Recent activity
 
-`GET /api/v1/ports/{port}/recent-activity` 必须同时提供 `epoch`、`after_seq`、`through_seq`。它只从 ring 返回最多 32 条与协同上下文有关的 TX、Control、Run 中止、端口重配或移除事件，排除普通 RX，避免高流量端口放大 MCP 结果。
+`GET /api/v1/ports/{port}/recent-activity` 必须同时提供 `epoch`、`after_seq`、`through_seq`。它只从 ring 返回最多 32 条与协同上下文有关的 TX、Control、Run 中止、端口重配或移除事件，排除普通 RX。端口重配摘要同时携带机型 Profile 和具体机型名的前后值。
 
 ### Diagnostics
 
@@ -313,7 +341,10 @@ Monitor spec：
 ```json
 {
   "port": "COM4",
-  "contains": "watchdog",
+  "matchers": [
+    {"kind": "contains", "value": "watchdog"},
+    {"kind": "regex", "value": "(?i)kernel panic|oops"}
+  ],
   "start_cursor": {"epoch": "uuid", "after_seq": 100},
   "severity": "warning",
   "description": "观察复位",
@@ -323,11 +354,42 @@ Monitor spec：
 }
 ```
 
-`contains` 与 `regex` 二选一。创建 body 是 `{request_id, spec}`，其中 `request_id` 同时作为幂等创建 ID。更新 body 是 `{spec, expected_revision}`；DELETE query 必须提供 `expected_revision`。
+`matchers` 包含 1–16 个条件，每项是 `contains` 或 bounded `regex`。所有条件按 OR 计算；单项最多 4096 UTF-8 bytes，整组最多 16384 bytes。创建 body 是 `{request_id, spec}`，其中 `request_id` 同时作为幂等创建 ID。更新 body 是 `{spec, expected_revision}`；DELETE query 必须提供 `expected_revision`。
+
+一个 incident 会记录 debounce window 内命中的去重条件和精确串口范围：
+
+```json
+{
+  "id": "uuid",
+  "incident_seq": 3,
+  "monitor_id": "uuid",
+  "port": "COM4",
+  "daemon_epoch": "uuid",
+  "seq_start": 820,
+  "seq_end": 824,
+  "wall_time_start_ns": 1770000000000000000,
+  "wall_time_end_ns": 1770000000250000000,
+  "severity": "warning",
+  "matches": [
+    {
+      "index": 1,
+      "matcher": {"kind": "regex", "value": "(?i)kernel panic|oops"}
+    }
+  ],
+  "preview": "kernel panic ...",
+  "evidence_cursor": {"epoch": "uuid", "after_seq": 819},
+  "evidence_ref": "serial://server/ports/COM4/events?epoch=uuid&after_seq=819&through_seq=824",
+  "created_wall_time_ns": 1770000000251000000
+}
+```
+
+`matches[].index` 对应 `MonitorSpec.matchers` 的下标。HTTP 使用 `daemon_epoch`、`seq_start`、`seq_end` 三个原始字段；MCP `monitor_incidents` 将它们组合为 `serial_range`。
+
+`serial_range` 也是 UI 定位证据的权威边界。当前 TUI 本地窗口不含完整范围时，客户端使用 incident 的 `daemon_epoch` 查询 `/api/v1/ports/{port}/events`，设置 `after_seq=seq_start-1` 和包含式 `through_seq=seq_end`。只有首尾与中间序号都完整连续、且没有重叠 gap 时才显示并高亮 RX 证据；这样旧后端周期和已从本地窗口淘汰的内容仍可从 journal 恢复，而 retention gap 不会被伪装成完整结果。
 
 列表 query 可使用 `port` 和 `status`。incident query：`after_incident_seq`、`limit`、`include_acked`。incident 响应提供 `next_cursor`、`truncated`、`first_available_incident_seq` 和 `retention_gap`。
 
-## WebSocket protocol v4
+## WebSocket protocol v5
 
 连接地址：`GET /api/v1/ws`。
 
@@ -355,7 +417,7 @@ Monitor spec：
 {
   "type": "hello",
   "request_id": "uuid",
-  "protocol_version": 4,
+  "protocol_version": 5,
   "client_name": "serialctl",
   "actor_kind": "human"
 }
@@ -368,7 +430,7 @@ Monitor spec：
   "type": "welcome",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 4,
+  "protocol_version": 5,
   "actor": {"id": "...", "label": "serialctl", "kind": "human"}
 }
 ```
@@ -484,8 +546,25 @@ Trigger spec 包含 optional initial write、optional start literal、action byt
 `serial-mcp --listen 127.0.0.1:3211` 提供：
 
 ```text
+GET  /health
 POST /mcp
 ```
+
+`GET /health` 只用于统一启动器确认固定 loopback 端口的进程身份和它所连接的 `seriald`，不是 MCP host 的 session 或工具接口。当前响应示例：
+
+```json
+{
+  "status": "ok",
+  "service": "serial-mcp",
+  "protocol_version": 5,
+  "pid": 12345,
+  "seriald_endpoint": "http://127.0.0.1:3210",
+  "seriald_server_id": "uuid",
+  "seriald_daemon_epoch": "uuid"
+}
+```
+
+统一启动器只在 `service`、`protocol_version=5` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
 
 实现是 sessionless JSON-RPC：
 

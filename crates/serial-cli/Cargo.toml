@@ -7,8 +7,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }
 seriald = { path = "../seriald" }
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23"

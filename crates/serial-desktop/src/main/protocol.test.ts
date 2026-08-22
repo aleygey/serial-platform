@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { decodeFrame, encodeControl } from './protocol'
+import { decodeFrame, encodeControl, SERIAL_PROTOCOL_VERSION } from './protocol'
 
 describe('serial wire envelope', () => {
+  it('uses the current shared protocol generation', () => {
+    expect(SERIAL_PROTOCOL_VERSION).toBe(5)
+  })
+
   it('encodes control JSON behind the protocol header', () => {
     const frame = encodeControl({ type: 'ping', request_id: 'request' })
     expect(frame[0]).toBe(1)
@@ -24,7 +28,7 @@ describe('serial wire envelope', () => {
     expect(decoded.kind === 'timeline' && decoded.event.text).toBe('ok\u001b[2J')
   })
 
-  it('keeps the v4 capture matcher array explicit on Human writes', () => {
+  it('keeps the capture matcher array explicit on Human writes', () => {
     const frame = encodeControl({
       type: 'write', request_id: 'request', port: 'COM6', control_id: 'control', fence: 1,
       data: 'dmVyc2lvbg0=', command_capture_matchers: []

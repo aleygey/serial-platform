@@ -24,6 +24,10 @@ serial-mcp    http://127.0.0.1:3211/mcp
 serialctl     foreground TUI
 ```
 
+`serial` 会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。App→`serial` 和 `serial`→App 都会复用这个后端。只有裸 `serial` 会保证 HTTP MCP `127.0.0.1:3211` 可用；App 的 Local Service 只管理 `seriald`。
+
+App 与 `serial` 只停止自己启动的进程。外部 owner 退出后，仍在运行的客户端不会自动 failover；重新启动后才重新发现或创建服务。
+
 ## 选择 MCP transport
 
 ### Streamable HTTP
@@ -96,6 +100,8 @@ capture_max_bytes = 1048576
 
 `orphan_run_timeout_seconds=0` 表示不限时；其他值至少 300 秒。命令行 `--orphan-run-timeout-seconds` 或环境变量 `SERIAL_MCP_ORPHAN_RUN_TIMEOUT_SECONDS` 对新启动进程优先。正常 Agent 工作流仍在最终回复前调用 `run_end`。
 
+未使用命令行 timeout override 时，运行中的 adapter 会监视共享配置。TUI 的 “serial MCP 设置” 保存后自动生效，不需要人工重启 MCP。
+
 ## 工具发现
 
 adapter 暴露固定 19 项：
@@ -118,28 +124,14 @@ serial mcp --dump-tools
 
 更新 adapter 后，让 MCP host 重新执行 `tools/list`。所有设备参数统一使用 `port`。
 
-OpenCode 会把 server 名作为工具前缀，例如 `serial_devices`、`serial_command_sequence` 和 `serial_model_profile_set`。如果 OpenCode 配置显式列出 tool permission，需要覆盖全部 19 项；纯观察工具可以直接允许，物理写入和配置变化可以按使用习惯要求确认。
-
-纯观察工具：
-
-```text
-devices model_profiles read wait search
-monitor_list monitor_status monitor_incidents
-```
-
-改变配置、后端状态或物理设备的工具：
-
-```text
-model_profile_set command command_sequence input signal trigger
-monitor_start monitor_stop run_start run_end release
-```
+OpenCode 会把 server 名作为工具前缀，例如 `serial_devices`、`serial_command_sequence` 和 `serial_model_profile_set`。Serial Platform 本身不要求 token、Header 或角色配置；MCP host 自己的工具确认策略不改变协议参数。
 
 ## Agent 指令建议
 
 MCP initialize 已提供服务器指令。若 host 支持附加 prompt，可以保持为以下短规则：
 
 ```text
-先调用 devices 和 model_profiles，明确选择 port 并核对实际机型。
+先调用 devices 和 model_profiles，明确选择 port 并核对机型 Profile、具体 model_name 与实际设备。
 写入前调用 run_start，并在同一工作流中保存 run_handle。
 普通命令用 command；账号/密码等已知依赖交互用一次 command_sequence。
 每个 command/step 都填写简洁 description。
@@ -171,21 +163,28 @@ MCP initialize 已提供服务器指令。若 host 支持附加 prompt，可以�
 }
 ```
 
-adapter 在发送下一步之前等待当前 matcher。任一步失败，所有剩余步骤不再写入。每步独立进入审计历史，并可在 TUI/App 中单独选择和定位 RX 输出。
+adapter 在发送下一步之前等待当前 matcher。任一步失败，所有剩余步骤不再写入。每步独立进入审计历史；TUI 先显示整个 sequence action，展开后可逐步选择、跳转并高亮各自的 RX 捕获区间。
 
 ## Monitor
 
-`monitor_start` 在 `seriald` 中创建一个持久 literal/regex matcher，并立即返回。stdio 进程退出不停止 Monitor。
+`monitor_start` 在 `seriald` 中创建一个持久 Monitor，并立即返回。一个任务可带 1–16 个 literal/regex 条件，按 OR 匹配；stdio 进程退出不停止 Monitor。
 
 ```json
 {
   "port": "COM4",
-  "regex": "(?i)kernel panic|watchdog",
+  "matchers": [
+    {"kind":"contains","value":"watchdog"},
+    {"kind":"regex","value":"(?i)kernel panic|oops"}
+  ],
   "description": "观察设备异常复位"
 }
 ```
 
-后续用 `monitor_status` 或 `monitor_list` 查看状态；`monitor_incidents` 读取 incident tail，并将返回的十进制 `next_after` 原样用于下一页或后续轮询。`monitor_stop` 停止未来匹配，保留已有 incident。
+后续用 `monitor_status` 或 `monitor_list` 查看状态；`monitor_incidents` 返回命中的条件与精确 `serial_range`，并将十进制 `next_after` 原样用于下一页或后续轮询。`monitor_stop` 停止未来匹配，保留已有 incident。
+
+## 人工协作后的 Agent 上下文
+
+人工在活动 Agent Run 中使用 `Alt+Enter` 会产生 cooperative TX，但不会转移 Agent Control。Agent 下一次物理写会在发送前收到 `context_changed` tool error，结果包含 `no_bytes_written=true` 和 `recent_context`。先用 `read(scope=tail)` 或 `wait` 阅读并确认新的串口状态，再决定是否重试；连续操作间没有第三方变化时不会附加 `recent_context`。
 
 ## Cursor 与长时间运行
 

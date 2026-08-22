@@ -77,6 +77,33 @@ pub(crate) fn ensure_welcome_protocol(protocol_version: u16) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpectedDaemonIdentity {
+    pub server_id: Uuid,
+    pub daemon_epoch: Uuid,
+}
+
+fn ensure_welcome_identity(
+    expected: Option<ExpectedDaemonIdentity>,
+    server_id: Uuid,
+    daemon_epoch: Uuid,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.server_id != server_id || expected.daemon_epoch != daemon_epoch {
+        bail!(
+            "seriald identity changed while serial-mcp was running: expected server {} epoch {}, \
+             but the WebSocket welcomed server {} epoch {}; restart serial-mcp",
+            expected.server_id,
+            expected.daemon_epoch,
+            server_id,
+            daemon_epoch
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct SessionHandle {
     tx: mpsc::Sender<SessionRequest>,
@@ -139,6 +166,10 @@ enum RunLifecycle {
 }
 
 enum SessionRequest {
+    UpdateRunIdleTtl {
+        run_idle_ttl: Option<Duration>,
+        reply: oneshot::Sender<()>,
+    },
     ActorIdentity {
         reply: Reply,
     },
@@ -247,15 +278,34 @@ enum SessionResponse {
 }
 
 impl SessionHandle {
-    pub fn spawn(endpoint: String, actor_label: String, run_idle_ttl: Option<Duration>) -> Self {
+    pub fn spawn(
+        endpoint: String,
+        actor_label: String,
+        run_idle_ttl: Option<Duration>,
+        expected_daemon: Option<ExpectedDaemonIdentity>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(32);
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_session(
-            SessionState::with_run_idle_ttl(endpoint, actor_label, run_idle_ttl),
+            SessionState::with_run_idle_ttl(endpoint, actor_label, run_idle_ttl, expected_daemon),
             rx,
             lifecycle_rx,
         ));
         Self { tx, lifecycle_tx }
+    }
+
+    pub async fn update_run_idle_ttl(&self, run_idle_ttl: Option<Duration>) -> Result<()> {
+        let (reply, applied) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::UpdateRunIdleTtl {
+                run_idle_ttl,
+                reply,
+            })
+            .await
+            .context("serial session task stopped")?;
+        applied
+            .await
+            .context("serial session task stopped before applying Run timeout")
     }
 
     pub async fn local_control_state(&self, port: String) -> Result<LocalControlState> {
@@ -607,6 +657,7 @@ impl OwnedRun {
 struct SessionState {
     endpoint: String,
     actor_label: String,
+    expected_daemon: Option<ExpectedDaemonIdentity>,
     socket: Option<Socket>,
     actor: Option<Actor>,
     leases: HashMap<String, ControlLease>,
@@ -619,10 +670,12 @@ impl SessionState {
         endpoint: String,
         actor_label: String,
         run_idle_ttl: Option<Duration>,
+        expected_daemon: Option<ExpectedDaemonIdentity>,
     ) -> Self {
         Self {
             endpoint,
             actor_label,
+            expected_daemon,
             socket: None,
             actor: None,
             leases: HashMap::new(),
@@ -633,6 +686,14 @@ impl SessionState {
 
     async fn handle(&mut self, request: SessionRequest) {
         match request {
+            SessionRequest::UpdateRunIdleTtl {
+                run_idle_ttl,
+                reply,
+            } => {
+                self.run_idle_ttl = run_idle_ttl;
+                self.renew_all().await;
+                let _ = reply.send(());
+            }
             SessionRequest::ActorIdentity { reply } => {
                 send_reply(
                     reply,
@@ -945,10 +1006,13 @@ impl SessionState {
             match next_frame(&mut socket).await? {
                 WireFrame::Control(ServerMessage::Welcome {
                     protocol_version,
+                    server_id,
+                    daemon_epoch,
                     actor,
                     ..
                 }) => {
                     ensure_welcome_protocol(protocol_version)?;
+                    ensure_welcome_identity(self.expected_daemon, server_id, daemon_epoch)?;
                     self.actor = Some(actor);
                     self.socket = Some(socket);
                     return Ok(());
@@ -1936,4 +2000,67 @@ fn ws_url(endpoint: &str) -> Result<String> {
         .strip_prefix("http://")
         .context("seriald endpoint is not an http:// origin")?;
     Ok(format!("ws://{rest}/api/v1/ws"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_idle_timeout_update_is_applied_inside_the_session_actor() {
+        let mut state = SessionState::with_run_idle_ttl(
+            "http://127.0.0.1:3210".into(),
+            "agent".into(),
+            Some(Duration::from_secs(1_800)),
+            None,
+        );
+        let (reply, applied) = oneshot::channel();
+        state
+            .handle(SessionRequest::UpdateRunIdleTtl {
+                run_idle_ttl: None,
+                reply,
+            })
+            .await;
+        applied.await.unwrap();
+        assert_eq!(state.run_idle_ttl, None);
+
+        let (reply, applied) = oneshot::channel();
+        state
+            .handle(SessionRequest::UpdateRunIdleTtl {
+                run_idle_ttl: Some(Duration::from_secs(3_600)),
+                reply,
+            })
+            .await;
+        applied.await.unwrap();
+        assert_eq!(state.run_idle_ttl, Some(Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn http_session_rejects_a_different_daemon_identity() {
+        let expected = ExpectedDaemonIdentity {
+            server_id: Uuid::new_v4(),
+            daemon_epoch: Uuid::new_v4(),
+        };
+        assert!(
+            ensure_welcome_identity(Some(expected), expected.server_id, expected.daemon_epoch)
+                .is_ok()
+        );
+        assert!(
+            ensure_welcome_identity(Some(expected), Uuid::new_v4(), expected.daemon_epoch)
+                .unwrap_err()
+                .to_string()
+                .contains("restart serial-mcp")
+        );
+        assert!(
+            ensure_welcome_identity(Some(expected), expected.server_id, Uuid::new_v4())
+                .unwrap_err()
+                .to_string()
+                .contains("restart serial-mcp")
+        );
+    }
+
+    #[test]
+    fn stdio_session_accepts_any_daemon_identity() {
+        assert!(ensure_welcome_identity(None, Uuid::new_v4(), Uuid::new_v4()).is_ok());
+    }
 }

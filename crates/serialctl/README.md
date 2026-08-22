@@ -14,6 +14,10 @@ serial profile ...
 
 发行包中的 `serialctl` 也可以直接运行。它不打开物理 UART；所有实时数据与写入都经过 `seriald`。
 
+裸 `serial` 会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端。无论使用默认还是自定义 endpoint、先开 App 还是先运行 `serial`，后启动的一方都会复用同一个服务。
+
+App 和 `serial` 只停止自己启动的进程。外部 owner 退出后，仍在运行的客户端不会自动 failover；重新启动后才重新发现或创建服务。
+
 ## 首次 setup
 
 推荐：
@@ -26,9 +30,9 @@ serial setup
 
 - 后端地址 / Endpoint：监听 IP 和端口；
 - 串口 Profile / Transport Profile：波特率、数据位、校验位等 UART 参数；
-- 机型 Profile / Model Profile：机型原名、Shell/U-Boot 提示符、换行、设备回显解析和写入节奏。
+- 机型 Profile / Model Profile：一类机型共用的 Shell/U-Boot 提示符、换行、设备回显解析和写入节奏，以及该系列的具体机型名列表。
 
-串口名是唯一设备标识，例如 `COM4`。没有额外名称。机型 Profile 名按输入原样保存，`TL-AS7230 1.0` 不会改写为空格以外的形式。
+串口名是唯一设备标识，例如 `COM4`，没有额外名称。机型 Profile 的 `name` 是系列名称；端口的 `model_name` 单独标记当前连接的具体型号，并且必须来自该 Profile 的 `model_names`。所有名称都按输入原样保存和显示。
 
 ## Profile CLI
 
@@ -45,28 +49,32 @@ serial profile transport export uart-115200 --output uart-115200.toml
 serial profile transport delete uart-115200 --yes
 ```
 
-Model Profile 同时管理机型身份与交互行为：
+Model Profile 管理一个机型系列的具体型号列表和共用交互行为：
 
 ```sh
 serial profile model list
-serial profile model show 'TL-AS7230 1.0'
+serial profile model show TL-AS7230
 serial profile model create --interactive
-serial profile model update 'TL-AS7230 1.0' --shell-prompt 'root@router:~# '
-serial profile model clone 'TL-AS7230 1.0' --name 'TL-AS7230 2.0'
+serial profile model update TL-AS7230 \
+  --model-name 'TL-AS7230-W 1.0' \
+  --model-name 'TL-AS7230-F4GE 1.0' \
+  --shell-prompt 'root@router:~# '
+serial profile model clone TL-AS7230 --name TL-AS7230-lab
 serial profile model import models.json
-serial profile model export 'TL-AS7230 1.0' --output model.json
-serial profile model delete 'TL-AS7230 1.0' --yes
+serial profile model export TL-AS7230 --output model.json
+serial profile model delete TL-AS7230 --yes
 ```
 
 绑定和解绑：
 
 ```sh
-serial profile attach --port COM4 --transport uart-115200 --model 'TL-AS7230 1.0'
+serial profile attach --port COM4 --transport uart-115200 --model TL-AS7230 \
+  --model-name 'TL-AS7230-W 1.0'
 serial profile detach --port COM4 --model
 serial profile detach --port COM4 --transport
 ```
 
-`update` 只改变显式字段；`--interactive` 使用当前值作为默认。Model prompt 用 `--clear-shell-prompt` / `--clear-uboot-prompt` 清空；EOL、echo、chunk size/delay 可用对应 `--inherit-*` 恢复通用值。
+`update` 只改变显式字段；重复的 `--model-name` 会替换该系列的具体机型名列表；`--interactive` 使用当前值作为默认。Model prompt 用 `--clear-shell-prompt` / `--clear-uboot-prompt` 清空；EOL、echo、chunk size/delay 可用对应 `--inherit-*` 恢复通用值。
 
 运行中 Profile mutation 带 `config_revision`，避免较旧页面覆盖新的配置。Transport 变化按需要重开串口；Model 行为更新在 snapshot 刷新后立即生效。
 
@@ -87,8 +95,8 @@ serial profile detach --port COM4 --transport
 
 - 输入任意可打印字符、Backspace、Delete、Tab 或 Enter，都会进入命令输入行。
 - 输入有内容时 Enter 发送；输入为空时 Enter 返回当前串口底部，不发送空命令。
-- `↑` / `↓` 选择 Agent 历史；`→` 展开；`←` 折叠。
-- `PgUp` / `PgDn` 浏览 Agent 历史；展开详情时滚动详情内容。
+- `↑` / `↓` 选择任务与命令 action；`→` 进入子层级；`←` 返回上一层。
+- `PgUp` / `PgDn` 浏览当前历史层级；展开详情时滚动详情内容。
 - 鼠标滚轮与 `PgUp` / `PgDn` 行为相同，不需要点击不同 pane 切换焦点。
 - `Alt-1` … `Alt-9` 直接切换端口。
 - `Ctrl-R` 在命令输入中搜索人工输入历史。
@@ -118,11 +126,11 @@ serial profile detach --port COM4 --transport
 
 在 LINE 与 RAW 模式中，`Ctrl-C` 都立即向设备发送 `0x03`，不会退出本地 TUI。RAW `Ctrl-D` / `Ctrl-Z` 分别发送 `0x04` / `0x1a`。
 
-## Agent 历史与输出高亮
+## 任务记录与输出高亮
 
-Agent 历史按从旧到新显示，最新记录在底部。处于 follow 状态时，新命令自动滚动到底部；选择旧记录、展开详情或手动浏览后保留当前位置。
+任务记录按从旧到新显示，最新 action 在底部。新的 Agent `command` 或 `command_sequence` action 到达时，TUI 会退出正在浏览的旧子层级并回到底部；同一 action 的 TX 分块或 sequence 后续 step 只合并进原记录，不重复重置。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。
 
-Run 行只显示运行状态与任务名称。普通 command 是一条命令；`command_sequence` 展开后每个 step 一行。历史中不显示内部 actor 类型、ID 或“已确认发送”说明，也不使用成功/失败 emoji。
+普通 `command` 是一个 action，按 `→` 后直接定位它的串口区域。`command_sequence` 也是一个 action；按 `→` 进入 step 层级，再用 `↑` / `↓` 选择每个具体命令，按 `←` 返回 action 层。Monitor action 按 `→` 进入 matcher，再按 `→` 进入 incident；选择 incident 后按它的 `serial_range` 跳转串口证据。命令捕获和 incident 属于旧后端周期，或完整范围已从本地窗口淘汰时，TUI 会从 journal 回取原周期的完整连续区间并高亮 RX；retention gap、缺失、超限或查询失败会返回实时尾并明确提示，不显示可能误导的局部证据。
 
 选择具体命令时，TUI 读取该 TX 事件保存的 `command_capture_matchers`：
 
@@ -130,9 +138,9 @@ Run 行只显示运行状态与任务名称。普通 command 是一条命令；`
 contains | regex | shell_prompt | uboot_prompt
 ```
 
-它从命令后的 RX 开始匹配第一个完成边界，并将命令对应的设备 echo 到该边界之间的区域定位到主终端、使用独立底色高亮。`command_sequence` 每个 step 独立定位。没有 matcher 或没有匹配时，仅临时展示命令文本，不修改持久 RX 画面。
+它从命令后的 RX 开始匹配第一个完成边界，并将设备 echo、返回内容和完成边界组成的捕获区域定位到主终端、使用独立底色高亮。`command_sequence` 每个 step 使用自己的 TX 起点、下一 step 上界和 matcher 独立定位。本地同周期窗口只有在捕获区间完整可信时才直接高亮，否则异步读取 journal；缺口不会降级成局部高亮。没有 matcher 或持久记录也没有匹配时，仅临时展示命令文本，不修改持久 RX 画面。
 
-默认 inline content 高度为 5 行，可在配置页“终端显示”中修改 `agent_history_rows` 为 3–20。小终端使用独立详情视图，展开状态不会因滚轮或实时输出自动折叠。
+默认 inline content 高度为 5 行，可在“设置 → 终端界面显示设置”中修改 `agent_history_rows` 为 3–20。小终端使用独立详情视图，展开状态不会因滚轮或实时输出自动折叠。
 
 ## 文本选择
 
@@ -173,25 +181,23 @@ serial logs --port COM4 --epoch UUID --after-seq 100 --through-seq 200
 serial logs --port COM4 --run UUID --direction rx
 ```
 
-## 配置页面
+## 配置与帮助
 
-配置分为两部分：
+菜单只有四个主入口：
 
-### 串口配置
+1. “修改当前串口配置”：选择端口、已有串口 Profile、UART 离散参数、已有机型 Profile 和具体机型名；
+2. “创建配置 Profile”：独立创建串口 Profile 或机型 Profile，不自动改变当前端口绑定；
+3. “设置”：进入“终端界面显示设置”或“serial MCP 设置”；
+4. “帮助”：按固定列显示“按键 + 简洁说明”。
 
-按 `port` 查看和编辑：绑定的 Transport Profile、baud、data bits、parity、stop bits、flow control、DTR/RTS、auto-open、enabled 和 Model Profile 绑定。
+在配置项上按 `→` 展开可选值，用 `↑` / `↓` 选择，Enter 应用并折叠，按 `←` 折叠或返回。具体机型名按“机型系列 → 具体机型名”两级进入。Shell/U-Boot 提示符、具体机型名列表和分段发送数值直接在当前行下输入，不打开独立弹窗。“保存并应用配置修改”位于所有串口与机型字段之后的独立操作区。
 
-### 机型 Profile
-
-查看和编辑：原样机型名、Shell prompt、U-Boot prompt、write EOL、echo、write chunk size 和 delay。一个 Model Profile 可以绑定多个端口；保存前显示受影响端口。
-
-页面同时配置：
+菜单底部只显示一行按键指南。高亮配置项后按 `?` 查看该字段说明。设置项包括：
 
 - `agent_history_rows`：3–20，默认 5；
-- `orphan_run_timeout_seconds`：默认 1800；`0` 表示不限时，有限值至少 300；
-- language、mouse capture、human idle release 和 MCP capture bounds。
+- `orphan_run_timeout_seconds`：默认 1800；`0` 表示不限时，有限值至少 300。
 
-孤立 Run 设置由新启动的 `serial-mcp` 读取，不改变 protocol v4；正常 Agent 完成使用 `run_end`。
+没有命令行 timeout override 时，运行中的 stdio/HTTP `serial-mcp` 会自动加载保存后的孤立 Run 时间，不需要人工重启。正常 Agent 工作流仍在最终回复前调用 `run_end`。
 
 ## 串口着色
 

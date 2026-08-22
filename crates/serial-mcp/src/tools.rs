@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use regex_syntax::ParserBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serial_protocol::{
@@ -12,13 +13,14 @@ use serial_protocol::{
     ConfigureModelProfilesRequest, ConfigurePortsRequest, CreateMonitorRequest, Cursor,
     DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, Direction,
     EchoMode, EventKind, EventQuery, EventQueryResponse, MAX_BREAK_DURATION_MS,
-    MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES,
-    MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS,
-    MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS,
-    MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS, MIN_TRIGGER_INTERVAL_MS,
-    MIN_TRIGGER_TIMEOUT_MS, ModelProfile, PROTOCOL_VERSION, SequenceWritePrecondition,
-    SessionState, SlotSnapshot, StatusResponse, TriggerInfo, TriggerSpec, TriggerStatus,
-    WritePacing,
+    MAX_COMMAND_DESCRIPTION_BYTES, MAX_MODEL_NAMES_PER_PROFILE, MAX_MONITOR_MATCHERS,
+    MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
+    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
+    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
+    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelProfile, MonitorMatcher,
+    PROTOCOL_VERSION, SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse,
+    TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -405,7 +407,7 @@ impl AgentTools {
             "daemon_epoch": status.daemon_epoch,
             "config_revision": status.config_revision,
             "ports": ports,
-            "selection_note": "Choose a port explicitly and confirm its model_profile matches the connected device before writing. A Run scopes evidence; it does not reset the device."
+            "selection_note": "Choose a port explicitly and confirm its model_profile and model_name match the connected device before writing. A Run scopes evidence; it does not reset the device."
         }))
     }
 
@@ -415,10 +417,21 @@ impl AgentTools {
             self.slot(port).await?;
         }
         let catalog = self.api.model_profiles().await?;
-        let bindings = status.ports
+        let bindings = status
+            .ports
             .into_iter()
-            .filter(|slot| args.port.as_deref().is_none_or(|port| slot.config.port == port))
-            .map(|slot| json!({"port": slot.config.port, "model_profile": slot.config.model_profile}))
+            .filter(|slot| {
+                args.port
+                    .as_deref()
+                    .is_none_or(|port| slot.config.port == port)
+            })
+            .map(|slot| {
+                json!({
+                    "port": slot.config.port,
+                    "model_profile": slot.config.model_profile,
+                    "model_name": slot.config.model_name,
+                })
+            })
             .collect::<Vec<_>>();
         Ok(json!({
             "config_revision": catalog.config_revision,
@@ -436,26 +449,91 @@ impl AgentTools {
             .find(|slot| slot.config.port == args.port)
             .ok_or_else(|| anyhow!("unknown serial port {:?}", args.port))?;
         let previous = current.config.model_profile.clone();
-        let mut config_revision = status.config_revision;
+        let previous_model_name = current.config.model_name.clone();
+        let next_model_profile = args.profile.as_ref().map(|profile| profile.name.clone());
+        let next_model_name = match args.profile.as_ref() {
+            None => {
+                if matches!(&args.model_name, ModelNameUpdate::Set(Some(_))) {
+                    bail!("model_name requires a non-null model profile");
+                }
+                None
+            }
+            Some(profile) => match &args.model_name {
+                ModelNameUpdate::Set(Some(model_name)) => {
+                    if !profile.model_names.iter().any(|name| name == model_name) {
+                        bail!(
+                            "model_name {:?} is not listed in model profile {:?}",
+                            model_name,
+                            profile.name
+                        );
+                    }
+                    Some(model_name.clone())
+                }
+                ModelNameUpdate::Set(None) => None,
+                ModelNameUpdate::Unspecified
+                    if previous.as_deref() == Some(profile.name.as_str())
+                        && previous_model_name
+                            .as_ref()
+                            .is_some_and(|name| profile.model_names.contains(name)) =>
+                {
+                    previous_model_name.clone()
+                }
+                ModelNameUpdate::Unspecified => None,
+            },
+        };
+
         let catalog = self.api.model_profiles().await?;
-        if let Some(profile) = args.profile.clone() {
-            let mut profiles = catalog.profiles;
-            match profiles
-                .iter()
-                .position(|candidate| candidate.name == profile.name)
+        let mut config_revision = catalog.config_revision;
+        let mut final_profiles = catalog.profiles;
+        let mut requires_final_catalog_write = false;
+        if let Some(profile) = args.profile.as_ref() {
+            for binding in &status.ports {
+                if binding.config.port != args.port
+                    && binding.config.model_profile.as_deref() == Some(profile.name.as_str())
+                    && binding
+                        .config
+                        .model_name
+                        .as_ref()
+                        .is_some_and(|name| !profile.model_names.contains(name))
+                {
+                    bail!(
+                        "model profile {:?} cannot remove concrete model {:?} while port {:?} still uses it",
+                        profile.name,
+                        binding.config.model_name,
+                        binding.config.port
+                    );
+                }
+            }
+            replace_model_profile(&mut final_profiles, profile.clone());
+            let mut first_profiles = final_profiles.clone();
+            if previous.as_deref() == Some(profile.name.as_str())
+                && previous_model_name
+                    .as_ref()
+                    .is_some_and(|name| !profile.model_names.contains(name))
             {
-                Some(index) => profiles[index] = profile,
-                None => profiles.push(profile),
+                if profile.model_names.len() >= MAX_MODEL_NAMES_PER_PROFILE {
+                    bail!(
+                        "model profile {:?} is at the concrete-model limit and cannot replace the current port binding atomically",
+                        profile.name
+                    );
+                }
+                let mut transition = profile.clone();
+                transition
+                    .model_names
+                    .push(previous_model_name.clone().expect("checked concrete model"));
+                replace_model_profile(&mut first_profiles, transition);
+                requires_final_catalog_write = true;
             }
             config_revision = self
                 .api
                 .configure_model_profiles(&ConfigureModelProfilesRequest {
-                    profiles,
+                    profiles: first_profiles,
                     expected_revision: Some(catalog.config_revision),
                 })
                 .await?
                 .config_revision;
         }
+
         let latest = self.status().await?;
         let mut port_configs = latest
             .ports
@@ -466,20 +544,34 @@ impl AgentTools {
             .iter_mut()
             .find(|port| port.port == args.port)
             .expect("port was validated against the same daemon");
-        configured.model_profile = args.profile.as_ref().map(|profile| profile.name.clone());
-        let response = self
+        configured.model_profile = next_model_profile;
+        configured.model_name = next_model_name.clone();
+        config_revision = self
             .api
             .configure_ports(&ConfigurePortsRequest {
                 ports: port_configs,
                 source: "agent:serial-mcp".into(),
                 expected_revision: Some(config_revision),
             })
-            .await?;
+            .await?
+            .config_revision;
+        if requires_final_catalog_write {
+            config_revision = self
+                .api
+                .configure_model_profiles(&ConfigureModelProfilesRequest {
+                    profiles: final_profiles,
+                    expected_revision: Some(config_revision),
+                })
+                .await?
+                .config_revision;
+        }
         Ok(json!({
             "port": args.port,
             "previous_model_profile": previous,
+            "previous_model_name": previous_model_name,
             "model_profile": args.profile,
-            "config_revision": response.config_revision,
+            "model_name": next_model_name,
+            "config_revision": config_revision,
         }))
     }
 
@@ -2198,6 +2290,8 @@ fn summarize_recent_context(
                     "source",
                     "previous_model_profile",
                     "new_model_profile",
+                    "previous_model_name",
+                    "new_model_name",
                 ] {
                     if let Some(value) = event.metadata.get(field) {
                         summary[field] = value.clone();
@@ -2672,31 +2766,57 @@ fn command_sequence_output(
     output
 }
 
-fn validate_monitor_matcher(contains: Option<&str>, regex: Option<&str>) -> Result<()> {
-    match (contains, regex) {
-        (Some(contains), None) => {
-            if contains.is_empty() {
-                bail!("contains must not be empty");
-            }
-            if contains.len() > MAX_REGEX_BYTES {
-                bail!("contains must not exceed {MAX_REGEX_BYTES} UTF-8 bytes");
-            }
-            Ok(())
+fn validate_monitor_matchers(matchers: &[MonitorMatcher]) -> Result<()> {
+    if matchers.is_empty() || matchers.len() > MAX_MONITOR_MATCHERS {
+        bail!("matchers must contain 1-{MAX_MONITOR_MATCHERS} conditions");
+    }
+    let mut total_bytes = 0usize;
+    for (index, matcher) in matchers.iter().enumerate() {
+        let value = match matcher {
+            MonitorMatcher::Contains(value) | MonitorMatcher::Regex(value) => value,
+        };
+        if value.is_empty() {
+            bail!("matchers[{index}].value must not be empty");
         }
-        (None, Some(regex)) => {
-            let compiled = compile_regex(regex, "regex")?;
-            if compiled.is_match("") {
-                bail!("regex must not match an empty serial stream");
-            }
-            Ok(())
+        if value.len() > MAX_MONITOR_PATTERN_BYTES {
+            bail!(
+                "matchers[{index}].value must not exceed {MAX_MONITOR_PATTERN_BYTES} UTF-8 bytes"
+            );
         }
-        (None, None) => bail!("provide exactly one of contains or regex"),
-        (Some(_), Some(_)) => bail!("contains and regex are alternatives; choose exactly one"),
+        total_bytes = total_bytes.saturating_add(value.len());
+        if let MonitorMatcher::Regex(regex) = matcher {
+            let field = format!("matchers[{index}].value");
+            compile_regex(regex, &field)?;
+            let hir = ParserBuilder::new()
+                .utf8(false)
+                .build()
+                .parse(regex)
+                .with_context(|| format!("{field} is not a valid regex"))?;
+            match hir.properties().minimum_len() {
+                Some(0) => bail!("matchers[{index}] regex must consume at least one byte"),
+                None => bail!("matchers[{index}] regex cannot match any byte sequence"),
+                Some(_) => {}
+            }
+        }
+    }
+    if total_bytes > MAX_MONITOR_TOTAL_PATTERN_BYTES {
+        bail!("matcher values must not exceed {MAX_MONITOR_TOTAL_PATTERN_BYTES} total UTF-8 bytes");
+    }
+    Ok(())
+}
+
+fn replace_model_profile(profiles: &mut Vec<ModelProfile>, profile: ModelProfile) {
+    match profiles
+        .iter()
+        .position(|candidate| candidate.name == profile.name)
+    {
+        Some(index) => profiles[index] = profile,
+        None => profiles.push(profile),
     }
 }
 
 fn create_monitor_request(args: MonitorStartArgs) -> Result<CreateMonitorRequest> {
-    validate_monitor_matcher(args.contains.as_deref(), args.regex.as_deref())?;
+    validate_monitor_matchers(&args.matchers)?;
     if let Some(description) = args.description.as_deref() {
         if description.is_empty() {
             bail!("description must not be empty when provided");
@@ -2709,8 +2829,7 @@ fn create_monitor_request(args: MonitorStartArgs) -> Result<CreateMonitorRequest
         "request_id": args.idempotency_key.unwrap_or_else(Uuid::new_v4),
         "spec": {
             "port": args.port,
-            "contains": args.contains,
-            "regex": args.regex,
+            "matchers": args.matchers,
             "description": args.description,
         }
     }))
@@ -2734,20 +2853,13 @@ fn monitor_from_response(response: impl serde::Serialize) -> Result<Value> {
 
 fn compact_monitor(monitor: &Value) -> Value {
     let spec = monitor.get("spec").unwrap_or(&Value::Null);
-    let matcher = if let Some(value) = spec.get("contains").and_then(Value::as_str) {
-        json!({"kind": "literal", "value": value})
-    } else if let Some(value) = spec.get("regex").and_then(Value::as_str) {
-        json!({"kind": "regex", "value": value})
-    } else {
-        Value::Null
-    };
     json!({
         "monitor_id": monitor.get("id").cloned().unwrap_or(Value::Null),
         "port": spec.get("port").cloned().unwrap_or(Value::Null),
         "status": monitor.get("status").cloned().unwrap_or(Value::Null),
         "severity": spec.get("severity").cloned().unwrap_or(Value::Null),
         "description": spec.get("description").cloned().unwrap_or(Value::Null),
-        "matcher": matcher,
+        "matchers": spec.get("matchers").cloned().unwrap_or_else(|| json!([])),
         "current_cursor": monitor.get("current_cursor").cloned().unwrap_or(Value::Null),
         "incident_count": monitor.get("incident_count").cloned().unwrap_or(Value::Null),
         "unacked_incident_count": monitor.get("unacked_incident_count").cloned().unwrap_or(Value::Null),
@@ -2764,6 +2876,7 @@ fn compact_monitor_incident(incident: &Value) -> Value {
         "port": incident.get("port").cloned().unwrap_or(Value::Null),
         "severity": incident.get("severity").cloned().unwrap_or(Value::Null),
         "description": incident.get("description").cloned().unwrap_or(Value::Null),
+        "matches": incident.get("matches").cloned().unwrap_or_else(|| json!([])),
         "preview": incident.get("preview").cloned().unwrap_or(Value::Null),
         "serial_range": {
             "epoch": incident.get("daemon_epoch").cloned().unwrap_or(Value::Null),
@@ -3155,6 +3268,7 @@ mod completion_tests {
                 port: "/dev/cu.usbserial-210".into(),
                 transport_profile: None,
                 model_profile: Some("TL-AS7230 1.0".into()),
+                model_name: Some("TL-AS7230-W 1.0".into()),
                 enabled: true,
             },
             daemon_epoch: Uuid::new_v4(),
@@ -3249,6 +3363,8 @@ mod completion_tests {
                 ("source".into(), json!("human:desktop")),
                 ("previous_model_profile".into(), json!("TL-AS7230 1.0")),
                 ("new_model_profile".into(), json!("TL-AS7230 2.0")),
+                ("previous_model_name".into(), json!("TL-AS7230-W 1.0")),
+                ("new_model_name".into(), json!("TL-AS7230-F4GE 1.0")),
             ]),
             durable: true,
         };
@@ -3277,6 +3393,58 @@ mod completion_tests {
             "TL-AS7230 1.0"
         );
         assert_eq!(context["events"][0]["new_model_profile"], "TL-AS7230 2.0");
+        assert_eq!(context["events"][0]["new_model_name"], "TL-AS7230-F4GE 1.0");
+    }
+}
+
+#[cfg(test)]
+mod model_profile_argument_tests {
+    use super::*;
+
+    fn arguments(model_name: Option<Value>) -> Value {
+        let mut value = json!({
+            "port": "COM4",
+            "profile": {
+                "name": "TL-AS7230",
+                "model_names": ["TL-AS7230-W 1.0"]
+            }
+        });
+        if let Some(model_name) = model_name {
+            value["model_name"] = model_name;
+        }
+        value
+    }
+
+    #[test]
+    fn model_name_argument_distinguishes_omitted_null_and_string() {
+        let omitted: ModelProfileSetArgs = serde_json::from_value(arguments(None)).unwrap();
+        assert_eq!(omitted.model_name, ModelNameUpdate::Unspecified);
+
+        let cleared: ModelProfileSetArgs =
+            serde_json::from_value(arguments(Some(Value::Null))).unwrap();
+        assert_eq!(cleared.model_name, ModelNameUpdate::Set(None));
+
+        let selected: ModelProfileSetArgs =
+            serde_json::from_value(arguments(Some(json!("TL-AS7230-W 1.0")))).unwrap();
+        assert_eq!(
+            selected.model_name,
+            ModelNameUpdate::Set(Some("TL-AS7230-W 1.0".into()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod monitor_argument_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_regex_must_consume_bytes_on_every_match() {
+        for expression in [r".*", r"\b|foo.*bar"] {
+            assert!(
+                validate_monitor_matchers(&[MonitorMatcher::Regex(expression.into())]).is_err()
+            );
+        }
+        validate_monitor_matchers(&[MonitorMatcher::Regex("foo.*bar".into())]).unwrap();
     }
 }
 
@@ -3349,9 +3517,7 @@ fn trigger_spec(args: &TriggerArgs) -> Result<TriggerSpec> {
         stop_contains,
         timeout_ms,
         max_fires,
-        // The Agent-facing Trigger intentionally cannot override physical
-        // write pacing. `None` tells seriald to apply the Slot transport
-        // settings to kickoff and action writes.
+        // Trigger writes use the port's configured physical write pacing.
         pacing: None,
     })
 }
@@ -3563,6 +3729,7 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
         "enabled": slot.config.enabled,
         "transport_profile": slot.config.transport_profile,
         "model_profile": slot.config.model_profile,
+        "model_name": slot.config.model_name,
         "endpoint_present": slot.endpoint_present,
         "session_state": slot.session_state,
         "state_code": slot.state_code,
@@ -3605,6 +3772,22 @@ struct ModelProfilesArgs {
 struct ModelProfileSetArgs {
     port: String,
     profile: Option<ModelProfile>,
+    #[serde(default, deserialize_with = "deserialize_model_name_update")]
+    model_name: ModelNameUpdate,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum ModelNameUpdate {
+    #[default]
+    Unspecified,
+    Set(Option<String>),
+}
+
+fn deserialize_model_name_update<'de, D>(deserializer: D) -> Result<ModelNameUpdate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(ModelNameUpdate::Set)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3631,8 +3814,7 @@ struct SearchArgs {
 #[serde(deny_unknown_fields)]
 struct MonitorStartArgs {
     port: String,
-    contains: Option<String>,
-    regex: Option<String>,
+    matchers: Vec<MonitorMatcher>,
     description: Option<String>,
     idempotency_key: Option<Uuid>,
 }

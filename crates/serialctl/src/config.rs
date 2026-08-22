@@ -33,8 +33,8 @@ pub struct ClientConfig {
     /// Seconds an unpinned Agent Run may remain idle before a newly started
     /// serial-mcp process treats it as orphaned and aborts it. Zero disables
     /// idle cleanup; in that mode only explicit `run_end`, adapter exit, or a
-    /// takeover ends ownership. Existing MCP processes read configuration only
-    /// at startup.
+    /// takeover ends ownership. Running serial-mcp processes reload this file
+    /// once per second, so a saved change applies without a restart.
     pub orphan_run_timeout_seconds: Option<u64>,
     /// serial-mcp capture preferences share this file. serialctl preserves
     /// them when saving its own console preferences.

@@ -32,12 +32,11 @@ pub fn pad_display(value: &str, width: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub struct DisplayLine {
+    /// Daemon epoch that produced this row. Synthetic local gap rows have no
+    /// epoch and can never prove that an archived journal interval is present.
+    pub daemon_epoch: Option<uuid::Uuid>,
     pub seq: u64,
-    /// Operation identity of the TX that owns this projected row, when any.
-    /// Keeping it in the presentation model lets the TUI jump from a grouped
-    /// Agent command back to the exact local scrollback row even when later
-    /// RX bytes advanced the row's display sequence.
-    pub operation_id: Option<uuid::Uuid>,
+    pub event_kind: EventKind,
     pub source: String,
     pub text: String,
     pub source_style: Style,
@@ -653,8 +652,9 @@ impl LineContext {
 
     fn display_line(&self, text: String) -> DisplayLine {
         DisplayLine {
+            daemon_epoch: Some(self.identity.daemon_epoch),
             seq: self.seq,
-            operation_id: self.operation_id,
+            event_kind: self.kind,
             source: self.source.clone(),
             bytes: text.len() + self.source.len() + 16,
             source_style: self.source_style,
@@ -1016,8 +1016,9 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
     lines
         .into_iter()
         .map(|text| DisplayLine {
+            daemon_epoch: Some(event.daemon_epoch),
             seq: event.seq,
-            operation_id: event.operation_id,
+            event_kind: event.kind,
             source: source.clone(),
             bytes: text.len() + source.len() + 16,
             source_style,
@@ -1033,8 +1034,9 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
 pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
     let text = text.into();
     DisplayLine {
+        daemon_epoch: None,
         seq,
-        operation_id: None,
+        event_kind: EventKind::Gap,
         source: tr("d.gap").into(),
         bytes: text.len() + 20,
         source_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),

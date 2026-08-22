@@ -11,7 +11,7 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 - **同一份事实记录**：RX、确认后的 TX、Control、Run、Trigger、断连和重配事件进入同一条带序号时间线。
 - **历史跨客户端重开保留**：日志由后端持久化；关闭再打开 TUI 或 App 不会清空已有串口记录。
 - **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 19 个 MCP 工具；三者共享同一个后端状态。
-- **配置分层清楚**：Transport Profile 管物理 UART 参数，Model Profile 管机型名、提示符、换行、设备回显解析和写入节奏。
+- **配置分层清楚**：Transport Profile 管物理 UART 参数；Model Profile 管机型系列共用的提示符、换行、设备回显解析和写入节奏；端口单独记录当前连接的具体机型名。
 
 ## 快速开始
 
@@ -25,7 +25,7 @@ serial setup
 
 - 后端地址 / Endpoint：`seriald` 的监听 IP 和端口。
 - 串口 Profile / Transport Profile：波特率、数据位、校验位、停止位、流控、DTR/RTS 和自动打开。
-- 机型 Profile / Model Profile：机型原名、Shell/U-Boot 提示符、换行、设备回显解析和慢速写入。
+- 机型 Profile / Model Profile：同系列机型共用的 Shell/U-Boot 提示符、换行、设备回显解析和慢速写入；具体机型名标记当前端口连接的型号。
 
 配置完成后直接运行：
 
@@ -35,11 +35,15 @@ serial
 
 不带子命令的 `serial` 会一次完成三件事：
 
-1. 启动本地 `seriald` 后端；
+1. 启动或复用本地 `seriald` 后端；
 2. 在 `http://127.0.0.1:3211/mcp` 启动 sessionless Streamable HTTP MCP；
 3. 在前台打开 TUI。
 
-若首次运行时还没有配置，`serial` 会先执行同样的简洁离线配置。退出前台 TUI 时，由本次启动的两个子进程也会结束。
+若首次运行时还没有配置，`serial` 会先执行同样的简洁离线配置。退出前台 TUI 时，只结束本次 `serial` 自己启动的后端和 MCP 子进程；复用的外部后端不受影响。
+
+同一本地数据目录只运行一个 `seriald`。`serial` 和 App 会自动发现并验证该后端；无论使用默认还是自定义地址、先启动 App 还是先运行 `serial`，后启动的一方都会复用同一个服务。
+
+App 和 `serial` 只停止自己启动的进程。拥有后端的一方退出后，另一方不会自动接管或启动替代后端；重新启动后才重新发现或创建服务。
 
 常用独立命令：
 
@@ -56,13 +60,14 @@ serial logs --port COM4 --regex '(?i)panic|watchdog'
 
 ## 两类 Profile
 
-端口配置只有四个字段：
+端口配置由操作系统串口、两个 Profile 绑定、具体机型名和开关组成：
 
 ```json
 {
   "port": "COM4",
   "transport_profile": "uart-115200",
-  "model_profile": "TL-AS7230 1.0",
+  "model_profile": "TL-AS7230",
+  "model_name": "TL-AS7230-W 1.0",
   "enabled": true
 }
 ```
@@ -81,13 +86,14 @@ Transport Profile 可复用于多个端口，包含：
 - `dtr` / `rts`
 - `auto_open`
 
-安全基线为 115200 8N1、无流控、DTR/RTS 低、自动打开。
+默认值为 115200 8N1、无流控、DTR/RTS 低、自动打开。
 
 ### Model Profile
 
-Model Profile 同时代表机型身份和串口交互行为，包含：
+Model Profile 代表一个机型系列共用的串口交互行为，包含：
 
 - `name`
+- `model_names`
 - `shell_prompt`
 - `uboot_prompt`
 - `write_eol`
@@ -95,14 +101,17 @@ Model Profile 同时代表机型身份和串口交互行为，包含：
 - `write_chunk_size`
 - `write_chunk_delay_ms`
 
-一个机型 Profile 可以绑定多个端口；保存共享 Profile 时，绑定端口会立即使用新的交互参数。物理 UART 参数变更可能重新打开串口，单纯修改机型行为不需要重新打开物理句柄。
+`name` 是机型系列/Profile 名称，例如 `TL-AS7230`；`model_names` 列出该系列的具体机型，例如 `TL-AS7230-W 1.0`、`TL-AS7230-F4GE 1.0`。端口的 `model_name` 必须从当前 Profile 的列表中选择。
+
+一个机型 Profile 可以绑定多个端口；保存共享 Profile 时，绑定端口会立即使用新的交互参数。物理 UART 参数变更可能重新打开串口，单纯修改机型行为或具体机型名不需要重新打开物理句柄。
 
 CLI 管理示例：
 
 ```sh
 serial profile transport create --interactive
 serial profile model create --interactive
-serial profile attach --port COM4 --transport uart-115200 --model 'TL-AS7230 1.0'
+serial profile attach --port COM4 --transport uart-115200 --model TL-AS7230 \
+  --model-name 'TL-AS7230-W 1.0'
 serial profile detach --port COM4 --model
 ```
 
@@ -115,17 +124,25 @@ TUI 顶部只显示串口名和连接状态；串口输出标题只显示当前�
 默认操作围绕键盘设计：
 
 - 输入任意可打印字符会直接进入命令输入行；有内容时按 Enter 发送，没有内容时按 Enter 返回串口底部。
-- `↑` / `↓` 选择 Agent 历史，`→` 展开，`←` 折叠。
-- 滚轮和 `PgUp` / `PgDn` 浏览 Agent 历史或已展开的命令详情，不需要点击窗口切换焦点。
+- `↑` / `↓` 选择任务与命令 action，`→` 进入子层级，`←` 返回上一层。
+- 滚轮和 `PgUp` / `PgDn` 浏览当前历史层级，不需要点击窗口切换焦点。
 - `Ctrl-] PgUp` / `Ctrl-] PgDn` 专门滚动串口输出。
 - `Ctrl-] /` 搜索持久串口历史，可切换普通文本/正则、大小写、RX/TX 和当前周期/保留周期/当前 Run。
 - `Alt-1` 到 `Alt-9` 快速切换端口；`Ctrl-] ?` 打开完整帮助。
 
-Agent 历史按从旧到新排列；未主动浏览旧记录时，新命令到达会自动跟随到底部。选择一条命令后，TUI 根据该 TX 事件持久化的 `command_capture_matchers` 在 RX 中定位并高亮命令与回显形成的区域；没有匹配时只临时显示命令文本，不污染串口历史。`command_sequence` 的每个步骤都可以单独选择和定位。
+任务与命令记录按从旧到新排列。新的 Agent `command` 或 `command_sequence` action 到达时，TUI 会退出正在浏览的旧层级并回到底部；同一个 sequence 的后续 step 或同一 TX 的分块只更新原 action，不会重复重置选择。普通 `command` 进入后直接定位并高亮设备回显、返回内容和完成边界；`command_sequence` 先作为一个 action，按 `→` 进入后再用 `↑` / `↓` 选择并定位每个 step。命令属于旧的后端周期或本地窗口已淘汰完整捕获区间时，TUI 会按原周期、命令序号和持久 matcher 从 journal 精确回取；只有从 TX 到完成边界完整连续时才显示 RX 高亮。retention gap、缺失、超限或查询失败会回到实时尾并明确提示，不把局部尾部伪装成完整结果。没有 matcher 时只临时显示命令文本，不污染串口历史。
+
+Monitor 也显示在同一记录栏：按 `→` 进入查看 matcher，再按 `→` 进入 incident 层；用 `↑` / `↓` 选择 incident 后，根据它的 `serial_range` 跳转并高亮对应串口证据。如果 incident 属于旧的后端周期，或对应内容已从 TUI 本地窗口淘汰，TUI 会按周期和序号范围从 journal 读取完整连续证据；若持久历史已有 retention gap 或范围不完整，则明确提示，且不显示可能误导的局部结果。
 
 鼠标拖选和双击词语都会显示选中高亮并复制文本。串口着色使用词边界匹配错误、警告和成功关键词，不会把 `get_data_error_name` 一类标识符误判；IPv4、IPv6 和 MAC 地址使用独立颜色。
 
-TUI 配置页将“串口配置”和“机型 Profile”分开显示，并可直接修改 `agent_history_rows`（3–20，默认 5）与 `orphan_run_timeout_seconds`（默认 1800 秒；`0` 表示不限时）。
+TUI 菜单分成“修改当前串口配置”“创建配置 Profile”“设置”“帮助”：
+
+- 当前串口配置中，按 `→` 展开端口/Profile/离散参数选项，`↑` / `↓` 选择，Enter 应用并折叠，`←` 折叠或返回；机型名按“机型系列 → 具体机型名”两级选择。
+- Shell/U-Boot 提示符和分段发送数值直接在当前行下输入；保存操作位于所有配置字段下方的独立操作区。
+- 新增串口 Profile 或机型 Profile 统一从“创建配置 Profile”进入，当前串口配置只列已有 Profile。
+- “设置”下分别配置 `agent_history_rows`（3–20，默认 5）和 `orphan_run_timeout_seconds`（默认 1800 秒；`0` 表示不限时）。MCP 设置保存后自动生效，不需要手动重启。
+- 菜单底部只显示一行按键指南；高亮配置项后按 `?` 查看该项说明。
 
 ## Electron App
 
@@ -135,7 +152,7 @@ TUI 配置页将“串口配置”和“机型 Profile”分开显示，并可�
 - 中间 RX 终端：持久历史、实时输出、文本搜索、地址/关键词着色和命令区域高亮；
 - 右侧 Agent 历史：从旧到新展示 Run、普通命令和命令序列；
 - 底部命令栏：面向当前端口发送人工命令；
-- 独立配置页：分别编辑串口/Transport Profile 与 Model Profile；
+- 独立配置页：分别编辑串口/Transport Profile、机型系列 Profile 与具体机型名；
 - 系统、浅色和深色三种主题。
 
 App 默认连接配置的本地后端；后端不存在且启用了自动启动时，App 会启动随包提供的服务，并只管理自己启动的进程。渲染进程只通过类型化 IPC 与主进程通信，不直接访问串口或后端网络。
@@ -158,13 +175,15 @@ run_start            run_end               release
 
 所有设备选择参数都叫 `port`。典型流程是：
 
-1. `devices` 检查端口与机型；
+1. `devices` 检查端口、机型 Profile 与具体机型名；
 2. `run_start(port, label)` 获取本次工作流的 `run_handle`；
 3. 使用 `command`，或用一次 `command_sequence` 完成“账号 → 等待密码提示 → 密码”这类已知依赖交互；
 4. 用 `read`、`wait`、`search` 或 Monitor 补充证据；
 5. 在 Agent 最终回复前调用 `run_end`。
 
 `run_handle` 是 MCP 进程内的工作流句柄；Agent 不需要传 Control ID、fence、generation、请求 UUID 或续租参数。默认孤立 Run 回收时间是 30 分钟，正常结束仍由 `run_end` 表达。
+
+`monitor_start` 的 `matchers` 可同时配置 1–16 个文本或正则条件，按 OR 匹配；incident 返回实际命中的条件和精确 `serial_range`。如果人工在活动 Agent Run 中用 `Alt+Enter` 写入，Agent 下一次物理写会在发送前返回 `context_changed`、`no_bytes_written=true` 和 `recent_context`；调用 `read` 或 `wait` 确认新状态后再决定是否重试。
 
 详见 [MCP 工具目录](./docs/MCP_TOOLS.md) 和 [adapter 配置](./adapters/README.md)。
 
@@ -188,7 +207,7 @@ physical UART
     ▼
 seriald ── durable journal
     ├── HTTP v1 configuration / diagnostics / history
-    ├── WebSocket protocol v4 realtime and control
+    ├── WebSocket protocol v5 realtime and control
     ├── serialctl TUI
     ├── Electron App
     └── serial-mcp ── stdio or Streamable HTTP ── Agent
@@ -197,10 +216,16 @@ seriald ── durable journal
 - `seriald` 是唯一持有物理串口句柄的进程。
 - `serialctl` 提供离线之外的配置、诊断、日志查询和 TUI。
 - `serial-mcp` 把同一 HTTP/WebSocket 能力收敛为 Agent 友好的工具。
-- Electron App 管理本地服务生命周期并复用 v4 接口。
+- Electron App 管理本地服务生命周期并复用 v5 接口。
 - `serial` 是统一入口。
 
-完整接口见 [架构文档](./DOCUMENTATION.md)、[protocol v4](./docs/PROTOCOL.md) 和 [roadmap](./ROADMAP.md)。
+文档入口：
+
+- [架构与交互设计](./DOCUMENTATION.md)：产品边界、配置模型、Control/Run、历史投影和启动所有权；
+- [protocol v5](./docs/PROTOCOL.md)：HTTP v1、WebSocket v5、Timeline、Monitor 与 MCP transport 线协议；
+- [MCP 工具契约](./docs/MCP_TOOLS.md)：19 个工具的输入、结果和 Agent 工作流；
+- [Adapter 配置](./adapters/README.md)：stdio/Streamable HTTP host 接入；
+- [Roadmap](./ROADMAP.md)：当前能力、发布质量门槛和非目标。
 
 ## 构建与发行
 
@@ -216,7 +241,7 @@ npm ci --no-audit --no-fund
 npm run build
 ```
 
-Jenkins 是发布构建与 GitHub Release 发布入口。workspace 版本 tag 尚不存在时构建 Debug 包；当当前提交存在与 `Cargo.toml` 版本一致的 annotated tag（例如 `v0.8.0`）时，Jenkins 自动切换 Release、构建四个平台、生成校验和并发布 GitHub Release，不需要填写发布参数。若同名 tag 不是 annotated tag 或没有指向本次 commit，本次仅按 Debug 构建且不发布。
+Jenkins 是发布构建与 GitHub Release 发布入口。workspace 版本 tag 尚不存在时构建 Debug 包；当当前提交存在与 `Cargo.toml` 版本一致的 annotated `vX.Y.Z` tag 时，Jenkins 自动切换 Release、构建四个平台、生成校验和并发布 GitHub Release，不需要填写发布参数。若同名 tag 不是 annotated tag 或没有指向本次 commit，本次仅按 Debug 构建且不发布。
 
 发布矩阵：
 

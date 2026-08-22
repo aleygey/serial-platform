@@ -7,11 +7,14 @@
 use crate::config::atomic_write;
 use crate::registry::SlotRegistry;
 use regex::bytes::{Regex, RegexBuilder};
+use regex_syntax::ParserBuilder;
+use regex_syntax::hir::{Hir, HirKind};
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    CreateMonitorRequest, Cursor, Direction, EventKind, MonitorIncident,
-    MonitorIncidentListResponse, MonitorListResponse, MonitorResponse, MonitorSpec, MonitorStatus,
-    MonitorView, TimelineEvent, UpdateMonitorRequest,
+    CreateMonitorRequest, Cursor, Direction, EventKind, MAX_MONITOR_MATCHERS,
+    MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES, MonitorIncident,
+    MonitorIncidentListResponse, MonitorListResponse, MonitorMatch, MonitorMatcher,
+    MonitorResponse, MonitorSpec, MonitorStatus, MonitorView, TimelineEvent, UpdateMonitorRequest,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -24,13 +27,12 @@ use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MONITORS: usize = 128;
 const MAX_ACTIVE_MONITORS: usize = 64;
 const MAX_INCIDENTS_PER_MONITOR: usize = 512;
 const MAX_INCIDENTS_TOTAL: usize = 1_024;
-const MAX_PATTERN_BYTES: usize = 4_096;
 // Keep the daemon contract aligned with the MCP schema. More importantly,
 // this participates in the persisted-state budget below because descriptions
 // are copied into retained Incidents.
@@ -893,6 +895,7 @@ impl MonitorManager {
                 wall_time_end_ns: pending.wall_time_end_ns,
                 severity: monitor.spec.severity,
                 description: monitor.spec.description.clone(),
+                matches: pending.matches,
                 preview: truncate_text(&pending.preview, MAX_PREVIEW_BYTES),
                 evidence_cursor: cursor,
                 evidence_ref: format!(
@@ -997,21 +1000,40 @@ struct PendingIncident {
     seq_end: u64,
     wall_time_start_ns: i64,
     wall_time_end_ns: i64,
+    matches: Vec<MonitorMatch>,
     preview: String,
 }
 
 enum CompiledMatcher {
     Literal(Vec<u8>),
-    Regex(Regex),
+    Regex {
+        expression: Regex,
+        maximum_len: Option<usize>,
+        literal_prefix: Vec<u8>,
+        required_literal: Vec<u8>,
+    },
+}
+
+struct CompiledCondition {
+    matcher: MonitorMatcher,
+    compiled: CompiledMatcher,
+    /// Absolute byte offset at which a distinct non-overlapping match may
+    /// begin. Keeping this per condition prevents an extending regex match
+    /// from being reported again when a later RX chunk grows its old suffix.
+    search_after: u64,
+    /// Unbounded expressions without an exact literal prefix cannot safely
+    /// advance `search_after`. A required literal lets them skip the regex
+    /// engine until a match is actually possible.
+    required_search_after: u64,
+    pending_required_at: Option<u64>,
 }
 
 struct StreamMatcher {
-    matcher: CompiledMatcher,
+    matchers: Vec<CompiledCondition>,
     bytes: Vec<u8>,
     chunks: VecDeque<MatchChunk>,
     base_offset: u64,
     next_offset: u64,
-    scanned_through: u64,
 }
 
 struct MatchChunk {
@@ -1022,30 +1044,46 @@ struct MatchChunk {
 
 impl StreamMatcher {
     fn compile(spec: &MonitorSpec) -> Result<Self, MonitorError> {
-        let matcher = if let Some(literal) = spec.contains.as_ref() {
-            CompiledMatcher::Literal(literal.as_bytes().to_vec())
-        } else {
-            let expression = spec
-                .regex
-                .as_deref()
-                .ok_or_else(|| MonitorError::InvalidSpec("missing matcher".into()))?;
-            CompiledMatcher::Regex(
-                RegexBuilder::new(expression)
-                    .size_limit(MAX_REGEX_COMPILED_BYTES)
-                    .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
-                    .build()
-                    .map_err(|error| {
-                        MonitorError::InvalidSpec(format!("invalid regex: {error}"))
-                    })?,
-            )
-        };
+        let matchers = spec
+            .matchers
+            .iter()
+            .map(|matcher| {
+                let compiled = match matcher {
+                    MonitorMatcher::Contains(literal) => {
+                        CompiledMatcher::Literal(literal.as_bytes().to_vec())
+                    }
+                    MonitorMatcher::Regex(source) => {
+                        let hir = parse_regex_hir(source)?;
+                        let analysis = analyze_regex_literals(&hir);
+                        CompiledMatcher::Regex {
+                            expression: RegexBuilder::new(source)
+                                .size_limit(MAX_REGEX_COMPILED_BYTES)
+                                .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
+                                .build()
+                                .map_err(|error| {
+                                    MonitorError::InvalidSpec(format!("invalid regex: {error}"))
+                                })?,
+                            maximum_len: hir.properties().maximum_len(),
+                            literal_prefix: analysis.prefix,
+                            required_literal: analysis.required.unwrap_or_default(),
+                        }
+                    }
+                };
+                Ok(CompiledCondition {
+                    matcher: matcher.clone(),
+                    compiled,
+                    search_after: 0,
+                    required_search_after: 0,
+                    pending_required_at: None,
+                })
+            })
+            .collect::<Result<Vec<_>, MonitorError>>()?;
         Ok(Self {
-            matcher,
+            matchers,
             bytes: Vec::with_capacity(MAX_MATCH_WINDOW_BYTES),
             chunks: VecDeque::new(),
             base_offset: 0,
             next_offset: 0,
-            scanned_through: 0,
         })
     }
 
@@ -1053,7 +1091,11 @@ impl StreamMatcher {
         self.bytes.clear();
         self.chunks.clear();
         self.base_offset = self.next_offset;
-        self.scanned_through = self.next_offset;
+        for condition in &mut self.matchers {
+            condition.search_after = self.next_offset;
+            condition.required_search_after = self.next_offset;
+            condition.pending_required_at = None;
+        }
     }
 
     fn push(&mut self, event: &TimelineEvent) -> Option<PendingIncident> {
@@ -1068,7 +1110,11 @@ impl StreamMatcher {
             self.bytes.clear();
             self.chunks.clear();
             self.base_offset = event_start;
-            self.scanned_through = event_start;
+            for condition in &mut self.matchers {
+                condition.search_after = event_start;
+                condition.required_search_after = event_start;
+                condition.pending_required_at = None;
+            }
         }
         if self.bytes.is_empty() {
             self.base_offset = event_start;
@@ -1081,27 +1127,36 @@ impl StreamMatcher {
         });
         self.next_offset = event_end;
 
-        let previous_scan = self.scanned_through;
-        let match_range = match &self.matcher {
-            CompiledMatcher::Literal(pattern) => self
-                .bytes
-                .windows(pattern.len())
-                .enumerate()
-                .find(|(start, window)| {
-                    *window == pattern.as_slice()
-                        && self
-                            .base_offset
-                            .saturating_add((*start + pattern.len()) as u64)
-                            > previous_scan
+        let mut match_ranges = self
+            .matchers
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, condition)| {
+                let range = scan_condition(condition, &self.bytes, self.base_offset)?;
+                Some((range.0, range.1, index, condition.matcher.clone()))
+            })
+            .collect::<Vec<_>>();
+        match_ranges.sort_unstable_by_key(|(_, _, index, _)| *index);
+        let incident = match_ranges.first().and_then(|first| {
+            let start = match_ranges
+                .iter()
+                .map(|(start, _, _, _)| *start)
+                .min()
+                .unwrap_or(first.0);
+            let end = match_ranges
+                .iter()
+                .map(|(_, end, _, _)| *end)
+                .max()
+                .unwrap_or(first.1);
+            let matches = match_ranges
+                .iter()
+                .map(|(_, _, index, matcher)| MonitorMatch {
+                    index: *index,
+                    matcher: matcher.clone(),
                 })
-                .map(|(start, _)| (start, start + pattern.len())),
-            CompiledMatcher::Regex(regex) => regex.find_iter(&self.bytes).find_map(|found| {
-                let absolute_end = self.base_offset.saturating_add(found.end() as u64);
-                (absolute_end > previous_scan).then_some((found.start(), found.end()))
-            }),
-        };
-        self.scanned_through = event_end;
-        let incident = match_range.and_then(|(start, end)| self.incident_for(start, end, event));
+                .collect();
+            self.incident_for(start, end, matches, event)
+        });
         self.trim();
         incident
     }
@@ -1110,6 +1165,7 @@ impl StreamMatcher {
         &self,
         start: usize,
         end: usize,
+        matches: Vec<MonitorMatch>,
         event: &TimelineEvent,
     ) -> Option<PendingIncident> {
         let absolute_start = self.base_offset.saturating_add(start as u64);
@@ -1131,6 +1187,7 @@ impl StreamMatcher {
             seq_end: last.seq,
             wall_time_start_ns: first.wall_time_ns,
             wall_time_end_ns: last.wall_time_ns,
+            matches,
             preview: sanitize_preview(&self.bytes[preview_start..preview_end]),
         })
     }
@@ -1142,6 +1199,16 @@ impl StreamMatcher {
         let remove = self.bytes.len() - MAX_MATCH_WINDOW_BYTES;
         self.bytes.drain(..remove);
         self.base_offset = self.base_offset.saturating_add(remove as u64);
+        for condition in &mut self.matchers {
+            condition.search_after = condition.search_after.max(self.base_offset);
+            condition.required_search_after = condition.required_search_after.max(self.base_offset);
+            if condition
+                .pending_required_at
+                .is_some_and(|offset| offset < self.base_offset)
+            {
+                condition.pending_required_at = None;
+            }
+        }
         while self
             .chunks
             .front()
@@ -1150,6 +1217,352 @@ impl StreamMatcher {
             self.chunks.pop_front();
         }
     }
+}
+
+#[derive(Default)]
+struct RegexLiteralAnalysis {
+    /// Exact bytes consumed at the beginning of every match.
+    prefix: Vec<u8>,
+    /// A literal that must occur somewhere in every match.
+    required: Option<Vec<u8>>,
+    /// Every match consumes exactly `prefix` (zero-width assertions aside).
+    exact: bool,
+}
+
+fn parse_regex_hir(source: &str) -> Result<Hir, MonitorError> {
+    let hir = ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(source)
+        .map_err(|error| MonitorError::InvalidSpec(format!("invalid regex: {error}")))?;
+    match hir.properties().minimum_len() {
+        Some(0) => Err(MonitorError::InvalidSpec(
+            "regex must consume at least one byte for every match".into(),
+        )),
+        None => Err(MonitorError::InvalidSpec(
+            "regex cannot match any byte sequence".into(),
+        )),
+        Some(_) => Ok(hir),
+    }
+}
+
+fn analyze_regex_literals(hir: &Hir) -> RegexLiteralAnalysis {
+    let mut analysis = match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => RegexLiteralAnalysis {
+            exact: true,
+            ..RegexLiteralAnalysis::default()
+        },
+        HirKind::Literal(literal) => RegexLiteralAnalysis {
+            prefix: literal.0.to_vec(),
+            required: (!literal.0.is_empty()).then(|| literal.0.to_vec()),
+            exact: true,
+        },
+        HirKind::Class(class) => {
+            class
+                .literal()
+                .map_or_else(RegexLiteralAnalysis::default, |literal| {
+                    RegexLiteralAnalysis {
+                        prefix: literal.clone(),
+                        required: Some(literal),
+                        exact: true,
+                    }
+                })
+        }
+        HirKind::Capture(capture) => analyze_regex_literals(&capture.sub),
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0 {
+                RegexLiteralAnalysis {
+                    exact: repetition.max == Some(0),
+                    ..RegexLiteralAnalysis::default()
+                }
+            } else {
+                let child = analyze_regex_literals(&repetition.sub);
+                let (prefix, repeated_exactly) = if child.exact {
+                    repeat_literal(&child.prefix, repetition.min)
+                } else {
+                    (child.prefix.clone(), false)
+                };
+                RegexLiteralAnalysis {
+                    required: child.required,
+                    prefix,
+                    exact: repeated_exactly && repetition.max == Some(repetition.min),
+                }
+            }
+        }
+        HirKind::Concat(parts) => {
+            let mut prefix = Vec::new();
+            let mut prefix_complete = true;
+            let mut required = None;
+            for part in parts {
+                let part = analyze_regex_literals(part);
+                if prefix_complete {
+                    prefix.extend_from_slice(&part.prefix);
+                    prefix_complete = part.exact;
+                }
+                required = longer_literal(required, part.required);
+            }
+            RegexLiteralAnalysis {
+                prefix,
+                required,
+                exact: prefix_complete,
+            }
+        }
+        HirKind::Alternation(branches) => {
+            let mut branches = branches.iter().map(analyze_regex_literals);
+            let Some(first) = branches.next() else {
+                return RegexLiteralAnalysis::default();
+            };
+            let mut prefix = first.prefix;
+            let mut exact = first.exact;
+            let mut exact_value = exact.then(|| prefix.clone());
+            let mut required = first.required;
+            for branch in branches {
+                prefix.truncate(common_prefix_len(&prefix, &branch.prefix));
+                exact &= branch.exact
+                    && exact_value
+                        .as_ref()
+                        .is_some_and(|value| value == &branch.prefix);
+                if !exact {
+                    exact_value = None;
+                }
+                if required != branch.required {
+                    required = None;
+                }
+            }
+            RegexLiteralAnalysis {
+                required,
+                prefix,
+                exact,
+            }
+        }
+    };
+    if !analysis.prefix.is_empty()
+        && analysis
+            .required
+            .as_ref()
+            .is_none_or(|required| analysis.prefix.len() > required.len())
+    {
+        analysis.required = Some(analysis.prefix.clone());
+    }
+    analysis
+}
+
+fn repeat_literal(literal: &[u8], count: u32) -> (Vec<u8>, bool) {
+    let maximum = MAX_MONITOR_PATTERN_BYTES;
+    let count = usize::try_from(count).unwrap_or(maximum);
+    let capacity = literal.len().saturating_mul(count).min(maximum);
+    let mut repeated = Vec::with_capacity(capacity);
+    for _ in 0..count {
+        if repeated.len().saturating_add(literal.len()) > maximum {
+            return (repeated, false);
+        }
+        repeated.extend_from_slice(literal);
+    }
+    (repeated, true)
+}
+
+fn longer_literal(left: Option<Vec<u8>>, right: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left.len() >= right.len() => Some(left),
+        (_, Some(right)) => Some(right),
+        (left, None) => left,
+    }
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn scan_condition(
+    condition: &mut CompiledCondition,
+    bytes: &[u8],
+    base_offset: u64,
+) -> Option<(usize, usize)> {
+    let CompiledCondition {
+        compiled,
+        search_after,
+        required_search_after,
+        pending_required_at,
+        ..
+    } = condition;
+    match compiled {
+        CompiledMatcher::Literal(pattern) => {
+            let search_at = relative_offset(*search_after, base_offset, bytes.len());
+            let (range, searched_through) = find_literal_matches(bytes, pattern, search_at);
+            let suffix_start = bytes.len().saturating_sub(pattern.len().saturating_sub(1));
+            *search_after = base_offset.saturating_add(searched_through.max(suffix_start) as u64);
+            range
+        }
+        CompiledMatcher::Regex {
+            expression,
+            maximum_len,
+            literal_prefix,
+            required_literal,
+        } => {
+            let search_at = relative_offset(*search_after, base_offset, bytes.len());
+            if maximum_len.is_none()
+                && literal_prefix.is_empty()
+                && !required_literal.is_empty()
+                && !required_literal_ready(
+                    *search_after,
+                    required_search_after,
+                    pending_required_at,
+                    bytes,
+                    base_offset,
+                    required_literal,
+                )
+            {
+                return None;
+            }
+
+            let (range, searched_through) = find_regex_matches(expression, bytes, search_at);
+            let searched_through_absolute = base_offset.saturating_add(searched_through as u64);
+            *search_after = match maximum_len {
+                Some(maximum_len) => {
+                    let suffix_start = bytes.len().saturating_sub(maximum_len.saturating_sub(1));
+                    searched_through_absolute.max(base_offset.saturating_add(suffix_start as u64))
+                }
+                None if !literal_prefix.is_empty() => {
+                    let prefix_search_at = searched_through.max(search_at);
+                    let (next_prefix, safe_prefix_start) =
+                        find_next_literal(bytes, literal_prefix, prefix_search_at);
+                    next_prefix.map_or_else(
+                        || {
+                            (*search_after)
+                                .max(base_offset.saturating_add(safe_prefix_start as u64))
+                        },
+                        |start| base_offset.saturating_add(start as u64),
+                    )
+                }
+                None => searched_through_absolute.max(*search_after),
+            };
+
+            if !required_literal.is_empty() {
+                if pending_required_at.is_some_and(|offset| offset < *search_after) {
+                    *pending_required_at = None;
+                }
+                if pending_required_at.is_none() {
+                    refresh_required_literal(
+                        required_search_after,
+                        pending_required_at,
+                        bytes,
+                        base_offset,
+                        required_literal,
+                        *search_after,
+                    );
+                }
+            }
+            range
+        }
+    }
+}
+
+fn relative_offset(absolute: u64, base: u64, length: usize) -> usize {
+    usize::try_from(absolute.saturating_sub(base))
+        .unwrap_or(length)
+        .min(length)
+}
+
+fn find_literal_matches(
+    bytes: &[u8],
+    literal: &[u8],
+    mut search_at: usize,
+) -> (Option<(usize, usize)>, usize) {
+    let mut range: Option<(usize, usize)> = None;
+    while let Some(relative) = find_literal(&bytes[search_at..], literal) {
+        let start = search_at.saturating_add(relative);
+        let end = start.saturating_add(literal.len());
+        range = Some(range.map_or((start, end), |(first, _)| (first, end)));
+        search_at = end;
+    }
+    (range, search_at)
+}
+
+fn find_regex_matches(
+    expression: &Regex,
+    bytes: &[u8],
+    mut search_at: usize,
+) -> (Option<(usize, usize)>, usize) {
+    let mut range: Option<(usize, usize)> = None;
+    while search_at <= bytes.len() {
+        let Some(found) = expression.find_at(bytes, search_at) else {
+            break;
+        };
+        if found.is_empty() {
+            if found.end() == bytes.len() {
+                break;
+            }
+            search_at = found.end().saturating_add(1);
+            continue;
+        }
+        range = Some(range.map_or((found.start(), found.end()), |(first, _)| {
+            (first, found.end())
+        }));
+        search_at = found.end();
+    }
+    (range, search_at)
+}
+
+fn required_literal_ready(
+    search_after: u64,
+    required_search_after: &mut u64,
+    pending_required_at: &mut Option<u64>,
+    bytes: &[u8],
+    base_offset: u64,
+    required: &[u8],
+) -> bool {
+    if pending_required_at.is_some_and(|offset| offset >= search_after && offset >= base_offset) {
+        return true;
+    }
+    refresh_required_literal(
+        required_search_after,
+        pending_required_at,
+        bytes,
+        base_offset,
+        required,
+        search_after,
+    );
+    pending_required_at.is_some()
+}
+
+fn refresh_required_literal(
+    required_search_after: &mut u64,
+    pending_required_at: &mut Option<u64>,
+    bytes: &[u8],
+    base_offset: u64,
+    required: &[u8],
+    minimum_offset: u64,
+) {
+    let search_at = relative_offset(
+        (*required_search_after).max(minimum_offset),
+        base_offset,
+        bytes.len(),
+    );
+    let (next, safe_start) = find_next_literal(bytes, required, search_at);
+    *pending_required_at = next.map(|start| base_offset.saturating_add(start as u64));
+    *required_search_after = next.map_or_else(
+        || {
+            (*required_search_after)
+                .max(minimum_offset)
+                .max(base_offset.saturating_add(safe_start as u64))
+        },
+        |start| base_offset.saturating_add(start.saturating_add(required.len()) as u64),
+    );
+}
+
+fn find_next_literal(bytes: &[u8], literal: &[u8], search_at: usize) -> (Option<usize>, usize) {
+    let next = find_literal(&bytes[search_at..], literal).map(|offset| search_at + offset);
+    let safe_start = bytes.len().saturating_sub(literal.len().saturating_sub(1));
+    (next, safe_start)
+}
+
+fn find_literal(bytes: &[u8], literal: &[u8]) -> Option<usize> {
+    bytes
+        .windows(literal.len())
+        .position(|window| window == literal)
 }
 
 fn sanitize_preview(bytes: &[u8]) -> String {
@@ -1244,6 +1657,11 @@ impl WorkerRuntime {
         if let Some((pending, _)) = self.pending.as_mut() {
             pending.seq_end = candidate.seq_end;
             pending.wall_time_end_ns = candidate.wall_time_end_ns;
+            for matched in candidate.matches {
+                if !pending.matches.contains(&matched) {
+                    pending.matches.push(matched);
+                }
+            }
             if pending.preview.len() < MAX_PREVIEW_BYTES {
                 pending.preview.push('\n');
                 pending.preview.push_str(&candidate.preview);
@@ -1610,7 +2028,8 @@ async fn process_monitor_event(
                 runtime.checkpoint(cursor),
             )
             .await?;
-    } else if !had_pending && runtime.pending.is_some() {
+    }
+    if !had_pending && runtime.pending.is_some() {
         // Persist the first debounced match immediately. The cursor stored in
         // this checkpoint deliberately rewinds to just before the match so a
         // crash cannot lose an incident even if the Slot ring belongs to a new
@@ -1655,6 +2074,21 @@ fn load_state(path: &Path) -> Result<PersistedState, MonitorError> {
         )));
     }
     let bytes = fs::read(path)?;
+    #[derive(Deserialize)]
+    struct StateHeader {
+        schema_version: u32,
+    }
+    let header: StateHeader = serde_json::from_slice(&bytes)
+        .map_err(|_| MonitorError::InvalidState("invalid JSON".into()))?;
+    if header.schema_version != STATE_SCHEMA_VERSION {
+        tracing::warn!(
+            path = %path.display(),
+            found = header.schema_version,
+            expected = STATE_SCHEMA_VERSION,
+            "incompatible Monitor catalog reset"
+        );
+        return Ok(PersistedState::default());
+    }
     serde_json::from_slice(&bytes).map_err(|_| MonitorError::InvalidState("invalid JSON".into()))
 }
 
@@ -1776,27 +2210,35 @@ fn validate_spec(spec: &MonitorSpec) -> Result<(), MonitorError> {
     if spec.port.is_empty() || spec.port.len() > 64 {
         return Err(MonitorError::InvalidSpec("invalid port".into()));
     }
-    match (spec.contains.as_deref(), spec.regex.as_deref()) {
-        (Some(literal), None) if !literal.is_empty() && literal.len() <= MAX_PATTERN_BYTES => {}
-        (None, Some(expression))
-            if !expression.is_empty() && expression.len() <= MAX_PATTERN_BYTES =>
-        {
-            let regex = RegexBuilder::new(expression)
+    if spec.matchers.is_empty() || spec.matchers.len() > MAX_MONITOR_MATCHERS {
+        return Err(MonitorError::InvalidSpec(format!(
+            "matchers must contain 1-{MAX_MONITOR_MATCHERS} conditions"
+        )));
+    }
+    let mut total_pattern_bytes = 0usize;
+    for matcher in &spec.matchers {
+        let value = match matcher {
+            MonitorMatcher::Contains(value) | MonitorMatcher::Regex(value) => value,
+        };
+        if value.is_empty() || value.len() > MAX_MONITOR_PATTERN_BYTES {
+            return Err(MonitorError::InvalidSpec(
+                "each matcher value must be non-empty and at most 4096 UTF-8 bytes".into(),
+            ));
+        }
+        total_pattern_bytes = total_pattern_bytes.saturating_add(value.len());
+        if let MonitorMatcher::Regex(expression) = matcher {
+            parse_regex_hir(expression)?;
+            RegexBuilder::new(expression)
                 .size_limit(MAX_REGEX_COMPILED_BYTES)
                 .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
                 .build()
                 .map_err(|error| MonitorError::InvalidSpec(format!("invalid regex: {error}")))?;
-            if regex.is_match(b"") {
-                return Err(MonitorError::InvalidSpec(
-                    "regex must not match an empty byte stream".into(),
-                ));
-            }
         }
-        _ => {
-            return Err(MonitorError::InvalidSpec(
-                "exactly one non-empty contains or regex is required".into(),
-            ));
-        }
+    }
+    if total_pattern_bytes > MAX_MONITOR_TOTAL_PATTERN_BYTES {
+        return Err(MonitorError::InvalidSpec(format!(
+            "matcher values exceed {MAX_MONITOR_TOTAL_PATTERN_BYTES} total UTF-8 bytes"
+        )));
     }
     if spec
         .description
@@ -1863,8 +2305,7 @@ mod matcher_tests {
     fn literal_spec(literal: &str) -> MonitorSpec {
         MonitorSpec {
             port: "slot-1".into(),
-            contains: Some(literal.into()),
-            regex: None,
+            matchers: vec![MonitorMatcher::Contains(literal.into())],
             start_cursor: None,
             severity: MonitorSeverity::Warning,
             description: None,
@@ -1908,6 +2349,22 @@ mod matcher_tests {
     }
 
     #[test]
+    fn one_condition_merges_every_match_in_the_same_rx_event() {
+        let epoch = Uuid::new_v4();
+        let mut matcher = StreamMatcher::compile(&literal_spec("ERROR")).unwrap();
+        let data = b"ERROR one ERROR two ERROR";
+        let incident = matcher.push(&rx_event(epoch, 1, 0, data)).unwrap();
+        assert_eq!(incident.matches.len(), 1);
+        assert_eq!(incident.matches[0].index, 0);
+        assert_eq!(matcher.matchers[0].search_after, data.len() as u64);
+        assert!(
+            matcher
+                .push(&rx_event(epoch, 2, data.len() as u64, b" ordinary output"))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn literal_matcher_spans_contiguous_rx_events() {
         let epoch = Uuid::new_v4();
         let mut matcher = StreamMatcher::compile(&literal_spec("panic")).unwrap();
@@ -1917,6 +2374,142 @@ mod matcher_tests {
             .unwrap();
         assert_eq!((incident.seq_start, incident.seq_end), (7, 8));
         assert!(incident.preview.contains("panic"));
+    }
+
+    #[test]
+    fn one_rx_chunk_merges_all_or_conditions_into_one_incident() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("ERROR");
+        spec.matchers
+            .push(MonitorMatcher::Regex(r"panic\s+code=E\d+".into()));
+        let mut runtime = WorkerRuntime::new(&spec, None, None).unwrap();
+        let candidate = runtime
+            .matcher
+            .push(&rx_event(epoch, 1, 0, b"ERROR: panic code=E42\n"))
+            .unwrap();
+        assert_eq!(
+            candidate
+                .matches
+                .iter()
+                .map(|matched| matched.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let incident = runtime
+            .accept_match(candidate, Instant::now(), wall_time_ns())
+            .unwrap();
+        assert_eq!(incident.matches.len(), 2);
+        assert!(runtime.pending.is_none());
+    }
+
+    #[test]
+    fn independent_conditions_match_across_rx_chunk_boundaries() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("panic");
+        spec.matchers
+            .push(MonitorMatcher::Regex(r"code=E\d+".into()));
+        let mut matcher = StreamMatcher::compile(&spec).unwrap();
+        assert!(matcher.push(&rx_event(epoch, 1, 0, b"pa")).is_none());
+        let incident = matcher
+            .push(&rx_event(epoch, 2, 2, b"nic code=E42"))
+            .unwrap();
+        assert_eq!((incident.seq_start, incident.seq_end), (1, 2));
+        assert_eq!(
+            incident
+                .matches
+                .iter()
+                .map(|matched| matched.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn extending_regex_suffix_is_not_reported_as_a_new_match() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("unused");
+        spec.matchers = vec![MonitorMatcher::Regex("panic.*".into())];
+        let mut matcher = StreamMatcher::compile(&spec).unwrap();
+        assert!(matcher.push(&rx_event(epoch, 1, 0, b"panic")).is_some());
+        assert!(matcher.push(&rx_event(epoch, 2, 5, b" extends")).is_none());
+        assert!(
+            matcher
+                .push(&rx_event(epoch, 3, 13, b" next panic again"))
+                .is_some()
+        );
+        assert!(matcher.push(&rx_event(epoch, 4, 30, b" more")).is_none());
+    }
+
+    #[test]
+    fn unbounded_regex_keeps_a_real_cross_chunk_candidate() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("unused");
+        spec.matchers = vec![MonitorMatcher::Regex("foo.*bar".into())];
+        let mut matcher = StreamMatcher::compile(&spec).unwrap();
+        assert!(matcher.push(&rx_event(epoch, 1, 0, b"foo")).is_none());
+        for offset in 3..259 {
+            assert!(
+                matcher
+                    .push(&rx_event(epoch, offset - 1, offset, b"x"))
+                    .is_none()
+            );
+        }
+        let incident = matcher.push(&rx_event(epoch, 258, 259, b"bar")).unwrap();
+        assert_eq!((incident.seq_start, incident.seq_end), (1, 258));
+    }
+
+    #[test]
+    fn extending_foo_plus_match_is_not_rediscovered() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("unused");
+        spec.matchers = vec![MonitorMatcher::Regex("foo.+".into())];
+        let mut matcher = StreamMatcher::compile(&spec).unwrap();
+        assert!(matcher.push(&rx_event(epoch, 1, 0, b"foo!")).is_some());
+        assert!(matcher.push(&rx_event(epoch, 2, 4, b" extends")).is_none());
+        assert!(
+            matcher
+                .push(&rx_event(epoch, 3, 12, b" next foo!"))
+                .is_some()
+        );
+        assert!(matcher.push(&rx_event(epoch, 4, 22, b" more")).is_none());
+    }
+
+    #[test]
+    fn tiny_rx_events_do_not_rescan_the_window_for_absent_required_literals() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("unused");
+        spec.matchers = (0..MAX_MONITOR_MATCHERS)
+            .map(|index| MonitorMatcher::Regex(format!(r".*NEEDLE{index}")))
+            .collect();
+        let mut matcher = StreamMatcher::compile(&spec).unwrap();
+        for offset in 0..8_192u64 {
+            assert!(
+                matcher
+                    .push(&rx_event(epoch, offset + 1, offset, b"x"))
+                    .is_none()
+            );
+        }
+        assert!(matcher.bytes.len() <= MAX_MATCH_WINDOW_BYTES);
+        for condition in &matcher.matchers {
+            assert!(condition.pending_required_at.is_none());
+            assert!(condition.required_search_after >= 8_180);
+        }
+    }
+
+    #[test]
+    fn bounded_regex_retains_only_the_suffix_that_can_still_match() {
+        let epoch = Uuid::new_v4();
+        let mut spec = literal_spec("unused");
+        spec.matchers = vec![MonitorMatcher::Regex("[A-Z]{4}".into())];
+        let mut matcher = StreamMatcher::compile(&spec).unwrap();
+        for offset in 0..1_024u64 {
+            assert!(
+                matcher
+                    .push(&rx_event(epoch, offset + 1, offset, b"x"))
+                    .is_none()
+            );
+        }
+        assert_eq!(matcher.matchers[0].search_after, 1_021);
     }
 
     #[test]
@@ -1962,12 +2555,34 @@ mod matcher_tests {
     }
 
     #[test]
-    fn regex_validation_rejects_empty_stream_matches() {
-        let mut spec = literal_spec("unused");
-        spec.contains = None;
-        spec.regex = Some(".*".into());
+    fn regex_validation_rejects_every_zero_length_matcher() {
+        for expression in [r".*", r"\b|foo.*bar"] {
+            let mut spec = literal_spec("unused");
+            spec.matchers = vec![MonitorMatcher::Regex(expression.into())];
+            assert!(matches!(
+                validate_spec(&spec),
+                Err(MonitorError::InvalidSpec(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn matcher_list_and_total_pattern_bytes_are_bounded() {
+        let mut too_many = literal_spec("x");
+        too_many.matchers = (0..=MAX_MONITOR_MATCHERS)
+            .map(|index| MonitorMatcher::Contains(format!("value-{index}")))
+            .collect();
         assert!(matches!(
-            validate_spec(&spec),
+            validate_spec(&too_many),
+            Err(MonitorError::InvalidSpec(_))
+        ));
+
+        let mut too_large = literal_spec("x");
+        too_large.matchers = (0..5)
+            .map(|_| MonitorMatcher::Contains("x".repeat(MAX_MONITOR_PATTERN_BYTES)))
+            .collect();
+        assert!(matches!(
+            validate_spec(&too_large),
             Err(MonitorError::InvalidSpec(_))
         ));
     }
@@ -1990,8 +2605,7 @@ mod tests {
     fn spec(port: &str) -> MonitorSpec {
         MonitorSpec {
             port: port.into(),
-            contains: Some("kernel panic".into()),
-            regex: None,
+            matchers: vec![MonitorMatcher::Contains("kernel panic".into())],
             start_cursor: None,
             severity: MonitorSeverity::Error,
             description: Some("watch the DUT".into()),
@@ -2035,6 +2649,10 @@ mod tests {
             wall_time_end_ns: incident_seq as i64,
             severity: MonitorSeverity::Error,
             description: Some("watch the DUT".into()),
+            matches: vec![MonitorMatch {
+                index: 0,
+                matcher: MonitorMatcher::Contains("kernel panic".into()),
+            }],
             preview: format!("kernel panic {incident_seq}"),
             evidence_cursor: Cursor {
                 epoch,
@@ -2086,8 +2704,7 @@ mod tests {
         assert_eq!((second.seq_start, second.seq_end), (4, 4));
 
         let mut regex_spec = spec("slot-1");
-        regex_spec.contains = None;
-        regex_spec.regex = Some(r"panic\s+code=E[0-9]+".into());
+        regex_spec.matchers = vec![MonitorMatcher::Regex(r"panic\s+code=E[0-9]+".into())];
         let mut regex = StreamMatcher::compile(&regex_spec).unwrap();
         assert!(regex.push(&rx_event(epoch, 5, 0, b"panic ")).is_none());
         assert!(regex.push(&rx_event(epoch, 6, 6, b"code=E42")).is_some());
@@ -2101,6 +2718,7 @@ mod tests {
             port: "slot-1".into(),
             transport_profile: None,
             model_profile: None,
+            model_name: None,
             enabled: false,
         };
         let registry = SlotRegistry::new(
@@ -2120,6 +2738,36 @@ mod tests {
         )
         .unwrap();
         (manager, registry, journal, epoch)
+    }
+
+    #[tokio::test]
+    async fn incompatible_monitor_catalog_schema_starts_with_an_empty_catalog() {
+        let temp = TempDir::new().unwrap();
+        let state_path = temp.path().join("monitors.json");
+        fs::write(
+            &state_path,
+            br#"{"schema_version":1,"monitors":{},"incidents":{},"checkpoints":{}}"#,
+        )
+        .unwrap();
+        let epoch = Uuid::new_v4();
+        let journal =
+            JournalManager::open(JournalConfig::new(temp.path().join("journal"))).unwrap();
+        let registry = SlotRegistry::new(
+            epoch,
+            Instant::now(),
+            journal.handle(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
+        let manager = MonitorManager::open(state_path, registry.clone(), epoch, Uuid::new_v4())
+            .expect("an incompatible Monitor catalog must not block seriald startup");
+        assert!(manager.list(None, None).await.monitors.is_empty());
+
+        manager.shutdown().await;
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2336,9 +2984,18 @@ mod tests {
         let created = manager.create(request.clone()).await.unwrap().monitor;
         assert_eq!(created.current_cursor.as_ref().unwrap().after_seq, 0);
         assert_eq!(
-            manager.create(request).await.unwrap().monitor.id,
+            manager.create(request.clone()).await.unwrap().monitor.id,
             created.id
         );
+        let mut changed = request;
+        changed
+            .spec
+            .matchers
+            .push(MonitorMatcher::Contains("watchdog".into()));
+        assert!(matches!(
+            manager.create(changed).await,
+            Err(MonitorError::RequestIdReused(id)) if id == created.id
+        ));
         assert_eq!(
             manager
                 .stop(created.id, created.revision)
@@ -2391,6 +3048,10 @@ mod tests {
                         seq_end: seq,
                         wall_time_start_ns: seq as i64,
                         wall_time_end_ns: seq as i64,
+                        matches: vec![MonitorMatch {
+                            index: 0,
+                            matcher: MonitorMatcher::Contains("kernel panic".into()),
+                        }],
                         preview: format!("panic {seq}"),
                     },
                     MonitorCheckpoint {
@@ -2528,6 +3189,10 @@ mod tests {
                     seq_end: newest_seq,
                     wall_time_start_ns: newest_seq as i64,
                     wall_time_end_ns: newest_seq as i64,
+                    matches: vec![MonitorMatch {
+                        index: 0,
+                        matcher: MonitorMatcher::Contains("kernel panic".into()),
+                    }],
                     preview: "newest kernel panic".into(),
                 },
                 MonitorCheckpoint {
@@ -2649,6 +3314,10 @@ mod tests {
                         seq_end: seq,
                         wall_time_start_ns: seq as i64,
                         wall_time_end_ns: seq as i64,
+                        matches: vec![MonitorMatch {
+                            index: 0,
+                            matcher: MonitorMatcher::Contains("kernel panic".into()),
+                        }],
                         preview: format!("panic {seq}"),
                     },
                     MonitorCheckpoint {

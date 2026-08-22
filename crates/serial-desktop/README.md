@@ -1,6 +1,6 @@
 # Serial Platform Desktop
 
-Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v4，不直接打开物理串口。
+Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v5，不直接打开物理串口。
 
 ## UI
 
@@ -10,7 +10,7 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 - 中栏：只显示设备 RX 的持久/实时终端，底部是人工命令输入；
 - 右栏：从旧到新的 Agent Run、普通命令和 `command_sequence` 历史。
 
-标题栏可启动 App 管理的本地后端，也只允许停止 App 自己启动的进程；连接外部后端时会明确显示为不可停止。配置页可以持久化“自动启动本地后端”开关，默认开启。
+标题栏可启动 App 管理的本地后端，也只允许停止 App 自己启动的进程；连接外部后端时会明确显示为不可停止。配置页可以持久化“自动启动本地后端”开关，默认开启。App 和 `serial` 会在同一本地数据目录中自动发现并验证唯一后端；无论谁先启动、使用默认还是自定义 endpoint，后启动的一方都会复用同一个服务。
 
 选择具体 Agent 命令时，终端读取 TX 事件持久化的 `command_capture_matchers`，定位并高亮对应 RX。没有匹配时只显示临时命令提示，不把本机 TX 插入 RX 历史。
 
@@ -18,8 +18,10 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 
 配置页明确分开：
 
-- 串口配置：端口、enabled、Transport Profile 和 Model Profile 绑定；
-- 机型 Profile：原样机型名、Shell/U-Boot prompt、EOL、echo 解析和 write pacing。
+- 串口配置：端口、enabled、Transport Profile、机型系列 Profile，以及从该系列中选择的具体机型名；
+- 机型 Profile：系列/Profile 名称、该系列的具体机型名列表、Shell/U-Boot prompt、EOL、echo 解析和 write pacing。
+
+Model Profile 的 `name` 是可复用的机型系列，`model_names` 列出系列下的具体型号；端口的 `model_name` 单独标记当前连接的设备，并且必须来自所选 Profile 的列表。
 
 主题支持 system、light 和 dark。
 
@@ -35,12 +37,12 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 
 ## Process architecture
 
-- `src/main`：本地服务生命周期、v4 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
+- `src/main`：本地服务生命周期、protocol v5 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
 - `src/preload`：context-isolated、类型化 bridge；
 - `src/renderer`：React UI 与纯展示状态；
 - `src/shared`：DTO、preferences 和 QA fixture。
 
-App 启动时读取配置 endpoint。若 endpoint 不可达且开启 `autoStartLocal`，主进程通过 `seriald serve --managed` 启动 app resources 中的 sidecar，等待 `/api/v1/health`，再建立 WebSocket。App 退出时先关闭受管子进程的 stdin，以 EOF 请求优雅退出，超时才强制终止；连接已有服务时不接管该进程。
+App 启动时先连接并验证当前可用的唯一后端；若没有活动服务且开启 `autoStartLocal`，主进程通过 `seriald serve --managed` 启动随包 sidecar。用户修改 endpoint 时，App 会先停止自己拥有的旧后端，再按新地址连接或启动。App 退出时先关闭自己受管子进程的 stdin，以 EOF 请求优雅退出，超时才强制终止；连接已有服务时不接管该进程，外部 owner 退出后也不会自动 failover。App Local Service 只管理 `seriald`，不启动 HTTP MCP。
 
 renderer 不直接访问网络或子进程。人工命令由主进程获得 Human Control 后写入，TX 进入后端审计历史，终端仍只渲染 RX。
 

@@ -21,6 +21,7 @@ vi.mock('./local-service', () => ({
 }))
 
 vi.mock('./serial-client', () => ({
+  serialdIdentityMatches: vi.fn(() => true),
   SerialClient: class {
     constructor() {
       throw new Error('Invalid URL')

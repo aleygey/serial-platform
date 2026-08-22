@@ -29,7 +29,8 @@ use serial_protocol::WritePacing;
 use serial_protocol::{
     Actor, ArchiveSummary, ClientMessage, CommandCaptureMatcher, CommandCaptureMatcherKind,
     CommandResult, ControlLease, ControlMode, Cursor, DataBits, Direction, EchoMode, EventKind,
-    EventQuery, FlowControl, GapRange, LoggingState, ModelProfile, Parity, ResolvedModelSettings,
+    EventQuery, FlowControl, GapRange, LoggingState, ModelProfile, MonitorIncident, MonitorMatcher,
+    MonitorStatus, MonitorView, Parity, PortDescriptor, ResolvedModelSettings,
     ResolvedTransportSettings, RunInfo, RunStatus, ServerMessage, SessionState, SlotSnapshot,
     StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerStatus,
     WireFrame,
@@ -69,6 +70,8 @@ const STATUS_NOTICE_DURATION: Duration = Duration::from_secs(4);
 const MAX_RUN_HISTORY_PER_SLOT: usize = 20;
 const MAX_COMMANDS_PER_RUN: usize = 64;
 const MAX_RUN_COMMAND_BYTES: usize = 4 * 1024;
+const MAX_MONITORS_PER_SLOT: usize = 32;
+const MAX_INCIDENTS_PER_MONITOR: usize = 64;
 const DEFAULT_AGENT_HISTORY_ROWS: u16 = 5;
 const MIN_AGENT_HISTORY_ROWS: u16 = 3;
 const MAX_AGENT_HISTORY_ROWS: u16 = 20;
@@ -84,6 +87,12 @@ const OUTPUT_SEARCH_ARCHIVE_LIMIT: usize = 4;
 const OUTPUT_SEARCH_QUERY_BYTES: usize = 4_096;
 const OUTPUT_SEARCH_HTTP_QUERY_LIMIT: usize = 8;
 const OUTPUT_SEARCH_DEADLINE: Duration = Duration::from_secs(10);
+const EXACT_EVIDENCE_PAGE_EVENTS: usize = 5_000;
+const EXACT_EVIDENCE_PAGE_BYTES: usize = 1024 * 1024;
+const EXACT_EVIDENCE_MAX_EVENTS: usize = 20_000;
+const EXACT_EVIDENCE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const EXACT_EVIDENCE_HTTP_QUERY_LIMIT: usize = 8;
+const EXACT_EVIDENCE_DEADLINE: Duration = Duration::from_secs(10);
 
 type ClipboardCopyFn = fn(&str) -> Result<()>;
 
@@ -453,6 +462,7 @@ impl LiteralProjectionMatcher {
 
 #[derive(Debug, Clone)]
 struct RunCommandStep {
+    daemon_epoch: Uuid,
     operation_id: Option<Uuid>,
     step_index: Option<usize>,
     first_seq: u64,
@@ -464,9 +474,11 @@ struct RunCommandStep {
 
 #[derive(Debug, Clone)]
 struct RunCommandRecord {
+    daemon_epoch: Uuid,
     sequence_id: Option<Uuid>,
     first_seq: u64,
     last_seq: u64,
+    first_wall_time_ns: i64,
     description: Option<String>,
     steps: Vec<RunCommandStep>,
 }
@@ -493,6 +505,7 @@ impl RunCommandStep {
         let truncated = data.len() > MAX_RUN_COMMAND_BYTES;
         data.truncate(MAX_RUN_COMMAND_BYTES);
         Self {
+            daemon_epoch: event.daemon_epoch,
             operation_id: event.operation_id,
             step_index: event
                 .metadata
@@ -543,15 +556,20 @@ impl RunCommandRecord {
 
     fn from_event(event: &TimelineEvent) -> Self {
         Self {
+            daemon_epoch: event.daemon_epoch,
             sequence_id: Self::sequence_id(event),
             first_seq: event.seq,
             last_seq: event.seq,
+            first_wall_time_ns: event.wall_time_ns,
             description: Self::description(event),
             steps: vec![RunCommandStep::from_event(event)],
         }
     }
 
     fn matches_event(&self, event: &TimelineEvent) -> bool {
+        if self.daemon_epoch != event.daemon_epoch {
+            return false;
+        }
         match (self.sequence_id, Self::sequence_id(event)) {
             (Some(existing), Some(incoming)) => existing == incoming,
             (None, None) => event.operation_id.is_some_and(|operation_id| {
@@ -564,6 +582,7 @@ impl RunCommandRecord {
     fn append_event(&mut self, event: &TimelineEvent) {
         self.first_seq = self.first_seq.min(event.seq);
         self.last_seq = self.last_seq.max(event.seq);
+        self.first_wall_time_ns = self.first_wall_time_ns.min(event.wall_time_ns);
         if self.description.is_none() {
             self.description = Self::description(event);
         }
@@ -596,6 +615,19 @@ struct RunHistoryEntry {
     commands: VecDeque<RunCommandRecord>,
 }
 
+#[derive(Debug, Clone)]
+struct MonitorHistoryEntry {
+    monitor: MonitorView,
+    incidents: VecDeque<MonitorIncident>,
+    limited: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryActionKey {
+    Command(RunCommandKey),
+    Monitor(Uuid),
+}
+
 impl RunHistoryEntry {
     fn from_run(run: &RunInfo) -> Self {
         Self {
@@ -615,22 +647,22 @@ impl RunHistoryEntry {
         self.end_seq = run.end_seq;
     }
 
-    /// Returns whether an older described command had to be evicted.
-    fn append_command(&mut self, event: &TimelineEvent) -> bool {
+    /// Returns `(new_action, evicted)` for the bounded command projection.
+    fn append_command(&mut self, event: &TimelineEvent) -> (bool, bool) {
         if let Some(command) = self
             .commands
             .iter_mut()
             .find(|command| command.matches_event(event))
         {
             command.append_event(event);
-            return false;
+            return (false, false);
         }
         let evicted = self.commands.len() == MAX_COMMANDS_PER_RUN;
         if self.commands.len() == MAX_COMMANDS_PER_RUN {
             self.commands.pop_front();
         }
         self.commands.push_back(RunCommandRecord::from_event(event));
-        evicted
+        (true, evicted)
     }
 }
 
@@ -658,11 +690,15 @@ struct SlotView {
     unseen: usize,
     last_epoch: Option<Uuid>,
     last_seq: u64,
+    /// Earliest event in the current raw-journal suffix whose sequence is
+    /// known to be contiguous through `last_seq`. Display rows can merge many
+    /// events, so their row sequences alone cannot prove a command capture is
+    /// complete.
+    local_contiguous_from_seq: Option<u64>,
     draft: Vec<char>,
     draft_cursor: usize,
     mode: InputMode,
     history: Vec<String>,
-    history_cursor: Option<usize>,
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
@@ -670,14 +706,22 @@ struct SlotView {
     /// rows remain the durable audit source; this projection only groups their
     /// lifecycle and confirmed TX events for quick review.
     run_history: VecDeque<RunHistoryEntry>,
+    monitor_history: VecDeque<MonitorHistoryEntry>,
     /// The bar is a bounded recent projection, not an assertion that the
     /// durable journal has been read from sequence one. Initial attach uses a
     /// tail, and any gap or local eviction keeps this conservative marker set.
     run_history_limited: bool,
-    /// `None` follows the newest described Agent command at the bottom. A concrete key
-    /// preserves an explicit operator selection when newer commands arrive.
+    /// `None` follows the newest described Agent command at the bottom. Every new
+    /// command action returns here; chunks and later steps of the same action do not.
     selected_run_command: Option<RunCommandKey>,
     expanded_run_command: Option<RunCommandKey>,
+    /// Child command selected inside an expanded `command_sequence` action.
+    /// `None` keeps navigation at the action level.
+    selected_run_step: Option<usize>,
+    selected_monitor: Option<Uuid>,
+    expanded_monitor: Option<Uuid>,
+    selected_monitor_matcher: Option<usize>,
+    selected_monitor_incident: Option<Uuid>,
     run_detail_scroll: usize,
 }
 
@@ -820,18 +864,24 @@ impl SlotView {
             scroll_snapshot: None,
             scroll_from_bottom: 0,
             unseen: 0,
+            local_contiguous_from_seq: None,
             draft: Vec::new(),
             draft_cursor: 0,
             mode: InputMode::Line,
             history: Vec::new(),
-            history_cursor: None,
             history_search: None,
             completion: None,
             last_manual_activity: None,
             run_history: VecDeque::new(),
+            monitor_history: VecDeque::new(),
             run_history_limited: true,
             selected_run_command: None,
             expanded_run_command: None,
+            selected_run_step: None,
+            selected_monitor: None,
+            expanded_monitor: None,
+            selected_monitor_matcher: None,
+            selected_monitor_incident: None,
             run_detail_scroll: 0,
         };
         view.sync_trigger_projection(false);
@@ -851,6 +901,11 @@ impl SlotView {
         self.run_history_limited = true;
         self.selected_run_command = None;
         self.expanded_run_command = None;
+        self.selected_run_step = None;
+        self.selected_monitor = None;
+        self.expanded_monitor = None;
+        self.selected_monitor_matcher = None;
+        self.selected_monitor_incident = None;
         self.run_detail_scroll = 0;
     }
 
@@ -866,6 +921,7 @@ impl SlotView {
             .is_some_and(|expanded| expanded.run_id == removed)
         {
             self.expanded_run_command = None;
+            self.selected_run_step = None;
             self.run_detail_scroll = 0;
         }
     }
@@ -987,11 +1043,24 @@ impl SlotView {
                 if !described_agent_command {
                     return;
                 }
-                let Some(entry) = self.ensure_run_for_event(event, run_id) else {
-                    return;
+                let (new_action, evicted) = {
+                    let Some(entry) = self.ensure_run_for_event(event, run_id) else {
+                        return;
+                    };
+                    entry.append_command(event)
                 };
-                if entry.append_command(event) {
+                if evicted {
                     self.run_history_limited = true;
+                }
+                if new_action {
+                    self.selected_run_command = None;
+                    self.expanded_run_command = None;
+                    self.selected_run_step = None;
+                    self.selected_monitor = None;
+                    self.expanded_monitor = None;
+                    self.selected_monitor_matcher = None;
+                    self.selected_monitor_incident = None;
+                    self.run_detail_scroll = 0;
                 }
             }
             _ => {}
@@ -1025,16 +1094,128 @@ impl SlotView {
         })
     }
 
-    fn select_run_command_index(&mut self, index: usize) {
-        let key = self.run_command_keys().get(index).copied();
-        self.selected_run_command = key;
+    fn selected_run_command_key(&self) -> Option<RunCommandKey> {
+        if self.selected_monitor.is_some() {
+            return None;
+        }
+        let index = self.selected_run_command_index()?;
+        self.run_command_keys().get(index).copied()
+    }
+
+    fn history_action_keys(&self) -> Vec<HistoryActionKey> {
+        let mut actions = self
+            .run_history_chronological()
+            .into_iter()
+            .flat_map(|run| {
+                run.commands.iter().map(move |command| {
+                    let key = RunCommandKey {
+                        run_id: run.id,
+                        first_seq: command.first_seq,
+                    };
+                    (
+                        command.first_wall_time_ns,
+                        command.first_seq,
+                        run.id,
+                        HistoryActionKey::Command(key),
+                    )
+                })
+            })
+            .chain(self.monitor_history.iter().map(|entry| {
+                (
+                    entry.monitor.created_wall_time_ns,
+                    entry
+                        .monitor
+                        .spec
+                        .start_cursor
+                        .as_ref()
+                        .map_or(0, |cursor| cursor.after_seq),
+                    entry.monitor.id,
+                    HistoryActionKey::Monitor(entry.monitor.id),
+                )
+            }))
+            .collect::<Vec<_>>();
+        actions.sort_by_key(|(wall_time, sequence, id, key)| {
+            (
+                *wall_time,
+                *sequence,
+                match key {
+                    HistoryActionKey::Command(_) => 0u8,
+                    HistoryActionKey::Monitor(_) => 1u8,
+                },
+                *id,
+            )
+        });
+        actions.into_iter().map(|(_, _, _, key)| key).collect()
+    }
+
+    fn selected_history_action_index(&self) -> Option<usize> {
+        let keys = self.history_action_keys();
+        (!keys.is_empty()).then(|| {
+            let selected = self
+                .selected_monitor
+                .map(HistoryActionKey::Monitor)
+                .or_else(|| self.selected_run_command.map(HistoryActionKey::Command));
+            selected
+                .and_then(|selected| keys.iter().position(|key| *key == selected))
+                .unwrap_or(keys.len() - 1)
+        })
+    }
+
+    fn selected_history_action_key(&self) -> Option<HistoryActionKey> {
+        let keys = self.history_action_keys();
+        let index = self.selected_history_action_index()?;
+        keys.get(index).copied()
+    }
+
+    fn select_history_action_index(&mut self, index: usize) {
+        match self.history_action_keys().get(index).copied() {
+            Some(HistoryActionKey::Command(key)) => {
+                self.selected_run_command = Some(key);
+                self.selected_monitor = None;
+            }
+            Some(HistoryActionKey::Monitor(id)) => {
+                self.selected_run_command = None;
+                self.selected_monitor = Some(id);
+            }
+            None => {
+                self.selected_run_command = None;
+                self.selected_monitor = None;
+            }
+        }
         self.expanded_run_command = None;
+        self.selected_run_step = None;
+        self.expanded_monitor = None;
+        self.selected_monitor_matcher = None;
+        self.selected_monitor_incident = None;
         self.run_detail_scroll = 0;
     }
 
-    fn selected_run_command_key(&self) -> Option<RunCommandKey> {
-        let index = self.selected_run_command_index()?;
-        self.run_command_keys().get(index).copied()
+    fn monitor(&self, id: Uuid) -> Option<&MonitorHistoryEntry> {
+        self.monitor_history
+            .iter()
+            .find(|entry| entry.monitor.id == id)
+    }
+
+    fn monitor_incident_ids(&self, id: Uuid, matcher: usize) -> Vec<Uuid> {
+        self.monitor(id)
+            .map(|entry| {
+                entry
+                    .incidents
+                    .iter()
+                    .filter(|incident| incident.matches.iter().any(|item| item.index == matcher))
+                    .map(|incident| incident.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn selected_monitor_incident(&self) -> Option<&MonitorIncident> {
+        let monitor = self.selected_monitor?;
+        let incident = self.selected_monitor_incident?;
+        self.monitor(monitor)?
+            .incidents
+            .iter()
+            .find(|item| item.id == incident)
     }
 
     fn run_command(&self, key: RunCommandKey) -> Option<&RunCommandRecord> {
@@ -1270,10 +1451,17 @@ impl SlotView {
         if self.last_epoch == Some(event.daemon_epoch) && event.seq <= self.last_seq {
             return;
         }
+        let follows_previous = self.last_epoch == Some(event.daemon_epoch)
+            && self.last_seq.checked_add(1) == Some(event.seq);
         if self.last_epoch.is_some() && self.last_epoch != Some(event.daemon_epoch) {
             self.reset_stream();
             self.clear_run_history();
             self.push_line(gap_line(event.seq, tr("st.epoch.changed")), selected);
+        }
+        if event.kind == EventKind::Gap {
+            self.local_contiguous_from_seq = None;
+        } else if !follows_previous || self.local_contiguous_from_seq.is_none() {
+            self.local_contiguous_from_seq = Some(event.seq);
         }
         if event.kind == EventKind::Gap {
             self.run_history_limited = true;
@@ -1449,6 +1637,7 @@ struct QueueSelection {
 #[derive(Clone)]
 struct MenuCatalog {
     ports: Vec<SlotSnapshot>,
+    detected_ports: Vec<PortDescriptor>,
     config_revision: Option<u64>,
     transport_profiles: Vec<TransportProfile>,
     transport_revision: Option<u64>,
@@ -1460,8 +1649,14 @@ struct MenuCatalog {
 struct CurrentProfileEditor {
     original_port: String,
     port: String,
+    original_transport_binding: Option<String>,
+    transport_binding: Option<String>,
     original_transport: Option<TransportProfile>,
     transport: TransportProfile,
+    original_model_profile_binding: Option<String>,
+    model_profile_binding: Option<String>,
+    original_model_name: Option<String>,
+    model_name: Option<String>,
     original_device: Option<ModelProfile>,
     device: ModelProfile,
 }
@@ -1470,6 +1665,8 @@ impl CurrentProfileEditor {
     fn new(view: &SlotView, catalog: &MenuCatalog) -> Self {
         let original_port = view.snapshot.config.port.clone();
         let port = original_port.clone();
+        let original_transport_binding = view.snapshot.config.transport_profile.clone();
+        let transport_binding = original_transport_binding.clone();
         let original_transport = catalog
             .transport_profiles
             .iter()
@@ -1480,6 +1677,10 @@ impl CurrentProfileEditor {
         let transport = original_transport
             .clone()
             .unwrap_or_else(|| current_transport_template(view, catalog));
+        let original_model_profile_binding = view.snapshot.config.model_profile.clone();
+        let model_profile_binding = original_model_profile_binding.clone();
+        let original_model_name = view.snapshot.config.model_name.clone();
+        let model_name = original_model_name.clone();
         let original_device = view
             .snapshot
             .config
@@ -1498,8 +1699,14 @@ impl CurrentProfileEditor {
         Self {
             original_port,
             port,
+            original_transport_binding,
+            transport_binding,
             original_transport,
             transport,
+            original_model_profile_binding,
+            model_profile_binding,
+            original_model_name,
+            model_name,
             original_device,
             device,
         }
@@ -1510,21 +1717,52 @@ impl CurrentProfileEditor {
     }
 
     fn transport_update(&self) -> Option<TransportProfile> {
-        self.original_transport
-            .as_ref()
-            .filter(|original| *original != &self.transport)
-            .map(|_| self.transport.clone())
+        (self.transport_binding == self.original_transport_binding)
+            .then_some(())
+            .and(
+                self.original_transport
+                    .as_ref()
+                    .filter(|original| *original != &self.transport)
+                    .map(|_| self.transport.clone()),
+            )
     }
 
     fn device_update(&self) -> Option<ModelProfile> {
-        self.original_device
-            .as_ref()
-            .filter(|original| *original != &self.device)
-            .map(|_| self.device.clone())
+        (self.model_profile_binding == self.original_model_profile_binding)
+            .then_some(())
+            .and(
+                self.original_device
+                    .as_ref()
+                    .filter(|original| *original != &self.device)
+                    .map(|_| self.device.clone()),
+            )
+    }
+
+    fn transport_binding_update(&self) -> Option<Option<String>> {
+        (self.transport_binding != self.original_transport_binding)
+            .then(|| self.transport_binding.clone())
+    }
+
+    fn model_profile_binding_update(&self) -> Option<Option<String>> {
+        (self.model_profile_binding != self.original_model_profile_binding)
+            .then(|| self.model_profile_binding.clone())
+    }
+
+    fn model_name_update(&self) -> Option<Option<String>> {
+        (self.model_name != self.original_model_name).then(|| self.model_name.clone())
+    }
+
+    fn changed(&self) -> bool {
+        self.port_update().is_some()
+            || self.transport_binding_update().is_some()
+            || self.transport_update().is_some()
+            || self.model_profile_binding_update().is_some()
+            || self.model_name_update().is_some()
+            || self.device_update().is_some()
     }
 
     fn device_is_bound(&self) -> bool {
-        self.original_device.is_some()
+        self.model_profile_binding.is_some()
     }
 }
 
@@ -1567,11 +1805,14 @@ fn shared_profile_impacts(
 enum MenuPage {
     Root,
     Profiles,
-    TransportProfiles,
-    ModelProfiles,
-    SerialSettings,
+    CreateProfiles,
+    CreateTransportProfile,
+    CreateModelProfile,
+    Settings,
+    ModelFamilies,
+    ModelNames,
     DisplaySettings,
-    RunSettings,
+    McpSettings,
     Help,
 }
 
@@ -1581,8 +1822,13 @@ struct MenuState {
     stack: Vec<(MenuPage, usize)>,
     catalog: Option<MenuCatalog>,
     profile_editor: Option<CurrentProfileEditor>,
+    create_transport: Option<TransportProfile>,
+    create_model: Option<ModelProfile>,
+    choice: Option<MenuChoice>,
+    model_family: Option<String>,
     prompt: Option<MenuPrompt>,
     confirmation: Option<MenuConfirmation>,
+    field_help: Option<String>,
     help_scroll: usize,
     busy: bool,
     message: String,
@@ -1596,8 +1842,13 @@ impl MenuState {
             stack: Vec::new(),
             catalog: None,
             profile_editor: None,
+            create_transport: None,
+            create_model: None,
+            choice: None,
+            model_family: None,
             prompt: None,
             confirmation: None,
+            field_help: None,
             help_scroll: 0,
             busy: false,
             message: tr("menu.loading").into(),
@@ -1608,6 +1859,7 @@ impl MenuState {
         self.stack.push((self.page, self.selected));
         self.page = page;
         self.selected = 0;
+        self.choice = None;
         self.help_scroll = 0;
     }
 
@@ -1615,11 +1867,66 @@ impl MenuState {
         if let Some((page, selected)) = self.stack.pop() {
             self.page = page;
             self.selected = selected;
+            self.choice = None;
             true
         } else {
             false
         }
     }
+}
+
+#[derive(Clone)]
+struct MenuChoice {
+    purpose: MenuChoicePurpose,
+    options: Vec<MenuChoiceOption>,
+    selected: usize,
+}
+
+#[derive(Clone)]
+struct MenuChoiceOption {
+    label: String,
+    value: MenuChoiceValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuChoicePurpose {
+    CurrentPort,
+    CurrentTransportProfile,
+    CurrentModelProfile,
+    CurrentBaudRate,
+    CurrentDataBits,
+    CurrentParity,
+    CurrentStopBits,
+    CurrentFlowControl,
+    CurrentDtr,
+    CurrentRts,
+    CurrentAutoOpen,
+    CurrentWriteEol,
+    CurrentEcho,
+    CreateTransportBaudRate,
+    CreateTransportDataBits,
+    CreateTransportParity,
+    CreateTransportStopBits,
+    CreateTransportFlowControl,
+    CreateTransportDtr,
+    CreateTransportRts,
+    CreateTransportAutoOpen,
+    CreateModelWriteEol,
+    CreateModelEcho,
+}
+
+#[derive(Clone)]
+enum MenuChoiceValue {
+    Text(String),
+    OptionalText(Option<String>),
+    Number(u32),
+    DataBits(DataBits),
+    Parity(Parity),
+    StopBits(StopBits),
+    FlowControl(FlowControl),
+    Bool(bool),
+    Eol(Option<String>),
+    Echo(Option<EchoMode>),
 }
 
 struct MenuConfirmation {
@@ -1654,23 +1961,30 @@ struct MenuPrompt {
 }
 
 enum MenuPromptPurpose {
-    TransportName {
-        port: String,
-        profile: TransportProfile,
-    },
-    DeviceName {
-        port: String,
-        profile: ModelProfile,
-    },
     CurrentProfile(CurrentProfilePromptField),
+    CreateTransport(CreateTransportPromptField),
+    CreateModel(CreateModelPromptField),
     AgentHistoryRows,
     OrphanRunTimeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentProfilePromptField {
-    Port,
-    BaudRate,
+    ShellPrompt,
+    UbootPrompt,
+    ChunkSize,
+    ChunkDelay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateTransportPromptField {
+    Name,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateModelPromptField {
+    Name,
+    ModelNames,
     ShellPrompt,
     UbootPrompt,
     ChunkSize,
@@ -1678,31 +1992,20 @@ enum CurrentProfilePromptField {
 }
 
 enum MenuMutation {
-    BindTransport {
-        port: String,
-        profile_name: String,
-    },
-    BindModelProfile {
-        port: String,
-        profile_name: Option<String>,
-    },
-    CreateTransportAndBind {
-        port: String,
-        profile: TransportProfile,
-    },
-    CreateModelProfileAndBind {
-        port: String,
-        profile: ModelProfile,
-    },
-    UpdateCurrentProfiles {
-        current_port: String,
-        new_port: Option<String>,
-        transport: Option<TransportProfile>,
-        device: Option<ModelProfile>,
-        expected_config_revision: Option<u64>,
-        expected_transport_revision: Option<u64>,
-        expected_model_profile_revision: Option<u64>,
-    },
+    CreateTransport { profile: TransportProfile },
+    CreateModelProfile { profile: ModelProfile },
+    UpdateCurrentProfiles(Box<CurrentProfileUpdate>),
+}
+
+struct CurrentProfileUpdate {
+    current_port: String,
+    new_port: Option<String>,
+    transport_binding: Option<Option<String>>,
+    transport: Option<TransportProfile>,
+    model_profile_binding: Option<Option<String>>,
+    model_name: Option<Option<String>>,
+    device: Option<ModelProfile>,
+    revisions: CurrentProfileRevisions,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1720,11 +2023,12 @@ enum MenuIoCommand {
 #[derive(Clone)]
 enum MenuSuccess {
     Loaded,
-    TransportBound(String),
-    ModelProfileBound(Option<String>),
     TransportCreated(String),
     ModelProfileCreated(String),
-    ProfilesUpdated,
+    ProfilesUpdated {
+        previous_port: String,
+        configured_port: String,
+    },
 }
 
 enum MenuIoEvent {
@@ -1735,53 +2039,9 @@ enum MenuIoEvent {
     Failed(String),
 }
 
-#[derive(Clone, Copy)]
-enum TransportPreset {
-    Baud(u32),
-    EightNOne,
-    EightEOne,
-    EightOOne,
-    EightNTwo,
-    FlowNone,
-    FlowHardware,
-    ToggleDtr,
-    ToggleRts,
-    ToggleAutoOpen,
-}
-
-const TRANSPORT_PRESETS: &[TransportPreset] = &[
-    TransportPreset::Baud(9_600),
-    TransportPreset::Baud(57_600),
-    TransportPreset::Baud(115_200),
-    TransportPreset::Baud(230_400),
-    TransportPreset::Baud(921_600),
-    TransportPreset::EightNOne,
-    TransportPreset::EightEOne,
-    TransportPreset::EightOOne,
-    TransportPreset::EightNTwo,
-    TransportPreset::FlowNone,
-    TransportPreset::FlowHardware,
-    TransportPreset::ToggleDtr,
-    TransportPreset::ToggleRts,
-    TransportPreset::ToggleAutoOpen,
-];
-
-#[derive(Clone, Copy)]
-enum ModelPreset {
-    Echo(EchoMode),
-    Eol(&'static str),
-}
-
-const MODEL_PRESETS: &[ModelPreset] = &[
-    ModelPreset::Echo(EchoMode::On),
-    ModelPreset::Echo(EchoMode::Off),
-    ModelPreset::Echo(EchoMode::Auto),
-    ModelPreset::Eol("\r"),
-    ModelPreset::Eol("\n"),
-    ModelPreset::Eol("\r\n"),
-];
-
-const CURRENT_PROFILE_ROW_COUNT: usize = 18;
+const CURRENT_PROFILE_ROW_COUNT: usize = 19;
+const CREATE_TRANSPORT_ROW_COUNT: usize = 10;
+const CREATE_MODEL_ROW_COUNT: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentProfileRow {
@@ -1796,6 +2056,7 @@ enum CurrentProfileRow {
     Rts,
     AutoOpen,
     ModelProfile,
+    ModelName,
     WriteEol,
     Echo,
     ShellPrompt,
@@ -1819,135 +2080,78 @@ impl CurrentProfileRow {
             8 => Self::Rts,
             9 => Self::AutoOpen,
             10 => Self::ModelProfile,
-            11 => Self::WriteEol,
-            12 => Self::Echo,
-            13 => Self::ShellPrompt,
-            14 => Self::UbootPrompt,
-            15 => Self::ChunkSize,
-            16 => Self::ChunkDelay,
-            17 => Self::Apply,
+            11 => Self::ModelName,
+            12 => Self::WriteEol,
+            13 => Self::Echo,
+            14 => Self::ShellPrompt,
+            15 => Self::UbootPrompt,
+            16 => Self::ChunkSize,
+            17 => Self::ChunkDelay,
+            18 => Self::Apply,
             _ => return None,
         })
     }
 }
 
-impl ModelPreset {
-    fn apply(self, profile: &mut ModelProfile) {
-        match self {
-            Self::Echo(echo) => profile.echo = Some(echo),
-            Self::Eol(eol) => profile.write_eol = Some(eol.into()),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateTransportRow {
+    Name,
+    BaudRate,
+    DataBits,
+    Parity,
+    StopBits,
+    FlowControl,
+    Dtr,
+    Rts,
+    AutoOpen,
+    Save,
+}
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Echo(EchoMode::On) => tr("menu.device.echo.on"),
-            Self::Echo(EchoMode::Off) => tr("menu.device.echo.off"),
-            Self::Echo(EchoMode::Auto) => tr("menu.device.echo.auto"),
-            Self::Eol("\r") => tr("menu.device.eol.cr"),
-            Self::Eol("\n") => tr("menu.device.eol.lf"),
-            Self::Eol("\r\n") => tr("menu.device.eol.crlf"),
-            Self::Eol(_) => tr("menu.device.eol.custom"),
-        }
+impl CreateTransportRow {
+    fn from_index(index: usize) -> Option<Self> {
+        Some(match index {
+            0 => Self::Name,
+            1 => Self::BaudRate,
+            2 => Self::DataBits,
+            3 => Self::Parity,
+            4 => Self::StopBits,
+            5 => Self::FlowControl,
+            6 => Self::Dtr,
+            7 => Self::Rts,
+            8 => Self::AutoOpen,
+            9 => Self::Save,
+            _ => return None,
+        })
     }
 }
 
-impl TransportPreset {
-    fn apply(self, profile: &mut TransportProfile) {
-        match self {
-            Self::Baud(baud_rate) => profile.baud_rate = baud_rate,
-            Self::EightNOne => {
-                profile.data_bits = DataBits::Eight;
-                profile.parity = Parity::None;
-                profile.stop_bits = StopBits::One;
-            }
-            Self::EightEOne => {
-                profile.data_bits = DataBits::Eight;
-                profile.parity = Parity::Even;
-                profile.stop_bits = StopBits::One;
-            }
-            Self::EightOOne => {
-                profile.data_bits = DataBits::Eight;
-                profile.parity = Parity::Odd;
-                profile.stop_bits = StopBits::One;
-            }
-            Self::EightNTwo => {
-                profile.data_bits = DataBits::Eight;
-                profile.parity = Parity::None;
-                profile.stop_bits = StopBits::Two;
-            }
-            Self::FlowNone => profile.flow_control = FlowControl::None,
-            Self::FlowHardware => profile.flow_control = FlowControl::Hardware,
-            Self::ToggleDtr => profile.dtr = !profile.dtr,
-            Self::ToggleRts => profile.rts = !profile.rts,
-            Self::ToggleAutoOpen => profile.auto_open = !profile.auto_open,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Baud(value) => trf("menu.serial.baud", &[&value.to_string()]),
-            Self::EightNOne => tr("menu.serial.8n1").into(),
-            Self::EightEOne => tr("menu.serial.8e1").into(),
-            Self::EightOOne => tr("menu.serial.8o1").into(),
-            Self::EightNTwo => tr("menu.serial.8n2").into(),
-            Self::FlowNone => tr("menu.serial.flow.none").into(),
-            Self::FlowHardware => tr("menu.serial.flow.hardware").into(),
-            Self::ToggleDtr => tr("menu.serial.dtr").into(),
-            Self::ToggleRts => tr("menu.serial.rts").into(),
-            Self::ToggleAutoOpen => tr("menu.serial.auto").into(),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateModelRow {
+    Name,
+    ModelNames,
+    WriteEol,
+    Echo,
+    ShellPrompt,
+    UbootPrompt,
+    ChunkSize,
+    ChunkDelay,
+    Save,
 }
 
-fn next_data_bits(value: DataBits) -> DataBits {
-    match value {
-        DataBits::Five => DataBits::Six,
-        DataBits::Six => DataBits::Seven,
-        DataBits::Seven => DataBits::Eight,
-        DataBits::Eight => DataBits::Five,
-    }
-}
-
-fn next_parity(value: Parity) -> Parity {
-    match value {
-        Parity::None => Parity::Even,
-        Parity::Even => Parity::Odd,
-        Parity::Odd => Parity::None,
-    }
-}
-
-fn next_stop_bits(value: StopBits) -> StopBits {
-    match value {
-        StopBits::One => StopBits::Two,
-        StopBits::Two => StopBits::One,
-    }
-}
-
-fn next_flow_control(value: FlowControl) -> FlowControl {
-    match value {
-        FlowControl::None => FlowControl::Software,
-        FlowControl::Software => FlowControl::Hardware,
-        FlowControl::Hardware => FlowControl::None,
-    }
-}
-
-fn next_eol(value: Option<&str>) -> Option<String> {
-    match value {
-        None => Some("\r".into()),
-        Some("\r") => Some("\n".into()),
-        Some("\n") => Some("\r\n".into()),
-        Some("\r\n") => Some(String::new()),
-        Some("") | Some(_) => None,
-    }
-}
-
-fn next_echo(value: Option<EchoMode>) -> Option<EchoMode> {
-    match value {
-        None => Some(EchoMode::On),
-        Some(EchoMode::On) => Some(EchoMode::Off),
-        Some(EchoMode::Off) => Some(EchoMode::Auto),
-        Some(EchoMode::Auto) => None,
+impl CreateModelRow {
+    fn from_index(index: usize) -> Option<Self> {
+        Some(match index {
+            0 => Self::Name,
+            1 => Self::ModelNames,
+            2 => Self::WriteEol,
+            3 => Self::Echo,
+            4 => Self::ShellPrompt,
+            5 => Self::UbootPrompt,
+            6 => Self::ChunkSize,
+            7 => Self::ChunkDelay,
+            8 => Self::Save,
+            _ => return None,
+        })
     }
 }
 
@@ -2012,6 +2216,7 @@ fn current_model_profile_template(view: &SlotView) -> ModelProfile {
         });
     ModelProfile {
         name: String::new(),
+        model_names: Vec::new(),
         shell_prompt: view.effective_shell_prompt().map(ToOwned::to_owned),
         uboot_prompt: view.effective_uboot_prompt().map(ToOwned::to_owned),
         write_eol: Some(view.effective_write_eol().to_owned()),
@@ -2030,18 +2235,29 @@ fn valid_menu_name(value: &str) -> bool {
 
 fn menu_item_count(menu: &MenuState) -> usize {
     match menu.page {
-        MenuPage::Root => 5,
+        MenuPage::Root => 4,
         MenuPage::Profiles => CURRENT_PROFILE_ROW_COUNT,
-        MenuPage::TransportProfiles => menu
-            .catalog
-            .as_ref()
-            .map_or(0, |catalog| catalog.transport_profiles.len() + 1),
-        MenuPage::ModelProfiles => menu.catalog.as_ref().map_or(0, |catalog| {
-            catalog.model_profiles.len() + 2 + MODEL_PRESETS.len()
+        MenuPage::CreateProfiles | MenuPage::Settings => 2,
+        MenuPage::CreateTransportProfile => CREATE_TRANSPORT_ROW_COUNT,
+        MenuPage::CreateModelProfile => CREATE_MODEL_ROW_COUNT,
+        MenuPage::ModelFamilies => menu.catalog.as_ref().map_or(0, |catalog| {
+            catalog
+                .model_profiles
+                .iter()
+                .filter(|profile| !profile.model_names.is_empty())
+                .count()
         }),
-        MenuPage::SerialSettings => TRANSPORT_PRESETS.len(),
+        MenuPage::ModelNames => menu.catalog.as_ref().map_or(0, |catalog| {
+            menu.model_family.as_deref().map_or(0, |family| {
+                catalog
+                    .model_profiles
+                    .iter()
+                    .find(|profile| profile.name == family)
+                    .map_or(0, |profile| profile.model_names.len())
+            })
+        }),
         MenuPage::DisplaySettings => 1,
-        MenuPage::RunSettings => 1,
+        MenuPage::McpSettings => 1,
         MenuPage::Help => 0,
     }
 }
@@ -2049,12 +2265,9 @@ fn menu_item_count(menu: &MenuState) -> usize {
 fn menu_success_message(success: &MenuSuccess) -> String {
     match success {
         MenuSuccess::Loaded => tr("menu.loaded").into(),
-        MenuSuccess::TransportBound(name) => trf("menu.transport.bound", &[name]),
-        MenuSuccess::ModelProfileBound(Some(name)) => trf("menu.device.bound", &[name]),
-        MenuSuccess::ModelProfileBound(None) => tr("menu.device.generic.bound").into(),
         MenuSuccess::TransportCreated(name) => trf("menu.transport.created", &[name]),
         MenuSuccess::ModelProfileCreated(name) => trf("menu.device.created", &[name]),
-        MenuSuccess::ProfilesUpdated => tr("menu.profile.updated").into(),
+        MenuSuccess::ProfilesUpdated { .. } => tr("menu.profile.updated").into(),
     }
 }
 
@@ -2097,6 +2310,127 @@ enum OutputSearchIoEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncidentEvidenceTarget {
+    incident_id: Uuid,
+    port: String,
+    daemon_epoch: Uuid,
+    seq_start: u64,
+    seq_end: u64,
+}
+
+impl From<&MonitorIncident> for IncidentEvidenceTarget {
+    fn from(incident: &MonitorIncident) -> Self {
+        Self {
+            incident_id: incident.id,
+            port: incident.port.clone(),
+            daemon_epoch: incident.daemon_epoch,
+            seq_start: incident.seq_start,
+            seq_end: incident.seq_end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandEvidenceTarget {
+    key: RunCommandKey,
+    step_index: Option<usize>,
+    port: String,
+    daemon_epoch: Uuid,
+    seq_start: u64,
+    write_end_seq: u64,
+    query_end_seq: u64,
+    command: String,
+    matchers: Vec<CommandCaptureMatcher>,
+}
+
+impl CommandEvidenceTarget {
+    fn same_selection(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.step_index == other.step_index
+            && self.port == other.port
+            && self.daemon_epoch == other.daemon_epoch
+            && self.seq_start == other.seq_start
+            && self.write_end_seq == other.write_end_seq
+            && self.command == other.command
+            && self.matchers == other.matchers
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactEvidenceTarget {
+    Incident(IncidentEvidenceTarget),
+    Command(CommandEvidenceTarget),
+}
+
+impl ExactEvidenceTarget {
+    fn port(&self) -> &str {
+        match self {
+            Self::Incident(target) => &target.port,
+            Self::Command(target) => &target.port,
+        }
+    }
+
+    fn daemon_epoch(&self) -> Uuid {
+        match self {
+            Self::Incident(target) => target.daemon_epoch,
+            Self::Command(target) => target.daemon_epoch,
+        }
+    }
+
+    fn seq_start(&self) -> u64 {
+        match self {
+            Self::Incident(target) => target.seq_start,
+            Self::Command(target) => target.seq_start,
+        }
+    }
+
+    fn query_end_seq(&self) -> u64 {
+        match self {
+            Self::Incident(target) => target.seq_end,
+            Self::Command(target) => target.query_end_seq,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExactEvidenceRequest {
+    request_id: Uuid,
+    target: ExactEvidenceTarget,
+}
+
+#[derive(Debug)]
+enum ExactEvidenceIoCommand {
+    Query(ExactEvidenceRequest),
+}
+
+#[derive(Debug)]
+struct ExactEvidenceResponse {
+    target: ExactEvidenceTarget,
+    events: Vec<TimelineEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactEvidenceFailure {
+    Gap(GapRange),
+    Incomplete,
+    LimitExceeded,
+    QueryFailed(String),
+}
+
+#[derive(Debug)]
+enum ExactEvidenceIoEvent {
+    Completed {
+        request_id: Uuid,
+        response: ExactEvidenceResponse,
+    },
+    Failed {
+        request_id: Uuid,
+        target: ExactEvidenceTarget,
+        failure: ExactEvidenceFailure,
+    },
+}
+
 struct App {
     ports: Vec<SlotView>,
     selected: usize,
@@ -2134,6 +2468,8 @@ struct App {
     menu_commands: Option<mpsc::Sender<MenuIoCommand>>,
     output_search: Option<OutputSearchState>,
     output_search_commands: Option<mpsc::Sender<OutputSearchIoCommand>>,
+    exact_evidence_commands: Option<mpsc::Sender<ExactEvidenceIoCommand>>,
+    pending_exact_evidence: Option<(Uuid, ExactEvidenceTarget)>,
     uncertain_write_outcomes: usize,
     human_idle_release: Duration,
     mouse_capture: bool,
@@ -2195,6 +2531,8 @@ impl App {
             menu_commands: None,
             output_search: None,
             output_search_commands: None,
+            exact_evidence_commands: None,
+            pending_exact_evidence: None,
             uncertain_write_outcomes: 0,
             human_idle_release: Duration::from_secs(DEFAULT_HUMAN_IDLE_RELEASE_SECONDS),
             mouse_capture: true,
@@ -2280,8 +2618,9 @@ impl App {
         self.current()
             .snapshot
             .config
-            .model_profile
+            .model_name
             .clone()
+            .or_else(|| self.current().snapshot.config.model_profile.clone())
             .unwrap_or_else(|| tr("ui.output.model.unconfigured").into())
     }
 
@@ -2554,6 +2893,166 @@ impl App {
         self.dirty = true;
     }
 
+    fn handle_exact_evidence_io_event(&mut self, event: ExactEvidenceIoEvent) {
+        let (request_id, event_target) = match &event {
+            ExactEvidenceIoEvent::Completed {
+                request_id,
+                response,
+            } => (*request_id, &response.target),
+            ExactEvidenceIoEvent::Failed {
+                request_id, target, ..
+            } => (*request_id, target),
+        };
+        let Some((pending_id, pending_target)) = self.pending_exact_evidence.as_ref() else {
+            return;
+        };
+        if *pending_id != request_id || pending_target != event_target {
+            return;
+        }
+        let still_selected = self.focus == PaneFocus::RunHistory
+            && match pending_target {
+                ExactEvidenceTarget::Incident(target) => {
+                    self.current()
+                        .selected_monitor_incident()
+                        .map(IncidentEvidenceTarget::from)
+                        .as_ref()
+                        == Some(target)
+                }
+                ExactEvidenceTarget::Command(target) => self
+                    .command_evidence_target(target.key, target.step_index)
+                    .is_some_and(|current| target.same_selection(&current)),
+            };
+        let pending_target = pending_target.clone();
+        self.pending_exact_evidence = None;
+        if !still_selected {
+            return;
+        }
+        match event {
+            ExactEvidenceIoEvent::Completed { response, .. } => {
+                let Some(inner) = self.layout.map(|layout| layout.output_inner) else {
+                    self.current_mut().follow();
+                    self.status = match pending_target {
+                        ExactEvidenceTarget::Incident(_) => {
+                            tr("st.monitor.jump.query.unavailable").into()
+                        }
+                        ExactEvidenceTarget::Command(_) => {
+                            tr("st.run.jump.query.unavailable").into()
+                        }
+                    };
+                    self.dirty = true;
+                    return;
+                };
+                let snapshot = match &response.target {
+                    ExactEvidenceTarget::Incident(target) => incident_evidence_snapshot(
+                        self.detailed_timeline,
+                        target,
+                        &response.events,
+                        inner.width,
+                    ),
+                    ExactEvidenceTarget::Command(target) => command_evidence_snapshot(
+                        self.detailed_timeline,
+                        target,
+                        &response.events,
+                        inner.width,
+                    ),
+                };
+                let Some(snapshot) = snapshot else {
+                    self.current_mut().follow();
+                    self.status = match &pending_target {
+                        ExactEvidenceTarget::Incident(target) => trf(
+                            "st.monitor.jump.incomplete",
+                            &[&target.seq_start.to_string(), &target.seq_end.to_string()],
+                        ),
+                        ExactEvidenceTarget::Command(target) => trf(
+                            "st.run.jump.incomplete",
+                            &[
+                                &target.seq_start.to_string(),
+                                &target.query_end_seq.to_string(),
+                            ],
+                        ),
+                    };
+                    self.dirty = true;
+                    return;
+                };
+                let scroll_from_bottom = snapshot
+                    .rows
+                    .len()
+                    .saturating_sub(usize::from(inner.height).max(1));
+                let view = self.current_mut();
+                view.scroll_snapshot = Some(snapshot);
+                view.scroll_from_bottom = scroll_from_bottom;
+                view.unseen = 0;
+                self.status = match pending_target {
+                    ExactEvidenceTarget::Incident(target) => trf(
+                        "st.monitor.jump.journal",
+                        &[&target.seq_start.to_string(), &target.seq_end.to_string()],
+                    ),
+                    ExactEvidenceTarget::Command(target) => {
+                        trf("st.run.jump.journal", &[&target.seq_start.to_string()])
+                    }
+                };
+            }
+            ExactEvidenceIoEvent::Failed { failure, .. } => {
+                self.current_mut().follow();
+                self.status = match (&pending_target, failure) {
+                    (ExactEvidenceTarget::Incident(target), ExactEvidenceFailure::Gap(gap)) => trf(
+                        "st.monitor.jump.gap",
+                        &[
+                            &target.seq_start.to_string(),
+                            &target.seq_end.to_string(),
+                            &gap.first_seq.to_string(),
+                            &gap.last_seq.to_string(),
+                            gap_reason_label(gap.reason),
+                        ],
+                    ),
+                    (ExactEvidenceTarget::Incident(target), ExactEvidenceFailure::Incomplete) => {
+                        trf(
+                            "st.monitor.jump.incomplete",
+                            &[&target.seq_start.to_string(), &target.seq_end.to_string()],
+                        )
+                    }
+                    (
+                        ExactEvidenceTarget::Incident(target),
+                        ExactEvidenceFailure::LimitExceeded,
+                    ) => trf(
+                        "st.monitor.jump.limit",
+                        &[&target.seq_start.to_string(), &target.seq_end.to_string()],
+                    ),
+                    (
+                        ExactEvidenceTarget::Incident(_),
+                        ExactEvidenceFailure::QueryFailed(message),
+                    ) => trf("st.monitor.jump.query.failed", &[&safe_inline(&message)]),
+                    (ExactEvidenceTarget::Command(target), ExactEvidenceFailure::Gap(gap)) => trf(
+                        "st.run.jump.gap",
+                        &[
+                            &target.seq_start.to_string(),
+                            &gap.first_seq.to_string(),
+                            &gap.last_seq.to_string(),
+                            gap_reason_label(gap.reason),
+                        ],
+                    ),
+                    (ExactEvidenceTarget::Command(target), ExactEvidenceFailure::Incomplete) => {
+                        trf(
+                            "st.run.jump.incomplete",
+                            &[
+                                &target.seq_start.to_string(),
+                                &target.query_end_seq.to_string(),
+                            ],
+                        )
+                    }
+                    (ExactEvidenceTarget::Command(target), ExactEvidenceFailure::LimitExceeded) => {
+                        trf("st.run.jump.limit", &[&target.seq_start.to_string()])
+                    }
+                    (
+                        ExactEvidenceTarget::Command(_),
+                        ExactEvidenceFailure::QueryFailed(message),
+                    ) => trf("st.run.jump.query.failed", &[&safe_inline(&message)]),
+                };
+            }
+        }
+        self.dirty = true;
+    }
+
     fn sync_status_notice(&mut self, now: Instant) {
         if self.status_notice_source != self.status {
             self.status_notice_source.clone_from(&self.status);
@@ -2700,6 +3199,7 @@ impl App {
                             tr("st.session.changed.unsent"),
                         );
                         self.ports[index].reset_stream();
+                        self.ports[index].local_contiguous_from_seq = None;
                     }
                     if epoch_changed {
                         self.ports[index].clear_run_history();
@@ -3594,7 +4094,6 @@ impl App {
             view.mode = InputMode::Line;
             view.draft = text.chars().collect();
             view.draft_cursor = view.draft.len();
-            view.history_cursor = None;
             view.history_search = None;
             view.completion = None;
             self.queue_selection = None;
@@ -3728,43 +4227,200 @@ impl App {
     }
 
     fn handle_run_history_key(&mut self, key: KeyEvent) {
-        let count = self.current().run_command_keys().len();
+        let count = self.current().history_action_keys().len();
         let selected = self
             .current()
-            .selected_run_command_index()
+            .selected_history_action_index()
             .unwrap_or_else(|| count.saturating_sub(1));
         let mut jump_to_selection = false;
+        if let (Some(monitor_id), Some(matcher), Some(incident_id)) = (
+            self.current().selected_monitor,
+            self.current().selected_monitor_matcher,
+            self.current().selected_monitor_incident,
+        ) {
+            let incidents = self.current().monitor_incident_ids(monitor_id, matcher);
+            let selected_incident = incidents
+                .iter()
+                .position(|id| *id == incident_id)
+                .unwrap_or_else(|| incidents.len().saturating_sub(1));
+            match key.code {
+                KeyCode::Up if !incidents.is_empty() => {
+                    self.current_mut().selected_monitor_incident =
+                        incidents.get(selected_incident.saturating_sub(1)).copied();
+                    jump_to_selection = true;
+                }
+                KeyCode::Down if !incidents.is_empty() => {
+                    self.current_mut().selected_monitor_incident = incidents
+                        .get((selected_incident + 1).min(incidents.len() - 1))
+                        .copied();
+                    jump_to_selection = true;
+                }
+                KeyCode::Home if !incidents.is_empty() => {
+                    self.current_mut().selected_monitor_incident = incidents.first().copied();
+                    jump_to_selection = true;
+                }
+                KeyCode::End if !incidents.is_empty() => {
+                    self.current_mut().selected_monitor_incident = incidents.last().copied();
+                    jump_to_selection = true;
+                }
+                KeyCode::Right | KeyCode::Enter => jump_to_selection = true,
+                KeyCode::Left | KeyCode::Esc => {
+                    self.current_mut().selected_monitor_incident = None;
+                }
+                _ => {}
+            }
+            if jump_to_selection {
+                self.jump_output_to_monitor_incident();
+            }
+            return;
+        }
+        if let (Some(monitor_id), Some(matcher)) = (
+            self.current().selected_monitor,
+            self.current().selected_monitor_matcher,
+        ) {
+            let matcher_count = self
+                .current()
+                .monitor(monitor_id)
+                .map_or(0, |entry| entry.monitor.spec.matchers.len());
+            match key.code {
+                KeyCode::Up if matcher_count > 0 => {
+                    self.current_mut().selected_monitor_matcher = Some(matcher.saturating_sub(1));
+                }
+                KeyCode::Down if matcher_count > 0 => {
+                    self.current_mut().selected_monitor_matcher =
+                        Some((matcher + 1).min(matcher_count - 1));
+                }
+                KeyCode::Right | KeyCode::Enter => {
+                    let incidents = self.current().monitor_incident_ids(monitor_id, matcher);
+                    self.current_mut().selected_monitor_incident = incidents.last().copied();
+                    if self.current().selected_monitor_incident.is_some() {
+                        self.jump_output_to_monitor_incident();
+                    }
+                }
+                KeyCode::Left | KeyCode::Esc => {
+                    self.current_mut().selected_monitor_matcher = None;
+                    self.current_mut().expanded_monitor = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let Some(step) = self.current().selected_run_step {
+            let step_count = self
+                .current()
+                .selected_run_command_key()
+                .and_then(|key| self.current().run_command(key))
+                .map_or(0, |record| record.steps.len());
+            match key.code {
+                KeyCode::Up if step_count > 0 => {
+                    self.current_mut().selected_run_step = Some(step.saturating_sub(1));
+                    jump_to_selection = true;
+                }
+                KeyCode::Down if step_count > 0 => {
+                    self.current_mut().selected_run_step = Some((step + 1).min(step_count - 1));
+                    jump_to_selection = true;
+                }
+                KeyCode::Home if step_count > 0 => {
+                    self.current_mut().selected_run_step = Some(0);
+                    jump_to_selection = true;
+                }
+                KeyCode::End if step_count > 0 => {
+                    self.current_mut().selected_run_step = Some(step_count - 1);
+                    jump_to_selection = true;
+                }
+                KeyCode::Right | KeyCode::Enter => jump_to_selection = true,
+                KeyCode::Left | KeyCode::Esc => {
+                    self.current_mut().selected_run_step = None;
+                    self.current_mut().run_detail_scroll = 0;
+                }
+                KeyCode::PageUp => {
+                    let maximum = self.max_run_detail_scroll();
+                    self.current_mut().run_detail_scroll = self
+                        .current()
+                        .run_detail_scroll
+                        .min(maximum)
+                        .saturating_sub(5);
+                }
+                KeyCode::PageDown => {
+                    let maximum = self.max_run_detail_scroll();
+                    self.current_mut().run_detail_scroll = self
+                        .current()
+                        .run_detail_scroll
+                        .min(maximum)
+                        .saturating_add(5)
+                        .min(maximum);
+                }
+                _ => {}
+            }
+            if jump_to_selection && let Some(key) = self.current().selected_run_command_key() {
+                self.jump_output_to_run_command(key, self.current().selected_run_step);
+            }
+            return;
+        }
         match key.code {
             KeyCode::Up if count > 0 => {
                 self.current_mut()
-                    .select_run_command_index(selected.saturating_sub(1));
-                jump_to_selection = true;
+                    .select_history_action_index(selected.saturating_sub(1));
+                jump_to_selection = matches!(
+                    self.current().selected_history_action_key(),
+                    Some(HistoryActionKey::Command(_))
+                );
             }
             KeyCode::Down if count > 0 => {
                 self.current_mut()
-                    .select_run_command_index((selected + 1).min(count - 1));
-                jump_to_selection = true;
+                    .select_history_action_index((selected + 1).min(count - 1));
+                jump_to_selection = matches!(
+                    self.current().selected_history_action_key(),
+                    Some(HistoryActionKey::Command(_))
+                );
             }
             KeyCode::Home if count > 0 => {
-                self.current_mut().select_run_command_index(0);
-                jump_to_selection = true;
+                self.current_mut().select_history_action_index(0);
+                jump_to_selection = matches!(
+                    self.current().selected_history_action_key(),
+                    Some(HistoryActionKey::Command(_))
+                );
             }
             KeyCode::End if count > 0 => {
-                self.current_mut().select_run_command_index(count - 1);
-                jump_to_selection = true;
+                self.current_mut().select_history_action_index(count - 1);
+                jump_to_selection = matches!(
+                    self.current().selected_history_action_key(),
+                    Some(HistoryActionKey::Command(_))
+                );
             }
             KeyCode::Right if count > 0 => {
-                let selected_key = self.current().selected_run_command_key();
-                {
-                    let view = self.current_mut();
-                    view.selected_run_command = selected_key;
-                    view.expanded_run_command = selected_key;
+                match self.current().selected_history_action_key() {
+                    Some(HistoryActionKey::Command(selected_key)) => {
+                        let step_count = self
+                            .current()
+                            .run_command(selected_key)
+                            .map_or(0, |record| record.steps.len());
+                        let view = self.current_mut();
+                        view.selected_run_command = Some(selected_key);
+                        view.expanded_run_command = Some(selected_key);
+                        view.selected_run_step = (step_count > 1).then_some(0);
+                        jump_to_selection = true;
+                    }
+                    Some(HistoryActionKey::Monitor(id)) => {
+                        let matcher_count = self
+                            .current()
+                            .monitor(id)
+                            .map_or(0, |entry| entry.monitor.spec.matchers.len());
+                        let view = self.current_mut();
+                        view.selected_monitor = Some(id);
+                        view.expanded_monitor = Some(id);
+                        view.selected_monitor_matcher = (matcher_count > 0).then_some(0);
+                    }
+                    None => {}
                 }
                 self.current_mut().run_detail_scroll = 0;
-                jump_to_selection = true;
             }
             KeyCode::Left if count > 0 => {
                 self.current_mut().expanded_run_command = None;
+                self.current_mut().selected_run_step = None;
+                self.current_mut().expanded_monitor = None;
+                self.current_mut().selected_monitor_matcher = None;
+                self.current_mut().selected_monitor_incident = None;
                 self.current_mut().run_detail_scroll = 0;
             }
             KeyCode::PageUp => {
@@ -3779,8 +4435,11 @@ impl App {
                 } else if count > 0 {
                     let page = usize::from(self.agent_history_rows.saturating_sub(1)).max(1);
                     self.current_mut()
-                        .select_run_command_index(selected.saturating_sub(page));
-                    jump_to_selection = true;
+                        .select_history_action_index(selected.saturating_sub(page));
+                    jump_to_selection = matches!(
+                        self.current().selected_history_action_key(),
+                        Some(HistoryActionKey::Command(_))
+                    );
                 }
             }
             KeyCode::PageDown => {
@@ -3796,8 +4455,11 @@ impl App {
                 } else if count > 0 {
                     let page = usize::from(self.agent_history_rows.saturating_sub(1)).max(1);
                     self.current_mut()
-                        .select_run_command_index(selected.saturating_add(page).min(count - 1));
-                    jump_to_selection = true;
+                        .select_history_action_index(selected.saturating_add(page).min(count - 1));
+                    jump_to_selection = matches!(
+                        self.current().selected_history_action_key(),
+                        Some(HistoryActionKey::Command(_))
+                    );
                 }
             }
             KeyCode::Esc => {
@@ -3808,7 +4470,7 @@ impl App {
             _ => {}
         }
         if jump_to_selection && let Some(key) = self.current().selected_run_command_key() {
-            self.jump_output_to_run_command(key);
+            self.jump_output_to_run_command(key, self.current().selected_run_step);
         }
     }
 
@@ -3828,7 +4490,13 @@ impl App {
         let rows = run_history_rows(self, inner.width);
         let selected_row = rows
             .iter()
-            .position(|row| row.command == selected)
+            .position(|row| {
+                row.command == selected
+                    && match view.selected_run_step {
+                        Some(step) => row.step == Some(step),
+                        None => row.step.is_none(),
+                    }
+            })
             .unwrap_or(0);
         let max_start = rows.len().saturating_sub(height);
         max_start.saturating_sub(selected_row.saturating_sub(2).min(max_start))
@@ -3840,53 +4508,205 @@ impl App {
         self.current_mut().run_detail_scroll = scroll;
     }
 
-    fn jump_output_to_run_command(&mut self, key: RunCommandKey) -> bool {
-        let target = self
-            .current()
-            .run_history
-            .iter()
-            .find(|run| run.id == key.run_id)
-            .and_then(|run| {
-                run.commands
-                    .iter()
-                    .find(|command| command.first_seq == key.first_seq)
-            })
-            .map(|command| {
-                (
-                    command.steps.iter().find_map(|step| step.operation_id),
-                    command.first_seq,
-                )
-            });
-        let Some((operation_id, sequence)) = target else {
+    fn jump_output_to_run_command(
+        &mut self,
+        key: RunCommandKey,
+        step_index: Option<usize>,
+    ) -> bool {
+        let Some(target) = self.command_evidence_target(key, step_index) else {
             return false;
         };
         let Some(inner) = self.layout.map(|layout| layout.output_inner) else {
             return false;
         };
-        let rows = all_output_visual_rows(self, inner.width);
-        let target_index = operation_id
-            .and_then(|operation_id| {
-                rows.iter()
-                    .position(|row| row.operation_id == Some(operation_id))
-            })
-            .or_else(|| rows.iter().position(|row| row.seq >= sequence));
-        let Some(target_index) = target_index else {
-            self.status = trf("st.run.jump.missing", &[&sequence.to_string()]);
+        let entries = self
+            .current()
+            .lines
+            .iter()
+            .chain(self.current().pending_line.iter())
+            .collect::<Vec<_>>();
+        if target.matchers.is_empty() {
+            if local_command_window_is_retained(self.current(), &target, &entries) {
+                let rows = all_output_visual_rows(self, inner.width);
+                if let Some(target_index) = rows.iter().position(|row| {
+                    row.daemon_epoch == Some(target.daemon_epoch) && row.seq >= target.seq_start
+                }) {
+                    let height = usize::from(inner.height).max(1);
+                    let start = target_index.saturating_sub(height / 3);
+                    let end = start.saturating_add(height).min(rows.len());
+                    let scroll_from_bottom = rows.len().saturating_sub(end);
+                    let snapshot = ScrollSnapshot {
+                        rows: rows.into_iter().map(|row| row.line).collect(),
+                    };
+                    let view = self.current_mut();
+                    view.scroll_snapshot = Some(snapshot);
+                    view.scroll_from_bottom = scroll_from_bottom;
+                    view.unseen = 0;
+                    self.pending_exact_evidence = None;
+                    self.status = trf("st.run.jump.overlay", &[&target.seq_start.to_string()]);
+                    return true;
+                }
+            }
+            let snapshot = ScrollSnapshot {
+                rows: wrap_command_fallback_line(&target.command, inner.width),
+            };
+            let view = self.current_mut();
+            view.scroll_snapshot = Some(snapshot);
+            view.scroll_from_bottom = 0;
+            view.unseen = 0;
+            self.pending_exact_evidence = None;
+            self.status = trf("st.run.jump.overlay", &[&target.seq_start.to_string()]);
+            return true;
+        }
+        let capture = command_capture_for_target(&target, &entries);
+        if local_command_evidence_is_complete(self.current(), &target, &entries, &capture) {
+            let rows = all_output_visual_rows(self, inner.width);
+            let target_seq = capture
+                .start
+                .and_then(|index| entries.get(index))
+                .map_or(target.seq_start, |entry| entry.seq);
+            let Some(target_index) = rows.iter().position(|row| {
+                row.daemon_epoch == Some(target.daemon_epoch) && row.seq >= target_seq
+            }) else {
+                return self.query_exact_evidence(ExactEvidenceTarget::Command(target));
+            };
+            let height = usize::from(inner.height).max(1);
+            let start = target_index.saturating_sub(height / 3);
+            let end = start.saturating_add(height).min(rows.len());
+            let scroll_from_bottom = rows.len().saturating_sub(end);
+            let snapshot = ScrollSnapshot {
+                rows: rows.into_iter().map(|row| row.line).collect(),
+            };
+            let view = self.current_mut();
+            view.scroll_snapshot = Some(snapshot);
+            view.scroll_from_bottom = scroll_from_bottom;
+            view.unseen = 0;
+            self.pending_exact_evidence = None;
+            self.status = trf("st.run.jump", &[&target.seq_start.to_string()]);
+            return true;
+        }
+        self.query_exact_evidence(ExactEvidenceTarget::Command(target))
+    }
+
+    fn command_evidence_target(
+        &self,
+        key: RunCommandKey,
+        step_index: Option<usize>,
+    ) -> Option<CommandEvidenceTarget> {
+        let view = self.current();
+        let record = view.run_command(key)?;
+        let step_index = step_index.filter(|index| *index < record.steps.len());
+        let step = step_index.and_then(|index| record.steps.get(index));
+        let seq_start = step.map_or(record.first_seq, |step| step.first_seq);
+        let write_end_seq = step.map_or(record.last_seq, |step| step.last_seq);
+        let daemon_epoch = step.map_or(record.daemon_epoch, |step| step.daemon_epoch);
+        let next_command = step_index
+            .and_then(|index| record.steps.get(index + 1).map(|step| step.first_seq))
+            .or_else(|| view.next_run_command_seq(key));
+        let query_end_seq = next_command
+            .map(|sequence| sequence.saturating_sub(1))
+            .unwrap_or(view.snapshot.head_seq.max(view.last_seq))
+            .max(write_end_seq);
+        Some(CommandEvidenceTarget {
+            key,
+            step_index,
+            port: view.snapshot.config.port.clone(),
+            daemon_epoch,
+            seq_start,
+            write_end_seq,
+            query_end_seq,
+            command: command_payload(record, step_index),
+            matchers: command_capture_matchers(record, step_index),
+        })
+    }
+
+    fn jump_output_to_monitor_incident(&mut self) -> bool {
+        let Some(incident) = self.current().selected_monitor_incident().cloned() else {
             return false;
         };
-        let height = usize::from(inner.height).max(1);
-        let start = target_index.saturating_sub(height / 3);
-        let end = start.saturating_add(height).min(rows.len());
-        let scroll_from_bottom = rows.len().saturating_sub(end);
-        let snapshot = ScrollSnapshot {
-            rows: rows.into_iter().map(|row| row.line).collect(),
+        let Some(inner) = self.layout.map(|layout| layout.output_inner) else {
+            return false;
         };
-        let view = self.current_mut();
-        view.scroll_snapshot = Some(snapshot);
-        view.scroll_from_bottom = scroll_from_bottom;
-        view.unseen = 0;
-        self.status = trf("st.run.jump", &[&sequence.to_string()]);
-        true
+        let target = IncidentEvidenceTarget::from(&incident);
+        if local_incident_entry_range(self.current(), &target).is_some() {
+            let rows = all_output_visual_rows(self, inner.width);
+            let Some(target_index) = rows.iter().position(|row| {
+                row.daemon_epoch == Some(target.daemon_epoch) && row.seq == target.seq_start
+            }) else {
+                return self.query_exact_evidence(ExactEvidenceTarget::Incident(target));
+            };
+            let height = usize::from(inner.height).max(1);
+            let start = target_index.saturating_sub(height / 3);
+            let end = start.saturating_add(height).min(rows.len());
+            let scroll_from_bottom = rows.len().saturating_sub(end);
+            let snapshot = ScrollSnapshot {
+                rows: rows.into_iter().map(|row| row.line).collect(),
+            };
+            let view = self.current_mut();
+            view.scroll_snapshot = Some(snapshot);
+            view.scroll_from_bottom = scroll_from_bottom;
+            view.unseen = 0;
+            self.pending_exact_evidence = None;
+            self.status = trf(
+                "st.monitor.jump",
+                &[&target.seq_start.to_string(), &target.seq_end.to_string()],
+            );
+            return true;
+        }
+        self.query_exact_evidence(ExactEvidenceTarget::Incident(target))
+    }
+
+    fn query_exact_evidence(&mut self, target: ExactEvidenceTarget) -> bool {
+        let Some(commands) = self.exact_evidence_commands.as_ref() else {
+            self.current_mut().follow();
+            self.pending_exact_evidence = None;
+            self.status = match target {
+                ExactEvidenceTarget::Incident(_) => tr("st.monitor.jump.query.unavailable").into(),
+                ExactEvidenceTarget::Command(_) => tr("st.run.jump.query.unavailable").into(),
+            };
+            return false;
+        };
+        let request_id = Uuid::new_v4();
+        let request = ExactEvidenceRequest {
+            request_id,
+            target: target.clone(),
+        };
+        match commands.try_send(ExactEvidenceIoCommand::Query(request)) {
+            Ok(()) => {
+                self.current_mut().follow();
+                self.pending_exact_evidence = Some((request_id, target.clone()));
+                self.status = match target {
+                    ExactEvidenceTarget::Incident(target) => trf(
+                        "st.monitor.jump.loading",
+                        &[&target.seq_start.to_string(), &target.seq_end.to_string()],
+                    ),
+                    ExactEvidenceTarget::Command(target) => {
+                        trf("st.run.jump.loading", &[&target.seq_start.to_string()])
+                    }
+                };
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.current_mut().follow();
+                self.pending_exact_evidence = None;
+                self.status = match target {
+                    ExactEvidenceTarget::Incident(_) => tr("st.monitor.jump.query.busy").into(),
+                    ExactEvidenceTarget::Command(_) => tr("st.run.jump.query.busy").into(),
+                };
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.current_mut().follow();
+                self.pending_exact_evidence = None;
+                self.status = match target {
+                    ExactEvidenceTarget::Incident(_) => {
+                        tr("st.monitor.jump.query.unavailable").into()
+                    }
+                    ExactEvidenceTarget::Command(_) => tr("st.run.jump.query.unavailable").into(),
+                };
+                false
+            }
+        }
     }
 
     fn has_queued_control(&self, port: &str) -> bool {
@@ -4622,7 +5442,6 @@ impl App {
                             view.history.remove(0);
                         }
                     }
-                    view.history_cursor = None;
                     view.draft.clear();
                     view.draft_cursor = 0;
                 }
@@ -4668,8 +5487,6 @@ impl App {
                 let length = self.current().draft.len();
                 self.current_mut().draft_cursor = length;
             }
-            KeyCode::Up => self.history_previous(),
-            KeyCode::Down => self.history_next(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4677,7 +5494,6 @@ impl App {
                     let view = self.current_mut();
                     view.draft.clear();
                     view.draft_cursor = 0;
-                    view.history_cursor = None;
                     view.completion = None;
                 }
                 // Ctrl-C is an asynchronous remote TTY interrupt, not a LINE
@@ -4765,35 +5581,6 @@ impl App {
         if accepted {
             self.status = trf("st.paste.queued", &[&paste.port]);
         }
-    }
-
-    fn history_previous(&mut self) {
-        let view = self.current_mut();
-        if view.history.is_empty() {
-            return;
-        }
-        let index = view
-            .history_cursor
-            .map(|index| index.saturating_sub(1))
-            .unwrap_or(view.history.len() - 1);
-        view.history_cursor = Some(index);
-        view.draft = view.history[index].chars().collect();
-        view.draft_cursor = view.draft.len();
-    }
-
-    fn history_next(&mut self) {
-        let view = self.current_mut();
-        let Some(index) = view.history_cursor else {
-            return;
-        };
-        if index + 1 < view.history.len() {
-            view.history_cursor = Some(index + 1);
-            view.draft = view.history[index + 1].chars().collect();
-        } else {
-            view.history_cursor = None;
-            view.draft.clear();
-        }
-        view.draft_cursor = view.draft.len();
     }
 
     fn start_history_search(&mut self) {
@@ -4927,6 +5714,10 @@ impl App {
         let Some(mut menu) = self.menu.take() else {
             return;
         };
+        if menu.field_help.take().is_some() {
+            self.menu = Some(menu);
+            return;
+        }
         if let Some(confirmation) = menu.confirmation.take() {
             self.handle_menu_confirmation_key(&mut menu, confirmation, key);
             self.menu = Some(menu);
@@ -4937,11 +5728,16 @@ impl App {
             self.menu = Some(menu);
             return;
         }
+        if let Some(choice) = menu.choice.take() {
+            self.handle_menu_choice_key(&mut menu, choice, key);
+            self.menu = Some(menu);
+            return;
+        }
 
         let mut keep_open = true;
         let count = menu_item_count(&menu);
         match key.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Left => {
                 if !menu.back() {
                     keep_open = false;
                     self.status = tr("st.menu.closed").into();
@@ -4966,13 +5762,51 @@ impl App {
             KeyCode::Char('r' | 'R') => {
                 self.submit_menu_command(&mut menu, MenuIoCommand::Reload);
             }
-            KeyCode::Enter => self.activate_menu_item(&mut menu),
+            KeyCode::Char('?') => {
+                menu.field_help = Some(menu_field_help(self, &menu));
+            }
+            KeyCode::Enter | KeyCode::Right => self.activate_menu_item(&mut menu),
             _ => {}
         }
         if keep_open {
             let count = menu_item_count(&menu);
             menu.selected = menu.selected.min(count.saturating_sub(1));
             self.menu = Some(menu);
+        }
+    }
+
+    fn handle_menu_choice_key(
+        &mut self,
+        menu: &mut MenuState,
+        mut choice: MenuChoice,
+        key: KeyEvent,
+    ) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Left => {
+                menu.message = tr("menu.choice.closed").into();
+            }
+            KeyCode::Up if !choice.options.is_empty() => {
+                choice.selected = choice.selected.saturating_sub(1);
+                menu.choice = Some(choice);
+            }
+            KeyCode::Down if !choice.options.is_empty() => {
+                choice.selected = (choice.selected + 1).min(choice.options.len() - 1);
+                menu.choice = Some(choice);
+            }
+            KeyCode::Home if !choice.options.is_empty() => {
+                choice.selected = 0;
+                menu.choice = Some(choice);
+            }
+            KeyCode::End if !choice.options.is_empty() => {
+                choice.selected = choice.options.len() - 1;
+                menu.choice = Some(choice);
+            }
+            KeyCode::Enter if !choice.options.is_empty() => {
+                let option = choice.options[choice.selected].clone();
+                self.apply_menu_choice(menu, choice.purpose, option.value);
+            }
+            KeyCode::Right => menu.choice = Some(choice),
+            _ => menu.choice = Some(choice),
         }
     }
 
@@ -5052,7 +5886,7 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if prompt.value.len() < 128 && !character.is_control() {
+                if prompt.value.len() < 512 && !character.is_control() {
                     prompt.value.insert(prompt.cursor, character);
                     prompt.cursor += 1;
                 }
@@ -5098,16 +5932,6 @@ impl App {
                         return;
                     };
                     let valid = match field {
-                        CurrentProfilePromptField::Port => valid_menu_name(&value)
-                            .then(|| editor.port = value.clone())
-                            .is_some(),
-                        CurrentProfilePromptField::BaudRate => value
-                            .trim()
-                            .parse::<u32>()
-                            .ok()
-                            .filter(|value| *value > 0)
-                            .map(|value| editor.transport.baud_rate = value)
-                            .is_some(),
                         CurrentProfilePromptField::ShellPrompt => {
                             editor.device.shell_prompt =
                                 (!value.is_empty()).then_some(value.clone());
@@ -5154,25 +5978,88 @@ impl App {
                     menu.prompt = Some(prompt);
                     return;
                 }
-                if !valid_menu_name(&value) {
-                    menu.message = tr("menu.name.invalid").into();
-                    menu.prompt = Some(prompt);
-                    return;
-                }
                 match prompt.purpose {
-                    MenuPromptPurpose::TransportName { port, mut profile } => {
-                        profile.name = value;
-                        self.submit_menu_mutation(
-                            menu,
-                            MenuMutation::CreateTransportAndBind { port, profile },
-                        );
+                    MenuPromptPurpose::CreateTransport(CreateTransportPromptField::Name) => {
+                        if !valid_menu_name(&value) {
+                            menu.message = tr("menu.name.invalid").into();
+                            menu.prompt = Some(prompt);
+                            return;
+                        }
+                        if let Some(profile) = menu.create_transport.as_mut() {
+                            profile.name = value;
+                            menu.message = tr("menu.current.modified").into();
+                        }
                     }
-                    MenuPromptPurpose::DeviceName { port, mut profile } => {
-                        profile.name = value;
-                        self.submit_menu_mutation(
-                            menu,
-                            MenuMutation::CreateModelProfileAndBind { port, profile },
-                        );
+                    MenuPromptPurpose::CreateModel(field) => {
+                        let Some(profile) = menu.create_model.as_mut() else {
+                            return;
+                        };
+                        let valid = match field {
+                            CreateModelPromptField::Name => {
+                                if valid_menu_name(&value) {
+                                    profile.name = value;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            CreateModelPromptField::ModelNames => {
+                                let mut names = value
+                                    .split([',', '，', ';', '；'])
+                                    .map(str::trim)
+                                    .filter(|name| !name.is_empty())
+                                    .map(ToOwned::to_owned)
+                                    .collect::<Vec<_>>();
+                                names.dedup();
+                                if names.iter().all(|name| valid_menu_name(name)) {
+                                    profile.model_names = names;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            CreateModelPromptField::ShellPrompt => {
+                                profile.shell_prompt = (!value.is_empty()).then_some(value);
+                                true
+                            }
+                            CreateModelPromptField::UbootPrompt => {
+                                profile.uboot_prompt = (!value.is_empty()).then_some(value);
+                                true
+                            }
+                            CreateModelPromptField::ChunkSize => {
+                                if value.trim().is_empty() {
+                                    profile.write_chunk_size = None;
+                                    true
+                                } else {
+                                    value
+                                        .trim()
+                                        .parse::<u32>()
+                                        .ok()
+                                        .filter(|value| *value > 0)
+                                        .map(|value| profile.write_chunk_size = Some(value))
+                                        .is_some()
+                                }
+                            }
+                            CreateModelPromptField::ChunkDelay => {
+                                if value.trim().is_empty() {
+                                    profile.write_chunk_delay_ms = None;
+                                    true
+                                } else {
+                                    value
+                                        .trim()
+                                        .parse::<u64>()
+                                        .ok()
+                                        .map(|value| profile.write_chunk_delay_ms = Some(value))
+                                        .is_some()
+                                }
+                            }
+                        };
+                        if !valid {
+                            menu.message = tr("menu.current.value.invalid").into();
+                            menu.prompt = Some(prompt);
+                            return;
+                        }
+                        menu.message = tr("menu.current.modified").into();
                     }
                     MenuPromptPurpose::CurrentProfile(_)
                     | MenuPromptPurpose::AgentHistoryRows
@@ -5195,7 +6082,7 @@ impl App {
             return;
         };
         for character in value.chars().filter(|character| !character.is_control()) {
-            if prompt.value.len() >= 128 {
+            if prompt.value.len() >= 512 {
                 break;
             }
             prompt.value.insert(prompt.cursor, character);
@@ -5211,32 +6098,6 @@ impl App {
                 mutation: Box::new(mutation),
             },
         );
-    }
-
-    fn begin_transport_name_prompt(
-        &self,
-        menu: &mut MenuState,
-        port: String,
-        profile: TransportProfile,
-        suggested_name: String,
-    ) {
-        let value = suggested_name.chars().collect::<Vec<_>>();
-        menu.prompt = Some(MenuPrompt {
-            title: tr("menu.prompt.transport.name").into(),
-            cursor: value.len(),
-            value,
-            purpose: MenuPromptPurpose::TransportName { port, profile },
-        });
-    }
-
-    fn begin_device_name_prompt(&self, menu: &mut MenuState, port: String, profile: ModelProfile) {
-        let value = "device-profile".chars().collect::<Vec<_>>();
-        menu.prompt = Some(MenuPrompt {
-            title: tr("menu.prompt.device.name").into(),
-            cursor: value.len(),
-            value,
-            purpose: MenuPromptPurpose::DeviceName { port, profile },
-        });
     }
 
     fn begin_orphan_run_timeout_prompt(&self, menu: &mut MenuState) {
@@ -5299,6 +6160,256 @@ impl App {
             .map(|catalog| CurrentProfileEditor::new(self.current(), catalog));
     }
 
+    fn open_menu_choice(
+        menu: &mut MenuState,
+        purpose: MenuChoicePurpose,
+        options: Vec<MenuChoiceOption>,
+        selected: usize,
+    ) {
+        if options.is_empty() {
+            menu.message = tr("menu.choice.empty").into();
+            return;
+        }
+        menu.choice = Some(MenuChoice {
+            purpose,
+            selected: selected.min(options.len() - 1),
+            options,
+        });
+        menu.message = tr("menu.choice.open").into();
+    }
+
+    fn apply_menu_choice(
+        &mut self,
+        menu: &mut MenuState,
+        purpose: MenuChoicePurpose,
+        value: MenuChoiceValue,
+    ) {
+        let changed = match purpose {
+            MenuChoicePurpose::CurrentPort => {
+                let (Some(editor), MenuChoiceValue::Text(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.port = value;
+                true
+            }
+            MenuChoicePurpose::CurrentTransportProfile => {
+                let MenuChoiceValue::OptionalText(binding) = value else {
+                    return;
+                };
+                let Some(profile) = binding.as_deref().and_then(|name| {
+                    menu.catalog
+                        .as_ref()?
+                        .transport_profiles
+                        .iter()
+                        .find(|profile| profile.name == name)
+                        .cloned()
+                }) else {
+                    menu.message = tr("menu.choice.empty").into();
+                    return;
+                };
+                let Some(editor) = menu.profile_editor.as_mut() else {
+                    return;
+                };
+                editor.transport_binding = binding;
+                editor.transport = profile;
+                true
+            }
+            MenuChoicePurpose::CurrentModelProfile => {
+                let MenuChoiceValue::OptionalText(binding) = value else {
+                    return;
+                };
+                let profile = binding.as_deref().and_then(|name| {
+                    menu.catalog
+                        .as_ref()?
+                        .model_profiles
+                        .iter()
+                        .find(|profile| profile.name == name)
+                        .cloned()
+                });
+                let Some(editor) = menu.profile_editor.as_mut() else {
+                    return;
+                };
+                editor.model_profile_binding = binding;
+                if let Some(profile) = profile {
+                    if !editor
+                        .model_name
+                        .as_ref()
+                        .is_some_and(|name| profile.model_names.contains(name))
+                    {
+                        editor.model_name = None;
+                    }
+                    editor.device = profile;
+                } else {
+                    editor.model_name = None;
+                }
+                true
+            }
+            MenuChoicePurpose::CurrentBaudRate => {
+                let (Some(editor), MenuChoiceValue::Number(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.transport.baud_rate = value;
+                true
+            }
+            MenuChoicePurpose::CurrentDataBits => {
+                let (Some(editor), MenuChoiceValue::DataBits(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.transport.data_bits = value;
+                true
+            }
+            MenuChoicePurpose::CurrentParity => {
+                let (Some(editor), MenuChoiceValue::Parity(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.transport.parity = value;
+                true
+            }
+            MenuChoicePurpose::CurrentStopBits => {
+                let (Some(editor), MenuChoiceValue::StopBits(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.transport.stop_bits = value;
+                true
+            }
+            MenuChoicePurpose::CurrentFlowControl => {
+                let (Some(editor), MenuChoiceValue::FlowControl(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.transport.flow_control = value;
+                true
+            }
+            MenuChoicePurpose::CurrentDtr
+            | MenuChoicePurpose::CurrentRts
+            | MenuChoicePurpose::CurrentAutoOpen => {
+                let (Some(editor), MenuChoiceValue::Bool(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                match purpose {
+                    MenuChoicePurpose::CurrentDtr => editor.transport.dtr = value,
+                    MenuChoicePurpose::CurrentRts => editor.transport.rts = value,
+                    MenuChoicePurpose::CurrentAutoOpen => editor.transport.auto_open = value,
+                    _ => unreachable!("grouped boolean choice"),
+                }
+                true
+            }
+            MenuChoicePurpose::CurrentWriteEol => {
+                let (Some(editor), MenuChoiceValue::Eol(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.device.write_eol = value;
+                true
+            }
+            MenuChoicePurpose::CurrentEcho => {
+                let (Some(editor), MenuChoiceValue::Echo(value)) =
+                    (menu.profile_editor.as_mut(), value)
+                else {
+                    return;
+                };
+                editor.device.echo = value;
+                true
+            }
+            MenuChoicePurpose::CreateTransportBaudRate => {
+                let (Some(profile), MenuChoiceValue::Number(value)) =
+                    (menu.create_transport.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.baud_rate = value;
+                true
+            }
+            MenuChoicePurpose::CreateTransportDataBits => {
+                let (Some(profile), MenuChoiceValue::DataBits(value)) =
+                    (menu.create_transport.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.data_bits = value;
+                true
+            }
+            MenuChoicePurpose::CreateTransportParity => {
+                let (Some(profile), MenuChoiceValue::Parity(value)) =
+                    (menu.create_transport.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.parity = value;
+                true
+            }
+            MenuChoicePurpose::CreateTransportStopBits => {
+                let (Some(profile), MenuChoiceValue::StopBits(value)) =
+                    (menu.create_transport.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.stop_bits = value;
+                true
+            }
+            MenuChoicePurpose::CreateTransportFlowControl => {
+                let (Some(profile), MenuChoiceValue::FlowControl(value)) =
+                    (menu.create_transport.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.flow_control = value;
+                true
+            }
+            MenuChoicePurpose::CreateTransportDtr
+            | MenuChoicePurpose::CreateTransportRts
+            | MenuChoicePurpose::CreateTransportAutoOpen => {
+                let (Some(profile), MenuChoiceValue::Bool(value)) =
+                    (menu.create_transport.as_mut(), value)
+                else {
+                    return;
+                };
+                match purpose {
+                    MenuChoicePurpose::CreateTransportDtr => profile.dtr = value,
+                    MenuChoicePurpose::CreateTransportRts => profile.rts = value,
+                    MenuChoicePurpose::CreateTransportAutoOpen => profile.auto_open = value,
+                    _ => unreachable!("grouped boolean choice"),
+                }
+                true
+            }
+            MenuChoicePurpose::CreateModelWriteEol => {
+                let (Some(profile), MenuChoiceValue::Eol(value)) =
+                    (menu.create_model.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.write_eol = value;
+                true
+            }
+            MenuChoicePurpose::CreateModelEcho => {
+                let (Some(profile), MenuChoiceValue::Echo(value)) =
+                    (menu.create_model.as_mut(), value)
+                else {
+                    return;
+                };
+                profile.echo = value;
+                true
+            }
+        };
+        if changed {
+            menu.message = tr("menu.current.modified").into();
+        }
+    }
+
     fn begin_current_profile_prompt(
         menu: &mut MenuState,
         field: CurrentProfilePromptField,
@@ -5341,85 +6452,217 @@ impl App {
         }
         match row {
             CurrentProfileRow::Port => {
-                let value = menu
-                    .profile_editor
+                let editor = menu.profile_editor.as_ref().expect("checked editor");
+                let current = editor.port.clone();
+                let original = editor.original_port.clone();
+                let mut ports = menu
+                    .catalog
                     .as_ref()
-                    .expect("checked editor")
-                    .port
-                    .clone();
-                Self::begin_current_profile_prompt(
+                    .map(|catalog| {
+                        catalog
+                            .detected_ports
+                            .iter()
+                            .filter(|port| {
+                                port.name == original
+                                    || !catalog.ports.iter().any(|configured| {
+                                        configured.config.port == port.name
+                                            && configured.config.port != original
+                                    })
+                            })
+                            .map(|port| port.name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                ports.push(current.clone());
+                ports.sort();
+                ports.dedup();
+                let selected = ports.iter().position(|port| port == &current).unwrap_or(0);
+                Self::open_menu_choice(
                     menu,
-                    CurrentProfilePromptField::Port,
-                    tr("menu.current.prompt.port"),
-                    value,
+                    MenuChoicePurpose::CurrentPort,
+                    ports
+                        .into_iter()
+                        .map(|port| MenuChoiceOption {
+                            label: port.clone(),
+                            value: MenuChoiceValue::Text(port),
+                        })
+                        .collect(),
+                    selected,
                 );
             }
-            CurrentProfileRow::TransportProfile => menu.push(MenuPage::TransportProfiles),
+            CurrentProfileRow::TransportProfile => {
+                let current = menu
+                    .profile_editor
+                    .as_ref()
+                    .and_then(|editor| editor.transport_binding.as_deref());
+                let profiles = menu
+                    .catalog
+                    .as_ref()
+                    .map(|catalog| catalog.transport_profiles.clone())
+                    .unwrap_or_default();
+                let selected = profiles
+                    .iter()
+                    .position(|profile| current == Some(profile.name.as_str()))
+                    .unwrap_or(0);
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentTransportProfile,
+                    profiles
+                        .into_iter()
+                        .map(|profile| MenuChoiceOption {
+                            label: profile.name.clone(),
+                            value: MenuChoiceValue::OptionalText(Some(profile.name)),
+                        })
+                        .collect(),
+                    selected,
+                );
+            }
             CurrentProfileRow::BaudRate => {
                 if !Self::profile_editable(menu, true) {
                     return;
                 }
-                let value = menu
+                let current = menu
                     .profile_editor
                     .as_ref()
                     .expect("checked editor")
                     .transport
-                    .baud_rate
-                    .to_string();
-                Self::begin_current_profile_prompt(
+                    .baud_rate;
+                let options = baud_rate_options(current);
+                let selected = options
+                    .iter()
+                    .position(|value| *value == current)
+                    .unwrap_or(0);
+                Self::open_menu_choice(
                     menu,
-                    CurrentProfilePromptField::BaudRate,
-                    tr("menu.current.prompt.baud"),
-                    value,
+                    MenuChoicePurpose::CurrentBaudRate,
+                    options
+                        .into_iter()
+                        .map(|value| MenuChoiceOption {
+                            label: value.to_string(),
+                            value: MenuChoiceValue::Number(value),
+                        })
+                        .collect(),
+                    selected,
                 );
             }
-            CurrentProfileRow::DataBits
-            | CurrentProfileRow::Parity
-            | CurrentProfileRow::StopBits
-            | CurrentProfileRow::FlowControl
-            | CurrentProfileRow::Dtr
-            | CurrentProfileRow::Rts
-            | CurrentProfileRow::AutoOpen => {
+            CurrentProfileRow::DataBits => {
                 if !Self::profile_editable(menu, true) {
                     return;
                 }
-                let transport = &mut menu
-                    .profile_editor
-                    .as_mut()
-                    .expect("checked editor")
-                    .transport;
-                match row {
-                    CurrentProfileRow::DataBits => {
-                        transport.data_bits = next_data_bits(transport.data_bits)
-                    }
-                    CurrentProfileRow::Parity => transport.parity = next_parity(transport.parity),
-                    CurrentProfileRow::StopBits => {
-                        transport.stop_bits = next_stop_bits(transport.stop_bits)
-                    }
-                    CurrentProfileRow::FlowControl => {
-                        transport.flow_control = next_flow_control(transport.flow_control)
-                    }
-                    CurrentProfileRow::Dtr => transport.dtr = !transport.dtr,
-                    CurrentProfileRow::Rts => transport.rts = !transport.rts,
-                    CurrentProfileRow::AutoOpen => transport.auto_open = !transport.auto_open,
-                    _ => unreachable!("grouped transport editor row"),
-                }
-                menu.message = tr("menu.current.modified").into();
+                let current = menu.profile_editor.as_ref().unwrap().transport.data_bits;
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentDataBits,
+                    data_bits_options(),
+                    data_bits_index(current),
+                );
             }
-            CurrentProfileRow::ModelProfile => menu.push(MenuPage::ModelProfiles),
-            CurrentProfileRow::WriteEol | CurrentProfileRow::Echo => {
+            CurrentProfileRow::Parity => {
+                if !Self::profile_editable(menu, true) {
+                    return;
+                }
+                let current = menu.profile_editor.as_ref().unwrap().transport.parity;
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentParity,
+                    parity_options(),
+                    parity_index(current),
+                );
+            }
+            CurrentProfileRow::StopBits => {
+                if !Self::profile_editable(menu, true) {
+                    return;
+                }
+                let current = menu.profile_editor.as_ref().unwrap().transport.stop_bits;
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentStopBits,
+                    stop_bits_options(),
+                    stop_bits_index(current),
+                );
+            }
+            CurrentProfileRow::FlowControl => {
+                if !Self::profile_editable(menu, true) {
+                    return;
+                }
+                let current = menu.profile_editor.as_ref().unwrap().transport.flow_control;
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentFlowControl,
+                    flow_control_options(),
+                    flow_control_index(current),
+                );
+            }
+            CurrentProfileRow::Dtr | CurrentProfileRow::Rts | CurrentProfileRow::AutoOpen => {
+                if !Self::profile_editable(menu, true) {
+                    return;
+                }
+                let transport = &menu.profile_editor.as_ref().unwrap().transport;
+                let (purpose, current) = match row {
+                    CurrentProfileRow::Dtr => (MenuChoicePurpose::CurrentDtr, transport.dtr),
+                    CurrentProfileRow::Rts => (MenuChoicePurpose::CurrentRts, transport.rts),
+                    CurrentProfileRow::AutoOpen => {
+                        (MenuChoicePurpose::CurrentAutoOpen, transport.auto_open)
+                    }
+                    _ => unreachable!(),
+                };
+                Self::open_menu_choice(menu, purpose, bool_options(), usize::from(current));
+            }
+            CurrentProfileRow::ModelProfile => {
+                let current = menu
+                    .profile_editor
+                    .as_ref()
+                    .and_then(|editor| editor.model_profile_binding.as_deref());
+                let profiles = menu
+                    .catalog
+                    .as_ref()
+                    .map(|catalog| catalog.model_profiles.clone())
+                    .unwrap_or_default();
+                let mut options = vec![MenuChoiceOption {
+                    label: tr("menu.value.unbound").into(),
+                    value: MenuChoiceValue::OptionalText(None),
+                }];
+                options.extend(profiles.into_iter().map(|profile| MenuChoiceOption {
+                    label: profile.name.clone(),
+                    value: MenuChoiceValue::OptionalText(Some(profile.name)),
+                }));
+                let selected = current
+                    .and_then(|name| options.iter().position(|option| option.label == name))
+                    .unwrap_or(0);
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentModelProfile,
+                    options,
+                    selected,
+                );
+            }
+            CurrentProfileRow::ModelName => menu.push(MenuPage::ModelFamilies),
+            CurrentProfileRow::WriteEol => {
                 if !Self::profile_editable(menu, false) {
                     return;
                 }
-                let device = &mut menu.profile_editor.as_mut().expect("checked editor").device;
-                match row {
-                    CurrentProfileRow::WriteEol => {
-                        device.write_eol = next_eol(device.write_eol.as_deref())
-                    }
-                    CurrentProfileRow::Echo => device.echo = next_echo(device.echo),
-                    _ => unreachable!("grouped device editor row"),
+                let current = menu
+                    .profile_editor
+                    .as_ref()
+                    .unwrap()
+                    .device
+                    .write_eol
+                    .clone();
+                let options = eol_options();
+                let selected = eol_index(current.as_deref());
+                Self::open_menu_choice(menu, MenuChoicePurpose::CurrentWriteEol, options, selected);
+            }
+            CurrentProfileRow::Echo => {
+                if !Self::profile_editable(menu, false) {
+                    return;
                 }
-                menu.message = tr("menu.current.modified").into();
+                let current = menu.profile_editor.as_ref().unwrap().device.echo;
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CurrentEcho,
+                    echo_options(),
+                    echo_index(current),
+                );
             }
             CurrentProfileRow::ShellPrompt
             | CurrentProfileRow::UbootPrompt
@@ -5461,6 +6704,185 @@ impl App {
                 Self::begin_current_profile_prompt(menu, field, title, value);
             }
             CurrentProfileRow::Apply => self.submit_current_profile_updates(menu),
+        }
+    }
+
+    fn begin_create_prompt(
+        menu: &mut MenuState,
+        title: &'static str,
+        value: String,
+        purpose: MenuPromptPurpose,
+    ) {
+        let value = value.chars().collect::<Vec<_>>();
+        menu.prompt = Some(MenuPrompt {
+            title: title.into(),
+            cursor: value.len(),
+            value,
+            purpose,
+        });
+    }
+
+    fn activate_create_transport_row(&mut self, menu: &mut MenuState) {
+        let Some(row) = CreateTransportRow::from_index(menu.selected) else {
+            return;
+        };
+        let Some(profile) = menu.create_transport.as_ref() else {
+            menu.message = tr("menu.catalog.unavailable").into();
+            return;
+        };
+        match row {
+            CreateTransportRow::Name => Self::begin_create_prompt(
+                menu,
+                tr("menu.prompt.transport.name"),
+                profile.name.clone(),
+                MenuPromptPurpose::CreateTransport(CreateTransportPromptField::Name),
+            ),
+            CreateTransportRow::BaudRate => {
+                let current = profile.baud_rate;
+                let values = baud_rate_options(current);
+                let selected = values
+                    .iter()
+                    .position(|value| *value == current)
+                    .unwrap_or(0);
+                Self::open_menu_choice(
+                    menu,
+                    MenuChoicePurpose::CreateTransportBaudRate,
+                    values
+                        .into_iter()
+                        .map(|value| MenuChoiceOption {
+                            label: value.to_string(),
+                            value: MenuChoiceValue::Number(value),
+                        })
+                        .collect(),
+                    selected,
+                );
+            }
+            CreateTransportRow::DataBits => Self::open_menu_choice(
+                menu,
+                MenuChoicePurpose::CreateTransportDataBits,
+                data_bits_options(),
+                data_bits_index(profile.data_bits),
+            ),
+            CreateTransportRow::Parity => Self::open_menu_choice(
+                menu,
+                MenuChoicePurpose::CreateTransportParity,
+                parity_options(),
+                parity_index(profile.parity),
+            ),
+            CreateTransportRow::StopBits => Self::open_menu_choice(
+                menu,
+                MenuChoicePurpose::CreateTransportStopBits,
+                stop_bits_options(),
+                stop_bits_index(profile.stop_bits),
+            ),
+            CreateTransportRow::FlowControl => Self::open_menu_choice(
+                menu,
+                MenuChoicePurpose::CreateTransportFlowControl,
+                flow_control_options(),
+                flow_control_index(profile.flow_control),
+            ),
+            CreateTransportRow::Dtr | CreateTransportRow::Rts | CreateTransportRow::AutoOpen => {
+                let (purpose, current) = match row {
+                    CreateTransportRow::Dtr => (MenuChoicePurpose::CreateTransportDtr, profile.dtr),
+                    CreateTransportRow::Rts => (MenuChoicePurpose::CreateTransportRts, profile.rts),
+                    CreateTransportRow::AutoOpen => (
+                        MenuChoicePurpose::CreateTransportAutoOpen,
+                        profile.auto_open,
+                    ),
+                    _ => unreachable!(),
+                };
+                Self::open_menu_choice(menu, purpose, bool_options(), usize::from(current));
+            }
+            CreateTransportRow::Save => {
+                let profile = profile.clone();
+                if !valid_menu_name(&profile.name) {
+                    menu.message = tr("menu.name.invalid").into();
+                    return;
+                }
+                self.submit_menu_mutation(menu, MenuMutation::CreateTransport { profile });
+            }
+        }
+    }
+
+    fn activate_create_model_row(&mut self, menu: &mut MenuState) {
+        let Some(row) = CreateModelRow::from_index(menu.selected) else {
+            return;
+        };
+        let Some(profile) = menu.create_model.as_ref() else {
+            menu.message = tr("menu.catalog.unavailable").into();
+            return;
+        };
+        match row {
+            CreateModelRow::Name => Self::begin_create_prompt(
+                menu,
+                tr("menu.prompt.device.name"),
+                profile.name.clone(),
+                MenuPromptPurpose::CreateModel(CreateModelPromptField::Name),
+            ),
+            CreateModelRow::ModelNames => Self::begin_create_prompt(
+                menu,
+                tr("menu.prompt.model.names"),
+                profile.model_names.join(", "),
+                MenuPromptPurpose::CreateModel(CreateModelPromptField::ModelNames),
+            ),
+            CreateModelRow::WriteEol => Self::open_menu_choice(
+                menu,
+                MenuChoicePurpose::CreateModelWriteEol,
+                eol_options(),
+                eol_index(profile.write_eol.as_deref()),
+            ),
+            CreateModelRow::Echo => Self::open_menu_choice(
+                menu,
+                MenuChoicePurpose::CreateModelEcho,
+                echo_options(),
+                echo_index(profile.echo),
+            ),
+            CreateModelRow::ShellPrompt
+            | CreateModelRow::UbootPrompt
+            | CreateModelRow::ChunkSize
+            | CreateModelRow::ChunkDelay => {
+                let (field, title, value) = match row {
+                    CreateModelRow::ShellPrompt => (
+                        CreateModelPromptField::ShellPrompt,
+                        tr("menu.current.prompt.shell"),
+                        profile.shell_prompt.clone().unwrap_or_default(),
+                    ),
+                    CreateModelRow::UbootPrompt => (
+                        CreateModelPromptField::UbootPrompt,
+                        tr("menu.current.prompt.uboot"),
+                        profile.uboot_prompt.clone().unwrap_or_default(),
+                    ),
+                    CreateModelRow::ChunkSize => (
+                        CreateModelPromptField::ChunkSize,
+                        tr("menu.current.prompt.chunk"),
+                        profile
+                            .write_chunk_size
+                            .map_or_else(String::new, |value| value.to_string()),
+                    ),
+                    CreateModelRow::ChunkDelay => (
+                        CreateModelPromptField::ChunkDelay,
+                        tr("menu.current.prompt.delay"),
+                        profile
+                            .write_chunk_delay_ms
+                            .map_or_else(String::new, |value| value.to_string()),
+                    ),
+                    _ => unreachable!(),
+                };
+                Self::begin_create_prompt(
+                    menu,
+                    title,
+                    value,
+                    MenuPromptPurpose::CreateModel(field),
+                );
+            }
+            CreateModelRow::Save => {
+                let profile = profile.clone();
+                if !valid_menu_name(&profile.name) {
+                    menu.message = tr("menu.name.invalid").into();
+                    return;
+                }
+                self.submit_menu_mutation(menu, MenuMutation::CreateModelProfile { profile });
+            }
         }
     }
 
@@ -5518,9 +6940,18 @@ impl App {
             return;
         };
         let port = editor.port_update();
+        let transport_binding = editor.transport_binding_update();
         let transport = editor.transport_update();
+        let model_profile_binding = editor.model_profile_binding_update();
+        let model_name = editor.model_name_update();
         let device = editor.device_update();
-        if port.is_none() && transport.is_none() && device.is_none() {
+        if port.is_none()
+            && transport_binding.is_none()
+            && transport.is_none()
+            && model_profile_binding.is_none()
+            && model_name.is_none()
+            && device.is_none()
+        {
             menu.message = tr("menu.current.no.changes").into();
             return;
         }
@@ -5530,15 +6961,20 @@ impl App {
         };
         let impacts = shared_profile_impacts(catalog, transport.as_ref(), device.as_ref());
         let has_shared_profile_update = transport.is_some() || device.is_some();
-        let mutation = MenuMutation::UpdateCurrentProfiles {
+        let mutation = MenuMutation::UpdateCurrentProfiles(Box::new(CurrentProfileUpdate {
             current_port: self.selected_port(),
             new_port: port,
+            transport_binding,
             transport,
+            model_profile_binding,
+            model_name,
             device,
-            expected_config_revision: catalog.config_revision,
-            expected_transport_revision: catalog.transport_revision,
-            expected_model_profile_revision: catalog.model_profile_revision,
-        };
+            revisions: CurrentProfileRevisions {
+                config: catalog.config_revision,
+                transport: catalog.transport_revision,
+                device: catalog.model_profile_revision,
+            },
+        }));
         if has_shared_profile_update {
             self.begin_shared_profile_confirmation(menu, impacts, mutation);
         } else {
@@ -5550,7 +6986,10 @@ impl App {
         if menu.busy
             && !matches!(
                 menu.page,
-                MenuPage::Root | MenuPage::DisplaySettings | MenuPage::RunSettings
+                MenuPage::Root
+                    | MenuPage::Settings
+                    | MenuPage::DisplaySettings
+                    | MenuPage::McpSettings
             )
         {
             menu.message = tr("menu.busy").into();
@@ -5562,120 +7001,75 @@ impl App {
                     menu.push(MenuPage::Profiles);
                     self.refresh_current_profile_editor(menu);
                 }
-                1 => menu.push(MenuPage::SerialSettings),
-                2 => {
-                    menu.push(MenuPage::DisplaySettings);
-                }
-                3 => menu.push(MenuPage::RunSettings),
-                4 => menu.push(MenuPage::Help),
+                1 => menu.push(MenuPage::CreateProfiles),
+                2 => menu.push(MenuPage::Settings),
+                3 => menu.push(MenuPage::Help),
                 _ => {}
             },
             MenuPage::Profiles => self.activate_current_profile_row(menu),
-            MenuPage::TransportProfiles => {
-                let Some((profiles_len, profile_name)) = menu.catalog.as_ref().map(|catalog| {
-                    (
-                        catalog.transport_profiles.len(),
-                        catalog
-                            .transport_profiles
-                            .get(menu.selected)
-                            .map(|profile| profile.name.clone()),
-                    )
-                }) else {
-                    menu.message = tr("menu.catalog.unavailable").into();
-                    return;
-                };
-                let port = self.selected_port();
-                if let Some(profile_name) = profile_name {
-                    self.submit_menu_mutation(
-                        menu,
-                        MenuMutation::BindTransport { port, profile_name },
-                    );
-                } else if menu.selected == profiles_len {
-                    self.begin_transport_name_prompt(
-                        menu,
-                        port,
-                        default_transport_profile(String::new()),
-                        "uart-115200-8n1".into(),
-                    );
+            MenuPage::CreateProfiles => match menu.selected {
+                0 => {
+                    menu.create_transport = Some(default_transport_profile(String::new()));
+                    menu.push(MenuPage::CreateTransportProfile);
                 }
-            }
-            MenuPage::ModelProfiles => {
-                let Some((profiles_len, profile_name)) = menu.catalog.as_ref().map(|catalog| {
-                    (
-                        catalog.model_profiles.len(),
-                        menu.selected
-                            .checked_sub(1)
-                            .and_then(|index| catalog.model_profiles.get(index))
-                            .map(|profile| profile.name.clone()),
-                    )
-                }) else {
-                    menu.message = tr("menu.catalog.unavailable").into();
-                    return;
-                };
-                let port = self.selected_port();
-                if menu.selected == 0 {
-                    self.submit_menu_mutation(
-                        menu,
-                        MenuMutation::BindModelProfile {
-                            port,
-                            profile_name: None,
-                        },
-                    );
-                } else if let Some(profile_name) = profile_name {
-                    self.submit_menu_mutation(
-                        menu,
-                        MenuMutation::BindModelProfile {
-                            port,
-                            profile_name: Some(profile_name),
-                        },
-                    );
-                } else if menu.selected == profiles_len + 1 {
-                    self.begin_device_name_prompt(
-                        menu,
-                        port,
-                        current_model_profile_template(self.current()),
-                    );
-                } else if let Some(preset) = menu
-                    .selected
-                    .checked_sub(profiles_len + 2)
-                    .and_then(|index| MODEL_PRESETS.get(index))
-                    .copied()
-                {
-                    let mut profile = current_model_profile_template(self.current());
-                    preset.apply(&mut profile);
-                    self.begin_device_name_prompt(menu, port, profile);
+                1 => {
+                    menu.create_model = Some(ModelProfile {
+                        name: String::new(),
+                        model_names: Vec::new(),
+                        shell_prompt: None,
+                        uboot_prompt: None,
+                        write_eol: Some("\r".into()),
+                        echo: Some(EchoMode::Auto),
+                        write_chunk_size: None,
+                        write_chunk_delay_ms: None,
+                    });
+                    menu.push(MenuPage::CreateModelProfile);
                 }
-            }
-            MenuPage::SerialSettings => {
-                let Some(mut profile) = menu
+                _ => {}
+            },
+            MenuPage::CreateTransportProfile => self.activate_create_transport_row(menu),
+            MenuPage::CreateModelProfile => self.activate_create_model_row(menu),
+            MenuPage::Settings => match menu.selected {
+                0 => menu.push(MenuPage::DisplaySettings),
+                1 => menu.push(MenuPage::McpSettings),
+                _ => {}
+            },
+            MenuPage::ModelFamilies => {
+                let profile = menu
                     .catalog
                     .as_ref()
-                    .map(|catalog| current_transport_template(self.current(), catalog))
-                else {
-                    menu.message = tr("menu.catalog.unavailable").into();
-                    return;
-                };
-                let Some(preset) = TRANSPORT_PRESETS.get(menu.selected).copied() else {
-                    return;
-                };
-                preset.apply(&mut profile);
-                let suggested_name = format!(
-                    "{}-custom",
-                    self.current()
-                        .snapshot
-                        .config
-                        .transport_profile
-                        .as_deref()
-                        .unwrap_or("uart")
-                        .trim()
-                );
-                profile.name.clear();
-                self.begin_transport_name_prompt(
-                    menu,
-                    self.selected_port(),
-                    profile,
-                    suggested_name,
-                );
+                    .and_then(|catalog| {
+                        catalog
+                            .model_profiles
+                            .iter()
+                            .filter(|profile| !profile.model_names.is_empty())
+                            .nth(menu.selected)
+                    })
+                    .map(|profile| profile.name.clone());
+                if let Some(profile) = profile {
+                    menu.model_family = Some(profile);
+                    menu.push(MenuPage::ModelNames);
+                }
+            }
+            MenuPage::ModelNames => {
+                let selection = menu.catalog.as_ref().and_then(|catalog| {
+                    let family = menu.model_family.as_deref()?;
+                    let profile = catalog
+                        .model_profiles
+                        .iter()
+                        .find(|profile| profile.name == family)?;
+                    let name = profile.model_names.get(menu.selected)?.clone();
+                    Some((profile.clone(), name))
+                });
+                if let Some((profile, name)) = selection
+                    && let Some(editor) = menu.profile_editor.as_mut()
+                {
+                    editor.model_profile_binding = Some(profile.name.clone());
+                    editor.device = profile;
+                    editor.model_name = Some(name);
+                    while menu.page != MenuPage::Profiles && menu.back() {}
+                    menu.message = tr("menu.current.modified").into();
+                }
             }
             MenuPage::DisplaySettings => {
                 let value = self.agent_history_rows.to_string();
@@ -5692,27 +7086,96 @@ impl App {
                     purpose: MenuPromptPurpose::AgentHistoryRows,
                 });
             }
-            MenuPage::RunSettings => self.begin_orphan_run_timeout_prompt(menu),
+            MenuPage::McpSettings => self.begin_orphan_run_timeout_prompt(menu),
             MenuPage::Help => {}
         }
     }
 
-    fn handle_menu_io_event(&mut self, event: MenuIoEvent) {
+    fn reconcile_configured_ports(&mut self, fresh: &[SlotSnapshot], preferred_port: &str) -> bool {
+        let previous_ports = self
+            .ports
+            .iter()
+            .map(|view| view.snapshot.config.port.clone())
+            .collect::<Vec<_>>();
+        let configured_ports = fresh
+            .iter()
+            .map(|slot| slot.config.port.clone())
+            .collect::<Vec<_>>();
+        let port_set_changed = previous_ports != configured_ports;
+        let mut previous = std::mem::take(&mut self.ports);
+        self.ports = fresh
+            .iter()
+            .cloned()
+            .map(|slot| {
+                let port = slot.config.port.clone();
+                if let Some(index) = previous
+                    .iter()
+                    .position(|view| view.snapshot.config.port == port)
+                {
+                    let mut view = previous.swap_remove(index);
+                    let configuration_changed = view.snapshot.config != slot.config;
+                    view.snapshot = slot;
+                    view.sync_trigger_projection(false);
+                    view.sync_active_run_history();
+                    if configuration_changed {
+                        view.follow();
+                    }
+                    view
+                } else {
+                    SlotView::new(slot)
+                }
+            })
+            .collect();
+        self.selected = self
+            .ports
+            .iter()
+            .position(|view| view.snapshot.config.port == preferred_port)
+            .unwrap_or_else(|| self.selected.min(self.ports.len().saturating_sub(1)));
+        let configured = configured_ports
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        self.pending_writes
+            .retain(|port, _| configured.contains(port));
+        self.inflight_writes
+            .retain(|port, _| configured.contains(port));
+        self.queued_controls
+            .retain(|port, _| configured.contains(port));
+        self.pending_requests.retain(|_, request| match request {
+            PendingRequest::Acquire { port, .. }
+            | PendingRequest::Renew { port }
+            | PendingRequest::Release { port }
+            | PendingRequest::CancelAcquire { port }
+            | PendingRequest::Write { port, .. } => configured.contains(port),
+        });
+        port_set_changed
+    }
+
+    fn handle_menu_io_event(
+        &mut self,
+        event: MenuIoEvent,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
         match event {
             MenuIoEvent::Completed { catalog, success } => {
-                for fresh in &catalog.ports {
-                    if let Some(view) = self
+                let current_port = self.selected_port();
+                let preferred_port = match &success {
+                    MenuSuccess::ProfilesUpdated {
+                        previous_port,
+                        configured_port,
+                    } if current_port == *previous_port => configured_port.as_str(),
+                    _ => current_port.as_str(),
+                };
+                if self.reconcile_configured_ports(&catalog.ports, preferred_port) {
+                    let ports = self
                         .ports
-                        .iter_mut()
-                        .find(|view| view.snapshot.config.port == fresh.config.port)
+                        .iter()
+                        .map(|view| view.snapshot.config.port.clone())
+                        .collect();
+                    if commands
+                        .try_send(NetworkCommand::Reconfigure { ports })
+                        .is_err()
                     {
-                        let configuration_changed = view.snapshot.config != fresh.config;
-                        view.snapshot = fresh.clone();
-                        view.sync_trigger_projection(false);
-                        view.sync_active_run_history();
-                        if configuration_changed {
-                            view.follow();
-                        }
+                        tracing::warn!("failed to reconnect after configured Port set changed");
                     }
                 }
                 let profile_editor = CurrentProfileEditor::new(self.current(), &catalog);
@@ -5737,6 +7200,37 @@ impl App {
             }
         }
         self.dirty = true;
+    }
+
+    fn handle_monitor_io_event(&mut self, event: MonitorIoEvent) {
+        match event {
+            MonitorIoEvent::Snapshot(entries) => {
+                for view in &mut self.ports {
+                    let mut matching = entries
+                        .iter()
+                        .filter(|entry| entry.monitor.spec.port == view.snapshot.config.port)
+                        .cloned()
+                        .collect::<VecDeque<_>>();
+                    while matching.len() > MAX_MONITORS_PER_SLOT {
+                        matching.pop_front();
+                    }
+                    view.monitor_history = matching;
+                    if view
+                        .selected_monitor
+                        .is_some_and(|id| view.monitor(id).is_none())
+                    {
+                        view.selected_monitor = None;
+                        view.expanded_monitor = None;
+                        view.selected_monitor_matcher = None;
+                        view.selected_monitor_incident = None;
+                    }
+                }
+                self.dirty = true;
+            }
+            MonitorIoEvent::Failed(error) => {
+                tracing::debug!(%error, "Monitor history refresh failed");
+            }
+        }
     }
 
     /// Ctrl-] g: switch between English and Chinese at runtime and persist
@@ -5847,9 +7341,23 @@ struct MenuIo {
     events: mpsc::Receiver<MenuIoEvent>,
 }
 
+struct MonitorIo {
+    events: mpsc::Receiver<MonitorIoEvent>,
+}
+
+enum MonitorIoEvent {
+    Snapshot(Vec<MonitorHistoryEntry>),
+    Failed(String),
+}
+
 struct OutputSearchIo {
     commands: mpsc::Sender<OutputSearchIoCommand>,
     events: mpsc::Receiver<OutputSearchIoEvent>,
+}
+
+struct ExactEvidenceIo {
+    commands: mpsc::Sender<ExactEvidenceIoCommand>,
+    events: mpsc::Receiver<ExactEvidenceIoEvent>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6166,6 +7674,329 @@ async fn execute_output_search(
     })
 }
 
+fn exact_evidence_is_complete(
+    port: &str,
+    daemon_epoch: Uuid,
+    seq_start: u64,
+    seq_end: u64,
+    events: &[TimelineEvent],
+) -> bool {
+    if seq_start == 0 || seq_start > seq_end || events.is_empty() {
+        return false;
+    }
+    if events.first().is_none_or(|event| {
+        event.port != port || event.daemon_epoch != daemon_epoch || event.seq != seq_start
+    }) || events.last().is_none_or(|event| {
+        event.port != port || event.daemon_epoch != daemon_epoch || event.seq != seq_end
+    }) {
+        return false;
+    }
+    events.windows(2).all(|pair| {
+        pair[0].port == port
+            && pair[1].port == port
+            && pair[0].daemon_epoch == daemon_epoch
+            && pair[1].daemon_epoch == daemon_epoch
+            && pair[0].seq.checked_add(1) == Some(pair[1].seq)
+    })
+}
+
+fn incident_evidence_is_complete(
+    target: &IncidentEvidenceTarget,
+    events: &[TimelineEvent],
+) -> bool {
+    exact_evidence_is_complete(
+        &target.port,
+        target.daemon_epoch,
+        target.seq_start,
+        target.seq_end,
+        events,
+    )
+}
+
+fn command_evidence_end_seq(
+    target: &CommandEvidenceTarget,
+    events: &[TimelineEvent],
+) -> Option<u64> {
+    if target.matchers.is_empty() {
+        return exact_evidence_is_complete(
+            &target.port,
+            target.daemon_epoch,
+            target.seq_start,
+            target.write_end_seq,
+            events,
+        )
+        .then_some(target.write_end_seq);
+    }
+    let entries = project_incident_evidence(events);
+    let entries = entries.iter().collect::<Vec<_>>();
+    let capture = command_capture_for_target(target, &entries);
+    capture
+        .end
+        .and_then(|index| entries.get(index))
+        .map(|entry| entry.seq)
+}
+
+fn first_exact_evidence_gap(
+    target: &ExactEvidenceTarget,
+    through_seq: u64,
+    events: &[TimelineEvent],
+) -> Option<GapRange> {
+    let mut expected = target.seq_start();
+    for event in events.iter().take_while(|event| event.seq <= through_seq) {
+        if event.seq > expected {
+            return Some(GapRange {
+                epoch: target.daemon_epoch(),
+                first_seq: expected,
+                last_seq: event.seq.saturating_sub(1),
+                reason: serial_protocol::GapReason::SequenceDiscontinuity,
+            });
+        }
+        expected = event.seq.saturating_add(1);
+    }
+    (expected <= through_seq).then_some(GapRange {
+        epoch: target.daemon_epoch(),
+        first_seq: expected,
+        last_seq: through_seq,
+        reason: serial_protocol::GapReason::SequenceDiscontinuity,
+    })
+}
+
+fn spawn_exact_evidence_io(api: ApiClient) -> ExactEvidenceIo {
+    let (command_tx, mut command_rx) = mpsc::channel(4);
+    let (event_tx, event_rx) = mpsc::channel(2);
+    tokio::spawn(async move {
+        let mut active: Option<(
+            Uuid,
+            ExactEvidenceTarget,
+            tokio::task::JoinHandle<ExactEvidenceIoEvent>,
+        )> = None;
+        loop {
+            if let Some((active_id, active_target, mut task)) = active.take() {
+                tokio::select! {
+                    result = &mut task => {
+                        let event = result.unwrap_or_else(|error| ExactEvidenceIoEvent::Failed {
+                            request_id: active_id,
+                            target: active_target,
+                            failure: ExactEvidenceFailure::QueryFailed(
+                                format!("Exact evidence worker stopped: {error}"),
+                            ),
+                        });
+                        if event_tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    command = command_rx.recv() => match command {
+                        Some(ExactEvidenceIoCommand::Query(request)) => {
+                            task.abort();
+                            let request_id = request.request_id;
+                            let target = request.target.clone();
+                            active = Some((request_id, target, spawn_exact_evidence_task(api.clone(), request)));
+                        }
+                        None => {
+                            task.abort();
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            match command_rx.recv().await {
+                Some(ExactEvidenceIoCommand::Query(request)) => {
+                    let request_id = request.request_id;
+                    let target = request.target.clone();
+                    active = Some((
+                        request_id,
+                        target,
+                        spawn_exact_evidence_task(api.clone(), request),
+                    ));
+                }
+                None => break,
+            }
+        }
+    });
+    ExactEvidenceIo {
+        commands: command_tx,
+        events: event_rx,
+    }
+}
+
+fn spawn_exact_evidence_task(
+    api: ApiClient,
+    request: ExactEvidenceRequest,
+) -> tokio::task::JoinHandle<ExactEvidenceIoEvent> {
+    tokio::spawn(async move {
+        let request_id = request.request_id;
+        let target = request.target.clone();
+        match tokio::time::timeout(
+            EXACT_EVIDENCE_DEADLINE,
+            execute_exact_evidence_query(&api, request.target),
+        )
+        .await
+        {
+            Ok(Ok(response)) => ExactEvidenceIoEvent::Completed {
+                request_id,
+                response,
+            },
+            Ok(Err(failure)) => ExactEvidenceIoEvent::Failed {
+                request_id,
+                target,
+                failure,
+            },
+            Err(_) => ExactEvidenceIoEvent::Failed {
+                request_id,
+                target,
+                failure: ExactEvidenceFailure::QueryFailed(format!(
+                    "query exceeded {} seconds",
+                    EXACT_EVIDENCE_DEADLINE.as_secs()
+                )),
+            },
+        }
+    })
+}
+
+async fn execute_exact_evidence_query(
+    api: &ApiClient,
+    target: ExactEvidenceTarget,
+) -> std::result::Result<ExactEvidenceResponse, ExactEvidenceFailure> {
+    let seq_start = target.seq_start();
+    let query_end_seq = target.query_end_seq();
+    if seq_start == 0 || seq_start > query_end_seq {
+        return Err(ExactEvidenceFailure::Incomplete);
+    }
+    let mut events = Vec::new();
+    let mut reported_gaps = Vec::new();
+    let mut data_bytes = 0usize;
+    let mut after_seq = seq_start.saturating_sub(1);
+    for _ in 0..EXACT_EVIDENCE_HTTP_QUERY_LIMIT {
+        let response = api
+            .events(
+                target.port(),
+                &EventQuery {
+                    epoch: Some(target.daemon_epoch()),
+                    after_seq: Some(after_seq),
+                    through_seq: Some(query_end_seq),
+                    before_wall_time_ns: None,
+                    after_wall_time_ns: None,
+                    direction: None,
+                    kind: None,
+                    actor_id: None,
+                    run_id: None,
+                    operation_id: None,
+                    contains: None,
+                    regex: None,
+                    limit_events: Some(EXACT_EVIDENCE_PAGE_EVENTS),
+                    limit_bytes: Some(EXACT_EVIDENCE_PAGE_BYTES),
+                },
+            )
+            .await
+            .map_err(|error| ExactEvidenceFailure::QueryFailed(error.to_string()))?;
+        reported_gaps.extend(
+            response
+                .gaps
+                .iter()
+                .filter(|gap| {
+                    gap.epoch == target.daemon_epoch()
+                        && gap.first_seq <= query_end_seq
+                        && gap.last_seq >= seq_start
+                })
+                .cloned(),
+        );
+        if let Some(first_available) = response.first_available_seq
+            && first_available > seq_start
+        {
+            return Err(ExactEvidenceFailure::Gap(GapRange {
+                epoch: target.daemon_epoch(),
+                first_seq: seq_start,
+                last_seq: first_available.saturating_sub(1).min(query_end_seq),
+                reason: serial_protocol::GapReason::Retention,
+            }));
+        }
+        for event in response.events {
+            if event.port != target.port()
+                || event.daemon_epoch != target.daemon_epoch()
+                || event.seq <= after_seq
+                || event.seq < seq_start
+                || event.seq > query_end_seq
+            {
+                return Err(ExactEvidenceFailure::Incomplete);
+            }
+            if event.kind == EventKind::Gap {
+                let reason = event
+                    .metadata
+                    .get("reason")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    .unwrap_or(serial_protocol::GapReason::SequenceDiscontinuity);
+                reported_gaps.push(GapRange {
+                    epoch: target.daemon_epoch(),
+                    first_seq: event.seq,
+                    last_seq: event.seq,
+                    reason,
+                });
+            }
+            data_bytes = data_bytes.saturating_add(event.data.len());
+            events.push(event);
+        }
+        events.sort_by_key(|event| event.seq);
+        events.dedup_by_key(|event| event.seq);
+        if events.len() > EXACT_EVIDENCE_MAX_EVENTS || data_bytes > EXACT_EVIDENCE_MAX_BYTES {
+            return Err(ExactEvidenceFailure::LimitExceeded);
+        }
+        let completed_through = match &target {
+            ExactEvidenceTarget::Incident(target) => {
+                incident_evidence_is_complete(target, &events).then_some(target.seq_end)
+            }
+            ExactEvidenceTarget::Command(target) => command_evidence_end_seq(target, &events),
+        };
+        if let Some(completed_through) = completed_through {
+            if let Some(gap) = reported_gaps
+                .iter()
+                .find(|gap| gap.first_seq <= completed_through && gap.last_seq >= seq_start)
+            {
+                return Err(ExactEvidenceFailure::Gap(gap.clone()));
+            }
+            let completed_len = events.partition_point(|event| event.seq <= completed_through);
+            if !exact_evidence_is_complete(
+                target.port(),
+                target.daemon_epoch(),
+                seq_start,
+                completed_through,
+                &events[..completed_len],
+            ) {
+                return Err(ExactEvidenceFailure::Gap(
+                    first_exact_evidence_gap(&target, completed_through, &events).unwrap_or(
+                        GapRange {
+                            epoch: target.daemon_epoch(),
+                            first_seq: seq_start,
+                            last_seq: completed_through,
+                            reason: serial_protocol::GapReason::SequenceDiscontinuity,
+                        },
+                    ),
+                ));
+            }
+            events.retain(|event| event.seq <= completed_through);
+            return Ok(ExactEvidenceResponse { target, events });
+        }
+        let Some(cursor) = response.next_cursor.filter(|cursor| {
+            cursor.epoch == target.daemon_epoch()
+                && cursor.after_seq > after_seq
+                && cursor.after_seq < query_end_seq
+        }) else {
+            if let Some(gap) = reported_gaps.first() {
+                return Err(ExactEvidenceFailure::Gap(gap.clone()));
+            }
+            return Err(ExactEvidenceFailure::Incomplete);
+        };
+        if !response.truncated {
+            if let Some(gap) = reported_gaps.first() {
+                return Err(ExactEvidenceFailure::Gap(gap.clone()));
+            }
+            return Err(ExactEvidenceFailure::Incomplete);
+        }
+        after_seq = cursor.after_seq;
+    }
+    Err(ExactEvidenceFailure::LimitExceeded)
+}
+
 fn spawn_menu_io(api: ApiClient) -> MenuIo {
     let (command_tx, mut command_rx) = mpsc::channel(8);
     let (event_tx, event_rx) = mpsc::channel(8);
@@ -6199,15 +8030,7 @@ async fn execute_menu_io(
 
 async fn execute_menu_mutation(api: &ApiClient, mutation: MenuMutation) -> Result<MenuSuccess> {
     match mutation {
-        MenuMutation::BindTransport { port, profile_name } => {
-            bind_transport_profile(api, &port, &profile_name).await?;
-            Ok(MenuSuccess::TransportBound(profile_name))
-        }
-        MenuMutation::BindModelProfile { port, profile_name } => {
-            bind_model_profile(api, &port, profile_name.as_deref()).await?;
-            Ok(MenuSuccess::ModelProfileBound(profile_name))
-        }
-        MenuMutation::CreateTransportAndBind { port, profile } => {
+        MenuMutation::CreateTransport { profile } => {
             let profile_name = profile.name.clone();
             let mut catalog = api.transport_profiles().await?;
             if catalog
@@ -6220,10 +8043,9 @@ async fn execute_menu_mutation(api: &ApiClient, mutation: MenuMutation) -> Resul
             catalog.profiles.push(profile);
             api.configure_transport_profiles(catalog.profiles, catalog.config_revision)
                 .await?;
-            bind_transport_profile(api, &port, &profile_name).await?;
             Ok(MenuSuccess::TransportCreated(profile_name))
         }
-        MenuMutation::CreateModelProfileAndBind { port, profile } => {
+        MenuMutation::CreateModelProfile { profile } => {
             let profile_name = profile.name.clone();
             let mut catalog = api.model_profiles().await?;
             if catalog
@@ -6236,44 +8058,34 @@ async fn execute_menu_mutation(api: &ApiClient, mutation: MenuMutation) -> Resul
             catalog.profiles.push(profile);
             api.configure_model_profiles(catalog.profiles, catalog.config_revision)
                 .await?;
-            bind_model_profile(api, &port, Some(&profile_name)).await?;
             Ok(MenuSuccess::ModelProfileCreated(profile_name))
         }
-        MenuMutation::UpdateCurrentProfiles {
-            current_port,
-            new_port,
-            transport,
-            device,
-            expected_config_revision,
-            expected_transport_revision,
-            expected_model_profile_revision,
-        } => {
-            update_current_profiles(
-                api,
-                &current_port,
-                new_port,
-                transport,
-                device,
-                CurrentProfileRevisions {
-                    config: expected_config_revision,
-                    transport: expected_transport_revision,
-                    device: expected_model_profile_revision,
-                },
-            )
-            .await?;
-            Ok(MenuSuccess::ProfilesUpdated)
+        MenuMutation::UpdateCurrentProfiles(update) => {
+            let previous_port = update.current_port.clone();
+            let configured_port = update
+                .new_port
+                .clone()
+                .unwrap_or_else(|| previous_port.clone());
+            update_current_profiles(api, *update).await?;
+            Ok(MenuSuccess::ProfilesUpdated {
+                previous_port,
+                configured_port,
+            })
         }
     }
 }
 
-async fn update_current_profiles(
-    api: &ApiClient,
-    current_port: &str,
-    new_port: Option<String>,
-    transport: Option<TransportProfile>,
-    device: Option<ModelProfile>,
-    revisions: CurrentProfileRevisions,
-) -> Result<()> {
+async fn update_current_profiles(api: &ApiClient, update: CurrentProfileUpdate) -> Result<()> {
+    let CurrentProfileUpdate {
+        current_port,
+        new_port,
+        transport_binding,
+        transport,
+        model_profile_binding,
+        model_name,
+        device,
+        revisions,
+    } = update;
     if transport.is_some() {
         ensure!(
             revisions.transport == revisions.config,
@@ -6298,7 +8110,7 @@ async fn update_current_profiles(
         .ports
         .iter()
         .find(|slot| slot.config.port == current_port)
-        .with_context(|| trf("menu.port.missing", &[current_port]))?;
+        .with_context(|| trf("menu.port.missing", &[&current_port]))?;
     if let Some(profile) = transport.as_ref() {
         ensure!(
             slot.config.transport_profile.as_deref() == Some(profile.name.as_str()),
@@ -6352,7 +8164,11 @@ async fn update_current_profiles(
             .await?;
         known_revision = updated.config_revision;
     }
-    if let Some(new_port) = new_port {
+    if new_port.is_some()
+        || transport_binding.is_some()
+        || model_profile_binding.is_some()
+        || model_name.is_some()
+    {
         let status = api.configuration_status().await?;
         ensure!(
             status.config_revision == known_revision,
@@ -6367,75 +8183,117 @@ async fn update_current_profiles(
         let slot = ports
             .iter_mut()
             .find(|slot| slot.port == current_port)
-            .with_context(|| trf("menu.port.missing", &[current_port]))?;
-        slot.port = new_port;
+            .with_context(|| trf("menu.port.missing", &[&current_port]))?;
+        if let Some(new_port) = new_port {
+            slot.port = new_port;
+        }
+        if let Some(binding) = transport_binding {
+            slot.transport_profile = binding;
+        }
+        if let Some(binding) = model_profile_binding {
+            slot.model_profile = binding;
+            if slot.model_profile.is_none() {
+                slot.model_name = None;
+            }
+        }
+        if let Some(model_name) = model_name {
+            slot.model_name = model_name;
+        }
         api.configure_ports(ports, status.config_revision).await?;
     }
     Ok(())
 }
 
-async fn bind_transport_profile(api: &ApiClient, port: &str, profile_name: &str) -> Result<()> {
-    let status = api.configuration_status().await?;
-    let catalog = api.transport_profiles().await?;
-    let profile = catalog
-        .profiles
-        .iter()
-        .find(|profile| profile.name == profile_name)
-        .with_context(|| trf("menu.transport.missing", &[profile_name]))?;
-    let mut ports = status
-        .ports
-        .into_iter()
-        .map(|slot| slot.config)
-        .collect::<Vec<_>>();
-    let slot = ports
-        .iter_mut()
-        .find(|slot| slot.port == port)
-        .with_context(|| trf("menu.port.missing", &[port]))?;
-    slot.transport_profile = Some(profile.name.clone());
-    api.configure_ports(ports, status.config_revision).await?;
-    Ok(())
-}
-
-async fn bind_model_profile(api: &ApiClient, port: &str, profile_name: Option<&str>) -> Result<()> {
-    let status = api.configuration_status().await?;
-    if let Some(profile_name) = profile_name {
-        let catalog = api.model_profiles().await?;
-        if !catalog
-            .profiles
-            .iter()
-            .any(|profile| profile.name == profile_name)
-        {
-            bail!(trf("menu.device.missing", &[profile_name]));
-        }
-    }
-    let mut ports = status
-        .ports
-        .into_iter()
-        .map(|slot| slot.config)
-        .collect::<Vec<_>>();
-    let slot = ports
-        .iter_mut()
-        .find(|slot| slot.port == port)
-        .with_context(|| trf("menu.port.missing", &[port]))?;
-    slot.model_profile = profile_name.map(ToOwned::to_owned);
-    api.configure_ports(ports, status.config_revision).await?;
-    Ok(())
-}
-
 async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
-    let (status, transport, model) = tokio::try_join!(
+    let (status, detected_ports, transport, model) = tokio::try_join!(
         api.configuration_status(),
+        api.ports(),
         api.transport_profiles(),
         api.model_profiles(),
     )?;
     Ok(MenuCatalog {
         ports: status.ports,
+        detected_ports,
         config_revision: status.config_revision,
         transport_profiles: transport.profiles,
         transport_revision: transport.config_revision,
         model_profiles: model.profiles,
         model_profile_revision: model.config_revision,
     })
+}
+
+fn spawn_monitor_io(api: ApiClient) -> MonitorIo {
+    let (event_tx, event_rx) = mpsc::channel(2);
+    tokio::spawn(async move {
+        let mut retained = HashMap::<Uuid, MonitorHistoryEntry>::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let result = refresh_monitor_history(&api, &mut retained).await;
+            let event = match result {
+                Ok(entries) => MonitorIoEvent::Snapshot(entries),
+                Err(error) => MonitorIoEvent::Failed(error.to_string()),
+            };
+            if event_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    MonitorIo { events: event_rx }
+}
+
+async fn refresh_monitor_history(
+    api: &ApiClient,
+    retained: &mut HashMap<Uuid, MonitorHistoryEntry>,
+) -> Result<Vec<MonitorHistoryEntry>> {
+    let mut monitors = api.monitors(None).await?.monitors;
+    monitors.sort_by_key(|monitor| monitor.created_wall_time_ns);
+    let ids = monitors
+        .iter()
+        .map(|monitor| monitor.id)
+        .collect::<Vec<_>>();
+    retained.retain(|id, _| ids.contains(id));
+    for monitor in monitors {
+        let entry = retained
+            .entry(monitor.id)
+            .or_insert_with(|| MonitorHistoryEntry {
+                monitor: monitor.clone(),
+                incidents: VecDeque::new(),
+                limited: false,
+            });
+        entry.monitor = monitor;
+        let known = entry
+            .incidents
+            .back()
+            .map_or(0, |incident| incident.incident_seq);
+        if entry.monitor.incident_count > known {
+            let page = api
+                .monitor_incidents(
+                    entry.monitor.id,
+                    (known > 0).then_some(known),
+                    MAX_INCIDENTS_PER_MONITOR,
+                )
+                .await?;
+            entry.limited |= page.truncated || page.retention_gap;
+            for incident in page.incidents {
+                if entry
+                    .incidents
+                    .back()
+                    .is_none_or(|known| known.id != incident.id)
+                {
+                    entry.incidents.push_back(incident);
+                }
+            }
+            while entry.incidents.len() > MAX_INCIDENTS_PER_MONITOR {
+                entry.incidents.pop_front();
+                entry.limited = true;
+            }
+        }
+    }
+    let mut entries = retained.values().cloned().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.monitor.created_wall_time_ns);
+    Ok(entries)
 }
 
 pub async fn run(
@@ -6485,6 +8343,9 @@ pub async fn run(
     app.menu_commands = Some(menu_io.commands.clone());
     let mut output_search_io = spawn_output_search_io(api.clone());
     app.output_search_commands = Some(output_search_io.commands.clone());
+    let mut exact_evidence_io = spawn_exact_evidence_io(api.clone());
+    app.exact_evidence_commands = Some(exact_evidence_io.commands.clone());
+    let mut monitor_io = spawn_monitor_io(api.clone());
     let mut network = ws::spawn(endpoint, ports, initial_cursors);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
@@ -6495,9 +8356,13 @@ pub async fn run(
         &mut terminal,
         &mut app,
         &network.commands,
-        &mut network.events,
-        &mut menu_io.events,
-        &mut output_search_io.events,
+        RunLoopEvents {
+            network: &mut network.events,
+            menu: &mut menu_io.events,
+            output_search: &mut output_search_io.events,
+            exact_evidence: &mut exact_evidence_io.events,
+            monitor: &mut monitor_io.events,
+        },
     )
     .await;
     let _ = network.commands.try_send(NetworkCommand::Shutdown);
@@ -6513,17 +8378,24 @@ pub async fn run(
     result
 }
 
+struct RunLoopEvents<'a> {
+    network: &'a mut mpsc::Receiver<NetworkEvent>,
+    menu: &'a mut mpsc::Receiver<MenuIoEvent>,
+    output_search: &'a mut mpsc::Receiver<OutputSearchIoEvent>,
+    exact_evidence: &'a mut mpsc::Receiver<ExactEvidenceIoEvent>,
+    monitor: &'a mut mpsc::Receiver<MonitorIoEvent>,
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     commands: &mpsc::Sender<NetworkCommand>,
-    network_events: &mut mpsc::Receiver<NetworkEvent>,
-    menu_events: &mut mpsc::Receiver<MenuIoEvent>,
-    output_search_events: &mut mpsc::Receiver<OutputSearchIoEvent>,
+    io_events: RunLoopEvents<'_>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut network_events_open = true;
     let mut output_search_events_open = true;
+    let mut exact_evidence_events_open = true;
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renew_tick = tokio::time::interval(Duration::from_secs(10));
@@ -6539,15 +8411,15 @@ async fn run_loop(
                 Some(Err(error)) => return Err(error).context("terminal input failed"),
                 None => return Ok(()),
             },
-            event = network_events.recv(), if network_events_open => {
+            event = io_events.network.recv(), if network_events_open => {
                 network_events_open = handle_network_channel_event(app, event, commands);
             },
-            event = menu_events.recv() => {
+            event = io_events.menu.recv() => {
                 if let Some(event) = event {
-                    app.handle_menu_io_event(event);
+                    app.handle_menu_io_event(event, commands);
                 }
             },
-            event = output_search_events.recv(), if output_search_events_open => {
+            event = io_events.output_search.recv(), if output_search_events_open => {
                 if let Some(event) = event {
                     app.handle_output_search_io_event(event);
                 } else {
@@ -6559,6 +8431,30 @@ async fn run_loop(
                         search.error = Some(tr("ui.output.search.unavailable").into());
                         app.dirty = true;
                     }
+                }
+            },
+            event = io_events.exact_evidence.recv(), if exact_evidence_events_open => {
+                if let Some(event) = event {
+                    app.handle_exact_evidence_io_event(event);
+                } else {
+                    exact_evidence_events_open = false;
+                    if let Some((_, target)) = app.pending_exact_evidence.take() {
+                        app.current_mut().follow();
+                        app.status = match target {
+                            ExactEvidenceTarget::Incident(_) => {
+                                tr("st.monitor.jump.query.unavailable").into()
+                            }
+                            ExactEvidenceTarget::Command(_) => {
+                                tr("st.run.jump.query.unavailable").into()
+                            }
+                        };
+                        app.dirty = true;
+                    }
+                }
+            },
+            event = io_events.monitor.recv() => {
+                if let Some(event) = event {
+                    app.handle_monitor_io_event(event);
                 }
             },
             _ = renew_tick.tick() => app.maintain_controls(commands),
@@ -7333,8 +9229,8 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
 #[derive(Debug)]
 struct OutputVisualRow {
     line: Line<'static>,
+    daemon_epoch: Option<Uuid>,
     seq: u64,
-    operation_id: Option<Uuid>,
 }
 
 #[derive(Debug)]
@@ -7344,38 +9240,55 @@ struct CommandCapture {
     command: String,
     highlight_available: bool,
     sequence: u64,
+    incident_epoch: Option<Uuid>,
 }
 
 enum CommandBoundaryMatcher {
-    Literal(String),
+    Contains(String),
+    Prompt(String),
     Regex(regex::Regex),
 }
 
 impl CommandBoundaryMatcher {
     fn matches(&self, text: &str) -> bool {
         match self {
-            Self::Literal(value) => text.contains(value),
+            Self::Contains(value) => text.contains(value),
+            // Prompt completion uses the same logical-line boundary as the
+            // Agent capture. A shell prompt at the start of the device echo
+            // (for example `dut# show status`) is not the command's final
+            // prompt and must not truncate the highlighted response.
+            Self::Prompt(value) => text.split('\n').any(|line| line.ends_with(value)),
             Self::Regex(value) => value.is_match(text),
         }
     }
 }
 
-fn command_boundary_matchers(record: &RunCommandRecord) -> Vec<CommandBoundaryMatcher> {
-    let explicit = record
-        .steps
-        .last()
+fn command_capture_matchers(
+    record: &RunCommandRecord,
+    step_index: Option<usize>,
+) -> Vec<CommandCaptureMatcher> {
+    step_index
+        .and_then(|index| record.steps.get(index))
+        .or_else(|| record.steps.last())
         .map(|step| step.capture_matchers.as_slice())
-        .unwrap_or_default();
-    explicit
+        .unwrap_or_default()
+        .to_vec()
+}
+
+fn command_boundary_matchers(matchers: &[CommandCaptureMatcher]) -> Vec<CommandBoundaryMatcher> {
+    matchers
         .iter()
         .filter_map(|matcher| match matcher.kind {
             CommandCaptureMatcherKind::Regex => regex::Regex::new(&matcher.value)
                 .ok()
                 .map(CommandBoundaryMatcher::Regex),
-            CommandCaptureMatcherKind::Contains
-            | CommandCaptureMatcherKind::ShellPrompt
-            | CommandCaptureMatcherKind::UbootPrompt => (!matcher.value.is_empty())
-                .then(|| CommandBoundaryMatcher::Literal(matcher.value.clone())),
+            CommandCaptureMatcherKind::Contains => (!matcher.value.is_empty())
+                .then(|| CommandBoundaryMatcher::Contains(matcher.value.clone())),
+            CommandCaptureMatcherKind::ShellPrompt | CommandCaptureMatcherKind::UbootPrompt => {
+                let value = matcher.value.replace("\r\n", "\n").replace('\r', "\n");
+                let value = value.trim_end_matches('\n');
+                (!value.is_empty()).then(|| CommandBoundaryMatcher::Prompt(value.to_owned()))
+            }
         })
         .collect()
 }
@@ -7400,10 +9313,13 @@ fn first_command_boundary(
     None
 }
 
-fn command_payload(record: &RunCommandRecord) -> String {
+fn command_payload(record: &RunCommandRecord, step_index: Option<usize>) -> String {
     record
         .steps
         .iter()
+        .enumerate()
+        .filter(|(index, _)| step_index.is_none_or(|selected| *index == selected))
+        .map(|(_, step)| step)
         .map(|step| {
             String::from_utf8_lossy(&step.data)
                 .trim_end_matches(['\r', '\n'])
@@ -7414,43 +9330,36 @@ fn command_payload(record: &RunCommandRecord) -> String {
         .join("  →  ")
 }
 
-fn command_capture(app: &App, entries: &[&DisplayLine]) -> Option<CommandCapture> {
-    if app.focus != PaneFocus::RunHistory {
-        return None;
-    }
-    let view = app.current();
-    let key = view.selected_run_command_key()?;
-    let record = view.run_command(key)?;
-    let payloads = record
-        .steps
-        .iter()
-        .map(|step| {
-            String::from_utf8_lossy(&step.data)
-                .trim_end_matches(['\r', '\n'])
-                .to_owned()
-        })
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let next_command = view.next_run_command_seq(key);
-    let eligible = |entry: &&DisplayLine| {
-        entry.seq >= record.first_seq
-            && next_command.is_none_or(|next_sequence| entry.seq < next_sequence)
-            && entry.run_boundary.is_none()
+fn command_capture_for_target(
+    target: &CommandEvidenceTarget,
+    entries: &[&DisplayLine],
+) -> CommandCapture {
+    let in_window = |entry: &&DisplayLine| {
+        entry.daemon_epoch == Some(target.daemon_epoch)
+            && entry.seq >= target.seq_start
+            && entry.seq <= target.query_end_seq
     };
+    let eligible = |entry: &&DisplayLine| {
+        in_window(entry)
+            && entry.event_kind == EventKind::Rx
+            && entry.run_boundary.is_none()
+            && entry.solid_style.is_none()
+    };
+    let first_in_window = entries.iter().position(in_window);
     let first_available = entries.iter().position(eligible);
-    let matched = entries.iter().position(|entry| {
-        eligible(entry)
-            && payloads
-                .iter()
-                .any(|payload| entry.text.contains(payload.as_str()))
+    let start = first_available;
+    let matchers = command_boundary_matchers(&target.matchers);
+    let boundary_start = first_available.and_then(|start| {
+        entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take_while(|(_, entry)| eligible(entry))
+            .find(|(_, entry)| entry.seq >= target.write_end_seq)
+            .map(|(index, _)| index)
+            .or(Some(start))
     });
-    let start = matched.or(first_available);
-    let matchers = command_boundary_matchers(record);
-    let boundary_start = entries
-        .iter()
-        .position(|entry| eligible(entry) && entry.seq >= record.last_seq)
-        .or(first_available);
-    let end = if matchers.is_empty() {
+    let end = if matchers.is_empty() || first_in_window != first_available {
         None
     } else {
         boundary_start.and_then(|index| {
@@ -7458,18 +9367,131 @@ fn command_capture(app: &App, entries: &[&DisplayLine]) -> Option<CommandCapture
                 .filter(|end| start.is_some_and(|start| *end >= start))
         })
     };
-    let highlight_available = start.is_some() && end.is_some();
-    Some(CommandCapture {
+    CommandCapture {
         start,
         end,
-        command: command_payload(record),
-        highlight_available,
-        sequence: record.first_seq,
-    })
+        command: target.command.clone(),
+        highlight_available: start.is_some() && end.is_some(),
+        sequence: target.seq_start,
+        incident_epoch: Some(target.daemon_epoch),
+    }
 }
 
+fn local_command_evidence_is_complete(
+    view: &SlotView,
+    target: &CommandEvidenceTarget,
+    entries: &[&DisplayLine],
+    capture: &CommandCapture,
+) -> bool {
+    if !local_command_window_is_retained(view, target, entries) || !capture.highlight_available {
+        return false;
+    }
+    let Some((start, end)) = capture.start.zip(capture.end) else {
+        return false;
+    };
+    if entries.get(end).is_none_or(|entry| {
+        entry.daemon_epoch != Some(target.daemon_epoch)
+            || entry.seq > target.query_end_seq
+            || entry.event_kind != EventKind::Rx
+    }) {
+        return false;
+    }
+    !entries[start..=end]
+        .iter()
+        .any(|entry| entry.event_kind == EventKind::Gap)
+}
+
+fn local_command_window_is_retained(
+    view: &SlotView,
+    target: &CommandEvidenceTarget,
+    entries: &[&DisplayLine],
+) -> bool {
+    if view.snapshot.config.port != target.port || view.snapshot.daemon_epoch != target.daemon_epoch
+    {
+        return false;
+    }
+    if view
+        .local_contiguous_from_seq
+        .is_none_or(|sequence| sequence > target.seq_start)
+    {
+        return false;
+    }
+    if view.local_history_truncated {
+        let first_retained = entries
+            .iter()
+            .find(|entry| entry.daemon_epoch == Some(target.daemon_epoch))
+            .map(|entry| entry.seq);
+        if first_retained.is_none_or(|sequence| sequence > target.seq_start) {
+            return false;
+        }
+    }
+    true
+}
+
+fn command_capture(app: &App, entries: &[&DisplayLine]) -> Option<CommandCapture> {
+    if app.focus != PaneFocus::RunHistory {
+        return None;
+    }
+    let view = app.current();
+    if let Some(incident) = view.selected_monitor_incident()
+        && incident.daemon_epoch == view.snapshot.daemon_epoch
+    {
+        let target = IncidentEvidenceTarget::from(incident);
+        local_incident_entry_range(view, &target)?;
+        let start = entries.iter().position(|entry| {
+            entry.daemon_epoch == Some(incident.daemon_epoch) && entry.seq == incident.seq_start
+        });
+        let end = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.daemon_epoch == Some(incident.daemon_epoch) && entry.seq == incident.seq_end
+            })
+            .map(|(index, _)| index)
+            .next_back();
+        return Some(CommandCapture {
+            start,
+            end,
+            command: incident.preview.clone(),
+            highlight_available: start.is_some() && end.is_some(),
+            sequence: incident.seq_start,
+            incident_epoch: Some(incident.daemon_epoch),
+        });
+    }
+    let key = view.selected_run_command_key()?;
+    let target = app.command_evidence_target(key, view.selected_run_step)?;
+    let full_entries = view
+        .lines
+        .iter()
+        .chain(view.pending_line.iter())
+        .collect::<Vec<_>>();
+    let full_capture = command_capture_for_target(&target, &full_entries);
+    if target.matchers.is_empty() && local_command_window_is_retained(view, &target, &full_entries)
+    {
+        return Some(command_capture_for_target(&target, entries));
+    }
+    if !local_command_evidence_is_complete(view, &target, &full_entries, &full_capture) {
+        return Some(CommandCapture {
+            start: None,
+            end: None,
+            command: target.command,
+            highlight_available: false,
+            sequence: target.seq_start,
+            incident_epoch: Some(target.daemon_epoch),
+        });
+    }
+    Some(command_capture_for_target(&target, entries))
+}
+
+const COMMAND_CAPTURE_BACKGROUND: Color = Color::Rgb(28, 53, 66);
+const COMMAND_FALLBACK_BACKGROUND: Color = Color::LightCyan;
+
 fn command_capture_line(mut line: Line<'static>) -> Line<'static> {
-    line.style = line.style.bg(Color::Rgb(28, 53, 66));
+    let background = COMMAND_CAPTURE_BACKGROUND;
+    line.style = line.style.patch(Style::default().bg(background));
+    for span in &mut line.spans {
+        span.style = span.style.patch(Style::default().bg(background));
+    }
     line
 }
 
@@ -7478,9 +9500,47 @@ fn command_fallback_line(command: &str) -> Line<'static> {
         format!("› {}", safe_inline(command)),
         Style::default()
             .fg(Color::Black)
-            .bg(Color::LightCyan)
+            .bg(COMMAND_FALLBACK_BACKGROUND)
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+/// Pads one already-wrapped visual row to the output pane width. Ratatui only
+/// paints cells occupied by text, so styling the `Line` and its existing spans
+/// alone leaves the short-row tail on the terminal's default background.
+fn fill_visual_row_background(
+    mut line: Line<'static>,
+    width: u16,
+    background: Color,
+) -> Line<'static> {
+    let width = usize::from(width);
+    let used = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let remaining = width.saturating_sub(used);
+    if remaining > 0 {
+        line.spans.push(Span::styled(
+            " ".repeat(remaining),
+            Style::default().bg(background),
+        ));
+    }
+    line
+}
+
+fn wrap_command_capture_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    wrap_timeline_line(command_capture_line(line), width)
+        .into_iter()
+        .map(|line| fill_visual_row_background(line, width, COMMAND_CAPTURE_BACKGROUND))
+        .collect()
+}
+
+fn wrap_command_fallback_line(command: &str, width: u16) -> Vec<Line<'static>> {
+    wrap_timeline_line(command_fallback_line(command), width)
+        .into_iter()
+        .map(|line| fill_visual_row_background(line, width, COMMAND_FALLBACK_BACKGROUND))
+        .collect()
 }
 
 fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec<OutputVisualRow> {
@@ -7500,12 +9560,12 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
         {
             let capture = capture.as_ref().expect("capture was just checked");
             rows.extend(
-                wrap_timeline_line(command_fallback_line(&capture.command), width)
+                wrap_command_fallback_line(&capture.command, width)
                     .into_iter()
                     .map(|line| OutputVisualRow {
                         line,
+                        daemon_epoch: None,
                         seq: capture.sequence,
-                        operation_id: None,
                     }),
             );
         }
@@ -7515,6 +9575,9 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
                     .start
                     .zip(capture.end)
                     .is_some_and(|(start, end)| start <= index && index <= end)
+                && capture.incident_epoch.is_none_or(|epoch| {
+                    entry.daemon_epoch == Some(epoch) && entry.event_kind == EventKind::Rx
+                })
         });
         let line = timeline_line(
             entry,
@@ -7524,31 +9587,25 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
             uboot_prompt,
             width as usize,
         );
-        rows.extend(
-            wrap_timeline_line(
-                if highlighted {
-                    command_capture_line(line)
-                } else {
-                    line
-                },
-                width,
-            )
-            .into_iter()
-            .map(|line| OutputVisualRow {
-                line,
-                seq: entry.seq,
-                operation_id: entry.operation_id,
-            }),
-        );
+        let visual_lines = if highlighted {
+            wrap_command_capture_line(line, width)
+        } else {
+            wrap_timeline_line(line, width)
+        };
+        rows.extend(visual_lines.into_iter().map(|line| OutputVisualRow {
+            line,
+            daemon_epoch: entry.daemon_epoch,
+            seq: entry.seq,
+        }));
     }
     if let Some(capture) = capture.filter(|capture| capture.start.is_none()) {
         rows.extend(
-            wrap_timeline_line(command_fallback_line(&capture.command), width)
+            wrap_command_fallback_line(&capture.command, width)
                 .into_iter()
                 .map(|line| OutputVisualRow {
                     line,
+                    daemon_epoch: None,
                     seq: capture.sequence,
-                    operation_id: None,
                 }),
         );
     }
@@ -7573,6 +9630,154 @@ fn all_output_visual_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .into_iter()
         .map(|row| row.line)
         .collect()
+}
+
+fn local_incident_entry_range(
+    view: &SlotView,
+    target: &IncidentEvidenceTarget,
+) -> Option<(usize, usize)> {
+    if view.snapshot.config.port != target.port || view.snapshot.daemon_epoch != target.daemon_epoch
+    {
+        return None;
+    }
+    let entries = view
+        .lines
+        .iter()
+        .chain(view.pending_line.iter())
+        .collect::<Vec<_>>();
+    let start = entries.iter().position(|entry| {
+        entry.daemon_epoch == Some(target.daemon_epoch) && entry.seq == target.seq_start
+    })?;
+    let end = entries.iter().rposition(|entry| {
+        entry.daemon_epoch == Some(target.daemon_epoch) && entry.seq == target.seq_end
+    })?;
+    if start > end {
+        return None;
+    }
+    let relevant = &entries[start..=end];
+    if relevant.iter().any(|entry| {
+        entry.daemon_epoch != Some(target.daemon_epoch) || entry.event_kind == EventKind::Gap
+    }) {
+        return None;
+    }
+    let mut sequences = relevant.iter().map(|entry| entry.seq).collect::<Vec<_>>();
+    sequences.dedup();
+    if sequences.first().copied() != Some(target.seq_start)
+        || sequences.last().copied() != Some(target.seq_end)
+        || !sequences
+            .windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+    {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn project_incident_evidence(events: &[TimelineEvent]) -> Vec<DisplayLine> {
+    let mut stream = TerminalStreamParser::new();
+    stream.set_echo_reconciliation(false);
+    let mut lines = Vec::new();
+    let mut pending = None;
+    for event in events {
+        if event.direction == Direction::Tx {
+            continue;
+        }
+        let batch = stream.push_event(event);
+        lines.extend(batch.completed);
+        pending = batch.pending;
+    }
+    lines.extend(pending);
+    lines
+}
+
+fn incident_evidence_snapshot(
+    detailed_timeline: bool,
+    target: &IncidentEvidenceTarget,
+    events: &[TimelineEvent],
+    width: u16,
+) -> Option<ScrollSnapshot> {
+    if width == 0 || !incident_evidence_is_complete(target, events) {
+        return None;
+    }
+    let source_width = detailed_source_width(width as usize);
+    let mut highlighted_rx = false;
+    let mut rows = Vec::new();
+    for entry in project_incident_evidence(events) {
+        let highlighted = entry.daemon_epoch == Some(target.daemon_epoch)
+            && entry.event_kind == EventKind::Rx
+            && entry.seq >= target.seq_start
+            && entry.seq <= target.seq_end;
+        highlighted_rx |= highlighted;
+        let line = timeline_line(
+            &entry,
+            detailed_timeline,
+            source_width,
+            None,
+            None,
+            width as usize,
+        );
+        if highlighted {
+            rows.extend(wrap_command_capture_line(line, width));
+        } else {
+            rows.extend(wrap_timeline_line(line, width));
+        }
+    }
+    (highlighted_rx && !rows.is_empty()).then_some(ScrollSnapshot { rows })
+}
+
+fn command_evidence_snapshot(
+    detailed_timeline: bool,
+    target: &CommandEvidenceTarget,
+    events: &[TimelineEvent],
+    width: u16,
+) -> Option<ScrollSnapshot> {
+    if width == 0 {
+        return None;
+    }
+    let completed_through = command_evidence_end_seq(target, events)?;
+    if !exact_evidence_is_complete(
+        &target.port,
+        target.daemon_epoch,
+        target.seq_start,
+        completed_through,
+        events,
+    ) {
+        return None;
+    }
+    if target.matchers.is_empty() {
+        return Some(ScrollSnapshot {
+            rows: wrap_command_fallback_line(&target.command, width),
+        });
+    }
+
+    let entries = project_incident_evidence(events);
+    let references = entries.iter().collect::<Vec<_>>();
+    let capture = command_capture_for_target(target, &references);
+    let (start, end) = capture.start.zip(capture.end)?;
+    if !capture.highlight_available || start > end {
+        return None;
+    }
+    let source_width = detailed_source_width(width as usize);
+    let mut rows = Vec::new();
+    for (index, entry) in entries.iter().enumerate().take(end + 1) {
+        let highlighted = index >= start
+            && entry.daemon_epoch == Some(target.daemon_epoch)
+            && entry.event_kind == EventKind::Rx;
+        let line = timeline_line(
+            entry,
+            detailed_timeline,
+            source_width,
+            None,
+            None,
+            width as usize,
+        );
+        if highlighted {
+            rows.extend(wrap_command_capture_line(line, width));
+        } else {
+            rows.extend(wrap_timeline_line(line, width));
+        }
+    }
+    (!rows.is_empty()).then_some(ScrollSnapshot { rows })
 }
 
 fn wrap_timeline_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
@@ -8018,6 +10223,10 @@ fn draw_queue(frame: &mut Frame<'_>, app: &App, area: Rect) {
 struct RunPanelRow {
     line: Line<'static>,
     command: Option<RunCommandKey>,
+    step: Option<usize>,
+    monitor: Option<Uuid>,
+    matcher: Option<usize>,
+    incident: Option<Uuid>,
 }
 
 fn run_status_text(status: RunStatus) -> &'static str {
@@ -8028,128 +10237,301 @@ fn run_status_text(status: RunStatus) -> &'static str {
     }
 }
 
-fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
+fn monitor_status_text(status: MonitorStatus) -> &'static str {
+    match status {
+        MonitorStatus::Running => tr("ui.monitor.status.running"),
+        MonitorStatus::Completed => tr("ui.monitor.status.completed"),
+        MonitorStatus::Stopped => tr("ui.monitor.status.stopped"),
+        MonitorStatus::Failed => tr("ui.monitor.status.failed"),
+    }
+}
+
+fn monitor_matcher_text(matcher: &MonitorMatcher) -> String {
+    match matcher {
+        MonitorMatcher::Contains(value) => {
+            trf("ui.monitor.matcher.contains", &[&safe_inline(value)])
+        }
+        MonitorMatcher::Regex(value) => trf("ui.monitor.matcher.regex", &[&safe_inline(value)]),
+    }
+}
+
+fn push_command_history_rows(
+    app: &App,
+    run: &RunHistoryEntry,
+    command: &RunCommandRecord,
+    width: u16,
+    rows: &mut Vec<RunPanelRow>,
+) {
     let view = app.current();
-    let selected = view.selected_run_command_key();
+    let key = RunCommandKey {
+        run_id: run.id,
+        first_seq: command.first_seq,
+    };
+    let is_selected = view.selected_run_command_key() == Some(key);
+    let expanded = view.expanded_run_command == Some(key);
+    let style = if is_selected && app.focus == PaneFocus::RunHistory {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if is_selected {
+        Style::default().fg(Color::LightCyan)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let marker = if is_selected { "▶" } else { " " };
+    let disclosure = if expanded { "▾" } else { "▸" };
+    let label = if run.label.trim().is_empty() {
+        tr("ui.run.unknown").to_string()
+    } else {
+        safe_inline(&run.label)
+    };
+    let run_label = trf("ui.run.header", &[run_status_text(run.status), &label]);
+    let description = command
+        .description
+        .as_deref()
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("ui.run.description.missing").into());
+    let title = format!("{run_label} · {description}");
     let available = width.saturating_sub(4).max(1);
-    let mut rows = Vec::new();
-    if view.run_history.is_empty() {
+    for (line_index, text) in wrap_queue_text(&title, available).into_iter().enumerate() {
         rows.push(RunPanelRow {
             line: Line::from(Span::styled(
-                tr("ui.run.none"),
-                Style::default().fg(Color::DarkGray),
+                if line_index == 0 {
+                    format!("{marker} {disclosure} {text}")
+                } else {
+                    format!("    {text}")
+                },
+                style,
             )),
-            command: None,
+            command: Some(key),
+            step: None,
+            monitor: None,
+            matcher: None,
+            incident: None,
         });
-        return rows;
     }
-    for run in view.run_history_chronological() {
-        let label = if run.label.trim().is_empty() {
-            tr("ui.run.unknown").to_string()
+    if !expanded {
+        return;
+    }
+    for (step_index, step) in command.steps.iter().enumerate() {
+        let mut payload = safe_inline(&String::from_utf8_lossy(&step.data));
+        if payload.is_empty() {
+            payload = tr("ui.run.command.empty").into();
+        }
+        if step.truncated {
+            payload.push('…');
+        }
+        let detail_width = usize::from(width);
+        let indentation = detail_width.saturating_sub(1).min(4);
+        let child_selected =
+            is_selected && command.steps.len() > 1 && view.selected_run_step == Some(step_index);
+        let first_prefix = if command.steps.len() > 1 {
+            format!(
+                "{}{} {}. ",
+                " ".repeat(indentation),
+                if child_selected { "▶" } else { " " },
+                step_index + 1
+            )
         } else {
-            safe_inline(&run.label)
+            " ".repeat(indentation)
+        };
+        let prefix_width = UnicodeWidthStr::width(first_prefix.as_str());
+        let continuation_prefix = " ".repeat(prefix_width);
+        let payload_width = detail_width
+            .saturating_sub(prefix_width)
+            .max(1)
+            .min(usize::from(u16::MAX)) as u16;
+        for (line_index, text) in wrap_queue_text(&payload, payload_width)
+            .into_iter()
+            .enumerate()
+        {
+            let detail_style = if child_selected && app.focus == PaneFocus::RunHistory {
+                Style::default().fg(Color::Black).bg(Color::LightCyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let line = if line_index == 0 {
+                Line::from(Span::styled(format!("{first_prefix}{text}"), detail_style))
+            } else {
+                Line::from(Span::styled(
+                    format!("{continuation_prefix}{text}"),
+                    detail_style,
+                ))
+            };
+            rows.push(RunPanelRow {
+                line,
+                command: Some(key),
+                step: Some(step_index),
+                monitor: None,
+                matcher: None,
+                incident: None,
+            });
+        }
+    }
+}
+
+fn push_monitor_history_rows(
+    app: &App,
+    entry: &MonitorHistoryEntry,
+    width: u16,
+    rows: &mut Vec<RunPanelRow>,
+) {
+    let view = app.current();
+    let available = width.saturating_sub(4).max(1);
+    let id = entry.monitor.id;
+    let is_selected = view.selected_monitor == Some(id);
+    let expanded = view.expanded_monitor == Some(id);
+    let description = entry
+        .monitor
+        .spec
+        .description
+        .as_deref()
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("ui.monitor.unnamed").into());
+    let style = if is_selected && app.focus == PaneFocus::RunHistory {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if is_selected {
+        Style::default().fg(Color::LightCyan)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    rows.push(RunPanelRow {
+        line: Line::from(Span::styled(
+            trf(
+                "ui.monitor.header",
+                &[
+                    if is_selected { "▶" } else { " " },
+                    if expanded { "▾" } else { "▸" },
+                    monitor_status_text(entry.monitor.status),
+                    &description,
+                    &entry.monitor.incident_count.to_string(),
+                ],
+            ),
+            style,
+        )),
+        command: None,
+        step: None,
+        monitor: Some(id),
+        matcher: None,
+        incident: None,
+    });
+    if !expanded {
+        return;
+    }
+    for (matcher_index, matcher) in entry.monitor.spec.matchers.iter().enumerate() {
+        let matcher_selected = is_selected
+            && view.selected_monitor_matcher == Some(matcher_index)
+            && view.selected_monitor_incident.is_none();
+        let matcher_style = if matcher_selected && app.focus == PaneFocus::RunHistory {
+            Style::default().fg(Color::Black).bg(Color::LightCyan)
+        } else {
+            Style::default().fg(Color::Gray)
         };
         rows.push(RunPanelRow {
             line: Line::from(Span::styled(
-                trf("ui.run.header", &[run_status_text(run.status), &label]),
-                Style::default()
-                    .fg(match run.status {
-                        RunStatus::Active => Color::LightBlue,
-                        RunStatus::Completed => Color::LightGreen,
-                        RunStatus::Aborted => Color::LightRed,
-                    })
-                    .add_modifier(Modifier::BOLD),
+                format!(
+                    "    {} {}. {}",
+                    if matcher_selected { "▶" } else { " " },
+                    matcher_index + 1,
+                    monitor_matcher_text(matcher)
+                ),
+                matcher_style,
             )),
             command: None,
+            step: None,
+            monitor: Some(id),
+            matcher: Some(matcher_index),
+            incident: None,
         });
-
-        for command in &run.commands {
-            let key = RunCommandKey {
-                run_id: run.id,
-                first_seq: command.first_seq,
-            };
-            let is_selected = selected == Some(key);
-            let expanded = view.expanded_run_command == Some(key);
-            let style = if is_selected && app.focus == PaneFocus::RunHistory {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_selected {
-                Style::default().fg(Color::LightCyan)
+        if view.selected_monitor_matcher != Some(matcher_index)
+            || view.selected_monitor_incident.is_none()
+        {
+            continue;
+        }
+        for incident in entry.incidents.iter().filter(|incident| {
+            incident
+                .matches
+                .iter()
+                .any(|item| item.index == matcher_index)
+        }) {
+            let incident_selected = view.selected_monitor_incident == Some(incident.id);
+            let incident_style = if incident_selected && app.focus == PaneFocus::RunHistory {
+                Style::default().fg(Color::Black).bg(Color::LightCyan)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::DarkGray)
             };
-            let marker = if is_selected { "▶" } else { " " };
-            let disclosure = if expanded { "▾" } else { "▸" };
-            let description = command
-                .description
-                .as_deref()
-                .map(safe_inline)
-                .unwrap_or_else(|| tr("ui.run.description.missing").into());
-            for (line_index, text) in wrap_queue_text(&description, available)
+            let preview = safe_inline(&incident.preview);
+            for (line_index, text) in wrap_queue_text(&preview, available.saturating_sub(4))
                 .into_iter()
                 .enumerate()
             {
                 rows.push(RunPanelRow {
                     line: Line::from(Span::styled(
                         if line_index == 0 {
-                            format!("{marker} {disclosure} {text}")
+                            format!(
+                                "        {} #{} {text}",
+                                if incident_selected { "▶" } else { " " },
+                                incident.incident_seq
+                            )
                         } else {
-                            format!("    {text}")
+                            format!("          {text}")
                         },
-                        style,
+                        incident_style,
                     )),
-                    command: Some(key),
+                    command: None,
+                    step: None,
+                    monitor: Some(id),
+                    matcher: Some(matcher_index),
+                    incident: Some(incident.id),
                 });
             }
+        }
+    }
+}
 
-            if !expanded {
-                continue;
+fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
+    let view = app.current();
+    let actions = view.history_action_keys();
+    if actions.is_empty() {
+        return vec![RunPanelRow {
+            line: Line::from(Span::styled(
+                tr("ui.run.none"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            command: None,
+            step: None,
+            monitor: None,
+            matcher: None,
+            incident: None,
+        }];
+    }
+    let mut rows = Vec::new();
+    for action in actions {
+        match action {
+            HistoryActionKey::Command(key) => {
+                let Some(run) = view.run_history.iter().find(|run| run.id == key.run_id) else {
+                    continue;
+                };
+                let Some(command) = run
+                    .commands
+                    .iter()
+                    .find(|command| command.first_seq == key.first_seq)
+                else {
+                    continue;
+                };
+                push_command_history_rows(app, run, command, width, &mut rows);
             }
-            for step in &command.steps {
-                let mut payload = safe_inline(&String::from_utf8_lossy(&step.data));
-                if payload.is_empty() {
-                    payload = tr("ui.run.command.empty").into();
-                }
-                if step.truncated {
-                    payload.push('…');
-                }
-                let detail_width = usize::from(width);
-                let indentation = detail_width.saturating_sub(1).min(4);
-                let first_prefix = " ".repeat(indentation);
-                let prefix_width = UnicodeWidthStr::width(first_prefix.as_str());
-                let continuation_prefix = " ".repeat(prefix_width);
-                let payload_width = detail_width
-                    .saturating_sub(prefix_width)
-                    .max(1)
-                    .min(usize::from(u16::MAX)) as u16;
-                for (line_index, text) in wrap_queue_text(&payload, payload_width)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let line = if line_index == 0 {
-                        Line::from(Span::styled(
-                            format!("{first_prefix}{text}"),
-                            Style::default().fg(Color::Gray),
-                        ))
-                    } else {
-                        Line::from(Span::styled(
-                            format!("{continuation_prefix}{text}"),
-                            Style::default().fg(Color::Gray),
-                        ))
-                    };
-                    rows.push(RunPanelRow {
-                        line,
-                        command: Some(key),
-                    });
-                }
+            HistoryActionKey::Monitor(id) => {
+                let Some(entry) = view.monitor(id) else {
+                    continue;
+                };
+                push_monitor_history_rows(app, entry, width, &mut rows);
             }
         }
-        rows.push(RunPanelRow {
-            line: Line::default(),
-            command: None,
-        });
     }
     rows
 }
@@ -8184,10 +10566,33 @@ fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect, framed: bool) 
         return;
     }
     let height = inner.height as usize;
-    let selected = app.current().selected_run_command_key();
-    let selected_row = selected
-        .and_then(|selected| rows.iter().position(|row| row.command == Some(selected)))
-        .unwrap_or(0);
+    let selected_row = if let Some(monitor) = app.current().selected_monitor {
+        rows.iter()
+            .position(|row| {
+                row.monitor == Some(monitor)
+                    && match app.current().selected_monitor_incident {
+                        Some(incident) => row.incident == Some(incident),
+                        None => match app.current().selected_monitor_matcher {
+                            Some(matcher) => row.matcher == Some(matcher) && row.incident.is_none(),
+                            None => row.matcher.is_none() && row.incident.is_none(),
+                        },
+                    }
+            })
+            .unwrap_or(0)
+    } else {
+        app.current()
+            .selected_run_command_key()
+            .and_then(|selected| {
+                rows.iter().position(|row| {
+                    row.command == Some(selected)
+                        && match app.current().selected_run_step {
+                            Some(step) => row.step == Some(step),
+                            None => row.step.is_none(),
+                        }
+                })
+            })
+            .unwrap_or(0)
+    };
     let max_start = rows.len().saturating_sub(height);
     let start = selected_row
         .saturating_sub(2)
@@ -8488,68 +10893,48 @@ fn help_heading(key: &'static str) -> Line<'static> {
     ))
 }
 
-fn help_item(key: &'static str) -> Line<'static> {
-    Line::from(Span::styled(tr(key), Style::default().fg(Color::White)))
+fn help_shortcut(key: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            pad_display(tr(key), 28),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(tr(description), Style::default().fg(Color::White)),
+    ])
 }
 
 /// Builds explicit visual rows instead of joining one large string and
 /// relying on Paragraph wrapping. Every shortcut remains a distinct row;
 /// section gaps are preserved and the popup can scroll on narrow terminals.
-fn help_lines(app: &App) -> Vec<Line<'static>> {
-    let mouse_key = if app.mouse_capture {
-        "help.wheel"
-    } else {
-        "help.selection"
-    };
-    let idle_seconds = app.human_idle_release.as_secs().to_string();
+fn help_lines(_app: &App) -> Vec<Line<'static>> {
     vec![
         help_heading("help.group.navigation"),
-        help_item("help.switch"),
-        help_item("help.next"),
-        help_item("help.mode"),
-        help_item("help.view"),
-        help_item("help.lang"),
-        help_item("help.scroll"),
-        help_item(mouse_key),
-        help_item("help.mouse.paste"),
-        help_item("help.menu"),
-        help_item("help.profile"),
-        help_item("help.run.history"),
-        help_item("help.run.keys"),
-        Line::default(),
-        help_heading("help.group.control"),
-        help_item("help.takeover"),
-        help_item("help.cooperative"),
-        help_item("help.release"),
-        Line::default(),
-        help_heading("help.group.queue"),
-        help_item("help.queue.behavior"),
-        help_item("help.queue.select"),
-        help_item("help.queue.delete"),
-        help_item("help.queue.edit"),
-        help_item("help.paste"),
+        help_shortcut("help.key.switch", "help.desc.switch"),
+        help_shortcut("help.key.history.select", "help.desc.history.select"),
+        help_shortcut("help.key.history.expand", "help.desc.history.expand"),
+        help_shortcut("help.key.history.panel", "help.desc.history.panel"),
+        help_shortcut("help.key.scroll", "help.desc.scroll"),
+        help_shortcut("help.key.follow", "help.desc.follow"),
+        help_shortcut("help.key.menu", "help.desc.menu"),
+        help_shortcut("help.key.profile", "help.desc.profile"),
+        help_shortcut("help.key.search.output", "help.desc.search.output"),
         Line::default(),
         help_heading("help.group.line"),
-        help_item("help.line1"),
-        help_item("help.line2"),
-        help_item("help.line3"),
-        help_item("help.search.scope"),
-        help_item("help.output.search"),
-        help_item("help.follow"),
-        help_item("help.echo"),
+        help_shortcut("help.key.enter", "help.desc.enter"),
+        help_shortcut("help.key.alt.enter", "help.desc.alt.enter"),
+        help_shortcut("help.key.input.search", "help.desc.input.search"),
+        help_shortcut("help.key.complete", "help.desc.complete"),
+        help_shortcut("help.key.paste", "help.desc.paste"),
         Line::default(),
-        help_heading("help.group.raw"),
-        help_item("help.raw1"),
-        help_item("help.raw2"),
-        help_item("help.byte"),
-        help_item("help.interrupt"),
-        Line::default(),
-        help_heading("help.group.safety"),
-        Line::from(tr("help.paste.note")),
-        Line::from(trf("help.expire", &[&idle_seconds])),
-        Line::from(tr("help.replay")),
-        Line::from(tr("help.uncertain")),
-        help_item("help.quit"),
+        help_heading("help.group.control"),
+        help_shortcut("help.key.takeover", "help.desc.takeover"),
+        help_shortcut("help.key.release", "help.desc.release"),
+        help_shortcut("help.key.mode", "help.desc.mode"),
+        help_shortcut("help.key.interrupt", "help.desc.interrupt"),
+        help_shortcut("help.key.lang", "help.desc.lang"),
+        help_shortcut("help.key.quit", "help.desc.quit"),
         Line::default(),
         Line::from(Span::styled(
             tr("help.close"),
@@ -8572,8 +10957,6 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
@@ -8595,7 +10978,15 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
         .as_deref()
         .map(safe_inline)
         .unwrap_or_else(|| tr("menu.value.generic").into());
-    let header = trf("menu.current", &[&port, &transport, &model]);
+    let model_name = app
+        .current()
+        .snapshot
+        .config
+        .model_name
+        .as_deref()
+        .map(safe_inline)
+        .unwrap_or_else(|| tr("menu.value.unbound").into());
+    let header = trf("menu.current", &[&port, &transport, &model, &model_name]);
     frame.render_widget(
         Paragraph::new(header).style(Style::default().fg(Color::LightCyan)),
         chunks[0],
@@ -8623,35 +11014,16 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
         chunks[1],
     );
     frame.render_widget(
-        Paragraph::new(menu_detail(app, menu))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Gray)),
-        chunks[2],
-    );
-    frame.render_widget(
-        Paragraph::new(if menu.busy {
-            format!("◐ {}", menu.message)
-        } else {
-            menu.message.clone()
-        })
-        .style(if menu.busy {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
-        chunks[3],
-    );
-    frame.render_widget(
         Paragraph::new(menu_footer(menu.page))
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[4],
+        chunks[2],
     );
 
     if let Some(confirmation) = menu.confirmation.as_ref() {
         draw_menu_confirmation(frame, confirmation, popup);
-    } else if let Some(prompt) = menu.prompt.as_ref() {
-        draw_menu_prompt(frame, prompt, popup, app.software_cursor_visible);
+    } else if let Some(help) = menu.field_help.as_ref() {
+        draw_menu_field_help(frame, help, popup);
     }
 }
 
@@ -8695,23 +11067,20 @@ fn draw_menu_confirmation(frame: &mut Frame<'_>, confirmation: &MenuConfirmation
     );
 }
 
-fn draw_menu_prompt(
-    frame: &mut Frame<'_>,
-    prompt: &MenuPrompt,
-    parent: Rect,
-    cursor_visible: bool,
-) {
-    let width = parent.width.saturating_sub(6).clamp(1, 76);
-    let popup = centered_rect(width, 5.min(parent.height).max(1), parent);
+fn draw_menu_field_help(frame: &mut Frame<'_>, help: &str, parent: Rect) {
+    let width = parent.width.saturating_sub(8).clamp(1, 72);
+    let popup = centered_rect(width, 7.min(parent.height).max(1), parent);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", prompt.title))
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(popup);
-    let (text, cursor) = line_input_projection(&prompt.value, prompt.cursor, inner.width);
+        .title(format!(" {} ", tr("menu.field.help.title")))
+        .border_style(Style::default().fg(Color::Cyan));
     frame.render_widget(
-        Paragraph::new(line_with_software_cursor(text, cursor, cursor_visible)).block(block),
+        Paragraph::new(help.to_owned())
+            .wrap(Wrap { trim: false })
+            .block(block.title_bottom(
+                Line::from(tr("menu.field.help.close")).alignment(Alignment::Center),
+            )),
         popup,
     );
 }
@@ -8720,20 +11089,20 @@ fn menu_page_title(page: MenuPage) -> &'static str {
     match page {
         MenuPage::Root => tr("menu.title"),
         MenuPage::Profiles => tr("menu.profile.title"),
-        MenuPage::TransportProfiles => tr("menu.transport.title"),
-        MenuPage::ModelProfiles => tr("menu.device.title"),
-        MenuPage::SerialSettings => tr("menu.serial.title"),
+        MenuPage::CreateProfiles => tr("menu.create.title"),
+        MenuPage::CreateTransportProfile => tr("menu.create.transport.title"),
+        MenuPage::CreateModelProfile => tr("menu.create.model.title"),
+        MenuPage::Settings => tr("menu.settings.title"),
+        MenuPage::ModelFamilies => tr("menu.model.family.title"),
+        MenuPage::ModelNames => tr("menu.model.name.title"),
         MenuPage::DisplaySettings => tr("menu.display.title"),
-        MenuPage::RunSettings => tr("menu.run.title"),
+        MenuPage::McpSettings => tr("menu.mcp.title"),
         MenuPage::Help => tr("menu.help.title"),
     }
 }
 
 fn menu_footer(page: MenuPage) -> &'static str {
     match page {
-        MenuPage::Profiles => tr("menu.footer.current"),
-        MenuPage::DisplaySettings => tr("menu.footer.display"),
-        MenuPage::RunSettings => tr("menu.footer.run"),
         MenuPage::Help => tr("menu.footer.help"),
         _ => tr("menu.footer"),
     }
@@ -8857,13 +11226,163 @@ fn orphan_run_timeout_label(seconds: u64) -> String {
     }
 }
 
+fn baud_rate_options(current: u32) -> Vec<u32> {
+    let mut values = vec![
+        9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600,
+    ];
+    values.push(current);
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn data_bits_options() -> Vec<MenuChoiceOption> {
+    [
+        DataBits::Five,
+        DataBits::Six,
+        DataBits::Seven,
+        DataBits::Eight,
+    ]
+    .into_iter()
+    .map(|value| MenuChoiceOption {
+        label: data_bits_label(value).into(),
+        value: MenuChoiceValue::DataBits(value),
+    })
+    .collect()
+}
+
+fn data_bits_index(value: DataBits) -> usize {
+    match value {
+        DataBits::Five => 0,
+        DataBits::Six => 1,
+        DataBits::Seven => 2,
+        DataBits::Eight => 3,
+    }
+}
+
+fn parity_options() -> Vec<MenuChoiceOption> {
+    [Parity::None, Parity::Even, Parity::Odd]
+        .into_iter()
+        .map(|value| MenuChoiceOption {
+            label: parity_label(value).into(),
+            value: MenuChoiceValue::Parity(value),
+        })
+        .collect()
+}
+
+fn parity_index(value: Parity) -> usize {
+    match value {
+        Parity::None => 0,
+        Parity::Even => 1,
+        Parity::Odd => 2,
+    }
+}
+
+fn stop_bits_options() -> Vec<MenuChoiceOption> {
+    [StopBits::One, StopBits::Two]
+        .into_iter()
+        .map(|value| MenuChoiceOption {
+            label: stop_bits_label(value).into(),
+            value: MenuChoiceValue::StopBits(value),
+        })
+        .collect()
+}
+
+fn stop_bits_index(value: StopBits) -> usize {
+    match value {
+        StopBits::One => 0,
+        StopBits::Two => 1,
+    }
+}
+
+fn flow_control_options() -> Vec<MenuChoiceOption> {
+    [
+        FlowControl::None,
+        FlowControl::Software,
+        FlowControl::Hardware,
+    ]
+    .into_iter()
+    .map(|value| MenuChoiceOption {
+        label: flow_control_label(value).into(),
+        value: MenuChoiceValue::FlowControl(value),
+    })
+    .collect()
+}
+
+fn flow_control_index(value: FlowControl) -> usize {
+    match value {
+        FlowControl::None => 0,
+        FlowControl::Software => 1,
+        FlowControl::Hardware => 2,
+    }
+}
+
+fn bool_options() -> Vec<MenuChoiceOption> {
+    [false, true]
+        .into_iter()
+        .map(|value| MenuChoiceOption {
+            label: on_off(value).into(),
+            value: MenuChoiceValue::Bool(value),
+        })
+        .collect()
+}
+
+fn eol_options() -> Vec<MenuChoiceOption> {
+    [
+        (tr("menu.detail.eol.inherit").into(), None),
+        ("CR".into(), Some("\r".into())),
+        ("LF".into(), Some("\n".into())),
+        ("CRLF".into(), Some("\r\n".into())),
+        (tr("menu.detail.eol.none").into(), Some(String::new())),
+    ]
+    .into_iter()
+    .map(|(label, value)| MenuChoiceOption {
+        label,
+        value: MenuChoiceValue::Eol(value),
+    })
+    .collect()
+}
+
+fn eol_index(value: Option<&str>) -> usize {
+    match value {
+        None => 0,
+        Some("\r") => 1,
+        Some("\n") => 2,
+        Some("\r\n") => 3,
+        Some(_) => 4,
+    }
+}
+
+fn echo_options() -> Vec<MenuChoiceOption> {
+    [
+        (tr("menu.detail.eol.inherit"), None),
+        (tr("menu.detail.echo.on"), Some(EchoMode::On)),
+        (tr("menu.detail.echo.off"), Some(EchoMode::Off)),
+        (tr("menu.detail.echo.auto"), Some(EchoMode::Auto)),
+    ]
+    .into_iter()
+    .map(|(label, value)| MenuChoiceOption {
+        label: label.into(),
+        value: MenuChoiceValue::Echo(value),
+    })
+    .collect()
+}
+
+fn echo_index(value: Option<EchoMode>) -> usize {
+    match value {
+        None => 0,
+        Some(EchoMode::On) => 1,
+        Some(EchoMode::Off) => 2,
+        Some(EchoMode::Auto) => 3,
+    }
+}
+
 fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
-    match menu.page {
+    let mut rows = match menu.page {
         MenuPage::Root => [
             tr("menu.root.profile"),
-            tr("menu.root.serial"),
-            tr("menu.root.display"),
-            tr("menu.root.run"),
+            tr("menu.root.create"),
+            tr("menu.root.settings"),
             tr("menu.root.help"),
         ]
         .into_iter()
@@ -8874,14 +11393,16 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
             let Some(editor) = menu.profile_editor.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let changed = editor.port_update().is_some()
-                || editor.transport_update().is_some()
-                || editor.device_update().is_some();
+            let changed = editor.changed();
             let values = [
                 trf("menu.current.row.port", &[&safe_inline(&editor.port)]),
                 trf(
                     "menu.current.row.transport",
-                    &[&safe_inline(&editor.transport.name)],
+                    &[&editor
+                        .transport_binding
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
                 ),
                 trf(
                     "menu.current.row.baud",
@@ -8912,10 +11433,18 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                 trf(
                     "menu.current.row.device",
                     &[&editor
-                        .original_device
-                        .as_ref()
-                        .map(|profile| safe_inline(&profile.name))
-                        .unwrap_or_else(|| tr("menu.value.generic").into())],
+                        .model_profile_binding
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
+                ),
+                trf(
+                    "menu.current.row.model.name",
+                    &[&editor
+                        .model_name
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
                 ),
                 trf(
                     "menu.current.row.eol",
@@ -8948,7 +11477,7 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                     tr("menu.current.row.apply.clean").into()
                 },
             ];
-            let mut rows = Vec::with_capacity(values.len() + 2);
+            let mut rows = Vec::with_capacity(values.len() + 4);
             rows.push(menu_section_heading("menu.current.section.serial"));
             rows.extend(
                 values[..10]
@@ -8959,7 +11488,7 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
             );
             rows.push(menu_section_heading("menu.current.section.model"));
             rows.extend(
-                values[10..]
+                values[10..18]
                     .iter()
                     .cloned()
                     .enumerate()
@@ -8968,65 +11497,130 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                         indented_menu_line(index, menu.selected, text)
                     }),
             );
+            rows.push(Line::default());
+            rows.push(menu_section_heading("menu.current.section.actions"));
+            rows.push(indented_menu_line(18, menu.selected, values[18].clone()));
             rows
         }
-        MenuPage::TransportProfiles => {
-            let Some(catalog) = menu.catalog.as_ref() else {
+        MenuPage::CreateProfiles => [tr("menu.create.transport"), tr("menu.create.model")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
+            .collect(),
+        MenuPage::CreateTransportProfile => {
+            let Some(profile) = menu.create_transport.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let current = app.current().snapshot.config.transport_profile.as_deref();
-            catalog
-                .transport_profiles
-                .iter()
-                .map(|profile| {
-                    format!(
-                        "{}{}",
-                        if current == Some(profile.name.as_str()) {
-                            "✓ "
-                        } else {
-                            "  "
-                        },
-                        safe_inline(&profile.name)
-                    )
-                })
-                .chain(std::iter::once(tr("menu.transport.new").into()))
+            let values = [
+                trf("menu.create.row.name", &[&safe_inline(&profile.name)]),
+                trf("menu.current.row.baud", &[&profile.baud_rate.to_string()]),
+                trf(
+                    "menu.current.row.data",
+                    &[data_bits_label(profile.data_bits)],
+                ),
+                trf("menu.current.row.parity", &[parity_label(profile.parity)]),
+                trf(
+                    "menu.current.row.stop",
+                    &[stop_bits_label(profile.stop_bits)],
+                ),
+                trf(
+                    "menu.current.row.flow",
+                    &[flow_control_label(profile.flow_control)],
+                ),
+                trf("menu.current.row.dtr", &[on_off(profile.dtr)]),
+                trf("menu.current.row.rts", &[on_off(profile.rts)]),
+                trf(
+                    "menu.current.row.auto",
+                    &[enabled_disabled(profile.auto_open)],
+                ),
+                tr("menu.create.row.save").into(),
+            ];
+            values
+                .into_iter()
                 .enumerate()
                 .map(|(index, text)| selected_menu_line(index, menu.selected, text))
                 .collect()
         }
-        MenuPage::ModelProfiles => {
-            let Some(catalog) = menu.catalog.as_ref() else {
+        MenuPage::CreateModelProfile => {
+            let Some(profile) = menu.create_model.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let current = app.current().snapshot.config.model_profile.as_deref();
-            std::iter::once(format!(
-                "{}{}",
-                if current.is_none() { "✓ " } else { "  " },
-                tr("menu.device.generic")
-            ))
-            .chain(catalog.model_profiles.iter().map(|profile| {
-                format!(
-                    "{}{}",
-                    if current == Some(profile.name.as_str()) {
-                        "✓ "
-                    } else {
-                        "  "
-                    },
-                    safe_inline(&profile.name)
-                )
-            }))
-            .chain(std::iter::once(tr("menu.device.new").into()))
-            .chain(MODEL_PRESETS.iter().map(|preset| preset.label().into()))
-            .enumerate()
-            .map(|(index, text)| selected_menu_line(index, menu.selected, text))
-            .collect()
+            let values = [
+                trf("menu.create.row.name", &[&safe_inline(&profile.name)]),
+                trf(
+                    "menu.create.row.model.names",
+                    &[&safe_inline(&profile.model_names.join(", "))],
+                ),
+                trf(
+                    "menu.current.row.eol",
+                    &[&eol_label(profile.write_eol.as_deref())],
+                ),
+                trf("menu.current.row.echo", &[echo_label(profile.echo)]),
+                trf(
+                    "menu.current.row.shell",
+                    &[&optional_profile_value(profile.shell_prompt.as_deref())],
+                ),
+                trf(
+                    "menu.current.row.uboot",
+                    &[&optional_profile_value(profile.uboot_prompt.as_deref())],
+                ),
+                trf(
+                    "menu.current.row.chunk",
+                    &[&optional_number(profile.write_chunk_size)],
+                ),
+                trf(
+                    "menu.current.row.delay",
+                    &[&optional_number(profile.write_chunk_delay_ms)],
+                ),
+                tr("menu.create.row.save").into(),
+            ];
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| selected_menu_line(index, menu.selected, text))
+                .collect()
         }
-        MenuPage::SerialSettings => TRANSPORT_PRESETS
-            .iter()
-            .copied()
+        MenuPage::Settings => [tr("menu.root.display"), tr("menu.root.mcp")]
+            .into_iter()
             .enumerate()
-            .map(|(index, preset)| selected_menu_line(index, menu.selected, preset.label()))
+            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
             .collect(),
+        MenuPage::ModelFamilies => menu
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .model_profiles
+                    .iter()
+                    .filter(|profile| !profile.model_names.is_empty())
+                    .enumerate()
+                    .map(|(index, profile)| {
+                        selected_menu_line(index, menu.selected, safe_inline(&profile.name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![Line::from(tr("menu.loading"))]),
+        MenuPage::ModelNames => menu
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                let family = menu.model_family.as_deref()?;
+                catalog
+                    .model_profiles
+                    .iter()
+                    .find(|profile| profile.name == family)
+            })
+            .map(|profile| {
+                profile
+                    .model_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        selected_menu_line(index, menu.selected, safe_inline(name))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![Line::from(tr("menu.loading"))]),
         MenuPage::DisplaySettings => vec![selected_menu_line(
             0,
             menu.selected,
@@ -9035,7 +11629,7 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                 &[&app.agent_history_rows.to_string()],
             ),
         )],
-        MenuPage::RunSettings => vec![selected_menu_line(
+        MenuPage::McpSettings => vec![selected_menu_line(
             0,
             menu.selected,
             trf(
@@ -9043,201 +11637,98 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                 &[&orphan_run_timeout_label(app.orphan_run_timeout_seconds)],
             ),
         )],
-        MenuPage::Help => menu_help_lines()
-            .into_iter()
-            .map(|line| match line {
-                Some((text, true)) => Line::from(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Some((text, false)) => {
-                    Line::from(Span::styled(text, Style::default().fg(Color::White)))
-                }
-                None => Line::default(),
-            })
-            .collect(),
+        MenuPage::Help => help_lines(app),
+    };
+
+    if let Some(anchor) = menu_selected_visual_row_base(menu) {
+        if let Some(choice) = menu.choice.as_ref() {
+            let insert_at = (anchor + 1).min(rows.len());
+            let options = choice
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let active = index == choice.selected;
+                    Line::from(Span::styled(
+                        format!("      {} {}", if active { "▶" } else { " " }, option.label),
+                        if active {
+                            Style::default().fg(Color::Black).bg(Color::LightCyan)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            rows.splice(insert_at..insert_at, options);
+        } else if let Some(prompt) = menu.prompt.as_ref() {
+            let insert_at = (anchor + 1).min(rows.len());
+            rows.insert(
+                insert_at,
+                inline_menu_prompt_line(prompt, app.software_cursor_visible),
+            );
+        }
     }
+    rows
 }
 
 fn menu_selected_visual_row(menu: &MenuState) -> Option<usize> {
-    (menu.page != MenuPage::Help && menu_item_count(menu) > 0).then(|| {
-        if menu.page == MenuPage::Profiles {
-            menu.selected + if menu.selected < 10 { 1 } else { 2 }
-        } else {
-            menu.selected
-        }
-    })
-}
-
-fn menu_detail(app: &App, menu: &MenuState) -> String {
-    match menu.page {
-        MenuPage::TransportProfiles => menu
-            .catalog
-            .as_ref()
-            .and_then(|catalog| catalog.transport_profiles.get(menu.selected))
-            .map_or_else(
-                || tr("menu.transport.new.detail").into(),
-                transport_profile_detail,
-            ),
-        MenuPage::ModelProfiles => {
-            if menu.selected == 0 {
-                tr("menu.device.generic.detail").into()
-            } else {
-                menu.catalog
-                    .as_ref()
-                    .and_then(|catalog| catalog.model_profiles.get(menu.selected - 1))
-                    .map_or_else(
-                        || tr("menu.device.clone.detail").into(),
-                        model_profile_detail,
-                    )
-            }
-        }
-        MenuPage::Profiles => match CurrentProfileRow::from_index(menu.selected) {
-            Some(CurrentProfileRow::Apply) => tr("menu.current.apply.detail").into(),
-            _ => tr("menu.current.detail").into(),
-        },
-        MenuPage::SerialSettings => {
-            let Some(catalog) = menu.catalog.as_ref() else {
-                return tr("menu.loading").into();
-            };
-            trf(
-                "menu.serial.current",
-                &[&transport_profile_detail(&current_transport_template(
-                    app.current(),
-                    catalog,
-                ))],
-            )
-        }
-        MenuPage::DisplaySettings => trf(
-            "menu.display.detail",
-            &[&app.agent_history_rows.to_string()],
-        ),
-        MenuPage::RunSettings => trf(
-            "menu.run.detail",
-            &[
-                &orphan_run_timeout_label(app.orphan_run_timeout_seconds),
-                &orphan_run_timeout_label(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS),
-            ],
-        ),
-        MenuPage::Help => String::new(),
-        _ => tr("menu.root.detail").into(),
+    let base = menu_selected_visual_row_base(menu)?;
+    if let Some(choice) = menu.choice.as_ref() {
+        Some(base + 1 + choice.selected)
+    } else if menu.prompt.is_some() {
+        Some(base + 1)
+    } else {
+        Some(base)
     }
 }
 
-fn transport_profile_detail(profile: &TransportProfile) -> String {
-    let data_bits = match profile.data_bits {
-        DataBits::Five => "5",
-        DataBits::Six => "6",
-        DataBits::Seven => "7",
-        DataBits::Eight => "8",
-    };
-    let stop_bits = match profile.stop_bits {
-        StopBits::One => "1",
-        StopBits::Two => "2",
-    };
-    let parity = match profile.parity {
-        Parity::None => tr("menu.detail.parity.none"),
-        Parity::Odd => tr("menu.detail.parity.odd"),
-        Parity::Even => tr("menu.detail.parity.even"),
-    };
-    let flow = match profile.flow_control {
-        FlowControl::None => tr("menu.detail.flow.none"),
-        FlowControl::Software => tr("menu.detail.flow.software"),
-        FlowControl::Hardware => tr("menu.detail.flow.hardware"),
-    };
-    let baud = trf("menu.detail.baud", &[&profile.baud_rate.to_string()]);
-    let data_bits = trf("menu.detail.data_bits", &[data_bits]);
-    let stop_bits = trf("menu.detail.stop_bits", &[stop_bits]);
-    trf(
-        "menu.detail.transport",
-        &[
-            &baud,
-            &data_bits,
-            parity,
-            &stop_bits,
-            flow,
-            if profile.dtr {
-                tr("menu.value.on")
-            } else {
-                tr("menu.value.off")
-            },
-            if profile.rts {
-                tr("menu.value.on")
-            } else {
-                tr("menu.value.off")
-            },
-            if profile.auto_open {
-                tr("menu.value.enabled")
-            } else {
-                tr("menu.value.disabled")
-            },
-        ],
+fn menu_selected_visual_row_base(menu: &MenuState) -> Option<usize> {
+    (menu.page != MenuPage::Help && menu_item_count(menu) > 0).then(|| match menu.page {
+        MenuPage::Profiles if menu.selected < 10 => menu.selected + 1,
+        MenuPage::Profiles if menu.selected < 18 => menu.selected + 2,
+        MenuPage::Profiles => menu.selected + 4,
+        _ => menu.selected,
+    })
+}
+
+fn inline_menu_prompt_line(prompt: &MenuPrompt, cursor_visible: bool) -> Line<'static> {
+    let value = prompt.value.iter().collect::<String>();
+    let before = prompt.value[..prompt.cursor.min(prompt.value.len())]
+        .iter()
+        .collect::<String>();
+    let prefix = format!("      {}: ", prompt.title);
+    let cursor = UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(before.as_str());
+    line_with_software_cursor(
+        format!("{prefix}{value} "),
+        cursor.min(u16::MAX as usize) as u16,
+        cursor_visible,
     )
 }
 
-fn model_profile_detail(profile: &ModelProfile) -> String {
-    let unset = tr("menu.value.unbound");
-    let shell = trf(
-        "menu.detail.prompt.shell",
-        &[&safe_inline(
-            profile.shell_prompt.as_deref().unwrap_or(unset),
-        )],
-    );
-    let uboot = trf(
-        "menu.detail.prompt.uboot",
-        &[&safe_inline(
-            profile.uboot_prompt.as_deref().unwrap_or(unset),
-        )],
-    );
-    let eol_value = match profile.write_eol.as_deref() {
-        Some("\r") => "CR",
-        Some("\n") => "LF",
-        Some("\r\n") => "CRLF",
-        Some("") => tr("menu.detail.eol.none"),
-        Some(_) => tr("menu.detail.eol.custom"),
-        None => tr("menu.detail.eol.inherit"),
-    };
-    let eol = trf("menu.detail.eol", &[eol_value]);
-    let echo = match profile.echo {
-        Some(EchoMode::On) => tr("menu.detail.echo.on"),
-        Some(EchoMode::Off) => tr("menu.detail.echo.off"),
-        Some(EchoMode::Auto) => tr("menu.detail.echo.auto"),
-        None => tr("menu.detail.eol.inherit"),
-    };
-    let chunk_size = profile.write_chunk_size.map_or_else(
-        || tr("menu.detail.eol.inherit").into(),
-        |value| value.to_string(),
-    );
-    let delay = profile.write_chunk_delay_ms.map_or_else(
-        || tr("menu.detail.eol.inherit").into(),
-        |value| value.to_string(),
-    );
-    let pacing = trf("menu.detail.pacing", &[&chunk_size, &delay]);
-    trf("menu.detail.device", &[&shell, &uboot, &eol, echo, &pacing])
-}
-
-fn menu_help_lines() -> Vec<Option<(&'static str, bool)>> {
-    vec![
-        Some((tr("help.group.navigation"), true)),
-        Some((tr("menu.help.menu"), false)),
-        Some((tr("help.profile"), false)),
-        Some((tr("help.run.history"), false)),
-        Some((tr("help.run.keys"), false)),
-        None,
-        Some((tr("help.group.control"), true)),
-        Some((tr("menu.help.enter"), false)),
-        Some((tr("menu.help.cooperative"), false)),
-        Some((tr("menu.help.takeover"), false)),
-        None,
-        Some((tr("help.group.queue"), true)),
-        Some((tr("menu.help.queue"), false)),
-        None,
-        Some((tr("help.group.safety"), true)),
-        Some((tr("menu.help.echo"), false)),
-        Some((tr("menu.help.model"), false)),
-    ]
+fn menu_field_help(_app: &App, menu: &MenuState) -> String {
+    match menu.page {
+        MenuPage::Profiles => match CurrentProfileRow::from_index(menu.selected) {
+            Some(CurrentProfileRow::Port) => tr("menu.help.field.port"),
+            Some(CurrentProfileRow::TransportProfile) => tr("menu.help.field.transport"),
+            Some(CurrentProfileRow::ModelProfile) => tr("menu.help.field.model.profile"),
+            Some(CurrentProfileRow::ModelName) => tr("menu.help.field.model.name"),
+            Some(CurrentProfileRow::ShellPrompt) => tr("menu.help.field.shell"),
+            Some(CurrentProfileRow::UbootPrompt) => tr("menu.help.field.uboot"),
+            Some(CurrentProfileRow::ChunkSize | CurrentProfileRow::ChunkDelay) => {
+                tr("menu.help.field.pacing")
+            }
+            Some(CurrentProfileRow::Apply) => tr("menu.help.field.apply"),
+            _ => tr("menu.help.field.serial"),
+        },
+        MenuPage::CreateProfiles
+        | MenuPage::CreateTransportProfile
+        | MenuPage::CreateModelProfile => tr("menu.help.field.create"),
+        MenuPage::DisplaySettings => tr("menu.help.field.display"),
+        MenuPage::McpSettings => tr("menu.help.field.mcp"),
+        MenuPage::ModelFamilies | MenuPage::ModelNames => tr("menu.help.field.model.name"),
+        _ => tr("menu.help.field.navigation"),
+    }
+    .into()
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -9379,7 +11870,6 @@ mod tests {
         let mut app = ready_app_with_control();
         app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
         app.ports[0].history.push("previous command".into());
-        app.ports[0].history_cursor = Some(0);
         app.ports[0].draft = "echo 'unterminated".chars().collect();
         app.ports[0].draft_cursor = app.ports[0].draft.len();
         app.ports[0].scroll_from_bottom = 5;
@@ -9402,7 +11892,6 @@ mod tests {
         assert_eq!(operation_id, None);
         assert!(app.current().draft.is_empty());
         assert_eq!(app.current().draft_cursor, 0);
-        assert_eq!(app.current().history_cursor, None);
         assert_eq!(app.current().scroll_from_bottom, 0);
         assert_eq!(app.current().unseen, 0);
         assert_eq!(app.current_mode(), InputMode::Line);
@@ -11256,28 +13745,18 @@ mod tests {
     }
 
     #[test]
-    fn input_mode_and_command_history_are_isolated_per_slot() {
+    fn input_mode_is_isolated_per_port() {
         let first = snapshot();
         let mut second = snapshot();
         second.config.port = "COM4".into();
-        second.config.port = "Port 2".into();
-        second.config.port = "COM4".into();
         let mut app = App::new(vec![first, second], None);
         app.ports[0].mode = InputMode::Raw;
-        app.ports[0].history.push("port-one-command".into());
 
         app.select(1);
         assert_eq!(app.current_mode(), InputMode::Line);
-        app.history_previous();
-        assert!(app.current().draft.is_empty());
 
         app.select(0);
         assert_eq!(app.current_mode(), InputMode::Raw);
-        app.history_previous();
-        assert_eq!(
-            app.current().draft.iter().collect::<String>(),
-            "port-one-command"
-        );
     }
 
     fn snapshot() -> SlotSnapshot {
@@ -11286,6 +13765,7 @@ mod tests {
                 port: "COM3".into(),
                 transport_profile: Some("generic-115200".into()),
                 model_profile: None,
+                model_name: None,
                 enabled: true,
             },
             daemon_epoch: Uuid::new_v4(),
@@ -11337,6 +13817,7 @@ mod tests {
         };
         let device = ModelProfile {
             name: "dut-console".into(),
+            model_names: vec!["DUT Console 1.0".into()],
             shell_prompt: Some("dut# ".into()),
             uboot_prompt: Some("dut=> ".into()),
             write_eol: Some("\r".into()),
@@ -11346,6 +13827,7 @@ mod tests {
         };
         let catalog = MenuCatalog {
             ports: vec![current.clone()],
+            detected_ports: Vec::new(),
             config_revision: Some(41),
             transport_profiles: vec![transport],
             transport_revision: Some(41),
@@ -11486,10 +13968,146 @@ mod tests {
         }
     }
 
+    fn monitor_incident(epoch: Uuid, seq_start: u64, seq_end: u64) -> MonitorIncident {
+        let monitor_id = Uuid::new_v4();
+        MonitorIncident {
+            id: Uuid::new_v4(),
+            incident_seq: 1,
+            monitor_id,
+            port: "COM3".into(),
+            daemon_epoch: epoch,
+            seq_start,
+            seq_end,
+            wall_time_start_ns: 100,
+            wall_time_end_ns: 200,
+            severity: serial_protocol::MonitorSeverity::Warning,
+            description: Some("串口异常".into()),
+            matches: vec![serial_protocol::MonitorMatch {
+                index: 0,
+                matcher: MonitorMatcher::Contains("alarm".into()),
+            }],
+            preview: "alarm".into(),
+            evidence_cursor: Cursor {
+                epoch,
+                after_seq: seq_start.saturating_sub(1),
+            },
+            evidence_ref: format!("serial://COM3/{epoch}/{seq_start}-{seq_end}"),
+            created_wall_time_ns: 200,
+            acked_wall_time_ns: None,
+        }
+    }
+
+    fn select_monitor_incident(app: &mut App, incident: MonitorIncident) {
+        let monitor_id = incident.monitor_id;
+        let incident_id = incident.id;
+        app.current_mut()
+            .monitor_history
+            .push_back(MonitorHistoryEntry {
+                monitor: MonitorView {
+                    id: monitor_id,
+                    revision: 1,
+                    spec: serial_protocol::MonitorSpec {
+                        port: incident.port.clone(),
+                        matchers: vec![MonitorMatcher::Contains("alarm".into())],
+                        start_cursor: None,
+                        severity: serial_protocol::MonitorSeverity::Warning,
+                        description: Some("串口异常".into()),
+                        debounce_ms: 0,
+                        cooldown_ms: 0,
+                        duration_ms: None,
+                    },
+                    status: MonitorStatus::Running,
+                    created_wall_time_ns: 100,
+                    started_wall_time_ns: 100,
+                    expires_wall_time_ns: None,
+                    stopped_wall_time_ns: None,
+                    current_cursor: None,
+                    incident_count: 1,
+                    unacked_incident_count: 1,
+                    gap_count: 0,
+                    last_error: None,
+                },
+                incidents: VecDeque::from([incident]),
+                limited: false,
+            });
+        let view = app.current_mut();
+        view.selected_monitor = Some(monitor_id);
+        view.expanded_monitor = Some(monitor_id);
+        view.selected_monitor_matcher = Some(0);
+        view.selected_monitor_incident = Some(incident_id);
+        app.focus = PaneFocus::RunHistory;
+        app.layout = Some(ConsoleLayout {
+            output_area: Rect::new(0, 0, 80, 20),
+            output_inner: Rect::new(1, 1, 78, 18),
+            input_area: Rect::new(0, 20, 80, 3),
+            run_history_area: None,
+            run_history_inner: None,
+        });
+    }
+
+    fn focus_run_history_for_jump(app: &mut App) {
+        app.focus = PaneFocus::RunHistory;
+        app.layout = Some(ConsoleLayout {
+            output_area: Rect::new(0, 0, 80, 20),
+            output_inner: Rect::new(1, 1, 78, 18),
+            input_area: Rect::new(0, 20, 80, 3),
+            run_history_area: None,
+            run_history_inner: None,
+        });
+    }
+
+    fn described_agent_tx(
+        run: &RunInfo,
+        epoch: Uuid,
+        seq: u64,
+        data: &[u8],
+        matcher: &str,
+    ) -> TimelineEvent {
+        let mut tx = event(EventKind::Tx, Direction::Tx, seq, data);
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata
+            .insert("command_description".into(), serde_json::json!("读取状态"));
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind": "contains", "value": matcher}]),
+        );
+        tx
+    }
+
+    fn described_agent_prompt_tx(
+        run: &RunInfo,
+        epoch: Uuid,
+        seq: u64,
+        data: &[u8],
+        description: &str,
+        prompt: &str,
+    ) -> TimelineEvent {
+        let mut tx = event(EventKind::Tx, Direction::Tx, seq, data);
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata
+            .insert("command_description".into(), serde_json::json!(description));
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind": "shell_prompt", "value": prompt}]),
+        );
+        tx
+    }
+
     fn stream_row(seq: u64, direction: Direction, text: &str) -> DisplayLine {
         DisplayLine {
+            daemon_epoch: None,
             seq,
-            operation_id: None,
+            event_kind: match direction {
+                Direction::Rx => EventKind::Rx,
+                Direction::Tx => EventKind::Tx,
+                Direction::None => EventKind::Checkpoint,
+            },
             source: if direction == Direction::Tx {
                 "HUMAN:test[abcd1234]>".into()
             } else {
@@ -11651,7 +14269,7 @@ mod tests {
         assert!(control > navigation + 1);
         assert!(plain[navigation + 1].contains("Alt-1..9"));
         assert!(plain[navigation..control].iter().any(String::is_empty));
-        assert!(plain.iter().any(|line| line.contains("强制人工接管")));
+        assert!(plain.iter().any(|line| line.contains("接管当前串口")));
 
         app.help = true;
         app.layout = Some(ConsoleLayout {
@@ -11922,6 +14540,632 @@ mod tests {
     }
 
     #[test]
+    fn command_and_monitor_actions_render_and_navigate_in_one_wall_time_order() {
+        let mut current = snapshot();
+        let run = agent_run("交错历史");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for (seq, wall_time, description) in [(2, 10, "命令一"), (4, 30, "命令二")] {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, description.as_bytes());
+            tx.daemon_epoch = epoch;
+            tx.wall_time_ns = wall_time;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata
+                .insert("command_description".into(), serde_json::json!(description));
+            app.ports[0].push_event(tx, true);
+        }
+        let monitor_id = Uuid::new_v4();
+        app.ports[0].monitor_history.push_back(MonitorHistoryEntry {
+            monitor: MonitorView {
+                id: monitor_id,
+                revision: 1,
+                spec: serial_protocol::MonitorSpec {
+                    port: "COM3".into(),
+                    matchers: vec![MonitorMatcher::Contains("alarm".into())],
+                    start_cursor: None,
+                    severity: serial_protocol::MonitorSeverity::Warning,
+                    description: Some("监控一".into()),
+                    debounce_ms: 250,
+                    cooldown_ms: 30_000,
+                    duration_ms: None,
+                },
+                status: MonitorStatus::Running,
+                created_wall_time_ns: 20,
+                started_wall_time_ns: 20,
+                expires_wall_time_ns: None,
+                stopped_wall_time_ns: None,
+                current_cursor: None,
+                incident_count: 0,
+                unacked_incident_count: 0,
+                gap_count: 0,
+                last_error: None,
+            },
+            incidents: VecDeque::new(),
+            limited: false,
+        });
+        app.focus = PaneFocus::RunHistory;
+
+        let rendered = run_history_rows(&app, 100)
+            .into_iter()
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.find("命令一").unwrap() < rendered.find("监控一").unwrap());
+        assert!(rendered.find("监控一").unwrap() < rendered.find("命令二").unwrap());
+
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert!(matches!(
+            app.current().selected_history_action_key(),
+            Some(HistoryActionKey::Command(RunCommandKey {
+                first_seq: 2,
+                ..
+            }))
+        ));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.current().selected_history_action_key(),
+            Some(HistoryActionKey::Monitor(monitor_id))
+        );
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            app.current().selected_history_action_key(),
+            Some(HistoryActionKey::Command(RunCommandKey {
+                first_seq: 4,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn monitor_incident_jump_uses_a_complete_same_epoch_local_window() {
+        let current = snapshot();
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for seq in 10..=12 {
+            let mut row = stream_row(seq, Direction::Rx, &format!("local-{seq}"));
+            row.daemon_epoch = Some(epoch);
+            app.ports[0].push_line(row, true);
+        }
+        select_monitor_incident(&mut app, monitor_incident(epoch, 10, 12));
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_monitor_incident());
+        assert!(received.try_recv().is_err());
+        let snapshot = app
+            .current()
+            .scroll_snapshot
+            .as_ref()
+            .expect("complete local evidence snapshot");
+        let rendered = snapshot
+            .rows
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("local-10"));
+        assert!(rendered.contains("local-12"));
+        let pane_width = usize::from(app.layout.unwrap().output_inner.width);
+        assert!(snapshot.rows.iter().all(|line| {
+            line.spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>()
+                == pane_width
+                && line.style.bg == Some(COMMAND_CAPTURE_BACKGROUND)
+                && line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(COMMAND_CAPTURE_BACKGROUND))
+        }));
+    }
+
+    #[test]
+    fn monitor_incident_jump_queries_when_the_local_window_is_fully_evicted() {
+        let current = snapshot();
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for seq in 20..=22 {
+            let mut row = stream_row(seq, Direction::Rx, &format!("newer-{seq}"));
+            row.daemon_epoch = Some(epoch);
+            app.ports[0].push_line(row, true);
+        }
+        let incident = monitor_incident(epoch, 10, 12);
+        let expected = ExactEvidenceTarget::Incident(IncidentEvidenceTarget::from(&incident));
+        select_monitor_incident(&mut app, incident);
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_monitor_incident());
+        let ExactEvidenceIoCommand::Query(request) =
+            received.try_recv().expect("journal fallback query");
+        assert_eq!(request.target, expected);
+        assert!(app.current().scroll_snapshot.is_none());
+    }
+
+    #[test]
+    fn monitor_incident_jump_queries_when_only_half_the_local_range_remains() {
+        let current = snapshot();
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for seq in 11..=12 {
+            let mut row = stream_row(seq, Direction::Rx, &format!("partial-{seq}"));
+            row.daemon_epoch = Some(epoch);
+            app.ports[0].push_line(row, true);
+        }
+        let incident = monitor_incident(epoch, 10, 12);
+        select_monitor_incident(&mut app, incident);
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_monitor_incident());
+        let ExactEvidenceIoCommand::Query(request) = received
+            .try_recv()
+            .expect("partial range must query journal");
+        assert!(matches!(
+            request.target,
+            ExactEvidenceTarget::Incident(IncidentEvidenceTarget {
+                seq_start: 10,
+                seq_end: 12,
+                ..
+            })
+        ));
+        assert!(app.current().scroll_snapshot.is_none());
+    }
+
+    #[test]
+    fn monitor_incident_jump_queries_and_highlights_an_archived_epoch() {
+        let current = snapshot();
+        let current_epoch = current.daemon_epoch;
+        let archived_epoch = Uuid::new_v4();
+        let mut app = App::new(vec![current], None);
+        for seq in 10..=35 {
+            let mut row = stream_row(seq, Direction::Rx, &format!("current-{seq}"));
+            row.daemon_epoch = Some(current_epoch);
+            app.ports[0].push_line(row, true);
+        }
+        let incident = monitor_incident(archived_epoch, 10, 35);
+        select_monitor_incident(&mut app, incident);
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_monitor_incident());
+        let ExactEvidenceIoCommand::Query(request) =
+            received.try_recv().expect("archived epoch query");
+        let events = (10..=35)
+            .map(|seq| {
+                let mut event = if seq == 20 {
+                    event(EventKind::SerialClosed, Direction::None, seq, &[])
+                } else {
+                    event(
+                        EventKind::Rx,
+                        Direction::Rx,
+                        seq,
+                        format!("archived-{seq}\r\n").as_bytes(),
+                    )
+                };
+                event.daemon_epoch = archived_epoch;
+                event
+            })
+            .collect::<Vec<_>>();
+        app.handle_exact_evidence_io_event(ExactEvidenceIoEvent::Completed {
+            request_id: request.request_id,
+            response: ExactEvidenceResponse {
+                target: request.target,
+                events,
+            },
+        });
+
+        assert_eq!(app.current().snapshot.daemon_epoch, current_epoch);
+        let snapshot = app
+            .current()
+            .scroll_snapshot
+            .as_ref()
+            .expect("archived evidence snapshot");
+        let rendered = snapshot
+            .rows
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("archived-10"));
+        assert!(rendered.contains("archived-35"));
+        let pane_width = usize::from(app.layout.unwrap().output_inner.width);
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .filter(|line| line_plain_text(line).contains("archived-"))
+                .all(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                        .sum::<usize>()
+                        == pane_width
+                        && line.style.bg == Some(COMMAND_CAPTURE_BACKGROUND)
+                        && line
+                            .spans
+                            .iter()
+                            .all(|span| span.style.bg == Some(COMMAND_CAPTURE_BACKGROUND))
+                })
+        );
+        assert!(snapshot.rows.iter().any(|line| {
+            !line_plain_text(line).contains("archived-")
+                && line.style.bg != Some(Color::Rgb(28, 53, 66))
+                && line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg != Some(Color::Rgb(28, 53, 66)))
+        }));
+        let visible = visible_output_lines(&app, app.layout.unwrap().output_inner)
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("archived-10"));
+        assert!(!visible.contains("archived-35"));
+    }
+
+    #[test]
+    fn monitor_incident_gap_and_query_failure_never_leave_a_wrong_snapshot() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::En);
+        let current = snapshot();
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        select_monitor_incident(&mut app, monitor_incident(epoch, 10, 12));
+        let (commands, mut received) = mpsc::channel(4);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_monitor_incident());
+        let ExactEvidenceIoCommand::Query(request) = received.try_recv().expect("gap query");
+        app.handle_exact_evidence_io_event(ExactEvidenceIoEvent::Failed {
+            request_id: request.request_id,
+            target: request.target,
+            failure: ExactEvidenceFailure::Gap(GapRange {
+                epoch,
+                first_seq: 10,
+                last_seq: 11,
+                reason: serial_protocol::GapReason::Retention,
+            }),
+        });
+        assert!(app.current().scroll_snapshot.is_none());
+        assert!(app.status.contains("journal gap #10-#11"));
+
+        assert!(app.jump_output_to_monitor_incident());
+        let ExactEvidenceIoCommand::Query(request) = received.try_recv().expect("failed query");
+        app.handle_exact_evidence_io_event(ExactEvidenceIoEvent::Failed {
+            request_id: request.request_id,
+            target: request.target,
+            failure: ExactEvidenceFailure::QueryFailed("test backend unavailable".into()),
+        });
+        assert!(app.current().scroll_snapshot.is_none());
+        assert!(app.status.contains("test backend unavailable"));
+    }
+
+    #[test]
+    fn truncated_local_command_tail_queries_journal_and_never_highlights_the_partial_tail() {
+        let mut current = snapshot();
+        let epoch = current.daemon_epoch;
+        current.head_seq = 5;
+        let run = agent_run("截断命令证据");
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        app.ports[0].push_event(
+            described_agent_tx(&run, epoch, 2, b"show status\r", "dut# "),
+            true,
+        );
+        for (seq, text) in [(4, "partial tail"), (5, "dut# ")] {
+            let mut row = stream_row(seq, Direction::Rx, text);
+            row.daemon_epoch = Some(epoch);
+            app.ports[0].push_line(row, true);
+        }
+        app.ports[0].local_history_truncated = true;
+        focus_run_history_for_jump(&mut app);
+        let key = app.current().selected_run_command_key().unwrap();
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_run_command(key, None));
+        let ExactEvidenceIoCommand::Query(request) = received
+            .try_recv()
+            .expect("truncated local capture must query the journal");
+        assert!(matches!(
+            request.target,
+            ExactEvidenceTarget::Command(CommandEvidenceTarget {
+                daemon_epoch,
+                seq_start: 2,
+                query_end_seq: 5,
+                ..
+            }) if daemon_epoch == epoch
+        ));
+        assert!(app.current().scroll_snapshot.is_none());
+        assert!(all_output_visual_rows(&app, 78).iter().all(|row| {
+            row.line.style.bg != Some(Color::Rgb(28, 53, 66))
+                && row
+                    .line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg != Some(Color::Rgb(28, 53, 66)))
+        }));
+    }
+
+    #[test]
+    fn discontinuous_local_command_events_query_journal_instead_of_highlighting_merged_rows() {
+        let mut current = snapshot();
+        let epoch = current.daemon_epoch;
+        current.head_seq = 5;
+        let run = agent_run("缺序命令证据");
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        app.ports[0].push_event(
+            described_agent_tx(&run, epoch, 2, b"show status\r", "dut# "),
+            true,
+        );
+        let mut output = event(EventKind::Rx, Direction::Rx, 3, b"value=ready\r\n");
+        output.daemon_epoch = epoch;
+        app.ports[0].push_event(output, true);
+        let mut prompt = event(EventKind::Rx, Direction::Rx, 5, b"dut# \r\n");
+        prompt.daemon_epoch = epoch;
+        app.ports[0].push_event(prompt, true);
+        focus_run_history_for_jump(&mut app);
+        let key = app.current().selected_run_command_key().unwrap();
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_run_command(key, None));
+        let ExactEvidenceIoCommand::Query(request) = received
+            .try_recv()
+            .expect("a silent raw sequence discontinuity must query the journal");
+        assert!(matches!(request.target, ExactEvidenceTarget::Command(_)));
+        assert!(app.current().scroll_snapshot.is_none());
+    }
+
+    #[test]
+    fn command_journal_backfill_restores_complete_rx_only_highlight() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::En);
+        let mut current = snapshot();
+        let epoch = current.daemon_epoch;
+        current.head_seq = 5;
+        let run = agent_run("日志回填命令");
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        let tx = described_agent_prompt_tx(&run, epoch, 2, b"show status\r", "读取状态", "dut# ");
+        app.ports[0].push_event(tx.clone(), true);
+        app.ports[0].local_history_truncated = true;
+        focus_run_history_for_jump(&mut app);
+        let key = app.current().selected_run_command_key().unwrap();
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_run_command(key, None));
+        let ExactEvidenceIoCommand::Query(request) = received.try_recv().expect("journal query");
+        let mut rx3 = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"dut# show status\r\nvalue=ready\r\n",
+        );
+        rx3.daemon_epoch = epoch;
+        let mut rx4 = event(EventKind::Rx, Direction::Rx, 4, b"more output\r\n");
+        rx4.daemon_epoch = epoch;
+        let mut rx5 = event(EventKind::Rx, Direction::Rx, 5, b"dut# \r\n");
+        rx5.daemon_epoch = epoch;
+        app.handle_exact_evidence_io_event(ExactEvidenceIoEvent::Completed {
+            request_id: request.request_id,
+            response: ExactEvidenceResponse {
+                target: request.target,
+                events: vec![tx, rx3, rx4, rx5],
+            },
+        });
+
+        let snapshot = app
+            .current()
+            .scroll_snapshot
+            .as_ref()
+            .expect("exact command evidence snapshot");
+        let highlighted = snapshot
+            .rows
+            .iter()
+            .filter(|line| line.style.bg == Some(COMMAND_CAPTURE_BACKGROUND))
+            .map(line_plain_text)
+            .collect::<String>();
+        assert!(highlighted.contains("show status"));
+        assert!(highlighted.contains("value=ready"));
+        assert!(highlighted.contains("more output"));
+        assert!(highlighted.contains("dut#"));
+        assert_eq!(highlighted.matches("show status").count(), 1);
+        let pane_width = usize::from(app.layout.unwrap().output_inner.width);
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .filter(|line| line.style.bg == Some(COMMAND_CAPTURE_BACKGROUND))
+                .all(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                        .sum::<usize>()
+                        == pane_width
+                })
+        );
+        assert!(
+            app.status.contains("exact command evidence loaded"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn archived_command_epoch_is_queried_and_rendered_without_using_current_rows() {
+        let mut current = snapshot();
+        let archived_epoch = current.daemon_epoch;
+        current.head_seq = 3;
+        let run = agent_run("旧周期命令");
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        let tx = described_agent_tx(&run, archived_epoch, 2, b"version\r", "old# ");
+        app.ports[0].push_event(tx.clone(), true);
+        let current_epoch = Uuid::new_v4();
+        app.ports[0].snapshot.daemon_epoch = current_epoch;
+        app.ports[0].last_epoch = Some(current_epoch);
+        let mut current_row = stream_row(3, Direction::Rx, "current epoch output");
+        current_row.daemon_epoch = Some(current_epoch);
+        app.ports[0].push_line(current_row, true);
+        focus_run_history_for_jump(&mut app);
+        let key = app.current().selected_run_command_key().unwrap();
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_run_command(key, None));
+        let ExactEvidenceIoCommand::Query(request) = received.try_recv().expect("archive query");
+        assert_eq!(request.target.daemon_epoch(), archived_epoch);
+        let mut rx = event(EventKind::Rx, Direction::Rx, 3, b"version 1.0\r\nold# \r\n");
+        rx.daemon_epoch = archived_epoch;
+        app.handle_exact_evidence_io_event(ExactEvidenceIoEvent::Completed {
+            request_id: request.request_id,
+            response: ExactEvidenceResponse {
+                target: request.target,
+                events: vec![tx, rx],
+            },
+        });
+
+        let rendered = app
+            .current()
+            .scroll_snapshot
+            .as_ref()
+            .expect("archived command evidence")
+            .rows
+            .iter()
+            .map(line_plain_text)
+            .collect::<String>();
+        assert!(rendered.contains("version 1.0"));
+        assert!(!rendered.contains("current epoch output"));
+        assert_eq!(app.current().snapshot.daemon_epoch, current_epoch);
+    }
+
+    #[test]
+    fn command_gap_failure_returns_to_live_tail_without_partial_highlight() {
+        let _guard = crate::i18n::lang_test_lock();
+        i18n::set_lang(i18n::Lang::En);
+        let mut current = snapshot();
+        let epoch = current.daemon_epoch;
+        current.head_seq = 5;
+        let run = agent_run("缺口命令");
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        app.ports[0].push_event(
+            described_agent_tx(&run, epoch, 2, b"status\r", "dut# "),
+            true,
+        );
+        app.ports[0].local_history_truncated = true;
+        focus_run_history_for_jump(&mut app);
+        let key = app.current().selected_run_command_key().unwrap();
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_run_command(key, None));
+        let ExactEvidenceIoCommand::Query(request) = received.try_recv().expect("gap query");
+        app.current_mut().scroll_snapshot = Some(ScrollSnapshot {
+            rows: vec![Line::from("operator scrolled while the query was pending")],
+        });
+        app.current_mut().scroll_from_bottom = 1;
+        app.handle_exact_evidence_io_event(ExactEvidenceIoEvent::Failed {
+            request_id: request.request_id,
+            target: request.target,
+            failure: ExactEvidenceFailure::Gap(GapRange {
+                epoch,
+                first_seq: 3,
+                last_seq: 4,
+                reason: serial_protocol::GapReason::Retention,
+            }),
+        });
+
+        assert!(app.current().scroll_snapshot.is_none());
+        assert_eq!(app.current().scroll_from_bottom, 0);
+        assert!(app.status.contains("journal gap #3-#4"));
+    }
+
+    #[test]
+    fn command_sequence_step_queries_only_its_exact_matcher_range() {
+        let mut current = snapshot();
+        let epoch = current.daemon_epoch;
+        current.head_seq = 5;
+        let run = agent_run("登录序列");
+        current.active_run = Some(run.clone());
+        let mut app = App::new(vec![current], None);
+        let sequence_id = Uuid::new_v4();
+        for (seq, index, data, matcher) in [
+            (2, 0, b"login\r".as_slice(), "Username:"),
+            (4, 1, b"admin\r".as_slice(), "Password:"),
+        ] {
+            let mut tx = described_agent_tx(&run, epoch, seq, data, matcher);
+            tx.metadata
+                .insert("command_sequence_id".into(), serde_json::json!(sequence_id));
+            tx.metadata.insert(
+                "command_sequence_description".into(),
+                serde_json::json!("登录设备"),
+            );
+            tx.metadata.insert(
+                "command_sequence_step_index".into(),
+                serde_json::json!(index),
+            );
+            app.ports[0].push_event(tx, true);
+        }
+        app.ports[0].local_history_truncated = true;
+        focus_run_history_for_jump(&mut app);
+        let key = app.current().selected_run_command_key().unwrap();
+        app.current_mut().expanded_run_command = Some(key);
+        app.current_mut().selected_run_step = Some(0);
+        let (commands, mut received) = mpsc::channel(2);
+        app.exact_evidence_commands = Some(commands);
+
+        assert!(app.jump_output_to_run_command(key, Some(0)));
+        let ExactEvidenceIoCommand::Query(request) = received.try_recv().expect("step query");
+        let ExactEvidenceTarget::Command(target) = request.target else {
+            panic!("expected command evidence target");
+        };
+        assert_eq!(target.step_index, Some(0));
+        assert_eq!(
+            (target.seq_start, target.write_end_seq, target.query_end_seq),
+            (2, 2, 3)
+        );
+        assert_eq!(target.matchers[0].value, "Username:");
+    }
+
+    #[test]
+    fn monitor_incident_journal_evidence_requires_both_endpoints_and_no_missing_sequence() {
+        let epoch = Uuid::new_v4();
+        let incident = monitor_incident(epoch, 10, 12);
+        let target = IncidentEvidenceTarget::from(&incident);
+        let events = (10..=12)
+            .map(|seq| {
+                let mut event = event(EventKind::Rx, Direction::Rx, seq, b"evidence\n");
+                event.daemon_epoch = epoch;
+                event
+            })
+            .collect::<Vec<_>>();
+
+        assert!(incident_evidence_is_complete(&target, &events));
+        assert!(!incident_evidence_is_complete(&target, &events[1..]));
+        assert!(!incident_evidence_is_complete(
+            &target,
+            &events[..events.len() - 1]
+        ));
+        assert!(!incident_evidence_is_complete(
+            &target,
+            &[events[0].clone(), events[2].clone()]
+        ));
+        let mut wrong_epoch = events;
+        wrong_epoch[1].daemon_epoch = Uuid::new_v4();
+        assert!(!incident_evidence_is_complete(&target, &wrong_epoch));
+    }
+
+    #[test]
     fn run_history_bar_marks_tail_and_gap_history_as_recent_only() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::En);
@@ -12016,6 +15260,9 @@ mod tests {
         menu.selected = 2;
 
         app.activate_menu_item(&mut menu);
+        assert_eq!(menu.page, MenuPage::Settings);
+        assert_eq!(menu.selected, 0);
+        app.activate_menu_item(&mut menu);
         assert_eq!(menu.page, MenuPage::DisplaySettings);
         assert_eq!(menu.selected, 0);
 
@@ -12048,6 +15295,13 @@ mod tests {
         catalog
             .ports
             .extend([transport_peer.clone(), device_peer.clone()]);
+        catalog.detected_ports.push(PortDescriptor {
+            name: "/dev/ttyUSB7".into(),
+            port_type: "usb".into(),
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+        });
         let mut app = App::new(vec![current], None);
         let (menu_commands, mut received) = mpsc::channel(2);
         app.menu_commands = Some(menu_commands);
@@ -12061,7 +15315,7 @@ mod tests {
             .into_iter()
             .map(|line| line_plain_text(&line))
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT + 2);
+        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT + 4);
         assert_eq!(rows[0], tr("menu.current.section.serial"));
         assert_eq!(rows[11], tr("menu.current.section.model"));
         assert!(rows[1].starts_with("▶     "));
@@ -12083,28 +15337,48 @@ mod tests {
 
         menu.selected = CurrentProfileRow::Port as usize;
         app.activate_current_profile_row(&mut menu);
-        let mut prompt = menu.prompt.take().expect("serial-port editor");
-        prompt.value = "/dev/ttyUSB7".chars().collect();
-        prompt.cursor = prompt.value.len();
-        app.handle_menu_prompt_key(
+        let mut choice = menu.choice.take().expect("serial-port choices");
+        choice.selected = choice
+            .options
+            .iter()
+            .position(|option| option.label == "/dev/ttyUSB7")
+            .expect("new detected Port");
+        app.handle_menu_choice_key(
             &mut menu,
-            prompt,
+            choice,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         menu.selected = CurrentProfileRow::BaudRate as usize;
         app.activate_current_profile_row(&mut menu);
-        let mut prompt = menu.prompt.take().expect("baud-rate editor");
-        prompt.value = "921600".chars().collect();
-        prompt.cursor = prompt.value.len();
-        app.handle_menu_prompt_key(
+        let mut choice = menu.choice.take().expect("baud-rate choices");
+        choice.selected = choice
+            .options
+            .iter()
+            .position(|option| option.label == "921600")
+            .expect("921600 choice");
+        app.handle_menu_choice_key(
             &mut menu,
-            prompt,
+            choice,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         menu.selected = CurrentProfileRow::DataBits as usize;
         app.activate_current_profile_row(&mut menu);
+        let mut choice = menu.choice.take().expect("data-bit choices");
+        choice.selected = 0;
+        app.handle_menu_choice_key(
+            &mut menu,
+            choice,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         menu.selected = CurrentProfileRow::Echo as usize;
         app.activate_current_profile_row(&mut menu);
+        let mut choice = menu.choice.take().expect("echo choices");
+        choice.selected = 2;
+        app.handle_menu_choice_key(
+            &mut menu,
+            choice,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         menu.selected = CurrentProfileRow::Apply as usize;
         app.activate_current_profile_row(&mut menu);
 
@@ -12134,26 +15408,128 @@ mod tests {
         else {
             panic!("expected a trusted current-profile update")
         };
-        let MenuMutation::UpdateCurrentProfiles {
+        let MenuMutation::UpdateCurrentProfiles(update) = *mutation else {
+            panic!("expected a current-profile update")
+        };
+        let CurrentProfileUpdate {
             current_port,
             new_port: Some(new_port),
             transport: Some(transport),
             device: Some(device),
-            expected_config_revision,
-            expected_transport_revision,
-            expected_model_profile_revision,
-        } = *mutation
+            revisions,
+            ..
+        } = *update
         else {
             panic!("expected a current-profile update")
         };
         assert_eq!(current_port, "COM3");
         assert_eq!(new_port, "/dev/ttyUSB7");
-        assert_eq!(expected_config_revision, Some(41));
-        assert_eq!(expected_transport_revision, Some(41));
-        assert_eq!(expected_model_profile_revision, Some(41));
+        assert_eq!(revisions.config, Some(41));
+        assert_eq!(revisions.transport, Some(41));
+        assert_eq!(revisions.device, Some(41));
         assert_eq!(transport.baud_rate, 921_600);
         assert_eq!(transport.data_bits, DataBits::Five);
         assert_eq!(device.echo, Some(EchoMode::Off));
+    }
+
+    #[test]
+    fn port_choice_excludes_other_configured_ports_and_right_does_not_commit() {
+        let (current, mut catalog) = editable_profile_fixture();
+        let mut occupied = current.clone();
+        occupied.config.port = "COM4".into();
+        catalog.ports.push(occupied);
+        catalog.detected_ports = ["COM3", "COM4", "COM7"]
+            .into_iter()
+            .map(|name| PortDescriptor {
+                name: name.into(),
+                port_type: "usb".into(),
+                manufacturer: None,
+                product: None,
+                serial_number: None,
+            })
+            .collect();
+        let mut app = App::new(vec![current], None);
+        let mut menu = MenuState::new();
+        menu.page = MenuPage::Profiles;
+        menu.catalog = Some(catalog);
+        app.refresh_current_profile_editor(&mut menu);
+
+        menu.selected = CurrentProfileRow::Port as usize;
+        app.activate_current_profile_row(&mut menu);
+        let mut choice = menu.choice.take().expect("Port options");
+        let labels = choice
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["COM3", "COM7"]);
+        choice.selected = 1;
+        app.handle_menu_choice_key(
+            &mut menu,
+            choice,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(menu.profile_editor.as_ref().unwrap().port, "COM3");
+        let choice = menu.choice.take().expect("Right keeps options expanded");
+        app.handle_menu_choice_key(
+            &mut menu,
+            choice,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(menu.profile_editor.as_ref().unwrap().port, "COM7");
+        assert!(menu.choice.is_none());
+    }
+
+    #[test]
+    fn successful_port_rename_rebuilds_view_and_reconnects_exact_port_set() {
+        let (current, mut catalog) = editable_profile_fixture();
+        let mut renamed = current.clone();
+        renamed.config.port = "COM7".into();
+        catalog.ports = vec![renamed];
+        let mut app = App::new(vec![current], None);
+        app.pending_writes.insert("COM3".into(), VecDeque::new());
+        let (network_commands, mut received) = mpsc::channel(2);
+
+        app.handle_menu_io_event(
+            MenuIoEvent::Completed {
+                catalog,
+                success: MenuSuccess::ProfilesUpdated {
+                    previous_port: "COM3".into(),
+                    configured_port: "COM7".into(),
+                },
+            },
+            &network_commands,
+        );
+
+        assert_eq!(app.ports.len(), 1);
+        assert_eq!(app.selected_port(), "COM7");
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(NetworkCommand::Reconfigure { ports }) if ports == vec!["COM7"]
+        ));
+    }
+
+    #[test]
+    fn model_name_navigation_selects_family_then_concrete_model() {
+        let (current, catalog) = editable_profile_fixture();
+        let mut app = App::new(vec![current], None);
+        let mut menu = MenuState::new();
+        menu.page = MenuPage::Profiles;
+        menu.catalog = Some(catalog);
+        app.refresh_current_profile_editor(&mut menu);
+
+        menu.selected = CurrentProfileRow::ModelName as usize;
+        app.activate_current_profile_row(&mut menu);
+        assert_eq!(menu.page, MenuPage::ModelFamilies);
+        app.activate_menu_item(&mut menu);
+        assert_eq!(menu.page, MenuPage::ModelNames);
+        app.activate_menu_item(&mut menu);
+
+        assert_eq!(menu.page, MenuPage::Profiles);
+        let editor = menu.profile_editor.as_ref().unwrap();
+        assert_eq!(editor.model_profile_binding.as_deref(), Some("dut-console"));
+        assert_eq!(editor.model_name.as_deref(), Some("DUT Console 1.0"));
     }
 
     #[test]
@@ -12210,10 +15586,13 @@ mod tests {
         });
         let mut menu = MenuState::new();
         menu.busy = true;
-        menu.selected = 3;
+        menu.selected = 2;
 
         app.activate_menu_item(&mut menu);
-        assert_eq!(menu.page, MenuPage::RunSettings);
+        assert_eq!(menu.page, MenuPage::Settings);
+        menu.selected = 1;
+        app.activate_menu_item(&mut menu);
+        assert_eq!(menu.page, MenuPage::McpSettings);
         app.activate_menu_item(&mut menu);
         let mut prompt = menu.prompt.take().expect("timeout prompt");
         prompt.value = "299".chars().collect();
@@ -12249,9 +15628,6 @@ mod tests {
         );
         assert_eq!(app.orphan_run_timeout_seconds, 0);
         assert!(menu.message.contains(tr("menu.run.timeout.unlimited")));
-        let detail = menu_detail(&app, &menu);
-        assert!(detail.contains(tr("menu.run.timeout.unlimited")));
-        assert!(detail.contains("run_end"));
 
         let saved = LoadedConfig::load(Some(path)).expect("saved Run settings");
         assert_eq!(saved.config.orphan_run_timeout_seconds, Some(0));
@@ -12528,6 +15904,252 @@ mod tests {
                 .map(|row| line_plain_text(&row.line))
                 .any(|line| line.starts_with('›'))
         );
+
+        let rendered_lines = rows.iter().map(|row| row.line.clone()).collect::<Vec<_>>();
+        let plain_lines = rendered_lines
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>();
+        let height = rendered_lines.len().max(1) as u16;
+        let backend = TestBackend::new(80, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(rendered_lines.clone()), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for (row, line) in rendered_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.style.bg == Some(COMMAND_CAPTURE_BACKGROUND))
+        {
+            assert_eq!(
+                line.spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum::<usize>(),
+                80
+            );
+            for column in 0..80 {
+                assert_eq!(
+                    buffer.content[row * 80 + column].bg,
+                    COMMAND_CAPTURE_BACKGROUND,
+                    "capture row {row} cell {column} lost its background"
+                );
+            }
+        }
+        let later_row = plain_lines
+            .iter()
+            .position(|line| line.contains("later output"))
+            .expect("missing ordinary row after the capture");
+        assert!((0..80).all(|column| {
+            buffer.content[later_row * 80 + column].bg != COMMAND_CAPTURE_BACKGROUND
+        }));
+    }
+
+    #[test]
+    fn capture_highlight_fills_wrapped_wide_character_rows_and_preserves_foreground() {
+        let width = 12;
+        let source = Line::from(vec![
+            Span::styled("device", Style::default().fg(Color::LightGreen)),
+            Span::raw(" output "),
+            Span::styled(
+                "error",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" abcdefghijklmnop"),
+        ]);
+        let mut rendered = wrap_command_capture_line(source, width);
+        assert!(rendered.len() >= 3, "fixture must wrap across visual rows");
+        assert!(rendered.iter().all(|line| {
+            line.spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>()
+                == usize::from(width)
+        }));
+        assert!(rendered.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("error")
+                && span.style.fg == Some(Color::Red)
+                && span.style.bg == Some(COMMAND_CAPTURE_BACKGROUND)
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        let wide_rows = wrap_command_capture_line(Line::from("设备输出 abcdefghijklmnop"), width);
+        assert!(wide_rows.len() >= 2);
+        assert!(wide_rows.iter().all(|line| {
+            line.spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>()
+                == usize::from(width)
+        }));
+
+        let ordinary_row = rendered.len();
+        rendered.extend(wrap_timeline_line(Line::from("未选中"), width));
+        let backend = TestBackend::new(width, rendered.len() as u16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(rendered.clone()), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for row in 0..ordinary_row {
+            for column in 0..usize::from(width) {
+                assert_eq!(
+                    buffer.content[row * usize::from(width) + column].bg,
+                    COMMAND_CAPTURE_BACKGROUND,
+                    "wrapped capture row {row} cell {column} lost its background"
+                );
+            }
+        }
+        assert!((0..usize::from(width)).all(|column| {
+            buffer.content[ordinary_row * usize::from(width) + column].bg
+                != COMMAND_CAPTURE_BACKGROUND
+        }));
+    }
+
+    #[test]
+    fn latest_of_multiple_commands_does_not_finish_at_the_echo_prompt_prefix() {
+        let mut current = snapshot();
+        current.effective_shell_prompt = Some("dut# ".into());
+        let run = agent_run("连续读取状态");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+
+        for mut event in [
+            event(EventKind::Rx, Direction::Rx, 1, b"dut# "),
+            described_agent_prompt_tx(&run, epoch, 2, b"show first\r", "第一条", "dut# "),
+            event(
+                EventKind::Rx,
+                Direction::Rx,
+                3,
+                b"show first\r\nfirst output\r\ndut# ",
+            ),
+            described_agent_prompt_tx(&run, epoch, 4, b"show last\r", "最后一条", "dut# "),
+            event(
+                EventKind::Rx,
+                Direction::Rx,
+                5,
+                b"show last\r\nlast output one\r\n",
+            ),
+            event(
+                EventKind::Rx,
+                Direction::Rx,
+                6,
+                b"last output two\r\n\x1b[32mdut# \x1b[0m",
+            ),
+        ] {
+            event.daemon_epoch = epoch;
+            app.ports[0].push_event(event, true);
+        }
+        app.focus = PaneFocus::RunHistory;
+
+        let key = app.current().selected_run_command_key().unwrap();
+        let target = app.command_evidence_target(key, None).unwrap();
+        let entries = app.ports[0]
+            .lines
+            .iter()
+            .chain(app.ports[0].pending_line.iter())
+            .collect::<Vec<_>>();
+        let capture = command_capture_for_target(&target, &entries);
+        let (start, end) = capture
+            .start
+            .zip(capture.end)
+            .expect("complete final command");
+        let captured = entries[start..=end]
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(capture.highlight_available);
+        assert_eq!(
+            captured,
+            [
+                "dut# show last",
+                "last output one",
+                "last output two",
+                "dut# "
+            ]
+        );
+        assert!(!captured.iter().any(|line| line.contains("first output")));
+    }
+
+    #[test]
+    fn command_capture_starts_at_first_device_result_without_echo() {
+        let mut current = snapshot();
+        let run = agent_run("无设备回显");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"show version\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata
+            .insert("command_description".into(), serde_json::json!("读取版本"));
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind": "shell_prompt", "value": "dut# "}]),
+        );
+        app.ports[0].push_event(tx, true);
+        let mut rx = event(
+            EventKind::Rx,
+            Direction::Rx,
+            3,
+            b"firmware 2.0\r\ndut# \r\n",
+        );
+        rx.daemon_epoch = epoch;
+        app.ports[0].push_event(rx, true);
+        app.focus = PaneFocus::RunHistory;
+
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+        let captured = render_output_entries(&app, &entries, 80)
+            .into_iter()
+            .filter(|row| row.line.style.bg == Some(Color::Rgb(28, 53, 66)))
+            .map(|row| line_plain_text(&row.line))
+            .collect::<String>();
+        assert!(captured.contains("firmware 2.0"));
+        assert!(captured.contains("dut#"));
+        assert!(!captured.contains("show version"));
+    }
+
+    #[test]
+    fn command_capture_does_not_cross_a_system_or_gap_row() {
+        let mut current = snapshot();
+        let run = agent_run("系统边界");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"status\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(Uuid::new_v4());
+        tx.metadata
+            .insert("command_description".into(), serde_json::json!("读取状态"));
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind": "shell_prompt", "value": "dut# "}]),
+        );
+        app.ports[0].push_event(tx, true);
+        app.ports[0].push_line(gap_line(3, "journal gap"), true);
+        app.ports[0].push_line(stream_row(4, Direction::Rx, "dut# "), true);
+        app.focus = PaneFocus::RunHistory;
+
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+        let rows = render_output_entries(&app, &entries, 80);
+        assert!(
+            rows.iter()
+                .any(|row| line_plain_text(&row.line).trim_end() == "› status")
+        );
+        assert!(rows.iter().all(|row| {
+            row.line.style.bg != Some(Color::Rgb(28, 53, 66))
+                && row
+                    .line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg != Some(Color::Rgb(28, 53, 66)))
+        }));
     }
 
     #[test]
@@ -12642,12 +16264,109 @@ mod tests {
         assert!(captured.contains("admin"));
         assert!(captured.contains("Password:"));
         assert!(!captured.contains("after login"));
+
+        drop(entries);
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current().selected_run_step, Some(0));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.current().selected_run_step, Some(1));
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
+        let selected_step = render_output_entries(&app, &entries, 80)
+            .into_iter()
+            .filter(|row| row.line.style.bg == Some(Color::Rgb(28, 53, 66)))
+            .map(|row| line_plain_text(&row.line))
+            .collect::<String>();
+        assert!(!selected_step.contains("Username:"));
+        assert!(selected_step.contains("admin"));
+        assert!(selected_step.contains("Password:"));
+        drop(entries);
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.current().selected_run_step.is_none());
+    }
+
+    #[test]
+    fn command_sequence_last_step_does_not_finish_at_the_echo_prompt_prefix() {
+        let mut current = snapshot();
+        current.effective_shell_prompt = Some("dut# ".into());
+        let run = agent_run("执行两步检查");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let sequence_id = Uuid::new_v4();
+        let mut app = App::new(vec![current], None);
+
+        let mut initial_prompt = event(EventKind::Rx, Direction::Rx, 1, b"dut# ");
+        initial_prompt.daemon_epoch = epoch;
+        app.ports[0].push_event(initial_prompt, true);
+        for (tx_seq, index, command, response) in [
+            (
+                2,
+                0,
+                b"show first\r".as_slice(),
+                b"show first\r\nfirst result\r\ndut# ".as_slice(),
+            ),
+            (
+                4,
+                1,
+                b"show last\r".as_slice(),
+                b"show last\r\nlast result one\r\nlast result two\r\ndut# ".as_slice(),
+            ),
+        ] {
+            let mut tx = described_agent_prompt_tx(
+                &run,
+                epoch,
+                tx_seq,
+                command,
+                &format!("步骤 {}", index + 1),
+                "dut# ",
+            );
+            tx.metadata
+                .insert("command_sequence_id".into(), serde_json::json!(sequence_id));
+            tx.metadata.insert(
+                "command_sequence_description".into(),
+                serde_json::json!("两步检查"),
+            );
+            tx.metadata.insert(
+                "command_sequence_step_index".into(),
+                serde_json::json!(index),
+            );
+            app.ports[0].push_event(tx, true);
+
+            let mut rx = event(EventKind::Rx, Direction::Rx, tx_seq + 1, response);
+            rx.daemon_epoch = epoch;
+            app.ports[0].push_event(rx, true);
+        }
+        app.focus = PaneFocus::RunHistory;
+
+        let key = app.current().selected_run_command_key().unwrap();
+        let target = app.command_evidence_target(key, Some(1)).unwrap();
+        let entries = app.ports[0]
+            .lines
+            .iter()
+            .chain(app.ports[0].pending_line.iter())
+            .collect::<Vec<_>>();
+        let capture = command_capture_for_target(&target, &entries);
+        let (start, end) = capture.start.zip(capture.end).expect("complete last step");
+        let captured = entries[start..=end]
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(capture.highlight_available);
+        assert_eq!(
+            captured,
+            [
+                "dut# show last",
+                "last result one",
+                "last result two",
+                "dut# "
+            ]
+        );
+        assert!(!captured.iter().any(|line| line.contains("first result")));
     }
 
     #[test]
     fn unmatched_command_uses_a_temporary_overlay_only_while_history_is_selected() {
         let mut current = snapshot();
-        current.effective_shell_prompt = Some("dut# ".into());
         let run = agent_run("无回显输出");
         current.active_run = Some(run.clone());
         let epoch = current.daemon_epoch;
@@ -12663,6 +16382,9 @@ mod tests {
             serde_json::json!("读取系统版本"),
         );
         app.ports[0].push_event(tx, true);
+        // A later Profile refresh must not retroactively reinterpret a command
+        // whose TX persisted no capture matcher.
+        app.ports[0].snapshot.effective_shell_prompt = Some("dut# ".into());
         let mut rx = event(
             EventKind::Rx,
             Direction::Rx,
@@ -12674,11 +16396,24 @@ mod tests {
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
 
         app.focus = PaneFocus::RunHistory;
-        let selected = render_output_entries(&app, &entries, 80)
+        let selected_rows = render_output_entries(&app, &entries, 80);
+        assert!(selected_rows.iter().all(|row| {
+            row.line.style.bg != Some(Color::Rgb(28, 53, 66))
+                && row
+                    .line
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg != Some(Color::Rgb(28, 53, 66)))
+        }));
+        let selected = selected_rows
             .into_iter()
             .map(|row| line_plain_text(&row.line))
             .collect::<Vec<_>>();
-        assert!(selected.iter().any(|line| line == "› show version"));
+        assert!(
+            selected
+                .iter()
+                .any(|line| line.trim_end() == "› show version")
+        );
 
         app.focus = PaneFocus::Input;
         let ordinary = render_output_entries(&app, &entries, 80)
@@ -12737,15 +16472,10 @@ mod tests {
             .map(line_plain_text)
             .collect::<String>();
         assert!(visible.contains("show version"), "jumped page: {visible}");
-        assert!(
-            all_output_visual_rows(&app, inner.width)
-                .iter()
-                .all(|row| row.operation_id != Some(operation_id))
-        );
     }
 
     #[test]
-    fn expanding_the_followed_command_pins_it_when_new_agent_commands_arrive() {
+    fn new_agent_command_returns_history_to_the_newest_action() {
         let mut current = snapshot();
         let run = agent_run("持续巡检");
         current.active_run = Some(run.clone());
@@ -12775,8 +16505,13 @@ mod tests {
         assert_eq!(app.current().expanded_run_command, Some(pinned));
 
         app.ports[0].push_event(described_tx(3, "第二条命令", b"second command"), true);
-        assert_eq!(app.current().selected_run_command_key(), Some(pinned));
-        assert_eq!(app.current().expanded_run_command, Some(pinned));
+        let newest = RunCommandKey {
+            run_id: run.id,
+            first_seq: 3,
+        };
+        assert!(app.current().selected_run_command.is_none());
+        assert_eq!(app.current().selected_run_command_key(), Some(newest));
+        assert!(app.current().expanded_run_command.is_none());
 
         let backend = TestBackend::new(80, 28);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -12792,8 +16527,8 @@ mod tests {
             },
             &commands,
         );
-        assert_eq!(app.current().selected_run_command_key(), Some(pinned));
-        assert_eq!(app.current().expanded_run_command, Some(pinned));
+        assert_eq!(app.current().selected_run_command_key(), Some(newest));
+        assert!(app.current().expanded_run_command.is_none());
     }
 
     #[test]
@@ -12823,7 +16558,7 @@ mod tests {
             let key = app.current().selected_run_command_key().unwrap();
             let command_rows = run_history_rows(&app, width)
                 .into_iter()
-                .filter(|row| row.command == Some(key))
+                .filter(|row| row.command == Some(key) && row.step == Some(0))
                 .map(|row| {
                     row.line
                         .spans
@@ -12840,7 +16575,6 @@ mod tests {
             );
             let reconstructed = command_rows
                 .iter()
-                .skip(1)
                 .map(|row| row.trim_start())
                 .collect::<String>();
             assert_eq!(reconstructed, payload);
@@ -12923,52 +16657,6 @@ mod tests {
             maximum.saturating_sub(5),
             "scrolling beyond the bottom must not create offset debt"
         );
-    }
-
-    #[test]
-    fn chinese_profile_details_are_readable_without_debug_enum_names() {
-        let _guard = crate::i18n::lang_test_lock();
-        i18n::set_lang(i18n::Lang::Zh);
-        let transport = TransportProfile {
-            name: "hardware-test".into(),
-            baud_rate: 230_400,
-            data_bits: DataBits::Seven,
-            parity: Parity::Even,
-            stop_bits: StopBits::Two,
-            flow_control: FlowControl::Hardware,
-            dtr: true,
-            rts: false,
-            auto_open: true,
-        };
-        let transport_text = transport_profile_detail(&transport);
-        assert!(transport_text.contains("波特率 230400"));
-        assert!(transport_text.contains("7 数据位"));
-        assert!(transport_text.contains("偶校验"));
-        assert!(transport_text.contains("2 停止位"));
-        assert!(transport_text.contains("硬件流控"));
-        assert!(transport_text.contains("DTR 开启"));
-        assert!(transport_text.contains("RTS 关闭"));
-        assert!(transport_text.contains("自动打开 启用"));
-        assert!(!transport_text.contains("Even"));
-        assert!(!transport_text.contains("Hardware"));
-        assert!(!transport_text.contains("true"));
-
-        let device = ModelProfile {
-            name: "interaction-test".into(),
-            shell_prompt: Some("dut# ".into()),
-            uboot_prompt: Some("dut=> ".into()),
-            write_eol: Some("\r\n".into()),
-            echo: Some(EchoMode::Auto),
-            write_chunk_size: Some(8),
-            write_chunk_delay_ms: Some(10),
-        };
-        let device_text = model_profile_detail(&device);
-        assert!(device_text.contains("Shell 提示符 dut#"));
-        assert!(device_text.contains("U-Boot 提示符 dut=>"));
-        assert!(device_text.contains("换行 CRLF"));
-        assert!(device_text.contains("自动判断"));
-        assert!(device_text.contains("分段发送：每段 8 字节，间隔 10 毫秒"));
-        assert!(!device_text.contains("Auto"));
     }
 
     #[test]
@@ -13707,7 +17395,7 @@ mod tests {
         );
         assert!(matches!(
             app.menu.as_ref().map(|menu| menu.page),
-            Some(MenuPage::SerialSettings)
+            Some(MenuPage::CreateProfiles)
         ));
         app.handle_key(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -13749,7 +17437,7 @@ mod tests {
         let menu = app.menu.as_ref().expect("profile menu");
         assert_eq!(menu.page, MenuPage::Profiles);
         assert_eq!(menu.stack, vec![(MenuPage::Root, 0)]);
-        assert!(menu_detail(&app, menu).contains("按 Enter 可编辑"));
+        assert!(!menu_rows(&app, menu).is_empty());
         let help = help_lines(&app)
             .iter()
             .map(line_plain_text)
@@ -13759,7 +17447,7 @@ mod tests {
     }
 
     #[test]
-    fn new_model_profile_clones_effective_behavior_before_echo_or_eol_preset() {
+    fn current_model_profile_template_preserves_effective_behavior() {
         let mut current = snapshot();
         current.effective_shell_prompt = Some("dut# ".into());
         current.effective_uboot_prompt = Some("dut=> ".into());
@@ -13779,19 +17467,6 @@ mod tests {
         assert_eq!(cloned.echo, Some(EchoMode::Auto));
         assert_eq!(cloned.write_chunk_size, Some(7));
         assert_eq!(cloned.write_chunk_delay_ms, Some(13));
-
-        let mut echo_off = cloned.clone();
-        ModelPreset::Echo(EchoMode::Off).apply(&mut echo_off);
-        assert_eq!(echo_off.echo, Some(EchoMode::Off));
-        assert_eq!(echo_off.write_eol, cloned.write_eol);
-        assert_eq!(echo_off.shell_prompt, cloned.shell_prompt);
-        assert_eq!(echo_off.write_chunk_size, cloned.write_chunk_size);
-
-        let mut line_feed = cloned.clone();
-        ModelPreset::Eol("\n").apply(&mut line_feed);
-        assert_eq!(line_feed.write_eol.as_deref(), Some("\n"));
-        assert_eq!(line_feed.echo, cloned.echo);
-        assert_eq!(line_feed.uboot_prompt, cloned.uboot_prompt);
     }
 
     #[test]

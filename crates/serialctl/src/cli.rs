@@ -75,6 +75,10 @@ pub struct SetupArgs {
     #[arg(long)]
     model: Option<String>,
 
+    /// Concrete model name belonging to --model.
+    #[arg(long, requires = "model")]
+    model_name: Option<String>,
+
     /// Remove existing configured ports that were not selected.
     #[arg(long)]
     delete_omitted: bool,
@@ -668,7 +672,8 @@ async fn run_setup(
     let model_catalog = profile::load_model_catalog(&api).await?;
     if !args.json {
         println!("串口 Profile：配置波特率、数据位、校验位、停止位和流控");
-        println!("机型 Profile：配置机型名、Shell/U-Boot 提示符、换行和发送节奏");
+        println!("机型 Profile：定义机型系列及 Shell/U-Boot 交互参数");
+        println!("具体机型名：标记当前串口连接的具体型号");
     }
 
     let mut configured_ports = Vec::with_capacity(selected.len());
@@ -707,18 +712,38 @@ async fn run_setup(
             }
             None => default_model,
         };
-        if let Some(name) = model_profile.as_deref() {
-            model_catalog
-                .profiles
-                .iter()
-                .find(|profile| profile.name == name)
-                .with_context(|| format!("unknown model Profile {name:?}"))?;
-        }
+        let selected_model = if let Some(name) = model_profile.as_deref() {
+            Some(
+                model_catalog
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.name == name)
+                    .with_context(|| format!("unknown model Profile {name:?}"))?,
+            )
+        } else {
+            None
+        };
+        let existing_model_name = existing.and_then(|port| port.model_name.clone());
+        let model_name = match selected_model {
+            None => None,
+            Some(profile) if args.model_name.is_some() => resolve_setup_model_name(
+                profile,
+                args.model_name.as_deref(),
+                existing_model_name.as_deref(),
+            )?,
+            Some(profile) if interactive => {
+                prompt_setup_model_name(profile, existing_model_name.as_deref())?
+            }
+            Some(profile) => {
+                resolve_setup_model_name(profile, None, existing_model_name.as_deref())?
+            }
+        };
 
         configured_ports.push(SlotConfig {
             port: discovered_port.name.clone(),
             transport_profile,
             model_profile,
+            model_name,
             enabled: existing.is_none_or(|port| port.enabled),
         });
     }
@@ -798,6 +823,61 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String> {
     } else {
         value.to_string()
     })
+}
+
+fn prompt_setup_model_name(
+    profile: &serial_protocol::ModelProfile,
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    if profile.model_names.is_empty() {
+        return Ok(None);
+    }
+    println!("具体机型名：");
+    for (index, name) in profile.model_names.iter().enumerate() {
+        println!("  {:>2}. {}", index + 1, safe_inline(name));
+    }
+    let default = current
+        .and_then(|name| profile.model_names.iter().position(|item| item == name))
+        .map_or_else(|| "none".to_string(), |index| (index + 1).to_string());
+    let selection = prompt_with_default("选择具体机型（序号或 none）", &default)?;
+    if selection.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let index = selection
+        .parse::<usize>()
+        .ok()
+        .filter(|index| (1..=profile.model_names.len()).contains(index))
+        .with_context(|| format!("expected 1..={} or none", profile.model_names.len()))?;
+    Ok(profile.model_names.get(index - 1).cloned())
+}
+
+fn resolve_setup_model_name(
+    profile: &serial_protocol::ModelProfile,
+    requested: Option<&str>,
+    existing: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(name) = requested {
+        if !profile
+            .model_names
+            .iter()
+            .any(|candidate| candidate == name)
+        {
+            bail!(
+                "model name {:?} does not belong to Model Profile {:?}",
+                safe_inline(name),
+                safe_inline(&profile.name)
+            );
+        }
+        return Ok(Some(name.to_owned()));
+    }
+    Ok(existing
+        .filter(|name| {
+            profile
+                .model_names
+                .iter()
+                .any(|candidate| candidate == name)
+        })
+        .map(ToOwned::to_owned))
 }
 
 fn prompt_yes_no_default_no(label: &str) -> Result<bool> {
@@ -967,6 +1047,7 @@ mod tests {
             port: port.into(),
             transport_profile: None,
             model_profile: None,
+            model_name: None,
             enabled: true,
         }
     }
@@ -1049,6 +1130,34 @@ mod tests {
         let omitted = unselected_existing_ports(&existing, &selected);
         assert_eq!(omitted.len(), 1);
         assert_eq!(omitted[0].port, "COM4");
+    }
+
+    #[test]
+    fn setup_keeps_only_a_concrete_name_from_the_selected_model_family() {
+        let profile = serial_protocol::ModelProfile {
+            name: "TL-AS7230".into(),
+            model_names: vec!["TL-AS7230-W 1.0".into(), "TL-AS7230-F4GE 1.0".into()],
+            shell_prompt: None,
+            uboot_prompt: None,
+            write_eol: None,
+            echo: None,
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
+        };
+
+        assert_eq!(
+            resolve_setup_model_name(&profile, None, Some("TL-AS7230-W 1.0")).unwrap(),
+            Some("TL-AS7230-W 1.0".into())
+        );
+        assert_eq!(
+            resolve_setup_model_name(&profile, None, Some("another-family-model")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_setup_model_name(&profile, Some("TL-AS7230-F4GE 1.0"), None).unwrap(),
+            Some("TL-AS7230-F4GE 1.0".into())
+        );
+        assert!(resolve_setup_model_name(&profile, Some("unknown-model"), None).is_err());
     }
 
     #[test]

@@ -4,8 +4,8 @@ use serde_json::{Map, Value, json};
 use serial_protocol::{
     ArchiveListResponse, ConfigureModelProfilesRequest, ConfigureModelProfilesResponse,
     ConfigurePortsRequest, ConfigurePortsResponse, CreateMonitorRequest, Cursor, EventQuery,
-    EventQueryResponse, ModelProfileListResponse, MonitorIncidentListResponse, MonitorListResponse,
-    MonitorResponse, StatusResponse,
+    EventQueryResponse, HealthResponse, ModelProfileListResponse, MonitorIncidentListResponse,
+    MonitorListResponse, MonitorResponse, StatusResponse,
 };
 
 const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
@@ -112,6 +112,10 @@ impl ApiClient {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    pub async fn health(&self) -> Result<HealthResponse> {
+        self.get_json("/api/v1/health").await
     }
 
     pub async fn status(&self) -> Result<StatusResponse> {

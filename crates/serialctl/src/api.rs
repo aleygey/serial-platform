@@ -7,9 +7,9 @@ use serial_protocol::{
     ArchiveListResponse, ConfigureModelProfilesRequest, ConfigureModelProfilesResponse,
     ConfigurePortsRequest, ConfigurePortsResponse, ConfigureTransportProfilesRequest,
     ConfigureTransportProfilesResponse, EventQuery, EventQueryResponse, HealthResponse,
-    JournalDiagnostics, ModelProfile, ModelProfileListResponse, PortDescriptor, SlotConfig,
-    SlotDiagnostics, SlotSnapshot, StatusResponse, StorageDiagnosticsResponse, TransportProfile,
-    TransportProfileListResponse,
+    JournalDiagnostics, ModelProfile, ModelProfileListResponse, MonitorIncidentListResponse,
+    MonitorListResponse, PortDescriptor, SlotConfig, SlotDiagnostics, SlotSnapshot, StatusResponse,
+    StorageDiagnosticsResponse, TransportProfile, TransportProfileListResponse,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +159,45 @@ impl ApiClient {
             profiles: response.profiles,
             config_revision: Some(response.config_revision),
         })
+    }
+
+    pub async fn monitors(&self, port: Option<&str>) -> Result<MonitorListResponse> {
+        let mut request = self.client.get(self.url("/api/v1/monitors"));
+        if let Some(port) = port {
+            request = request.query(&[("port", port)]);
+        }
+        decode_response(
+            request
+                .send()
+                .await
+                .context("seriald Monitor list request failed")?,
+        )
+        .await
+    }
+
+    pub async fn monitor_incidents(
+        &self,
+        monitor_id: uuid::Uuid,
+        after_incident_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<MonitorIncidentListResponse> {
+        let mut request = self
+            .client
+            .get(self.url(&format!("/api/v1/monitors/{monitor_id}/incidents")));
+        request = request.query(&[
+            ("limit", limit.to_string()),
+            ("include_acked", "true".into()),
+        ]);
+        if let Some(after) = after_incident_seq {
+            request = request.query(&[("after_incident_seq", after)]);
+        }
+        decode_response(
+            request
+                .send()
+                .await
+                .context("seriald Monitor Incident list request failed")?,
+        )
+        .await
     }
 
     pub async fn configure_model_profiles(

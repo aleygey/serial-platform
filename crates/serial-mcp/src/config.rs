@@ -57,6 +57,12 @@ pub struct ResolvedConfig {
     pub capture: CaptureLimits,
     /// `None` is the explicit unlimited mode selected with zero seconds.
     pub orphan_run_timeout: Option<Duration>,
+    pub config_path: PathBuf,
+    /// Exact bytes used to resolve the initial timeout. The watcher starts
+    /// from this snapshot so a save between resolve and task startup cannot be
+    /// mistaken for the already-applied value.
+    pub config_snapshot: Option<Vec<u8>>,
+    pub orphan_run_timeout_overridden: bool,
 }
 
 pub fn resolve(
@@ -64,14 +70,23 @@ pub fn resolve(
     endpoint_override: Option<String>,
     orphan_run_timeout_override: Option<u64>,
 ) -> Result<ResolvedConfig> {
+    let orphan_run_timeout_overridden = orphan_run_timeout_override.is_some();
     let config_path = match config_override {
         Some(path) => path,
         None => default_config_path()?,
     };
-    let config = match fs::read_to_string(&config_path) {
-        Ok(contents) => toml::from_str::<ClientConfig>(&contents)
-            .with_context(|| format!("invalid serialctl config {}", config_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ClientConfig::default(),
+    let (config, config_snapshot) = match fs::read(&config_path) {
+        Ok(contents) => {
+            let text = std::str::from_utf8(&contents).with_context(|| {
+                format!("serialctl config {} is not UTF-8", config_path.display())
+            })?;
+            let config = toml::from_str::<ClientConfig>(text)
+                .with_context(|| format!("invalid serialctl config {}", config_path.display()))?;
+            (config, Some(contents))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (ClientConfig::default(), None)
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("cannot read serialctl config {}", config_path.display())
@@ -102,19 +117,108 @@ pub fn resolve(
     let orphan_run_timeout_seconds = orphan_run_timeout_override
         .or(config.orphan_run_timeout_seconds)
         .unwrap_or(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS);
-    anyhow::ensure!(
-        orphan_run_timeout_seconds == 0
-            || orphan_run_timeout_seconds >= MIN_ORPHAN_RUN_TIMEOUT_SECONDS,
-        "orphan Run timeout must be 0 (unlimited) or at least \
-         {MIN_ORPHAN_RUN_TIMEOUT_SECONDS} seconds"
-    );
+    let orphan_run_timeout = checked_orphan_run_timeout(orphan_run_timeout_seconds)?;
 
     Ok(ResolvedConfig {
         endpoint,
         capture,
-        orphan_run_timeout: (orphan_run_timeout_seconds != 0)
-            .then(|| Duration::from_secs(orphan_run_timeout_seconds)),
+        orphan_run_timeout,
+        config_path,
+        config_snapshot,
+        orphan_run_timeout_overridden,
     })
+}
+
+fn parse_orphan_run_timeout(contents: &str) -> Result<Option<Duration>> {
+    let config = toml::from_str::<ClientConfig>(contents).context("invalid serialctl config")?;
+    checked_orphan_run_timeout(
+        config
+            .orphan_run_timeout_seconds
+            .unwrap_or(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS),
+    )
+}
+
+fn checked_orphan_run_timeout(seconds: u64) -> Result<Option<Duration>> {
+    anyhow::ensure!(
+        seconds == 0 || seconds >= MIN_ORPHAN_RUN_TIMEOUT_SECONDS,
+        "orphan Run timeout must be 0 (unlimited) or at least {MIN_ORPHAN_RUN_TIMEOUT_SECONDS} seconds"
+    );
+    Ok((seconds != 0).then(|| Duration::from_secs(seconds)))
+}
+
+#[cfg(test)]
+fn reloaded_or_previous(contents: &str, previous: Option<Duration>) -> Option<Duration> {
+    parse_orphan_run_timeout(contents).unwrap_or(previous)
+}
+
+pub async fn watch_orphan_run_timeout(
+    path: PathBuf,
+    session: crate::session::SessionHandle,
+    initial: Option<Duration>,
+    initial_snapshot: Option<Vec<u8>>,
+) {
+    let mut observed = initial_snapshot;
+    let mut applied = initial;
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll.tick().await;
+        let contents = match fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!(
+                    "serial-mcp: cannot reload Run timeout config {}: {error}; keeping the active value",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let Some(contents) = take_changed_contents(&mut observed, contents) else {
+            continue;
+        };
+        let parsed = match contents {
+            Some(contents) => String::from_utf8(contents)
+                .context("serialctl config is not UTF-8")
+                .and_then(|contents| parse_orphan_run_timeout(&contents)),
+            None => checked_orphan_run_timeout(DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS),
+        };
+        let next = match parsed {
+            Ok(next) => next,
+            Err(error) => {
+                eprintln!(
+                    "serial-mcp: ignored invalid orphan Run timeout update in {}: {error:#}; keeping the active value",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if next == applied {
+            continue;
+        }
+        if session.update_run_idle_ttl(next).await.is_err() {
+            break;
+        }
+        applied = next;
+        match applied {
+            Some(timeout) => eprintln!(
+                "serial-mcp: orphan Run timeout updated to {} seconds",
+                timeout.as_secs()
+            ),
+            None => eprintln!("serial-mcp: orphan Run timeout updated to unlimited"),
+        }
+    }
+}
+
+fn take_changed_contents(
+    observed: &mut Option<Vec<u8>>,
+    current: Option<Vec<u8>>,
+) -> Option<Option<Vec<u8>>> {
+    if *observed == current {
+        return None;
+    }
+    *observed = current.clone();
+    Some(current)
 }
 
 fn default_config_path() -> Result<PathBuf> {
@@ -188,11 +292,42 @@ orphan_run_timeout_seconds = 1800
             from_config.orphan_run_timeout,
             Some(Duration::from_secs(3600))
         );
+        assert!(!from_config.orphan_run_timeout_overridden);
 
         let overridden = resolve(Some(config_path), None, Some(7200)).unwrap();
         assert_eq!(
             overridden.orphan_run_timeout,
             Some(Duration::from_secs(7200))
+        );
+        assert!(overridden.orphan_run_timeout_overridden);
+    }
+
+    #[test]
+    fn watcher_observes_a_save_between_resolve_and_its_first_poll() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_path = temporary.path().join("serialctl.toml");
+        let initial = b"orphan_run_timeout_seconds = 1800\n".to_vec();
+        fs::write(&config_path, &initial).unwrap();
+        let resolved = resolve(Some(config_path.clone()), None, None).unwrap();
+        assert_eq!(resolved.config_snapshot, Some(initial));
+
+        let updated = b"orphan_run_timeout_seconds = 3600\n".to_vec();
+        fs::write(&config_path, &updated).unwrap();
+        let mut observed = resolved.config_snapshot;
+        assert_eq!(
+            take_changed_contents(&mut observed, Some(updated.clone())),
+            Some(Some(updated.clone()))
+        );
+        assert_eq!(take_changed_contents(&mut observed, Some(updated)), None);
+    }
+
+    #[test]
+    fn missing_config_snapshot_detects_the_first_created_file() {
+        let mut observed = None;
+        let created = b"orphan_run_timeout_seconds = 3600\n".to_vec();
+        assert_eq!(
+            take_changed_contents(&mut observed, Some(created.clone())),
+            Some(Some(created))
         );
     }
 
@@ -218,6 +353,24 @@ orphan_run_timeout_seconds = 1800
                 .orphan_run_timeout,
             Some(Duration::from_secs(86401))
         );
+    }
+
+    #[test]
+    fn hot_reload_accepts_finite_and_unlimited_and_retains_on_invalid_input() {
+        let previous = Some(Duration::from_secs(1800));
+        assert_eq!(
+            reloaded_or_previous("orphan_run_timeout_seconds = 3600\n", previous),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            reloaded_or_previous("orphan_run_timeout_seconds = 0\n", previous),
+            None
+        );
+        assert_eq!(
+            reloaded_or_previous("orphan_run_timeout_seconds = 30\n", previous),
+            previous
+        );
+        assert_eq!(reloaded_or_previous("not = [valid", previous), previous);
     }
 
     #[test]

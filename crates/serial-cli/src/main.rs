@@ -1,7 +1,7 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    io::{Error, ErrorKind, IsTerminal as _, Write as _},
+    io::{Error, ErrorKind, IsTerminal as _, Read as _, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::PathBuf,
     process::{self, Child, Command, ExitStatus, Stdio},
@@ -11,9 +11,11 @@ use std::{
 };
 
 use serial_protocol::{
-    DataBits, EchoMode, FlowControl, ModelProfile, Parity, SlotConfig, StopBits, TransportProfile,
+    DataBits, EchoMode, FlowControl, McpHealthResponse, ModelProfile, PROTOCOL_VERSION, Parity,
+    SlotConfig, StopBits, TransportProfile,
 };
 use seriald::config::{ConfigPaths, ConfigStore, DaemonConfig};
+use seriald::runtime::{ActiveEndpoint, connect_address, discover_active};
 
 const HELP: &str = "\
 Unified serial-platform command
@@ -40,8 +42,13 @@ Usage: serial setup [--root DIR]
 
 后端地址：seriald 监听 IP 和端口
 串口 Profile：波特率、数据位、校验位
-机型 Profile：机型名、Shell/U-Boot 提示符和输入方式
+机型 Profile：同系列设备共用的 Shell/U-Boot 提示符和输入方式
+具体机型名：当前串口所连接设备的具体型号
 ";
+
+const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const MCP_IDENTITY_WAIT: Duration = Duration::from_secs(2);
+const MCP_IDENTITY_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Component {
@@ -118,7 +125,7 @@ fn dispatch(mut args: Vec<OsString>) -> Dispatch {
     let component = match first {
         None if daemon_root => Component::Daemon,
         None => Component::Console,
-        Some("serve" | "paths") => Component::Daemon,
+        Some("serve" | "paths" | "discover") => Component::Daemon,
         Some("mcp") => Component::Mcp,
         Some("console" | "profile" | "status" | "doctor" | "archives" | "logs") => {
             Component::Console
@@ -187,35 +194,51 @@ fn run_setup(args: &[OsString]) -> Result<(), String> {
 }
 
 fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
-    let store = config_store(args).map_err(Error::other)?;
+    let root = resolved_root(args).map_err(Error::other)?;
+    let store = config_store_for_root(root.as_deref()).map_err(Error::other)?;
     if !store.paths().config_file.exists() {
         configure_offline(&store, std::io::stdin().is_terminal()).map_err(Error::other)?;
     }
     let config = store
         .load()
         .map_err(|error| Error::other(error.to_string()))?;
-    let daemon_address = local_daemon_address(config.bind);
-    let endpoint = format!("http://{daemon_address}");
-
-    let mut daemon = if tcp_ready(daemon_address) {
-        None
+    let discovered = discover_active(store.paths(), config.server_id)
+        .map_err(|error| Error::other(error.to_string()))?;
+    let (active, mut daemon) = if let Some(active) = discovered {
+        (active, None)
     } else {
+        let daemon_address = connect_address(config.bind);
         let mut command = Command::new(required_sibling(component_program(Component::Daemon))?);
-        append_root_args(&mut command, args);
+        append_root_arg(&mut command, root.as_deref());
         configure_managed_child(&mut command);
         command
             .args(["serve", "--managed"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let child = command.spawn()?;
-        Some(wait_for_child_port(child, daemon_address, "seriald")?)
+        let (daemon, active) = wait_for_child_endpoint(
+            child,
+            store.paths(),
+            config.server_id,
+            daemon_address,
+            "seriald",
+        )?;
+        (active, daemon)
     };
+    let endpoint = active.endpoint.clone();
 
     let mut mcp = None;
     let result = (|| {
         let mcp_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3211);
-        if !tcp_ready(mcp_address) {
+        if tcp_ready(mcp_address) {
+            if wait_for_matching_mcp(mcp_address, &active, MCP_IDENTITY_WAIT).is_none() {
+                return Err(Error::new(
+                    ErrorKind::AddrInUse,
+                    "127.0.0.1:3211 is occupied, but it is not protocol v5 serial-mcp connected to the selected seriald",
+                ));
+            }
+        } else {
             let mut command = Command::new(required_sibling(component_program(Component::Mcp))?);
             configure_managed_child(&mut command);
             command
@@ -228,12 +251,8 @@ fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            mcp = Some(wait_for_child_port(
-                command.spawn()?,
-                mcp_address,
-                "serial-mcp",
-            )?);
+                .stderr(Stdio::piped());
+            mcp = wait_for_mcp_child(command.spawn()?, mcp_address, &active)?;
         }
 
         println!("seriald {endpoint}  |  MCP http://127.0.0.1:3211/mcp");
@@ -248,10 +267,26 @@ fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
 }
 
 fn config_store(args: &[OsString]) -> Result<ConfigStore, String> {
-    match extract_root(args)? {
-        Some(root) => Ok(ConfigStore::new(ConfigPaths::from_root(&root))),
+    let root = resolved_root(args)?;
+    config_store_for_root(root.as_deref())
+}
+
+fn config_store_for_root(root: Option<&std::path::Path>) -> Result<ConfigStore, String> {
+    match root {
+        Some(root) => Ok(ConfigStore::new(ConfigPaths::from_root(root))),
         None => ConfigStore::platform_default().map_err(|error| error.to_string()),
     }
+}
+
+fn resolved_root(args: &[OsString]) -> Result<Option<PathBuf>, String> {
+    resolve_root(args, env::var_os("SERIALD_ROOT"))
+}
+
+fn resolve_root(
+    args: &[OsString],
+    environment_root: Option<OsString>,
+) -> Result<Option<PathBuf>, String> {
+    Ok(extract_root(args)?.or_else(|| environment_root.map(PathBuf::from)))
 }
 
 fn extract_root(args: &[OsString]) -> Result<Option<PathBuf>, String> {
@@ -274,10 +309,17 @@ fn extract_root(args: &[OsString]) -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
-fn append_root_args(command: &mut Command, args: &[OsString]) {
-    if let Ok(Some(root)) = extract_root(args) {
+fn append_root_arg(command: &mut Command, root: Option<&std::path::Path>) {
+    if let Some(root) = root {
         command.arg("--root").arg(root);
     }
+}
+
+struct OfflineConfiguration {
+    bind: SocketAddr,
+    transport_profiles: Vec<TransportProfile>,
+    model_profiles: Vec<ModelProfile>,
+    ports: Vec<SlotConfig>,
 }
 
 fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), String> {
@@ -290,17 +332,18 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
     }
     println!("后端地址 / Endpoint：seriald 监听 IP 和端口");
     println!("串口 Profile / Transport Profile：波特率、数据位、校验位");
-    println!("机型 Profile / Model Profile：机型名、Shell/U-Boot 提示符和输入方式");
+    println!("机型 Profile / Model Profile：同系列设备共用的 Shell/U-Boot 提示符和输入方式");
+    println!("具体机型名 / Model name：当前串口所连接设备的具体型号");
 
-    let mut config = if store.paths().config_file.exists() {
+    let defaults = if store.paths().config_file.exists() {
         store.load().map_err(|error| error.to_string())?
     } else {
         DaemonConfig::generate()
     };
-    let bind = prompt("后端 IP:端口", &config.bind.to_string())?;
-    config.bind = SocketAddr::from_str(&bind).map_err(|_| "后端地址格式应为 IP:端口".to_owned())?;
+    let bind = prompt("后端 IP:端口", &defaults.bind.to_string())?;
+    let bind = SocketAddr::from_str(&bind).map_err(|_| "后端地址格式应为 IP:端口".to_owned())?;
 
-    let existing_ports = config
+    let existing_ports = defaults
         .ports
         .iter()
         .map(|slot| slot.port.as_str())
@@ -313,13 +356,13 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
         .map(str::to_owned)
         .collect::<Vec<_>>();
 
-    let transport_name = config
+    let transport_name = defaults
         .transport_profiles
         .first()
         .map(|profile| profile.name.as_str())
         .unwrap_or("default-115200");
     let transport_name = prompt("串口 Profile 名", transport_name)?;
-    let baud_default = config
+    let baud_default = defaults
         .transport_profiles
         .first()
         .map(|profile| profile.baud_rate)
@@ -327,7 +370,7 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
     let baud_rate = prompt("波特率", &baud_default.to_string())?
         .parse::<u32>()
         .map_err(|_| "波特率必须是整数".to_owned())?;
-    config.transport_profiles = vec![TransportProfile {
+    let transport_profiles = vec![TransportProfile {
         name: transport_name.clone(),
         baud_rate,
         data_bits: DataBits::Eight,
@@ -339,13 +382,28 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
         auto_open: true,
     }];
 
-    let current_model = config.model_profiles.first();
-    let model_name = prompt(
-        "机型名（留空表示不绑定）",
+    let current_model = defaults.model_profiles.first();
+    let model_profile_name = prompt(
+        "机型 Profile 名（留空表示不绑定）",
         current_model
             .map(|profile| profile.name.as_str())
             .unwrap_or(""),
     )?;
+    let current_concrete_model = defaults
+        .ports
+        .first()
+        .and_then(|port| port.model_name.as_deref())
+        .or_else(|| {
+            current_model.and_then(|profile| profile.model_names.first().map(String::as_str))
+        });
+    let concrete_model_name = if model_profile_name.is_empty() {
+        String::new()
+    } else {
+        prompt(
+            "具体机型名（留空表示暂不标记）",
+            current_concrete_model.unwrap_or(""),
+        )?
+    };
     let shell_prompt = prompt_optional(
         "Shell 提示符（- 清空）",
         current_model.and_then(|profile| profile.shell_prompt.as_deref()),
@@ -354,11 +412,15 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
         "U-Boot 提示符（- 清空）",
         current_model.and_then(|profile| profile.uboot_prompt.as_deref()),
     )?;
-    config.model_profiles = if model_name.is_empty() {
+    let model_profiles = if model_profile_name.is_empty() {
         Vec::new()
     } else {
         vec![ModelProfile {
-            name: model_name.clone(),
+            name: model_profile_name.clone(),
+            model_names: (!concrete_model_name.is_empty())
+                .then(|| concrete_model_name.clone())
+                .into_iter()
+                .collect(),
             shell_prompt,
             uboot_prompt,
             write_eol: Some("\r".into()),
@@ -367,19 +429,43 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
             write_chunk_delay_ms: Some(1),
         }]
     };
-    config.ports = ports
+    let ports = ports
         .into_iter()
         .map(|port| SlotConfig {
             port,
             transport_profile: Some(transport_name.clone()),
-            model_profile: (!model_name.is_empty()).then(|| model_name.clone()),
+            model_profile: (!model_profile_name.is_empty()).then(|| model_profile_name.clone()),
+            model_name: (!concrete_model_name.is_empty()).then(|| concrete_model_name.clone()),
             enabled: true,
         })
         .collect();
-    config.config_revision = config.config_revision.saturating_add(1);
-    store.save(&config).map_err(|error| error.to_string())?;
+    persist_offline_configuration(
+        store,
+        OfflineConfiguration {
+            bind,
+            transport_profiles,
+            model_profiles,
+            ports,
+        },
+    )?;
     println!("配置已保存：{}", store.paths().config_file.display());
     Ok(())
+}
+
+fn persist_offline_configuration(
+    store: &ConfigStore,
+    draft: OfflineConfiguration,
+) -> Result<(), String> {
+    let mut current = store
+        .load_or_create()
+        .map_err(|error| error.to_string())?
+        .config;
+    current.bind = draft.bind;
+    current.transport_profiles = draft.transport_profiles;
+    current.model_profiles = draft.model_profiles;
+    current.ports = draft.ports;
+    current.config_revision = current.config_revision.saturating_add(1);
+    store.save(&current).map_err(|error| error.to_string())
 }
 
 fn prompt(label: &str, default: &str) -> Result<String, String> {
@@ -408,14 +494,6 @@ fn prompt_optional(label: &str, default: Option<&str>) -> Result<Option<String>,
     Ok((!value.is_empty() && value != "-").then_some(value))
 }
 
-fn local_daemon_address(bind: SocketAddr) -> SocketAddr {
-    if bind.ip().is_unspecified() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind.port())
-    } else {
-        bind
-    }
-}
-
 fn required_sibling(program: &OsStr) -> std::io::Result<PathBuf> {
     sibling_program(program)
         .filter(|candidate| candidate.is_file())
@@ -431,31 +509,248 @@ fn tcp_ready(address: SocketAddr) -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
 }
 
-fn wait_for_child_port(
+fn matching_mcp_health(address: SocketAddr, seriald: &ActiveEndpoint) -> Option<McpHealthResponse> {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) else {
+        return None;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request = format!("GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return None;
+    }
+    let mut response = Vec::new();
+    if stream.take(64 * 1024).read_to_end(&mut response).is_err() {
+        return None;
+    }
+    matching_mcp_health_response(&response, seriald)
+}
+
+fn wait_for_matching_mcp(
+    address: SocketAddr,
+    seriald: &ActiveEndpoint,
+    timeout: Duration,
+) -> Option<McpHealthResponse> {
+    wait_for_matching_mcp_with(timeout, || matching_mcp_health(address, seriald))
+}
+
+fn wait_for_matching_mcp_with(
+    timeout: Duration,
+    mut probe: impl FnMut() -> Option<McpHealthResponse>,
+) -> Option<McpHealthResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(health) = probe() {
+            return Some(health);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(MCP_IDENTITY_POLL);
+    }
+}
+
+#[cfg(test)]
+fn mcp_health_response_matches(response: &[u8], seriald: &ActiveEndpoint) -> bool {
+    matching_mcp_health_response(response, seriald).is_some()
+}
+
+fn matching_mcp_health_response(
+    response: &[u8],
+    seriald: &ActiveEndpoint,
+) -> Option<McpHealthResponse> {
+    let body_offset = response.windows(4).position(|part| part == b"\r\n\r\n")?;
+    let header = &response[..body_offset];
+    if !header.starts_with(b"HTTP/1.1 200 ") && !header.starts_with(b"HTTP/1.0 200 ") {
+        return None;
+    }
+    let Ok(health) = serde_json::from_slice::<McpHealthResponse>(&response[body_offset + 4..])
+    else {
+        return None;
+    };
+    (health.status == "ok"
+        && health.service == "serial-mcp"
+        && health.protocol_version == PROTOCOL_VERSION
+        && health.protocol_version == seriald.protocol_version
+        && health.pid != 0
+        && health.seriald_endpoint == seriald.endpoint
+        && health.seriald_server_id == seriald.server_id
+        && health.seriald_daemon_epoch == seriald.daemon_epoch)
+        .then_some(health)
+}
+
+fn wait_for_mcp_child(
     mut child: Child,
     address: SocketAddr,
-    name: &str,
-) -> std::io::Result<Child> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    seriald: &ActiveEndpoint,
+) -> std::io::Result<Option<Child>> {
+    let deadline = Instant::now() + MCP_STARTUP_TIMEOUT;
     loop {
-        if tcp_ready(address) {
-            return Ok(child);
+        if let Some(health) = matching_mcp_health(address, seriald) {
+            if health.pid == child.id() {
+                drain_child_stderr(&mut child);
+                return Ok(Some(child));
+            }
+            let mut loser = Some(child);
+            stop_child(&mut loser);
+            return Ok(None);
         }
         if let Some(status) = child.try_wait()? {
+            let detail = read_child_stderr(&mut child);
+            if wait_for_competing_mcp_after_exit(
+                address,
+                seriald,
+                &detail,
+                child.id(),
+                MCP_IDENTITY_WAIT.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .is_some()
+            {
+                return Ok(None);
+            }
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            };
             return Err(Error::other(format!(
-                "{name} exited during startup ({status})"
+                "serial-mcp exited during startup ({status}){suffix}"
             )));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let detail = read_child_stderr(&mut child);
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            };
             return Err(Error::new(
                 ErrorKind::TimedOut,
-                format!("{name} did not listen on {address}"),
+                format!(
+                    "serial-mcp did not publish a matching protocol v5 identity on {address}{suffix}"
+                ),
             ));
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_for_competing_mcp_after_exit(
+    address: SocketAddr,
+    seriald: &ActiveEndpoint,
+    detail: &str,
+    child_pid: u32,
+    timeout: Duration,
+) -> Option<McpHealthResponse> {
+    wait_for_competing_mcp_after_exit_with(tcp_ready(address), detail, child_pid, timeout, || {
+        matching_mcp_health(address, seriald)
+    })
+}
+
+fn wait_for_competing_mcp_after_exit_with(
+    address_ready: bool,
+    detail: &str,
+    child_pid: u32,
+    timeout: Duration,
+    probe: impl FnMut() -> Option<McpHealthResponse>,
+) -> Option<McpHealthResponse> {
+    if !address_ready && !address_in_use_detail(detail) {
+        return None;
+    }
+    wait_for_matching_mcp_with(timeout, probe).filter(|health| health.pid != child_pid)
+}
+
+fn address_in_use_detail(detail: &str) -> bool {
+    detail.contains("Address already in use")
+        || detail.contains("os error 48")
+        || detail.contains("os error 98")
+        || detail.contains("os error 10048")
+}
+
+fn wait_for_child_endpoint(
+    mut child: Child,
+    paths: &ConfigPaths,
+    server_id: uuid::Uuid,
+    expected_address: SocketAddr,
+    name: &str,
+) -> std::io::Result<(Option<Child>, ActiveEndpoint)> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if let Some(active) = discover_active(paths, server_id)
+                .map_err(|error| Error::other(error.to_string()))?
+            {
+                return Ok((None, active));
+            }
+            let detail = read_child_stderr(&mut child);
+            if detail.contains("already owned by another process") {
+                while Instant::now() < deadline {
+                    if let Some(active) = discover_active(paths, server_id)
+                        .map_err(|error| Error::other(error.to_string()))?
+                    {
+                        return Ok((None, active));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            };
+            return Err(Error::other(format!(
+                "{name} exited during startup ({status}){suffix}"
+            )));
+        }
+        let active =
+            discover_active(paths, server_id).map_err(|error| Error::other(error.to_string()))?;
+        if let Some(active) = active.as_ref()
+            && active.address == expected_address
+        {
+            drain_child_stderr(&mut child);
+            return Ok((Some(child), active.clone()));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(active) = active {
+                return Ok((None, active));
+            }
+            let detail = read_child_stderr(&mut child);
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            };
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "{name} did not publish a verified endpoint at http://{expected_address}{suffix}"
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn read_child_stderr(child: &mut Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = stderr.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).trim().to_owned()
+}
+
+fn drain_child_stderr(child: &mut Child) {
+    let Some(mut stderr) = child.stderr.take() else {
+        return;
+    };
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+    });
 }
 
 fn stop_child(child: &mut Option<Child>) {
@@ -550,6 +845,40 @@ mod tests {
     }
 
     #[test]
+    fn interactive_setup_rebases_on_the_atomic_first_create_winner() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(root.path()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let winner_store = store.clone();
+        let winner_barrier = barrier.clone();
+        let winner = std::thread::spawn(move || {
+            let loaded = winner_store.load_or_create().unwrap();
+            winner_barrier.wait();
+            (loaded.config.server_id, loaded.config.config_revision)
+        });
+
+        barrier.wait();
+        let stale = DaemonConfig::generate();
+        let requested_bind = "127.0.0.1:4321".parse().unwrap();
+        persist_offline_configuration(
+            &store,
+            OfflineConfiguration {
+                bind: requested_bind,
+                transport_profiles: stale.transport_profiles,
+                model_profiles: stale.model_profiles,
+                ports: stale.ports,
+            },
+        )
+        .unwrap();
+
+        let (winner_server_id, winner_revision) = winner.join().unwrap();
+        let saved = store.load().unwrap();
+        assert_eq!(saved.server_id, winner_server_id);
+        assert_eq!(saved.config_revision, winner_revision + 1);
+        assert_eq!(saved.bind, requested_bind);
+    }
+
+    #[test]
     fn root_only_invocation_selects_unified_mode_and_setup_is_detected() {
         let root_only = vec![OsString::from("--root"), OsString::from("/tmp/serial")];
         assert_eq!(dispatch_token(&root_only), (None, true));
@@ -562,11 +891,145 @@ mod tests {
     }
 
     #[test]
-    fn setup_help_is_short_and_describes_the_three_configuration_groups() {
+    fn unified_root_matches_seriald_environment_resolution() {
+        let environment = OsString::from("environment-root");
+        assert_eq!(
+            resolve_root(&[], Some(environment.clone())).unwrap(),
+            Some(PathBuf::from("environment-root"))
+        );
+        assert_eq!(
+            resolve_root(
+                &[OsString::from("--root"), OsString::from("explicit-root")],
+                Some(environment.clone()),
+            )
+            .unwrap(),
+            Some(PathBuf::from("explicit-root"))
+        );
+        assert_eq!(
+            resolve_root(&[OsString::from("--root=inline-root")], Some(environment)).unwrap(),
+            Some(PathBuf::from("inline-root"))
+        );
+        assert_eq!(resolve_root(&[], None).unwrap(), None);
+    }
+
+    #[test]
+    fn setup_help_is_short_and_describes_each_configuration_item() {
         assert!(SETUP_HELP.contains("serial setup [--root DIR]"));
         assert!(SETUP_HELP.contains("后端地址"));
         assert!(SETUP_HELP.contains("串口 Profile"));
         assert!(SETUP_HELP.contains("机型 Profile"));
+        assert!(SETUP_HELP.contains("具体机型名"));
+    }
+
+    #[test]
+    fn mcp_health_must_match_service_protocol_and_selected_seriald_identity() {
+        let seriald = ActiveEndpoint::new(
+            "127.0.0.1:4321".parse().unwrap(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            42,
+        );
+        let health = McpHealthResponse {
+            status: "ok".into(),
+            service: "serial-mcp".into(),
+            protocol_version: PROTOCOL_VERSION,
+            pid: 43,
+            seriald_endpoint: seriald.endpoint.clone(),
+            seriald_server_id: seriald.server_id,
+            seriald_daemon_epoch: seriald.daemon_epoch,
+        };
+        let body = serde_json::to_string(&health).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(mcp_health_response_matches(response.as_bytes(), &seriald));
+
+        let wrong_epoch = McpHealthResponse {
+            seriald_daemon_epoch: uuid::Uuid::new_v4(),
+            ..health
+        };
+        let body = serde_json::to_string(&wrong_epoch).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(!mcp_health_response_matches(response.as_bytes(), &seriald));
+        assert!(!mcp_health_response_matches(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            &seriald
+        ));
+    }
+
+    #[test]
+    fn occupied_port_waits_for_a_delayed_matching_mcp_identity() {
+        let seriald = ActiveEndpoint::new(
+            "127.0.0.1:4321".parse().unwrap(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            42,
+        );
+        let health = McpHealthResponse {
+            status: "ok".into(),
+            service: "serial-mcp".into(),
+            protocol_version: PROTOCOL_VERSION,
+            pid: 44,
+            seriald_endpoint: seriald.endpoint,
+            seriald_server_id: seriald.server_id,
+            seriald_daemon_epoch: seriald.daemon_epoch,
+        };
+        let mut attempts = 0;
+        let matched = wait_for_matching_mcp_with(Duration::from_millis(500), || {
+            attempts += 1;
+            (attempts == 3).then(|| health.clone())
+        });
+        assert_eq!(matched, Some(health));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn addr_in_use_loser_waits_for_the_delayed_winner_identity() {
+        let seriald = ActiveEndpoint::new(
+            "127.0.0.1:4321".parse().unwrap(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            42,
+        );
+        let winner = McpHealthResponse {
+            status: "ok".into(),
+            service: "serial-mcp".into(),
+            protocol_version: PROTOCOL_VERSION,
+            pid: 44,
+            seriald_endpoint: seriald.endpoint,
+            seriald_server_id: seriald.server_id,
+            seriald_daemon_epoch: seriald.daemon_epoch,
+        };
+        let mut attempts = 0;
+        let matched = wait_for_competing_mcp_after_exit_with(
+            false,
+            "bind serial-mcp: Address already in use (os error 48)",
+            43,
+            Duration::from_millis(500),
+            || {
+                attempts += 1;
+                (attempts == 3).then(|| winner.clone())
+            },
+        );
+        assert_eq!(matched, Some(winner));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn unrelated_listener_is_rejected_after_the_bounded_identity_wait() {
+        let started = Instant::now();
+        let mut attempts = 0;
+        let matched = wait_for_matching_mcp_with(Duration::from_millis(120), || {
+            attempts += 1;
+            None
+        });
+        assert!(matched.is_none());
+        assert!(attempts >= 2);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
 
