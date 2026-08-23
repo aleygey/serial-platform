@@ -31,7 +31,7 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 - 分段 journal、CRC、断尾恢复、gap ledger、保留上限和 bounded regex 查询。
 - daemon-owned Trigger：kickoff、重复 action、RX stop literal 和硬上限。
 - 持久 Monitor：1–16 个 OR literal/regex matcher、burst grouping、命中条件、精确串口范围、证据游标和 acknowledge。
-- HTTP v1 与 WebSocket protocol v6；`seriald.toml` 配置 schema 3；公开请求和事件统一使用 `port`。
+- HTTP v1 与 WebSocket protocol v6；`seriald.toml` 配置 schema 3，并提供经过验证、带原始备份的 schema 2 单向迁移；公开请求和事件统一使用 `port`。
 
 ### serialctl / TUI
 

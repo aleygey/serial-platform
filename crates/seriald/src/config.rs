@@ -17,8 +17,8 @@ use std::{
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    FlowControl, MAX_MODEL_FAMILIES, MAX_MODEL_NAMES_PER_FAMILY, ModelFamily, ModelProfile,
-    SlotConfig, TransportProfile,
+    EchoMode, FlowControl, MAX_MODEL_FAMILIES, MAX_MODEL_NAMES_PER_FAMILY, ModelFamily,
+    ModelProfile, SlotConfig, TransportProfile,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -46,6 +46,8 @@ const MAX_PORT_NAME_BYTES: usize = 512;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_MODEL_NAME_BYTES: usize = 128;
 const MAX_PROMPT_PATTERN_BYTES: usize = 4096;
+const MAX_CONFIG_MIGRATION_RETRIES: usize = 8;
+const MAX_CONFIG_MIGRATION_BACKUPS: usize = 128;
 
 /// Files owned by one serial-platform installation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +173,153 @@ pub struct DaemonConfig {
     pub model_profiles: Vec<ModelProfile>,
     #[serde(default)]
     pub model_families: Vec<ModelFamily>,
+}
+
+/// The schema-2 shape is retained solely for a lossless, one-way startup
+/// migration. In schema 2, model identity names lived inside the interaction
+/// profile and a port's selected family was implied by `model_profile`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonConfigV2 {
+    schema_version: u32,
+    #[serde(default = "default_config_revision")]
+    config_revision: u64,
+    server_id: Uuid,
+    bind: SocketAddr,
+    #[serde(default)]
+    logging: LoggingConfig,
+    #[serde(default)]
+    control: ControlConfig,
+    #[serde(default)]
+    ports: Vec<SlotConfigV2>,
+    #[serde(default)]
+    transport_profiles: Vec<TransportProfile>,
+    #[serde(default)]
+    model_profiles: Vec<ModelProfileV2>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlotConfigV2 {
+    port: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_name: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelProfileV2 {
+    name: String,
+    /// `None` also distinguishes the released v0.8.0 schema-2 shape from the
+    /// later schema-2 development shape when another profile or port carries
+    /// one of the added identity fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shell_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uboot_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_eol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    echo: Option<EchoMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_chunk_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_chunk_delay_ms: Option<u64>,
+}
+
+impl DaemonConfigV2 {
+    fn migrate(self) -> DaemonConfig {
+        // The released v0.8.0 schema used ModelProfile.name as both behavior
+        // profile and device identity. A later development build added
+        // model_names/model_name without changing schema_version. Presence of
+        // either added field selects that extended shape config-wide; if no
+        // marker exists, preserving the released behavior is the only
+        // lossless interpretation of the ambiguous TOML.
+        let extended_identity_shape = self
+            .model_profiles
+            .iter()
+            .any(|profile| profile.model_names.is_some())
+            || self.ports.iter().any(|slot| slot.model_name.is_some());
+        let model_families = self
+            .model_profiles
+            .iter()
+            .map(|profile| ModelFamily {
+                name: profile.name.clone(),
+                model_names: if extended_identity_shape {
+                    profile.model_names.clone().unwrap_or_default()
+                } else {
+                    vec![profile.name.clone()]
+                },
+            })
+            .collect();
+        let model_profiles = self
+            .model_profiles
+            .into_iter()
+            .map(|profile| ModelProfile {
+                name: profile.name,
+                shell_prompt: profile.shell_prompt,
+                uboot_prompt: profile.uboot_prompt,
+                write_eol: profile.write_eol,
+                echo: profile.echo,
+                write_chunk_size: profile.write_chunk_size,
+                write_chunk_delay_ms: profile.write_chunk_delay_ms,
+            })
+            .collect();
+        let ports = self
+            .ports
+            .into_iter()
+            .map(|slot| {
+                let (model_family, model_name) = if extended_identity_shape {
+                    (
+                        slot.model_name
+                            .as_ref()
+                            .and_then(|_| slot.model_profile.clone()),
+                        slot.model_name,
+                    )
+                } else {
+                    (slot.model_profile.clone(), slot.model_profile.clone())
+                };
+                SlotConfig {
+                    port: slot.port,
+                    transport_profile: slot.transport_profile,
+                    model_profile: slot.model_profile,
+                    model_family,
+                    model_name,
+                    enabled: slot.enabled,
+                }
+            })
+            .collect();
+
+        DaemonConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            config_revision: self.config_revision,
+            server_id: self.server_id,
+            bind: self.bind,
+            logging: self.logging,
+            control: self.control,
+            ports,
+            transport_profiles: self.transport_profiles,
+            model_profiles,
+            model_families,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigSchemaHeader {
+    schema_version: u32,
+}
+
+struct ParsedConfig {
+    config: DaemonConfig,
+    schema2_source: Option<String>,
 }
 
 const fn default_config_revision() -> u64 {
@@ -363,12 +512,14 @@ impl ConfigStore {
     }
 
     /// Loads an existing valid configuration or atomically creates the first
-    /// one. Existing unreadable or invalid files are never overwritten.
+    /// one. A valid schema-2 configuration is backed up and atomically
+    /// rewritten in schema 3. Existing unreadable or invalid files are never
+    /// overwritten.
     pub fn load_or_create(&self) -> Result<LoadedConfig, ConfigError> {
         self.ensure_directories()?;
 
         let config = if self.paths.config_file.exists() {
-            self.load()?
+            self.load_and_persist_migration()?
         } else {
             let config = DaemonConfig::generate();
             config.validate()?;
@@ -379,7 +530,7 @@ impl ConfigStore {
             {
                 config
             } else {
-                self.load()?
+                self.load_and_persist_migration()?
             }
         };
 
@@ -390,8 +541,62 @@ impl ConfigStore {
         })
     }
 
-    /// Loads and validates an existing configuration without creating one.
+    /// Loads and validates an existing configuration without creating or
+    /// rewriting one. Schema 2 is migrated in memory so discovery and unified
+    /// launcher paths can read the installation identity before seriald owns
+    /// the runtime lock.
     pub fn load(&self) -> Result<DaemonConfig, ConfigError> {
+        Ok(self.read_existing()?.config)
+    }
+
+    fn load_and_persist_migration(&self) -> Result<DaemonConfig, ConfigError> {
+        for _ in 0..MAX_CONFIG_MIGRATION_RETRIES {
+            let parsed = self.read_existing()?;
+            let Some(schema2_source) = parsed.schema2_source.as_deref() else {
+                return Ok(parsed.config);
+            };
+            if self.persist_schema2_migration(schema2_source, &parsed.config)? {
+                return Ok(parsed.config);
+            }
+        }
+        Err(ConfigError::MigrationConflict {
+            path: self.paths.config_file.clone(),
+        })
+    }
+
+    fn read_existing(&self) -> Result<ParsedConfig, ConfigError> {
+        let serialized = self.read_serialized()?;
+        let header: ConfigSchemaHeader =
+            toml::from_str(&serialized).map_err(|_| ConfigError::InvalidToml {
+                path: self.paths.config_file.clone(),
+            })?;
+        let (config, schema2_source) = match header.schema_version {
+            2 => {
+                let legacy: DaemonConfigV2 =
+                    toml::from_str(&serialized).map_err(|_| ConfigError::InvalidToml {
+                        path: self.paths.config_file.clone(),
+                    })?;
+                (legacy.migrate(), Some(serialized))
+            }
+            CONFIG_SCHEMA_VERSION => {
+                let config: DaemonConfig =
+                    toml::from_str(&serialized).map_err(|_| ConfigError::InvalidToml {
+                        path: self.paths.config_file.clone(),
+                    })?;
+                (config, None)
+            }
+            version => {
+                return Err(ConfigValidationError::UnsupportedSchemaVersion(version).into());
+            }
+        };
+        config.validate()?;
+        Ok(ParsedConfig {
+            config,
+            schema2_source,
+        })
+    }
+
+    fn read_serialized(&self) -> Result<String, ConfigError> {
         let metadata = fs::metadata(&self.paths.config_file)
             .map_err(|source| io_error(&self.paths.config_file, source))?;
         if metadata.len() > MAX_CONFIG_FILE_BYTES {
@@ -402,14 +607,65 @@ impl ConfigStore {
         }
         restrict_config_file_permissions(&self.paths.config_file)
             .map_err(|source| io_error(&self.paths.config_file, source))?;
-        let serialized = fs::read_to_string(&self.paths.config_file)
+        fs::read_to_string(&self.paths.config_file)
+            .map_err(|source| io_error(&self.paths.config_file, source))
+    }
+
+    /// Returns `false` when the source changed since it was parsed. The caller
+    /// must then reload and migrate the newer contents instead of overwriting
+    /// a concurrent configuration update.
+    fn persist_schema2_migration(
+        &self,
+        expected_source: &str,
+        migrated: &DaemonConfig,
+    ) -> Result<bool, ConfigError> {
+        if self.read_serialized()? != expected_source {
+            return Ok(false);
+        }
+
+        self.ensure_schema2_backup(expected_source)?;
+
+        // Creating the backup takes time and may race a non-daemon offline
+        // writer. Recheck immediately before the atomic replacement.
+        if self.read_serialized()? != expected_source {
+            return Ok(false);
+        }
+        let serialized =
+            toml::to_string_pretty(migrated).map_err(|_| ConfigError::Serialization)?;
+        atomic_write(&self.paths.config_file, serialized.as_bytes())
             .map_err(|source| io_error(&self.paths.config_file, source))?;
-        let config: DaemonConfig =
-            toml::from_str(&serialized).map_err(|_| ConfigError::InvalidToml {
-                path: self.paths.config_file.clone(),
-            })?;
-        config.validate()?;
-        Ok(config)
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn schema2_backup_path(&self) -> PathBuf {
+        self.schema2_backup_path_at(0)
+    }
+
+    fn schema2_backup_path_at(&self, index: usize) -> PathBuf {
+        if index == 0 {
+            self.paths.config_file.with_extension("toml.schema2.bak")
+        } else {
+            self.paths
+                .config_file
+                .with_extension(format!("toml.schema2.{index}.bak"))
+        }
+    }
+
+    fn ensure_schema2_backup(&self, expected_source: &str) -> Result<PathBuf, ConfigError> {
+        for index in 0..MAX_CONFIG_MIGRATION_BACKUPS {
+            let backup_path = self.schema2_backup_path_at(index);
+            if atomic_create(&backup_path, expected_source.as_bytes())
+                .map_err(|source| io_error(&backup_path, source))?
+                || regular_file_has_contents(&backup_path, expected_source.as_bytes())
+            {
+                return Ok(backup_path);
+            }
+        }
+        Err(ConfigError::MigrationBackupExhausted {
+            path: self.paths.config_file.clone(),
+            limit: MAX_CONFIG_MIGRATION_BACKUPS,
+        })
     }
 
     /// Validates and atomically replaces the persisted configuration.
@@ -483,6 +739,15 @@ impl ConfigStore {
     }
 }
 
+fn regular_file_has_contents(path: &Path, expected: &[u8]) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && metadata.len() == expected.len() as u64
+        && fs::read(path).is_ok_and(|contents| contents == expected)
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("the operating system did not provide a user configuration directory")]
@@ -497,6 +762,12 @@ pub enum ConfigError {
         "configuration file at {path} exceeds the {MAX_CONFIG_FILE_BYTES}-byte limit ({bytes} bytes)"
     )]
     ConfigFileTooLarge { path: PathBuf, bytes: u64 },
+    #[error("configuration at {path} kept changing while schema 2 migration was in progress")]
+    MigrationConflict { path: PathBuf },
+    #[error(
+        "configuration at {path} has no free schema-2 backup slot among {limit} protected paths"
+    )]
+    MigrationBackupExhausted { path: PathBuf, limit: usize },
     #[error("configuration file at {path} is not valid TOML")]
     InvalidToml { path: PathBuf },
     #[error("configuration could not be serialized")]
@@ -1192,6 +1463,78 @@ mod tests {
         }
     }
 
+    fn schema2_config() -> DaemonConfigV2 {
+        DaemonConfigV2 {
+            schema_version: 2,
+            config_revision: 37,
+            server_id: Uuid::parse_str("842d93cb-5dee-47fe-8453-0583e878497d").unwrap(),
+            bind: "127.0.0.1:4321".parse().unwrap(),
+            logging: LoggingConfig {
+                max_total_bytes: 12 * GIB,
+                retention_target_percent: 83,
+                segment_max_bytes: 2 * 1024 * 1024,
+            },
+            control: ControlConfig {
+                max_ttl_ms: 90_000,
+                wait_timeout_ms: 75_000,
+                max_waiters: 17,
+            },
+            ports: vec![
+                SlotConfigV2 {
+                    port: "COM4".into(),
+                    transport_profile: Some("uart-fast".into()),
+                    model_profile: Some("TL-AS7230".into()),
+                    model_name: Some("TL-AS7230-W 1.0".into()),
+                    enabled: true,
+                },
+                SlotConfigV2 {
+                    port: "COM5".into(),
+                    transport_profile: None,
+                    model_profile: Some("generic-shell".into()),
+                    model_name: None,
+                    enabled: false,
+                },
+                SlotConfigV2 {
+                    port: "COM6".into(),
+                    transport_profile: None,
+                    model_profile: None,
+                    model_name: None,
+                    enabled: true,
+                },
+            ],
+            transport_profiles: vec![transport_profile("uart-fast")],
+            model_profiles: vec![
+                ModelProfileV2 {
+                    name: "TL-AS7230".into(),
+                    model_names: Some(vec!["TL-AS7230-W 1.0".into(), "TL-AS7230-F4GE 1.0".into()]),
+                    shell_prompt: Some("/ # ".into()),
+                    uboot_prompt: Some("U-Boot> ".into()),
+                    write_eol: Some("\r".into()),
+                    echo: Some(EchoMode::Auto),
+                    write_chunk_size: Some(7),
+                    write_chunk_delay_ms: Some(13),
+                },
+                ModelProfileV2 {
+                    name: "generic-shell".into(),
+                    model_names: None,
+                    shell_prompt: Some("# ".into()),
+                    uboot_prompt: None,
+                    write_eol: Some("\n".into()),
+                    echo: Some(EchoMode::On),
+                    write_chunk_size: None,
+                    write_chunk_delay_ms: None,
+                },
+            ],
+        }
+    }
+
+    fn write_schema2(store: &ConfigStore, config: &DaemonConfigV2) -> String {
+        store.ensure_directories().unwrap();
+        let source = toml::to_string_pretty(config).unwrap();
+        fs::write(&store.paths.config_file, &source).unwrap();
+        source
+    }
+
     #[test]
     fn fresh_configuration_is_token_free_and_works_on_lan_bindings() {
         let mut config = DaemonConfig::generate();
@@ -1322,6 +1665,401 @@ mod tests {
         assert_eq!(created.config.schema_version, CONFIG_SCHEMA_VERSION);
         let loaded = store.load().unwrap();
         assert_eq!(loaded.server_id, created.config.server_id);
+    }
+
+    #[test]
+    fn schema2_migration_preserves_configuration_and_splits_model_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let legacy = schema2_config();
+        let original = write_schema2(&store, &legacy);
+
+        let loaded = store.load_or_create().unwrap().config;
+
+        assert_eq!(loaded.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(loaded.config_revision, legacy.config_revision);
+        assert_eq!(loaded.server_id, legacy.server_id);
+        assert_eq!(loaded.bind, legacy.bind);
+        assert_eq!(loaded.logging, legacy.logging);
+        assert_eq!(loaded.control, legacy.control);
+        assert_eq!(loaded.transport_profiles, legacy.transport_profiles);
+        assert_eq!(loaded.ports.len(), 3);
+        assert_eq!(loaded.ports[0].model_profile.as_deref(), Some("TL-AS7230"));
+        assert_eq!(loaded.ports[0].model_family.as_deref(), Some("TL-AS7230"));
+        assert_eq!(
+            loaded.ports[0].model_name.as_deref(),
+            Some("TL-AS7230-W 1.0")
+        );
+        assert_eq!(
+            loaded.ports[1].model_profile.as_deref(),
+            Some("generic-shell")
+        );
+        assert!(loaded.ports[1].model_family.is_none());
+        assert!(loaded.ports[1].model_name.is_none());
+        assert!(loaded.ports[2].model_profile.is_none());
+        assert!(loaded.ports[2].model_family.is_none());
+        assert!(loaded.ports[2].model_name.is_none());
+
+        assert_eq!(loaded.model_profiles.len(), 2);
+        assert_eq!(loaded.model_profiles[0].name, "TL-AS7230");
+        assert_eq!(
+            loaded.model_profiles[0].shell_prompt.as_deref(),
+            Some("/ # ")
+        );
+        assert_eq!(loaded.model_profiles[0].write_chunk_size, Some(7));
+        assert_eq!(loaded.model_profiles[0].write_chunk_delay_ms, Some(13));
+        assert_eq!(loaded.model_families.len(), 2);
+        assert_eq!(loaded.model_families[0].name, "TL-AS7230");
+        assert_eq!(
+            loaded.model_families[0].model_names,
+            ["TL-AS7230-W 1.0", "TL-AS7230-F4GE 1.0"]
+        );
+        assert_eq!(loaded.model_families[1].name, "generic-shell");
+        assert!(loaded.model_families[1].model_names.is_empty());
+        assert_eq!(
+            fs::read_to_string(store.schema2_backup_path()).unwrap(),
+            original
+        );
+
+        let persisted = fs::read_to_string(&store.paths.config_file).unwrap();
+        assert!(persisted.contains("schema_version = 3"));
+        assert_eq!(store.load().unwrap().server_id, legacy.server_id);
+    }
+
+    #[test]
+    fn released_schema2_profile_identity_is_preserved_without_extended_fields() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut legacy = schema2_config();
+        legacy.model_profiles = vec![ModelProfileV2 {
+            name: "TL-AS7230-W 1.0".into(),
+            model_names: None,
+            shell_prompt: Some("/ # ".into()),
+            uboot_prompt: None,
+            write_eol: Some("\r".into()),
+            echo: Some(EchoMode::Auto),
+            write_chunk_size: Some(1),
+            write_chunk_delay_ms: Some(1),
+        }];
+        legacy.ports = vec![
+            SlotConfigV2 {
+                port: "COM4".into(),
+                transport_profile: Some("uart-fast".into()),
+                model_profile: Some("TL-AS7230-W 1.0".into()),
+                model_name: None,
+                enabled: true,
+            },
+            SlotConfigV2 {
+                port: "COM5".into(),
+                transport_profile: None,
+                model_profile: None,
+                model_name: None,
+                enabled: false,
+            },
+        ];
+        write_schema2(&store, &legacy);
+
+        let migrated = store.load_or_create().unwrap().config;
+
+        assert_eq!(
+            migrated.model_families,
+            vec![ModelFamily {
+                name: "TL-AS7230-W 1.0".into(),
+                model_names: vec!["TL-AS7230-W 1.0".into()],
+            }]
+        );
+        assert_eq!(
+            migrated.ports[0].model_profile.as_deref(),
+            Some("TL-AS7230-W 1.0")
+        );
+        assert_eq!(
+            migrated.ports[0].model_family.as_deref(),
+            Some("TL-AS7230-W 1.0")
+        );
+        assert_eq!(
+            migrated.ports[0].model_name.as_deref(),
+            Some("TL-AS7230-W 1.0")
+        );
+        assert!(migrated.ports[1].model_family.is_none());
+        assert!(migrated.ports[1].model_name.is_none());
+    }
+
+    #[test]
+    fn schema2_migration_preserves_maximum_revision() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut legacy = schema2_config();
+        legacy.config_revision = u64::MAX;
+        write_schema2(&store, &legacy);
+
+        let migrated = store.load_or_create().unwrap().config;
+
+        assert_eq!(migrated.config_revision, u64::MAX);
+        assert!(matches!(
+            migrated.staged_with_ports(migrated.ports.clone()),
+            Err(ConfigValidationError::RevisionExhausted)
+        ));
+    }
+
+    #[test]
+    fn schema2_migration_preserves_the_default_revision_when_it_was_omitted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let source = toml::to_string_pretty(&schema2_config()).unwrap().replacen(
+            "config_revision = 37\n",
+            "",
+            1,
+        );
+        store.ensure_directories().unwrap();
+        fs::write(&store.paths.config_file, source).unwrap();
+
+        let migrated = store.load_or_create().unwrap().config;
+
+        assert_eq!(migrated.config_revision, default_config_revision());
+    }
+
+    #[test]
+    fn explicit_empty_model_names_selects_the_extended_schema2_shape() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut legacy = schema2_config();
+        legacy.model_profiles = vec![ModelProfileV2 {
+            name: "generic-shell".into(),
+            model_names: Some(Vec::new()),
+            shell_prompt: Some("# ".into()),
+            uboot_prompt: None,
+            write_eol: Some("\r".into()),
+            echo: Some(EchoMode::Auto),
+            write_chunk_size: None,
+            write_chunk_delay_ms: None,
+        }];
+        legacy.ports = vec![SlotConfigV2 {
+            port: "COM4".into(),
+            transport_profile: None,
+            model_profile: Some("generic-shell".into()),
+            model_name: None,
+            enabled: true,
+        }];
+        let source = write_schema2(&store, &legacy);
+        assert!(source.contains("model_names = []"));
+
+        let migrated = store.load_or_create().unwrap().config;
+
+        assert!(migrated.model_families[0].model_names.is_empty());
+        assert_eq!(
+            migrated.ports[0].model_profile.as_deref(),
+            Some("generic-shell")
+        );
+        assert!(migrated.ports[0].model_family.is_none());
+        assert!(migrated.ports[0].model_name.is_none());
+    }
+
+    #[test]
+    fn schema2_load_is_read_only_until_startup_persists_the_migration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            fs::read_to_string(&store.paths.config_file).unwrap(),
+            original
+        );
+        assert!(!store.schema2_backup_path().exists());
+    }
+
+    #[test]
+    fn persisted_schema2_migration_is_idempotent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        write_schema2(&store, &schema2_config());
+        store.load_or_create().unwrap();
+        let first_config = fs::read(&store.paths.config_file).unwrap();
+        let first_backup = fs::read(store.schema2_backup_path()).unwrap();
+
+        store.load_or_create().unwrap();
+
+        assert_eq!(fs::read(&store.paths.config_file).unwrap(), first_config);
+        assert_eq!(fs::read(store.schema2_backup_path()).unwrap(), first_backup);
+    }
+
+    #[test]
+    fn schema2_migration_uses_a_numbered_path_when_the_base_backup_conflicts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+        let sentinel = b"existing schema-2 backup";
+        fs::write(store.schema2_backup_path(), sentinel).unwrap();
+
+        store.load_or_create().unwrap();
+
+        assert_eq!(fs::read(store.schema2_backup_path()).unwrap(), sentinel);
+        assert_eq!(
+            fs::read_to_string(store.schema2_backup_path_at(1)).unwrap(),
+            original
+        );
+        assert_eq!(store.load().unwrap().schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema2_migration_reuses_an_identical_existing_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+        fs::write(store.schema2_backup_path(), &original).unwrap();
+
+        store.load_or_create().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(store.schema2_backup_path()).unwrap(),
+            original
+        );
+        assert!(!store.schema2_backup_path_at(1).exists());
+    }
+
+    #[test]
+    fn schema2_migration_does_not_reuse_a_differently_sized_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+        let conflicting = vec![b'x'; original.len() + 1];
+        fs::write(store.schema2_backup_path(), &conflicting).unwrap();
+
+        store.load_or_create().unwrap();
+
+        assert_eq!(fs::read(store.schema2_backup_path()).unwrap(), conflicting);
+        assert_eq!(
+            fs::read_to_string(store.schema2_backup_path_at(1)).unwrap(),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema2_migration_never_treats_a_symlink_as_the_backup() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+        symlink(&store.paths.config_file, store.schema2_backup_path()).unwrap();
+
+        store.load_or_create().unwrap();
+
+        assert!(
+            fs::symlink_metadata(store.schema2_backup_path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(store.schema2_backup_path_at(1)).unwrap(),
+            original
+        );
+        assert_eq!(store.load().unwrap().schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn concurrent_schema2_migrators_converge_without_overwriting_the_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+        let workers = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.load_or_create().map(|loaded| loaded.config)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let migrated = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(
+            migrated
+                .iter()
+                .all(|config| config.schema_version == CONFIG_SCHEMA_VERSION)
+        );
+        assert!(migrated.iter().all(|config| config.config_revision == 37));
+        assert_eq!(
+            fs::read_to_string(store.schema2_backup_path()).unwrap(),
+            original
+        );
+        assert_eq!(store.load().unwrap().schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn unsupported_schema_is_rejected_without_modifying_the_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut config = schema2_config();
+        config.schema_version = CONFIG_SCHEMA_VERSION + 1;
+        let original = write_schema2(&store, &config);
+
+        assert!(matches!(
+            store.load_or_create(),
+            Err(ConfigError::Validation(
+                ConfigValidationError::UnsupportedSchemaVersion(version)
+            )) if version == CONFIG_SCHEMA_VERSION + 1
+        ));
+        assert_eq!(
+            fs::read_to_string(&store.paths.config_file).unwrap(),
+            original
+        );
+        assert!(!store.schema2_backup_path().exists());
+    }
+
+    #[test]
+    fn invalid_schema2_is_rejected_without_modifying_or_backing_up_the_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let mut config = schema2_config();
+        config.ports[0].model_name = Some("not-in-the-profile".into());
+        let original = write_schema2(&store, &config);
+
+        assert!(matches!(
+            store.load_or_create(),
+            Err(ConfigError::Validation(
+                ConfigValidationError::UnknownModelName { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::read_to_string(&store.paths.config_file).unwrap(),
+            original
+        );
+        assert!(!store.schema2_backup_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_schema2_replacement_leaves_the_original_file_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(temporary.path()));
+        let original = write_schema2(&store, &schema2_config());
+        fs::write(store.schema2_backup_path(), &original).unwrap();
+        let parsed = store.read_existing().unwrap();
+        fs::set_permissions(&store.paths.config_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = store
+            .persist_schema2_migration(parsed.schema2_source.as_deref().unwrap(), &parsed.config);
+
+        fs::set_permissions(&store.paths.config_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(ConfigError::Io { .. })));
+        assert_eq!(
+            fs::read_to_string(&store.paths.config_file).unwrap(),
+            original
+        );
     }
 
     #[test]

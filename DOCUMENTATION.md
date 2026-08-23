@@ -82,7 +82,7 @@ Serial Platform 是通用的人/Agent 协同串口平台：后端独占物理 UA
 
 `transport_profile` 与 `model_profile` 可以各自省略。`model_family` 与 `model_name` 是独立于行为 Profile 的身份对：必须同时设置或同时省略，且具体名必须存在于对应 Model Family 的 `model_names` 中。解绑行为 Profile 不会清除机型身份；清除身份时两个字段一起清除。`enabled=false` 保留配置但不打开串口。
 
-配置更新带 `config_revision` 乐观并发保护。后端先验证完整候选配置，再持久化并发布；物理 UART 变更通过暂停、关闭旧句柄、应用、提交的事务路径完成。失败不会留下部分生效的配置。当前 `seriald.toml` 持久配置是 `schema_version=3`；旧 schema 直接拒绝，不执行隐式迁移。
+配置更新带 `config_revision` 乐观并发保护。后端先验证完整候选配置，再持久化并发布；物理 UART 变更通过暂停、关闭旧句柄、应用、提交的事务路径完成。失败不会留下部分生效的配置。当前 `seriald.toml` 持久配置是 `schema_version=3`。首次加载 schema 2 时，后端会严格解析并验证旧配置，在内存中确定性拆分行为 Profile 与两级机型身份，保留原 `server_id`、`config_revision` 和其他配置；取得数据目录所有权后先以 create-new 语义保留原始备份，再原子写入 schema 3。迁移失败不覆盖原文件；没有明确迁移规则的其他 schema 继续拒绝。
 
 端口重配事件记录 `source`、行为 Profile、一级机型系列和二级具体机型的前后值。MCP 最近上下文只向 Agent 摘要端口被重配以及机型身份的前后值，不暴露行为 Profile 名；Agent 可重新调用 `devices` 获取当前已生效的提示符。
 

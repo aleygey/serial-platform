@@ -168,7 +168,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 
 响应返回更新后的 `ports` snapshots 与新 `config_revision`。`source` 是 1–128 字符的审计标签。`model_profile` 是独立的行为绑定；`model_family` 和 `model_name` 必须同时为字符串或同时为 null/省略，具体机型必须存在于对应 family 中。
 
-`seriald.toml` 的当前持久配置是 `schema_version=3`。该号码与 `active-endpoint.json` 和 Monitor state 的 schema 无关；旧配置 schema 直接返回 unsupported schema，不执行隐式迁移。
+`seriald.toml` 的当前持久配置是 `schema_version=3`。该号码与 `active-endpoint.json` 和 Monitor state 的 schema 无关。schema 2 有一条严格、单向的启动迁移：先验证完整旧配置并保留原始备份，再原子写入 schema 3；迁移保留 `server_id`、`config_revision`、串口配置、行为 Profile、机型身份和端口绑定。只读 discovery 可在内存中读取迁移结果但不改盘；持有数据目录运行时所有权的启动路径负责持久化。迁移失败或遇到其他 schema 时返回错误且不覆盖原文件。
 
 Transport Profile：
 
