@@ -13,14 +13,14 @@ use axum::routing::{get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serial_protocol::{
     Actor, ActorKind, ArchiveListResponse, ClientMessage, CommandResult,
-    ConfigureModelProfilesRequest, ConfigureModelProfilesResponse, ConfigurePortsRequest,
-    ConfigurePortsResponse, ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse,
-    CreateMonitorRequest, Cursor, DaemonDiagnosticsResponse, ErrorCode, EventQuery,
-    EventQueryResponse, GapRange, HealthResponse, ModelProfileListResponse,
-    MonitorIncidentListResponse, MonitorIncidentResponse, MonitorListResponse, MonitorResponse,
-    MonitorStatus, PROTOCOL_VERSION, PortDescriptor, ServerMessage, SlotDiagnostics,
-    StatusResponse, StorageDiagnosticsResponse, TransportProfileListResponse, UpdateMonitorRequest,
-    encode_control, encode_event,
+    ConfigureModelFamiliesRequest, ConfigureModelFamiliesResponse, ConfigureModelProfilesRequest,
+    ConfigureModelProfilesResponse, ConfigurePortsRequest, ConfigurePortsResponse,
+    ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse, CreateMonitorRequest,
+    Cursor, DaemonDiagnosticsResponse, ErrorCode, EventQuery, EventQueryResponse, GapRange,
+    HealthResponse, ModelFamilyListResponse, ModelProfileListResponse, MonitorIncidentListResponse,
+    MonitorIncidentResponse, MonitorListResponse, MonitorResponse, MonitorStatus, PROTOCOL_VERSION,
+    PortDescriptor, ServerMessage, SlotDiagnostics, StatusResponse, StorageDiagnosticsResponse,
+    TransportProfileListResponse, UpdateMonitorRequest, encode_control, encode_event,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -191,6 +191,24 @@ impl AppState {
         }
     }
 
+    async fn configure_model_families_transaction(
+        &self,
+        requested: Vec<serial_protocol::ModelFamily>,
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<serial_protocol::ModelFamily>, u64), ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(expected_revision, current.config_revision)?;
+        let staged = current
+            .staged_with_model_families(requested)
+            .map_err(ConfigError::from)?;
+        self.inner.config_store.save(&staged)?;
+        let revision = staged.config_revision;
+        let families = staged.model_families.clone();
+        *self.inner.config.write().await = staged;
+        Ok((families, revision))
+    }
+
     async fn configure_transport_profiles_transaction(
         &self,
         requested: Vec<serial_protocol::TransportProfile>,
@@ -270,6 +288,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/config/model-profiles",
             get(list_model_profiles).put(configure_model_profiles),
+        )
+        .route(
+            "/api/v1/config/model-families",
+            get(list_model_families).put(configure_model_families),
         )
         .route("/api/v1/archives", get(archives))
         .route("/api/v1/diagnostics", get(diagnostics))
@@ -447,6 +469,34 @@ async fn configure_model_profiles(
     .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
     Ok(Json(ConfigureModelProfilesResponse {
         profiles,
+        config_revision,
+    }))
+}
+
+async fn list_model_families(
+    State(state): State<AppState>,
+) -> Result<Json<ModelFamilyListResponse>, ApiError> {
+    let config = state.inner.config.read().await;
+    Ok(Json(ModelFamilyListResponse {
+        families: config.model_families.clone(),
+        config_revision: config.config_revision,
+    }))
+}
+
+async fn configure_model_families(
+    State(state): State<AppState>,
+    Json(request): Json<ConfigureModelFamiliesRequest>,
+) -> Result<Json<ConfigureModelFamiliesResponse>, ApiError> {
+    let transaction = state.clone();
+    let (families, config_revision) = tokio::spawn(async move {
+        transaction
+            .configure_model_families_transaction(request.families, request.expected_revision)
+            .await
+    })
+    .await
+    .map_err(|_| ApiError::Internal("configuration transaction task failed".into()))??;
+    Ok(Json(ConfigureModelFamiliesResponse {
+        families,
         config_revision,
     }))
 }

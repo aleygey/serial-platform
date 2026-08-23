@@ -1,6 +1,6 @@
 # Serial Platform Desktop
 
-Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v5，不直接打开物理串口。
+Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v6，不直接打开物理串口。
 
 ## UI
 
@@ -18,10 +18,11 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 
 配置页明确分开：
 
-- 串口配置：端口、enabled、Transport Profile、机型系列 Profile，以及从该系列中选择的具体机型名；
-- 机型 Profile：系列/Profile 名称、该系列的具体机型名列表、Shell/U-Boot prompt、EOL、echo 解析和 write pacing。
+- 串口配置：端口、enabled、Transport Profile、行为 Model Profile，以及独立的一级机型系列/二级具体机型身份；
+- 机型 Profile：可复用的 Profile 名称、Shell/U-Boot prompt、EOL、echo 解析和 write pacing，不包含机型名；
+- 机型名目录：独立编辑 Model Family，一级是机型系列，二级是该系列下可绑定的具体机型。
 
-Model Profile 的 `name` 是可复用的机型系列，`model_names` 列出系列下的具体型号；端口的 `model_name` 单独标记当前连接的设备，并且必须来自所选 Profile 的列表。
+Model Profile 和 Model Family 是两份独立 catalog。端口的 `model_profile` 只决定串口交互行为；`model_family` 和 `model_name` 成对标记当前设备，具体机型必须来自所选系列的二级列表。
 
 主题支持 system、light 和 dark。
 
@@ -37,7 +38,7 @@ Model Profile 的 `name` 是可复用的机型系列，`model_names` 列出系�
 
 ## Process architecture
 
-- `src/main`：本地服务生命周期、protocol v5 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
+- `src/main`：本地服务生命周期、protocol v6 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
 - `src/preload`：context-isolated、类型化 bridge；
 - `src/renderer`：React UI 与纯展示状态；
 - `src/shared`：DTO、preferences 和 QA fixture。

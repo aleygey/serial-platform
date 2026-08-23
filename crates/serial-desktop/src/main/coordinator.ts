@@ -3,6 +3,7 @@ import type {
   DesktopEvent,
   DesktopPreferences,
   DesktopSnapshot,
+  ModelFamily,
   ModelProfile,
   SerialConfigurationDraft,
   TimelineEvent
@@ -10,7 +11,12 @@ import type {
 import { createQaSnapshot } from '../shared/qa-fixture'
 import { createOfflineSnapshot } from '../shared/offline-snapshot'
 import { LocalService } from './local-service'
-import { SerialClient, serialdIdentityMatches, type ServerData } from './serial-client'
+import {
+  ConfigurationConflictError,
+  SerialClient,
+  serialdIdentityMatches,
+  type ServerData
+} from './serial-client'
 import { selectLocalEndpoint, type DiscoveredSeriald } from './service-command'
 import { SettingsStore } from './settings'
 import {
@@ -70,16 +76,21 @@ export class DesktopCoordinator {
     await this.publishSnapshot()
   }
 
-  async saveSerialConfiguration(draft: SerialConfigurationDraft): Promise<void> {
+  async saveSerialConfiguration(draft: SerialConfigurationDraft, expectedRevision: number): Promise<void> {
     if (this.qaMode) return
-    await this.requireClient().saveSerialConfiguration(draft)
-    await this.publishSnapshot()
+    await this.saveConfiguration(() => (
+      this.requireClient().saveSerialConfiguration(draft, expectedRevision)
+    ))
   }
 
-  async saveModelProfiles(profiles: ModelProfile[]): Promise<void> {
+  async saveModelProfiles(profiles: ModelProfile[], expectedRevision: number): Promise<void> {
     if (this.qaMode) return
-    await this.requireClient().saveModelProfiles(profiles)
-    await this.publishSnapshot()
+    await this.saveConfiguration(() => this.requireClient().saveModelProfiles(profiles, expectedRevision))
+  }
+
+  async saveModelFamilies(families: ModelFamily[], expectedRevision: number): Promise<void> {
+    if (this.qaMode) return
+    await this.saveConfiguration(() => this.requireClient().saveModelFamilies(families, expectedRevision))
   }
 
   async savePreferences(preferences: DesktopPreferences): Promise<void> {
@@ -279,6 +290,16 @@ export class DesktopCoordinator {
     this.emit({ type: 'snapshot', snapshot })
   }
 
+  private async saveConfiguration(action: () => Promise<void>): Promise<void> {
+    try {
+      await action()
+    } catch (error) {
+      if (error instanceof ConfigurationConflictError) await this.publishSnapshot()
+      throw error
+    }
+    await this.publishSnapshot()
+  }
+
   private toSnapshot(data: ServerData): DesktopSnapshot {
     return {
       connection: this.connection,
@@ -290,6 +311,7 @@ export class DesktopCoordinator {
       availablePorts: data.availablePorts,
       transportProfiles: data.transportProfiles,
       modelProfiles: data.modelProfiles,
+      modelFamilies: data.modelFamilies,
       events: data.events,
       preferences: this.preferences!,
       service: this.service.state()

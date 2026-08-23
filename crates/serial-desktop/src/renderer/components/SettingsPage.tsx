@@ -2,6 +2,7 @@ import { ArrowLeft, Cable, Check, Cpu, Moon, Plus, Save, Sun, Trash2 } from 'luc
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   DesktopPreferences,
+  ModelFamily,
   ModelProfile,
   PortDescriptor,
   SerialConfigurationDraft,
@@ -15,15 +16,17 @@ interface Props {
   availablePorts: PortDescriptor[]
   transportProfiles: TransportProfile[]
   modelProfiles: ModelProfile[]
+  modelFamilies: ModelFamily[]
   preferences: DesktopPreferences
   initialPort?: string
   onBack: () => void
-  onSaveSerial: (draft: SerialConfigurationDraft) => Promise<void>
-  onSaveModels: (profiles: ModelProfile[]) => Promise<void>
+  onSaveSerial: (draft: SerialConfigurationDraft) => Promise<boolean>
+  onSaveModels: (profiles: ModelProfile[]) => Promise<boolean>
+  onSaveModelFamilies: (families: ModelFamily[]) => Promise<boolean>
   onSavePreferences: (preferences: DesktopPreferences) => Promise<void>
 }
 
-type SettingsSection = 'serial' | 'model'
+type SettingsSection = 'serial' | 'model' | 'identity'
 
 export function SettingsPage(props: Props): React.JSX.Element {
   const [section, setSection] = useState<SettingsSection>('serial')
@@ -40,7 +43,7 @@ export function SettingsPage(props: Props): React.JSX.Element {
         <button className="icon-button" type="button" onClick={props.onBack}><ArrowLeft size={18} /></button>
         <div>
           <strong>设备配置</strong>
-          <small>串口连接与机型行为分别管理</small>
+          <small>串口连接、交互行为与机型名称分别管理</small>
         </div>
         {saved && <span className="saved-badge"><Check size={14} /> 已保存</span>}
       </header>
@@ -54,6 +57,10 @@ export function SettingsPage(props: Props): React.JSX.Element {
             <span className="settings-nav-icon"><Cpu size={18} /></span>
             <span><strong>机型 Profile</strong><small>提示符与交互行为</small></span>
           </button>
+          <button className={section === 'identity' ? 'is-active' : ''} onClick={() => setSection('identity')} type="button">
+            <span className="settings-nav-icon"><Cpu size={18} /></span>
+            <span><strong>机型名称</strong><small>系列与具体型号</small></span>
+          </button>
           <ApplicationSettings preferences={props.preferences} onSave={async (preferences) => {
             await props.onSavePreferences(preferences)
             saveNotice()
@@ -62,10 +69,13 @@ export function SettingsPage(props: Props): React.JSX.Element {
         <section className="settings-content">
           {section === 'serial' ? (
             <SerialEditor {...props} onSaved={saveNotice} />
-          ) : (
+          ) : section === 'model' ? (
             <ModelEditor profiles={props.modelProfiles} configuredPorts={props.configuredPorts} onSave={async (profiles) => {
-              await props.onSaveModels(profiles)
-              saveNotice()
+              if (await props.onSaveModels(profiles)) saveNotice()
+            }} />
+          ) : (
+            <ModelFamilyEditor families={props.modelFamilies} configuredPorts={props.configuredPorts} onSave={async (families) => {
+              if (await props.onSaveModelFamilies(families)) saveNotice()
             }} />
           )}
         </section>
@@ -79,6 +89,7 @@ function SerialEditor({
   availablePorts,
   transportProfiles,
   modelProfiles,
+  modelFamilies,
   initialPort,
   onSaveSerial,
   onSaved
@@ -94,15 +105,14 @@ function SerialEditor({
   const updateProfile = <K extends keyof TransportProfile>(key: K, next: TransportProfile[K]): void => {
     setValue((current) => ({ ...current, transportProfile: { ...current.transportProfile, [key]: next } }))
   }
-  const selectedModelProfile = modelProfiles.find((profile) => profile.name === value.modelProfile)
+  const selectedModelFamily = modelFamilies.find((family) => family.name === value.modelFamily)
 
   return (
     <div className="editor-shell">
       <div className="editor-heading">
         <div><span className="eyebrow">SERIAL CONNECTION</span><h1>串口配置</h1><p>选择物理端口，并配置 UART 通信参数与关联机型。</p></div>
-        <button className="primary-button" type="button" disabled={!value.port} onClick={async () => {
-          await onSaveSerial(value)
-          onSaved()
+        <button className="primary-button" type="button" disabled={!value.port || Boolean(value.modelFamily) !== Boolean(value.modelName)} onClick={async () => {
+          if (await onSaveSerial(value)) onSaved()
         }}><Save size={16} /> 保存串口配置</button>
       </div>
       <div className="serial-editor-grid">
@@ -113,7 +123,7 @@ function SerialEditor({
             return (
               <button className={selectedPort === port ? 'is-active' : ''} key={port} onClick={() => setSelectedPort(port)} type="button">
                 <span className={`status-dot ${configured?.session_state === 'online' ? 'is-open' : 'is-idle'}`} />
-                <span><strong>{port}</strong><small>{configured?.config.model_name || descriptor?.product || configured?.config.model_profile || '可用串口'}</small></span>
+                <span><strong>{port}</strong><small>{configured?.config.model_name || descriptor?.product || '可用串口'}</small></span>
               </button>
             )
           })}
@@ -129,18 +139,24 @@ function SerialEditor({
             </Field>
             <Field label="机型 Profile">
               <select value={value.modelProfile ?? ''} onChange={(event) => setValue((current) => selectModelProfile(current, event.target.value || null, modelProfiles))}>
-                <option value="">未关联机型</option>
+                <option value="">通用交互参数</option>
                 {modelProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.name}</option>)}
+              </select>
+            </Field>
+            <Field label="一级机型">
+              <select value={value.modelFamily ?? ''} onChange={(event) => setValue((current) => selectModelFamily(current, event.target.value || null, modelFamilies))}>
+                <option value="">未标记机型</option>
+                {modelFamilies.map((family) => <option key={family.name} value={family.name}>{family.name}</option>)}
               </select>
             </Field>
             <Field label="具体型号">
               <select
-                disabled={!selectedModelProfile || selectedModelProfile.model_names.length === 0}
+                disabled={!selectedModelFamily || selectedModelFamily.model_names.length === 0}
                 value={value.modelName ?? ''}
                 onChange={(event) => setValue((current) => ({ ...current, modelName: event.target.value || null }))}
               >
-                <option value="">{selectedModelProfile && selectedModelProfile.model_names.length === 0 ? '该 Profile 暂无具体型号' : '暂不指定具体型号'}</option>
-                {selectedModelProfile?.model_names.map((name) => <option key={name} value={name}>{name}</option>)}
+                <option value="">{selectedModelFamily && selectedModelFamily.model_names.length === 0 ? '该系列暂无具体型号' : '选择具体型号'}</option>
+                {selectedModelFamily?.model_names.map((name) => <option key={name} value={name}>{name}</option>)}
               </select>
             </Field>
           </div>
@@ -209,23 +225,23 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
   return (
     <div className="editor-shell">
       <div className="editor-heading">
-        <div><span className="eyebrow">DEVICE BEHAVIOR</span><h1>机型 Profile</h1><p>Profile 复用交互行为，具体型号用于标记每个串口实际连接的设备。</p></div>
-        <button className="primary-button" title={validationIssue} type="button" disabled={!items.length || Boolean(validationIssue)} onClick={() => onSave(catalog)}><Save size={16} /> 保存机型配置</button>
+        <div><span className="eyebrow">DEVICE BEHAVIOR</span><h1>机型 Profile</h1><p>复用提示符、换行与发送节奏，不承载机型名称。</p></div>
+        <button className="primary-button" title={validationIssue} type="button" disabled={Boolean(validationIssue)} onClick={() => onSave(catalog)}><Save size={16} /> 保存机型配置</button>
       </div>
       <div className="serial-editor-grid">
         <div className="device-picker profile-picker">
-          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.profile.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.profile.name || '未命名 Profile'}</strong><small>{item.profile.model_names.length ? `${item.profile.model_names.length} 个具体型号` : '未配置具体型号'}</small></span></button>)}
+          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.profile.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.profile.name || '未命名 Profile'}</strong><small>串口交互参数</small></span></button>)}
           <button className="add-profile" type="button" onClick={() => {
             const index = items.length
             const id = nextDraftId.current++
-            const name = nextModelName(items)
-            setItems((current) => [...current, { key: `new:${id}`, profile: defaultModel(name), persisted: false }])
+            const name = nextModelProfileName(items)
+            setItems((current) => [...current, { key: `new:${id}`, profile: defaultModelProfile(name), persisted: false }])
             setSelected(index)
           }}><Plus size={16} /> 新建机型 Profile</button>
         </div>
         {profile ? (
           <div className="form-card">
-            <div className="profile-form-header"><div className="form-section-title"><span>01</span><div><strong>机型身份</strong><small>原样显示，不改写空格或大小写</small></div></div><button
+            <div className="profile-form-header"><div className="form-section-title"><span>01</span><div><strong>Profile 标识</strong><small>名称原样保存</small></div></div><button
               aria-label={`删除机型 Profile ${profile.name}`}
               className="danger-icon"
               disabled={policy.deleteDisabled}
@@ -233,45 +249,13 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
               title={policy.deleteDisabled ? '请先在串口配置中改绑或解绑' : '删除 Profile'}
               onClick={() => { setItems((current) => current.filter((_, index) => index !== selected)); setSelected((current) => Math.max(0, current - 1)) }}
             ><Trash2 size={16} /></button></div>
-            <Field label="Profile 名称"><input readOnly={policy.nameReadOnly} title={policy.nameReadOnly ? '已有 Profile 名称是稳定标识' : undefined} value={profile.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230 Family" /></Field>
+            <Field label="Profile 名称"><input readOnly={policy.nameReadOnly} title={policy.nameReadOnly ? '已有 Profile 名称是稳定标识' : undefined} value={profile.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 OpenWrt Shell" /></Field>
             {policy.nameReadOnly && <div className="field-note">已有 Profile 名称是稳定标识；如需使用新名称，请新建 Profile。</div>}
             {affectedPorts.length > 0 && (
               <div className="impact-notice">
                 已关联端口：<strong>{affectedPorts.join('、')}</strong>。如需删除，请先在“串口配置”改绑或解绑。
               </div>
             )}
-            <div className="model-name-editor">
-              <div className="model-name-heading">
-                <div><strong>具体型号</strong><small>保留原始空格和大小写；串口将在这里选择实际设备型号</small></div>
-                <button type="button" onClick={() => update('model_names', [...profile.model_names, nextConcreteModelName(profile.model_names)])}><Plus size={14} /> 添加型号</button>
-              </div>
-              {profile.model_names.map((name, index) => {
-                const boundPorts = configuredPorts
-                  .filter((item) => item.config.model_profile === profile.name && item.config.model_name === name)
-                  .map((item) => item.config.port)
-                const bound = boundPorts.length > 0
-                return (
-                  <div className="model-name-row" key={index}>
-                    <input
-                      aria-label={`具体型号 ${index + 1}`}
-                      readOnly={bound}
-                      title={bound ? `已绑定端口 ${boundPorts.join('、')}，请先改绑` : undefined}
-                      value={name}
-                      onChange={(event) => update('model_names', profile.model_names.map((value, itemIndex) => itemIndex === index ? event.target.value : value))}
-                    />
-                    {bound && <span title={boundPorts.join('、')}>已绑定 {boundPorts.join('、')}</span>}
-                    <button
-                      aria-label={`删除具体型号 ${name}`}
-                      disabled={bound}
-                      title={bound ? '请先在串口配置中改绑或清除具体型号' : '删除具体型号'}
-                      type="button"
-                      onClick={() => update('model_names', profile.model_names.filter((_, itemIndex) => itemIndex !== index))}
-                    ><Trash2 size={14} /></button>
-                  </div>
-                )
-              })}
-              {profile.model_names.length === 0 && <div className="empty-model-names">暂未配置具体型号；Profile 仍可保存并复用交互行为。</div>}
-            </div>
             {validationIssue && <div className="validation-notice" role="alert">{validationIssue}</div>}
             <div className="form-divider" />
             <div className="form-section-title"><span>02</span><div><strong>命令提示符</strong><small>用于识别命令输出的完整边界</small></div></div>
@@ -288,7 +272,87 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
               <Field label="写入间隔 (ms)"><input inputMode="numeric" value={profile.write_chunk_delay_ms ?? 0} onChange={(event) => update('write_chunk_delay_ms', Number(event.target.value))} /></Field>
             </div>
           </div>
-        ) : <div className="empty-profile"><Cpu size={30} /><strong>创建第一个机型 Profile</strong><span>配置机型名和提示符后即可关联串口</span></div>}
+        ) : <div className="empty-profile"><Cpu size={30} /><strong>创建第一个机型 Profile</strong><span>配置提示符和发送行为后即可关联串口</span></div>}
+      </div>
+    </div>
+  )
+}
+
+interface ModelFamilyDraft {
+  key: string
+  family: ModelFamily
+  persisted: boolean
+}
+
+export function ModelFamilyEditor({ families, configuredPorts, onSave }: { families: ModelFamily[]; configuredPorts: PortSnapshot[]; onSave: (families: ModelFamily[]) => Promise<void> }): React.JSX.Element {
+  const [items, setItems] = useState<ModelFamilyDraft[]>(() => persistedFamilyDrafts(families))
+  const [selected, setSelected] = useState(0)
+  const nextDraftId = useRef(1)
+  useEffect(() => { setItems(persistedFamilyDrafts(families)); setSelected((current) => Math.min(current, Math.max(0, families.length - 1))) }, [families])
+  const draft = items[selected]
+  const family = draft?.family
+  const affectedPorts = family
+    ? configuredPorts.filter((item) => item.config.model_family === family.name).map((item) => item.config.port)
+    : []
+  const policy = resolveModelProfilePolicy(draft?.persisted ?? false, affectedPorts)
+  const catalog = items.map((item) => item.family)
+  const validationIssue = validateModelFamilyCatalog(catalog, configuredPorts)
+  const update = <K extends keyof ModelFamily>(key: K, value: ModelFamily[K]): void => {
+    setItems((current) => current.map((item, index) => index === selected
+      ? { ...item, family: { ...item.family, [key]: value } }
+      : item))
+  }
+
+  return (
+    <div className="editor-shell">
+      <div className="editor-heading">
+        <div><span className="eyebrow">MODEL IDENTITY</span><h1>机型名称</h1><p>一级是机型系列，二级是串口实际连接的具体型号。</p></div>
+        <button className="primary-button" title={validationIssue} type="button" disabled={Boolean(validationIssue)} onClick={() => onSave(catalog)}><Save size={16} /> 保存机型名称</button>
+      </div>
+      <div className="serial-editor-grid">
+        <div className="device-picker profile-picker">
+          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.family.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.family.name || '未命名系列'}</strong><small>{item.family.model_names.length} 个具体型号</small></span></button>)}
+          <button className="add-profile" type="button" onClick={() => {
+            const index = items.length
+            const id = nextDraftId.current++
+            const name = nextFamilyName(items)
+            setItems((current) => [...current, { key: `new:${id}`, family: { name, model_names: [] }, persisted: false }])
+            setSelected(index)
+          }}><Plus size={16} /> 新建一级机型</button>
+        </div>
+        {family ? (
+          <div className="form-card">
+            <div className="profile-form-header"><div className="form-section-title"><span>01</span><div><strong>一级机型</strong><small>机型系列名称</small></div></div><button
+              aria-label={`删除一级机型 ${family.name}`}
+              className="danger-icon"
+              disabled={policy.deleteDisabled}
+              type="button"
+              title={policy.deleteDisabled ? '请先在串口配置中改绑机型' : '删除一级机型'}
+              onClick={() => { setItems((current) => current.filter((_, index) => index !== selected)); setSelected((current) => Math.max(0, current - 1)) }}
+            ><Trash2 size={16} /></button></div>
+            <Field label="一级机型名称"><input readOnly={policy.nameReadOnly} value={family.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230" /></Field>
+            {affectedPorts.length > 0 && <div className="impact-notice">已关联端口：<strong>{affectedPorts.join('、')}</strong></div>}
+            <div className="model-name-editor">
+              <div className="model-name-heading">
+                <div><strong>二级具体型号</strong><small>选择具体型号后才会写入串口配置</small></div>
+                <button type="button" onClick={() => update('model_names', [...family.model_names, nextConcreteModelName(family.model_names)])}><Plus size={14} /> 添加具体型号</button>
+              </div>
+              {family.model_names.map((name, index) => {
+                const boundPorts = configuredPorts.filter((item) => item.config.model_family === family.name && item.config.model_name === name).map((item) => item.config.port)
+                const bound = boundPorts.length > 0
+                return (
+                  <div className="model-name-row" key={index}>
+                    <input aria-label={`二级具体型号 ${index + 1}`} readOnly={bound} value={name} onChange={(event) => update('model_names', family.model_names.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} />
+                    {bound && <span title={boundPorts.join('、')}>已绑定 {boundPorts.join('、')}</span>}
+                    <button aria-label={`删除具体型号 ${name}`} disabled={bound} type="button" onClick={() => update('model_names', family.model_names.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={14} /></button>
+                  </div>
+                )
+              })}
+              {family.model_names.length === 0 && <div className="empty-model-names">请添加至少一个二级具体型号后再用于串口配置。</div>}
+            </div>
+            {validationIssue && <div className="validation-notice" role="alert">{validationIssue}</div>}
+          </div>
+        ) : <div className="empty-profile"><Cpu size={30} /><strong>创建第一个一级机型</strong><span>然后添加对应的二级具体型号</span></div>}
       </div>
     </div>
   )
@@ -331,6 +395,7 @@ function serialDraft(port: string, configuredPorts: PortSnapshot[], profiles: Tr
     port,
     enabled: configured?.config.enabled ?? true,
     modelProfile: configured?.config.model_profile,
+    modelFamily: configured?.config.model_family,
     modelName: configured?.config.model_name,
     transportProfile: { ...profile }
   }
@@ -343,20 +408,20 @@ function defaultTransport(): TransportProfile {
 function persistedModelDrafts(profiles: ModelProfile[]): ModelDraft[] {
   return profiles.map((profile) => ({
     key: `persisted:${profile.name}`,
-    profile: { ...profile, model_names: [...profile.model_names] },
+    profile: { ...profile },
     persisted: true
   }))
 }
 
-function nextModelName(items: ModelDraft[]): string {
+function nextModelProfileName(items: ModelDraft[]): string {
   const names = new Set(items.map((item) => item.profile.name))
   let suffix = 1
-  while (names.has(`新机型 ${suffix}`)) suffix += 1
-  return `新机型 ${suffix}`
+  while (names.has(`新 Profile ${suffix}`)) suffix += 1
+  return `新 Profile ${suffix}`
 }
 
-function defaultModel(name: string): ModelProfile {
-  return { name, model_names: [], shell_prompt: null, uboot_prompt: '=> ', write_eol: '\r', echo: 'auto', write_chunk_size: 1, write_chunk_delay_ms: 0 }
+function defaultModelProfile(name: string): ModelProfile {
+  return { name, shell_prompt: null, uboot_prompt: '=> ', write_eol: '\r', echo: 'auto', write_chunk_size: 1, write_chunk_delay_ms: 0 }
 }
 
 export function selectModelProfile(
@@ -364,10 +429,23 @@ export function selectModelProfile(
   modelProfile: string | null,
   profiles: ModelProfile[]
 ): SerialConfigurationDraft {
-  if (!modelProfile) return { ...draft, modelProfile: null, modelName: null }
-  const selected = profiles.find((profile) => profile.name === modelProfile)
-  const modelName = draft.modelName && selected?.model_names.includes(draft.modelName) ? draft.modelName : null
-  return { ...draft, modelProfile, modelName }
+  if (!modelProfile) return { ...draft, modelProfile: null }
+  if (!profiles.some((profile) => profile.name === modelProfile)) return draft
+  return { ...draft, modelProfile }
+}
+
+export function selectModelFamily(
+  draft: SerialConfigurationDraft,
+  modelFamily: string | null,
+  families: ModelFamily[]
+): SerialConfigurationDraft {
+  if (!modelFamily) return { ...draft, modelFamily: null, modelName: null }
+  const selected = families.find((family) => family.name === modelFamily)
+  if (!selected) return draft
+  const modelName = draft.modelFamily === modelFamily && draft.modelName && selected.model_names.includes(draft.modelName)
+    ? draft.modelName
+    : null
+  return { ...draft, modelFamily, modelName }
 }
 
 export function validateModelProfileCatalog(profiles: ModelProfile[], configuredPorts: PortSnapshot[]): string | undefined {
@@ -377,24 +455,49 @@ export function validateModelProfileCatalog(profiles: ModelProfile[], configured
     if (profile.name !== profile.name.trim()) return `Profile “${profile.name}” 名称首尾不能有空格。`
     if (profileNames.has(profile.name)) return `Profile 名称“${profile.name}”重复。`
     profileNames.add(profile.name)
+  }
+  for (const item of configuredPorts) if (item.config.model_profile && !profileNames.has(item.config.model_profile)) return `端口 ${item.config.port} 正在使用 Profile“${item.config.model_profile}”；请先改绑。`
+  return undefined
+}
+
+export function validateModelFamilyCatalog(families: ModelFamily[], configuredPorts: PortSnapshot[]): string | undefined {
+  const familyNames = new Set<string>()
+  for (const family of families) {
+    if (!family.name.trim()) return '一级机型名称不能为空。'
+    if (family.name !== family.name.trim()) return `一级机型“${family.name}”首尾不能有空格。`
+    if (familyNames.has(family.name)) return `一级机型名称“${family.name}”重复。`
+    familyNames.add(family.name)
     const modelNames = new Set<string>()
-    for (const name of profile.model_names) {
-      if (!name.trim()) return `Profile “${profile.name}”包含空的具体型号。`
+    for (const name of family.model_names) {
+      if (!name.trim()) return `一级机型“${family.name}”包含空的具体型号。`
       if (name !== name.trim()) return `具体型号“${name}”首尾不能有空格。`
-      if (modelNames.has(name)) return `Profile “${profile.name}”中的具体型号“${name}”重复。`
+      if (modelNames.has(name)) return `一级机型“${family.name}”中的具体型号“${name}”重复。`
       modelNames.add(name)
     }
   }
   for (const item of configuredPorts) {
-    const profileName = item.config.model_profile
+    const familyName = item.config.model_family
     const modelName = item.config.model_name
-    if (!profileName || !modelName) continue
-    const profile = profiles.find((candidate) => candidate.name === profileName)
-    if (!profile?.model_names.includes(modelName)) {
-      return `端口 ${item.config.port} 正在使用具体型号“${modelName}”；请先在“串口配置”改绑，再删除该型号。`
-    }
+    if (!familyName && !modelName) continue
+    const family = families.find((candidate) => candidate.name === familyName)
+    if (!family || !modelName || !family.model_names.includes(modelName)) return `端口 ${item.config.port} 正在使用机型“${modelName ?? familyName}”；请先在串口配置中改绑。`
   }
   return undefined
+}
+
+function persistedFamilyDrafts(families: ModelFamily[]): ModelFamilyDraft[] {
+  return families.map((family) => ({
+    key: `persisted:${family.name}`,
+    family: { ...family, model_names: [...family.model_names] },
+    persisted: true
+  }))
+}
+
+function nextFamilyName(items: ModelFamilyDraft[]): string {
+  const names = new Set(items.map((item) => item.family.name))
+  let suffix = 1
+  while (names.has(`新系列 ${suffix}`)) suffix += 1
+  return `新系列 ${suffix}`
 }
 
 function nextConcreteModelName(names: string[]): string {

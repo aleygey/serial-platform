@@ -3384,6 +3384,8 @@ impl SlotActor {
                         ("source", json!(source)),
                         ("previous_model_profile", Value::Null),
                         ("new_model_profile", json!(self.config.model_profile)),
+                        ("previous_model_family", Value::Null),
+                        ("new_model_family", json!(self.config.model_family)),
                         ("previous_model_name", Value::Null),
                         ("new_model_name", json!(self.config.model_name)),
                     ]),
@@ -3420,6 +3422,8 @@ impl SlotActor {
                         ("source", json!(source)),
                         ("previous_model_profile", json!(self.config.model_profile)),
                         ("new_model_profile", Value::Null),
+                        ("previous_model_family", json!(self.config.model_family)),
+                        ("new_model_family", Value::Null),
                         ("previous_model_name", json!(self.config.model_name)),
                         ("new_model_name", Value::Null),
                     ]),
@@ -3519,6 +3523,7 @@ impl SlotActor {
             resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
         let previous = std::mem::replace(&mut self.config, config);
         let previous_model_profile = previous.model_profile.clone();
+        let previous_model_family = previous.model_family.clone();
         let previous_model_name = previous.model_name.clone();
         self.transport_profile = transport_profile;
         self.model_profile = model_profile;
@@ -3557,6 +3562,8 @@ impl SlotActor {
                 ("source", json!(source)),
                 ("previous_model_profile", json!(previous_model_profile)),
                 ("new_model_profile", json!(self.config.model_profile)),
+                ("previous_model_family", json!(previous_model_family)),
+                ("new_model_family", json!(self.config.model_family)),
                 ("previous_model_name", json!(previous_model_name)),
                 ("new_model_name", json!(self.config.model_name)),
                 (

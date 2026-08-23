@@ -18,11 +18,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
     DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
-    MAX_COMMAND_DESCRIPTION_BYTES, MAX_MODEL_NAMES_PER_PROFILE, MAX_MONITOR_MATCHERS,
-    MAX_MONITOR_PATTERN_BYTES, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
-    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
-    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
-    McpHealthResponse,
+    MAX_COMMAND_DESCRIPTION_BYTES, MAX_MONITOR_MATCHERS, MAX_MONITOR_PATTERN_BYTES,
+    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
+    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
+    MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, McpHealthResponse,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -34,7 +33,7 @@ use crate::tools::AgentTools;
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
-const SERVER_INSTRUCTIONS: &str = "Inspect devices and model_profiles before executing commands. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. Runs scope evidence only. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. Every command requires a concise purpose for durable history. Use command_sequence for dependent interactions such as username then password; every non-final step needs an explicit expect or regex boundary, and a failed step prevents later writes. command and command_sequence use the selected port's transport_profile and model_profile; input and signal are raw. Monitor Jobs persist after this MCP process exits; stop them when no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices before executing commands. Confirm the selected port's model_family and model_name match the physically connected device. If they do not match, call model_identity_set with the exact existing family/name; if the identity is not in the human-managed catalog, ask the user to create it in the TUI/App first. command, command_sequence, and wait automatically use the command_prompts reported by devices; pass expect or regex to override prompt matching for a call. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. Runs scope evidence only. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. run_end defaults to outcome=completed; use outcome=aborted only to deliberately abort the owned Run and immediately release control. Every command requires a concise purpose for durable history. Use command_sequence for dependent interactions such as username then password; every non-final step needs an explicit expect or regex boundary, and a failed step prevents later writes. input and signal are raw. Monitor Jobs persist after this MCP process exits; stop them when no longer needed.";
 
 pub async fn serve_stdio(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -375,7 +374,6 @@ fn request_is_cancellable(request: &RpcRequest) -> bool {
             .and_then(Value::as_str)
             .unwrap_or_default(),
         "devices"
-            | "model_profiles"
             | "read"
             | "wait"
             | "search"
@@ -491,7 +489,8 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
     // harmless merely because the adapter itself keeps an audit trail.
     let destructive = matches!(
         name,
-        "model_profile_set"
+        "model_identity_set"
+            | "run_end"
             | "command"
             | "command_sequence"
             | "input"
@@ -526,38 +525,20 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "devices",
-            "List serial ports, configured profiles, and ownership.",
+            "List serial ports with concrete model identity, command prompts, readiness, cursor, and current ownership.",
             object(json!({"port":{"type":"string"}}), &[]),
             true,
         ),
         tool(
-            "model_profiles",
-            "Read model profiles and their current port bindings.",
-            object(json!({"port":{"type":"string"}}), &[]),
-            true,
-        ),
-        tool(
-            "model_profile_set",
-            "Create or update one model-family profile and bind it, plus an optional concrete model name, to a port; pass profile=null to detach both.",
+            "model_identity_set",
+            "Set an exact family/name already created in the TUI/App, or detach with two nulls. Ask the user to create a missing identity first.",
             object(
                 json!({
                     "port":{"type":"string","minLength":1},
-                    "profile":{"description":"Complete model profile, or null to detach.","anyOf":[
-                        {"type":"object","additionalProperties":false,"required":["name"],"properties":{
-                            "name":{"type":"string","minLength":1,"maxLength":64},
-                            "model_names":{"type":"array","maxItems":MAX_MODEL_NAMES_PER_PROFILE,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":128}},
-                            "shell_prompt":{"type":["string","null"],"minLength":1,"maxLength":4096},
-                            "uboot_prompt":{"type":["string","null"],"minLength":1,"maxLength":4096},
-                            "write_eol":{"type":["string","null"]},
-                            "echo":{"type":["string","null"],"enum":["on","off","auto",null]},
-                            "write_chunk_size":{"type":["integer","null"],"minimum":1},
-                            "write_chunk_delay_ms":{"type":["integer","null"],"minimum":0,"maximum":10000}
-                        }},
-                        {"type":"null"}
-                    ]},
-                    "model_name":{"description":"A name from profile.model_names; null clears it. When omitted for the same profile, a still-valid existing binding is retained; otherwise it is cleared.","anyOf":[{"type":"string","minLength":1,"maxLength":128},{"type":"null"}]}
+                    "model_family":{"anyOf":[{"type":"string","minLength":1,"maxLength":128},{"type":"null"}]},
+                    "model_name":{"anyOf":[{"type":"string","minLength":1,"maxLength":128},{"type":"null"}]}
                 }),
-                &["port", "profile"],
+                &["port", "model_family", "model_name"],
             ),
             false,
         ),
@@ -786,41 +767,14 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_end",
-            "End the Run authorized by run_handle and release control; call before the final reply unless deliberately handing off.",
+            "End the Run authorized by run_handle. completed tries Control release; aborted succeeds only after ControlReleased.",
             object(
                 json!({
-                    "run_handle":run_handle_schema()
+                    "run_handle":run_handle_schema(),
+                    "outcome":{"type":"string","enum":["completed","aborted"],"default":"completed","description":"Use aborted only for deliberate early termination."}
                 }),
                 &["run_handle"],
             ),
-            false,
-        ),
-        tool(
-            "release",
-            "Release only this MCP's control; no local lease is a no-op, while aborting its active Run requires run_handle.",
-            {
-                let mut schema = object(
-                    json!({
-                        "port":{"type":"string"},
-                        "abort_run":{"type":"boolean"},
-                        "run_handle":run_handle_schema()
-                    }),
-                    &[],
-                );
-                schema["oneOf"] = json!([
-                    {
-                        "required":["port"],
-                        "properties":{"abort_run":{"const":false}},
-                        "not":{"required":["run_handle"]}
-                    },
-                    {
-                        "required":["run_handle","abort_run"],
-                        "properties":{"abort_run":{"const":true}},
-                        "not":{"required":["port"]}
-                    }
-                ]);
-                schema
-            },
             false,
         ),
     ]
@@ -1004,8 +958,7 @@ mod tests {
             names,
             [
                 "devices",
-                "model_profiles",
-                "model_profile_set",
+                "model_identity_set",
                 "read",
                 "command",
                 "command_sequence",
@@ -1020,20 +973,25 @@ mod tests {
                 "monitor_incidents",
                 "monitor_stop",
                 "run_start",
-                "run_end",
-                "release"
+                "run_end"
             ]
         );
     }
 
     #[test]
-    fn agent_guidance_explains_runs_sequences_and_profiles() {
+    fn agent_guidance_explains_identity_prompts_runs_and_sequences() {
+        assert!(SERVER_INSTRUCTIONS.contains("Inspect devices"));
+        assert!(SERVER_INSTRUCTIONS.contains("model_family and model_name"));
+        assert!(SERVER_INSTRUCTIONS.contains("human-managed catalog"));
+        assert!(SERVER_INSTRUCTIONS.contains("command_prompts"));
+        assert!(SERVER_INSTRUCTIONS.contains("expect or regex"));
         assert!(SERVER_INSTRUCTIONS.contains("Before the final reply, call run_end"));
         assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
         assert!(SERVER_INSTRUCTIONS.contains("Use command_sequence"));
         assert!(SERVER_INSTRUCTIONS.contains("every non-final step"));
         assert!(SERVER_INSTRUCTIONS.contains("failed step prevents later writes"));
-        assert!(SERVER_INSTRUCTIONS.contains("transport_profile and model_profile"));
+        assert!(!SERVER_INSTRUCTIONS.contains("model_profile"));
+        assert!(!SERVER_INSTRUCTIONS.contains("transport_profile"));
     }
 
     #[test]
@@ -1047,13 +1005,14 @@ mod tests {
     fn annotations_do_not_hide_physical_or_persistent_side_effects() {
         let tools = tool_definitions();
         for name in [
-            "model_profile_set",
+            "model_identity_set",
             "command",
             "command_sequence",
             "input",
             "signal",
             "trigger",
             "monitor_stop",
+            "run_end",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["destructiveHint"], true, "{name}");
@@ -1072,53 +1031,31 @@ mod tests {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["openWorldHint"], true, "{name}");
         }
-        let catalog = tools
-            .iter()
-            .find(|tool| tool["name"] == "model_profiles")
-            .unwrap();
-        assert_eq!(catalog["annotations"]["readOnlyHint"], true);
-        assert_eq!(catalog["annotations"]["destructiveHint"], false);
-        assert_eq!(catalog["annotations"]["openWorldHint"], false);
     }
 
     #[test]
-    fn model_profile_tools_expose_one_profile_and_port_binding_contract() {
+    fn devices_and_identity_are_the_only_model_facing_tools() {
         let tools = tool_definitions();
-        let read = tools
-            .iter()
-            .find(|tool| tool["name"] == "model_profiles")
-            .unwrap();
-        assert_eq!(read["annotations"]["readOnlyHint"], true);
-        assert!(read["inputSchema"]["properties"].get("port").is_some());
-
-        let set = tools
-            .iter()
-            .find(|tool| tool["name"] == "model_profile_set")
-            .unwrap();
-        assert_eq!(set["annotations"]["readOnlyHint"], false);
-        assert_eq!(set["inputSchema"]["required"], json!(["port", "profile"]));
-        let properties = set["inputSchema"]["properties"].as_object().unwrap();
-        assert!(properties.contains_key("port"));
-        assert!(properties.contains_key("profile"));
-        assert!(properties.contains_key("model_name"));
-        assert_eq!(properties.len(), 3);
-        let profile = &properties["profile"]["anyOf"][0];
-        assert_eq!(profile["required"], json!(["name"]));
-        for field in [
-            "name",
-            "model_names",
-            "shell_prompt",
-            "uboot_prompt",
-            "write_eol",
-            "echo",
-        ] {
+        for removed in ["model_profiles", "model_profile_set", "model_families"] {
             assert!(
-                profile["properties"].get(field).is_some(),
-                "missing {field}"
+                tools.iter().all(|tool| tool["name"] != removed),
+                "{removed}"
             );
         }
-        let serialized = serde_json::to_string(set).unwrap();
-        assert!(!serialized.contains("slot_id"));
+        let devices = tools.iter().find(|tool| tool["name"] == "devices").unwrap();
+        assert_eq!(devices["annotations"]["readOnlyHint"], true);
+        let identity = tools
+            .iter()
+            .find(|tool| tool["name"] == "model_identity_set")
+            .unwrap();
+        assert_eq!(
+            identity["inputSchema"]["required"],
+            json!(["port", "model_family", "model_name"])
+        );
+        let serialized = serde_json::to_string(&tools).unwrap();
+        assert!(!serialized.contains("model_profile"));
+        assert!(!serialized.contains("transport_profile"));
+        assert!(!serialized.contains("write_chunk"));
         assert!(!serialized.contains("device_model"));
     }
 
@@ -1393,7 +1330,6 @@ mod tests {
     fn only_read_only_tool_calls_are_cancellable() {
         for name in [
             "devices",
-            "model_profiles",
             "read",
             "wait",
             "search",
@@ -1409,7 +1345,7 @@ mod tests {
             }));
         }
         for name in [
-            "model_profile_set",
+            "model_identity_set",
             "command",
             "command_sequence",
             "input",
@@ -1419,7 +1355,6 @@ mod tests {
             "monitor_stop",
             "run_start",
             "run_end",
-            "release",
         ] {
             assert!(!request_is_cancellable(&RpcRequest {
                 jsonrpc: Some("2.0".into()),
@@ -1528,26 +1463,15 @@ mod tests {
             }
         }
 
-        let release = tools.iter().find(|tool| tool["name"] == "release").unwrap();
-        assert_eq!(release["inputSchema"]["required"], json!([]));
-        let modes = release["inputSchema"]["oneOf"].as_array().unwrap();
-        assert_eq!(modes.len(), 2);
-        assert_eq!(modes[0]["required"], json!(["port"]));
-        assert_eq!(modes[0]["properties"]["abort_run"]["const"], false);
-        assert_eq!(modes[0]["not"]["required"], json!(["run_handle"]));
-        assert_eq!(modes[1]["required"], json!(["run_handle", "abort_run"]));
-        assert_eq!(modes[1]["properties"]["abort_run"]["const"], true);
-        assert_eq!(modes[1]["not"]["required"], json!(["port"]));
-        assert!(
-            release["inputSchema"]["properties"]
-                .get("run_handle")
-                .is_some()
+        let run_end = tools.iter().find(|tool| tool["name"] == "run_end").unwrap();
+        assert_eq!(run_end["inputSchema"]["required"], json!(["run_handle"]));
+        assert_eq!(
+            run_end["inputSchema"]["properties"]["outcome"]["enum"],
+            json!(["completed", "aborted"])
         );
-        assert!(release["inputSchema"]["properties"].get("run_id").is_none());
-        assert!(
-            release["inputSchema"]["properties"]
-                .get("run_token")
-                .is_none()
+        assert_eq!(
+            run_end["inputSchema"]["properties"]["outcome"]["default"],
+            "completed"
         );
     }
 
@@ -1555,9 +1479,9 @@ mod tests {
     fn report_tool_definition_json_size() {
         let bytes = serde_json::to_vec(&tool_definitions()).unwrap().len();
         eprintln!("tool_definition_json_bytes={bytes}");
-        // The eight Run-scoped tools intentionally repeat one compact opaque
+        // The seven Run-scoped tools intentionally repeat one compact opaque
         // capability schema so hosts cannot omit it while prompt cost stays bounded.
-        assert!(bytes <= 13_000, "tool definitions grew to {bytes} bytes");
+        assert!(bytes <= 12_000, "tool definitions grew to {bytes} bytes");
         for tool in tool_definitions() {
             assert!(
                 tool["description"].as_str().unwrap().len() <= 180,

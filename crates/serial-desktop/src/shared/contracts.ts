@@ -16,7 +16,6 @@ export interface TransportProfile {
 
 export interface ModelProfile {
   name: string
-  model_names: string[]
   shell_prompt?: string | null
   uboot_prompt?: string | null
   write_eol?: string | null
@@ -25,10 +24,16 @@ export interface ModelProfile {
   write_chunk_delay_ms?: number | null
 }
 
+export interface ModelFamily {
+  name: string
+  model_names: string[]
+}
+
 export interface PortConfig {
   port: string
   transport_profile?: string | null
   model_profile?: string | null
+  model_family?: string | null
   model_name?: string | null
   enabled: boolean
 }
@@ -102,6 +107,7 @@ export interface DesktopSnapshot {
   availablePorts: PortDescriptor[]
   transportProfiles: TransportProfile[]
   modelProfiles: ModelProfile[]
+  modelFamilies: ModelFamily[]
   events: Record<string, TimelineEvent[]>
   preferences: DesktopPreferences
   service: ServiceState
@@ -112,6 +118,7 @@ export interface SerialConfigurationDraft {
   enabled: boolean
   transportProfile: TransportProfile
   modelProfile?: string | null
+  modelFamily?: string | null
   modelName?: string | null
 }
 
@@ -120,8 +127,9 @@ export interface DesktopBridge {
   refresh(): Promise<DesktopSnapshot>
   sendCommand(port: string, command: string): Promise<void>
   setPortOpen(port: string, open: boolean): Promise<void>
-  saveSerialConfiguration(draft: SerialConfigurationDraft): Promise<void>
-  saveModelProfiles(profiles: ModelProfile[]): Promise<void>
+  saveSerialConfiguration(draft: SerialConfigurationDraft, expectedRevision: number): Promise<void>
+  saveModelProfiles(profiles: ModelProfile[], expectedRevision: number): Promise<void>
+  saveModelFamilies(families: ModelFamily[], expectedRevision: number): Promise<void>
   savePreferences(preferences: DesktopPreferences): Promise<void>
   startLocalService(): Promise<void>
   stopLocalService(): Promise<void>

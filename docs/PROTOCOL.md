@@ -1,4 +1,4 @@
-# Serial Platform Protocol v5
+# Serial Platform Protocol v6
 
 本文是 `seriald` HTTP/WebSocket 和 `serial-mcp` transport 的当前线协议说明。Rust DTO 与编码实现位于 `serial-protocol`；Agent 工具参数见 [MCP_TOOLS.md](./MCP_TOOLS.md)。
 
@@ -31,7 +31,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "address": "127.0.0.1:3210",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 5,
+  "protocol_version": 6,
   "pid": 12345
 }
 ```
@@ -40,7 +40,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 
 ## HTTP v1
 
-`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=5`；路由仍保持 `/api/v1/...`。
+`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=6`；路由仍保持 `/api/v1/...`。
 
 ### 路由
 
@@ -52,6 +52,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `PUT` | `/api/v1/config/ports` | 原子替换端口配置 |
 | `GET` / `PUT` | `/api/v1/config/transport-profiles` | 读取/原子替换 Transport Profile catalog |
 | `GET` / `PUT` | `/api/v1/config/model-profiles` | 读取/原子替换 Model Profile catalog |
+| `GET` / `PUT` | `/api/v1/config/model-families` | 读取/原子替换两级 Model Family catalog |
 | `GET` | `/api/v1/archives` | 枚举保留的端口/周期日志 |
 | `GET` | `/api/v1/diagnostics` | 后端、连接、journal 与所有端口诊断 |
 | `GET` | `/api/v1/diagnostics/storage` | journal 用量与 writer health |
@@ -63,7 +64,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `GET` / `PUT` / `DELETE` | `/api/v1/monitors/{monitor_id}` | 读取/更新/停止 Monitor |
 | `GET` | `/api/v1/monitors/{monitor_id}/incidents` | 分页读取 incident |
 | `POST` | `/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | 确认 incident |
-| `GET` | `/api/v1/ws` | WebSocket protocol v5 |
+| `GET` | `/api/v1/ws` | WebSocket protocol v6 |
 
 ### Health
 
@@ -73,7 +74,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "server_id": "uuid",
   "daemon_epoch": "uuid",
   "uptime_ms": 1200,
-  "protocol_version": 5
+  "protocol_version": 6
 }
 ```
 
@@ -85,7 +86,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 {
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 5,
+  "protocol_version": 6,
   "config_revision": 12,
   "sequence_write_precondition_supported": true,
   "serial_context_precondition_supported": true,
@@ -100,7 +101,8 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "config": {
     "port": "COM4",
     "transport_profile": "uart-115200",
-    "model_profile": "TL-AS7230",
+    "model_profile": "linux-shell",
+    "model_family": "TL-AS7230",
     "model_name": "TL-AS7230-W 1.0",
     "enabled": true
   },
@@ -153,7 +155,8 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
     {
       "port": "COM4",
       "transport_profile": "uart-115200",
-      "model_profile": "TL-AS7230",
+      "model_profile": "linux-shell",
+      "model_family": "TL-AS7230",
       "model_name": "TL-AS7230-W 1.0",
       "enabled": true
     }
@@ -163,7 +166,9 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 }
 ```
 
-响应返回更新后的 `ports` snapshots 与新 `config_revision`。`source` 是 1–128 字符的审计标签。
+响应返回更新后的 `ports` snapshots 与新 `config_revision`。`source` 是 1–128 字符的审计标签。`model_profile` 是独立的行为绑定；`model_family` 和 `model_name` 必须同时为字符串或同时为 null/省略，具体机型必须存在于对应 family 中。
+
+`seriald.toml` 的当前持久配置是 `schema_version=3`。该号码与 `active-endpoint.json` 和 Monitor state 的 schema 无关；旧配置 schema 直接返回 unsupported schema，不执行隐式迁移。
 
 Transport Profile：
 
@@ -185,11 +190,7 @@ Model Profile：
 
 ```json
 {
-  "name": "TL-AS7230",
-  "model_names": [
-    "TL-AS7230-W 1.0",
-    "TL-AS7230-F4GE 1.0"
-  ],
+  "name": "linux-shell",
   "shell_prompt": "root@router:~# ",
   "uboot_prompt": "=> ",
   "write_eol": "\r",
@@ -199,9 +200,21 @@ Model Profile：
 }
 ```
 
-`ModelProfile.name` 是可复用的机型系列/交互 Profile 名称，`model_names` 是该系列允许绑定的具体机型名。端口的 `model_name` 必须来自当前 `model_profile.model_names`；未绑定机型 Profile 时不能保留具体机型名。两者都按原字符串比较和显示。
+Model Profile 只管理可复用的串口交互行为，不包含 `model_names`，也不与任何机型系列绑死。`GET /api/v1/config/model-profiles` 返回 `{profiles, config_revision}`；PUT body 是 `{profiles, expected_revision?}`，表示全量替换。
 
-Profile catalog GET 响应是 `{profiles, config_revision}`；PUT body 是 `{profiles, expected_revision?}`，表示完整替换。
+Model Family：
+
+```json
+{
+  "name": "TL-AS7230",
+  "model_names": [
+    "TL-AS7230-W 1.0",
+    "TL-AS7230-F4GE 1.0"
+  ]
+}
+```
+
+`GET /api/v1/config/model-families` 返回 `{families, config_revision}`；PUT body 是 `{families:[{name,model_names}], expected_revision?}`，响应为同形的 `{families, config_revision}`。这是独立的两级身份 catalog，第一级 `name` 是机型系列，第二级 `model_names` 是具体机型。全量替换不允许删除当前端口正在引用的 family 或 model name。所有 Profile 和机型身份名称都按原字符串比较和显示。
 
 ### TimelineEvent
 
@@ -259,7 +272,7 @@ Agent command TX 的 metadata 可以包含：
 
 matcher kind 为 `contains`、`regex`、`shell_prompt` 或 `uboot_prompt`。数组为空时省略。
 
-端口机型变化的 `port_reconfigured` metadata 包含 `source`、`previous_model_profile`、`new_model_profile`、`previous_model_name` 和 `new_model_name`。
+端口配置变化的 `port_reconfigured` metadata 包含 `source`，以及 `previous_` / `new_` 版本的 `model_profile`、`model_family` 和 `model_name`。
 
 ### Archive 与 events
 
@@ -326,7 +339,7 @@ tail 使用 `EventQueryResponse` 结构。`truncated` 或 `gaps` 明确表示 ri
 
 ### Recent activity
 
-`GET /api/v1/ports/{port}/recent-activity` 必须同时提供 `epoch`、`after_seq`、`through_seq`。它只从 ring 返回最多 32 条与协同上下文有关的 TX、Control、Run 中止、端口重配或移除事件，排除普通 RX。端口重配摘要同时携带机型 Profile 和具体机型名的前后值。
+`GET /api/v1/ports/{port}/recent-activity` 必须同时提供 `epoch`、`after_seq`、`through_seq`。它只从 ring 返回最多 32 条与协同上下文有关的 TX、Control、Run 中止、端口重配或移除事件，排除普通 RX。端口重配摘要同时携带行为 Model Profile、一级 `model_family` 和二级 `model_name` 的前后值。
 
 ### Diagnostics
 
@@ -389,7 +402,7 @@ Monitor spec：
 
 列表 query 可使用 `port` 和 `status`。incident query：`after_incident_seq`、`limit`、`include_acked`。incident 响应提供 `next_cursor`、`truncated`、`first_available_incident_seq` 和 `retention_gap`。
 
-## WebSocket protocol v5
+## WebSocket protocol v6
 
 连接地址：`GET /api/v1/ws`。
 
@@ -417,7 +430,7 @@ Monitor spec：
 {
   "type": "hello",
   "request_id": "uuid",
-  "protocol_version": 5,
+  "protocol_version": 6,
   "client_name": "serialctl",
   "actor_kind": "human"
 }
@@ -430,7 +443,7 @@ Monitor spec：
   "type": "welcome",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 5,
+  "protocol_version": 6,
   "actor": {"id": "...", "label": "serialctl", "kind": "human"}
 }
 ```
@@ -556,7 +569,7 @@ POST /mcp
 {
   "status": "ok",
   "service": "serial-mcp",
-  "protocol_version": 5,
+  "protocol_version": 6,
   "pid": 12345,
   "seriald_endpoint": "http://127.0.0.1:3210",
   "seriald_server_id": "uuid",
@@ -564,7 +577,7 @@ POST /mcp
 }
 ```
 
-统一启动器只在 `service`、`protocol_version=5` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
+统一启动器只在 `service`、`protocol_version=6` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
 
 实现是 sessionless JSON-RPC：
 
@@ -576,7 +589,7 @@ POST /mcp
 - 仅允许监听 `127.0.0.1`；
 - `Origin` 若存在，只接受同端口的 `localhost` 或 `127.0.0.1`。
 
-initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回 19 项；`tools/call` 的成功与工具错误都放在 MCP tool result 中，结构化值位于 `structuredContent`，紧凑 JSON 文本位于 `content[0].text`。
+initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回 17 项；`tools/call` 的成功与工具错误都放在 MCP tool result 中，结构化值位于 `structuredContent`，紧凑 JSON 文本位于 `content[0].text`。`devices` 是唯一发现工具，只公开 `port`、两级机型身份、Agent 所需状态和有效 Shell/U-Boot 提示符，不公开 Profile 名、Transport/UART、EOL/echo 或写入节奏。`run_end` 以可选 `outcome=completed|aborted` 区分正常完成与异常终止，默认 `completed`；正常完成后立即尝试释放 Control，异常终止只在 `ControlReleased` 权威确认后成功。
 
 stdio transport 使用每行一个 JSON-RPC frame。stdout 只写 MCP frame，诊断写 stderr。并发 request 的响应次序可以与请求次序不同，但每个 frame 由一个 writer 完整写出。
 
@@ -584,7 +597,7 @@ stdio transport 使用每行一个 JSON-RPC frame。stdout 只写 MCP frame，�
 
 - `request_id` 标识协议请求；后端缓存近期已执行写入的结果。
 - 相同请求重试可返回缓存；已执行但超出幂等缓存的 ID 被拒绝，避免再次写入。
-- MCP cancellation 只中断纯观察工具。
+- MCP cancellation 只中断 `devices`、`read`、`wait`、`search`、`monitor_list`、`monitor_status` 和 `monitor_incidents`。
 - 物理 action、Run transition 和 Monitor mutation 会继续收敛到结果。
 - 明确的前置条件拒绝会说明零字节写入；transport loss、timeout 和 partial write 不能据此自动重试。
 - replay ring 淘汰、journal retention 与周期变化都通过 gap 显式表达。

@@ -576,6 +576,15 @@ pub async fn state(api: &ApiClient, args: DoctorSlotArgs) -> Result<()> {
                         || tr("menu.value.generic").into(),
                         |profile| safe_inline(profile),
                     ),
+                    &slot.config.model_family.as_ref().map_or_else(
+                        || tr("menu.value.unbound").into(),
+                        |family| safe_inline(family),
+                    ),
+                    &slot
+                        .config
+                        .model_name
+                        .as_ref()
+                        .map_or_else(|| tr("menu.value.unbound").into(), |name| safe_inline(name)),
                 ],
             ),
         );

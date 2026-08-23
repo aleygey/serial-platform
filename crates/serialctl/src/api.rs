@@ -4,10 +4,11 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    ArchiveListResponse, ConfigureModelProfilesRequest, ConfigureModelProfilesResponse,
-    ConfigurePortsRequest, ConfigurePortsResponse, ConfigureTransportProfilesRequest,
-    ConfigureTransportProfilesResponse, EventQuery, EventQueryResponse, HealthResponse,
-    JournalDiagnostics, ModelProfile, ModelProfileListResponse, MonitorIncidentListResponse,
+    ArchiveListResponse, ConfigureModelFamiliesRequest, ConfigureModelFamiliesResponse,
+    ConfigureModelProfilesRequest, ConfigureModelProfilesResponse, ConfigurePortsRequest,
+    ConfigurePortsResponse, ConfigureTransportProfilesRequest, ConfigureTransportProfilesResponse,
+    EventQuery, EventQueryResponse, HealthResponse, JournalDiagnostics, ModelFamily,
+    ModelFamilyListResponse, ModelProfile, ModelProfileListResponse, MonitorIncidentListResponse,
     MonitorListResponse, PortDescriptor, SlotConfig, SlotDiagnostics, SlotSnapshot, StatusResponse,
     StorageDiagnosticsResponse, TransportProfile, TransportProfileListResponse,
 };
@@ -28,6 +29,13 @@ pub type ConfigurePortsDocumentResponse = ConfigurePortsResponse;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileCatalog<T> {
     pub profiles: Vec<T>,
+    #[serde(default)]
+    pub config_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelFamilyCatalog {
+    pub families: Vec<ModelFamily>,
     #[serde(default)]
     pub config_revision: Option<u64>,
 }
@@ -161,6 +169,16 @@ impl ApiClient {
         })
     }
 
+    pub async fn model_families(&self) -> Result<ModelFamilyCatalog> {
+        let response = self
+            .get_json::<ModelFamilyListResponse>("/api/v1/config/model-families")
+            .await?;
+        Ok(ModelFamilyCatalog {
+            families: response.families,
+            config_revision: Some(response.config_revision),
+        })
+    }
+
     pub async fn monitors(&self, port: Option<&str>) -> Result<MonitorListResponse> {
         let mut request = self.client.get(self.url("/api/v1/monitors"));
         if let Some(port) = port {
@@ -218,6 +236,28 @@ impl ApiClient {
         let response = decode_response::<ConfigureModelProfilesResponse>(response).await?;
         Ok(ProfileCatalog {
             profiles: response.profiles,
+            config_revision: Some(response.config_revision),
+        })
+    }
+
+    pub async fn configure_model_families(
+        &self,
+        families: Vec<ModelFamily>,
+        expected_revision: Option<u64>,
+    ) -> Result<ModelFamilyCatalog> {
+        let response = self
+            .client
+            .put(self.url("/api/v1/config/model-families"))
+            .json(&ConfigureModelFamiliesRequest {
+                families,
+                expected_revision,
+            })
+            .send()
+            .await
+            .context("seriald model-family configuration request failed")?;
+        let response = decode_response::<ConfigureModelFamiliesResponse>(response).await?;
+        Ok(ModelFamilyCatalog {
+            families: response.families,
             config_revision: Some(response.config_revision),
         })
     }

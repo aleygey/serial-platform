@@ -7,7 +7,7 @@ describe('local service command', () => {
     endpoint: 'http://127.0.0.1:3210',
     serverId: '11111111-1111-4111-8111-111111111111',
     daemonEpoch: '22222222-2222-4222-8222-222222222222',
-    protocolVersion: 5,
+    protocolVersion: 6,
     pid: 42
   }
 
@@ -26,7 +26,7 @@ describe('local service command', () => {
       address: '127.0.0.1:4321',
       server_id: discovered.serverId,
       daemon_epoch: discovered.daemonEpoch,
-      protocol_version: 5,
+      protocol_version: 6,
       pid: 42
     }))).toEqual({ ...discovered, endpoint: 'http://127.0.0.1:4321' })
     expect(() => parseDiscoveredEndpoint(JSON.stringify({
@@ -35,7 +35,7 @@ describe('local service command', () => {
       address: '127.0.0.1:4321',
       server_id: discovered.serverId,
       daemon_epoch: discovered.daemonEpoch,
-      protocol_version: 4,
+      protocol_version: 5,
       pid: 42
     }))).toThrow('不兼容')
   })

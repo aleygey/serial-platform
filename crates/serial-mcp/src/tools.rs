@@ -9,18 +9,17 @@ use regex_syntax::ParserBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandCaptureMatcher, CommandCaptureMatcherKind,
-    ConfigureModelProfilesRequest, ConfigurePortsRequest, CreateMonitorRequest, Cursor,
-    DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS, Direction,
-    EchoMode, EventKind, EventQuery, EventQueryResponse, MAX_BREAK_DURATION_MS,
-    MAX_COMMAND_DESCRIPTION_BYTES, MAX_MODEL_NAMES_PER_PROFILE, MAX_MONITOR_MATCHERS,
+    Actor, ActorKind, CommandCaptureMatcher, CommandCaptureMatcherKind, ConfigurePortsRequest,
+    CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES,
+    DEFAULT_TRIGGER_TIMEOUT_MS, Direction, EchoMode, EventKind, EventQuery, EventQueryResponse,
+    MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES, MAX_MONITOR_MATCHERS,
     MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
     MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
     MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
     MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelProfile, MonitorMatcher,
-    PROTOCOL_VERSION, SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse,
-    TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, MonitorMatcher, PROTOCOL_VERSION,
+    SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse, TriggerInfo,
+    TriggerSpec, TriggerStatus, WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -31,7 +30,7 @@ use crate::{
     capture::{Capture, CaptureOptions, CommandBoundary, Completion, CompletionPattern},
     config::CaptureLimits,
     render::{MatchExcerptOptions, MatchExcerptPattern, RenderOptions, render_events},
-    session::{LocalControlState, SequenceBoundaryRejected, SessionHandle},
+    session::{SequenceBoundaryRejected, SessionHandle},
 };
 
 const DEFAULT_TEXT_CHARS: usize = 16_000;
@@ -149,8 +148,7 @@ impl AgentTools {
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
         let mut output = match name {
             "devices" => self.devices(parse(arguments)?).await,
-            "model_profiles" => self.model_profiles(parse(arguments)?).await,
-            "model_profile_set" => self.model_profile_set(parse(arguments)?).await,
+            "model_identity_set" => self.model_identity_set(parse(arguments)?).await,
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,
             "command_sequence" => self.command_sequence(parse(arguments)?).await,
@@ -166,7 +164,6 @@ impl AgentTools {
             "monitor_stop" => self.monitor_stop(parse(arguments)?).await,
             "run_start" => self.run_start(parse(arguments)?).await,
             "run_end" => self.run_end(parse(arguments)?).await,
-            "release" => self.release(parse(arguments)?).await,
             _ => bail!("unknown serial tool {name:?}"),
         }?;
         self.attach_recent_context(name, &mut output).await;
@@ -405,137 +402,45 @@ impl AgentTools {
         }
         Ok(json!({
             "daemon_epoch": status.daemon_epoch,
-            "config_revision": status.config_revision,
             "ports": ports,
-            "selection_note": "Choose a port explicitly and confirm its model_profile and model_name match the connected device before writing. A Run scopes evidence; it does not reset the device."
+            "selection_note": "Choose a port explicitly and confirm model_family and model_name match the physically connected device before writing. If they do not match, call model_identity_set with the exact existing family/name; if that identity is not in the human-managed catalog, ask the user to create it in the TUI/App first. command, command_sequence, and wait automatically use command_prompts; pass expect or regex to override prompt matching for a call. A Run scopes evidence; it does not reset the device."
         }))
     }
 
-    async fn model_profiles(&self, args: ModelProfilesArgs) -> Result<Value> {
-        let status = self.status().await?;
-        if let Some(port) = args.port.as_deref() {
-            self.slot(port).await?;
+    async fn model_identity_set(&self, args: ModelIdentitySetArgs) -> Result<Value> {
+        let model_family = args.model_family.into_option();
+        let model_name = args.model_name.into_option();
+        if model_family.is_some() != model_name.is_some() {
+            bail!("model_family and model_name must both be strings or both be null");
         }
-        let catalog = self.api.model_profiles().await?;
-        let bindings = status
-            .ports
-            .into_iter()
-            .filter(|slot| {
-                args.port
-                    .as_deref()
-                    .is_none_or(|port| slot.config.port == port)
-            })
-            .map(|slot| {
-                json!({
-                    "port": slot.config.port,
-                    "model_profile": slot.config.model_profile,
-                    "model_name": slot.config.model_name,
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "config_revision": catalog.config_revision,
-            "profiles": catalog.profiles,
-            "bindings": bindings,
-            "port_filter": args.port,
-        }))
-    }
-
-    async fn model_profile_set(&self, args: ModelProfileSetArgs) -> Result<Value> {
         let status = self.status().await?;
         let current = status
             .ports
             .iter()
             .find(|slot| slot.config.port == args.port)
             .ok_or_else(|| anyhow!("unknown serial port {:?}", args.port))?;
-        let previous = current.config.model_profile.clone();
+        let previous_model_family = current.config.model_family.clone();
         let previous_model_name = current.config.model_name.clone();
-        let next_model_profile = args.profile.as_ref().map(|profile| profile.name.clone());
-        let next_model_name = match args.profile.as_ref() {
-            None => {
-                if matches!(&args.model_name, ModelNameUpdate::Set(Some(_))) {
-                    bail!("model_name requires a non-null model profile");
-                }
-                None
+        if let (Some(family_name), Some(model_name)) =
+            (model_family.as_deref(), model_name.as_deref())
+        {
+            let catalog = self.api.model_families().await?;
+            let family = catalog
+                .families
+                .iter()
+                .find(|family| family.name == family_name)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown model family {family_name:?}; ask the user to create it in the TUI/App first"
+                    )
+                })?;
+            if !family.model_names.iter().any(|name| name == model_name) {
+                bail!(
+                    "model name {model_name:?} is not listed in model family {family_name:?}; ask the user to create it in the TUI/App first"
+                );
             }
-            Some(profile) => match &args.model_name {
-                ModelNameUpdate::Set(Some(model_name)) => {
-                    if !profile.model_names.iter().any(|name| name == model_name) {
-                        bail!(
-                            "model_name {:?} is not listed in model profile {:?}",
-                            model_name,
-                            profile.name
-                        );
-                    }
-                    Some(model_name.clone())
-                }
-                ModelNameUpdate::Set(None) => None,
-                ModelNameUpdate::Unspecified
-                    if previous.as_deref() == Some(profile.name.as_str())
-                        && previous_model_name
-                            .as_ref()
-                            .is_some_and(|name| profile.model_names.contains(name)) =>
-                {
-                    previous_model_name.clone()
-                }
-                ModelNameUpdate::Unspecified => None,
-            },
-        };
-
-        let catalog = self.api.model_profiles().await?;
-        let mut config_revision = catalog.config_revision;
-        let mut final_profiles = catalog.profiles;
-        let mut requires_final_catalog_write = false;
-        if let Some(profile) = args.profile.as_ref() {
-            for binding in &status.ports {
-                if binding.config.port != args.port
-                    && binding.config.model_profile.as_deref() == Some(profile.name.as_str())
-                    && binding
-                        .config
-                        .model_name
-                        .as_ref()
-                        .is_some_and(|name| !profile.model_names.contains(name))
-                {
-                    bail!(
-                        "model profile {:?} cannot remove concrete model {:?} while port {:?} still uses it",
-                        profile.name,
-                        binding.config.model_name,
-                        binding.config.port
-                    );
-                }
-            }
-            replace_model_profile(&mut final_profiles, profile.clone());
-            let mut first_profiles = final_profiles.clone();
-            if previous.as_deref() == Some(profile.name.as_str())
-                && previous_model_name
-                    .as_ref()
-                    .is_some_and(|name| !profile.model_names.contains(name))
-            {
-                if profile.model_names.len() >= MAX_MODEL_NAMES_PER_PROFILE {
-                    bail!(
-                        "model profile {:?} is at the concrete-model limit and cannot replace the current port binding atomically",
-                        profile.name
-                    );
-                }
-                let mut transition = profile.clone();
-                transition
-                    .model_names
-                    .push(previous_model_name.clone().expect("checked concrete model"));
-                replace_model_profile(&mut first_profiles, transition);
-                requires_final_catalog_write = true;
-            }
-            config_revision = self
-                .api
-                .configure_model_profiles(&ConfigureModelProfilesRequest {
-                    profiles: first_profiles,
-                    expected_revision: Some(catalog.config_revision),
-                })
-                .await?
-                .config_revision;
         }
-
-        let latest = self.status().await?;
-        let mut port_configs = latest
+        let mut port_configs = status
             .ports
             .into_iter()
             .map(|port| port.config)
@@ -543,34 +448,24 @@ impl AgentTools {
         let configured = port_configs
             .iter_mut()
             .find(|port| port.port == args.port)
-            .expect("port was validated against the same daemon");
-        configured.model_profile = next_model_profile;
-        configured.model_name = next_model_name.clone();
-        config_revision = self
+            .expect("port was validated against the same status snapshot");
+        configured.model_family.clone_from(&model_family);
+        configured.model_name.clone_from(&model_name);
+        let config_revision = self
             .api
             .configure_ports(&ConfigurePortsRequest {
                 ports: port_configs,
                 source: "agent:serial-mcp".into(),
-                expected_revision: Some(config_revision),
+                expected_revision: Some(status.config_revision),
             })
             .await?
             .config_revision;
-        if requires_final_catalog_write {
-            config_revision = self
-                .api
-                .configure_model_profiles(&ConfigureModelProfilesRequest {
-                    profiles: final_profiles,
-                    expected_revision: Some(config_revision),
-                })
-                .await?
-                .config_revision;
-        }
         Ok(json!({
             "port": args.port,
-            "previous_model_profile": previous,
+            "previous_model_family": previous_model_family,
             "previous_model_name": previous_model_name,
-            "model_profile": args.profile,
-            "model_name": next_model_name,
+            "model_family": model_family,
+            "model_name": model_name,
             "config_revision": config_revision,
         }))
     }
@@ -1949,76 +1844,33 @@ impl AgentTools {
         let _write_guard = self.write_guard(&run_use.port).await;
         let slot = self.slot(&run_use.port).await?;
         matching_active_run(&slot, run_use.run_id, "run_end")?;
-        let ended = self
-            .session
-            .end_run(run_use.port.clone(), run_use.run_id, run_use.run_token)
-            .await?;
-        Ok(json!({
-            "port": run_use.port,
-            "run_id": ended.id,
-            "run_handle": args.run_handle,
-            "run_open": false,
-            "control_release": "best_effort"
-        }))
-    }
-
-    async fn release(&self, args: ReleaseArgs) -> Result<Value> {
-        let (port, run_use) = match args.run_handle.as_ref() {
-            Some(handle) => {
-                if !args.abort_run {
-                    bail!(
-                        "run_handle is valid for release only with abort_run=true; use run_end for normal completion"
-                    );
-                }
-                if args.port.is_some() {
-                    bail!("aborting release needs only run_handle and abort_run=true; omit port");
-                }
-                let authorized = self.session.authorize_run_use(handle.clone()).await?;
-                (authorized.port.clone(), Some(authorized))
+        match args.outcome {
+            RunEndOutcome::Completed => {
+                let ended = self
+                    .session
+                    .end_run(run_use.port.clone(), run_use.run_id, run_use.run_token)
+                    .await?;
+                Ok(run_end_output(
+                    run_use.port,
+                    ended.id,
+                    args.run_handle,
+                    RunEndOutcome::Completed,
+                    "best_effort",
+                ))
             }
-            None => {
-                if args.abort_run {
-                    bail!("abort_run=true requires run_handle from run_start");
-                }
-                let port = args
-                    .port
-                    .context("release requires port, or run_handle with abort_run=true")?;
-                (port, None)
+            RunEndOutcome::Aborted => {
+                self.session
+                    .abort_run(run_use.port.clone(), run_use.run_id, run_use.run_token)
+                    .await?;
+                Ok(run_end_output(
+                    run_use.port,
+                    run_use.run_id,
+                    args.run_handle,
+                    RunEndOutcome::Aborted,
+                    "released",
+                ))
             }
-        };
-        let run_capability = run_use.as_ref().map(|run| (run.run_id, run.run_token));
-        let _write_guard = self.write_guard(&port).await;
-        let local = self.session.local_control_state(port.clone()).await?;
-        if !local.has_lease {
-            // Public status may show a foreign Run, but release controls only
-            // this MCP connection. Avoid consulting or modifying that Run;
-            // the local no-lease release also discards any stale owned_run.
-            let had_lease = self
-                .session
-                .release(port.clone(), false, None, true)
-                .await?;
-            return Ok(release_output(port, had_lease));
         }
-
-        let current = self.slot(&port).await?;
-        let decision = plan_release(
-            local,
-            current.active_run.as_ref().map(|run| run.id),
-            args.abort_run,
-            run_capability,
-        )?;
-        let ReleaseDecision::Release {
-            authorize,
-            allow_stale_cleanup,
-        } = decision
-        else {
-            unreachable!("a checked local lease cannot produce AlreadyReleased")
-        };
-        let had_lease = self
-            .session
-            .release(port.clone(), args.abort_run, authorize, allow_stale_cleanup)
-            .await?;
-        Ok(release_output(port, had_lease))
     }
 
     async fn slot(&self, port: &str) -> Result<SlotSnapshot> {
@@ -2288,8 +2140,8 @@ fn summarize_recent_context(
                 for field in [
                     "port",
                     "source",
-                    "previous_model_profile",
-                    "new_model_profile",
+                    "previous_model_family",
+                    "new_model_family",
                     "previous_model_name",
                     "new_model_name",
                 ] {
@@ -2461,71 +2313,20 @@ fn matching_active_run<'a>(
     Ok(active)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ReleaseDecision {
-    AlreadyReleased,
-    Release {
-        authorize: Option<(Uuid, Uuid)>,
-        allow_stale_cleanup: bool,
-    },
-}
-
-fn plan_release(
-    local: LocalControlState,
-    daemon_active_run_id: Option<Uuid>,
-    abort_run: bool,
-    run_capability: Option<(Uuid, Uuid)>,
-) -> Result<ReleaseDecision> {
-    if !local.has_lease {
-        return Ok(ReleaseDecision::AlreadyReleased);
-    }
-    let Some(local_run_id) = local.owned_run_id else {
-        return Ok(ReleaseDecision::Release {
-            authorize: None,
-            allow_stale_cleanup: false,
-        });
-    };
-    let Some(active_run_id) = daemon_active_run_id else {
-        return Ok(ReleaseDecision::Release {
-            authorize: None,
-            allow_stale_cleanup: true,
-        });
-    };
-    if active_run_id != local_run_id {
-        bail!(
-            "local Run ownership changed: serial-mcp recorded Run {local_run_id}, but seriald \
-             reports active Run {active_run_id}; refusing to release across that Run boundary"
-        );
-    }
-    if !abort_run {
-        bail!(
-            "serial-mcp owns active Run {local_run_id}; use run_end, or set abort_run=true with \
-             its run_handle"
-        );
-    }
-    let capability = run_capability.context(
-        "release would abort this MCP's active Run; pass run_handle from this caller's \
-         run_start response",
-    )?;
-    if capability.0 != local_run_id {
-        bail!(
-            "release capability names Run {}, but serial-mcp owns Run {local_run_id}; refusing \
-             to abort a different Run",
-            capability.0
-        );
-    }
-    Ok(ReleaseDecision::Release {
-        authorize: Some(capability),
-        allow_stale_cleanup: false,
-    })
-}
-
-fn release_output(port: String, had_lease: bool) -> Value {
+fn run_end_output(
+    port: String,
+    run_id: Uuid,
+    run_handle: String,
+    outcome: RunEndOutcome,
+    control_release: &'static str,
+) -> Value {
     json!({
         "port": port,
-        "released": had_lease,
-        "already_released": !had_lease,
-        "serial_port_closed": false
+        "run_id": run_id,
+        "run_handle": run_handle,
+        "outcome": outcome,
+        "run_open": false,
+        "control_release": control_release,
     })
 }
 
@@ -2803,16 +2604,6 @@ fn validate_monitor_matchers(matchers: &[MonitorMatcher]) -> Result<()> {
         bail!("matcher values must not exceed {MAX_MONITOR_TOTAL_PATTERN_BYTES} total UTF-8 bytes");
     }
     Ok(())
-}
-
-fn replace_model_profile(profiles: &mut Vec<ModelProfile>, profile: ModelProfile) {
-    match profiles
-        .iter()
-        .position(|candidate| candidate.name == profile.name)
-    {
-        Some(index) => profiles[index] = profile,
-        None => profiles.push(profile),
-    }
 }
 
 fn create_monitor_request(args: MonitorStartArgs) -> Result<CreateMonitorRequest> {
@@ -3268,6 +3059,7 @@ mod completion_tests {
                 port: "/dev/cu.usbserial-210".into(),
                 transport_profile: None,
                 model_profile: Some("TL-AS7230 1.0".into()),
+                model_family: Some("TL-AS7230".into()),
                 model_name: Some("TL-AS7230-W 1.0".into()),
                 enabled: true,
             },
@@ -3319,6 +3111,120 @@ mod completion_tests {
     }
 
     #[test]
+    fn device_summary_exposes_identity_and_prompts_without_profile_or_transport_details() {
+        let summary = slot_summary(&slot(Some("root# "), Some("U-Boot> ")));
+        assert_eq!(summary["model_family"], "TL-AS7230");
+        assert_eq!(summary["model_name"], "TL-AS7230-W 1.0");
+        assert_eq!(summary["command_prompts"]["shell"], "root# ");
+        assert_eq!(summary["command_prompts"]["uboot"], "U-Boot> ");
+        for hidden in [
+            "transport_profile",
+            "model_profile",
+            "effective_transport",
+            "effective_device",
+            "write_eol",
+            "echo",
+            "write_pacing",
+        ] {
+            assert!(summary.get(hidden).is_none(), "unexpected {hidden}");
+        }
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("TL-AS7230 1.0"));
+        for hidden in [
+            "transport_profile",
+            "model_profile",
+            "effective_transport",
+            "effective_device",
+            "write_eol",
+            "\"echo\"",
+            "write_pacing",
+            "write_chunk",
+        ] {
+            assert!(!serialized.contains(hidden), "leaked {hidden}");
+        }
+    }
+
+    #[test]
+    fn run_end_outcome_defaults_and_accepts_only_completed_or_aborted() {
+        let defaulted: RunEndArgs =
+            serde_json::from_value(json!({"run_handle": "abcdefghijklmnopqrstuv"})).unwrap();
+        assert_eq!(defaulted.outcome, RunEndOutcome::Completed);
+
+        let completed: RunEndArgs = serde_json::from_value(json!({
+            "run_handle": "abcdefghijklmnopqrstuv",
+            "outcome": "completed"
+        }))
+        .unwrap();
+        assert_eq!(completed.outcome, RunEndOutcome::Completed);
+
+        let aborted: RunEndArgs = serde_json::from_value(json!({
+            "run_handle": "abcdefghijklmnopqrstuv",
+            "outcome": "aborted"
+        }))
+        .unwrap();
+        assert_eq!(aborted.outcome, RunEndOutcome::Aborted);
+
+        assert!(
+            serde_json::from_value::<RunEndArgs>(json!({
+                "run_handle": "abcdefghijklmnopqrstuv",
+                "outcome": "cancelled"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_end_outputs_explicit_terminal_outcome_and_release_state() {
+        let run_id = Uuid::new_v4();
+        let completed = run_end_output(
+            "COM4".into(),
+            run_id,
+            "abcdefghijklmnopqrstuv".into(),
+            RunEndOutcome::Completed,
+            "best_effort",
+        );
+        assert_eq!(completed["outcome"], "completed");
+        assert_eq!(completed["run_open"], false);
+        assert_eq!(completed["control_release"], "best_effort");
+
+        let aborted = run_end_output(
+            "COM4".into(),
+            run_id,
+            "abcdefghijklmnopqrstuv".into(),
+            RunEndOutcome::Aborted,
+            "released",
+        );
+        assert_eq!(aborted["outcome"], "aborted");
+        assert_eq!(aborted["run_open"], false);
+        assert_eq!(aborted["control_release"], "released");
+    }
+
+    #[test]
+    fn aborted_run_end_refuses_a_foreign_run() {
+        let expected_run_id = Uuid::new_v4();
+        let foreign_run_id = Uuid::new_v4();
+        let mut foreign = slot(None, None);
+        foreign.active_run = Some(serial_protocol::RunInfo {
+            id: foreign_run_id,
+            owner: Actor {
+                id: "agent:foreign".into(),
+                label: "foreign".into(),
+                kind: ActorKind::Agent,
+            },
+            label: "foreign run".into(),
+            status: serial_protocol::RunStatus::Active,
+            start_seq: 1,
+            end_seq: None,
+            metadata: BTreeMap::new(),
+        });
+        let error = matching_active_run(&foreign, expected_run_id, "run_end")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&foreign_run_id.to_string()));
+        assert!(error.contains("refusing to adopt or modify another caller's Run"));
+    }
+
+    #[test]
     fn explicit_and_quiet_boundaries_produce_exact_audit_matchers() {
         let (_, _, _, contains) =
             requested_completion(Some("Password:"), None, &slot(None, None), true).unwrap();
@@ -3337,7 +3243,7 @@ mod completion_tests {
     }
 
     #[test]
-    fn recent_context_reports_human_model_profile_switches() {
+    fn recent_context_reports_human_model_identity_switches_without_profile_names() {
         let epoch = Uuid::new_v4();
         let event = serial_protocol::TimelineEvent {
             port: "COM4".into(),
@@ -3361,8 +3267,10 @@ mod completion_tests {
             metadata: BTreeMap::from([
                 ("port".into(), json!("COM4")),
                 ("source".into(), json!("human:desktop")),
-                ("previous_model_profile".into(), json!("TL-AS7230 1.0")),
-                ("new_model_profile".into(), json!("TL-AS7230 2.0")),
+                ("previous_model_profile".into(), json!("private-profile-a")),
+                ("new_model_profile".into(), json!("private-profile-b")),
+                ("previous_model_family".into(), json!("TL-AS7230")),
+                ("new_model_family".into(), json!("TL-AS7250")),
                 ("previous_model_name".into(), json!("TL-AS7230-W 1.0")),
                 ("new_model_name".into(), json!("TL-AS7230-F4GE 1.0")),
             ]),
@@ -3388,47 +3296,46 @@ mod completion_tests {
         )
         .unwrap();
         assert_eq!(context["events"][0]["source"], "human:desktop");
-        assert_eq!(
-            context["events"][0]["previous_model_profile"],
-            "TL-AS7230 1.0"
-        );
-        assert_eq!(context["events"][0]["new_model_profile"], "TL-AS7230 2.0");
+        assert!(context["events"][0].get("previous_model_profile").is_none());
+        assert!(context["events"][0].get("new_model_profile").is_none());
+        assert_eq!(context["events"][0]["previous_model_family"], "TL-AS7230");
+        assert_eq!(context["events"][0]["new_model_family"], "TL-AS7250");
         assert_eq!(context["events"][0]["new_model_name"], "TL-AS7230-F4GE 1.0");
     }
 }
 
 #[cfg(test)]
-mod model_profile_argument_tests {
+mod model_configuration_argument_tests {
     use super::*;
 
-    fn arguments(model_name: Option<Value>) -> Value {
-        let mut value = json!({
-            "port": "COM4",
-            "profile": {
-                "name": "TL-AS7230",
-                "model_names": ["TL-AS7230-W 1.0"]
-            }
-        });
-        if let Some(model_name) = model_name {
-            value["model_name"] = model_name;
-        }
-        value
-    }
-
     #[test]
-    fn model_name_argument_distinguishes_omitted_null_and_string() {
-        let omitted: ModelProfileSetArgs = serde_json::from_value(arguments(None)).unwrap();
-        assert_eq!(omitted.model_name, ModelNameUpdate::Unspecified);
-
-        let cleared: ModelProfileSetArgs =
-            serde_json::from_value(arguments(Some(Value::Null))).unwrap();
-        assert_eq!(cleared.model_name, ModelNameUpdate::Set(None));
-
-        let selected: ModelProfileSetArgs =
-            serde_json::from_value(arguments(Some(json!("TL-AS7230-W 1.0")))).unwrap();
+    fn identity_fields_are_required_and_accept_strings_or_null() {
+        let selected: ModelIdentitySetArgs = serde_json::from_value(json!({
+            "port": "COM4",
+            "model_family": "TL-AS7230",
+            "model_name": "TL-AS7230-W 1.0"
+        }))
+        .unwrap();
         assert_eq!(
-            selected.model_name,
-            ModelNameUpdate::Set(Some("TL-AS7230-W 1.0".into()))
+            selected.model_family.into_option().as_deref(),
+            Some("TL-AS7230")
+        );
+        assert_eq!(
+            selected.model_name.into_option().as_deref(),
+            Some("TL-AS7230-W 1.0")
+        );
+
+        let detached: ModelIdentitySetArgs = serde_json::from_value(json!({
+            "port": "COM4", "model_family": null, "model_name": null
+        }))
+        .unwrap();
+        assert_eq!(detached.model_family.into_option(), None);
+        assert_eq!(detached.model_name.into_option(), None);
+        assert!(
+            serde_json::from_value::<ModelIdentitySetArgs>(json!({
+                "port": "COM4", "model_family": null
+            }))
+            .is_err()
         );
     }
 }
@@ -3690,12 +3597,6 @@ fn ensure_serial_context_precondition_supported(status: &StatusResponse) -> Resu
 }
 
 fn slot_summary(slot: &SlotSnapshot) -> Value {
-    let effective_transport = slot.effective_transport.unwrap_or_else(|| {
-        serial_protocol::resolve_transport_settings(
-            &serial_protocol::SerialSettings::default(),
-            None,
-        )
-    });
     let (shell_prompt, uboot_prompt) = effective_prompts(slot);
     let control = slot.control.as_ref().map(|lease| {
         json!({
@@ -3727,21 +3628,16 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
     json!({
         "port": slot.config.port,
         "enabled": slot.config.enabled,
-        "transport_profile": slot.config.transport_profile,
-        "model_profile": slot.config.model_profile,
+        "model_family": slot.config.model_family,
         "model_name": slot.config.model_name,
         "endpoint_present": slot.endpoint_present,
         "session_state": slot.session_state,
         "state_code": slot.state_code,
         "state_reason": slot.state_reason,
         "target_activity": slot.target_activity,
-        "effective_transport": effective_transport,
-        "effective_device": {
-            "write_eol": effective_write_eol(slot),
-            "echo": effective_echo_mode(slot),
-            "shell_prompt": shell_prompt,
-            "uboot_prompt": uboot_prompt,
-            "write_pacing": effective_write_pacing(slot)
+        "command_prompts": {
+            "shell": shell_prompt,
+            "uboot": uboot_prompt
         },
         "cursor": {"epoch": slot.daemon_epoch, "after_seq": slot.head_seq},
         "generation": slot.generation,
@@ -3762,32 +3658,28 @@ fn actor_summary(actor: &serial_protocol::Actor) -> Value {
 struct DevicesArgs {
     port: Option<String>,
 }
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ModelProfilesArgs {
-    port: Option<String>,
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModelProfileSetArgs {
+struct ModelIdentitySetArgs {
     port: String,
-    profile: Option<ModelProfile>,
-    #[serde(default, deserialize_with = "deserialize_model_name_update")]
-    model_name: ModelNameUpdate,
+    model_family: RequiredNullableString,
+    model_name: RequiredNullableString,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-enum ModelNameUpdate {
-    #[default]
-    Unspecified,
-    Set(Option<String>),
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RequiredNullableString {
+    Value(String),
+    Null(()),
 }
 
-fn deserialize_model_name_update<'de, D>(deserializer: D) -> Result<ModelNameUpdate, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(ModelNameUpdate::Set)
+impl RequiredNullableString {
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Null(()) => None,
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3911,12 +3803,14 @@ struct RunStartArgs {
 #[serde(deny_unknown_fields)]
 struct RunEndArgs {
     run_handle: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReleaseArgs {
-    port: Option<String>,
     #[serde(default)]
-    abort_run: bool,
-    run_handle: Option<String>,
+    outcome: RunEndOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RunEndOutcome {
+    #[default]
+    Completed,
+    Aborted,
 }

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import type {
   DesktopSnapshot,
+  ModelFamily,
   ModelProfile,
   PortDescriptor,
   SerialConfigurationDraft,
@@ -38,6 +39,20 @@ interface ProfileList<T> {
   config_revision: number
 }
 
+interface FamilyList {
+  families: ModelFamily[]
+  config_revision: number
+}
+
+interface ConfigurationSnapshot {
+  status: StatusResponse
+  transport: ProfileList<TransportProfile>
+  profiles: ProfileList<ModelProfile>
+  families: FamilyList
+}
+
+const CONFIGURATION_SNAPSHOT_ATTEMPTS = 3
+
 interface ConfigurePortsResponse {
   ports: PortSnapshot[]
   config_revision: number
@@ -64,8 +79,17 @@ export interface ServerData {
   availablePorts: PortDescriptor[]
   transportProfiles: TransportProfile[]
   modelProfiles: ModelProfile[]
+  modelFamilies: ModelFamily[]
   events: Record<string, TimelineEvent[]>
 }
+
+class SerialHttpError extends Error {
+  constructor(readonly status: number, detail: string) {
+    super(`后端返回 ${status}${detail ? `：${detail}` : ''}`)
+  }
+}
+
+export class ConfigurationConflictError extends Error {}
 
 export class SerialClient extends EventEmitter {
   readonly endpoint: string
@@ -73,6 +97,7 @@ export class SerialClient extends EventEmitter {
   private availablePorts: PortDescriptor[] = []
   private transportProfiles: TransportProfile[] = []
   private modelProfiles: ModelProfile[] = []
+  private modelFamilies: ModelFamily[] = []
   private readonly events = new Map<string, TimelineEvent[]>()
   private socket?: WebSocket
   private renewTimer?: NodeJS.Timeout
@@ -120,20 +145,17 @@ export class SerialClient extends EventEmitter {
   }
 
   async refresh(loadHistory = false): Promise<ServerData> {
-    const [status, availablePorts, transport, models] = await Promise.all([
-      this.get<StatusResponse>('/api/v1/status'),
+    const [availablePorts, configuration] = await Promise.all([
       this.get<PortDescriptor[]>('/api/v1/ports'),
-      this.get<ProfileList<TransportProfile>>('/api/v1/config/transport-profiles'),
-      this.get<ProfileList<ModelProfile>>('/api/v1/config/model-profiles')
+      this.loadConsistentConfiguration()
     ])
+    const { status, transport, profiles, families } = configuration
     assertCompatibleProtocol(status.protocol_version)
     this.status = status
     this.availablePorts = availablePorts
     this.transportProfiles = transport.profiles
-    this.modelProfiles = models.profiles.map((profile) => ({
-      ...profile,
-      model_names: profile.model_names ?? []
-    }))
+    this.modelProfiles = profiles.profiles
+    this.modelFamilies = families.families
     if (loadHistory) {
       await Promise.all(status.ports.map((configured) => this.loadHistory(configured)))
     }
@@ -147,6 +169,7 @@ export class SerialClient extends EventEmitter {
       availablePorts: [...this.availablePorts],
       transportProfiles: structuredClone(this.transportProfiles),
       modelProfiles: structuredClone(this.modelProfiles),
+      modelFamilies: structuredClone(this.modelFamilies),
       events: Object.fromEntries([...this.events].map(([port, items]) => [port, [...items]]))
     }
   }
@@ -165,29 +188,37 @@ export class SerialClient extends EventEmitter {
     await this.reconnectSocket()
   }
 
-  async saveSerialConfiguration(draft: SerialConfigurationDraft): Promise<void> {
-    const [status, catalog] = await Promise.all([
-      this.get<StatusResponse>('/api/v1/status'),
-      this.get<ProfileList<TransportProfile>>('/api/v1/config/transport-profiles')
-    ])
+  async saveSerialConfiguration(
+    draft: SerialConfigurationDraft,
+    expectedRevision: number
+  ): Promise<void> {
+    const { status, transport: catalog } = await this.loadConsistentConfiguration()
+    if (status.config_revision !== expectedRevision) {
+      await this.raiseConfigurationConflict()
+    }
     const boundBefore = new Set(status.ports.map((configured) => configured.config.transport_profile).filter(Boolean))
     const stage = stageTransportCatalog(draft.port, draft.transportProfile, catalog.profiles, boundBefore)
-    const staged = sameProfileCatalog(stage.profiles, catalog.profiles)
-      ? { config_revision: status.config_revision }
-      : await this.put<ProfileList<TransportProfile>>('/api/v1/config/transport-profiles', {
-          profiles: stage.profiles,
-          expected_revision: status.config_revision
-        })
     const existing = status.ports.find((configured) => configured.config.port === draft.port)?.config
     const next = configuredPortFromDraft(draft, stage.selected.name, existing)
     const ports = status.ports.some((configured) => configured.config.port === draft.port)
       ? status.ports.map((configured) => (configured.config.port === draft.port ? next : configured.config))
       : [...status.ports.map((configured) => configured.config), next]
-    const switched = await this.put<ConfigurePortsResponse>('/api/v1/config/ports', {
-      ports,
-      source: 'human:desktop',
-      expected_revision: staged.config_revision
-    })
+    let switched: ConfigurePortsResponse
+    try {
+      const staged = sameProfileCatalog(stage.profiles, catalog.profiles)
+        ? { config_revision: status.config_revision }
+        : await this.put<ProfileList<TransportProfile>>('/api/v1/config/transport-profiles', {
+            profiles: stage.profiles,
+            expected_revision: status.config_revision
+          })
+      switched = await this.put<ConfigurePortsResponse>('/api/v1/config/ports', {
+        ports,
+        source: 'human:desktop',
+        expected_revision: staged.config_revision
+      })
+    } catch (error) {
+      return this.recoverConfigurationConflict(error)
+    }
     const bound = new Set(switched.ports.map((configured) => configured.config.transport_profile).filter(Boolean))
     const prefix = transportCandidatePrefix(draft.port)
     const cleaned = stage.profiles.filter(
@@ -205,12 +236,27 @@ export class SerialClient extends EventEmitter {
     await this.reconnectSocket()
   }
 
-  async saveModelProfiles(profiles: ModelProfile[]): Promise<void> {
-    const status = await this.get<StatusResponse>('/api/v1/status')
-    await this.put('/api/v1/config/model-profiles', {
-      profiles,
-      expected_revision: status.config_revision
-    })
+  async saveModelProfiles(profiles: ModelProfile[], expectedRevision: number): Promise<void> {
+    try {
+      await this.put('/api/v1/config/model-profiles', {
+        profiles,
+        expected_revision: expectedRevision
+      })
+    } catch (error) {
+      await this.recoverConfigurationConflict(error)
+    }
+    await this.refresh()
+  }
+
+  async saveModelFamilies(families: ModelFamily[], expectedRevision: number): Promise<void> {
+    try {
+      await this.put('/api/v1/config/model-families', {
+        families,
+        expected_revision: expectedRevision
+      })
+    } catch (error) {
+      await this.recoverConfigurationConflict(error)
+    }
     await this.refresh()
   }
 
@@ -531,6 +577,41 @@ export class SerialClient extends EventEmitter {
     this.pending.clear()
   }
 
+  private async loadConsistentConfiguration(): Promise<ConfigurationSnapshot> {
+    for (let attempt = 0; attempt < CONFIGURATION_SNAPSHOT_ATTEMPTS; attempt += 1) {
+      const [status, transport, profiles, families] = await Promise.all([
+        this.get<StatusResponse>('/api/v1/status'),
+        this.get<ProfileList<TransportProfile>>('/api/v1/config/transport-profiles'),
+        this.get<ProfileList<ModelProfile>>('/api/v1/config/model-profiles'),
+        this.get<FamilyList>('/api/v1/config/model-families')
+      ])
+      const revision = status.config_revision
+      if (
+        transport.config_revision === revision
+        && profiles.config_revision === revision
+        && families.config_revision === revision
+      ) {
+        return { status, transport, profiles, families }
+      }
+    }
+    throw new Error('后端配置正在持续变化，无法获取一致快照，请重试')
+  }
+
+  private async recoverConfigurationConflict(error: unknown): Promise<never> {
+    if (!(error instanceof SerialHttpError) || error.status !== 409) throw error
+    return this.raiseConfigurationConflict()
+  }
+
+  private async raiseConfigurationConflict(): Promise<never> {
+    try {
+      await this.refresh()
+    } catch (refreshError) {
+      const detail = refreshError instanceof Error ? refreshError.message : String(refreshError)
+      throw new ConfigurationConflictError(`配置已被其他操作更新，自动刷新失败：${detail}`)
+    }
+    throw new ConfigurationConflictError('配置已被其他操作更新，App 已刷新到最新内容，请重新确认后保存')
+  }
+
   private async get<T>(path: string): Promise<T> {
     return this.request(path) as Promise<T>
   }
@@ -551,7 +632,7 @@ export class SerialClient extends EventEmitter {
     })
     if (!response.ok) {
       const detail = (await response.text()).trim()
-      throw new Error(`后端返回 ${response.status}${detail ? `：${detail}` : ''}`)
+      throw new SerialHttpError(response.status, detail)
     }
     return response.json()
   }
@@ -623,11 +704,12 @@ export function configuredPortFromDraft(
   existing?: PortSnapshot['config']
 ): PortSnapshot['config'] {
   const modelProfile = draft.modelProfile ?? null
-  const modelName = modelProfile === null
+  const modelFamily = draft.modelFamily ?? null
+  const modelName = modelFamily === null
     ? null
     : draft.modelName !== undefined
       ? draft.modelName
-      : existing?.model_profile === modelProfile
+      : existing?.model_family === modelFamily
         ? existing.model_name ?? null
         : null
   return {
@@ -635,6 +717,7 @@ export function configuredPortFromDraft(
     enabled: draft.enabled,
     transport_profile: transportProfile,
     model_profile: modelProfile,
+    model_family: modelFamily,
     model_name: modelName
   }
 }

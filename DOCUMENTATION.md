@@ -1,6 +1,6 @@
 # Serial Platform Architecture
 
-本文描述 Serial Platform 的当前架构。具体 JSON 契约以 [protocol v5](./docs/PROTOCOL.md) 为准，Agent 工具以 [MCP 工具目录](./docs/MCP_TOOLS.md) 或 `serial mcp --dump-tools` 为准。
+本文描述 Serial Platform 的当前架构。具体 JSON 契约以 [protocol v6](./docs/PROTOCOL.md) 为准，Agent 工具以 [MCP 工具目录](./docs/MCP_TOOLS.md) 或 `serial mcp --dump-tools` 为准。
 
 ## 产品边界
 
@@ -28,11 +28,11 @@ Serial Platform 是通用的人/Agent 协同串口平台：后端独占物理 UA
 | 组件 | 责任 |
 |---|---|
 | `serial` | 统一入口；离线 setup；一次启动后端、HTTP MCP 和前台 TUI；分发其他子命令 |
-| `seriald` | 物理串口所有权、Control/Run/Trigger、journal、HTTP v1 和 WebSocket v5 |
+| `seriald` | 物理串口所有权、Control/Run/Trigger、journal、HTTP v1 和 WebSocket v6 |
 | `serialctl` | 人工 setup、Profile 管理、诊断、历史查询和全屏 TUI |
-| `serial-mcp` | 面向 Agent 的 19 工具；支持 stdio 与 sessionless Streamable HTTP |
+| `serial-mcp` | 面向 Agent 的 17 工具；支持 stdio 与 sessionless Streamable HTTP |
 | Electron App | 本地服务生命周期、三栏控制台、配置页和桌面快捷键 |
-| `serial-protocol` | 跨组件 DTO、v5 WebSocket 消息和二进制帧 codec |
+| `serial-protocol` | 跨组件 DTO、v6 WebSocket 消息和二进制帧 codec |
 
 `seriald` 是唯一直接打开物理串口的组件。其余组件只通过 HTTP/WebSocket 访问后端，因此多个 TUI、桌面窗口和 Agent 可以观察同一条时间线，而不会争抢 OS 句柄。
 
@@ -55,8 +55,9 @@ Serial Platform 是通用的人/Agent 协同串口平台：后端独占物理 UA
 | `generation` | 一次物理串口会话 | 串口成功重新打开 |
 | `seq` | 一个端口/周期内的逻辑事件序号 | 每个时间线事件 |
 | RX/TX offset | 对应方向的确认字节偏移 | 字节到达或写入成功 |
-| `model_profile` | 一类机型共用的交互 Profile | 人、CLI 或 Agent 修改端口绑定 |
-| `model_name` | 当前串口连接的具体机型名 | 从绑定 Profile 的 `model_names` 中选择 |
+| `model_profile` | 可复用的串口交互行为 Profile | 人通过 TUI、App、CLI 或 HTTP 修改端口绑定 |
+| `model_family` | 当前设备的一级机型系列 | 与 `model_name` 成对设置或清空 |
+| `model_name` | 当前设备的二级具体机型 | 从 `model_family.model_names` 中选择 |
 | `run_id` | 一段 Agent 工作的审计身份 | 显式开始新 Run |
 | `operation_id` | 一次物理操作的关联身份 | 客户端开始新操作 |
 
@@ -72,17 +73,18 @@ Serial Platform 是通用的人/Agent 协同串口平台：后端独占物理 UA
 {
   "port": "COM4",
   "transport_profile": "uart-115200",
-  "model_profile": "TL-AS7230",
+  "model_profile": "linux-shell",
+  "model_family": "TL-AS7230",
   "model_name": "TL-AS7230-W 1.0",
   "enabled": true
 }
 ```
 
-`transport_profile`、`model_profile` 与 `model_name` 均可省略。具体 `model_name` 必须属于绑定 Profile 的 `model_names`；解绑机型 Profile 会同时清除具体机型名。`enabled=false` 保留配置但不打开串口。
+`transport_profile` 与 `model_profile` 可以各自省略。`model_family` 与 `model_name` 是独立于行为 Profile 的身份对：必须同时设置或同时省略，且具体名必须存在于对应 Model Family 的 `model_names` 中。解绑行为 Profile 不会清除机型身份；清除身份时两个字段一起清除。`enabled=false` 保留配置但不打开串口。
 
-配置更新带 `config_revision` 乐观并发保护。后端先验证完整候选配置，再持久化并发布；物理 UART 变更通过暂停、关闭旧句柄、应用、提交的事务路径完成。失败不会留下部分生效的配置。
+配置更新带 `config_revision` 乐观并发保护。后端先验证完整候选配置，再持久化并发布；物理 UART 变更通过暂停、关闭旧句柄、应用、提交的事务路径完成。失败不会留下部分生效的配置。当前 `seriald.toml` 持久配置是 `schema_version=3`；旧 schema 直接拒绝，不执行隐式迁移。
 
-端口重配事件记录 `source`、机型 Profile 和具体机型名的前后值。MCP 的最近上下文因此可以告诉 Agent：人刚刚把哪个端口切换到了哪个系列和具体型号。
+端口重配事件记录 `source`、行为 Profile、一级机型系列和二级具体机型的前后值。MCP 最近上下文只向 Agent 摘要端口被重配以及机型身份的前后值，不暴露行为 Profile 名；Agent 可重新调用 `devices` 获取当前已生效的提示符。
 
 ### Transport Profile
 
@@ -90,9 +92,9 @@ Transport Profile 描述主机 UART：波特率、数据位、校验位、停止
 
 通用基线：115200、8N1、无流控、DTR/RTS 低、自动打开。
 
-### Model Profile
+### Model Family 目录
 
-Model Profile 描述一个机型系列共用的交互行为，并列出该系列的具体型号：
+Model Family 目录只描述设备身份，不携带串口行为：
 
 ```json
 {
@@ -100,7 +102,19 @@ Model Profile 描述一个机型系列共用的交互行为，并列出该系列
   "model_names": [
     "TL-AS7230-W 1.0",
     "TL-AS7230-F4GE 1.0"
-  ],
+  ]
+}
+```
+
+`name` 是第一级机型系列，`model_names` 是第二级具体机型。名称原样保存，不替换空格、不改变大小写。目录是全量替换契约；当前端口正在引用的系列或具体机型不能被删除。
+
+### Model Profile
+
+Model Profile 只描述可复用的串口交互行为：
+
+```json
+{
+  "name": "linux-shell",
   "shell_prompt": "root@router:~# ",
   "uboot_prompt": "=> ",
   "write_eol": "\r",
@@ -110,7 +124,7 @@ Model Profile 描述一个机型系列共用的交互行为，并列出该系列
 }
 ```
 
-`name` 是第一层机型系列/Profile 名称，`model_names` 是第二层具体机型名。名称原样保存，不替换空格、不改变大小写。提示符可以为空；后端不会猜测 Shell 或 U-Boot。Model Profile 更新会立即影响所有绑定端口的命令边界与写入行为，但不需要重开物理串口。
+Model Profile 不包含 `model_names`，也不规定设备必须属于哪个系列。提示符可以为空；后端不会猜测 Shell 或 U-Boot。Model Profile 更新会立即影响所有绑定端口的命令边界与写入行为，但不需要重开物理串口。
 
 `echo` 只指导 Agent 捕获如何识别和去除设备自身回显；人类界面不会额外合成本机 TX 到 RX 终端。
 
@@ -137,13 +151,13 @@ MCP `run_start` 完成 Control 获取和 Run 创建，返回：
 - `run_id`：时间线中的公开审计 ID；
 - `run_handle`：22 字符、仅当前 adapter 进程解析的工作流句柄。
 
-后续 Run-scoped 工具只传 `run_handle`。adapter 内部解析端口、Run 和 Control 状态，并在物理动作前再次检查。正常完成必须调用 `run_end`；默认 1800 秒的孤立 Run 回收只处理 Agent 中断或遗弃，`0` 表示不限时。该设置写在共享 `serialctl.toml`；未使用命令行 override 的 adapter 会在运行中自动加载修改。
+后续 Run-scoped 工具只传 `run_handle`。adapter 内部解析端口、Run 和 Control 状态，并在物理动作前再次检查。工作流收口统一调用 `run_end`：`outcome=completed` 表示正常完成且是默认值，记录 `RunEnded` 后立即尝试释放 Control；`outcome=aborted` 只有在收到权威的 `ControlReleased` 后才成功，并记录 `RunAborted`。默认 1800 秒的孤立 Run 回收只处理 Agent 中断或遗弃，`0` 表示不限时。该设置写在共享 `serialctl.toml`；未使用命令行 override 的 adapter 会在运行中自动加载修改。
 
 ### 串行上下文保护
 
 Agent 物理动作带 daemon-enforced sequence precondition：上一游标、预期 generation 和预期 TX offset。新的 RX 不阻止写入，但 generation 变化、第三方 TX、显式 gap 或 replay ring 边界不足会在零字节写入时拒绝动作。
 
-adapter 在结果中只在必要时附加 `recent_context`：例如用户 Takeover、其他 Agent 写入、Run 中止、机型 Profile 或具体机型名变化。如果连续两次操作之间没有第三方干扰，不增加该字段。
+adapter 在结果中只在必要时附加 `recent_context`：例如用户 Takeover、其他 Agent 写入、Run 中止、端口重配或机型系列/具体机型变化。摘要不会暴露行为 Profile 名；如果连续两次操作之间没有第三方干扰，不增加该字段。
 
 人工在 Agent Run 中使用 `Alt+Enter` 是绑定到该 Run 的 cooperative write，不转移 Control。它仍然改变了真实串口上下文，因此 Agent 下一次 `command`、`command_sequence`、`input`、`signal` 或 `trigger` 会在写前返回 `context_changed`，并明确给出 `no_bytes_written=true` 与 `recent_context`。Agent 调用 `read(scope=tail)` 或 `wait` 阅读并确认新状态后，才决定是否重试。
 
@@ -226,8 +240,8 @@ TUI 从上到下由四部分组成：
 
 配置菜单只有四个主入口：
 
-1. “修改当前串口配置”：端口与离散参数用 `→` 展开选项、`↑` / `↓` 选择、Enter 应用并折叠；`←` 折叠或返回。串口 Profile 和机型 Profile 只显示已经创建的项。机型名按“机型系列 → 具体机型名”两级选择。提示符和分段发送数值在当前行下展开输入框。
-2. “创建配置 Profile”：独立创建串口 Profile 或机型 Profile，直接填写/选择完整参数，不改变当前端口绑定。
+1. “修改当前串口配置”：端口与离散参数用 `→` 展开选项、`↑` / `↓` 选择、Enter 应用并折叠；`←` 折叠或返回。串口 Profile 和机型 Profile 只显示已经创建的项，其中“机型 Profile”只选交互行为。独立的“机型名”按“一级机型系列 → 二级具体机型”选择，二级 Enter 确认，空二级不能绑定。提示符和分段发送数值在当前行下展开输入框。
+2. “创建配置”：包含“创建串口 Profile”“创建机型 Profile”和“配置机型名”。前两项创建可复用行为配置，不改变当前端口绑定。“配置机型名”首页显示“新增一级机型名”和已有机型系列；用 `↑` / `↓` 选择，`→` 或 Enter 进入系列，再通过“新增二级机型名”在当前行下输入具体机型；`←` 逐级返回。
 3. “设置”：分为“终端界面显示设置”和“serial MCP 设置”，分别配置任务记录栏高度与孤立 Run 自动回收时间。
 4. “帮助”：仅列当前工作流快捷键。
 
@@ -239,11 +253,11 @@ Electron 主进程负责：
 
 - 解析配置 endpoint，并发现同一 data root 已验证的活动 endpoint；
 - 在需要时启动随包的本地 `seriald`；
-- 连接 HTTP v1 与 WebSocket v5；
+- 连接 HTTP v1 与 WebSocket v6；
 - 持久设置、服务退出和优雅清理；
 - 向 renderer 暴露窄而类型化的 IPC。
 
-renderer 是 React 视图，不直接访问后端。控制台为三栏布局：端口、RX 终端、Agent 历史；命令输入位于中间栏底部。配置页明确分成串口/Transport Profile、机型系列 Profile 与具体机型名。系统/浅色/深色主题使用相同设计变量。
+renderer 是 React 视图，不直接访问后端。控制台为三栏布局：端口、RX 终端、Agent 历史；命令输入位于中间栏底部。配置页明确分成串口/Transport Profile、行为 Model Profile 与独立的两级 Model Family 机型目录。系统/浅色/深色主题使用相同设计变量。
 
 端口历史在内存视图中有界，权威完整记录仍在后端 journal。桌面搜索和命令区域定位不会改变原始事件。
 
@@ -254,13 +268,15 @@ renderer 是 React 视图，不直接访问后端。控制台为三栏布局：�
 - stdio：newline-delimited JSON-RPC，供 MCP host 直接启动；
 - Streamable HTTP：`POST http://127.0.0.1:3211/mcp`，sessionless，仅监听 loopback。
 
-两者共享 19 个工具和相同结构化结果。HTTP notification 返回 202；`GET /mcp` 不提供 SSE session。若请求带 `Origin`，只接受相同本地监听端口的 `localhost` 或 `127.0.0.1` origin。
+两者共享 17 个工具和相同结构化结果。HTTP notification 返回 202；`GET /mcp` 不提供 SSE session。若请求带 `Origin`，只接受相同本地监听端口的 `localhost` 或 `127.0.0.1` origin。
 
-HTTP adapter 还提供仅供统一启动器使用的本地 `GET /health`。启动器据此确认 3211 上确实是 protocol v5 `serial-mcp`，并且它连接的 `server_id`、`daemon_epoch` 和 endpoint 与当前选中的 `seriald` 完全一致；普通 TCP listener、旧协议 adapter 或连接到另一后端的 adapter 都不会被误复用。HTTP adapter 在启动时固定这组后端身份，若同一 endpoint 换成新的 daemon epoch，会拒绝重连，重启 adapter 后才会发布并使用新身份。
+MCP 公开面中，`devices` 是唯一的设备发现工具：它返回串口名、两级机型身份、Agent 需要的连接/Control/Run/Trigger/cursor 状态和当前有效的 Shell/U-Boot 提示符。它不返回行为 Model Profile 名、Transport/UART 参数、EOL/echo 或写入节奏。`model_identity_set` 只绑定或解绑人工预先配置的 family/name；Profile 和 Model Family 目录仍由 TUI、Electron 或 HTTP 配置。
+
+HTTP adapter 还提供仅供统一启动器使用的本地 `GET /health`。启动器据此确认 3211 上确实是 protocol v6 `serial-mcp`，并且它连接的 `server_id`、`daemon_epoch` 和 endpoint 与当前选中的 `seriald` 完全一致；普通 TCP listener、旧协议 adapter 或连接到另一后端的 adapter 都不会被误复用。HTTP adapter 在启动时固定这组后端身份，若同一 endpoint 换成新的 daemon epoch，会拒绝重连，重启 adapter 后才会发布并使用新身份。
 
 没有命令行 timeout override 时，adapter 监视共享 `serialctl.toml` 的 `orphan_run_timeout_seconds`；TUI 保存设置后运行中的 stdio/HTTP MCP 自动应用新值。
 
-纯观察调用可以响应 MCP cancellation。物理写入、Run 变化、Monitor mutation 等调用可能已经跨过副作用边界，因此即使 host 取消，也会继续收敛到权威结果，避免隐藏写入结果后被错误重试。
+可取消的纯观察工具是 `devices`、`read`、`wait`、`search`、`monitor_list`、`monitor_status` 和 `monitor_incidents`。物理写入、Run 变化、机型身份修改、Monitor mutation 等调用可能已经跨过副作用边界，因此即使 host 取消，也会继续收敛到权威结果，避免隐藏变更结果后被错误重试。
 
 ## 启动拓扑
 
@@ -273,9 +289,9 @@ serial
   └── serialctl     foreground TUI
 ```
 
-每个 resolved data root 在打开 journal 前取得 `data/seriald.lock`，保证只有一个后端实例。后端监听成功后发布 `data/active-endpoint.json`，其中记录实际 endpoint、Socket 地址、`server_id`、`daemon_epoch`、protocol version 和 PID。发现端只有在 `/api/v1/health` 返回 `status=ok`，且身份、周期和 protocol v5 与记录完全一致时才接受该端点；失效记录不阻塞新实例取得 lock 并覆写。通配 bind 发布本机可连接的 loopback 地址。
+每个 resolved data root 在打开 journal 前取得 `data/seriald.lock`，保证只有一个后端实例。后端监听成功后发布 `data/active-endpoint.json`，其中记录实际 endpoint、Socket 地址、`server_id`、`daemon_epoch`、protocol version 和 PID。发现端只有在 `/api/v1/health` 返回 `status=ok`，且身份、周期和 protocol v6 与记录完全一致时才接受该端点；失效记录不阻塞新实例取得 lock 并覆写。通配 bind 发布本机可连接的 loopback 地址。
 
-活动端点是运行时事实，因此默认 endpoint 和自定义 endpoint 使用相同规则。App 先启动时，随后运行的 `serial` 复用 App 的后端；`serial` 先启动时，App 发现并复用该后端。App 对 preferred endpoint 也要求有效的 protocol v5 health 和服务身份，发现 marker 时还会逐项核对 health。两者并发首启时，首个进程取得 data-root lock，失败的一方等待并重新发现 winner；全新配置也只原子创建一次，所有启动器读取同一个 `server_id`。两者只管理自己启动的进程：拥有后端的一方退出后，仍在运行的外部客户端不会自动 failover，重新启动后才重新发现或创建服务。`serial` 在选定后端后再保证本地 HTTP MCP 可用，并只回收自己补齐的 MCP 进程。
+活动端点是运行时事实，因此默认 endpoint 和自定义 endpoint 使用相同规则。App 先启动时，随后运行的 `serial` 复用 App 的后端；`serial` 先启动时，App 发现并复用该后端。App 对 preferred endpoint 也要求有效的 protocol v6 health 和服务身份，发现 marker 时还会逐项核对 health。两者并发首启时，首个进程取得 data-root lock，失败的一方等待并重新发现 winner；全新配置也只原子创建一次，所有启动器读取同一个 `server_id`。两者只管理自己启动的进程：拥有后端的一方退出后，仍在运行的外部客户端不会自动 failover，重新启动后才重新发现或创建服务。`serial` 在选定后端后再保证本地 HTTP MCP 可用，并只回收自己补齐的 MCP 进程。
 
 ### 分开运行
 

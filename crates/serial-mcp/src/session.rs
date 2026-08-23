@@ -133,17 +133,6 @@ struct RunCapability {
     run_token: Uuid,
 }
 
-/// Process-local ownership known by the serialized MCP control session.
-///
-/// Public daemon snapshots cannot answer whether a lease belongs to this MCP
-/// connection, so release planning must use this state instead of inferring
-/// ownership from a visible Run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalControlState {
-    pub has_lease: bool,
-    pub owned_run_id: Option<Uuid>,
-}
-
 /// Keeps an authorized Run alive for the complete lifetime of one tool call.
 /// Dropping a cancelled or failed tool future releases the pin as well.
 pub struct RunUseGuard {
@@ -171,10 +160,6 @@ enum SessionRequest {
         reply: oneshot::Sender<()>,
     },
     ActorIdentity {
-        reply: Reply,
-    },
-    LocalControlState {
-        port: String,
         reply: Reply,
     },
     BeginRunUse {
@@ -250,11 +235,10 @@ enum SessionRequest {
         run_token: Uuid,
         reply: Reply,
     },
-    Release {
+    AbortRun {
         port: String,
-        abort_run: bool,
-        run_capability: Option<(Uuid, Uuid)>,
-        allow_stale_cleanup: bool,
+        run_id: Uuid,
+        run_token: Uuid,
         reply: Reply,
     },
 }
@@ -266,14 +250,13 @@ type Reply = oneshot::Sender<Result<SessionResponse>>;
 #[allow(clippy::large_enum_variant)]
 enum SessionResponse {
     ActorIdentity(Option<String>),
-    LocalControlState(LocalControlState),
     Write { event_seq: u64 },
     Break { event_seq: u64 },
     Trigger(TriggerInfo),
     Run(RunInfo),
     RunStarted(StartedRun),
     RunAuthorized(AuthorizedRunUse),
-    Released { had_lease: bool },
+    RunAborted,
     RunOwnership { retained: bool },
 }
 
@@ -306,18 +289,6 @@ impl SessionHandle {
         applied
             .await
             .context("serial session task stopped before applying Run timeout")
-    }
-
-    pub async fn local_control_state(&self, port: String) -> Result<LocalControlState> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(SessionRequest::LocalControlState { port, reply })
-            .await
-            .context("serial session task stopped")?;
-        match receive(response).await? {
-            SessionResponse::LocalControlState(state) => Ok(state),
-            _ => bail!("serial session returned the wrong response type"),
-        }
     }
 
     /// Server-issued identity for this exact WebSocket connection. Labels are
@@ -569,26 +540,19 @@ impl SessionHandle {
         }
     }
 
-    pub async fn release(
-        &self,
-        port: String,
-        abort_run: bool,
-        run_capability: Option<(Uuid, Uuid)>,
-        allow_stale_cleanup: bool,
-    ) -> Result<bool> {
+    pub async fn abort_run(&self, port: String, run_id: Uuid, run_token: Uuid) -> Result<()> {
         let (reply, response) = oneshot::channel();
         self.tx
-            .send(SessionRequest::Release {
+            .send(SessionRequest::AbortRun {
                 port,
-                abort_run,
-                run_capability,
-                allow_stale_cleanup,
+                run_id,
+                run_token,
                 reply,
             })
             .await
             .context("serial session task stopped")?;
         match receive(response).await? {
-            SessionResponse::Released { had_lease } => Ok(had_lease),
+            SessionResponse::RunAborted => Ok(()),
             _ => bail!("serial session returned the wrong response type"),
         }
     }
@@ -701,10 +665,6 @@ impl SessionState {
                         self.actor.as_ref().map(|actor| actor.id.clone()),
                     )),
                 );
-            }
-            SessionRequest::LocalControlState { port, reply } => {
-                let state = self.local_control_state(&port);
-                send_reply(reply, Ok(SessionResponse::LocalControlState(state)));
             }
             SessionRequest::BeginRunUse {
                 run_handle,
@@ -877,26 +837,18 @@ impl SessionState {
                     .map(SessionResponse::Run);
                 send_reply(reply, result);
             }
-            SessionRequest::Release {
+            SessionRequest::AbortRun {
                 port,
-                abort_run,
-                run_capability,
-                allow_stale_cleanup,
+                run_id,
+                run_token,
                 reply,
             } => {
                 let result = self
-                    .release(port, abort_run, run_capability, allow_stale_cleanup)
+                    .abort_run(port, run_id, run_token)
                     .await
-                    .map(|had_lease| SessionResponse::Released { had_lease });
+                    .map(|()| SessionResponse::RunAborted);
                 send_reply(reply, result);
             }
-        }
-    }
-
-    fn local_control_state(&self, port: &str) -> LocalControlState {
-        LocalControlState {
-            has_lease: self.leases.contains_key(port),
-            owned_run_id: self.owned_runs.get(port).map(|run| run.id),
         }
     }
 
@@ -1568,18 +1520,16 @@ impl SessionState {
         }
     }
 
-    async fn release(
-        &mut self,
-        port: String,
-        abort_run: bool,
-        run_capability: Option<(Uuid, Uuid)>,
-        allow_stale_cleanup: bool,
-    ) -> Result<bool> {
+    async fn abort_run(&mut self, port: String, run_id: Uuid, run_token: Uuid) -> Result<()> {
         let Some(lease) = self.leases.get(&port).cloned() else {
             self.owned_runs.remove(&port);
-            return Ok(false);
+            bail!(
+                "aborted run_end cannot send ReleaseControl because local control was already \
+                 lost; local Run ownership was discarded. Inspect devices for remote \
+                 convergence, then use a fresh run_start before any further write"
+            );
         };
-        self.prepare_release(&port, abort_run, run_capability, allow_stale_cleanup)?;
+        self.validate_run_capability(&port, run_id, run_token)?;
         let request = ClientMessage::ReleaseControl {
             request_id: Uuid::new_v4(),
             port: port.clone(),
@@ -1588,9 +1538,13 @@ impl SessionState {
         };
         match self.call(request).await {
             Ok(CommandResult::ControlReleased) => {
+                // seriald emits RunAborted before ControlReleased while
+                // handling this request on the Slot actor. Therefore this
+                // acknowledgement is the authoritative terminal boundary for
+                // both the Run and its control lease.
                 self.leases.remove(&port);
                 self.owned_runs.remove(&port);
-                Ok(true)
+                Ok(())
             }
             Ok(other) => {
                 // An unexpected acknowledgement cannot justify retaining a
@@ -1612,35 +1566,6 @@ impl SessionState {
                 )
             }
         }
-    }
-
-    fn prepare_release(
-        &mut self,
-        port: &str,
-        abort_run: bool,
-        run_capability: Option<(Uuid, Uuid)>,
-        allow_stale_cleanup: bool,
-    ) -> Result<()> {
-        if allow_stale_cleanup {
-            // A fresh daemon snapshot proved that no Run is active. Local Run
-            // ownership is therefore stale bookkeeping, not authority to be
-            // protected by abort_run. Discard it before attempting to release
-            // the remaining local lease.
-            self.owned_runs.remove(port);
-        } else if let Some(run) = self.owned_runs.get(port) {
-            if !abort_run {
-                bail!(
-                    "serial-mcp owns active Run {}; call run_end first or pass abort_run=true",
-                    run.id
-                );
-            }
-            let (run_id, run_token) = run_capability.context(
-                "release would abort an active Run; pass the run_handle returned by this \
-                 caller's run_start",
-            )?;
-            self.validate_run_capability(port, run_id, run_token)?;
-        }
-        Ok(())
     }
 
     async fn best_effort_release(&mut self, port: &str) {
@@ -2006,6 +1931,74 @@ fn ws_url(endpoint: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    async fn abort_test_state(
+        response: CommandResult,
+    ) -> (
+        SessionState,
+        tokio::task::JoinHandle<ClientMessage>,
+        String,
+        Uuid,
+        Uuid,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let frame = socket.next().await.unwrap().unwrap();
+            let Message::Binary(bytes) = frame else {
+                panic!("expected binary ReleaseControl frame");
+            };
+            let request = serial_protocol::decode_client_control(&bytes).unwrap();
+            let request_id = request.request_id();
+            let response = serial_protocol::encode_control(&ServerMessage::Result {
+                request_id,
+                result: response,
+            })
+            .unwrap();
+            socket.send(Message::Binary(response.into())).await.unwrap();
+            request
+        });
+        let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let mut state = SessionState::with_run_idle_ttl(
+            format!("http://{address}"),
+            "agent".into(),
+            Some(Duration::from_secs(1_800)),
+            None,
+        );
+        state.socket = Some(socket);
+        let port = "COM4".to_owned();
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        let actor = Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Agent,
+        };
+        state.leases.insert(
+            port.clone(),
+            ControlLease {
+                id: Uuid::new_v4(),
+                owner: actor,
+                epoch: Uuid::new_v4(),
+                generation: 7,
+                fence: 11,
+                issued_wall_time_ns: 1,
+                expires_wall_time_ns: i64::MAX,
+            },
+        );
+        state.owned_runs.insert(
+            port.clone(),
+            OwnedRun::new_with_handle(
+                run_id,
+                run_token,
+                "abcdefghijklmnopqrstuv".into(),
+                Instant::now(),
+            ),
+        );
+        (state, server, port, run_id, run_token)
+    }
+
     #[tokio::test]
     async fn run_idle_timeout_update_is_applied_inside_the_session_actor() {
         let mut state = SessionState::with_run_idle_ttl(
@@ -2033,6 +2026,71 @@ mod tests {
             .await;
         applied.await.unwrap();
         assert_eq!(state.run_idle_ttl, Some(Duration::from_secs(3_600)));
+    }
+
+    #[tokio::test]
+    async fn aborted_run_sends_capability_guarded_release_and_requires_control_released() {
+        let (mut state, server, port, run_id, run_token) =
+            abort_test_state(CommandResult::ControlReleased).await;
+        let lease = state.leases[&port].clone();
+        state
+            .abort_run(port.clone(), run_id, run_token)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(matches!(
+            request,
+            ClientMessage::ReleaseControl {
+                port: request_port,
+                control_id,
+                fence,
+                ..
+            } if request_port == port && control_id == lease.id && fence == lease.fence
+        ));
+        assert!(!state.leases.contains_key(&port));
+        assert!(!state.owned_runs.contains_key(&port));
+
+        let (mut state, server, port, run_id, run_token) =
+            abort_test_state(CommandResult::AcquireCancelled { removed: false }).await;
+        let error = state
+            .abort_run(port.clone(), run_id, run_token)
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+        assert!(error.contains("unexpected release result"));
+        assert!(!state.leases.contains_key(&port));
+        assert!(!state.owned_runs.contains_key(&port));
+    }
+
+    #[tokio::test]
+    async fn aborted_run_without_a_local_lease_fails_and_discards_ownership() {
+        let mut state = SessionState::with_run_idle_ttl(
+            "http://127.0.0.1:3210".into(),
+            "agent".into(),
+            Some(Duration::from_secs(1_800)),
+            None,
+        );
+        let port = "COM4".to_owned();
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        state.owned_runs.insert(
+            port.clone(),
+            OwnedRun::new_with_handle(
+                run_id,
+                run_token,
+                "abcdefghijklmnopqrstuv".into(),
+                Instant::now(),
+            ),
+        );
+        let error = state
+            .abort_run(port.clone(), run_id, run_token)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("local control was already lost"));
+        assert!(error.contains("fresh run_start"));
+        assert!(!state.owned_runs.contains_key(&port));
     }
 
     #[test]

@@ -17,7 +17,8 @@ use std::{
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    FlowControl, MAX_MODEL_NAMES_PER_PROFILE, ModelProfile, SlotConfig, TransportProfile,
+    FlowControl, MAX_MODEL_FAMILIES, MAX_MODEL_NAMES_PER_FAMILY, ModelFamily, ModelProfile,
+    SlotConfig, TransportProfile,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use crate::control::{
     WAIT_TIMEOUT,
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 3210;
 pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * GIB;
@@ -168,6 +169,8 @@ pub struct DaemonConfig {
     pub transport_profiles: Vec<TransportProfile>,
     #[serde(default)]
     pub model_profiles: Vec<ModelProfile>,
+    #[serde(default)]
+    pub model_families: Vec<ModelFamily>,
 }
 
 const fn default_config_revision() -> u64 {
@@ -186,6 +189,7 @@ impl DaemonConfig {
             ports: Vec::new(),
             transport_profiles: Vec::new(),
             model_profiles: Vec::new(),
+            model_families: Vec::new(),
         }
     }
 
@@ -205,7 +209,13 @@ impl DaemonConfig {
         validate_control(&self.control)?;
         validate_transport_profiles(&self.transport_profiles)?;
         validate_model_profiles(&self.model_profiles)?;
-        validate_ports(&self.ports, &self.transport_profiles, &self.model_profiles)
+        validate_model_families(&self.model_families)?;
+        validate_ports(
+            &self.ports,
+            &self.transport_profiles,
+            &self.model_profiles,
+            &self.model_families,
+        )
     }
 
     /// Replaces every configured port after validating the complete result.
@@ -273,6 +283,28 @@ impl DaemonConfig {
     ) -> Result<Self, ConfigValidationError> {
         let mut staged = self.clone();
         staged.replace_model_profiles(model_profiles)?;
+        staged.bump_revision()?;
+        Ok(staged)
+    }
+
+    pub fn replace_model_families(
+        &mut self,
+        model_families: Vec<ModelFamily>,
+    ) -> Result<(), ConfigValidationError> {
+        let previous = std::mem::replace(&mut self.model_families, model_families);
+        if let Err(error) = self.validate() {
+            self.model_families = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn staged_with_model_families(
+        &self,
+        model_families: Vec<ModelFamily>,
+    ) -> Result<Self, ConfigValidationError> {
+        let mut staged = self.clone();
+        staged.replace_model_families(model_families)?;
         staged.bump_revision()?;
         Ok(staged)
     }
@@ -415,6 +447,17 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub fn update_model_families(
+        &self,
+        current: &mut DaemonConfig,
+        model_families: Vec<ModelFamily>,
+    ) -> Result<(), ConfigError> {
+        let updated = current.staged_with_model_families(model_families)?;
+        self.save(&updated)?;
+        *current = updated;
+        Ok(())
+    }
+
     pub fn update_transport_profiles(
         &self,
         current: &mut DaemonConfig,
@@ -504,6 +547,16 @@ pub enum ConfigValidationError {
     DuplicateModelProfileName { first: usize, second: usize },
     #[error("configuration contains {actual} model profiles; the maximum is {limit}")]
     TooManyModelProfiles { actual: usize, limit: usize },
+    #[error("model family at index {index} has invalid field {field}: {reason}")]
+    InvalidModelFamily {
+        index: usize,
+        field: &'static str,
+        reason: &'static str,
+    },
+    #[error("model families at indexes {first} and {second} use the same name")]
+    DuplicateModelFamilyName { first: usize, second: usize },
+    #[error("configuration contains {actual} model families; the maximum is {limit}")]
+    TooManyModelFamilies { actual: usize, limit: usize },
     #[error("transport profile at index {index} has invalid field {field}: {reason}")]
     InvalidTransportProfile {
         index: usize,
@@ -530,14 +583,22 @@ pub enum ConfigValidationError {
         name: String,
         available: String,
     },
-    #[error("port {port} cannot bind concrete model {name:?} without a model profile")]
-    ModelNameWithoutProfile { port: String, name: String },
+    #[error("port {port} must bind model_family and model_name together")]
+    IncompleteModelIdentity { port: String },
     #[error(
-        "port {port} references model {name:?}, which is not in profile {profile:?}; available models: {available}"
+        "port {port} references unknown model family {name:?}; available families: {available}"
+    )]
+    UnknownModelFamily {
+        port: String,
+        name: String,
+        available: String,
+    },
+    #[error(
+        "port {port} references model {name:?}, which is not in family {family:?}; available models: {available}"
     )]
     UnknownModelName {
         port: String,
-        profile: String,
+        family: String,
         name: String,
         available: String,
     },
@@ -577,6 +638,7 @@ pub(crate) fn validate_ports(
     ports: &[SlotConfig],
     transport_profiles: &[TransportProfile],
     model_profiles: &[ModelProfile],
+    model_families: &[ModelFamily],
 ) -> Result<(), ConfigValidationError> {
     if ports.len() > MAX_PORT_IDENTITIES_PER_DAEMON {
         return Err(ConfigValidationError::TooManyPorts {
@@ -607,42 +669,58 @@ pub(crate) fn validate_ports(
             }
         }
 
-        let bound_model_profile = match slot.model_profile.as_deref() {
-            Some(model_profile) => {
-                let Some(profile) = model_profiles
+        if let Some(model_profile) = slot.model_profile.as_deref() {
+            if !model_profiles
+                .iter()
+                .any(|profile| profile.name == model_profile)
+            {
+                let available = model_profiles
                     .iter()
-                    .find(|profile| profile.name == model_profile)
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ConfigValidationError::UnknownModelProfile {
+                    port: slot.port.clone(),
+                    name: model_profile.to_owned(),
+                    available: catalog_summary(available),
+                });
+            }
+        }
+
+        match (slot.model_family.as_deref(), slot.model_name.as_deref()) {
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ConfigValidationError::IncompleteModelIdentity {
+                    port: slot.port.clone(),
+                });
+            }
+            (Some(model_family), Some(model_name)) => {
+                validate_text_field(index, "model_family", model_family, MAX_MODEL_NAME_BYTES)?;
+                validate_text_field(index, "model_name", model_name, MAX_MODEL_NAME_BYTES)?;
+                let Some(family) = model_families
+                    .iter()
+                    .find(|family| family.name == model_family)
                 else {
-                    let available = model_profiles
-                        .iter()
-                        .map(|profile| profile.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(ConfigValidationError::UnknownModelProfile {
+                    return Err(ConfigValidationError::UnknownModelFamily {
                         port: slot.port.clone(),
-                        name: model_profile.to_owned(),
-                        available: catalog_summary(available),
+                        name: model_family.to_owned(),
+                        available: catalog_summary(
+                            model_families
+                                .iter()
+                                .map(|family| family.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
                     });
                 };
-                Some(profile)
-            }
-            None => None,
-        };
-        if let Some(model_name) = slot.model_name.as_deref() {
-            validate_text_field(index, "model_name", model_name, MAX_MODEL_NAME_BYTES)?;
-            let Some(profile) = bound_model_profile else {
-                return Err(ConfigValidationError::ModelNameWithoutProfile {
-                    port: slot.port.clone(),
-                    name: model_name.to_owned(),
-                });
-            };
-            if !profile.model_names.iter().any(|name| name == model_name) {
-                return Err(ConfigValidationError::UnknownModelName {
-                    port: slot.port.clone(),
-                    profile: profile.name.clone(),
-                    name: model_name.to_owned(),
-                    available: catalog_summary(profile.model_names.join(", ")),
-                });
+                if !family.model_names.iter().any(|name| name == model_name) {
+                    return Err(ConfigValidationError::UnknownModelName {
+                        port: slot.port.clone(),
+                        family: family.name.clone(),
+                        name: model_name.to_owned(),
+                        available: catalog_summary(family.model_names.join(", ")),
+                    });
+                }
             }
         }
 
@@ -751,28 +829,6 @@ pub(crate) fn validate_model_profiles(
                 second: index,
             });
         }
-        if profile.model_names.len() > MAX_MODEL_NAMES_PER_PROFILE {
-            return Err(ConfigValidationError::InvalidModelProfile {
-                index,
-                field: "model_names",
-                reason: "must contain at most 128 concrete model names",
-            });
-        }
-        let mut model_names = HashSet::new();
-        for model_name in &profile.model_names {
-            if model_name.is_empty()
-                || model_name.len() > MAX_MODEL_NAME_BYTES
-                || model_name != model_name.trim()
-                || model_name.chars().any(char::is_control)
-                || !model_names.insert(model_name)
-            {
-                return Err(ConfigValidationError::InvalidModelProfile {
-                    index,
-                    field: "model_names",
-                    reason: "each model name must be non-empty, trimmed, unique, and at most 128 bytes",
-                });
-            }
-        }
         for (field, pattern) in [
             ("shell_prompt", profile.shell_prompt.as_deref()),
             ("uboot_prompt", profile.uboot_prompt.as_deref()),
@@ -816,6 +872,60 @@ pub(crate) fn validate_model_profiles(
                 field: "write_chunk_delay_ms",
                 reason: "must not exceed 10000 ms",
             });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model_families(
+    families: &[ModelFamily],
+) -> Result<(), ConfigValidationError> {
+    if families.len() > MAX_MODEL_FAMILIES {
+        return Err(ConfigValidationError::TooManyModelFamilies {
+            actual: families.len(),
+            limit: MAX_MODEL_FAMILIES,
+        });
+    }
+    let mut family_names: HashMap<&str, usize> = HashMap::new();
+    for (index, family) in families.iter().enumerate() {
+        if family.name.is_empty()
+            || family.name.len() > MAX_MODEL_NAME_BYTES
+            || family.name != family.name.trim()
+            || family.name.chars().any(char::is_control)
+        {
+            return Err(ConfigValidationError::InvalidModelFamily {
+                index,
+                field: "name",
+                reason: "must be a non-empty, trimmed name of at most 128 bytes",
+            });
+        }
+        if let Some(first) = family_names.insert(&family.name, index) {
+            return Err(ConfigValidationError::DuplicateModelFamilyName {
+                first,
+                second: index,
+            });
+        }
+        if family.model_names.len() > MAX_MODEL_NAMES_PER_FAMILY {
+            return Err(ConfigValidationError::InvalidModelFamily {
+                index,
+                field: "model_names",
+                reason: "must contain at most 128 concrete model names",
+            });
+        }
+        let mut model_names = HashSet::new();
+        for model_name in &family.model_names {
+            if model_name.is_empty()
+                || model_name.len() > MAX_MODEL_NAME_BYTES
+                || model_name != model_name.trim()
+                || model_name.chars().any(char::is_control)
+                || !model_names.insert(model_name)
+            {
+                return Err(ConfigValidationError::InvalidModelFamily {
+                    index,
+                    field: "model_names",
+                    reason: "each model name must be non-empty, trimmed, unique, and at most 128 bytes",
+                });
+            }
         }
     }
     Ok(())
@@ -1055,7 +1165,6 @@ mod tests {
     fn model_profile(name: &str) -> ModelProfile {
         ModelProfile {
             name: name.into(),
-            model_names: vec!["TL-AS7230-W 1.0".into(), "TL-AS7230-F4GE 1.0".into()],
             shell_prompt: Some("/ # ".into()),
             uboot_prompt: Some("U-Boot> ".into()),
             write_eol: Some("\r".into()),
@@ -1065,11 +1174,19 @@ mod tests {
         }
     }
 
+    fn model_family(name: &str) -> ModelFamily {
+        ModelFamily {
+            name: name.into(),
+            model_names: vec!["TL-AS7230-W 1.0".into(), "TL-AS7230-F4GE 1.0".into()],
+        }
+    }
+
     fn slot(port: &str) -> SlotConfig {
         SlotConfig {
             port: port.into(),
             transport_profile: None,
             model_profile: None,
+            model_family: None,
             model_name: None,
             enabled: false,
         }
@@ -1124,7 +1241,6 @@ mod tests {
         let mut configured = slot("COM4");
         configured.transport_profile = Some("uart".into());
         configured.model_profile = Some("TL-AS7230 1.0".into());
-        configured.model_name = Some("TL-AS7230-W 1.0".into());
         config.ports = vec![configured];
         config.validate().unwrap();
 
@@ -1136,11 +1252,13 @@ mod tests {
     }
 
     #[test]
-    fn concrete_model_name_must_belong_to_the_bound_profile() {
+    fn concrete_model_name_must_belong_to_the_selected_family() {
         let mut config = DaemonConfig::generate();
         config.model_profiles = vec![model_profile("TL-AS7230")];
+        config.model_families = vec![model_family("TL-AS7230")];
         let mut configured = slot("COM4");
         configured.model_profile = Some("TL-AS7230".into());
+        configured.model_family = Some("TL-AS7230".into());
         configured.model_name = Some("TL-AS7230-W 1.0".into());
         config.ports = vec![configured];
         config.validate().unwrap();
@@ -1151,10 +1269,48 @@ mod tests {
             Err(ConfigValidationError::UnknownModelName { .. })
         ));
 
-        config.ports[0].model_profile = None;
+        config.ports[0].model_family = None;
         assert!(matches!(
             config.validate(),
-            Err(ConfigValidationError::ModelNameWithoutProfile { .. })
+            Err(ConfigValidationError::IncompleteModelIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn model_identity_is_independent_from_interaction_profile() {
+        let mut config = DaemonConfig::generate();
+        config.model_profiles = vec![model_profile("shared-shell")];
+        config.model_families = vec![model_family("TL-AS7230")];
+        let mut configured = slot("COM4");
+        configured.model_profile = Some("shared-shell".into());
+        configured.model_family = Some("TL-AS7230".into());
+        configured.model_name = Some("TL-AS7230-W 1.0".into());
+        config.ports = vec![configured];
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn model_family_replacement_is_revisioned_and_preserves_bound_names() {
+        let mut config = DaemonConfig::generate();
+        config.model_families = vec![model_family("TL-AS7230")];
+        let mut configured = slot("COM4");
+        configured.model_family = Some("TL-AS7230".into());
+        configured.model_name = Some("TL-AS7230-W 1.0".into());
+        config.ports = vec![configured];
+        let previous_revision = config.config_revision;
+
+        let staged = config
+            .staged_with_model_families(config.model_families.clone())
+            .unwrap();
+        assert_eq!(staged.config_revision, previous_revision + 1);
+
+        let missing_bound_name = vec![ModelFamily {
+            name: "TL-AS7230".into(),
+            model_names: vec!["TL-AS7230-F4GE 1.0".into()],
+        }];
+        assert!(matches!(
+            config.staged_with_model_families(missing_bound_name),
+            Err(ConfigValidationError::UnknownModelName { .. })
         ));
     }
 

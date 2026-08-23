@@ -3,6 +3,7 @@ import type {
   DesktopBridge,
   DesktopEvent,
   DesktopPreferences,
+  ModelFamily,
   ModelProfile,
   SerialConfigurationDraft
 } from '../shared/contracts'
@@ -12,10 +13,12 @@ const bridge: DesktopBridge = {
   refresh: () => ipcRenderer.invoke('serial:refresh'),
   sendCommand: (port, command) => ipcRenderer.invoke('serial:send-command', port, command),
   setPortOpen: (port, open) => ipcRenderer.invoke('serial:set-port-open', port, open),
-  saveSerialConfiguration: (draft: SerialConfigurationDraft) =>
-    ipcRenderer.invoke('serial:save-serial-configuration', draft),
-  saveModelProfiles: (profiles: ModelProfile[]) =>
-    ipcRenderer.invoke('serial:save-model-profiles', profiles),
+  saveSerialConfiguration: (draft: SerialConfigurationDraft, expectedRevision: number) =>
+    ipcRenderer.invoke('serial:save-serial-configuration', draft, expectedRevision),
+  saveModelProfiles: (profiles: ModelProfile[], expectedRevision: number) =>
+    ipcRenderer.invoke('serial:save-model-profiles', profiles, expectedRevision),
+  saveModelFamilies: (families: ModelFamily[], expectedRevision: number) =>
+    ipcRenderer.invoke('serial:save-model-families', families, expectedRevision),
   savePreferences: (preferences: DesktopPreferences) =>
     ipcRenderer.invoke('serial:save-preferences', preferences),
   startLocalService: () => ipcRenderer.invoke('serial:start-local-service'),

@@ -12,7 +12,7 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 4. 端口和机型配置足够直观，首次使用可以快速完成；
 5. 通用平台只提供串口原语，不把厂商流程和 Shell 假设写进核心。
 
-当前产品结构围绕这五点收敛。公开设备身份只有 OS 串口名 `port`；Transport Profile 描述主机 UART，Model Profile 描述一个机型系列共用的交互行为，端口的 `model_name` 标记当前连接的具体型号；TUI、Electron 与 19 个 MCP 工具共享 `seriald` 时间线。
+当前产品结构围绕这五点收敛。公开设备位只有 OS 串口名 `port`；Transport Profile 描述主机 UART，Model Profile 只描述可复用的串口交互行为，独立 Model Family 目录描述“一级机型系列 → 二级具体机型”身份；TUI、Electron 与 17 个 MCP 工具共享 `seriald` 时间线。
 
 ## 当前能力
 
@@ -25,17 +25,18 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 - 端口重配 transaction 与 `config_revision` 并发保护。
 - App 与 CLI 在同一本地数据目录中自动发现并验证唯一后端，默认和自定义 endpoint 使用相同复用规则。
 - Transport Profile：baud、data/parity/stop、flow control、DTR/RTS、auto-open。
-- Model Profile：机型系列、该系列的具体机型名列表、Shell/U-Boot prompt、EOL、echo 解析和 write pacing；端口单独绑定具体 `model_name`。
+- Model Profile：与设备身份解耦的 Shell/U-Boot prompt、EOL、echo 解析和 write pacing。
+- Model Family 目录：独立管理一级机型系列和二级具体机型；端口成对绑定 `model_family` / `model_name`。
 - 有界 replay ring；tail 查询的成本不随持久日志增长。
 - 分段 journal、CRC、断尾恢复、gap ledger、保留上限和 bounded regex 查询。
 - daemon-owned Trigger：kickoff、重复 action、RX stop literal 和硬上限。
 - 持久 Monitor：1–16 个 OR literal/regex matcher、burst grouping、命中条件、精确串口范围、证据游标和 acknowledge。
-- HTTP v1 与 WebSocket protocol v5；公开请求和事件统一使用 `port`。
+- HTTP v1 与 WebSocket protocol v6；`seriald.toml` 配置 schema 3；公开请求和事件统一使用 `port`。
 
 ### serialctl / TUI
 
 - `serial setup` 在后端未运行时直接完成首次配置，并提供简短中英说明。
-- 两类 Profile 的 list/show/create/update/clone/import/export/delete 与端口 attach/detach。
+- Transport/Model 两类 Profile 的 list/show/create/update/clone/import/export/delete，独立 Model Family 目录配置，以及行为/机型身份各自可控的端口 attach/detach。
 - connection、port、stream、storage、state 五层诊断和 JSON 输出。
 - 持久日志的文本/正则、周期、Run、operation、方向、类型和游标查询。
 - RX-only 主终端；关闭再打开后从当前周期 journal 恢复并接回实时流。
@@ -46,18 +47,18 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 - 滚轮/PgUp/PgDn 浏览 Agent 历史，前缀组合滚动串口输出。
 - 双击词语与拖选的可见高亮和复制。
 - 串口历史搜索支持文本/正则、大小写、RX/TX 和不同周期范围。
-- 配置菜单分成当前串口、创建 Profile、设置和帮助；选项行按 `→` 展开、`↑` / `↓` 选择、Enter 应用，文本/数值行内编辑，`?` 按需显示字段说明。
+- 配置菜单分成当前串口、创建配置、设置和帮助；“创建配置”下独立创建串口 Profile、行为 Model Profile，或通过一级系列/二级具体机型界面配置机型名；选项行按 `→` 展开、`↑` / `↓` 选择、Enter 应用，文本/数值行内编辑，`?` 按需显示字段说明。
 - 可配置 Agent 历史高度与 30 分钟默认孤立 Run 回收；`0` 为不限时，MCP 自动加载保存后的 timeout。
 - 词边界关键词、IPv4、IPv6 和 MAC 地址着色。
 
 ### Electron App
 
-- Electron 主进程管理本地后端生命周期并复用 HTTP/WebSocket v5。
+- Electron 主进程管理本地后端生命周期并复用 HTTP/WebSocket v6。
 - 左侧端口、中间 RX 终端、右侧 Agent 历史的三栏工作台。
 - 串口开关、人工命令、持久历史、终端搜索和命令输出区域高亮。
 - Agent 命令与序列按旧到新显示并自动跟随。
-- 串口/Transport Profile、机型系列 Profile 与具体机型名分区配置。
-- 机型系列和具体机型名原样显示；共享 Model Profile 影响端口明确提示。
+- 串口/Transport Profile、行为 Model Profile 与两级 Model Family 目录分区配置。
+- 机型系列和具体机型名原样显示；共享行为 Profile 影响端口明确提示。
 - 系统、浅色、深色主题和常用快捷键。
 - context-isolated preload 与类型化 IPC；renderer 不直接连接后端。
 - Linux AppImage、Windows portable EXE、macOS arm64/x86_64 `.app`。
@@ -65,8 +66,10 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 ### serial-mcp
 
 - stdio 与 loopback sessionless Streamable HTTP 两种 transport。
-- 19 工具覆盖设备/机型系列与具体机型、Run、命令、原始输入、信号、Trigger、查询和 Monitor。
-- `run_handle` 收敛 Run-scoped 参数；正常会话结束前由 Agent 调用 `run_end`。
+- 17 工具覆盖设备发现、已配置机型身份绑定、Run、命令、原始输入、信号、Trigger、查询和 Monitor。
+- `devices` 是唯一发现工具，只提供串口、两级机型身份、Agent 所需状态和有效 Shell/U-Boot 提示符；不向 Agent 暴露 Profile 名、UART、EOL/echo 或写入节奏。
+- 机型身份工具只绑定/解绑人工预先配置的 family/name；Profile 和两级机型目录继续由 TUI、Electron 或 HTTP 管理。
+- `run_handle` 收敛 Run-scoped 参数；Agent 用 `run_end(outcome=completed|aborted)` 统一表达正常完成或经权威确认的异常终止，并收口 Control。
 - `command_sequence` 一次完成 1–8 步依赖交互；每个非最终步骤必须等到明确 RX 边界。
 - 命令 TX 持久化 `command_capture_matchers`，供人类界面精确定位输出。
 - process-local live cursor、bounded capture、明确 truncation/gap/interference。
@@ -92,9 +95,9 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 - TUI 重开恢复、后端重启边界、journal retention gap 与损坏断尾恢复。
 - command matcher 在普通命令、命令序列逐 step、无回显、提示符变化和无匹配时的定位。
 - Monitor 多 matcher OR、debounce 聚合、incident 命中条件、串口证据跳转，以及旧周期/本地淘汰后的 journal 回取与 retention gap 提示。
-- 人工 Takeover、cooperative write、其他 Agent 写入、机型系列/具体型号切换的 `recent_context` 与零字节拒写。
-- TUI 选项展开/折叠、两级机型选择、行内输入、字段帮助和 MCP timeout 热加载。
-- Streamable HTTP initialize、notification 202、cancellation、Origin 和 19 工具 schema。
+- 人工 Takeover、cooperative write、其他 Agent 写入、行为 Profile 与机型系列/具体型号切换的 `recent_context` 与零字节拒写。
+- TUI 选项展开/折叠、两级机型选择与新增、行内输入、字段帮助和 MCP timeout 热加载。
+- Streamable HTTP initialize、notification 202、cancellation、Origin 和 17 工具 schema。
 - annotated tag 到 Jenkins、四平台 artifacts、SHA256SUMS 和 GitHub Release 的完整链路。
 
 ## 非目标

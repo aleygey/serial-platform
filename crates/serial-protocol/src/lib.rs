@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 /// Shared protocol generation for HTTP DTOs, WebSocket control/timeline
 /// frames, and cross-component compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -378,29 +378,24 @@ pub struct SlotConfig {
     /// Optional reusable physical UART profile. No profile means 115200 8N1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_profile: Option<String>,
-    /// Optional model profile describing the connected device and its prompt
-    /// and input behavior.
+    /// Optional serial-interaction profile supplying prompt and input behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile: Option<String>,
-    /// Optional concrete product name within the bound model profile. The
-    /// profile owns reusable interaction behavior; this field identifies the
-    /// exact device attached to this port for humans and Agents.
+    /// Optional first-level model-family identity. Model identity is separate
+    /// from the interaction profile so either can change independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_family: Option<String>,
+    /// Optional concrete second-level model name in `model_family`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
     pub enabled: bool,
 }
 
-/// Maximum concrete product names in one model-family profile.
-pub const MAX_MODEL_NAMES_PER_PROFILE: usize = 128;
-
-/// Reusable interaction behavior for one model family.
+/// Reusable serial interaction behavior. This catalog is independent from
+/// model identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub name: String,
-    /// Concrete product names belonging to this family, displayed as the
-    /// second level of the model selector.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub model_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +411,19 @@ pub struct ModelProfile {
     pub write_chunk_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_chunk_delay_ms: Option<u64>,
+}
+
+/// Maximum first-level entries in the model-family catalog.
+pub const MAX_MODEL_FAMILIES: usize = 128;
+/// Maximum concrete product names in one model family.
+pub const MAX_MODEL_NAMES_PER_FAMILY: usize = 128;
+
+/// Strictly two-level model-identity catalog entry. `name` is the first-level
+/// family and `model_names` are selectable concrete second-level models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFamily {
+    pub name: String,
+    pub model_names: Vec<String>,
 }
 
 /// Device-interaction settings after applying the attached model profile.
@@ -1141,6 +1149,29 @@ pub struct ConfigureModelProfilesResponse {
     pub config_revision: u64,
 }
 
+/// Read model for the independent, two-level model-identity catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFamilyListResponse {
+    pub families: Vec<ModelFamily>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
+/// Full replacement of the model-family identity catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureModelFamiliesRequest {
+    pub families: Vec<ModelFamily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureModelFamiliesResponse {
+    pub families: Vec<ModelFamily>,
+    #[serde(default)]
+    pub config_revision: u64,
+}
+
 /// One discoverable, retained port/daemon-epoch journal archive.
 ///
 /// Segment timestamps describe when the first and last retained segments were
@@ -1771,7 +1802,6 @@ mod tests {
     fn model_profile() -> ModelProfile {
         ModelProfile {
             name: "sigmastar-evb".into(),
-            model_names: vec!["SigmaStar EVB 1.0".into()],
             shell_prompt: Some("root@sigmastar:/# ".into()),
             uboot_prompt: Some("SigmaStar =>".into()),
             write_eol: Some("\n".into()),
@@ -1819,7 +1849,6 @@ mod tests {
         // than inheriting a stale prompt from the previously attached model.
         let promptless = ModelProfile {
             name: "promptless".into(),
-            model_names: Vec::new(),
             shell_prompt: None,
             uboot_prompt: None,
             write_eol: None,
@@ -1900,12 +1929,14 @@ mod tests {
             "port": "COM3",
             "transport_profile": "generic-115200",
             "model_profile": "TL-AS7230",
+            "model_family": "TL-AS7230",
             "model_name": "TL-AS7230-W 1.0",
             "enabled": true,
         });
         let slot: SlotConfig = serde_json::from_value(value).unwrap();
         assert_eq!(slot.port, "COM3");
         assert_eq!(slot.model_profile.as_deref(), Some("TL-AS7230"));
+        assert_eq!(slot.model_family.as_deref(), Some("TL-AS7230"));
         assert_eq!(slot.model_name.as_deref(), Some("TL-AS7230-W 1.0"));
     }
 
@@ -1916,6 +1947,7 @@ mod tests {
                 port: "COM3".into(),
                 transport_profile: Some("generic-115200".into()),
                 model_profile: None,
+                model_family: None,
                 model_name: None,
                 enabled: true,
             },
@@ -2196,8 +2228,16 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v5_exposes_multi_match_monitor_and_model_name_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_v6_exposes_independent_model_identity_contracts() {
+        assert_eq!(PROTOCOL_VERSION, 6);
+        let profile = serde_json::to_value(model_profile()).unwrap();
+        assert!(profile.get("model_names").is_none());
+        let family = serde_json::to_value(ModelFamily {
+            name: "TL-AS7230".into(),
+            model_names: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(family["model_names"], serde_json::json!([]));
     }
 
     #[test]

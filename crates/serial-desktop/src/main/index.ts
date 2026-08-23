@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron'
 import { DesktopCoordinator } from './coordinator'
-import type { DesktopPreferences, ModelProfile, SerialConfigurationDraft } from '../shared/contracts'
+import type { DesktopPreferences, ModelFamily, ModelProfile, SerialConfigurationDraft } from '../shared/contracts'
 import { HELP, startupAction } from './startup'
 import { GracefulQuitGate } from './graceful-quit'
 
@@ -66,10 +66,15 @@ function installIpc(): void {
     coordinator!.sendCommand(port, command))
   ipcMain.handle('serial:set-port-open', (_event, port: string, open: boolean) =>
     coordinator!.setPortOpen(port, open))
-  ipcMain.handle('serial:save-serial-configuration', (_event, draft: SerialConfigurationDraft) =>
-    coordinator!.saveSerialConfiguration(draft))
-  ipcMain.handle('serial:save-model-profiles', (_event, profiles: ModelProfile[]) =>
-    coordinator!.saveModelProfiles(profiles))
+  ipcMain.handle('serial:save-serial-configuration', (
+    _event,
+    draft: SerialConfigurationDraft,
+    expectedRevision: number
+  ) => coordinator!.saveSerialConfiguration(draft, expectedRevision))
+  ipcMain.handle('serial:save-model-profiles', (_event, profiles: ModelProfile[], expectedRevision: number) =>
+    coordinator!.saveModelProfiles(profiles, expectedRevision))
+  ipcMain.handle('serial:save-model-families', (_event, families: ModelFamily[], expectedRevision: number) =>
+    coordinator!.saveModelFamilies(families, expectedRevision))
   ipcMain.handle('serial:save-preferences', (_event, preferences: DesktopPreferences) =>
     coordinator!.savePreferences(preferences))
   ipcMain.handle('serial:start-local-service', () => coordinator!.startLocalService())

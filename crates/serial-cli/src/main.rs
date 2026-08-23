@@ -11,8 +11,8 @@ use std::{
 };
 
 use serial_protocol::{
-    DataBits, EchoMode, FlowControl, McpHealthResponse, ModelProfile, PROTOCOL_VERSION, Parity,
-    SlotConfig, StopBits, TransportProfile,
+    DataBits, EchoMode, FlowControl, McpHealthResponse, ModelFamily, ModelProfile,
+    PROTOCOL_VERSION, Parity, SlotConfig, StopBits, TransportProfile,
 };
 use seriald::config::{ConfigPaths, ConfigStore, DaemonConfig};
 use seriald::runtime::{ActiveEndpoint, connect_address, discover_active};
@@ -42,8 +42,9 @@ Usage: serial setup [--root DIR]
 
 后端地址：seriald 监听 IP 和端口
 串口 Profile：波特率、数据位、校验位
-机型 Profile：同系列设备共用的 Shell/U-Boot 提示符和输入方式
-具体机型名：当前串口所连接设备的具体型号
+机型 Profile：Shell/U-Boot 提示符和发送行为
+一级机型名：设备系列
+二级机型名：当前串口连接的具体型号
 ";
 
 const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -235,7 +236,7 @@ fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
             if wait_for_matching_mcp(mcp_address, &active, MCP_IDENTITY_WAIT).is_none() {
                 return Err(Error::new(
                     ErrorKind::AddrInUse,
-                    "127.0.0.1:3211 is occupied, but it is not protocol v5 serial-mcp connected to the selected seriald",
+                    "127.0.0.1:3211 is occupied, but it is not protocol v6 serial-mcp connected to the selected seriald",
                 ));
             }
         } else {
@@ -319,6 +320,7 @@ struct OfflineConfiguration {
     bind: SocketAddr,
     transport_profiles: Vec<TransportProfile>,
     model_profiles: Vec<ModelProfile>,
+    model_families: Vec<ModelFamily>,
     ports: Vec<SlotConfig>,
 }
 
@@ -332,8 +334,9 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
     }
     println!("后端地址 / Endpoint：seriald 监听 IP 和端口");
     println!("串口 Profile / Transport Profile：波特率、数据位、校验位");
-    println!("机型 Profile / Model Profile：同系列设备共用的 Shell/U-Boot 提示符和输入方式");
-    println!("具体机型名 / Model name：当前串口所连接设备的具体型号");
+    println!("机型 Profile / Model Profile：Shell/U-Boot 提示符和发送行为");
+    println!("一级机型名 / Model family：设备系列");
+    println!("二级机型名 / Model name：当前串口所连接设备的具体型号");
 
     let defaults = if store.paths().config_file.exists() {
         store.load().map_err(|error| error.to_string())?
@@ -389,21 +392,28 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
             .map(|profile| profile.name.as_str())
             .unwrap_or(""),
     )?;
+    let current_family = defaults.model_families.first();
+    let model_family_name = prompt(
+        "一级机型名（留空表示不标记机型）",
+        current_family
+            .map(|family| family.name.as_str())
+            .unwrap_or(""),
+    )?;
     let current_concrete_model = defaults
         .ports
         .first()
         .and_then(|port| port.model_name.as_deref())
         .or_else(|| {
-            current_model.and_then(|profile| profile.model_names.first().map(String::as_str))
+            current_family.and_then(|family| family.model_names.first().map(String::as_str))
         });
-    let concrete_model_name = if model_profile_name.is_empty() {
+    let concrete_model_name = if model_family_name.is_empty() {
         String::new()
     } else {
-        prompt(
-            "具体机型名（留空表示暂不标记）",
-            current_concrete_model.unwrap_or(""),
-        )?
+        prompt("二级具体机型名", current_concrete_model.unwrap_or(""))?
     };
+    if !model_family_name.is_empty() && concrete_model_name.is_empty() {
+        return Err("二级具体机型名不能为空".into());
+    }
     let shell_prompt = prompt_optional(
         "Shell 提示符（- 清空）",
         current_model.and_then(|profile| profile.shell_prompt.as_deref()),
@@ -417,10 +427,6 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
     } else {
         vec![ModelProfile {
             name: model_profile_name.clone(),
-            model_names: (!concrete_model_name.is_empty())
-                .then(|| concrete_model_name.clone())
-                .into_iter()
-                .collect(),
             shell_prompt,
             uboot_prompt,
             write_eol: Some("\r".into()),
@@ -429,12 +435,21 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
             write_chunk_delay_ms: Some(1),
         }]
     };
+    let model_families = if model_family_name.is_empty() {
+        Vec::new()
+    } else {
+        vec![ModelFamily {
+            name: model_family_name.clone(),
+            model_names: vec![concrete_model_name.clone()],
+        }]
+    };
     let ports = ports
         .into_iter()
         .map(|port| SlotConfig {
             port,
             transport_profile: Some(transport_name.clone()),
             model_profile: (!model_profile_name.is_empty()).then(|| model_profile_name.clone()),
+            model_family: (!model_family_name.is_empty()).then(|| model_family_name.clone()),
             model_name: (!concrete_model_name.is_empty()).then(|| concrete_model_name.clone()),
             enabled: true,
         })
@@ -445,6 +460,7 @@ fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), Strin
             bind,
             transport_profiles,
             model_profiles,
+            model_families,
             ports,
         },
     )?;
@@ -463,6 +479,7 @@ fn persist_offline_configuration(
     current.bind = draft.bind;
     current.transport_profiles = draft.transport_profiles;
     current.model_profiles = draft.model_profiles;
+    current.model_families = draft.model_families;
     current.ports = draft.ports;
     current.config_revision = current.config_revision.saturating_add(1);
     store.save(&current).map_err(|error| error.to_string())
@@ -629,7 +646,7 @@ fn wait_for_mcp_child(
             return Err(Error::new(
                 ErrorKind::TimedOut,
                 format!(
-                    "serial-mcp did not publish a matching protocol v5 identity on {address}{suffix}"
+                    "serial-mcp did not publish a matching protocol v6 identity on {address}{suffix}"
                 ),
             ));
         }
@@ -866,6 +883,7 @@ mod tests {
                 bind: requested_bind,
                 transport_profiles: stale.transport_profiles,
                 model_profiles: stale.model_profiles,
+                model_families: stale.model_families,
                 ports: stale.ports,
             },
         )
@@ -918,7 +936,8 @@ mod tests {
         assert!(SETUP_HELP.contains("后端地址"));
         assert!(SETUP_HELP.contains("串口 Profile"));
         assert!(SETUP_HELP.contains("机型 Profile"));
-        assert!(SETUP_HELP.contains("具体机型名"));
+        assert!(SETUP_HELP.contains("一级机型名"));
+        assert!(SETUP_HELP.contains("二级机型名"));
     }
 
     #[test]

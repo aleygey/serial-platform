@@ -104,17 +104,18 @@ capture_max_bytes = 1048576
 
 ## 工具发现
 
-adapter 暴露固定 19 项：
+adapter 暴露固定 17 项：
 
 ```text
-devices              model_profiles       model_profile_set
-read                 command              command_sequence
-input                signal               trigger
-wait                 search
-monitor_start        monitor_list          monitor_status
-monitor_incidents    monitor_stop
-run_start            run_end               release
+devices              model_identity_set   read
+command              command_sequence     input
+signal               trigger              wait
+search               monitor_start        monitor_list
+monitor_status       monitor_incidents    monitor_stop
+run_start            run_end
 ```
+
+`devices` 是唯一的设备发现工具。它提供 `port`、`model_family` / `model_name`、Agent 需要的连接与工作流状态，以及当前有效的 Shell/U-Boot 提示符；不暴露行为 Model Profile 名、Transport/UART 参数、EOL/echo 或写入节奏。`model_identity_set` 只绑定或解绑人通过 TUI、App 或 HTTP 预先配置的 family/name，不创建机型目录。
 
 查看 host 实际应缓存的完整 schema：
 
@@ -124,18 +125,18 @@ serial mcp --dump-tools
 
 更新 adapter 后，让 MCP host 重新执行 `tools/list`。所有设备参数统一使用 `port`。
 
-OpenCode 会把 server 名作为工具前缀，例如 `serial_devices`、`serial_command_sequence` 和 `serial_model_profile_set`。Serial Platform 本身不要求 token、Header 或角色配置；MCP host 自己的工具确认策略不改变协议参数。
+OpenCode 会把 server 名作为工具前缀，例如 `serial_devices`、`serial_command_sequence` 和 `serial_model_identity_set`。Serial Platform 本身不要求 token、Header 或角色配置；MCP host 自己的工具确认策略不改变协议参数。
 
 ## Agent 指令建议
 
 MCP initialize 已提供服务器指令。若 host 支持附加 prompt，可以保持为以下短规则：
 
 ```text
-先调用 devices 和 model_profiles，明确选择 port 并核对机型 Profile、具体 model_name 与实际设备。
+先调用 devices，明确选择 port，并核对 model_family/model_name、有效 Shell/U-Boot 提示符与实际设备。
 写入前调用 run_start，并在同一工作流中保存 run_handle。
 普通命令用 command；账号/密码等已知依赖交互用一次 command_sequence。
 每个 command/step 都填写简洁 description。
-最终回复前调用 run_end。
+最终回复前调用 run_end；正常完成省略 outcome 或使用 completed，异常终止使用 aborted。
 ```
 
 不要让模型传底层 Control、fence、generation、operation 或续租状态；adapter 会处理这些细节。
@@ -202,6 +203,6 @@ adapter 在发送下一步之前等待当前 matcher。任一步失败，所有�
 
 stdio 可以并发处理独立请求，输出 frame 由单一 writer 完整写出。每个端口的物理 mutation 在 adapter 内串行化，`command_sequence` 整体持有该路径，bytes 不会和同一 adapter 的另一个命令交错。
 
-MCP cancellation 只中断纯观察调用。物理写入、Run transition 和 Monitor mutation 可能已经跨过副作用边界，会继续收敛到权威结果，避免 host 因看不到结果而错误重试。
+MCP cancellation 可中断 `devices`、`read`、`wait`、`search`、`monitor_list`、`monitor_status` 和 `monitor_incidents`。其他工具可能已经跨过副作用边界，会继续收敛到权威结果，避免 host 因看不到结果而错误重试。
 
 完整输入 schema、结果、capture 与 recent context 语义见 [MCP 工具目录](../docs/MCP_TOOLS.md)。

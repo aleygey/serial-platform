@@ -3,7 +3,7 @@ import { decodeFrame, encodeControl, SERIAL_PROTOCOL_VERSION } from './protocol'
 
 describe('serial wire envelope', () => {
   it('uses the current shared protocol generation', () => {
-    expect(SERIAL_PROTOCOL_VERSION).toBe(5)
+    expect(SERIAL_PROTOCOL_VERSION).toBe(6)
   })
 
   it('encodes control JSON behind the protocol header', () => {

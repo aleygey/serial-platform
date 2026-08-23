@@ -96,8 +96,8 @@ export function App(): React.JSX.Element {
     }
   }
 
-  const startBackend = (): Promise<void> => withToast(() => window.serial.startLocalService(), setToast, false)
-  const stopBackend = (): Promise<void> => withToast(() => window.serial.stopLocalService(), setToast, false)
+  const startBackend = async (): Promise<void> => { await withToast(() => window.serial.startLocalService(), setToast, false) }
+  const stopBackend = async (): Promise<void> => { await withToast(() => window.serial.stopLocalService(), setToast, false) }
   const savePreferences = async (preferences: DesktopSnapshot['preferences']): Promise<void> => {
     setSnapshot((current) => current ? { ...current, preferences } : current)
     await withToast(() => window.serial.savePreferences(preferences), setToast)
@@ -124,11 +124,16 @@ export function App(): React.JSX.Element {
           availablePorts={snapshot.availablePorts}
           transportProfiles={snapshot.transportProfiles}
           modelProfiles={snapshot.modelProfiles}
+          modelFamilies={snapshot.modelFamilies}
           preferences={snapshot.preferences}
           initialPort={selectedPort}
           onBack={() => setPage('console')}
-          onSaveSerial={async (draft) => withToast(() => window.serial.saveSerialConfiguration(draft), setToast)}
-          onSaveModels={async (profiles) => withToast(() => window.serial.saveModelProfiles(profiles), setToast)}
+          onSaveSerial={async (draft) => withToast(
+            () => window.serial.saveSerialConfiguration(draft, snapshot.configRevision),
+            setToast
+          )}
+          onSaveModels={async (profiles) => withToast(() => window.serial.saveModelProfiles(profiles, snapshot.configRevision), setToast)}
+          onSaveModelFamilies={async (families) => withToast(() => window.serial.saveModelFamilies(families, snapshot.configRevision), setToast)}
           onSavePreferences={savePreferences}
         />
         <Toast value={toast} onClose={() => setToast(undefined)} />
@@ -165,7 +170,7 @@ export function App(): React.JSX.Element {
           <CommandBar
             port={selectedPort}
             disabled={!configuredPort || configuredPort.session_state !== 'online' || snapshot.connection !== 'connected'}
-            onSend={(command) => withToast(() => window.serial.sendCommand(selectedPort!, command), setToast, false)}
+            onSend={async (command) => { await withToast(() => window.serial.sendCommand(selectedPort!, command), setToast, false) }}
           />
         </div>
         <AgentHistory items={history} selectedCommand={selectedCommand} onSelect={setSelectedCommand} />
@@ -242,12 +247,14 @@ async function withToast(
   action: () => Promise<void>,
   setToast: (toast: { kind: 'notice' | 'error'; message: string } | undefined) => void,
   announce = true
-): Promise<void> {
+): Promise<boolean> {
   try {
     await action()
     if (announce) setToast({ kind: 'notice', message: '配置已保存并生效' })
+    return true
   } catch (error) {
     setToast({ kind: 'error', message: message(error) })
+    return false
   }
 }
 

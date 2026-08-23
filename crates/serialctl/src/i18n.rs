@@ -345,7 +345,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current",
-        "Port {} · Serial Profile {} · Model Profile {} · Model {}",
+        "Port {} · Serial Profile {} · Model Profile {} · Model identity {}",
         "串口：{} · 串口 Profile：{} · 机型 Profile：{} · 机型名：{}",
     ),
     (
@@ -354,6 +354,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "通用交互设置（不使用机型 Profile）",
     ),
     ("menu.value.unbound", "Unbound", "未绑定"),
+    ("menu.value.model.identity", "{} / {}", "{} / {}"),
     ("menu.value.enabled", "enabled", "启用"),
     ("menu.value.disabled", "disabled", "停用"),
     ("menu.value.on", "on", "开启"),
@@ -363,11 +364,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Edit current port configuration",
         "修改当前串口配置",
     ),
-    (
-        "menu.root.create",
-        "Create configuration Profile",
-        "创建配置 Profile",
-    ),
+    ("menu.root.create", "Create configuration", "创建配置"),
     ("menu.root.settings", "Settings", "设置"),
     (
         "menu.root.display",
@@ -377,11 +374,7 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("menu.root.mcp", "serial MCP settings", "serial MCP 设置"),
     ("menu.root.help", "Help", "帮助"),
     ("menu.settings.title", "Settings", "设置"),
-    (
-        "menu.create.title",
-        "Create configuration Profile",
-        "创建配置 Profile",
-    ),
+    ("menu.create.title", "Create configuration", "创建配置"),
     (
         "menu.create.transport",
         "Create Serial Profile",
@@ -391,6 +384,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.create.model",
         "Create Model Profile",
         "创建机型 Profile",
+    ),
+    (
+        "menu.create.model.names",
+        "Configure model names",
+        "配置机型名",
     ),
     (
         "menu.create.transport.title",
@@ -407,12 +405,27 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "Profile name: {}",
         "Profile 名称：{}",
     ),
-    (
-        "menu.create.row.model.names",
-        "Concrete model names: {}",
-        "具体机型名：{}",
-    ),
     ("menu.create.row.save", "Create Profile", "创建 Profile"),
+    (
+        "menu.model.configure.title",
+        "Configure model names",
+        "配置机型名",
+    ),
+    (
+        "menu.model.names.configure.title",
+        "Configure concrete model names",
+        "配置二级机型名",
+    ),
+    (
+        "menu.model.family.add",
+        "Add first-level model name",
+        "新增一级机型名",
+    ),
+    (
+        "menu.model.name.add",
+        "Add second-level model name",
+        "新增二级机型名",
+    ),
     (
         "menu.model.family.title",
         "Choose model family",
@@ -422,6 +435,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.model.name.title",
         "Choose concrete model",
         "选择具体机型名",
+    ),
+    (
+        "menu.model.names.empty",
+        "This model family has no concrete model names",
+        "该一级机型下暂无二级机型名",
     ),
     ("menu.current.section.actions", "Apply", "应用配置"),
     ("menu.choice.open", "options expanded", "选项已展开"),
@@ -443,8 +461,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current.section.model",
-        "Device model profile",
-        "机型 Profile 配置",
+        "Model behavior and identity",
+        "机型 Profile 与机型名",
     ),
     ("menu.current.row.port", "Port: {}", "端口：{}"),
     (
@@ -632,6 +650,51 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "机型 Profile {} 已不存在",
     ),
     (
+        "menu.model.family.created",
+        "First-level model name {} created",
+        "一级机型名 {} 已创建",
+    ),
+    (
+        "menu.model.name.created",
+        "Second-level model name {} added to {}",
+        "二级机型名 {} 已添加到 {}",
+    ),
+    (
+        "menu.model.family.name.invalid",
+        "Enter a first-level model name of 1–128 bytes without surrounding whitespace",
+        "请输入 1–128 字节且首尾无空白的一级机型名",
+    ),
+    (
+        "menu.model.name.invalid",
+        "Enter a second-level model name of 1–128 bytes without surrounding whitespace",
+        "请输入 1–128 字节且首尾无空白的二级机型名",
+    ),
+    (
+        "menu.model.family.exists",
+        "First-level model name {} already exists",
+        "一级机型名 {} 已存在",
+    ),
+    (
+        "menu.model.name.exists",
+        "Second-level model name {} already exists in this family",
+        "该一级机型下已存在二级机型名 {}",
+    ),
+    (
+        "menu.model.family.missing",
+        "First-level model name {} no longer exists; reload and select again",
+        "一级机型名 {} 已不存在；请重新加载后选择",
+    ),
+    (
+        "menu.model.name.limit",
+        "One first-level model may contain at most {} second-level names",
+        "每个一级机型最多包含 {} 个二级机型名",
+    ),
+    (
+        "menu.model.family.limit",
+        "At most {} first-level model names may be configured",
+        "最多可配置 {} 个一级机型名",
+    ),
+    (
         "menu.profile.exists",
         "profile {} already exists; choose another name",
         "Profile {} 已存在；请选择其他名称",
@@ -749,9 +812,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "新机型 Profile 名称",
     ),
     (
-        "menu.prompt.model.names",
-        "Concrete model names, separated by commas",
-        "具体机型名（使用逗号分隔）",
+        "menu.prompt.model.family",
+        "New first-level model name",
+        "新一级机型名",
+    ),
+    (
+        "menu.prompt.model.name",
+        "New second-level model name",
+        "新二级机型名",
     ),
     ("menu.field.help.title", "Field description", "配置项说明"),
     ("menu.field.help.close", "any key closes", "按任意键关闭"),
@@ -762,18 +830,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.help.field.transport",
-        "Select an existing Serial Profile. New Profiles are created from the separate Create configuration Profile menu.",
-        "选择已经创建的串口 Profile；新增 Profile 请使用独立的“创建配置 Profile”。",
+        "Select an existing Serial Profile. New Profiles are created from Create configuration.",
+        "选择已经创建的串口 Profile；新增 Profile 请使用“创建配置”。",
     ),
     (
         "menu.help.field.model.profile",
-        "A Model Profile describes one model family's prompts, line ending and write pacing.",
-        "机型 Profile 描述一类机型共用的提示符、换行和分段发送参数。",
+        "A Model Profile controls prompts, line ending and write pacing independently from model identity.",
+        "机型 Profile 独立配置提示符、换行和分段发送参数，不作为机型身份。",
     ),
     (
         "menu.help.field.model.name",
-        "Choose the family first, then the concrete model name attached to this port.",
-        "先选择机型系列，再选择当前串口连接的具体机型名。",
+        "Choose the first-level model family, then the second-level concrete model attached to this port.",
+        "先选择一级机型系列，再选择当前串口连接的二级具体机型名。",
     ),
     (
         "menu.help.field.shell",
@@ -802,8 +870,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.help.field.create",
-        "Create a reusable Serial Profile or Model Profile without changing the current port binding.",
-        "创建可复用的串口 Profile 或机型 Profile，不会自动修改当前串口绑定。",
+        "Create a reusable Serial Profile, Model Profile, or model-name hierarchy.",
+        "创建串口 Profile、机型 Profile，或配置两级机型名。",
+    ),
+    (
+        "menu.help.field.model.configure",
+        "Add a first-level model name, then enter it to add second-level concrete model names.",
+        "先新增一级机型名，再进入该层级新增二级具体机型名。",
     ),
     (
         "menu.help.field.display",
@@ -1544,8 +1617,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.run.jump.incomplete",
-        "command evidence #{}-#{} is no longer fully retained or has no verified boundary",
-        "命令证据 #{}–#{} 已无法完整读取或没有可验证的结束边界",
+        "command output #{}-#{} has not formed a verified completion boundary",
+        "命令输出 #{}–#{} 尚未形成可验证的结束边界",
+    ),
+    (
+        "st.run.jump.pending",
+        "command output at sequence #{} is still arriving; waiting for a completion boundary",
+        "命令序号 #{} 的输出仍在继续，正在等待结束边界",
     ),
     (
         "st.run.jump.limit",
@@ -1694,6 +1772,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "seriald {}  服务实例 {}  {} 个串口",
     ),
     ("m.status.control", "control: {}", "控制权：{}"),
+    (
+        "m.status.model",
+        "  Model Profile: {} · model family: {} · concrete model: {}",
+        "  机型 Profile：{} · 一级机型：{} · 二级机型：{}",
+    ),
     ("m.status.reason", "  reason: {}", "  原因：{}"),
     (
         "m.status.trigger",
@@ -1831,8 +1914,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("doctor.value.trigger", "{} · {}", "{} · {}"),
     (
         "doctor.value.profiles",
-        "Serial Profile={} · Model Profile={}",
-        "串口 Profile={} · 机型 Profile={}",
+        "Serial Profile={} · Model Profile={} · model family={} · concrete model={}",
+        "串口 Profile={} · 机型 Profile={} · 一级机型={} · 二级机型={}",
     ),
     (
         "doctor.value.transport",
@@ -2263,13 +2346,29 @@ mod tests {
         let _guard = lang_test_lock();
         set_lang(Lang::Zh);
         assert_eq!(tr("menu.root.profile"), "修改当前串口配置");
-        assert_eq!(tr("menu.root.create"), "创建配置 Profile");
+        assert_eq!(tr("menu.root.create"), "创建配置");
         assert_eq!(tr("menu.root.settings"), "设置");
         assert_eq!(tr("menu.root.help"), "帮助");
         assert!(tr("menu.current").contains("串口："));
         assert!(tr("menu.current").contains("串口 Profile"));
         assert!(tr("menu.current").contains("机型 Profile"));
         assert!(!tr("menu.current").contains("Transport"));
+    }
+
+    #[test]
+    fn incomplete_command_evidence_does_not_claim_retention_loss() {
+        let _guard = lang_test_lock();
+        set_lang(Lang::Zh);
+        let zh = trf("st.run.jump.incomplete", &["2", "5"]);
+        assert_eq!(zh, "命令输出 #2–#5 尚未形成可验证的结束边界");
+        assert!(!zh.contains("无法完整读取"));
+        set_lang(Lang::En);
+        let en = trf("st.run.jump.incomplete", &["2", "5"]);
+        assert_eq!(
+            en,
+            "command output #2-#5 has not formed a verified completion boundary"
+        );
+        assert!(!en.contains("retained"));
     }
 
     #[test]

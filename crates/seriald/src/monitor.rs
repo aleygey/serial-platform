@@ -2718,6 +2718,7 @@ mod tests {
             port: "slot-1".into(),
             transport_profile: None,
             model_profile: None,
+            model_family: None,
             model_name: None,
             enabled: false,
         };

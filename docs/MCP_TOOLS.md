@@ -1,6 +1,6 @@
 # Serial MCP Tools
 
-`serial-mcp` 把 Serial Platform 收敛为 19 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
+`serial-mcp` 把 Serial Platform 收敛为 17 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
 
 ```sh
 serial mcp --dump-tools
@@ -44,13 +44,12 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 
 支持 MCP protocol：`2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`。
 
-## 19 个工具
+## 17 个工具
 
 | Tool | Required | Optional | 作用 |
 |---|---|---|---|
-| `devices` | — | `port` | 读取端口、Profile、生效参数、连接、Control、Run、Trigger 和 cursor head |
-| `model_profiles` | — | `port` | 读取 Model Profile catalog 与端口绑定 |
-| `model_profile_set` | `port`, `profile` | `model_name` | 创建/更新机型系列 Profile，并绑定具体机型名；`profile:null` 同时解绑 |
+| `devices` | — | `port` | 唯一设备发现入口；读取串口、两级机型身份、Agent 状态和有效 Shell/U-Boot 提示符 |
+| `model_identity_set` | `port`, `model_family`, `model_name` | — | 成对绑定已有系列/具体机型，或以两个 null 清空身份 |
 | `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq` | 从实时 ring 或指定历史周期读取有界文本 |
 | `command` | `run_handle`, `command`, `description` | `expect`, `regex`, `timeout_seconds` | 追加有效 EOL、写入、捕获 RX 并保留任务说明 |
 | `command_sequence` | `run_handle`, `description`, `steps` | 每步 matcher/timeout | 一次完成 1–8 步已知依赖交互 |
@@ -65,16 +64,15 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 | `monitor_incidents` | `monitor_id` | `after` | 读取 incident tail 或向前分页 |
 | `monitor_stop` | `monitor_id` | — | 停止未来匹配，保留 incident |
 | `run_start` | `port`, `label` | — | 排队获取 Control，开始 Run，返回 `run_handle` |
-| `run_end` | `run_handle` | — | 正常结束 Run 并 best-effort 释放 Control |
-| `release` | 见下文 | — | 释放无 Run Control，或显式中止当前 adapter 的 Run |
+| `run_end` | `run_handle` | `outcome` | 正常完成 Run，或经权威确认后异常中止并释放 Control |
 
 ## 标准工作流
 
-1. 调用 `devices`，明确选择 `port`，核对 `model_profile`、`model_name` 与实际设备。
+1. 调用 `devices`，明确选择 `port`，核对一级 `model_family`、二级 `model_name`、有效 Shell/U-Boot 提示符和当前连接/工作流状态。
 2. 调用 `run_start`，在本次 Agent 工作流中保存返回的 `run_handle`。`run_id` 只用于审计和查询。
 3. 普通 Shell/Bootloader 命令使用 `command`；已知的多轮依赖交互使用一次 `command_sequence`。
 4. 需要补充观察时使用 `wait`、`read`、`search` 或 Monitor。
-5. 在最终 Agent 回复前调用 `run_end`。只有明确把活动 Run 交给后续 Agent 工作流时才保持它打开。
+5. 在最终 Agent 回复前调用 `run_end`。正常完成可省略 `outcome`；异常结束传 `outcome="aborted"`。只有明确把活动 Run 交给后续 Agent 工作流时才保持它打开。
 
 Run 只界定证据，不复位设备，也不证明当前状态干净。Agent 应通过串口、其他设备界面或人工确认实际机型和状态。
 
@@ -119,85 +117,33 @@ Input：
 {"port":"COM4"}
 ```
 
-结果包含 `daemon_epoch`、`config_revision`、`ports` 和设备选择提示。每个端口项包含 `model_profile`、具体 `model_name`、session state、generation、head/ring cursor、有效 Transport/Model 参数、Control、active Run、active Trigger、logging 和 RX overflow。
+结果按 `ports` 返回可选串口。每个端口项包含 `port`、一级 `model_family`、二级 `model_name`、当前有效的 Shell/U-Boot 提示符，以及 Agent 需要判断是否可操作的连接、generation/cursor、Control、active Run、active Trigger、logging 和 RX overflow 状态。
+
+`devices` 不返回行为 Model Profile 名称、Transport Profile 或 UART 参数，也不暴露 `write_eol`、`echo`、chunk size/delay 或任何写入节奏。这些设置由人通过 TUI、Electron App 或 HTTP 配置；Agent 只使用已生效的提示符和写入行为。
 
 指定未知 `port` 会失败；工具不会静默选择另一个端口。
 
-## `model_profiles`
+## `model_identity_set`
 
-```json
-{"port":"COM4"}
-```
-
-`port` 可省略。结果：
-
-```json
-{
-  "config_revision": 12,
-  "profiles": [
-    {
-      "name": "TL-AS7230",
-      "model_names": ["TL-AS7230-W 1.0", "TL-AS7230-F4GE 1.0"]
-    }
-  ],
-  "bindings": [
-    {
-      "port":"COM4",
-      "model_profile":"TL-AS7230",
-      "model_name":"TL-AS7230-W 1.0"
-    }
-  ],
-  "port_filter": "COM4"
-}
-```
-
-## `model_profile_set`
-
-创建或替换一个完整机型系列 Profile，并把系列和具体机型名绑定到端口：
+绑定已在目录中存在的一级系列和二级具体机型：
 
 ```json
 {
   "port": "COM4",
-  "profile": {
-    "name": "TL-AS7230",
-    "model_names": [
-      "TL-AS7230-W 1.0",
-      "TL-AS7230-F4GE 1.0"
-    ],
-    "shell_prompt": "root@router:~# ",
-    "uboot_prompt": "=> ",
-    "write_eol": "\r",
-    "echo": "auto",
-    "write_chunk_size": 1,
-    "write_chunk_delay_ms": 1
-  },
+  "model_family": "TL-AS7230",
   "model_name": "TL-AS7230-W 1.0"
 }
 ```
 
-Profile 字段：
+`port`、`model_family` 和 `model_name` 都是必填字段。后两者必须同时为字符串，或同时为 `null`；不支持省略后隐式保留。字符串必须命中已由人通过 TUI、Electron App 或 HTTP 配置的 family 及其下具体机型。该工具只绑定或解绑，不发现、创建或替换目录。
 
-- `name`：机型系列/Profile 名称，必填，不含首尾空白，1–64 UTF-8 bytes；
-- `model_names`：该系列的具体机型名，最多 128 项，每项最多 128 UTF-8 bytes，不能重复；
-- `shell_prompt` / `uboot_prompt`：string 或 null，非空时最大 4096 UTF-8 bytes 且不能包含 NUL；
-- `write_eol`：`""`、`"\r"`、`"\n"`、`"\r\n"` 或 null；
-- `echo`：`on` / `off` / `auto` / null；
-- `write_chunk_size`：正整数或 null；
-- `write_chunk_delay_ms`：0–10000 或 null。
-
-`model_name` 省略、传字符串和传 `null` 的含义不同：
-
-- 字符串必须存在于本次 `profile.model_names`，并成为当前端口的具体机型名；
-- `null` 清除具体机型名，但保留机型 Profile；
-- 省略时，若端口仍绑定同名 Profile 且原具体机型名仍在新列表中，则保留原值；其他情况清除。
-
-解绑：
+清空身份：
 
 ```json
-{"port":"COM4","profile":null}
+{"port":"COM4","model_family":null,"model_name":null}
 ```
 
-结果返回 `previous_model_profile`、`previous_model_name`、当前 `model_profile`、`model_name` 与新 `config_revision`。名称按输入原样保存。
+结果返回 `port`、`previous_model_family`、`previous_model_name`、当前 `model_family`、`model_name` 和新 `config_revision`。名称按输入原样保存。
 
 ## `read`
 
@@ -239,7 +185,7 @@ scope：
 }
 ```
 
-- `command` 最大 4096 字符；空字符串表示只发送 EOL。
+- `command` 加当前有效 EOL 后最多 4096 UTF-8 bytes；空字符串表示只发送 EOL。
 - `description` 必填，1–256 UTF-8 bytes，进入持久命令历史。
 - `expect` 与 `regex` 互斥。
 - timeout 是 1–120 秒，默认 10 秒。
@@ -443,31 +389,23 @@ scope：
 
 ## `run_end`
 
+正常完成：
+
 ```json
 {"run_handle":"abcdefghijklmnopqrstuv"}
 ```
 
-结束由 handle 指定的活动 Run，并 best-effort 释放 Control。结果中 `run_open=false`。这是正常 Agent 会话的标准结束动作。
-
-## `release`
-
-无活动 Run 时，按端口释放当前 adapter 的 Control：
+异常中止：
 
 ```json
-{"port":"COM4","abort_run":false}
+{"run_handle":"abcdefghijklmnopqrstuv","outcome":"aborted"}
 ```
 
-显式中止当前 adapter 的活动 Run：
-
-```json
-{"run_handle":"abcdefghijklmnopqrstuv","abort_run":true}
-```
-
-中止模式不能同时传 `port`。正常完成应使用 `run_end`。adapter 没有持有本地 Control 时，release 是 no-op，不会影响其他连接的 Run。
+`outcome` 是可选枚举 `completed | aborted`，默认 `completed`。`completed` 记录 `RunEnded` 并立即尝试释放 Control；`aborted` 发送带当前私有 capability 的 `ReleaseControl`，只有收到权威确认后才记录成功结果，后端会先记录 `RunAborted`。成功时两种结果都返回 `run_open=false`。
 
 ## Recent context 与 physical action guard
 
-adapter 记住每端口上次成功操作的 cursor。两个操作之间出现其他 actor 的 TX、用户 Takeover、Control/Run 中止、机型 Profile 或具体机型名变化时，相关工具结果才附加：
+adapter 记住每端口上次成功操作的 cursor。两个操作之间出现其他 actor 的 TX、用户 Takeover、Control/Run 中止、端口重配或机型系列/具体机型变化时，相关工具结果才附加。行为 Profile 名不会进入 MCP 摘要：
 
 ```json
 {
@@ -483,8 +421,8 @@ adapter 记住每端口上次成功操作的 cursor。两个操作之间出现�
         "actor": {"kind": "system", "label": "seriald"},
         "port": "COM4",
         "source": "human:serialctl",
-        "previous_model_profile": "TL-AS7230",
-        "new_model_profile": "TL-AS7230",
+        "previous_model_family": "TL-AS7230",
+        "new_model_family": "TL-AS7230",
         "previous_model_name": "TL-AS7230-W 1.0",
         "new_model_name": "TL-AS7230-F4GE 1.0"
       }
@@ -523,7 +461,7 @@ adapter 记住每端口上次成功操作的 cursor。两个操作之间出现�
 可取消的纯观察工具：
 
 ```text
-devices model_profiles read wait search
+devices read wait search
 monitor_list monitor_status monitor_incidents
 ```
 

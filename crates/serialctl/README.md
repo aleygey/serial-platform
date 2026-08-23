@@ -26,13 +26,14 @@ App 和 `serial` 只停止自己启动的进程。外部 owner 退出后，仍�
 serial setup
 ```
 
-该流程直接读写本地后端配置，`seriald` 不需要先启动。交互只解释三项：
+该流程直接读写本地后端配置，`seriald` 不需要先启动。交互只解释四项：
 
 - 后端地址 / Endpoint：监听 IP 和端口；
 - 串口 Profile / Transport Profile：波特率、数据位、校验位等 UART 参数；
-- 机型 Profile / Model Profile：一类机型共用的 Shell/U-Boot 提示符、换行、设备回显解析和写入节奏，以及该系列的具体机型名列表。
+- 机型 Profile / Model Profile：可复用的 Shell/U-Boot 提示符、换行、设备回显解析和写入节奏。
+- 机型名：一级机型系列与其下的二级具体机型名，只用于标记当前串口连接的设备身份。
 
-串口名是唯一设备标识，例如 `COM4`，没有额外名称。机型 Profile 的 `name` 是系列名称；端口的 `model_name` 单独标记当前连接的具体型号，并且必须来自该 Profile 的 `model_names`。所有名称都按输入原样保存和显示。
+串口名是唯一端口标识，例如 `COM4`，没有额外 slot 名。机型 Profile（交互行为）和机型名（设备身份）彼此独立；端口同时保存 `model_family` 与 `model_name`，具体机型名必须属于所选一级系列。所有名称都按输入原样保存和显示。
 
 ## Profile CLI
 
@@ -49,32 +50,34 @@ serial profile transport export uart-115200 --output uart-115200.toml
 serial profile transport delete uart-115200 --yes
 ```
 
-Model Profile 管理一个机型系列的具体型号列表和共用交互行为：
+Model Profile 只管理可复用的设备交互行为：
 
 ```sh
 serial profile model list
-serial profile model show TL-AS7230
+serial profile model show router-shell
 serial profile model create --interactive
-serial profile model update TL-AS7230 \
-  --model-name 'TL-AS7230-W 1.0' \
-  --model-name 'TL-AS7230-F4GE 1.0' \
+serial profile model update router-shell \
   --shell-prompt 'root@router:~# '
-serial profile model clone TL-AS7230 --name TL-AS7230-lab
+serial profile model clone router-shell --name router-shell-lab
 serial profile model import models.json
-serial profile model export TL-AS7230 --output model.json
-serial profile model delete TL-AS7230 --yes
+serial profile model export router-shell --output model.json
+serial profile model delete router-shell --yes
 ```
 
 绑定和解绑：
 
 ```sh
-serial profile attach --port COM4 --transport uart-115200 --model TL-AS7230 \
+serial profile attach --port COM4 --transport uart-115200 --model router-shell \
+  --model-family TL-AS7230 \
   --model-name 'TL-AS7230-W 1.0'
 serial profile detach --port COM4 --model
+serial profile detach --port COM4 --identity
 serial profile detach --port COM4 --transport
 ```
 
-`update` 只改变显式字段；重复的 `--model-name` 会替换该系列的具体机型名列表；`--interactive` 使用当前值作为默认。Model prompt 用 `--clear-shell-prompt` / `--clear-uboot-prompt` 清空；EOL、echo、chunk size/delay 可用对应 `--inherit-*` 恢复通用值。
+裸 `serial profile detach --port COM4` 只解绑机型行为 Profile，等价于 `--model`；设备身份只有显式传入 `--identity` 才会清除。`--model-family` 与 `--model-name` 必须成对提供。
+
+`update` 只改变显式字段；`--interactive` 使用当前值作为默认。Model prompt 用 `--clear-shell-prompt` / `--clear-uboot-prompt` 清空；EOL、echo、chunk size/delay 可用对应 `--inherit-*` 恢复通用值。一级与二级机型名在 TUI 的“创建配置 → 配置机型名”中维护，不增加另一套 Profile CLI。
 
 运行中 Profile mutation 带 `config_revision`，避免较旧页面覆盖新的配置。Transport 变化按需要重开串口；Model 行为更新在 snapshot 刷新后立即生效。
 
@@ -128,7 +131,7 @@ serial profile detach --port COM4 --transport
 
 ## 任务记录与输出高亮
 
-任务记录按从旧到新显示，最新 action 在底部。新的 Agent `command` 或 `command_sequence` action 到达时，TUI 会退出正在浏览的旧子层级并回到底部；同一 action 的 TX 分块或 sequence 后续 step 只合并进原记录，不重复重置。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。
+任务记录按从旧到新显示，最新 action 在底部。每个 Run 使用独立的状态色标题；标题下的命令行同时显示 description 与具体 command。新的 Agent `command` 或 `command_sequence` action 到达时，TUI 会退出正在浏览的旧子层级并回到底部；同一 action 的 TX 分块或 sequence 后续 step 只合并进原记录，不重复重置。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。
 
 普通 `command` 是一个 action，按 `→` 后直接定位它的串口区域。`command_sequence` 也是一个 action；按 `→` 进入 step 层级，再用 `↑` / `↓` 选择每个具体命令，按 `←` 返回 action 层。Monitor action 按 `→` 进入 matcher，再按 `→` 进入 incident；选择 incident 后按它的 `serial_range` 跳转串口证据。命令捕获和 incident 属于旧后端周期，或完整范围已从本地窗口淘汰时，TUI 会从 journal 回取原周期的完整连续区间并高亮 RX；retention gap、缺失、超限或查询失败会返回实时尾并明确提示，不显示可能误导的局部证据。
 
@@ -186,11 +189,11 @@ serial logs --port COM4 --run UUID --direction rx
 菜单只有四个主入口：
 
 1. “修改当前串口配置”：选择端口、已有串口 Profile、UART 离散参数、已有机型 Profile 和具体机型名；
-2. “创建配置 Profile”：独立创建串口 Profile 或机型 Profile，不自动改变当前端口绑定；
+2. “创建配置”：可创建串口 Profile、机型 Profile，或维护一级机型系列与二级具体机型名，不自动改变当前端口绑定；
 3. “设置”：进入“终端界面显示设置”或“serial MCP 设置”；
 4. “帮助”：按固定列显示“按键 + 简洁说明”。
 
-在配置项上按 `→` 展开可选值，用 `↑` / `↓` 选择，Enter 应用并折叠，按 `←` 折叠或返回。具体机型名按“机型系列 → 具体机型名”两级进入。Shell/U-Boot 提示符、具体机型名列表和分段发送数值直接在当前行下输入，不打开独立弹窗。“保存并应用配置修改”位于所有串口与机型字段之后的独立操作区。
+在配置项上按 `→` 展开可选值，用 `↑` / `↓` 选择，Enter 应用并折叠，按 `←` 折叠或返回。当前串口的机型身份按“一级机型系列 → 二级具体机型名”两级选择；没有二级名称的系列不能绑定，一级列表首行“未绑定”可清除两级身份但保留机型行为 Profile。“配置机型名”页先新增一级系列，再进入该系列新增二级名称。名称、Shell/U-Boot 提示符和分段发送数值直接在当前行下输入，不打开独立弹窗。“保存并应用配置修改”位于所有串口与机型字段之后的独立操作区。
 
 菜单底部只显示一行按键指南。高亮配置项后按 `?` 查看该字段说明。设置项包括：
 

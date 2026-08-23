@@ -8,11 +8,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serial_protocol::{
-    DataBits, EchoMode, FlowControl, ModelProfile, Parity, SlotConfig, StopBits, TransportProfile,
+    DataBits, EchoMode, FlowControl, ModelFamily, ModelProfile, Parity, SlotConfig, StopBits,
+    TransportProfile,
 };
 
 use crate::{
-    api::{ApiClient, ProfileCatalog, is_conflict},
+    api::{ApiClient, ModelFamilyCatalog, ProfileCatalog, is_conflict},
     display::safe_inline,
 };
 
@@ -339,9 +340,6 @@ struct ModelCreateArgs {
     /// Unique DUT profile name.
     #[arg(long)]
     name: Option<String>,
-    /// Concrete model name in this model family. Repeat for multiple models.
-    #[arg(long = "model-name")]
-    model_names: Vec<String>,
     /// Shell prompt used to delimit completed commands.
     #[arg(long)]
     shell_prompt: Option<String>,
@@ -372,9 +370,6 @@ struct ModelCloneArgs {
     source: String,
     #[arg(long)]
     name: Option<String>,
-    /// Replace the concrete model-name list. Repeat for multiple models.
-    #[arg(long = "model-name")]
-    model_names: Vec<String>,
     #[arg(long)]
     shell_prompt: Option<String>,
     #[arg(long)]
@@ -395,12 +390,6 @@ struct ModelCloneArgs {
 struct ModelUpdateArgs {
     /// Exact profile name. Profile identity cannot be renamed in place.
     name: String,
-    /// Replace the concrete model-name list. Repeat for multiple models.
-    #[arg(long = "model-name", conflicts_with = "clear_model_names")]
-    model_names: Vec<String>,
-    /// Remove every concrete model name from this family.
-    #[arg(long)]
-    clear_model_names: bool,
     #[arg(long, conflicts_with = "clear_shell_prompt")]
     shell_prompt: Option<String>,
     /// Clear the shell prompt for this Model Profile.
@@ -459,8 +448,11 @@ struct ProfileAttachArgs {
     /// DUT behavior profile name.
     #[arg(long, conflicts_with = "generic")]
     model: Option<String>,
-    /// Concrete model name belonging to --model.
-    #[arg(long, requires = "model", conflicts_with = "generic")]
+    /// First-level model-family identity.
+    #[arg(long)]
+    model_family: Option<String>,
+    /// Concrete model name belonging to --model-family.
+    #[arg(long, requires = "model_family")]
     model_name: Option<String>,
     /// Attach no DUT-specific profile.
     #[arg(long)]
@@ -481,6 +473,9 @@ struct ProfileDetachArgs {
     /// Detach DUT-specific behavior. This is the default when no kind is set.
     #[arg(long)]
     model: bool,
+    /// Clear the first- and second-level model identity.
+    #[arg(long)]
+    identity: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -500,6 +495,9 @@ pub async fn run(api: &ApiClient, args: ProfileArgs) -> Result<()> {
 impl ProfileCommand {
     fn validate_local(&self) -> Result<()> {
         match self {
+            Self::Attach(args) if args.model_family.is_some() != args.model_name.is_some() => {
+                bail!("profile attach requires --model-family and --model-name together")
+            }
             Self::Transport {
                 command: TransportCommand::Update(args),
             } if !args.interactive && !args.has_changes() => bail!(
@@ -523,6 +521,10 @@ pub async fn load_transport_catalog(
 
 pub async fn load_model_catalog(api: &ApiClient) -> Result<ProfileCatalog<ModelProfile>> {
     api.model_profiles().await
+}
+
+pub async fn load_model_family_catalog(api: &ApiClient) -> Result<ModelFamilyCatalog> {
+    api.model_families().await
 }
 
 async fn run_transport(api: &ApiClient, command: TransportCommand) -> Result<()> {
@@ -697,7 +699,6 @@ async fn run_model(api: &ApiClient, command: ModelCommand) -> Result<()> {
             }
             let profile = ModelProfile {
                 name: required_name(args.name, "Model Profile name", !args.json)?,
-                model_names: args.model_names,
                 shell_prompt: args.shell_prompt,
                 uboot_prompt: args.uboot_prompt,
                 write_eol: args.write_eol,
@@ -713,9 +714,6 @@ async fn run_model(api: &ApiClient, command: ModelCommand) -> Result<()> {
             let catalog = load_model_catalog(api).await?;
             let mut profile = find_named(&catalog.profiles, &args.source)?.clone();
             profile.name = required_name(args.name, "New Model Profile name", !args.json)?;
-            if !args.model_names.is_empty() {
-                profile.model_names = args.model_names;
-            }
             if let Some(value) = args.shell_prompt {
                 profile.shell_prompt = Some(value);
             }
@@ -850,9 +848,7 @@ fn apply_transport_update(profile: &mut TransportProfile, args: &TransportUpdate
 
 impl ModelUpdateArgs {
     fn has_changes(&self) -> bool {
-        !self.model_names.is_empty()
-            || self.clear_model_names
-            || self.shell_prompt.is_some()
+        self.shell_prompt.is_some()
             || self.clear_shell_prompt
             || self.uboot_prompt.is_some()
             || self.clear_uboot_prompt
@@ -868,11 +864,6 @@ impl ModelUpdateArgs {
 }
 
 fn apply_model_update(profile: &mut ModelProfile, args: &ModelUpdateArgs) {
-    if !args.model_names.is_empty() {
-        profile.model_names.clone_from(&args.model_names);
-    } else if args.clear_model_names {
-        profile.model_names.clear();
-    }
     if let Some(value) = &args.shell_prompt {
         profile.shell_prompt = Some(value.clone());
     } else if args.clear_shell_prompt {
@@ -1016,8 +1007,12 @@ async fn delete_model(api: &ApiClient, args: DeleteArgs) -> Result<()> {
 }
 
 async fn attach(api: &ApiClient, args: ProfileAttachArgs) -> Result<()> {
-    if args.transport.is_none() && args.model.is_none() && !args.generic {
-        bail!("attach requires --transport, --model, or --generic");
+    if args.transport.is_none()
+        && args.model.is_none()
+        && args.model_family.is_none()
+        && !args.generic
+    {
+        bail!("attach requires --transport, --model, --model-family, or --generic");
     }
     let status = api.configuration_status().await?;
     let mut ports = status
@@ -1033,15 +1028,20 @@ async fn attach(api: &ApiClient, args: ProfileAttachArgs) -> Result<()> {
         slot.transport_profile = Some(selected.name.clone());
     }
     if args.generic {
-        detach_model_binding(slot);
+        slot.model_profile = None;
     } else if let Some(name) = args.model {
         if name.eq_ignore_ascii_case("generic") {
-            detach_model_binding(slot);
+            slot.model_profile = None;
         } else {
             let catalog = load_model_catalog(api).await?;
             let selected = find_named(&catalog.profiles, &name)?;
-            apply_model_attachment(slot, selected, args.model_name)?;
+            slot.model_profile = Some(selected.name.clone());
         }
+    }
+    if let Some(name) = args.model_family {
+        let catalog = load_model_family_catalog(api).await?;
+        let selected = find_named(&catalog.families, &name)?;
+        apply_model_identity(slot, selected, args.model_name)?;
     }
 
     let response = api
@@ -1064,13 +1064,7 @@ async fn detach(api: &ApiClient, args: ProfileDetachArgs) -> Result<()> {
         .map(|slot| slot.config)
         .collect::<Vec<_>>();
     let slot = find_port_mut(&mut ports, &args.port)?;
-    let detach_model = args.model || !args.transport;
-    if detach_model {
-        detach_model_binding(slot);
-    }
-    if args.transport {
-        slot.transport_profile = None;
-    }
+    apply_detach(slot, args.transport, args.model, args.identity);
     let response = api
         .configure_ports(ports, status.config_revision)
         .await
@@ -1083,37 +1077,56 @@ async fn detach(api: &ApiClient, args: ProfileDetachArgs) -> Result<()> {
     )
 }
 
-fn apply_model_attachment(
+fn apply_detach(slot: &mut SlotConfig, transport: bool, model: bool, identity: bool) {
+    let model = model || (!transport && !identity);
+    if model {
+        slot.model_profile = None;
+    }
+    if identity {
+        detach_model_identity(slot);
+    }
+    if transport {
+        slot.transport_profile = None;
+    }
+}
+
+fn apply_model_identity(
     slot: &mut SlotConfig,
-    selected: &ModelProfile,
+    selected: &ModelFamily,
     requested_model_name: Option<String>,
 ) -> Result<()> {
-    let same_profile = slot.model_profile.as_deref() == Some(selected.name.as_str());
-    slot.model_name = if let Some(model_name) = requested_model_name {
-        if !selected.model_names.contains(&model_name) {
-            bail!(
-                "model name {:?} does not belong to Model Profile {:?}",
-                safe_inline(&model_name),
-                safe_inline(&selected.name)
-            );
-        }
-        Some(model_name)
-    } else if same_profile
+    let same_family = slot.model_family.as_deref() == Some(selected.name.as_str());
+    let model_name = if let Some(model_name) = requested_model_name {
+        model_name
+    } else if same_family
         && slot
             .model_name
             .as_ref()
             .is_some_and(|model_name| selected.model_names.contains(model_name))
     {
-        slot.model_name.clone()
+        slot.model_name
+            .clone()
+            .expect("checked concrete model name")
     } else {
-        None
+        bail!(
+            "model family {:?} requires a concrete --model-name",
+            safe_inline(&selected.name)
+        )
     };
-    slot.model_profile = Some(selected.name.clone());
+    if !selected.model_names.contains(&model_name) {
+        bail!(
+            "model name {:?} does not belong to model family {:?}",
+            safe_inline(&model_name),
+            safe_inline(&selected.name)
+        );
+    }
+    slot.model_family = Some(selected.name.clone());
+    slot.model_name = Some(model_name);
     Ok(())
 }
 
-fn detach_model_binding(slot: &mut SlotConfig) {
-    slot.model_profile = None;
+fn detach_model_identity(slot: &mut SlotConfig) {
+    slot.model_family = None;
     slot.model_name = None;
 }
 
@@ -1142,7 +1155,7 @@ fn print_slot_result(
         );
     } else {
         println!(
-            "Port {}: transport={}, model={}",
+            "Port {}: transport={}, model_profile={}, model_family={}, model_name={}",
             safe_inline(&slot.config.port),
             safe_inline(
                 slot.config
@@ -1150,7 +1163,9 @@ fn print_slot_result(
                     .as_deref()
                     .unwrap_or("115200 8N1")
             ),
-            safe_inline(slot.config.model_profile.as_deref().unwrap_or("Generic"))
+            safe_inline(slot.config.model_profile.as_deref().unwrap_or("Generic")),
+            safe_inline(slot.config.model_family.as_deref().unwrap_or("Unspecified")),
+            safe_inline(slot.config.model_name.as_deref().unwrap_or("Unspecified")),
         );
     }
     Ok(())
@@ -1208,17 +1223,6 @@ fn validate_transport(profile: &TransportProfile) -> Result<()> {
 
 fn validate_model(profile: &ModelProfile) -> Result<()> {
     validate_name(&profile.name)?;
-    for (index, name) in profile.model_names.iter().enumerate() {
-        if name.trim().is_empty() || name.trim() != name {
-            bail!(
-                "model name {} must be non-empty without surrounding whitespace",
-                index + 1
-            );
-        }
-        if profile.model_names[..index].contains(name) {
-            bail!("duplicate model name {:?}", safe_inline(name));
-        }
-    }
     if profile
         .write_chunk_size
         .is_some_and(|chunk_size| chunk_size == 0)
@@ -1279,7 +1283,6 @@ fn populate_model_interactively(args: &mut ModelCreateArgs) -> Result<()> {
         Some(name) => prompt_with_default("Model Profile name", &name)?,
         None => prompt("Model Profile name")?,
     });
-    args.model_names = prompt_model_names(&args.model_names)?;
     args.shell_prompt = prompt_optional_prompt("Shell prompt", args.shell_prompt.take())?;
     args.uboot_prompt = prompt_optional_prompt("U-Boot prompt", args.uboot_prompt.take())?;
 
@@ -1322,7 +1325,6 @@ fn populate_model_interactively(args: &mut ModelCreateArgs) -> Result<()> {
 
 fn populate_model_profile_interactively(profile: &mut ModelProfile) -> Result<()> {
     ensure_tty()?;
-    profile.model_names = prompt_model_names(&profile.model_names)?;
     profile.shell_prompt = prompt_optional_prompt("Shell prompt", profile.shell_prompt.take())?;
     profile.uboot_prompt = prompt_optional_prompt("U-Boot prompt", profile.uboot_prompt.take())?;
 
@@ -1366,19 +1368,6 @@ fn populate_model_profile_interactively(profile: &mut ModelProfile) -> Result<()
         false,
     )?;
     Ok(())
-}
-
-fn prompt_model_names(current: &[String]) -> Result<Vec<String>> {
-    let entered = prompt_with_default(
-        "Concrete model names (comma separated, empty for none)",
-        &current.join(", "),
-    )?;
-    Ok(entered
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
 }
 
 fn data_bits_arg(value: &DataBits) -> DataBitsArg {
@@ -1576,6 +1565,12 @@ impl Named for ModelProfile {
     }
 }
 
+impl Named for ModelFamily {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Deserialize)]
 struct CatalogFile<T> {
     profiles: Vec<T>,
@@ -1735,7 +1730,6 @@ mod tests {
     fn model_profile_files_use_the_protocol_pacing_schema() {
         let profile = ModelProfile {
             name: "slow-dut".into(),
-            model_names: Vec::new(),
             shell_prompt: Some("# ".into()),
             uboot_prompt: None,
             write_eol: Some("\r".into()),
@@ -1746,6 +1740,10 @@ mod tests {
         let encoded = serde_json::to_value(&profile).unwrap();
         assert_eq!(encoded["write_chunk_size"], 8);
         assert_eq!(encoded["write_chunk_delay_ms"], 1);
+        assert!(
+            encoded.get("model_names").is_none(),
+            "model identity catalog must stay independent from behavior Profiles"
+        );
         assert_eq!(
             serde_json::from_value::<ModelProfile>(encoded).unwrap(),
             profile
@@ -1794,8 +1792,6 @@ mod tests {
             "cr",
             "--write-chunk-size",
             "8",
-            "--model-name",
-            "TL-AS7230-W 1.0",
         ])
         .unwrap();
         let ProfileCommand::Model {
@@ -1808,7 +1804,6 @@ mod tests {
         assert!(args.clear_shell_prompt);
         assert_eq!(args.write_eol.as_deref(), Some("\r"));
         assert_eq!(args.write_chunk_size, Some(8));
-        assert_eq!(args.model_names, vec!["TL-AS7230-W 1.0"]);
         assert!(args.has_changes());
 
         assert!(
@@ -1826,46 +1821,42 @@ mod tests {
     }
 
     #[test]
-    fn model_attachment_validates_names_and_detach_clears_both_bindings() {
-        let first = ModelProfile {
+    fn model_identity_validates_names_and_is_independent_from_behavior_profile() {
+        let first = ModelFamily {
             name: "AS7230".into(),
             model_names: vec!["AS7230-W 1.0".into()],
-            shell_prompt: None,
-            uboot_prompt: None,
-            write_eol: None,
-            echo: None,
-            write_chunk_size: None,
-            write_chunk_delay_ms: None,
         };
-        let second = ModelProfile {
+        let second = ModelFamily {
             name: "AS7250".into(),
             model_names: vec!["AS7250-F4GE 1.0".into()],
-            ..first.clone()
         };
         let mut slot = SlotConfig {
             port: "COM3".into(),
             transport_profile: Some("generic-115200".into()),
-            model_profile: Some(first.name.clone()),
+            model_profile: Some("linux-shell".into()),
+            model_family: Some(first.name.clone()),
             model_name: Some("AS7230-W 1.0".into()),
             enabled: true,
         };
 
-        apply_model_attachment(&mut slot, &first, None).unwrap();
+        apply_model_identity(&mut slot, &first, None).unwrap();
         assert_eq!(slot.model_name.as_deref(), Some("AS7230-W 1.0"));
-        apply_model_attachment(&mut slot, &second, None).unwrap();
-        assert_eq!(slot.model_profile.as_deref(), Some("AS7250"));
-        assert!(slot.model_name.is_none());
-        apply_model_attachment(&mut slot, &second, Some("AS7250-F4GE 1.0".into())).unwrap();
+        assert!(apply_model_identity(&mut slot, &second, None).is_err());
+        assert_eq!(slot.model_family.as_deref(), Some("AS7230"));
+        assert_eq!(slot.model_profile.as_deref(), Some("linux-shell"));
+        assert_eq!(slot.model_name.as_deref(), Some("AS7230-W 1.0"));
+        apply_model_identity(&mut slot, &second, Some("AS7250-F4GE 1.0".into())).unwrap();
         assert_eq!(slot.model_name.as_deref(), Some("AS7250-F4GE 1.0"));
-        assert!(apply_model_attachment(&mut slot, &second, Some("unknown".into())).is_err());
+        assert!(apply_model_identity(&mut slot, &second, Some("unknown".into())).is_err());
 
-        detach_model_binding(&mut slot);
-        assert!(slot.model_profile.is_none());
+        detach_model_identity(&mut slot);
+        assert_eq!(slot.model_profile.as_deref(), Some("linux-shell"));
+        assert!(slot.model_family.is_none());
         assert!(slot.model_name.is_none());
     }
 
     #[test]
-    fn attach_model_name_requires_a_model_profile_flag() {
+    fn attach_model_name_requires_a_model_family_flag() {
         assert!(
             ProfileParser::try_parse_from([
                 "profile",
@@ -1882,7 +1873,7 @@ mod tests {
             "attach",
             "--port",
             "COM3",
-            "--model",
+            "--model-family",
             "AS7230",
             "--model-name",
             "AS7230-W 1.0",
@@ -1891,8 +1882,43 @@ mod tests {
         let ProfileCommand::Attach(args) = parsed.command else {
             panic!("expected profile attach")
         };
-        assert_eq!(args.model.as_deref(), Some("AS7230"));
+        assert_eq!(args.model_family.as_deref(), Some("AS7230"));
         assert_eq!(args.model_name.as_deref(), Some("AS7230-W 1.0"));
+
+        let family_only = ProfileParser::try_parse_from([
+            "profile",
+            "attach",
+            "--port",
+            "COM3",
+            "--model-family",
+            "AS7230",
+        ])
+        .unwrap();
+        assert!(family_only.command.validate_local().is_err());
+    }
+
+    #[test]
+    fn bare_detach_removes_only_behavior_and_preserves_model_identity() {
+        let mut slot = SlotConfig {
+            port: "COM3".into(),
+            transport_profile: Some("generic-115200".into()),
+            model_profile: Some("linux-shell".into()),
+            model_family: Some("AS7230".into()),
+            model_name: Some("AS7230-W 1.0".into()),
+            enabled: true,
+        };
+
+        apply_detach(&mut slot, false, false, false);
+        assert!(slot.model_profile.is_none());
+        assert_eq!(slot.model_family.as_deref(), Some("AS7230"));
+        assert_eq!(slot.model_name.as_deref(), Some("AS7230-W 1.0"));
+        assert_eq!(slot.transport_profile.as_deref(), Some("generic-115200"));
+
+        slot.model_profile = Some("linux-shell".into());
+        apply_detach(&mut slot, false, false, true);
+        assert_eq!(slot.model_profile.as_deref(), Some("linux-shell"));
+        assert!(slot.model_family.is_none());
+        assert!(slot.model_name.is_none());
     }
 
     #[test]
@@ -1921,8 +1947,6 @@ mod tests {
 
         let model = ModelUpdateArgs {
             name: "dut".into(),
-            model_names: Vec::new(),
-            clear_model_names: false,
             shell_prompt: None,
             clear_shell_prompt: false,
             uboot_prompt: None,
@@ -1973,7 +1997,6 @@ mod tests {
 
         let mut model = ModelProfile {
             name: "dut".into(),
-            model_names: Vec::new(),
             shell_prompt: Some("# ".into()),
             uboot_prompt: Some("=> ".into()),
             write_eol: Some("\r".into()),
@@ -1983,8 +2006,6 @@ mod tests {
         };
         let model_update = ModelUpdateArgs {
             name: model.name.clone(),
-            model_names: Vec::new(),
-            clear_model_names: false,
             shell_prompt: None,
             clear_shell_prompt: true,
             uboot_prompt: None,

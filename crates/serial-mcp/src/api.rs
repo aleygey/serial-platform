@@ -2,10 +2,9 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
 use serial_protocol::{
-    ArchiveListResponse, ConfigureModelProfilesRequest, ConfigureModelProfilesResponse,
-    ConfigurePortsRequest, ConfigurePortsResponse, CreateMonitorRequest, Cursor, EventQuery,
-    EventQueryResponse, HealthResponse, ModelProfileListResponse, MonitorIncidentListResponse,
-    MonitorListResponse, MonitorResponse, StatusResponse,
+    ArchiveListResponse, ConfigurePortsRequest, ConfigurePortsResponse, CreateMonitorRequest,
+    Cursor, EventQuery, EventQueryResponse, HealthResponse, ModelFamilyListResponse,
+    MonitorIncidentListResponse, MonitorListResponse, MonitorResponse, StatusResponse,
 };
 
 const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
@@ -122,24 +121,8 @@ impl ApiClient {
         self.get_json("/api/v1/status").await
     }
 
-    pub async fn model_profiles(&self) -> Result<ModelProfileListResponse> {
-        self.get_json("/api/v1/config/model-profiles").await
-    }
-
-    pub async fn configure_model_profiles(
-        &self,
-        request: &ConfigureModelProfilesRequest,
-    ) -> Result<ConfigureModelProfilesResponse> {
-        let response = self
-            .request(
-                self.client
-                    .put(self.url("/api/v1/config/model-profiles"))
-                    .json(request),
-            )
-            .send()
-            .await
-            .context("seriald model profile update failed")?;
-        decode_response(response).await
+    pub async fn model_families(&self) -> Result<ModelFamilyListResponse> {
+        self.get_json("/api/v1/config/model-families").await
     }
 
     pub async fn configure_ports(

@@ -13,6 +13,7 @@ export function createOfflineSnapshot(
     availablePorts: [],
     transportProfiles: [],
     modelProfiles: [],
+    modelFamilies: [],
     events: {},
     preferences,
     service

@@ -29,6 +29,7 @@ export function installQaBridge(): boolean {
     },
     saveSerialConfiguration: async () => undefined,
     saveModelProfiles: async () => undefined,
+    saveModelFamilies: async () => undefined,
     savePreferences: async (next) => {
       snapshot = { ...snapshot, preferences: next }
       publish()

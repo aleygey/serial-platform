@@ -217,7 +217,7 @@ impl SlotRegistry {
         model_profiles: Vec<ModelProfile>,
         control_limits: ControlLimits,
     ) -> Self {
-        validate_ports(&configs, &transport_profiles, &model_profiles)
+        validate_runtime_ports(&configs, &transport_profiles, &model_profiles)
             .expect("port registry requires validated port configuration");
         let active = configs
             .into_iter()
@@ -309,7 +309,7 @@ impl SlotRegistry {
         model_profiles: Vec<ModelProfile>,
         source: String,
     ) -> Result<AppliedSlotReplacement, RegistryError> {
-        validate_ports(&configs, &transport_profiles, &model_profiles)?;
+        validate_runtime_ports(&configs, &transport_profiles, &model_profiles)?;
         let gate = self.inner.mutation.clone().lock_owned().await;
         match gate.lifecycle {
             RegistryLifecycle::Running => {}
@@ -595,4 +595,20 @@ fn find_transport_profile(
         .iter()
         .find(|profile| profile.name == name)
         .cloned()
+}
+
+/// The runtime registry only resolves physical and interaction profiles.
+/// Model-family membership is validated transactionally by `DaemonConfig`
+/// before a configuration reaches the registry.
+fn validate_runtime_ports(
+    configs: &[SlotConfig],
+    transport_profiles: &[TransportProfile],
+    model_profiles: &[ModelProfile],
+) -> Result<(), ConfigValidationError> {
+    let mut runtime_configs = configs.to_vec();
+    for config in &mut runtime_configs {
+        config.model_family = None;
+        config.model_name = None;
+    }
+    validate_ports(&runtime_configs, transport_profiles, model_profiles, &[])
 }
