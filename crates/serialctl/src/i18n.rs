@@ -1132,14 +1132,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.history.select", "Up / Down", "上 / 下"),
     (
         "help.desc.history.select",
-        "Select an Agent action or child command",
-        "选择 Agent 动作或子命令",
+        "Select a Run, action description, or command",
+        "选择 Run、动作说明或具体命令",
     ),
     ("help.key.history.expand", "Right / Left", "右 / 左"),
     (
         "help.desc.history.expand",
-        "Expand or return one history level",
-        "展开或返回上一层记录",
+        "Enter or return one level of the three-level tree",
+        "进入或返回三层树的一个层级",
     ),
     ("help.key.history.panel", "Ctrl-] h", "Ctrl-] h"),
     (

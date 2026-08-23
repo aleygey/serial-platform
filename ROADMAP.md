@@ -41,7 +41,7 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 - 持久日志的文本/正则、周期、Run、operation、方向、类型和游标查询。
 - RX-only 主终端；关闭再打开后从当前周期 journal 恢复并接回实时流。
 - 顶部使用串口名，输出标题使用原样机型名。
-- 任务与命令记录从旧到新；新 Agent command/sequence action 强制回到底部，同一 action 的后续 step 不重复重置；方向键进入/返回层级。
+- 任务与命令记录从旧到新，使用 Run → action description → 具体命令的三层树；sequence 在第三层按顺序展开所有 step；方向键在各层选择、进入和返回。
 - 普通 `command` 定位完整 RX 捕获；`command_sequence` 展开后逐 step 选择、跳转并高亮。
 - Monitor action 展开 matcher 和 incident，按 `serial_range` 跳转串口证据；旧后端周期或本地窗口已淘汰时从 journal 回取完整连续范围后再高亮。
 - 滚轮/PgUp/PgDn 浏览 Agent 历史，前缀组合滚动串口输出。

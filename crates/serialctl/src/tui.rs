@@ -481,7 +481,6 @@ struct RunCommandRecord {
     sequence_id: Option<Uuid>,
     first_seq: u64,
     last_seq: u64,
-    first_wall_time_ns: i64,
     description: Option<String>,
     steps: Vec<RunCommandStep>,
 }
@@ -578,7 +577,6 @@ impl RunCommandRecord {
             sequence_id: Self::sequence_id(event),
             first_seq: event.seq,
             last_seq: event.seq,
-            first_wall_time_ns: event.wall_time_ns,
             description: Self::description(event),
             steps: vec![RunCommandStep::from_event(event)],
         }
@@ -600,7 +598,6 @@ impl RunCommandRecord {
     fn append_event(&mut self, event: &TimelineEvent) {
         self.first_seq = self.first_seq.min(event.seq);
         self.last_seq = self.last_seq.max(event.seq);
-        self.first_wall_time_ns = self.first_wall_time_ns.min(event.wall_time_ns);
         if self.description.is_none() {
             self.description = Self::description(event);
         }
@@ -642,7 +639,7 @@ struct MonitorHistoryEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryActionKey {
-    Command(RunCommandKey),
+    Run(Uuid),
     Monitor(Uuid),
 }
 
@@ -735,12 +732,15 @@ struct SlotView {
     /// durable journal has been read from sequence one. Initial attach uses a
     /// tail, and any gap or local eviction keeps this conservative marker set.
     run_history_limited: bool,
-    /// `None` follows the newest described Agent command at the bottom. Every new
-    /// command action returns here; chunks and later steps of the same action do not.
+    /// Top-level Run selection. `None` follows the newest Run/Monitor root.
+    selected_run: Option<Uuid>,
+    /// The only Run whose command descriptions are visible.
+    expanded_run: Option<Uuid>,
+    /// Second-level command action selected inside `expanded_run`.
     selected_run_command: Option<RunCommandKey>,
+    /// The only command action whose concrete command bytes are visible.
     expanded_run_command: Option<RunCommandKey>,
-    /// Child command selected inside an expanded `command_sequence` action.
-    /// `None` keeps navigation at the action level.
+    /// Third-level concrete command selected inside `expanded_run_command`.
     selected_run_step: Option<usize>,
     selected_monitor: Option<Uuid>,
     expanded_monitor: Option<Uuid>,
@@ -901,6 +901,8 @@ impl SlotView {
             run_history: VecDeque::new(),
             monitor_history: VecDeque::new(),
             run_history_limited: true,
+            selected_run: None,
+            expanded_run: None,
             selected_run_command: None,
             expanded_run_command: None,
             selected_run_step: None,
@@ -925,6 +927,8 @@ impl SlotView {
     fn clear_run_history(&mut self) {
         self.run_history.clear();
         self.run_history_limited = true;
+        self.selected_run = None;
+        self.expanded_run = None;
         self.selected_run_command = None;
         self.expanded_run_command = None;
         self.selected_run_step = None;
@@ -936,6 +940,12 @@ impl SlotView {
     }
 
     fn forget_run_selection(&mut self, removed: Uuid) {
+        if self.selected_run == Some(removed) {
+            self.selected_run = None;
+        }
+        if self.expanded_run == Some(removed) {
+            self.expanded_run = None;
+        }
         if self
             .selected_run_command
             .is_some_and(|selected| selected.run_id == removed)
@@ -1071,6 +1081,8 @@ impl SlotView {
                     self.run_history_limited = true;
                 }
                 if new_action {
+                    self.selected_run = Some(run_id);
+                    self.expanded_run = None;
                     self.selected_run_command = None;
                     self.expanded_run_command = None;
                     self.selected_run_step = None;
@@ -1097,50 +1109,40 @@ impl SlotView {
             .collect()
     }
 
+    fn run_command_keys_for(&self, run_id: Uuid) -> Vec<RunCommandKey> {
+        self.run_history
+            .iter()
+            .find(|run| run.id == run_id)
+            .map(|run| {
+                run.commands
+                    .iter()
+                    .map(|command| RunCommandKey {
+                        run_id,
+                        first_seq: command.first_seq,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn run_history_chronological(&self) -> Vec<&RunHistoryEntry> {
         let mut runs = self.run_history.iter().collect::<Vec<_>>();
         runs.sort_by_key(|run| run.start_seq);
         runs
     }
 
-    fn selected_run_command_index(&self) -> Option<usize> {
-        let keys = self.run_command_keys();
-        (!keys.is_empty()).then(|| {
-            self.selected_run_command
-                .and_then(|selected| keys.iter().position(|key| *key == selected))
-                .unwrap_or(keys.len() - 1)
-        })
-    }
-
     fn selected_run_command_key(&self) -> Option<RunCommandKey> {
-        if self.selected_monitor.is_some() {
-            return None;
-        }
-        let index = self.selected_run_command_index()?;
-        self.run_command_keys().get(index).copied()
+        let selected = self.selected_run_command?;
+        self.run_command(selected).map(|_| selected)
     }
 
     fn history_action_keys(&self) -> Vec<HistoryActionKey> {
         let mut actions = self
             .run_history_chronological()
             .into_iter()
-            .flat_map(|run| {
-                run.commands.iter().map(move |command| {
-                    let key = RunCommandKey {
-                        run_id: run.id,
-                        first_seq: command.first_seq,
-                    };
-                    (
-                        command.first_wall_time_ns,
-                        command.first_seq,
-                        run.id,
-                        HistoryActionKey::Command(key),
-                    )
-                })
-            })
+            .map(|run| (run.start_seq, run.id, HistoryActionKey::Run(run.id)))
             .chain(self.monitor_history.iter().map(|entry| {
                 (
-                    entry.monitor.created_wall_time_ns,
                     entry
                         .monitor
                         .spec
@@ -1152,18 +1154,17 @@ impl SlotView {
                 )
             }))
             .collect::<Vec<_>>();
-        actions.sort_by_key(|(wall_time, sequence, id, key)| {
+        actions.sort_by_key(|(sequence, id, key)| {
             (
-                *wall_time,
                 *sequence,
                 match key {
-                    HistoryActionKey::Command(_) => 0u8,
+                    HistoryActionKey::Run(_) => 0u8,
                     HistoryActionKey::Monitor(_) => 1u8,
                 },
                 *id,
             )
         });
-        actions.into_iter().map(|(_, _, _, key)| key).collect()
+        actions.into_iter().map(|(_, _, key)| key).collect()
     }
 
     fn selected_history_action_index(&self) -> Option<usize> {
@@ -1172,7 +1173,7 @@ impl SlotView {
             let selected = self
                 .selected_monitor
                 .map(HistoryActionKey::Monitor)
-                .or_else(|| self.selected_run_command.map(HistoryActionKey::Command));
+                .or_else(|| self.selected_run.map(HistoryActionKey::Run));
             selected
                 .and_then(|selected| keys.iter().position(|key| *key == selected))
                 .unwrap_or(keys.len() - 1)
@@ -1185,21 +1186,32 @@ impl SlotView {
         keys.get(index).copied()
     }
 
+    fn selected_run_id(&self) -> Option<Uuid> {
+        match self.selected_history_action_key()? {
+            HistoryActionKey::Run(id) => Some(id),
+            HistoryActionKey::Monitor(_) => None,
+        }
+    }
+
     fn select_history_action_index(&mut self, index: usize) {
         match self.history_action_keys().get(index).copied() {
-            Some(HistoryActionKey::Command(key)) => {
-                self.selected_run_command = Some(key);
+            Some(HistoryActionKey::Run(id)) => {
+                self.selected_run = Some(id);
                 self.selected_monitor = None;
             }
             Some(HistoryActionKey::Monitor(id)) => {
+                self.selected_run = None;
                 self.selected_run_command = None;
                 self.selected_monitor = Some(id);
             }
             None => {
+                self.selected_run = None;
                 self.selected_run_command = None;
                 self.selected_monitor = None;
             }
         }
+        self.expanded_run = None;
+        self.selected_run_command = None;
         self.expanded_run_command = None;
         self.selected_run_step = None;
         self.expanded_monitor = None;
@@ -4563,6 +4575,7 @@ impl App {
                 KeyCode::Right | KeyCode::Enter => jump_to_selection = true,
                 KeyCode::Left | KeyCode::Esc => {
                     self.current_mut().selected_run_step = None;
+                    self.current_mut().expanded_run_command = None;
                     self.current_mut().run_detail_scroll = 0;
                 }
                 KeyCode::PageUp => {
@@ -4589,49 +4602,117 @@ impl App {
             }
             return;
         }
+        if let Some(selected_key) = self.current().selected_run_command_key() {
+            let command_keys = self.current().run_command_keys_for(selected_key.run_id);
+            let selected_command = command_keys
+                .iter()
+                .position(|candidate| *candidate == selected_key)
+                .unwrap_or_else(|| command_keys.len().saturating_sub(1));
+            match key.code {
+                KeyCode::Up if !command_keys.is_empty() => {
+                    let selected = command_keys[selected_command.saturating_sub(1)];
+                    let view = self.current_mut();
+                    view.selected_run_command = Some(selected);
+                    view.expanded_run_command = None;
+                    view.selected_run_step = None;
+                    view.run_detail_scroll = 0;
+                    jump_to_selection = true;
+                }
+                KeyCode::Down if !command_keys.is_empty() => {
+                    let selected = command_keys[(selected_command + 1).min(command_keys.len() - 1)];
+                    let view = self.current_mut();
+                    view.selected_run_command = Some(selected);
+                    view.expanded_run_command = None;
+                    view.selected_run_step = None;
+                    view.run_detail_scroll = 0;
+                    jump_to_selection = true;
+                }
+                KeyCode::Home if !command_keys.is_empty() => {
+                    let view = self.current_mut();
+                    view.selected_run_command = command_keys.first().copied();
+                    view.expanded_run_command = None;
+                    view.selected_run_step = None;
+                    view.run_detail_scroll = 0;
+                    jump_to_selection = true;
+                }
+                KeyCode::End if !command_keys.is_empty() => {
+                    let view = self.current_mut();
+                    view.selected_run_command = command_keys.last().copied();
+                    view.expanded_run_command = None;
+                    view.selected_run_step = None;
+                    view.run_detail_scroll = 0;
+                    jump_to_selection = true;
+                }
+                KeyCode::Right | KeyCode::Enter => {
+                    let step_count = self
+                        .current()
+                        .run_command(selected_key)
+                        .map_or(0, |record| record.steps.len());
+                    let view = self.current_mut();
+                    view.expanded_run_command = Some(selected_key);
+                    view.selected_run_step = (step_count > 0).then_some(0);
+                    view.run_detail_scroll = 0;
+                    jump_to_selection = true;
+                }
+                KeyCode::Left | KeyCode::Esc => {
+                    let view = self.current_mut();
+                    view.expanded_run = None;
+                    view.selected_run_command = None;
+                    view.expanded_run_command = None;
+                    view.selected_run_step = None;
+                    view.run_detail_scroll = 0;
+                }
+                KeyCode::PageUp => {
+                    let maximum = self.max_run_detail_scroll();
+                    self.current_mut().run_detail_scroll = self
+                        .current()
+                        .run_detail_scroll
+                        .min(maximum)
+                        .saturating_sub(5);
+                }
+                KeyCode::PageDown => {
+                    let maximum = self.max_run_detail_scroll();
+                    self.current_mut().run_detail_scroll = self
+                        .current()
+                        .run_detail_scroll
+                        .min(maximum)
+                        .saturating_add(5)
+                        .min(maximum);
+                }
+                _ => {}
+            }
+            if jump_to_selection && let Some(selected) = self.current().selected_run_command_key() {
+                self.jump_output_to_run_command(selected, self.current().selected_run_step);
+            }
+            return;
+        }
         match key.code {
             KeyCode::Up if count > 0 => {
                 self.current_mut()
                     .select_history_action_index(selected.saturating_sub(1));
-                jump_to_selection = matches!(
-                    self.current().selected_history_action_key(),
-                    Some(HistoryActionKey::Command(_))
-                );
             }
             KeyCode::Down if count > 0 => {
                 self.current_mut()
                     .select_history_action_index((selected + 1).min(count - 1));
-                jump_to_selection = matches!(
-                    self.current().selected_history_action_key(),
-                    Some(HistoryActionKey::Command(_))
-                );
             }
             KeyCode::Home if count > 0 => {
                 self.current_mut().select_history_action_index(0);
-                jump_to_selection = matches!(
-                    self.current().selected_history_action_key(),
-                    Some(HistoryActionKey::Command(_))
-                );
             }
             KeyCode::End if count > 0 => {
                 self.current_mut().select_history_action_index(count - 1);
-                jump_to_selection = matches!(
-                    self.current().selected_history_action_key(),
-                    Some(HistoryActionKey::Command(_))
-                );
             }
             KeyCode::Right if count > 0 => {
                 match self.current().selected_history_action_key() {
-                    Some(HistoryActionKey::Command(selected_key)) => {
-                        let step_count = self
-                            .current()
-                            .run_command(selected_key)
-                            .map_or(0, |record| record.steps.len());
+                    Some(HistoryActionKey::Run(run_id)) => {
+                        let first_command =
+                            self.current().run_command_keys_for(run_id).first().copied();
                         let view = self.current_mut();
-                        view.selected_run_command = Some(selected_key);
-                        view.expanded_run_command = Some(selected_key);
-                        view.selected_run_step = (step_count > 1).then_some(0);
-                        jump_to_selection = true;
+                        view.selected_run = Some(run_id);
+                        view.expanded_run = Some(run_id);
+                        view.selected_run_command = first_command;
+                        view.expanded_run_command = None;
+                        view.selected_run_step = None;
+                        jump_to_selection = first_command.is_some();
                     }
                     Some(HistoryActionKey::Monitor(id)) => {
                         let matcher_count = self
@@ -4648,6 +4729,8 @@ impl App {
                 self.current_mut().run_detail_scroll = 0;
             }
             KeyCode::Left if count > 0 => {
+                self.current_mut().expanded_run = None;
+                self.current_mut().selected_run_command = None;
                 self.current_mut().expanded_run_command = None;
                 self.current_mut().selected_run_step = None;
                 self.current_mut().expanded_monitor = None;
@@ -4656,7 +4739,7 @@ impl App {
                 self.current_mut().run_detail_scroll = 0;
             }
             KeyCode::PageUp => {
-                if self.current().expanded_run_command.is_some() {
+                if self.current().expanded_run.is_some() {
                     let maximum = self.max_run_detail_scroll();
                     let scroll = self
                         .current()
@@ -4668,14 +4751,10 @@ impl App {
                     let page = usize::from(self.agent_history_rows.saturating_sub(1)).max(1);
                     self.current_mut()
                         .select_history_action_index(selected.saturating_sub(page));
-                    jump_to_selection = matches!(
-                        self.current().selected_history_action_key(),
-                        Some(HistoryActionKey::Command(_))
-                    );
                 }
             }
             KeyCode::PageDown => {
-                if self.current().expanded_run_command.is_some() {
+                if self.current().expanded_run.is_some() {
                     let maximum = self.max_run_detail_scroll();
                     let scroll = self
                         .current()
@@ -4688,10 +4767,6 @@ impl App {
                     let page = usize::from(self.agent_history_rows.saturating_sub(1)).max(1);
                     self.current_mut()
                         .select_history_action_index(selected.saturating_add(page).min(count - 1));
-                    jump_to_selection = matches!(
-                        self.current().selected_history_action_key(),
-                        Some(HistoryActionKey::Command(_))
-                    );
                 }
             }
             KeyCode::Esc => {
@@ -4708,8 +4783,10 @@ impl App {
 
     fn max_run_detail_scroll(&self) -> usize {
         let view = self.current();
-        let selected = view.selected_run_command_key();
-        if selected.is_none() || view.expanded_run_command != selected {
+        let Some(selected) = view.selected_run_command_key() else {
+            return 0;
+        };
+        if view.expanded_run != Some(selected.run_id) {
             return 0;
         }
         let Some(inner) = self.layout.and_then(|layout| layout.run_history_inner) else {
@@ -4723,7 +4800,7 @@ impl App {
         let selected_row = rows
             .iter()
             .position(|row| {
-                row.command == selected
+                row.command == Some(selected)
                     && match view.selected_run_step {
                         Some(step) => row.step == Some(step),
                         None => row.step.is_none(),
@@ -10809,6 +10886,7 @@ fn draw_queue(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 struct RunPanelRow {
     line: Line<'static>,
+    run: Option<Uuid>,
     command: Option<RunCommandKey>,
     step: Option<usize>,
     monitor: Option<Uuid>,
@@ -10842,29 +10920,67 @@ fn monitor_matcher_text(matcher: &MonitorMatcher) -> String {
     }
 }
 
-fn push_run_history_header(run: &RunHistoryEntry, width: u16, rows: &mut Vec<RunPanelRow>) {
+fn push_run_history_rows(
+    app: &App,
+    run: &RunHistoryEntry,
+    width: u16,
+    rows: &mut Vec<RunPanelRow>,
+) {
+    let view = app.current();
+    let is_selected = view.selected_run_id() == Some(run.id)
+        && view.selected_run_command.is_none()
+        && view.selected_monitor.is_none();
+    let expanded = view.expanded_run == Some(run.id);
     let label = if run.label.trim().is_empty() {
         tr("ui.run.unknown").to_string()
     } else {
         safe_inline(&run.label)
     };
     let title = trf("ui.run.header", &[run_status_text(run.status), &label]);
-    let style = Style::default()
+    let mut style = Style::default()
         .fg(match run.status {
             RunStatus::Active => Color::LightBlue,
             RunStatus::Completed => Color::LightGreen,
             RunStatus::Aborted => Color::LightRed,
         })
         .add_modifier(Modifier::BOLD);
-    for text in wrap_queue_text(&title, width.max(1)) {
+    if is_selected && app.focus == PaneFocus::RunHistory {
+        style = style.bg(Color::Rgb(36, 48, 58));
+    }
+    let prefix = format!(
+        "{} {} ",
+        if is_selected { "▶" } else { " " },
+        if expanded { "▾" } else { "▸" }
+    );
+    let available = width
+        .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) as u16)
+        .max(1);
+    for (line_index, text) in wrap_queue_text(&title, available).into_iter().enumerate() {
         rows.push(RunPanelRow {
-            line: Line::from(Span::styled(text, style)),
+            line: Line::from(Span::styled(
+                if line_index == 0 {
+                    format!("{prefix}{text}")
+                } else {
+                    format!(
+                        "{}{text}",
+                        " ".repeat(UnicodeWidthStr::width(prefix.as_str()))
+                    )
+                },
+                style,
+            )),
+            run: Some(run.id),
             command: None,
             step: None,
             monitor: None,
             matcher: None,
             incident: None,
         });
+    }
+    if !expanded {
+        return;
+    }
+    for command in &run.commands {
+        push_command_history_rows(app, run, command, width, rows);
     }
 }
 
@@ -10892,31 +11008,29 @@ fn push_command_history_rows(
     } else {
         Style::default().fg(Color::White)
     };
-    let marker = if is_selected { "▶" } else { " " };
     let disclosure = if expanded { "▾" } else { "▸" };
     let description = command
         .description
         .as_deref()
         .map(safe_inline)
         .unwrap_or_else(|| tr("ui.run.description.missing").into());
-    let payload = command_payload(command, None);
-    let payload = if payload.is_empty() {
-        tr("ui.run.command.empty").to_string()
-    } else {
-        safe_inline(&payload)
-    };
-    let title = format!("{description} · {payload}");
-    let available = width.saturating_sub(4).max(1);
-    for (line_index, text) in wrap_queue_text(&title, available).into_iter().enumerate() {
+    let prefix = format!("    {disclosure} ");
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let available = width.saturating_sub(prefix_width as u16).max(1);
+    for (line_index, text) in wrap_queue_text(&description, available)
+        .into_iter()
+        .enumerate()
+    {
         rows.push(RunPanelRow {
             line: Line::from(Span::styled(
                 if line_index == 0 {
-                    format!("{marker} {disclosure} {text}")
+                    format!("{prefix}{text}")
                 } else {
-                    format!("    {text}")
+                    format!("{}{text}", " ".repeat(prefix_width))
                 },
                 style,
             )),
+            run: Some(run.id),
             command: Some(key),
             step: None,
             monitor: None,
@@ -10928,33 +11042,20 @@ fn push_command_history_rows(
         return;
     }
     for (step_index, step) in command.steps.iter().enumerate() {
-        let mut payload = safe_inline(&String::from_utf8_lossy(&step.data));
+        let mut payload = safe_inline(&String::from_utf8_lossy(&step.data))
+            .trim_end()
+            .to_string();
         if payload.is_empty() {
             payload = tr("ui.run.command.empty").into();
         }
         if step.truncated {
             payload.push('…');
         }
-        let description = step
-            .description
-            .as_deref()
-            .map(safe_inline)
-            .unwrap_or_else(|| tr("ui.run.description.missing").into());
-        let detail = format!("{description} · {payload}");
+        let detail = payload;
         let detail_width = usize::from(width);
-        let indentation = detail_width.saturating_sub(1).min(4);
-        let child_selected =
-            is_selected && command.steps.len() > 1 && view.selected_run_step == Some(step_index);
-        let first_prefix = if command.steps.len() > 1 {
-            format!(
-                "{}{} {}. ",
-                " ".repeat(indentation),
-                if child_selected { "▶" } else { " " },
-                step_index + 1
-            )
-        } else {
-            " ".repeat(indentation)
-        };
+        let indentation = detail_width.saturating_sub(1).min(8);
+        let child_selected = is_selected && view.selected_run_step == Some(step_index);
+        let first_prefix = " ".repeat(indentation);
         let prefix_width = UnicodeWidthStr::width(first_prefix.as_str());
         let continuation_prefix = " ".repeat(prefix_width);
         let payload_width = detail_width
@@ -10980,6 +11081,7 @@ fn push_command_history_rows(
             };
             rows.push(RunPanelRow {
                 line,
+                run: Some(run.id),
                 command: Some(key),
                 step: Some(step_index),
                 monitor: None,
@@ -11032,6 +11134,7 @@ fn push_monitor_history_rows(
             ),
             style,
         )),
+        run: None,
         command: None,
         step: None,
         monitor: Some(id),
@@ -11060,6 +11163,7 @@ fn push_monitor_history_rows(
                 ),
                 matcher_style,
             )),
+            run: None,
             command: None,
             step: None,
             monitor: Some(id),
@@ -11101,6 +11205,7 @@ fn push_monitor_history_rows(
                         },
                         incident_style,
                     )),
+                    run: None,
                     command: None,
                     step: None,
                     monitor: Some(id),
@@ -11121,6 +11226,7 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
                 tr("ui.run.none"),
                 Style::default().fg(Color::DarkGray),
             )),
+            run: None,
             command: None,
             step: None,
             monitor: None,
@@ -11129,32 +11235,19 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
         }];
     }
     let mut rows = Vec::new();
-    let mut current_run_segment = None;
     for action in actions {
         match action {
-            HistoryActionKey::Command(key) => {
-                let Some(run) = view.run_history.iter().find(|run| run.id == key.run_id) else {
+            HistoryActionKey::Run(id) => {
+                let Some(run) = view.run_history.iter().find(|run| run.id == id) else {
                     continue;
                 };
-                let Some(command) = run
-                    .commands
-                    .iter()
-                    .find(|command| command.first_seq == key.first_seq)
-                else {
-                    continue;
-                };
-                if current_run_segment != Some(run.id) {
-                    push_run_history_header(run, width, &mut rows);
-                }
-                push_command_history_rows(app, run, command, width, &mut rows);
-                current_run_segment = Some(run.id);
+                push_run_history_rows(app, run, width, &mut rows);
             }
             HistoryActionKey::Monitor(id) => {
                 let Some(entry) = view.monitor(id) else {
                     continue;
                 };
                 push_monitor_history_rows(app, entry, width, &mut rows);
-                current_run_segment = None;
             }
         }
     }
@@ -11214,6 +11307,12 @@ fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect, framed: bool) 
                             Some(step) => row.step == Some(step),
                             None => row.step.is_none(),
                         }
+                })
+            })
+            .or_else(|| {
+                let selected = app.current().selected_run_id()?;
+                rows.iter().position(|row| {
+                    row.run == Some(selected) && row.command.is_none() && row.monitor.is_none()
                 })
             })
             .unwrap_or(0)
@@ -14736,6 +14835,25 @@ mod tests {
         });
     }
 
+    fn select_first_run_command(app: &mut App) {
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.current().selected_run_command_key().is_some());
+    }
+
+    fn select_last_run_command(app: &mut App) {
+        select_first_run_command(app);
+        app.handle_run_history_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    }
+
+    fn expand_selected_run_command(app: &mut App) {
+        if app.current().selected_run_command_key().is_none() {
+            select_first_run_command(app);
+        }
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.current().selected_run_step.is_some());
+    }
+
     fn focus_run_history_for_jump(app: &mut App) {
         app.focus = PaneFocus::RunHistory;
         app.layout = Some(ConsoleLayout {
@@ -14745,6 +14863,7 @@ mod tests {
             run_history_area: None,
             run_history_inner: None,
         });
+        select_first_run_command(app);
     }
 
     fn described_agent_tx(
@@ -15223,21 +15342,44 @@ mod tests {
             Some("输入密码")
         );
 
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let key = app.current().selected_run_command_key().unwrap();
-        app.current_mut().expanded_run_command = Some(key);
-        let rendered = run_history_rows(&app, 80)
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.current().expanded_run_command, Some(key));
+        assert_eq!(app.current().selected_run_step, Some(0));
+        let rows = run_history_rows(&app, 80);
+        let rendered = rows
+            .iter()
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.lines().any(|line| line == "        admin"));
+        assert!(rendered.lines().any(|line| line == "        password"));
+        let rendered = rows
             .into_iter()
             .flat_map(|row| row.line.spans)
             .map(|span| span.content.into_owned())
             .collect::<String>();
         assert_eq!(rendered.matches("登录样机控制台").count(), 1);
-        assert!(rendered.contains("输入账号 · admin"));
-        assert!(rendered.contains("输入密码 · password"));
+        assert!(!rendered.contains("输入账号"));
+        assert!(!rendered.contains("输入密码"));
         assert!(rendered.contains("admin"));
         assert!(rendered.contains("password"));
         assert!(!rendered.contains('\u{2705}'));
         assert!(!rendered.contains('\u{274c}'));
         assert!(!rendered.contains("已确认发送"));
+
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.current().selected_run_step, Some(1));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.current().selected_run_step.is_none());
+        assert!(app.current().expanded_run_command.is_none());
+        assert_eq!(app.current().selected_run_command, Some(key));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.current().selected_run_command.is_none());
+        assert!(app.current().expanded_run.is_none());
+        assert_eq!(app.current().selected_run, Some(run.id));
     }
 
     #[test]
@@ -15266,7 +15408,10 @@ mod tests {
                 spec: serial_protocol::MonitorSpec {
                     port: "COM3".into(),
                     matchers: vec![MonitorMatcher::Contains("alarm".into())],
-                    start_cursor: None,
+                    start_cursor: Some(Cursor {
+                        epoch,
+                        after_seq: 3,
+                    }),
                     severity: serial_protocol::MonitorSeverity::Warning,
                     description: Some("监控一".into()),
                     debounce_ms: 250,
@@ -15294,30 +15439,26 @@ mod tests {
             .map(|row| line_plain_text(&row.line))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.find("命令一").unwrap() < rendered.find("监控一").unwrap());
-        assert!(rendered.find("监控一").unwrap() < rendered.find("命令二").unwrap());
+        assert!(rendered.contains("交错历史"));
+        assert!(rendered.contains("监控一"));
+        assert!(!rendered.contains("命令一"));
+        assert!(!rendered.contains("命令二"));
 
         app.handle_run_history_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert!(matches!(
+        assert_eq!(
             app.current().selected_history_action_key(),
-            Some(HistoryActionKey::Command(RunCommandKey {
-                first_seq: 2,
-                ..
-            }))
-        ));
+            Some(HistoryActionKey::Run(run.id))
+        );
         app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             app.current().selected_history_action_key(),
             Some(HistoryActionKey::Monitor(monitor_id))
         );
         app.handle_run_history_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert!(matches!(
+        assert_eq!(
             app.current().selected_history_action_key(),
-            Some(HistoryActionKey::Command(RunCommandKey {
-                first_seq: 4,
-                ..
-            }))
-        ));
+            Some(HistoryActionKey::Monitor(monitor_id))
+        );
     }
 
     #[test]
@@ -15347,7 +15488,10 @@ mod tests {
                 spec: serial_protocol::MonitorSpec {
                     port: "COM3".into(),
                     matchers: vec![MonitorMatcher::Contains("alarm".into())],
-                    start_cursor: None,
+                    start_cursor: Some(Cursor {
+                        epoch,
+                        after_seq: 3,
+                    }),
                     severity: serial_protocol::MonitorSeverity::Warning,
                     description: Some("Alarm monitor".into()),
                     debounce_ms: 250,
@@ -15370,75 +15514,65 @@ mod tests {
         });
         app.focus = PaneFocus::RunHistory;
 
-        let rows = run_history_rows(&app, 100);
-        let header_rows = rows
+        let collapsed = run_history_rows(&app, 100);
+        let header_rows = collapsed
             .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.command.is_none() && row.monitor.is_none() && row.incident.is_none()
-            })
+            .filter(|row| row.run == Some(run.id) && row.command.is_none())
             .collect::<Vec<_>>();
-        assert_eq!(
-            header_rows.len(),
-            2,
-            "Monitor splits and redraws the Run group"
-        );
-        assert!(header_rows.iter().all(|(_, row)| {
-            row.line.spans.iter().all(|span| {
-                span.style.fg == Some(Color::LightBlue)
-                    && span.style.add_modifier.contains(Modifier::BOLD)
-            })
-        }));
-        let first_command = rows
+        assert_eq!(header_rows.len(), 1, "Run is one top-level row");
+        assert!(collapsed.iter().all(|row| row.command.is_none()));
+
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let rows = run_history_rows(&app, 100);
+        let command_rows = rows
             .iter()
-            .find(|row| {
-                row.command.is_some()
-                    && row.step.is_none()
-                    && line_plain_text(&row.line).contains("Read version")
-            })
-            .expect("first command child row");
-        assert!(line_plain_text(&first_command.line).contains("show version"));
+            .filter(|row| row.command.is_some() && row.step.is_none())
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>();
+        assert!(command_rows.iter().any(|row| row == "    ▸ Read version"));
+        assert!(command_rows.iter().any(|row| row == "    ▸ Read status"));
+        assert!(command_rows.iter().all(|row| !row.contains("show ")));
+
         let selected_command_row = rows
             .iter()
-            .position(|row| {
-                row.command.is_some()
-                    && row.step.is_none()
-                    && line_plain_text(&row.line).contains("Read status")
-            })
-            .expect("selected command row");
-
+            .position(|row| row.command == app.current().selected_run_command && row.step.is_none())
+            .expect("selected command description row");
         let lines = rows.iter().map(|row| row.line.clone()).collect::<Vec<_>>();
         let backend = TestBackend::new(100, lines.len() as u16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| frame.render_widget(Paragraph::new(lines.clone()), frame.area()))
             .unwrap();
-        let buffer = terminal.backend().buffer();
-        for (row, _) in header_rows {
-            let cell = &buffer.content[row * 100];
-            assert_eq!(cell.fg, Color::LightBlue);
-            assert!(cell.modifier.contains(Modifier::BOLD));
-            assert_ne!(cell.bg, Color::Cyan);
-        }
         assert_eq!(
-            buffer.content[selected_command_row * 100].bg,
+            terminal.backend().buffer().content[selected_command_row * 100 + 4].bg,
             Color::Cyan,
-            "selection belongs to the command child, not its Run title"
+            "selection belongs to the command description, not its Run title"
         );
 
-        let template = app.current().run_history.front().unwrap().clone();
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let expanded = run_history_rows(&app, 100)
+            .into_iter()
+            .map(|row| line_plain_text(&row.line))
+            .collect::<Vec<_>>();
+        assert!(expanded.iter().any(|row| row == "        show version"));
+        assert!(expanded.iter().all(|row| row != "        show status"));
+        assert_eq!(app.current().selected_run_step, Some(0));
+
+        app.current_mut().expanded_run = None;
+        app.current_mut().selected_run_command = None;
         for (status, color) in [
             (RunStatus::Active, Color::LightBlue),
             (RunStatus::Completed, Color::LightGreen),
             (RunStatus::Aborted, Color::LightRed),
         ] {
-            let mut run = template.clone();
-            run.status = status;
-            let mut status_rows = Vec::new();
-            push_run_history_header(&run, 100, &mut status_rows);
-            assert_eq!(status_rows.len(), 1);
-            assert!(line_plain_text(&status_rows[0].line).contains(run_status_text(status)));
-            assert!(status_rows[0].line.spans.iter().all(|span| {
+            app.current_mut().run_history[0].status = status;
+            let status_rows = run_history_rows(&app, 100);
+            let status_row = status_rows
+                .iter()
+                .find(|row| row.run == Some(run.id) && row.command.is_none())
+                .unwrap();
+            assert!(line_plain_text(&status_row.line).contains(run_status_text(status)));
+            assert!(status_row.line.spans.iter().all(|span| {
                 span.style.fg == Some(color) && span.style.add_modifier.contains(Modifier::BOLD)
             }));
 
@@ -15446,10 +15580,7 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
                 .draw(|frame| {
-                    frame.render_widget(
-                        Paragraph::new(vec![status_rows[0].line.clone()]),
-                        frame.area(),
-                    )
+                    frame.render_widget(Paragraph::new(vec![status_row.line.clone()]), frame.area())
                 })
                 .unwrap();
             let first_cell = &terminal.backend().buffer().content[0];
@@ -16712,10 +16843,17 @@ mod tests {
             app.ports[0].push_event(tx, true);
         }
 
-        assert_eq!(app.current().selected_run_command_index(), Some(1));
+        assert_eq!(app.current().selected_run, Some(run.id));
+        assert!(app.current().selected_run_command.is_none());
         app.focus = PaneFocus::RunHistory;
-        app.handle_run_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.current().selected_run_command_index(), Some(0));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.current().selected_run_command,
+            Some(RunCommandKey {
+                run_id: run.id,
+                first_seq: 2,
+            })
+        );
         app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(
             app.current().expanded_run_command,
@@ -16823,22 +16961,40 @@ mod tests {
         }
         let (commands, _) = mpsc::channel(1);
 
-        assert_eq!(app.current().selected_run_command_index(), Some(1));
+        assert_eq!(app.current().selected_run, Some(run.id));
+        assert!(app.current().selected_run_command.is_none());
         let history = run_history_rows(&app, 80)
             .into_iter()
             .map(|row| line_plain_text(&row.line))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(history.find("第一条").unwrap() < history.find("第二条").unwrap());
+        assert!(!history.contains("第一条"));
+        assert!(!history.contains("第二条"));
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
         assert_eq!(app.focus, PaneFocus::RunHistory);
-        assert_eq!(app.current().selected_run_command_index(), Some(0));
+        assert!(app.current().selected_run_command.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.current().selected_run_command,
+            Some(RunCommandKey {
+                run_id: run.id,
+                first_seq: 2,
+            })
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.current().selected_run_command,
+            Some(RunCommandKey {
+                run_id: run.id,
+                first_seq: 3,
+            })
+        );
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
         assert_eq!(
             app.current().expanded_run_command,
             Some(RunCommandKey {
                 run_id: run.id,
-                first_seq: 2,
+                first_seq: 3,
             })
         );
 
@@ -16883,7 +17039,7 @@ mod tests {
         rx.daemon_epoch = epoch;
         app.ports[0].push_event(rx, true);
         app.ports[0].push_line(stream_row(4, Direction::Rx, "later output"), true);
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let rows = render_output_entries(&app, &entries, 80);
@@ -17039,7 +17195,7 @@ mod tests {
             event.daemon_epoch = epoch;
             app.ports[0].push_event(event, true);
         }
-        app.focus = PaneFocus::RunHistory;
+        select_last_run_command(&mut app);
 
         let key = app.current().selected_run_command_key().unwrap();
         let target = app.command_evidence_target(key, None).unwrap();
@@ -17098,7 +17254,7 @@ mod tests {
         );
         rx.daemon_epoch = epoch;
         app.ports[0].push_event(rx, true);
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let captured = render_output_entries(&app, &entries, 80)
@@ -17132,7 +17288,7 @@ mod tests {
         app.ports[0].push_event(tx, true);
         app.ports[0].push_line(gap_line(3, "journal gap"), true);
         app.ports[0].push_line(stream_row(4, Direction::Rx, "dut# "), true);
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let rows = render_output_entries(&app, &entries, 80);
@@ -17195,7 +17351,7 @@ mod tests {
             }
             app.ports[0].push_event(item, true);
         }
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let rows = render_output_entries(&app, &entries, 80);
@@ -17238,7 +17394,7 @@ mod tests {
         let mut later_break = event(EventKind::Break, Direction::None, 4, &[]);
         later_break.daemon_epoch = epoch;
         completed_before_break.ports[0].push_event(later_break, true);
-        completed_before_break.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut completed_before_break);
         let entries = completed_before_break.ports[0]
             .lines
             .iter()
@@ -17273,7 +17429,7 @@ mod tests {
             let mut prompt = event(EventKind::Rx, Direction::Rx, 5, b"dut# \r\n");
             prompt.daemon_epoch = epoch;
             app.ports[0].push_event(prompt, true);
-            app.focus = PaneFocus::RunHistory;
+            select_first_run_command(&mut app);
 
             let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
             let rows = render_output_entries(&app, &entries, 80);
@@ -17305,7 +17461,7 @@ mod tests {
         let mut prompt = event(EventKind::Rx, Direction::Rx, 5, b"dut# \r\n");
         prompt.daemon_epoch = epoch;
         app.ports[0].push_event(prompt, true);
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         assert!(render_output_entries(&app, &entries, 80).iter().all(|row| {
             row.line.style.bg != Some(COMMAND_CAPTURE_BACKGROUND)
@@ -17423,7 +17579,7 @@ mod tests {
         );
         rx.daemon_epoch = epoch;
         app.ports[0].push_event(rx, true);
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let rows = render_output_entries(&app, &entries, 80);
@@ -17491,7 +17647,7 @@ mod tests {
             app.ports[0].push_event(rx, true);
         }
         app.ports[0].push_line(stream_row(6, Direction::Rx, "after login"), true);
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let rows = render_output_entries(&app, &entries, 80);
@@ -17576,7 +17732,7 @@ mod tests {
             rx.daemon_epoch = epoch;
             app.ports[0].push_event(rx, true);
         }
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
 
         let key = app.current().selected_run_command_key().unwrap();
         let target = app.command_evidence_target(key, Some(1)).unwrap();
@@ -17634,9 +17790,9 @@ mod tests {
         );
         rx.daemon_epoch = epoch;
         app.ports[0].push_event(rx, true);
-        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
 
-        app.focus = PaneFocus::RunHistory;
+        select_first_run_command(&mut app);
+        let entries = app.ports[0].lines.iter().collect::<Vec<_>>();
         let selected_rows = render_output_entries(&app, &entries, 80);
         assert!(selected_rows.iter().all(|row| {
             row.line.style.bg != Some(Color::Rgb(28, 53, 66))
@@ -17734,6 +17890,7 @@ mod tests {
             tx
         };
         app.ports[0].push_event(described_tx(2, "第一条命令", b"first command"), true);
+        assert_eq!(app.current().selected_run, Some(run.id));
         assert!(app.current().selected_run_command.is_none());
 
         app.focus = PaneFocus::RunHistory;
@@ -17743,15 +17900,13 @@ mod tests {
             first_seq: 2,
         };
         assert_eq!(app.current().selected_run_command, Some(pinned));
-        assert_eq!(app.current().expanded_run_command, Some(pinned));
+        assert_eq!(app.current().expanded_run, Some(run.id));
+        assert!(app.current().expanded_run_command.is_none());
 
         app.ports[0].push_event(described_tx(3, "第二条命令", b"second command"), true);
-        let newest = RunCommandKey {
-            run_id: run.id,
-            first_seq: 3,
-        };
+        assert_eq!(app.current().selected_run, Some(run.id));
         assert!(app.current().selected_run_command.is_none());
-        assert_eq!(app.current().selected_run_command_key(), Some(newest));
+        assert!(app.current().expanded_run.is_none());
         assert!(app.current().expanded_run_command.is_none());
 
         let backend = TestBackend::new(80, 28);
@@ -17768,7 +17923,8 @@ mod tests {
             },
             &commands,
         );
-        assert_eq!(app.current().selected_run_command_key(), Some(newest));
+        assert_eq!(app.current().selected_run, Some(run.id));
+        assert!(app.current().selected_run_command_key().is_none());
         assert!(app.current().expanded_run_command.is_none());
     }
 
@@ -17792,8 +17948,7 @@ mod tests {
             tx.metadata
                 .insert("command_description".into(), serde_json::json!("用途"));
             app.ports[0].push_event(tx, true);
-            app.focus = PaneFocus::RunHistory;
-            app.handle_run_history_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            expand_selected_run_command(&mut app);
 
             let width = 18;
             let key = app.current().selected_run_command_key().unwrap();
@@ -17818,7 +17973,7 @@ mod tests {
                 .iter()
                 .map(|row| row.trim_start())
                 .collect::<String>();
-            assert_eq!(reconstructed, format!("用途 · {payload}"));
+            assert_eq!(reconstructed, payload);
         }
     }
 
@@ -17839,9 +17994,8 @@ mod tests {
             serde_json::json!("读取完整配置"),
         );
         app.ports[0].push_event(tx, true);
-        app.focus = PaneFocus::RunHistory;
+        expand_selected_run_command(&mut app);
         let key = app.current().selected_run_command_key().unwrap();
-        app.current_mut().expanded_run_command = Some(key);
         assert!(
             run_history_rows(&app, 20)
                 .iter()
@@ -19368,7 +19522,8 @@ mod tests {
         );
 
         assert_eq!(app.focus, PaneFocus::RunHistory);
-        assert_eq!(app.current().selected_run_command_index(), Some(1));
+        assert_eq!(app.current().selected_run, Some(run.id));
+        assert!(app.current().selected_run_command.is_none());
         assert_eq!(app.current().scroll_from_bottom, 0);
     }
 

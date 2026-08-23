@@ -207,7 +207,7 @@ TUI 和 App 从该命令 TX 后的 RX 开始寻找第一个匹配边界，并高
 
 `command_sequence` 在一个 MCP 调用中执行 1–8 个已知依赖步骤。每个非最终步骤必须配置 `expect` 或 `regex`；只有匹配后才发送下一条，任何失败都会停止剩余写入。每个步骤保留独立描述、命令 bytes、matcher 与执行状态，整体用 `sequence_id` 和总任务描述分组。
 
-任务与命令记录使用两级动作模型：普通 `command` 是一个 action，进入后直接定位它的命令与完整 RX 捕获区间；`command_sequence` 是一个 action，进入后列出各 step，上下选择 step 后按该 step 的 TX 起点、下一 step 上界和 matcher 独立查询、定位并高亮。没有 matcher 时只显示临时命令文本；有 matcher 但本地证据不完整时必须等待 journal 的完整连续结果，不改写串口历史，也不降级展示局部尾部。
+任务与命令记录使用三层树模型：第一层是 Run 及其状态，第二层是 `command` / `command_sequence` action 的 description，第三层是实际发送的命令。普通 `command` 只有一个第三层子项；`command_sequence` 按 step 顺序列出多个子项，上下选择 step 后按该 step 的 TX 起点、下一 step 上界和 matcher 独立查询、定位并高亮。没有 matcher 时只显示临时命令文本；有 matcher 但本地证据不完整时必须等待 journal 的完整连续结果，不改写串口历史，也不降级展示局部尾部。
 
 ## Trigger 与 Monitor
 
@@ -232,7 +232,7 @@ TUI 从上到下由四部分组成：
 3. Agent 任务与命令历史：两条 powerline 风格分隔栏之间；
 4. 人工命令输入。
 
-任务与命令记录按旧到新排列，最新在底部。新的 Agent command/command sequence action 到达时，TUI 自动退出旧 action 的子层级并回到底部；同一 action 的 TX 分块或后续 sequence step 只合并进原记录，不重复重置。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。默认用 `↑` / `↓` 选择一次 command/command sequence/Monitor action，按 `→` 进入子层级，按 `←` 返回；滚轮和 PgUp/PgDn 浏览当前层级，带 `Ctrl-]` 前缀的 PgUp/PgDn 才滚动串口输出。
+任务与命令记录按旧到新排列，最新 Run 在底部。新的 Agent action 到达时，TUI 自动退回它所属的 Run；同一 action 的 TX 分块或后续 sequence step 只合并进原记录。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。默认用 `↑` / `↓` 在当前层选择，按 `→` 按 Run → description → 具体命令逐层展开，按 `←` 逐层返回；滚轮和 PgUp/PgDn 浏览当前层级，带 `Ctrl-]` 前缀的 PgUp/PgDn 才滚动串口输出。
 
 主终端只渲染 RX。普通 command 进入后定位完整捕获区间；command sequence 进入后逐步选择和定位；Monitor 进入后显示 matcher，继续进入可选择 incident，并按 `serial_range` 跳转到证据。命令捕获与 Monitor incident 共用同一条精确 journal 证据链：范围属于旧的后端周期或已从 TUI 本地窗口淘汰时，按持久周期和序号边界回取；只有区间完整连续时才显示并高亮 RX，retention gap、缺失、超限或查询失败会返回实时尾并明确提示。双击选词与拖选使用可见高亮，选择不会因为实时刷新立即消失。
 

@@ -133,13 +133,13 @@ TUI 顶部只显示串口名和连接状态；串口输出标题只显示当前�
 默认操作围绕键盘设计：
 
 - 输入任意可打印字符会直接进入命令输入行；有内容时按 Enter 发送，没有内容时按 Enter 返回串口底部。
-- `↑` / `↓` 选择任务与命令 action，`→` 进入子层级，`←` 返回上一层。
+- `↑` / `↓` 在当前层选择；`→` 从 Run 进入 action description，再进入具体命令；`←` 逐层返回。
 - 滚轮和 `PgUp` / `PgDn` 浏览当前历史层级，不需要点击窗口切换焦点。
 - `Ctrl-] PgUp` / `Ctrl-] PgDn` 专门滚动串口输出。
 - `Ctrl-] /` 搜索持久串口历史，可切换普通文本/正则、大小写、RX/TX 和当前周期/保留周期/当前 Run。
 - `Alt-1` 到 `Alt-9` 快速切换端口；`Ctrl-] ?` 打开完整帮助。
 
-任务与命令记录按从旧到新排列。新的 Agent `command` 或 `command_sequence` action 到达时，TUI 会退出正在浏览的旧层级并回到底部；同一个 sequence 的后续 step 或同一 TX 的分块只更新原 action，不会重复重置选择。普通 `command` 进入后直接定位并高亮设备回显、返回内容和完成边界；`command_sequence` 先作为一个 action，按 `→` 进入后再用 `↑` / `↓` 选择并定位每个 step。命令属于旧的后端周期或本地窗口已淘汰完整捕获区间时，TUI 会按原周期、命令序号和持久 matcher 从 journal 精确回取；只有从 TX 到完成边界完整连续时才显示 RX 高亮。retention gap、缺失、超限或查询失败会回到实时尾并明确提示，不把局部尾部伪装成完整结果。没有 matcher 时只临时显示命令文本，不污染串口历史。
+任务与命令记录按从旧到新排列，采用 Run 标题 → action description → 具体命令的三层树。第二层缩进 4 列且不混入命令；第三层缩进 8 列，普通 `command` 显示一条，`command_sequence` 按 step 顺序显示多条。新的 Agent action 到达时，TUI 退回它所属的 Run；同一 sequence 的后续 step 或同一 TX 的分块只更新原 action。进入 action 或具体 step 时会定位并高亮设备回显、返回内容和完成边界。命令属于旧的后端周期或本地窗口已淘汰完整捕获区间时，TUI 会按原周期、命令序号和持久 matcher 从 journal 精确回取；只有从 TX 到完成边界完整连续时才显示 RX 高亮。retention gap、缺失、超限或查询失败会回到实时尾并明确提示，不把局部尾部伪装成完整结果。没有 matcher 时只临时显示命令文本，不污染串口历史。
 
 Monitor 也显示在同一记录栏：按 `→` 进入查看 matcher，再按 `→` 进入 incident 层；用 `↑` / `↓` 选择 incident 后，根据它的 `serial_range` 跳转并高亮对应串口证据。如果 incident 属于旧的后端周期，或对应内容已从 TUI 本地窗口淘汰，TUI 会按周期和序号范围从 journal 读取完整连续证据；若持久历史已有 retention gap 或范围不完整，则明确提示，且不显示可能误导的局部结果。
 

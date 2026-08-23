@@ -131,9 +131,9 @@ serial profile detach --port COM4 --transport
 
 ## 任务记录与输出高亮
 
-任务记录按从旧到新显示，最新 action 在底部。每个 Run 使用独立的状态色标题；标题下的命令行同时显示 description 与具体 command。新的 Agent `command` 或 `command_sequence` action 到达时，TUI 会退出正在浏览的旧子层级并回到底部；同一 action 的 TX 分块或 sequence 后续 step 只合并进原记录，不重复重置。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。
+任务记录按从旧到新显示，最新 Run 在底部。历史树是严格三层：顶层是带独立状态色的 Run 标题；第二层缩进 4 列，只显示每个 `command` / `command_sequence` action 的 description；第三层缩进 8 列，只显示具体命令。新的 Agent action 到达时，TUI 会退出正在浏览的旧子层级并回到它所属的 Run；同一 action 的 TX 分块或 sequence 后续 step 只合并进原记录，不重复重置。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。
 
-普通 `command` 是一个 action，按 `→` 后直接定位它的串口区域。`command_sequence` 也是一个 action；按 `→` 进入 step 层级，再用 `↑` / `↓` 选择每个具体命令，按 `←` 返回 action 层。Monitor action 按 `→` 进入 matcher，再按 `→` 进入 incident；选择 incident 后按它的 `serial_range` 跳转串口证据。命令捕获和 incident 属于旧后端周期，或完整范围已从本地窗口淘汰时，TUI 会从 journal 回取原周期的完整连续区间并高亮 RX；retention gap、缺失、超限或查询失败会返回实时尾并明确提示，不显示可能误导的局部证据。
+用 `↑` / `↓` 在当前层级选择，用 `→` 依次从 Run 进入 description、再进入具体命令，用 `←` 逐层返回。普通 `command` 的第三层只有一条具体命令；`command_sequence` 的第三层按 step 顺序列出多条命令，上下选择时同步定位各自的串口证据。Monitor 按 `→` 进入 matcher，再按 `→` 进入 incident；选择 incident 后按它的 `serial_range` 跳转串口证据。命令捕获和 incident 属于旧后端周期，或完整范围已从本地窗口淘汰时，TUI 会从 journal 回取原周期的完整连续区间并高亮 RX；retention gap、缺失、超限或查询失败会返回实时尾并明确提示，不显示可能误导的局部证据。
 
 选择具体命令时，TUI 读取该 TX 事件保存的 `command_capture_matchers`：
 
