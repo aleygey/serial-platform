@@ -53,7 +53,9 @@ pipeline {
         skipDefaultCheckout(true)
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
-        timeout(time: 120, unit: 'MINUTES')
+        // Release builds compile and package four platform targets, then transfer
+        // roughly 1 GiB of artifacts through the controller before publishing.
+        timeout(time: 240, unit: 'MINUTES')
     }
 
     environment {
