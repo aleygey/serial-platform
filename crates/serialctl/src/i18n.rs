@@ -6,6 +6,9 @@
 //! active language is process-global and may be switched at runtime; every
 //! render pass re-reads it, so the next repaint reflects a switch.
 
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(not(test))]
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -35,29 +38,60 @@ impl Lang {
     }
 }
 
+#[cfg(not(test))]
 static LANG: OnceLock<RwLock<Lang>> = OnceLock::new();
 
+#[cfg(not(test))]
 fn lang_cell() -> &'static RwLock<Lang> {
     LANG.get_or_init(|| RwLock::new(Lang::default()))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LANG: Cell<Lang> = const { Cell::new(Lang::En) };
+}
+
+#[cfg(not(test))]
 pub fn lang() -> Lang {
     *lang_cell().read().expect("language lock poisoned")
 }
 
+#[cfg(test)]
+pub fn lang() -> Lang {
+    TEST_LANG.get()
+}
+
+#[cfg(not(test))]
 pub fn set_lang(lang: Lang) {
     *lang_cell().write().expect("language lock poisoned") = lang;
 }
 
-/// Serializes tests that depend on the process-global language and gives
-/// assertions a stable English baseline. Product code uses
-/// `Lang::default()` (Chinese) when no preference is configured.
 #[cfg(test)]
-pub(crate) fn lang_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn set_lang(lang: Lang) {
+    TEST_LANG.set(lang);
+}
+
+#[cfg(test)]
+pub(crate) struct LangTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for LangTestGuard {
+    fn drop(&mut self) {
+        set_lang(Lang::En);
+    }
+}
+
+/// Serializes tests that intentionally switch languages and gives assertions
+/// a stable thread-local English baseline. Product code remains process-global
+/// and uses `Lang::default()` (Chinese) when no preference is configured.
+#[cfg(test)]
+pub(crate) fn lang_test_lock() -> LangTestGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     set_lang(Lang::En);
-    guard
+    LangTestGuard { _guard: guard }
 }
 
 /// (key, English, 简体中文)

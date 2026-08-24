@@ -13247,6 +13247,7 @@ mod tests {
 
     #[test]
     fn raw_queue_is_not_lossily_converted_into_a_line_draft() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_foreign_control();
         let (commands, _received) = mpsc::channel(4);
         assert!(app.request_raw_write(&commands, vec![0x03]));
@@ -14363,6 +14364,7 @@ mod tests {
 
     #[test]
     fn output_search_run_scope_rebinds_to_the_active_run_on_every_submit() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut current = snapshot();
         current.head_seq = 100;
         let mut first_run = agent_run("first");
@@ -16564,6 +16566,7 @@ mod tests {
 
     #[test]
     fn model_name_navigation_selects_family_then_concrete_model() {
+        let _guard = crate::i18n::lang_test_lock();
         let (current, mut catalog) = editable_profile_fixture();
         catalog.model_families.push(ModelFamily {
             name: "Empty Family".into(),
@@ -17317,6 +17320,7 @@ mod tests {
 
     #[test]
     fn command_capture_skips_audit_annotations_but_highlights_only_rx() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut current = snapshot();
         let run = agent_run("审计行穿插");
         current.active_run = Some(run.clone());
