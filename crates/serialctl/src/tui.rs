@@ -16327,6 +16327,7 @@ mod tests {
 
     #[test]
     fn current_profile_page_edits_fields_and_submits_observed_revisions() {
+        let _guard = crate::i18n::lang_test_lock();
         let (current, mut catalog) = editable_profile_fixture();
         let mut transport_peer = current.clone();
         transport_peer.config.port = "COM4".into();
