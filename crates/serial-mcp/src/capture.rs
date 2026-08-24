@@ -65,9 +65,11 @@ pub struct CaptureResult {
 }
 
 /// The confirmed TX audit is the lower bound for one command capture. RX below
-/// it is never command output. A complete configured echo is stripped and
-/// raises confidence; exact post-TX evidence may still complete when that echo
-/// is missing or incomplete, with the result explicitly downgraded.
+/// it is never command output. A complete configured echo is normally stripped
+/// and raises confidence. Ambiguous plain-CRLF hard wraps are retained in the
+/// lossless event result while being excluded from completion matching. Exact
+/// post-TX evidence may still complete when an echo is missing or incomplete,
+/// with the result explicitly downgraded.
 pub struct CommandBoundary {
     pub tx_event_seq: u64,
     pub operation_id: Uuid,
@@ -108,6 +110,10 @@ pub struct CommandBoundaryResult {
     pub tx_audit_observed: bool,
     pub echo_required: bool,
     pub echo_observed: bool,
+    /// A plain CRLF can be either a TTY hard wrap or a real output line. When
+    /// it participates in a complete long echo match, keep the original RX
+    /// events losslessly instead of guessing which bytes are disposable.
+    pub ambiguous_echo_retained: bool,
     pub discarded_rx_event_count: usize,
     pub discarded_rx_byte_count: usize,
     pub interfered: bool,
@@ -125,7 +131,11 @@ impl CommandBoundaryResult {
         }
         if self.echo_required {
             if self.echo_observed {
-                "echo_confirmed"
+                if self.ambiguous_echo_retained {
+                    "echo_ambiguous_retained"
+                } else {
+                    "echo_confirmed"
+                }
             } else if matches!(
                 completion,
                 Completion::Pattern(_) | Completion::Prompt(_) | Completion::Regex(_)
@@ -602,6 +612,15 @@ impl AcceptedEvents {
             reset_matching: true,
         }
     }
+
+    fn after_retained_echo(events: Vec<TimelineEvent>, matching_rx: Vec<u8>) -> Self {
+        Self {
+            events,
+            matching_rx,
+            observed_post_tx_rx: true,
+            reset_matching: true,
+        }
+    }
 }
 
 struct CommandBoundaryTracker {
@@ -613,6 +632,7 @@ struct CommandBoundaryTracker {
     prewrite_activity: CaptureActivity,
     tx_audit_observed: bool,
     echo_observed: bool,
+    ambiguous_echo_retained: bool,
     discarded_rx_event_count: usize,
     discarded_rx_byte_count: usize,
     interfered: bool,
@@ -633,6 +653,7 @@ impl CommandBoundaryTracker {
             prewrite_activity: CaptureActivity::default(),
             tx_audit_observed: false,
             echo_observed: false,
+            ambiguous_echo_retained: false,
             discarded_rx_event_count: 0,
             discarded_rx_byte_count: 0,
             interfered: false,
@@ -697,7 +718,7 @@ impl CommandBoundaryTracker {
             .iter()
             .flat_map(|event| event.data.iter().copied())
             .collect();
-        let Some(echo_end) = find_echo_end(&pending, expected) else {
+        let Some(echo_match) = find_echo_end(&pending, expected) else {
             // Sequence, not echo, is the causal lower bound. Exact
             // post-write evidence may therefore complete a command even when
             // an echo-on target loses or omits part of the echo. The pending
@@ -707,10 +728,21 @@ impl CommandBoundaryTracker {
             return AcceptedEvents::pending_rx(fallback_after_incomplete_echo(&pending, expected));
         };
 
-        let events = self.discard_pending_prefix(echo_end);
         self.echo_observed = true;
         self.armed = true;
-        AcceptedEvents::after_echo(events)
+        if echo_match.ambiguous_plain_crlf_wrap {
+            // A plain CRLF is not intrinsically distinguishable from a real
+            // output newline followed by bytes equal to the remaining command
+            // suffix. Use the logical match to arm completion, but retain the
+            // original RX events so this heuristic can never erase evidence.
+            let matching_rx = pending[echo_match.end..].to_vec();
+            let events = self.take_pending();
+            self.ambiguous_echo_retained = true;
+            AcceptedEvents::after_retained_echo(events, matching_rx)
+        } else {
+            let events = self.discard_pending_prefix(echo_match.end);
+            AcceptedEvents::after_echo(events)
+        }
     }
 
     fn bound_pending(&mut self) {
@@ -767,6 +799,11 @@ impl CommandBoundaryTracker {
         accepted
     }
 
+    fn take_pending(&mut self) -> Vec<TimelineEvent> {
+        self.pending_bytes = 0;
+        self.pending_rx.drain(..).collect()
+    }
+
     fn finish(self) -> (CommandBoundaryResult, Vec<TimelineEvent>) {
         // Missing/incomplete echo is lower-confidence evidence, not a reason
         // to erase the post-TX bytes. Return the bounded pending events so the
@@ -777,6 +814,7 @@ impl CommandBoundaryTracker {
             tx_audit_observed: self.tx_audit_observed,
             echo_required: self.boundary.expected_echo.is_some(),
             echo_observed: self.echo_observed,
+            ambiguous_echo_retained: self.ambiguous_echo_retained,
             discarded_rx_event_count: self.discarded_rx_event_count,
             discarded_rx_byte_count: self.discarded_rx_byte_count,
             interfered: self.interfered,
@@ -785,13 +823,47 @@ impl CommandBoundaryTracker {
     }
 }
 
-/// Return the raw byte offset immediately after a complete command echo.
-/// Some target TTYs inject CR CR LF while hard-wrapping long echoed input; that
-/// exact sequence is tolerated only after matching has started. The caller
-/// scans all possible starts because stale RX may precede the real echo.
-fn find_echo_end(actual: &[u8], expected: &[u8]) -> Option<usize> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EchoMatch {
+    /// Raw byte offset immediately after the complete logical echo.
+    end: usize,
+    /// At least one accepted physical wrap was plain CRLF. The caller must
+    /// retain the original events because that byte pattern is ambiguous.
+    ambiguous_plain_crlf_wrap: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoedHardWrap {
+    CrLf,
+    CrCrLf,
+}
+
+impl EchoedHardWrap {
+    fn len(self) -> usize {
+        match self {
+            Self::CrLf => 2,
+            Self::CrCrLf => 3,
+        }
+    }
+}
+
+/// A plain CRLF is accepted as presentation-only wrapping only after a real
+/// terminal-width prefix. This rejects short partial echoes followed by an
+/// ordinary output line that happens to begin with the remaining suffix.
+const MIN_PLAIN_CRLF_HARD_WRAP_COLUMN: usize = 32;
+
+/// Return the raw match boundary for a complete command echo.
+/// Target TTYs commonly inject either CR LF or CR CR LF while hard-wrapping
+/// long echoed input. CR CR LF is distinctive; ambiguous plain CR LF is
+/// accepted only at a plausible physical terminal column and is reported to
+/// the caller for lossless retention. The caller scans all possible starts
+/// because stale RX may precede the real echo.
+fn find_echo_end(actual: &[u8], expected: &[u8]) -> Option<EchoMatch> {
     if expected.is_empty() {
-        return Some(0);
+        return Some(EchoMatch {
+            end: 0,
+            ambiguous_plain_crlf_wrap: false,
+        });
     }
 
     for start in 0..actual.len() {
@@ -800,23 +872,43 @@ fn find_echo_end(actual: &[u8], expected: &[u8]) -> Option<usize> {
         }
         let mut actual_index = start;
         let mut expected_index = 0;
+        let mut physical_line_start = actual[..start]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let mut ambiguous_plain_crlf_wrap = false;
         while expected_index < expected.len() {
             if actual_index >= actual.len() {
                 break;
             }
             if actual[actual_index] == expected[expected_index] {
+                let matched = actual[actual_index];
                 actual_index += 1;
                 expected_index += 1;
-                continue;
-            }
-            if expected_index > 0 && actual[actual_index..].starts_with(b"\r\r\n") {
-                actual_index += 3;
+                if matched == b'\n' {
+                    physical_line_start = actual_index;
+                }
                 continue;
             }
             if expected[expected_index] == b'\n' && actual[actual_index..].starts_with(b"\r\n") {
                 // A target TTY may expand a transmitted LF (or the LF half
                 // of CRLF) to CRLF in its local echo.
                 actual_index += 1;
+                continue;
+            }
+            if expected_index > 0
+                && !matches!(expected[expected_index], b'\r' | b'\n')
+                && let Some(wrap) = echoed_hard_wrap(&actual[actual_index..])
+            {
+                if wrap == EchoedHardWrap::CrLf
+                    && actual_index.saturating_sub(physical_line_start)
+                        < MIN_PLAIN_CRLF_HARD_WRAP_COLUMN
+                {
+                    break;
+                }
+                ambiguous_plain_crlf_wrap |= wrap == EchoedHardWrap::CrLf;
+                actual_index += wrap.len();
+                physical_line_start = actual_index;
                 continue;
             }
             break;
@@ -833,10 +925,23 @@ fn find_echo_end(actual: &[u8], expected: &[u8]) -> Option<usize> {
                     actual_index += 1;
                 }
             }
-            return Some(actual_index);
+            return Some(EchoMatch {
+                end: actual_index,
+                ambiguous_plain_crlf_wrap,
+            });
         }
     }
     None
+}
+
+fn echoed_hard_wrap(actual: &[u8]) -> Option<EchoedHardWrap> {
+    if actual.starts_with(b"\r\r\n") {
+        Some(EchoedHardWrap::CrCrLf)
+    } else if actual.starts_with(b"\r\n") {
+        Some(EchoedHardWrap::CrLf)
+    } else {
+        None
+    }
 }
 
 /// Build the completion-matching view while a configured echo is incomplete.
@@ -1467,11 +1572,141 @@ mod tests {
     }
 
     #[test]
-    fn echo_boundary_tolerates_target_cr_cr_lf_hard_wraps() {
-        let expected = b"printf 1234567890\r";
-        let actual = b"stale prompt\r\nprintf 1234\r\r\n567890\r\r\nresult\r\n";
-        let end = find_echo_end(actual, expected).expect("wrapped echo should match");
-        assert_eq!(&actual[end..], b"result\r\n");
+    fn echo_boundary_tolerates_common_target_hard_wraps() {
+        let command = format!("printf {}", "0123456789".repeat(8));
+        let (first, rest) = command.split_at(40);
+        let expected = format!("{command}\r");
+        for (actual, ambiguous) in [
+            (
+                format!("stale prompt\r\n{first}\r\r\n{rest}\r\r\nresult\r\n"),
+                false,
+            ),
+            (
+                format!("stale prompt\r\n{first}\r\n{rest}\r\nresult\r\n"),
+                true,
+            ),
+        ] {
+            let matched = find_echo_end(actual.as_bytes(), expected.as_bytes())
+                .expect("wrapped echo should match");
+            assert_eq!(&actual.as_bytes()[matched.end..], b"result\r\n");
+            assert_eq!(matched.ambiguous_plain_crlf_wrap, ambiguous);
+        }
+    }
+
+    #[test]
+    fn hard_wrap_is_not_consumed_in_place_of_the_transmitted_line_ending() {
+        let command = format!("show {}", "version-".repeat(10));
+        let (first, rest) = command.split_at(40);
+        let expected = format!("{command}\r\n");
+        let actual = format!("{first}\r\n{rest}\r\nresult\r\n");
+        let matched = find_echo_end(actual.as_bytes(), expected.as_bytes())
+            .expect("wrapped CRLF echo should match");
+        assert_eq!(&actual.as_bytes()[matched.end..], b"result\r\n");
+        assert!(matched.ambiguous_plain_crlf_wrap);
+    }
+
+    #[test]
+    fn wrapped_echo_across_rx_events_arms_the_boundary_and_preserves_offsets() {
+        let command = format!("printf {}", "1234567890".repeat(8));
+        let (first, rest) = command.split_at(40);
+        let expected = format!("{command}\r\n");
+        let first_rx = format!("{first}\r\n");
+        let second_rx = format!("{rest}\r\nresult\r\n[root@dut ~]# ");
+        let operation_id = Uuid::new_v4();
+        let mut boundary = CommandBoundaryTracker::new(
+            CommandBoundary {
+                tx_event_seq: 10,
+                operation_id,
+                expected_echo: Some(expected.as_bytes().to_vec()),
+            },
+            CaptureLimits::default(),
+        );
+        boundary.accept(event(
+            10,
+            Direction::Tx,
+            expected.as_bytes(),
+            Some(operation_id),
+        ));
+
+        let mut first_event = event(11, Direction::Rx, first_rx.as_bytes(), None);
+        first_event.stream_offset_start = Some(100);
+        first_event.stream_offset_end = Some(100 + first_rx.len() as u64);
+        let partial = boundary.accept(first_event);
+        assert!(partial.events.is_empty());
+        assert!(partial.reset_matching);
+        assert!(!boundary.echo_observed);
+
+        let second_start = 100 + first_rx.len() as u64;
+        let mut second_event = event(12, Direction::Rx, second_rx.as_bytes(), None);
+        second_event.stream_offset_start = Some(second_start);
+        second_event.stream_offset_end = Some(second_start + second_rx.len() as u64);
+        let accepted = boundary.accept(second_event);
+        assert!(accepted.reset_matching);
+        assert!(accepted.observed_post_tx_rx);
+        assert_eq!(accepted.matching_rx, b"result\r\n[root@dut ~]# ");
+        assert_eq!(accepted.events.len(), 2);
+        assert_eq!(accepted.events[0].data, first_rx.as_bytes());
+        assert_eq!(accepted.events[0].stream_offset_start, Some(100));
+        assert_eq!(accepted.events[1].data, second_rx.as_bytes());
+        assert_eq!(accepted.events[1].stream_offset_start, Some(second_start));
+
+        let (result, pending) = boundary.finish();
+        assert!(result.echo_observed);
+        assert!(result.ambiguous_echo_retained);
+        assert!(result.tx_audit_observed);
+        assert_eq!(result.discarded_rx_byte_count, 0);
+        assert_eq!(
+            result.confidence(&Completion::Pattern("]# ".into())),
+            "echo_ambiguous_retained"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn ordinary_output_newline_does_not_fabricate_a_wrapped_echo() {
+        let operation_id = Uuid::new_v4();
+        let mut boundary = CommandBoundaryTracker::new(
+            CommandBoundary {
+                tx_event_seq: 20,
+                operation_id,
+                expected_echo: Some(b"printf alphabeta\r\n".to_vec()),
+            },
+            CaptureLimits::default(),
+        );
+        boundary.accept(event(
+            20,
+            Direction::Tx,
+            b"printf alphabeta\r\n",
+            Some(operation_id),
+        ));
+
+        let accepted = boundary.accept(event(
+            21,
+            Direction::Rx,
+            b"printf alpha\r\nresult beta\r\n[root@dut ~]# ",
+            None,
+        ));
+        assert!(accepted.events.is_empty());
+        assert!(accepted.reset_matching);
+        assert!(!boundary.echo_observed);
+
+        let (result, pending) = boundary.finish();
+        assert!(!result.echo_observed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].data,
+            b"printf alpha\r\nresult beta\r\n[root@dut ~]# "
+        );
+    }
+
+    #[test]
+    fn short_partial_echo_plus_exact_suffix_is_not_a_hard_wrap() {
+        let expected = b"printf alphabeta\r\n";
+        let actual = b"printf alpha\r\nbeta\r\nRESULT";
+        assert!(
+            find_echo_end(actual, expected).is_none(),
+            "a short ordinary output line must not be consumed as an echo suffix"
+        );
     }
 
     #[test]

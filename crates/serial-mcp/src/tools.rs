@@ -64,6 +64,7 @@ struct ExecutedCommandStep {
     gap: bool,
     interfered: bool,
     echo_missing: bool,
+    echo_ambiguous: bool,
     no_rx: bool,
 }
 
@@ -899,6 +900,7 @@ impl AgentTools {
             gap,
             false,
             false,
+            false,
             result
                 .events
                 .iter()
@@ -1228,19 +1230,6 @@ impl AgentTools {
                 },
             )
             .await;
-        let rendered = render_events(
-            &result.events,
-            RenderOptions {
-                max_chars: DEFAULT_TEXT_CHARS,
-                include_raw: false,
-                // collect_after_write has already consumed the complete
-                // authoritative echo while arming the completion watcher.
-                echo: None,
-                collapse_repeats: true,
-                include_events: false,
-                match_excerpt: None,
-            },
-        );
         let boundary = result
             .command_boundary
             .as_ref()
@@ -1250,6 +1239,21 @@ impl AgentTools {
             })?;
         let interfered = boundary.interfered;
         let echo_missing = boundary.echo_required && !boundary.echo_observed;
+        let echo_ambiguous = boundary.ambiguous_echo_retained;
+        let rendered = render_events(
+            &result.events,
+            RenderOptions {
+                max_chars: DEFAULT_TEXT_CHARS,
+                include_raw: false,
+                // Unambiguous echoes were consumed by collect_after_write.
+                // Ambiguous plain-CRLF wraps remain visible and warning-tagged
+                // so rendering cannot silently discard real RX evidence.
+                echo: None,
+                collapse_repeats: true,
+                include_events: false,
+                match_excerpt: None,
+            },
+        );
         let last_seq = result.through_seq.unwrap_or(write.event_seq);
         let rx_event_count = result
             .events
@@ -1264,6 +1268,7 @@ impl AgentTools {
             gap,
             interfered,
             echo_missing,
+            echo_ambiguous,
             rx_event_count,
         );
         let cursor = Cursor {
@@ -1273,7 +1278,7 @@ impl AgentTools {
         self.remember_live_cursor(&slot.config.port, cursor.clone());
         let mut output = json!({
             "port": slot.config.port,
-            "write": if echo_missing { "uncertain" } else { "confirmed" },
+            "write": command_write_status(echo_missing, echo_ambiguous),
             "capture": completion_kind(&result.completion),
             "execution": "unknown",
             "confidence": confidence,
@@ -1287,6 +1292,9 @@ impl AgentTools {
             "description": prepared.description,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
         });
+        if echo_ambiguous {
+            output["echo_retained"] = json!(true);
+        }
         let no_rx = command_has_no_rx(rx_event_count, boundary.echo_observed);
         attach_capture_warnings(
             &mut output,
@@ -1296,6 +1304,7 @@ impl AgentTools {
             gap,
             interfered,
             echo_missing,
+            echo_ambiguous,
             no_rx,
         );
         attach_omission(&mut output, &rendered);
@@ -1307,6 +1316,7 @@ impl AgentTools {
             gap,
             interfered,
             echo_missing,
+            echo_ambiguous,
             no_rx,
         })
     }
@@ -2500,10 +2510,14 @@ fn command_sequence_stop(
     if executed.interfered {
         return stop("interfered", "another actor wrote during this step");
     }
-    if executed.echo_missing {
+    if executed.echo_missing || executed.echo_ambiguous {
         return stop(
             "echo_uncertain",
-            "the configured command echo was not observed completely",
+            if executed.echo_ambiguous {
+                "the command echo used an ambiguous plain-CRLF wrap; raw RX was retained"
+            } else {
+                "the configured command echo was not observed completely"
+            },
         );
     }
     if executed.no_rx {
@@ -2808,12 +2822,21 @@ fn completion_kind(completion: &Completion) -> &'static str {
     }
 }
 
+fn command_write_status(echo_missing: bool, echo_ambiguous: bool) -> &'static str {
+    if echo_missing || echo_ambiguous {
+        "uncertain"
+    } else {
+        "confirmed"
+    }
+}
+
 fn command_confidence(
     completion: &Completion,
     output_truncated: bool,
     has_gap: bool,
     interfered: bool,
     echo_missing: bool,
+    echo_ambiguous: bool,
     rx_event_count: usize,
 ) -> &'static str {
     if has_gap
@@ -2831,7 +2854,7 @@ fn command_confidence(
         "incomplete"
     } else if matches!(completion, Completion::Quiet) {
         "low"
-    } else if echo_missing {
+    } else if echo_missing || echo_ambiguous {
         "medium"
     } else if rx_event_count == 0 {
         "low"
@@ -2872,6 +2895,7 @@ fn attach_capture_warnings(
     gap: bool,
     interfered: bool,
     echo_missing: bool,
+    echo_ambiguous: bool,
     no_rx: bool,
 ) {
     let mut warnings: Vec<String> = Vec::new();
@@ -2889,6 +2913,11 @@ fn attach_capture_warnings(
     }
     if echo_missing {
         warnings.push("configured echo missing; target delivery may be incomplete".into());
+    }
+    if echo_ambiguous {
+        warnings.push(
+            "plain-CRLF echo wrap was ambiguous; original RX was retained in command text".into(),
+        );
     }
     if no_rx {
         warnings.push("no post-boundary RX observed".into());
@@ -3301,6 +3330,57 @@ mod completion_tests {
         assert_eq!(context["events"][0]["previous_model_family"], "TL-AS7230");
         assert_eq!(context["events"][0]["new_model_family"], "TL-AS7250");
         assert_eq!(context["events"][0]["new_model_name"], "TL-AS7230-F4GE 1.0");
+    }
+
+    #[test]
+    fn ambiguous_plain_crlf_echo_is_uncertain_medium_and_warning_tagged() {
+        let completion = Completion::Pattern("dut# ".into());
+        assert_eq!(command_write_status(false, true), "uncertain");
+        assert_eq!(
+            command_confidence(&completion, false, false, false, false, true, 2),
+            "medium"
+        );
+
+        let mut output = json!({"echo_retained": true});
+        attach_capture_warnings(
+            &mut output,
+            &completion,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(output["echo_retained"], true);
+        assert!(
+            output["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("ambiguous")))
+        );
+
+        let executed = ExecutedCommandStep {
+            output,
+            completion,
+            cursor: Cursor {
+                epoch: Uuid::new_v4(),
+                after_seq: 10,
+            },
+            truncated: false,
+            gap: false,
+            interfered: false,
+            echo_missing: false,
+            echo_ambiguous: true,
+            no_rx: false,
+        };
+        let stop = command_sequence_stop(&executed, true)
+            .expect("an ambiguous intermediate echo must stop the sequence");
+        assert_eq!(stop.code, "echo_uncertain");
     }
 }
 

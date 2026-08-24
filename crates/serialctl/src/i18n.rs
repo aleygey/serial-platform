@@ -425,6 +425,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "配置机型名",
     ),
     (
+        "menu.delete.transport",
+        "Delete Serial Profile",
+        "删除串口 Profile",
+    ),
+    (
+        "menu.delete.device",
+        "Delete Model Profile",
+        "删除机型 Profile",
+    ),
+    (
         "menu.create.transport.title",
         "Create Serial Profile",
         "创建串口 Profile",
@@ -433,6 +443,26 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.create.model.title",
         "Create Model Profile",
         "创建机型 Profile",
+    ),
+    (
+        "menu.delete.transport.title",
+        "Delete Serial Profile",
+        "删除串口 Profile",
+    ),
+    (
+        "menu.delete.device.title",
+        "Delete Model Profile",
+        "删除机型 Profile",
+    ),
+    (
+        "menu.delete.transport.empty",
+        "No Serial Profile is configured",
+        "暂无可删除的串口 Profile",
+    ),
+    (
+        "menu.delete.device.empty",
+        "No Model Profile is configured",
+        "暂无可删除的机型 Profile",
     ),
     (
         "menu.create.row.name",
@@ -568,6 +598,21 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "草稿已修改；请选择“保存并应用配置修改”提交",
     ),
     (
+        "menu.current.port.switched",
+        "Now editing port {}; drafts are retained per port within this catalog revision",
+        "正在修改串口 {}；当前目录版本内会分别保留各串口草稿",
+    ),
+    (
+        "menu.current.drafts.expired",
+        "unsaved port drafts from the previous catalog revision were discarded",
+        "目录版本已变化；其他未保存的串口草稿已丢弃",
+    ),
+    (
+        "menu.current.port.only",
+        "Only one configured port is available",
+        "当前只有一个已配置串口",
+    ),
+    (
         "menu.current.no.changes",
         "There are no configuration changes to save",
         "当前没有需要保存的配置修改",
@@ -669,6 +714,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "串口 Profile {} 已创建",
     ),
     (
+        "menu.transport.deleted",
+        "Serial Profile {} deleted",
+        "串口 Profile {} 已删除",
+    ),
+    (
         "menu.transport.missing",
         "Serial Profile {} no longer exists",
         "串口 Profile {} 已不存在",
@@ -677,6 +727,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "menu.device.created",
         "Model Profile {} created",
         "机型 Profile {} 已创建",
+    ),
+    (
+        "menu.device.deleted",
+        "Model Profile {} deleted",
+        "机型 Profile {} 已删除",
     ),
     (
         "menu.device.missing",
@@ -689,9 +744,88 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "一级机型名 {} 已创建",
     ),
     (
+        "menu.model.family.deleted",
+        "First-level model name {} deleted",
+        "一级机型名 {} 已删除",
+    ),
+    (
         "menu.model.name.created",
         "Second-level model name {} added to {}",
         "二级机型名 {} 已添加到 {}",
+    ),
+    (
+        "menu.model.name.deleted",
+        "Second-level model name {} removed from {}",
+        "二级机型名 {} 已从 {} 删除",
+    ),
+    (
+        "menu.model.name.missing",
+        "Second-level model name {} no longer exists",
+        "二级机型名 {} 已不存在",
+    ),
+    ("menu.delete.title", "Confirm deletion", "确认删除"),
+    (
+        "menu.delete.kind.transport",
+        "Serial Profile",
+        "串口 Profile",
+    ),
+    ("menu.delete.kind.device", "Model Profile", "机型 Profile"),
+    ("menu.delete.confirm", "Delete {} “{}”?", "确认删除{}“{}”？"),
+    (
+        "menu.delete.confirm.model.family",
+        "Delete first-level model name “{}”?",
+        "确认删除一级机型名“{}”？",
+    ),
+    (
+        "menu.delete.confirm.model.name",
+        "Delete model name “{}”?",
+        "确认删除机型名“{}”？",
+    ),
+    (
+        "menu.delete.permanent",
+        "This operation is permanent and is protected by the configuration revision guard.",
+        "此操作不可撤销，并受配置版本保护。",
+    ),
+    (
+        "menu.delete.pending",
+        "Review the deletion, then explicitly confirm or cancel",
+        "请核对删除内容后明确确认或取消",
+    ),
+    ("menu.delete.cancelled", "Deletion cancelled", "已取消删除"),
+    (
+        "menu.transport.delete.safe",
+        "The built-in generic-115200 Serial Profile cannot be deleted",
+        "内置串口 Profile generic-115200 不能删除",
+    ),
+    (
+        "menu.transport.delete.in.use",
+        "Serial Profile {} is bound to port(s) {}; bind another Profile first",
+        "串口 Profile {} 正绑定于串口 {}；请先改绑其他 Profile",
+    ),
+    (
+        "menu.device.delete.in.use",
+        "Model Profile {} is bound to port(s) {}; unbind it first",
+        "机型 Profile {} 正绑定于串口 {}；请先解除绑定",
+    ),
+    (
+        "menu.model.family.delete.in.use",
+        "Model family {} is bound to port(s) {}; clear those model identities first",
+        "一级机型名 {} 正绑定于串口 {}；请先清除这些机型身份",
+    ),
+    (
+        "menu.model.name.delete.in.use",
+        "Model name {} is bound to port(s) {}; select another model name first",
+        "机型名 {} 正绑定于串口 {}；请先选择其他机型名",
+    ),
+    (
+        "menu.model.family.delete.detail",
+        "Deleting this family also deletes its {} second-level model name(s).",
+        "删除该一级机型名也会删除其下 {} 个二级机型名。",
+    ),
+    (
+        "menu.model.name.delete.detail",
+        "The model name belongs to family {}.",
+        "该机型名属于一级机型 {}。",
     ),
     (
         "menu.model.family.name.invalid",
@@ -831,6 +965,21 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "↑/↓ 选择 · → 展开 · ← 折叠/返回 · Enter 确认 · ? 说明",
     ),
     (
+        "menu.footer.profiles",
+        "Tab/Shift+Tab switch port · ↑/↓ select · Enter edit · ← back · ? help",
+        "Tab/Shift+Tab 切换串口 · ↑/↓ 选择 · Enter 修改 · ← 返回 · ? 说明",
+    ),
+    (
+        "menu.footer.model.configure",
+        "↑/↓ select · Enter add/open · D/Delete remove · ← back · ? help",
+        "↑/↓ 选择 · Enter 新增/进入 · D/Delete 删除 · ← 返回 · ? 说明",
+    ),
+    (
+        "menu.footer.delete",
+        "↑/↓ select · Enter delete · ← back · ? help",
+        "↑/↓ 选择 · Enter 删除 · ← 返回 · ? 说明",
+    ),
+    (
         "menu.footer.help",
         "PgUp/PgDn scroll · Esc returns to the menu",
         "PgUp/PgDn 滚动 · Esc 返回菜单",
@@ -908,9 +1057,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "创建串口 Profile、机型 Profile，或配置两级机型名。",
     ),
     (
+        "menu.help.field.delete",
+        "Only unused Profiles can be deleted. Every deletion requires confirmation and the current catalog revision.",
+        "只能删除未绑定的 Profile；每次删除都需要确认并校验当前目录版本。",
+    ),
+    (
         "menu.help.field.model.configure",
-        "Add a first-level model name, then enter it to add second-level concrete model names.",
-        "先新增一级机型名，再进入该层级新增二级具体机型名。",
+        "Add or enter model-name levels with Enter. Press D/Delete to remove the selected unused name.",
+        "按 Enter 新增或进入机型层级；按 D/Delete 删除所选且未绑定的机型名。",
     ),
     (
         "menu.help.field.display",
@@ -1141,8 +1295,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "ui.scroll.plain",
-        "wheel/PgUp/PgDn browse Agent history",
-        "滚轮/PgUp/PgDn 查看 Agent 历史",
+        "wheel/PgUp/PgDn serial output · arrows Agent history",
+        "滚轮/PgUp/PgDn 滚动串口 · 方向键浏览 Agent 历史",
     ),
     // ---- Help popup ----
     ("help.title", " serialctl help ", " serialctl 帮助 "),
@@ -1172,8 +1326,18 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.history.expand", "Right / Left", "右 / 左"),
     (
         "help.desc.history.expand",
-        "Enter or return one level of the three-level tree",
-        "进入或返回三层树的一个层级",
+        "Move one level deeper or back in the three-level tree",
+        "在三层树中进入或返回一个层级",
+    ),
+    (
+        "help.key.history.detail",
+        "Shift-Up / Shift-Down",
+        "Shift-上 / Shift-下",
+    ),
+    (
+        "help.desc.history.detail",
+        "Scroll a long expanded Agent detail",
+        "滚动展开后的长 Agent 详情",
     ),
     ("help.key.history.panel", "Ctrl-] h", "Ctrl-] h"),
     (
@@ -1188,8 +1352,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "help.desc.scroll",
-        "Browse the current Agent-history level",
-        "浏览当前 Agent 历史层级",
+        "Scroll serial output regardless of Agent-history focus",
+        "始终滚动串口输出，不受 Agent 历史焦点影响",
     ),
     ("help.key.follow", "Ctrl-] f", "Ctrl-] f"),
     (
@@ -1214,8 +1378,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.enter", "Enter", "Enter"),
     (
         "help.desc.enter",
-        "Send non-empty input; empty input follows the live tail",
-        "发送非空命令；空输入回到串口底部",
+        "Send input or a bare effective Profile EOL (CR if configured empty), then follow the live tail",
+        "发送命令或单独的有效 Profile 换行符（明确配置为空时发 CR），然后回到串口底部",
     ),
     ("help.key.alt.enter", "Alt-Enter", "Alt-Enter"),
     (
@@ -1570,11 +1734,6 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "已关闭排队命令选择",
     ),
     (
-        "st.agent.enter.follow",
-        "Agent Run is active; empty Enter only resumed live output",
-        "Agent 任务正在执行；空回车只会回到最新输出",
-    ),
-    (
         "st.cooperative.unavailable",
         "cooperative input requires a matching active Agent lease and Run; draft kept",
         "直接发送要求当前 Agent 的控制权租约与 Agent 任务匹配；命令草稿已保留",
@@ -1611,8 +1770,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.run.panel.focused",
-        "command-history bar focused; Up/Down selects, Enter expands and locates output, Ctrl-] h hides",
-        "已聚焦命令记录横栏；上下选择，Enter 展开并定位串口输出，Ctrl-] h 隐藏",
+        "command-history bar focused; arrows select and expand, Ctrl-] h hides",
+        "已聚焦命令记录横栏；方向键选择并展开，Ctrl-] h 隐藏",
     ),
     (
         "st.run.panel.hidden",
@@ -1678,6 +1837,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "st.run.jump.query.unavailable",
         "exact command evidence query is unavailable",
         "命令完整证据查询当前不可用",
+    ),
+    (
+        "st.evidence.jump.cancelled",
+        "manual serial scrolling cancelled the pending Agent evidence jump",
+        "已手动滚动串口；已取消等待中的 Agent 证据跳转",
     ),
     (
         "st.clipboard.copy.failed",

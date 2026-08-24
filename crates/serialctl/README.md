@@ -77,7 +77,7 @@ serial profile detach --port COM4 --transport
 
 裸 `serial profile detach --port COM4` 只解绑机型行为 Profile，等价于 `--model`；设备身份只有显式传入 `--identity` 才会清除。`--model-family` 与 `--model-name` 必须成对提供。
 
-`update` 只改变显式字段；`--interactive` 使用当前值作为默认。Model prompt 用 `--clear-shell-prompt` / `--clear-uboot-prompt` 清空；EOL、echo、chunk size/delay 可用对应 `--inherit-*` 恢复通用值。一级与二级机型名在 TUI 的“创建配置 → 配置机型名”中维护，不增加另一套 Profile CLI。
+`update` 只改变显式字段；`--interactive` 使用当前值作为默认。Model prompt 用 `--clear-shell-prompt` / `--clear-uboot-prompt` 清空；EOL、echo、chunk size/delay 可用对应 `--inherit-*` 恢复通用值。一级与二级机型名在 TUI 的“创建配置 → 配置机型名”中维护；按 `D` / `Delete` 可删除所选且未绑定的一级或二级机型名，不增加另一套 Profile CLI。
 
 运行中 Profile mutation 带 `config_revision`，避免较旧页面覆盖新的配置。Transport 变化按需要重开串口；Model 行为更新在 snapshot 刷新后立即生效。
 
@@ -97,10 +97,10 @@ serial profile detach --port COM4 --transport
 全局行为：
 
 - 输入任意可打印字符、Backspace、Delete、Tab 或 Enter，都会进入命令输入行。
-- 输入有内容时 Enter 发送；输入为空时 Enter 返回当前串口底部，不发送空命令。
+- Enter 总会尝试写串口并返回当前输出底部：有内容时发送“内容 + 有效 Profile EOL”，空输入时发送有效 Profile EOL；若有效 EOL 明确配置为空，空输入固定发送一个 `CR`。写入暂时无法排队时保留原草稿，便于重试。
 - `↑` / `↓` 选择任务与命令 action；`→` 进入子层级；`←` 返回上一层。
-- `PgUp` / `PgDn` 浏览当前历史层级；展开详情时滚动详情内容。
-- 鼠标滚轮与 `PgUp` / `PgDn` 行为相同，不需要点击不同 pane 切换焦点。
+- 展开详情后用 `Shift+↑` / `Shift+↓` 滚动长内容；普通方向键仍只控制历史树。
+- `PgUp` / `PgDn` 和鼠标滚轮始终滚动串口输出，不受鼠标位置或 Agent 历史焦点影响。
 - `Alt-1` … `Alt-9` 直接切换端口。
 - `Ctrl-R` 在命令输入中搜索人工输入历史。
 
@@ -141,9 +141,11 @@ serial profile detach --port COM4 --transport
 contains | regex | shell_prompt | uboot_prompt
 ```
 
-它从命令后的 RX 开始匹配第一个完成边界，并将设备 echo、返回内容和完成边界组成的捕获区域定位到主终端、使用独立底色高亮。`command_sequence` 每个 step 使用自己的 TX 起点、下一 step 上界和 matcher 独立定位。本地同周期窗口只有在捕获区间完整可信时才直接高亮，否则异步读取 journal；缺口不会降级成局部高亮。没有 matcher 或持久记录也没有匹配时，仅临时展示命令文本，不修改持久 RX 画面。
+定位不会拿面板中的命令字符串和某一行 RX 做全串相等比较：权威起点是 TX 的 daemon epoch、sequence、operation/run 标识，终点才由上述 matcher 确认。echo=On 时 serial-mcp 另用预期 TX 字节确认设备回显；长命令越过目标 TTY 列宽时，跨 RX event 的 `CRLF` / `CRCRLF` 物理硬换行都按逻辑连续命令处理。明确的 `CRCRLF` 回显可安全剥离；普通 `CRLF` 与真实输出换行存在字节级歧义，因此只在达到合理终端列宽后参与匹配，同时保留原始 RX、把置信度降为 medium 并返回 warning，避免静默吞掉串口证据。
 
-默认 inline content 高度为 5 行，可在“设置 → 终端界面显示设置”中修改 `agent_history_rows` 为 3–20。小终端使用独立详情视图，展开状态不会因滚轮或实时输出自动折叠。
+TUI 从命令后的 RX 开始匹配第一个完成边界，并将设备 echo、返回内容和完成边界组成的捕获区域定位到主终端、使用独立底色高亮。`command_sequence` 每个 step 使用自己的 TX 起点、下一 step 上界和 matcher 独立定位。本地同周期窗口只有在捕获区间完整可信时才直接高亮，否则异步读取 journal；缺口不会降级成局部高亮。没有 matcher 或持久记录也没有匹配时，仅临时展示命令文本，不修改持久 RX 画面。
+
+默认 inline content 高度为 5 行，可在“设置 → 终端界面显示设置”中修改 `agent_history_rows` 为 3–20。小终端使用独立详情视图，展开状态不会因滚轮或实时输出自动折叠；长详情用 `Shift+↑` / `Shift+↓` 滚动。
 
 ## 文本选择
 
@@ -188,8 +190,8 @@ serial logs --port COM4 --run UUID --direction rx
 
 菜单只有四个主入口：
 
-1. “修改当前串口配置”：选择端口、已有串口 Profile、UART 离散参数、已有机型 Profile 和具体机型名；
-2. “创建配置”：可创建串口 Profile、机型 Profile，或维护一级机型系列与二级具体机型名，不自动改变当前端口绑定；
+1. “修改当前串口配置”：选择端口、已有串口 Profile、UART 离散参数、已有机型 Profile 和具体机型名；按 `Tab` / `Shift+Tab` 可在菜单内切换目标串口，同一配置目录 revision 内各串口草稿独立保留；revision 因保存、目录 mutation 或 Reload 改变时，旧草稿会失效并明确提示；
+2. “创建配置”：可创建或删除未绑定的串口/机型 Profile，也可维护一级机型系列与二级具体机型名，不自动改变当前端口绑定；
 3. “设置”：进入“终端界面显示设置”或“serial MCP 设置”；
 4. “帮助”：按固定列显示“按键 + 简洁说明”。
 
