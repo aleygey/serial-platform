@@ -5418,17 +5418,14 @@ impl App {
         }
 
         match key.code {
-            KeyCode::PageUp => {
-                self.run_panel_visible = true;
-                self.focus = PaneFocus::RunHistory;
-                self.handle_run_history_key(key);
-                self.dirty = true;
-                return;
-            }
-            KeyCode::PageDown => {
-                self.run_panel_visible = true;
-                self.focus = PaneFocus::RunHistory;
-                self.handle_run_history_key(key);
+            KeyCode::PageUp | KeyCode::PageDown => {
+                if self.focus == PaneFocus::RunHistory {
+                    self.handle_run_history_key(key);
+                } else if key.code == KeyCode::PageUp {
+                    self.scroll_up(10);
+                } else {
+                    self.scroll_down(10);
+                }
                 self.dirty = true;
                 return;
             }
@@ -5483,16 +5480,27 @@ impl App {
         ) {
             self.last_output_click = None;
             self.clear_text_selection();
-            self.run_panel_visible = true;
-            self.focus = PaneFocus::RunHistory;
-            self.handle_run_history_key(KeyEvent::new(
-                if mouse.kind == MouseEventKind::ScrollUp {
-                    KeyCode::PageUp
-                } else {
-                    KeyCode::PageDown
-                },
-                KeyModifiers::NONE,
-            ));
+            let position = Position::new(mouse.column, mouse.row);
+            let over_run_history = self
+                .layout
+                .and_then(|layout| layout.run_history_area)
+                .is_some_and(|area| rect_contains(area, position));
+            if over_run_history {
+                self.run_panel_visible = true;
+                self.focus = PaneFocus::RunHistory;
+                self.handle_run_history_key(KeyEvent::new(
+                    if mouse.kind == MouseEventKind::ScrollUp {
+                        KeyCode::PageUp
+                    } else {
+                        KeyCode::PageDown
+                    },
+                    KeyModifiers::NONE,
+                ));
+            } else if mouse.kind == MouseEventKind::ScrollUp {
+                self.scroll_up(3);
+            } else {
+                self.scroll_down(3);
+            }
             self.dirty = true;
             return;
         }
@@ -19489,7 +19497,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_pages_agent_history_without_mouse_focus_routing() {
+    fn mouse_wheel_scrolls_serial_output_without_browsing_agent_history() {
         let mut current = snapshot();
         let run = agent_run("滚轮巡检");
         current.active_run = Some(run.clone());
@@ -19510,22 +19518,83 @@ mod tests {
             );
             app.ports[0].push_event(tx, true);
         }
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let output = app.layout.expect("console layout").output_inner;
         let (commands, _) = mpsc::channel(1);
 
         app.handle_terminal_event(
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollUp,
-                column: 1,
-                row: 1,
+                column: output.x,
+                row: output.y,
                 modifiers: KeyModifiers::NONE,
             }),
             &commands,
         );
 
-        assert_eq!(app.focus, PaneFocus::RunHistory);
+        assert_eq!(app.focus, PaneFocus::Input);
         assert_eq!(app.current().selected_run, Some(run.id));
         assert!(app.current().selected_run_command.is_none());
+        assert_eq!(app.current().scroll_from_bottom, 3);
+
+        app.handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: output.x,
+                row: output.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &commands,
+        );
         assert_eq!(app.current().scroll_from_bottom, 0);
+        assert!(app.current().scroll_snapshot.is_none());
+    }
+
+    #[test]
+    fn page_keys_scroll_serial_output_until_agent_history_has_focus() {
+        let mut current = snapshot();
+        let run = agent_run("翻页巡检");
+        current.active_run = Some(run.clone());
+        let epoch = current.daemon_epoch;
+        let mut app = App::new(vec![current], None);
+        for seq in 0..30 {
+            app.ports[0].push_line(stream_row(seq, Direction::Rx, "row"), true);
+        }
+        for seq in 31..40 {
+            let mut tx = event(EventKind::Tx, Direction::Tx, seq, b"command\r");
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata.insert(
+                "command_description".into(),
+                serde_json::json!(format!("command-{seq}")),
+            );
+            app.ports[0].push_event(tx, true);
+        }
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let (commands, _) = mpsc::channel(1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &commands,
+        );
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert!(app.current().scroll_from_bottom > 0);
+        assert!(app.current().selected_run_command.is_none());
+
+        let serial_scroll = app.current().scroll_from_bottom;
+        app.focus = PaneFocus::RunHistory;
+        app.handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &commands,
+        );
+        assert_eq!(app.focus, PaneFocus::RunHistory);
+        assert_eq!(app.current().scroll_from_bottom, serial_scroll);
     }
 
     #[test]

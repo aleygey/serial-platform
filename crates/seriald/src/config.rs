@@ -632,9 +632,42 @@ impl ConfigStore {
         }
         let serialized =
             toml::to_string_pretty(migrated).map_err(|_| ConfigError::Serialization)?;
-        atomic_write(&self.paths.config_file, serialized.as_bytes())
-            .map_err(|source| io_error(&self.paths.config_file, source))?;
-        Ok(true)
+        #[cfg(windows)]
+        {
+            let mut last_error = match atomic_write(&self.paths.config_file, serialized.as_bytes())
+            {
+                Ok(()) => return Ok(true),
+                Err(source) if is_windows_replace_contention(&source) => source,
+                Err(source) => return Err(io_error(&self.paths.config_file, source)),
+            };
+            for delay_ms in [1, 2, 4, 8, 16, 32, 64] {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                match self.read_serialized() {
+                    Ok(current) if current != expected_source => return Ok(false),
+                    Ok(_) => {}
+                    Err(ConfigError::Io { source, .. })
+                        if is_windows_replace_contention(&source) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                match atomic_write(&self.paths.config_file, serialized.as_bytes()) {
+                    Ok(()) => return Ok(true),
+                    Err(source) if is_windows_replace_contention(&source) => {
+                        last_error = source;
+                    }
+                    Err(source) => return Err(io_error(&self.paths.config_file, source)),
+                }
+            }
+            Err(io_error(&self.paths.config_file, last_error))
+        }
+        #[cfg(not(windows))]
+        {
+            atomic_write(&self.paths.config_file, serialized.as_bytes())
+                .map_err(|source| io_error(&self.paths.config_file, source))?;
+            Ok(true)
+        }
     }
 
     #[cfg(test)]
@@ -940,22 +973,21 @@ pub(crate) fn validate_ports(
             }
         }
 
-        if let Some(model_profile) = slot.model_profile.as_deref() {
-            if !model_profiles
+        if let Some(model_profile) = slot.model_profile.as_deref()
+            && !model_profiles
                 .iter()
                 .any(|profile| profile.name == model_profile)
-            {
-                let available = model_profiles
-                    .iter()
-                    .map(|profile| profile.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(ConfigValidationError::UnknownModelProfile {
-                    port: slot.port.clone(),
-                    name: model_profile.to_owned(),
-                    available: catalog_summary(available),
-                });
-            }
+        {
+            let available = model_profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ConfigValidationError::UnknownModelProfile {
+                port: slot.port.clone(),
+                name: model_profile.to_owned(),
+                available: catalog_summary(available),
+            });
         }
 
         match (slot.model_family.as_deref(), slot.model_name.as_deref()) {
@@ -1373,6 +1405,11 @@ fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn is_windows_replace_contention(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 #[cfg(not(windows))]
