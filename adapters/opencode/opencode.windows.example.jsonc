@@ -5,11 +5,12 @@
       "type": "local",
       "command": ["C:\\Tools\\serial-platform\\serial.exe", "mcp", "--actor-label", "opencode:workstation"],
       "enabled": true,
-      "timeout": 120000
+      "timeout": 130000
     }
   },
   "permission": {
     "serial_devices": "allow",
+    "serial_model_identity_set": "ask",
     "serial_read": "allow",
     "serial_wait": "allow",
     "serial_search": "allow",
@@ -19,11 +20,10 @@
     "serial_monitor_start": "ask",
     "serial_monitor_stop": "ask",
     "serial_command": "ask",
-    "serial_input": "ask",
+    "serial_command_sequence": "ask",
     "serial_signal": "ask",
     "serial_trigger": "ask",
     "serial_run_start": "ask",
-    "serial_run_end": "ask",
-    "serial_release": "allow"
+    "serial_run_end": "ask"
   }
 }

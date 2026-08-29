@@ -97,7 +97,7 @@ serial profile detach --port COM4 --transport
 全局行为：
 
 - 输入任意可打印字符、Backspace、Delete、Tab 或 Enter，都会进入命令输入行。
-- Enter 总会尝试写串口并返回当前输出底部：有内容时发送“内容 + 有效 Profile EOL”，空输入时发送有效 Profile EOL；若有效 EOL 明确配置为空，空输入固定发送一个 `CR`。写入暂时无法排队时保留原草稿，便于重试。
+- Enter 总会立即尝试写串口并返回当前输出底部：有内容时发送“内容 + 有效 Profile EOL”，空输入时发送有效 Profile EOL；若有效 EOL 明确配置为空，空输入固定发送一个 `CR`。端口正由 Agent Run 使用时，同一个 Enter 会作为 Human command 立即发送并建立 Agent 读取门禁，不进入等待队列；发送失败时保留原草稿，便于重试。Alt+Enter 没有独立语义。
 - `↑` / `↓` 选择任务与命令 action；`→` 进入子层级；`←` 返回上一层。
 - 展开详情后用 `Shift+↑` / `Shift+↓` 滚动长内容；普通方向键仍只控制历史树。
 - `PgUp` / `PgDn` 和鼠标滚轮始终滚动串口输出，不受鼠标位置或 Agent 历史焦点影响。
@@ -113,15 +113,12 @@ serial profile detach --port COM4 --transport
 | `l` / `r` | LINE / RAW 模式 |
 | `f` 或 `End` | 串口输出返回最新 |
 | `PgUp` / `PgDn` | 滚动串口输出 |
-| `/` | 搜索持久串口历史 |
+| `/` | 在串口输出右上角打开即时查找 |
 | `m` | 打开配置菜单 |
 | `o` | 打开当前端口/Profile 配置 |
 | `h` | 显示/隐藏 Agent 历史 |
 | `t` | 人工 Takeover |
 | `c` | 释放人工 Control |
-| `u` | 查看排队的 LINE 命令 |
-| `d` | 删除最新排队命令 |
-| `e` | 将最新排队命令取回编辑 |
 | `p` | 确认粘贴 |
 | `g` | 中英文切换 |
 | `?` | 完整帮助 |
@@ -135,13 +132,15 @@ serial profile detach --port COM4 --transport
 
 用 `↑` / `↓` 在当前层级选择，用 `→` 依次从 Run 进入 description、再进入具体命令，用 `←` 逐层返回。普通 `command` 的第三层只有一条具体命令；`command_sequence` 的第三层按 step 顺序列出多条命令，上下选择时同步定位各自的串口证据。Monitor 按 `→` 进入 matcher，再按 `→` 进入 incident；选择 incident 后按它的 `serial_range` 跳转串口证据。命令捕获和 incident 属于旧后端周期，或完整范围已从本地窗口淘汰时，TUI 会从 journal 回取原周期的完整连续区间并高亮 RX；retention gap、缺失、超限或查询失败会返回实时尾并明确提示，不显示可能误导的局部证据。
 
-选择具体命令时，TUI 读取该 TX 事件保存的 `command_capture_matchers`：
+选择具体命令时，新记录优先使用 daemon 持久化的 `command_capture_completed` 权威范围，其中包含 TX、evidence 序号、RX stream offsets、完成方式和置信度。它直接限定真正属于该命令的输出，不会因为后续重复提示符而漂移。
+
+只有尚未携带权威 capture 的旧记录，TUI 才读取 TX 事件保存的 `command_capture_matchers`：
 
 ```text
 contains | regex | shell_prompt | uboot_prompt
 ```
 
-定位不会拿面板中的命令字符串和某一行 RX 做全串相等比较：权威起点是 TX 的 daemon epoch、sequence、operation/run 标识，终点才由上述 matcher 确认。echo=On 时 serial-mcp 另用预期 TX 字节确认设备回显；长命令越过目标 TTY 列宽时，跨 RX event 的 `CRLF` / `CRCRLF` 物理硬换行都按逻辑连续命令处理。明确的 `CRCRLF` 回显可安全剥离；普通 `CRLF` 与真实输出换行存在字节级歧义，因此只在达到合理终端列宽后参与匹配，同时保留原始 RX、把置信度降为 medium 并返回 warning，避免静默吞掉串口证据。
+旧记录推断不会拿面板中的命令字符串和某一行 RX 做全串相等比较：起点绑定 TX 的 daemon epoch、generation、sequence、operation/run 标识，且不能越过下一条外部 TX 或硬边界，终点才由上述 matcher 确认；界面会明确标为 inferred。echo=On 时 serial-mcp 另用预期 TX 字节确认设备回显；长命令越过目标 TTY 列宽时，跨 RX event 的 `CRLF` / `CRCRLF` 物理硬换行都按逻辑连续命令处理。明确的 `CRCRLF` 回显可安全剥离；普通 `CRLF` 与真实输出换行存在字节级歧义，因此只在达到合理终端列宽后参与匹配，同时保留原始 RX、把置信度降为 medium 并返回 warning，避免静默吞掉串口证据。
 
 TUI 从命令后的 RX 开始匹配第一个完成边界，并将设备 echo、返回内容和完成边界组成的捕获区域定位到主终端、使用独立底色高亮。`command_sequence` 每个 step 使用自己的 TX 起点、下一 step 上界和 matcher 独立定位。本地同周期窗口只有在捕获区间完整可信时才直接高亮，否则异步读取 journal；缺口不会降级成局部高亮。没有 matcher 或持久记录也没有匹配时，仅临时展示命令文本，不修改持久 RX 画面。
 
@@ -163,18 +162,22 @@ TUI 启动后，先从 `seriald` journal 恢复当前 `daemon_epoch` 的记录�
 
 恢复受明确边界保护：最近最多 20,000 序号、每端口 8 MiB 处理预算、全部端口 10 秒启动预算。范围不足、retention gap 或读取失败会显示出来，不假装完整。
 
-`Ctrl-] /` 打开持久搜索：
+`Ctrl-] /` 在串口输出栏右上角打开默认隐藏的即时查找框。焦点直接进入搜索输入，输入每个字符都会在实际显示文本中重新匹配并把主输出定位到最新结果的上下文；多个结果循环导航，关闭后恢复原焦点。
 
 | 键 | 选项 |
 |---|---|
-| `F2` / `Tab` | 普通文本 / regex |
-| `F3` | 大小写敏感 |
-| `F4` | RX / TX 方向 |
-| `F5` | 当前周期 / 全部保留周期 / 当前 Agent Run |
-| `↑` / `↓` | 选择结果 |
-| `PgUp` / `PgDn` | 滚动结果详情 |
+| 直接输入 / 粘贴 | 立即匹配并定位 |
+| `Enter` / `F3` / `↓` | 下一个结果（到末尾后循环） |
+| `Shift+Enter` / `Shift+F3` / `↑` | 上一个结果（到开头后循环） |
+| `Alt+R` | 普通文本 / regex |
+| `Alt+C` | 区分 / 忽略大小写 |
+| `Alt+D` | RX + TX / 仅 RX / 仅 TX |
+| `Alt+S` | 当前周期 / 本地保留输出 / 当前 Agent Run |
+| `Esc` | 关闭查找并恢复原焦点 |
 
-搜索结果放在独立视图，不把旧周期 bytes 混入实时终端。交互搜索最多显示 200 条、扫描最近四个 archive、每个 archive 最近 10,000 序号、八次 HTTP 请求、单响应 16 MiB、总时限 10 秒。partial、truncated 和 gap 明确显示。
+搜索针对经过终端控制序列清洗后的连续显示行，同一逻辑行可跨多个 timeline event；正则表达式每次查询只编译一次。结果使用 epoch、sequence、行内 offset 作为稳定锚点；追加输出以 100 ms 合并刷新，停留在最新命中时会跟随新结果，查看旧命中时不会跳走。搜索范围受 TUI 当前保留窗口约束；更早内容已经淘汰时查找框会明确显示不完整警告，不会声称零结果覆盖了全部 journal。完整持久历史请使用下列有界 CLI 查询。
+
+Agent 请求在当前 Human Control 上启动 Run 时，TUI 会显示阻塞式审批框；只有当前精确持有者可以批准或拒绝。批准会由 daemon 原子转交 Control 并开始 Run，不存在“批准后 Agent 尚未接管”的写入窗口；审批期间普通输入不会穿透弹窗。
 
 完整 CLI 查询：
 

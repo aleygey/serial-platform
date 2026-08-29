@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 /// Shared protocol generation for HTTP DTOs, WebSocket control/timeline
 /// frames, and cross-component compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -43,6 +43,12 @@ pub const MAX_PHYSICAL_WRITE_TIMEOUT_MS: u64 = 15_000;
 /// Maximum UTF-8 size of the human-readable purpose attached to one Agent
 /// command. The purpose is durable audit metadata, not serial payload.
 pub const MAX_COMMAND_DESCRIPTION_BYTES: usize = 256;
+/// Shared UTF-8 byte bound for one command capture matcher and the exact
+/// completion detail copied from it. Matcher syntax is data rather than a
+/// human-readable label, so newlines and other control characters are valid.
+pub const MAX_COMMAND_CAPTURE_DETAIL_BYTES: usize = 4 * 1024;
+/// Hard bound for matcher metadata attached to one physical command write.
+pub const MAX_COMMAND_CAPTURE_MATCHERS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -249,7 +255,80 @@ pub enum CommandCaptureMatcherKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandCaptureMatcher {
     pub kind: CommandCaptureMatcherKind,
+    /// Exact matcher text, including any newlines or control characters.
+    /// First-party clients and seriald bound this to
+    /// [`MAX_COMMAND_CAPTURE_DETAIL_BYTES`] UTF-8 bytes.
     pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandCaptureCompletionKind {
+    Literal,
+    Prompt,
+    Regex,
+    Quiet,
+    Signal,
+    RunAborted,
+    Timeout,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandCaptureConfidence {
+    High,
+    Medium,
+    Low,
+    Partial,
+    Interfered,
+    Incomplete,
+    Unreliable,
+}
+
+/// Client report for the completed receive window belonging to one
+/// authoritative command TX. seriald validates all identities and sequence
+/// bounds, then derives exact stream offsets from its timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCaptureReport {
+    pub daemon_epoch: Uuid,
+    pub generation: u64,
+    pub run_id: Uuid,
+    pub operation_id: Uuid,
+    pub tx_event_seq: u64,
+    pub evidence_from_seq: u64,
+    pub evidence_through_seq: u64,
+    pub completion: CommandCaptureCompletionKind,
+    /// Exact completion matcher/detail. Unlike a command description, this
+    /// may contain matcher-significant control characters and newlines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_detail: Option<String>,
+    pub confidence: CommandCaptureConfidence,
+}
+
+/// Durable, daemon-validated command capture boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCaptureCompleted {
+    pub daemon_epoch: Uuid,
+    pub generation: u64,
+    pub run_id: Uuid,
+    pub operation_id: Uuid,
+    pub tx_event_seq: u64,
+    pub evidence_from_seq: u64,
+    pub evidence_through_seq: u64,
+    pub completion: CommandCaptureCompletionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_detail: Option<String>,
+    pub confidence: CommandCaptureConfidence,
+    pub record_event_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_stream_offset_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_stream_offset_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_stream_offset_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_stream_offset_end: Option<u64>,
 }
 
 /// Optional fail-closed boundary for one Agent physical serial action.
@@ -519,6 +598,53 @@ pub struct ControlLease {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum RunStartDecision {
+    Approve,
+    Deny,
+}
+
+/// Agent Run request awaiting the current Human control holder's explicit
+/// decision. `id` is the Agent's request ID and therefore doubles as the
+/// idempotent approval/polling identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingRunStartApproval {
+    pub id: Uuid,
+    pub port: String,
+    pub requester: Actor,
+    pub required_approver: Actor,
+    pub label: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, Value>,
+    pub control_ttl_ms: u64,
+    pub daemon_epoch: Uuid,
+    pub generation: u64,
+    pub expected_control_id: Uuid,
+    pub expected_fence: u64,
+    pub requested_wall_time_ns: i64,
+    pub expires_wall_time_ns: i64,
+}
+
+/// Authoritative Human-intervention fence for one active Agent Run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunContextState {
+    pub run_id: Uuid,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_human_command_seq: Option<u64>,
+    pub acknowledged_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_through_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanCommandMode {
+    Owned,
+    Cooperative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Active,
     Completed,
@@ -627,7 +753,11 @@ pub struct SlotSnapshot {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub rx_overflow_bytes: u64,
     pub control: Option<ControlLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_run_start: Option<PendingRunStartApproval>,
     pub active_run: Option<RunInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_context: Option<RunContextState>,
     /// Current daemon-owned Trigger Job, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_trigger: Option<TriggerInfo>,
@@ -681,6 +811,11 @@ pub enum EventKind {
     ControlReleased,
     ControlRevoked,
     ControlExpired,
+    RunStartRequested,
+    RunStartApproved,
+    RunStartDenied,
+    RunStartTimedOut,
+    RunStartCancelled,
     RunStarted,
     RunEnded,
     RunAborted,
@@ -688,6 +823,7 @@ pub enum EventKind {
     TriggerCompleted,
     TriggerCancelled,
     TriggerFailed,
+    CommandCaptureCompleted,
     Break,
     Checkpoint,
     LoggingDegraded,
@@ -767,6 +903,28 @@ pub enum ClientMessage {
         mode: ControlMode,
         ttl_ms: u64,
     },
+    /// Atomically acquire Agent control and create a Run when idle, or create
+    /// an approval targeted at the current Human holder. Repeating the exact
+    /// message with the same request ID polls the authoritative outcome.
+    RequestRunStart {
+        request_id: Uuid,
+        port: String,
+        label: String,
+        #[serde(default)]
+        metadata: BTreeMap<String, Value>,
+        ttl_ms: u64,
+    },
+    DecideRunStart {
+        request_id: Uuid,
+        port: String,
+        approval_id: Uuid,
+        decision: RunStartDecision,
+    },
+    CancelRunStart {
+        request_id: Uuid,
+        port: String,
+        approval_id: Uuid,
+    },
     RenewControl {
         request_id: Uuid,
         port: String,
@@ -784,6 +942,19 @@ pub enum ClientMessage {
         request_id: Uuid,
         port: String,
         control_id: Uuid,
+    },
+    /// One Human command whose ownership mode is resolved atomically by the
+    /// Slot actor. This command never joins a delayed control queue.
+    SendHumanCommand {
+        request_id: Uuid,
+        port: String,
+        expected_generation: u64,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     Write {
         request_id: Uuid,
@@ -904,6 +1075,22 @@ pub enum ClientMessage {
         fence: u64,
         label: String,
     },
+    /// Confirm that the owning Agent has observed Human command evidence
+    /// through the supplied timeline sequence.
+    AcknowledgeRunContext {
+        request_id: Uuid,
+        port: String,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+    },
+    /// Persist the completed evidence boundary for a previously confirmed
+    /// Agent command TX.
+    RecordCommandCapture {
+        request_id: Uuid,
+        port: String,
+        report: Box<CommandCaptureReport>,
+    },
     Ping {
         request_id: Uuid,
     },
@@ -916,9 +1103,13 @@ impl ClientMessage {
             | Self::Attach { request_id, .. }
             | Self::Detach { request_id, .. }
             | Self::AcquireControl { request_id, .. }
+            | Self::RequestRunStart { request_id, .. }
+            | Self::DecideRunStart { request_id, .. }
+            | Self::CancelRunStart { request_id, .. }
             | Self::RenewControl { request_id, .. }
             | Self::ReleaseControl { request_id, .. }
             | Self::CancelAcquire { request_id, .. }
+            | Self::SendHumanCommand { request_id, .. }
             | Self::Write { request_id, .. }
             | Self::SendBreak { request_id, .. }
             | Self::TriggerStart { request_id, .. }
@@ -927,6 +1118,8 @@ impl ClientMessage {
             | Self::StartRun { request_id, .. }
             | Self::EndRun { request_id, .. }
             | Self::Checkpoint { request_id, .. }
+            | Self::AcknowledgeRunContext { request_id, .. }
+            | Self::RecordCommandCapture { request_id, .. }
             | Self::Ping { request_id } => *request_id,
         }
     }
@@ -935,23 +1128,88 @@ impl ClientMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandResult {
-    HelloAccepted { actor: Actor },
-    Attached { ports: Vec<String> },
-    Detached { ports: Vec<String> },
-    ControlGranted { lease: ControlLease },
-    ControlQueued { position: usize },
-    ControlRenewed { lease: ControlLease },
+    HelloAccepted {
+        actor: Actor,
+    },
+    Attached {
+        ports: Vec<String>,
+    },
+    Detached {
+        ports: Vec<String>,
+    },
+    ControlGranted {
+        lease: ControlLease,
+    },
+    ControlQueued {
+        position: usize,
+    },
+    RunStartPending {
+        approval: Box<PendingRunStartApproval>,
+    },
+    RunStartGranted {
+        approval_id: Uuid,
+        lease: ControlLease,
+        run: RunInfo,
+    },
+    RunStartDenied {
+        approval_id: Uuid,
+    },
+    RunStartTimedOut {
+        approval_id: Uuid,
+    },
+    RunStartCancelled {
+        approval_id: Uuid,
+    },
+    ControlRenewed {
+        lease: ControlLease,
+    },
     ControlReleased,
-    AcquireCancelled { removed: bool },
-    WriteAccepted { event_seq: u64 },
-    BreakSent { event_seq: u64 },
-    TriggerStarted { trigger: Box<TriggerInfo> },
-    TriggerStatus { trigger: Box<TriggerInfo> },
-    TriggerCancelled { trigger: Box<TriggerInfo> },
-    RunStarted { run: RunInfo },
-    RunEnded { run: RunInfo },
-    CheckpointCreated { event_seq: u64 },
-    Pong { server_wall_time_ns: i64 },
+    AcquireCancelled {
+        removed: bool,
+    },
+    HumanCommandAccepted {
+        event_seq: u64,
+        mode: HumanCommandMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease: Option<ControlLease>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interfered_run_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_revision: Option<u64>,
+    },
+    WriteAccepted {
+        event_seq: u64,
+    },
+    BreakSent {
+        event_seq: u64,
+    },
+    TriggerStarted {
+        trigger: Box<TriggerInfo>,
+    },
+    TriggerStatus {
+        trigger: Box<TriggerInfo>,
+    },
+    TriggerCancelled {
+        trigger: Box<TriggerInfo>,
+    },
+    RunStarted {
+        run: RunInfo,
+    },
+    RunEnded {
+        run: RunInfo,
+    },
+    CheckpointCreated {
+        event_seq: u64,
+    },
+    RunContextAcknowledged {
+        context: RunContextState,
+    },
+    CommandCaptureRecorded {
+        capture: Box<CommandCaptureCompleted>,
+    },
+    Pong {
+        server_wall_time_ns: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1014,6 +1272,8 @@ pub enum ErrorCode {
     PortOffline,
     CursorAhead,
     SequenceBoundaryChanged,
+    UserReadRequired,
+    WriteOutcomeUncertain,
     ResourceExhausted,
     IdempotencyExpired,
     ConfigRevisionMismatch,
@@ -1965,7 +2225,9 @@ mod tests {
             tx_offset: 0,
             rx_overflow_bytes: 0,
             control: None,
+            pending_run_start: None,
             active_run: None,
+            run_context: None,
             active_trigger: None,
             logging: LoggingState::Healthy,
             effective_shell_prompt: None,
@@ -2228,8 +2490,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v6_exposes_independent_model_identity_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_v7_exposes_independent_model_identity_contracts() {
+        assert_eq!(PROTOCOL_VERSION, 7);
         let profile = serde_json::to_value(model_profile()).unwrap();
         assert!(profile.get("model_names").is_none());
         let family = serde_json::to_value(ModelFamily {
@@ -2238,6 +2500,142 @@ mod tests {
         })
         .unwrap();
         assert_eq!(family["model_names"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn protocol_v7_run_start_and_context_messages_have_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_value(EventKind::RunStartRequested).unwrap(),
+            "run_start_requested"
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::RunStartApproved).unwrap(),
+            "run_start_approved"
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::RunStartDenied).unwrap(),
+            "run_start_denied"
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::RunStartTimedOut).unwrap(),
+            "run_start_timed_out"
+        );
+        assert_eq!(
+            serde_json::to_value(EventKind::RunStartCancelled).unwrap(),
+            "run_start_cancelled"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::UserReadRequired).unwrap(),
+            "user_read_required"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::WriteOutcomeUncertain).unwrap(),
+            "write_outcome_uncertain"
+        );
+        assert_eq!(
+            serde_json::from_value::<ErrorCode>(serde_json::json!("write_outcome_uncertain"))
+                .unwrap(),
+            ErrorCode::WriteOutcomeUncertain
+        );
+        let request_id = Uuid::new_v4();
+        let request = ClientMessage::RequestRunStart {
+            request_id,
+            port: "COM3".into(),
+            label: "diagnostics".into(),
+            metadata: BTreeMap::from([("suite".into(), serde_json::json!("smoke"))]),
+            ttl_ms: 30_000,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], "request_run_start");
+        assert_eq!(request.request_id(), request_id);
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(value).unwrap(),
+            request
+        );
+
+        let acknowledgement = ClientMessage::AcknowledgeRunContext {
+            request_id: Uuid::new_v4(),
+            port: "COM3".into(),
+            run_id: Uuid::new_v4(),
+            revision: 2,
+            through_seq: 91,
+        };
+        assert_eq!(
+            serde_json::to_value(&acknowledgement).unwrap()["type"],
+            "acknowledge_run_context"
+        );
+
+        let human_command = ClientMessage::SendHumanCommand {
+            request_id: Uuid::new_v4(),
+            port: "COM3".into(),
+            expected_generation: 7,
+            data: b"status\r".to_vec(),
+            operation_id: Some(Uuid::new_v4()),
+            description: Some("operator status".into()),
+        };
+        let encoded = serde_json::to_value(&human_command).unwrap();
+        assert_eq!(encoded["type"], "send_human_command");
+        assert_eq!(encoded["data"], BASE64.encode(b"status\r"));
+    }
+
+    #[test]
+    fn protocol_v7_command_capture_round_trips_authoritative_boundaries() {
+        assert_eq!(
+            serde_json::to_value(EventKind::CommandCaptureCompleted).unwrap(),
+            "command_capture_completed"
+        );
+        let matcher_detail = format!("{}\n\u{0000}tail", "界".repeat(100));
+        assert!(matcher_detail.len() > MAX_COMMAND_DESCRIPTION_BYTES);
+        assert!(matcher_detail.len() <= MAX_COMMAND_CAPTURE_DETAIL_BYTES);
+        let report = CommandCaptureReport {
+            daemon_epoch: Uuid::new_v4(),
+            generation: 4,
+            run_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            tx_event_seq: 12,
+            evidence_from_seq: 12,
+            evidence_through_seq: 18,
+            completion: CommandCaptureCompletionKind::Regex,
+            completion_detail: Some(matcher_detail.clone()),
+            confidence: CommandCaptureConfidence::High,
+        };
+        let message = ClientMessage::RecordCommandCapture {
+            request_id: Uuid::new_v4(),
+            port: "COM3".into(),
+            report: Box::new(report.clone()),
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["type"], "record_command_capture");
+        assert_eq!(value["report"]["evidence_from_seq"], 12);
+        assert_eq!(value["report"]["completion_detail"], matcher_detail);
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(value).unwrap(),
+            message
+        );
+
+        let completed = CommandCaptureCompleted {
+            daemon_epoch: report.daemon_epoch,
+            generation: report.generation,
+            run_id: report.run_id,
+            operation_id: report.operation_id,
+            tx_event_seq: report.tx_event_seq,
+            evidence_from_seq: report.evidence_from_seq,
+            evidence_through_seq: report.evidence_through_seq,
+            completion: report.completion,
+            completion_detail: report.completion_detail,
+            confidence: report.confidence,
+            record_event_seq: 19,
+            tx_stream_offset_start: Some(100),
+            tx_stream_offset_end: Some(104),
+            rx_stream_offset_start: Some(220),
+            rx_stream_offset_end: Some(244),
+        };
+        let event = serde_json::to_value(CommandResult::CommandCaptureRecorded {
+            capture: Box::new(completed),
+        })
+        .unwrap();
+        assert_eq!(event["type"], "command_capture_recorded");
+        assert_eq!(event["capture"]["rx_stream_offset_end"], 244);
     }
 
     #[test]

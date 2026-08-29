@@ -1,11 +1,20 @@
 import { Command, LoaderCircle, Moon, Power, RefreshCw, Server, Settings2, Square, Sun, Wifi, WifiOff, X } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { DesktopEvent, DesktopSnapshot, ThemePreference } from '../shared/contracts'
+import { useCallback, useEffect, useState } from 'react'
+import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
+import type {
+  DesktopEvent,
+  DesktopSnapshot,
+  HumanCommandSubmission,
+  RunStartDecision,
+  ThemePreference
+} from '../shared/contracts'
+import { isApprovalActionable } from '../shared/run-start'
 import { AgentHistory } from './components/AgentHistory'
 import { CommandBar } from './components/CommandBar'
 import { PortRail } from './components/PortRail'
 import { SettingsPage } from './components/SettingsPage'
 import { TerminalPane } from './components/TerminalPane'
+import { RunStartApprovalModal } from './components/RunStartApprovalModal'
 import { buildAgentHistory, locateCommandOutput, type AgentCommand } from './lib/history'
 import { resolveBackendControl } from './lib/backend-control'
 import iconUrl from './assets/icon.png'
@@ -18,39 +27,58 @@ export function App(): React.JSX.Element {
   const [selectedPort, setSelectedPort] = useState<string>()
   const [selectedCommand, setSelectedCommand] = useState<AgentCommand>()
   const [toast, setToast] = useState<{ kind: 'notice' | 'error'; message: string }>()
+  const [expiredApprovals, setExpiredApprovals] = useState<Set<string>>(() => new Set())
   const [loadingMessage, setLoadingMessage] = useState('正在启动本地工作台…')
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
-    if (event.type === 'snapshot') {
-      setSnapshot(event.snapshot)
-    } else if (event.type === 'timeline') {
-      setSnapshot((current) => {
-        if (!current) return current
-        const events = current.events[event.event.port] ?? []
-        const last = events.at(-1)
-        if (last?.daemon_epoch === event.event.daemon_epoch && last.seq >= event.event.seq) return current
-        return {
-          ...current,
-          events: { ...current.events, [event.event.port]: [...events, event.event].slice(-12_000) }
-        }
-      })
-    } else if (event.type === 'connection') {
-      setSnapshot((current) => current ? { ...current, connection: event.state, connectionMessage: event.message } : current)
+    if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'connection' || event.type === 'service') {
+      setSnapshot((current) => mergeDesktopSnapshotEvent(current, event))
+    }
+    if (event.type === 'connection') {
       setLoadingMessage(event.message)
-    } else if (event.type === 'service') {
-      setSnapshot((current) => current ? { ...current, service: event.service } : current)
-    } else {
+    } else if (event.type === 'notice' || event.type === 'error') {
       setToast({ kind: event.type, message: event.message })
     }
   }, [])
 
   useEffect(() => {
-    const unsubscribe = window.serial.onEvent(applyEvent)
+    // Main subscribes to the live socket while the bootstrap IPC request is
+    // still in flight. Buffer those events so a timeline/capture delivered in
+    // that window cannot be discarded because React has no initial snapshot,
+    // or overwritten by the slightly older bootstrap reply.
+    let buffering = true
+    let cancelled = false
+    const buffered: DesktopEvent[] = []
+    const unsubscribe = window.serial.onEvent((event) => {
+      if (buffering) buffered.push(event)
+      else applyEvent(event)
+    })
     window.serial.bootstrap().then((value) => {
-      setSnapshot(value)
-      setSelectedPort(value.preferences.selectedPort ?? value.configuredPorts[0]?.config.port ?? value.availablePorts[0]?.name)
-    }).catch((error) => setToast({ kind: 'error', message: message(error) }))
-    return unsubscribe
+      if (cancelled) return
+      const merged = buffered.reduce<DesktopSnapshot>(
+        (current, event) => mergeDesktopSnapshotEvent(current, event) ?? current,
+        value
+      )
+      buffering = false
+      setSnapshot(merged)
+      setSelectedPort(merged.preferences.selectedPort ?? merged.configuredPorts[0]?.config.port ?? merged.availablePorts[0]?.name)
+      for (const event of buffered) {
+        if (event.type === 'connection') setLoadingMessage(event.message)
+        else if (event.type === 'notice' || event.type === 'error') {
+          setToast({ kind: event.type, message: event.message })
+        }
+      }
+      buffered.length = 0
+    }).catch((error) => {
+      if (cancelled) return
+      buffering = false
+      buffered.length = 0
+      setToast({ kind: 'error', message: message(error) })
+    })
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
   }, [applyEvent])
 
   useEffect(() => {
@@ -69,6 +97,15 @@ export function App(): React.JSX.Element {
     const timer = setTimeout(() => setToast(undefined), toast.kind === 'error' ? 6_000 : 3_000)
     return () => clearTimeout(timer)
   }, [toast])
+
+  useEffect(() => {
+    if (!snapshot) return
+    const pending = new Set(snapshot.configuredPorts.flatMap((port) => port.pending_run_start?.id ?? []))
+    setExpiredApprovals((current) => {
+      const retained = new Set([...current].filter((id) => pending.has(id)))
+      return retained.size === current.size ? current : retained
+    })
+  }, [snapshot])
 
   useEffect(() => {
     const handler = (event: KeyboardEvent): void => {
@@ -101,6 +138,24 @@ export function App(): React.JSX.Element {
   const savePreferences = async (preferences: DesktopSnapshot['preferences']): Promise<void> => {
     setSnapshot((current) => current ? { ...current, preferences } : current)
     await withToast(() => window.serial.savePreferences(preferences), setToast)
+  }
+
+  const pendingApproval = snapshot?.connection === 'connected'
+    ? snapshot.configuredPorts
+        .flatMap((port) => port.pending_run_start && !expiredApprovals.has(port.pending_run_start.id)
+          && isApprovalActionable(port, port.pending_run_start, snapshot.actor)
+          ? [port.pending_run_start]
+          : [])
+        .sort((left, right) => left.requested_wall_time_ns - right.requested_wall_time_ns)[0]
+    : undefined
+
+  const decideRunStart = async (decision: RunStartDecision): Promise<boolean> => {
+    if (!pendingApproval) return false
+    return withToast(
+      () => window.serial.decideRunStart(pendingApproval.port, pendingApproval.id, decision),
+      setToast,
+      false
+    )
   }
 
   if (!snapshot) {
@@ -137,6 +192,14 @@ export function App(): React.JSX.Element {
           onSavePreferences={savePreferences}
         />
         <Toast value={toast} onClose={() => setToast(undefined)} />
+        {pendingApproval && (
+          <RunStartApprovalModal
+            approval={pendingApproval}
+            key={pendingApproval.id}
+            onDecide={decideRunStart}
+            onExpired={() => setExpiredApprovals((current) => new Set(current).add(pendingApproval.id))}
+          />
+        )}
       </div>
     )
   }
@@ -144,8 +207,16 @@ export function App(): React.JSX.Element {
   const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
   const events = selectedPort ? snapshot.events[selectedPort] ?? [] : []
   const history = buildAgentHistory(events)
-  const match = selectedCommand
-    ? locateCommandOutput(events, selectedCommand)
+  const currentSelectedCommand = selectedCommand
+    ? history.flatMap((item) => item.kind === 'command' ? item.commands : []).find((command) => (
+        command.id === selectedCommand.id
+        && command.firstSeq === selectedCommand.firstSeq
+        && command.daemonEpoch === selectedCommand.daemonEpoch
+        && command.generation === selectedCommand.generation
+      ))
+    : undefined
+  const match = currentSelectedCommand
+    ? locateCommandOutput(events, currentSelectedCommand)
     : undefined
   return (
     <div className="app-frame">
@@ -163,21 +234,59 @@ export function App(): React.JSX.Element {
           <TerminalPane
             configuredPort={configuredPort}
             events={events}
-            selectedCommand={selectedCommand}
+            selectedCommand={currentSelectedCommand}
             match={match}
             onClearCommand={() => setSelectedCommand(undefined)}
           />
           <CommandBar
             port={selectedPort}
             disabled={!configuredPort || configuredPort.session_state !== 'online' || snapshot.connection !== 'connected'}
-            onSend={async (command) => { await withToast(() => window.serial.sendCommand(selectedPort!, command), setToast, false) }}
+            onSend={(command) => submitHumanCommand(
+              () => window.serial.sendCommand(selectedPort!, command),
+              setToast
+            )}
           />
         </div>
-        <AgentHistory items={history} selectedCommand={selectedCommand} onSelect={setSelectedCommand} />
+        <AgentHistory items={history} selectedCommand={currentSelectedCommand} onSelect={setSelectedCommand} />
       </div>
       <Toast value={toast} onClose={() => setToast(undefined)} />
+      {pendingApproval && (
+        <RunStartApprovalModal
+          approval={pendingApproval}
+          key={pendingApproval.id}
+          onDecide={decideRunStart}
+          onExpired={() => setExpiredApprovals((current) => new Set(current).add(pendingApproval.id))}
+        />
+      )}
     </div>
   )
+}
+
+export function mergeDesktopSnapshotEvent(
+  current: DesktopSnapshot | undefined,
+  event: DesktopEvent
+): DesktopSnapshot | undefined {
+  if (event.type === 'snapshot') return event.snapshot
+  if (!current) return current
+  if (event.type === 'connection') {
+    return { ...current, connection: event.state, connectionMessage: event.message }
+  }
+  if (event.type === 'service') return { ...current, service: event.service }
+  if (event.type !== 'timeline') return current
+
+  const configured = current.configuredPorts.find((port) => port.config.port === event.event.port)
+  if (!configured || configured.daemon_epoch !== event.event.daemon_epoch) return current
+  const prior = current.events[event.event.port] ?? []
+  const events = prior.some((item) => item.daemon_epoch !== event.event.daemon_epoch) ? [] : prior
+  const last = events.at(-1)
+  if (last && last.seq >= event.event.seq) return current
+  return {
+    ...current,
+    events: {
+      ...current.events,
+      [event.event.port]: [...events, event.event].slice(-12_000)
+    }
+  }
 }
 
 interface WindowBarProps {
@@ -241,6 +350,33 @@ function BrandMark(): React.JSX.Element {
 function Toast({ value, onClose }: { value?: { kind: 'notice' | 'error'; message: string }; onClose: () => void }): React.JSX.Element | null {
   if (!value) return null
   return <div className={`toast is-${value.kind}`}><span>{value.message}</span><button type="button" onClick={onClose}><X size={14} /></button></div>
+}
+
+export async function submitHumanCommand(
+  action: () => Promise<HumanCommandSubmission>,
+  setToast: (toast: { kind: 'notice' | 'error'; message: string } | undefined) => void
+): Promise<HumanCommandSubmission> {
+  try {
+    const submission = await action()
+    if (
+      !submission
+      || !['accepted', 'rejected', 'uncertain'].includes(submission.status)
+      || (submission.status !== 'accepted' && typeof submission.message !== 'string')
+    ) {
+      throw new Error('App 未收到可识别的人工命令结果')
+    }
+    if (submission.status !== 'accepted') {
+      setToast({ kind: 'error', message: submission.message })
+    }
+    return submission
+  } catch {
+    const submission: HumanCommandSubmission = {
+      status: 'uncertain',
+      message: HUMAN_COMMAND_UNCERTAIN_MESSAGE
+    }
+    setToast({ kind: 'error', message: submission.message })
+    return submission
+  }
 }
 
 async function withToast(

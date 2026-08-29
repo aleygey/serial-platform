@@ -4,7 +4,7 @@ const CONTROL = 0x01
 const RX = 0x02
 const TX = 0x03
 
-export const SERIAL_PROTOCOL_VERSION = 6
+export const SERIAL_PROTOCOL_VERSION = 7
 
 export interface WireControl {
   type: string
@@ -56,6 +56,8 @@ export function normalizeTimelineEvent(raw: Record<string, unknown>): TimelineEv
     actor: (raw.actor as TimelineEvent['actor']) ?? null,
     run_id: raw.run_id ? String(raw.run_id) : null,
     operation_id: raw.operation_id ? String(raw.operation_id) : null,
+    stream_offset_start: optionalNumber(raw.stream_offset_start),
+    stream_offset_end: optionalNumber(raw.stream_offset_end),
     text:
       typeof raw.text === 'string'
         ? raw.text
@@ -66,4 +68,8 @@ export function normalizeTimelineEvent(raw: Record<string, unknown>): TimelineEv
     durable: Boolean(raw.durable),
     replay: Boolean(raw.replay)
   }
+}
+
+function optionalNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : null
 }

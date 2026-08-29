@@ -22,6 +22,7 @@ vi.mock('./local-service', () => ({
 
 vi.mock('./serial-client', () => ({
   ConfigurationConflictError: class extends Error {},
+  HumanCommandOutcomeUncertainError: class extends Error {},
   serialdIdentityMatches: vi.fn(() => true),
   SerialClient: class {
     constructor() {
@@ -31,7 +32,11 @@ vi.mock('./serial-client', () => ({
 }))
 
 import { DesktopCoordinator } from './coordinator'
-import { ConfigurationConflictError, type ServerData } from './serial-client'
+import {
+  ConfigurationConflictError,
+  HumanCommandOutcomeUncertainError,
+  type ServerData
+} from './serial-client'
 import type { SerialConfigurationDraft } from '../shared/contracts'
 
 describe('DesktopCoordinator offline bootstrap', () => {
@@ -84,6 +89,24 @@ describe('DesktopCoordinator offline bootstrap', () => {
       snapshot: expect.objectContaining({ configRevision: 8 })
     })
   })
+
+  it('returns structured Human command outcomes without turning a definite rejection into uncertainty', async () => {
+    const coordinator = new DesktopCoordinator(vi.fn())
+    const sendCommand = vi.fn()
+    Object.assign(coordinator, { client: { sendCommand } })
+
+    sendCommand.mockRejectedValueOnce(new Error('daemon rejected the command'))
+    await expect(coordinator.sendCommand('COM6', 'version')).resolves.toEqual({
+      status: 'rejected',
+      message: 'daemon rejected the command'
+    })
+
+    sendCommand.mockRejectedValueOnce(new HumanCommandOutcomeUncertainError('socket closed'))
+    await expect(coordinator.sendCommand('COM6', 'version')).resolves.toEqual({
+      status: 'uncertain',
+      message: 'socket closed'
+    })
+  })
 })
 
 function serverData(configRevision: number): ServerData {
@@ -91,7 +114,7 @@ function serverData(configRevision: number): ServerData {
     status: {
       server_id: '11111111-1111-4111-8111-111111111111',
       daemon_epoch: '22222222-2222-4222-8222-222222222222',
-      protocol_version: 6,
+      protocol_version: 7,
       config_revision: configRevision,
       ports: []
     },

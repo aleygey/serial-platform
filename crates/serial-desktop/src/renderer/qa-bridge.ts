@@ -17,7 +17,8 @@ export function installQaBridge(): boolean {
   const bridge: DesktopBridge = {
     bootstrap: async () => snapshot,
     refresh: async () => snapshot,
-    sendCommand: async () => undefined,
+    sendCommand: async () => ({ status: 'accepted' }),
+    decideRunStart: async () => undefined,
     setPortOpen: async (port, open) => {
       snapshot = {
         ...snapshot,

@@ -1,4 +1,4 @@
-# Serial Platform Protocol v6
+# Serial Platform Protocol v7
 
 本文是 `seriald` HTTP/WebSocket 和 `serial-mcp` transport 的当前线协议说明。Rust DTO 与编码实现位于 `serial-protocol`；Agent 工具参数见 [MCP_TOOLS.md](./MCP_TOOLS.md)。
 
@@ -31,16 +31,16 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "address": "127.0.0.1:3210",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "pid": 12345
 }
 ```
 
-记录只是发现入口。客户端必须调用其中 endpoint 的 `GET /api/v1/health`，并确认 `status=ok`、`server_id`、`daemon_epoch` 和 `protocol_version` 全部与记录一致后才能复用。`address` 来自实际 listener 地址，通配 bind 会转换为本机可连接的 loopback。失效记录不会阻止新实例取得 OS lock 并覆写；拥有进程正常退出时只清理与自身 `server_id`、`daemon_epoch` 一致的记录。
+记录只是发现入口。客户端必须调用其中 endpoint 的 `GET /api/v1/health`，并确认 `status=ok`、`server_id`、`daemon_epoch` 和 `protocol_version` 全部与记录一致后才能复用。`address` 来自实际 listener 地址：精确 bind 保留该 IP，IPv4/IPv6 通配 bind 分别发布本机可连接的 `127.0.0.1`/`::1`。失效记录不会阻止新实例取得 OS lock 并覆写；拥有进程正常退出时只清理与自身 `server_id`、`daemon_epoch` 一致的记录。
 
 ## HTTP v1
 
-`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=6`；路由仍保持 `/api/v1/...`。
+`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=7`；路由仍保持 `/api/v1/...`。
 
 ### 路由
 
@@ -64,7 +64,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `GET` / `PUT` / `DELETE` | `/api/v1/monitors/{monitor_id}` | 读取/更新/停止 Monitor |
 | `GET` | `/api/v1/monitors/{monitor_id}/incidents` | 分页读取 incident |
 | `POST` | `/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | 确认 incident |
-| `GET` | `/api/v1/ws` | WebSocket protocol v6 |
+| `GET` | `/api/v1/ws` | WebSocket protocol v7 |
 
 ### Health
 
@@ -74,7 +74,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "server_id": "uuid",
   "daemon_epoch": "uuid",
   "uptime_ms": 1200,
-  "protocol_version": 6
+  "protocol_version": 7
 }
 ```
 
@@ -86,7 +86,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 {
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "config_revision": 12,
   "sequence_write_precondition_supported": true,
   "serial_context_precondition_supported": true,
@@ -119,7 +119,9 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "rx_offset": 20480,
   "tx_offset": 311,
   "control": null,
+  "pending_run_start": null,
   "active_run": null,
+  "run_context": null,
   "active_trigger": null,
   "logging": "healthy",
   "effective_shell_prompt": "root@router:~# ",
@@ -143,7 +145,21 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 }
 ```
 
-`session_state`：`disabled`、`waiting_for_port`、`opening`、`online`、`backoff`、`stopping`。
+`session_state`：`disabled`、`waiting_for_port`、`opening`、`online`、`backoff`、`stopping`。`pending_run_start` 是等待当前 Human Control holder 决策的完整 `PendingRunStartApproval`；`run_context` 是活动 Agent Run 的人工命令 revision/ack fence。两者在创建、决策、取消、过期、断连或代际变化时都会随 snapshot 广播更新。
+
+存在人工干预的 Agent Run context 示例：
+
+```json
+{
+  "run_id": "uuid",
+  "revision": 2,
+  "last_human_command_seq": 830,
+  "acknowledged_revision": 1,
+  "acknowledged_through_seq": 820
+}
+```
+
+`revision > acknowledged_revision` 即表示 Agent physical-action gate 仍关闭。
 
 ### 配置 DTO
 
@@ -248,8 +264,11 @@ rx tx
 serial_opening serial_opened serial_open_failed serial_closed
 port_reconfigured port_removed
 control_granted control_released control_revoked control_expired
+run_start_requested run_start_approved run_start_denied
+run_start_timed_out run_start_cancelled
 run_started run_ended run_aborted
 trigger_started trigger_completed trigger_cancelled trigger_failed
+command_capture_completed
 break checkpoint logging_degraded gap
 ```
 
@@ -271,6 +290,34 @@ Agent command TX 的 metadata 可以包含：
 ```
 
 matcher kind 为 `contains`、`regex`、`shell_prompt` 或 `uboot_prompt`。数组为空时省略。
+
+`command_capture_matchers` 是随 TX 保存的兼容定位提示，不是 v7 的完成边界。命令完成后，Agent 通过 `record_command_capture` 提交证据范围；`seriald` 校验后写入 `command_capture_completed`。该事件的 `run_id`、`operation_id` 位于事件顶层，`metadata.capture` 保存完整、权威的 `CommandCaptureCompleted`：
+
+```json
+{
+  "daemon_epoch": "uuid",
+  "generation": 3,
+  "run_id": "uuid",
+  "operation_id": "uuid",
+  "tx_event_seq": 812,
+  "evidence_from_seq": 812,
+  "evidence_through_seq": 826,
+  "completion": "prompt",
+  "completion_detail": "root@router:~# ",
+  "confidence": "high",
+  "record_event_seq": 827,
+  "tx_stream_offset_start": 300,
+  "tx_stream_offset_end": 311,
+  "rx_stream_offset_start": 20480,
+  "rx_stream_offset_end": 20742
+}
+```
+
+`completion`：`literal`、`prompt`、`regex`、`quiet`、`signal`、`run_aborted`、`timeout` 或 `disconnected`。`confidence`：`high`、`medium`、`low`、`partial`、`interfered`、`incomplete` 或 `unreliable`。没有某一方向的证据时，对应 stream offset 可以省略。
+
+Human 命令仍形成普通 `tx` 事件，但至少携带 `metadata.human_command=true` 和 `metadata.cooperative`。若它发生在活动 Agent Run 中，还携带该 Run 的 `interfered_run_id` 与递增后的 `context_revision`；这个 TX seq 是 read gate 必须覆盖的权威边界。
+
+Run-start 审批事件使用稳定投影：`run_start_requested`、`run_start_approved`、`run_start_denied`、`run_start_timed_out`、`run_start_cancelled` 都在 `metadata.approval` 保存完整 `PendingRunStartApproval`，并在 `metadata.approval_id` 重复其 ID。批准事件还可在 `metadata.run` 保存创建后的 Run；系统取消会附带 `reason` 和 `cancelled_by`。
 
 端口配置变化的 `port_reconfigured` metadata 包含 `source`，以及 `previous_` / `new_` 版本的 `model_profile`、`model_family` 和 `model_name`。
 
@@ -402,7 +449,7 @@ Monitor spec：
 
 列表 query 可使用 `port` 和 `status`。incident query：`after_incident_seq`、`limit`、`include_acked`。incident 响应提供 `next_cursor`、`truncated`、`first_available_incident_seq` 和 `retention_gap`。
 
-## WebSocket protocol v6
+## WebSocket protocol v7
 
 连接地址：`GET /api/v1/ws`。
 
@@ -430,7 +477,7 @@ Monitor spec：
 {
   "type": "hello",
   "request_id": "uuid",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "client_name": "serialctl",
   "actor_kind": "human"
 }
@@ -443,7 +490,7 @@ Monitor spec：
   "type": "welcome",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "actor": {"id": "...", "label": "serialctl", "kind": "human"}
 }
 ```
@@ -473,12 +520,122 @@ control 消息使用 tagged JSON `type`：
 ```text
 hello attach detach
 acquire_control renew_control release_control cancel_acquire
-write send_break
+request_run_start decide_run_start cancel_run_start
+send_human_command write send_break
 trigger_start trigger_status trigger_cancel
-start_run end_run checkpoint ping
+start_run end_run checkpoint
+acknowledge_run_context record_command_capture ping
 ```
 
 端口相关消息全部包含 `port`。
+
+`acquire_control` 的 `mode` 线形状仍为 `queue|takeover`，但 v7 不存在通用 Control waiter queue：端口被其他 actor 持有时，`queue` 立即返回 `conflict`，释放、过期和断连不会提升任何 waiter；`cancel_acquire` 只是兼容 no-op，返回 `acquire_cancelled {removed:false}`。Agent 的 `acquire_control` 和 Agent 的旧 `start_run` 均被拒绝；Agent 必须使用原子的 `request_run_start`。`takeover` 只允许 Human，并继续作为明确的强制接管操作。
+
+### Agent Run-start 审批
+
+Agent 请求的 `request_id` 同时是 approval ID 和幂等轮询 ID：
+
+```json
+{
+  "type": "request_run_start",
+  "request_id": "uuid",
+  "port": "COM4",
+  "label": "检查启动日志",
+  "metadata": {},
+  "ttl_ms": 60000
+}
+```
+
+`ttl_ms` 是批准后 Agent Control lease 的 TTL，不是审批等待时长。审批寿命来自 daemon `[control].wait_timeout_ms`（默认 60 秒，硬上限 1 小时），权威截止时间是 DTO 的 `expires_wall_time_ns`。空闲端口在同一个 Slot turn 内原子授予 Agent Control 并创建 Run，返回 `run_start_granted {approval_id,lease,run}`；这里不会先暴露一个只有 Control、尚无 Run 的中间状态。若当前 holder 是 Human，则不写串口、不转移 Control，只返回：
+
+```json
+{
+  "type": "run_start_pending",
+  "approval": {
+    "id": "uuid",
+    "port": "COM4",
+    "requester": {"id":"actor-agent","label":"agent","kind":"agent"},
+    "required_approver": {"id":"actor-human","label":"serialctl","kind":"human"},
+    "label": "检查启动日志",
+    "metadata": {},
+    "control_ttl_ms": 60000,
+    "daemon_epoch": "uuid",
+    "generation": 3,
+    "expected_control_id": "uuid",
+    "expected_fence": 7,
+    "requested_wall_time_ns": 1700000000000000000,
+    "expires_wall_time_ns": 1700000060000000000
+  }
+}
+```
+
+完全相同的 `request_run_start` 可用同一 `request_id` 幂等轮询；复用 ID 但更改 label、metadata 或 TTL 会被拒绝。只有 `required_approver` 指定的仍在线 Human holder 可以发送：
+
+```json
+{
+  "type": "decide_run_start",
+  "request_id": "new-human-rpc-uuid",
+  "port": "COM4",
+  "approval_id": "agent-request-uuid",
+  "decision": "approve"
+}
+```
+
+`decision` 为 `approve|deny`。批准时后端在同一个 Slot turn 重新核对 daemon epoch、generation、端口、活动 Run/Trigger 以及 Human Control ID/fence，然后原子撤销该 Human lease、授予 requester Agent lease并创建 Run。否决返回 `run_start_denied`；到期返回 `run_start_timed_out`；requester 可用 `cancel_run_start` 得到 `run_start_cancelled`。requester 或 approver 断连、holder/lease 改变、重配、串口断开/重开或 daemon shutdown 也会 fail closed 地取消：不创建 Run，不写任何字节。
+
+其他 actor 已持有 Control、已有 Run/Trigger 或已有不同 pending approval 时立即冲突，不进入等待队列。
+
+### Human command 与 read gate
+
+Human 普通输入统一使用 `send_human_command`；它把授权判断和物理写入放在同一个 Slot turn，并且绝不排队：
+
+```json
+{
+  "type": "send_human_command",
+  "request_id": "uuid",
+  "port": "COM4",
+  "expected_generation": 3,
+  "data": "dW5hbWUgLWEN",
+  "operation_id": "uuid",
+  "description": "人工查看系统版本"
+}
+```
+
+- Control 空闲：原子授予该 Human Control 后写入，结果 mode 为 `owned` 并返回 `lease`；
+- 当前 holder 正是该 Human：直接写入，结果 mode 为 `owned`；
+- 当前 holder 是拥有活动 Run 的 Agent：不转移 lease，以 `cooperative` 模式写入并返回 `interfered_run_id`、`context_revision`；若 Trigger 正在运行，先在后端停止并收敛 Trigger，再接受 Human TX；
+- 其他 holder、无匹配活动 Agent Run、端口/generation 不匹配或其他冲突：立即拒绝，绝不保存为延迟输入。
+
+完整成功结果形状为：
+
+```json
+{
+  "type": "human_command_accepted",
+  "event_seq": 830,
+  "mode": "cooperative",
+  "interfered_run_id": "uuid",
+  "context_revision": 2
+}
+```
+
+`owned` 且本次从 idle 获得 Control 时还返回 `lease`；不适用的可选字段省略。
+
+确认了至少一个 Human TX byte 后，活动 Agent Run 的 `run_context.revision` 才递增，`last_human_command_seq` 指向该 TX event。此时属于该 Run owner 的下一次 `write`、`send_break` 或 `trigger_start` 会在进入串口 writer 前返回 `user_read_required`，保证零字节写入。
+
+只有该 Agent Run owner 可以确认最新 revision：
+
+```json
+{
+  "type": "acknowledge_run_context",
+  "request_id": "uuid",
+  "port": "COM4",
+  "run_id": "uuid",
+  "revision": 2,
+  "through_seq": 830
+}
+```
+
+后端要求 `revision` 精确等于最新 revision，且 `through_seq >= last_human_command_seq` 且不超过当前 head，成功返回 `run_context_acknowledged {context}`。MCP adapter 只在 `read(scope=tail|continue)` 的实际响应包含同一 daemon epoch 下、带 `human_command=true` 的精确 TX event，并且返回 cursor 已覆盖该 seq 后发送这个 ACK。若 `wait` 已把普通 live cursor 推过该 TX，下一次 live read 会从 `last_human_command_seq-1` 临时恢复；若 ring 已淘汰该事件则返回明确 gap，仍不 ACK。`wait`、`search`、`read(scope=archive)`、只移动游标或读取了不含该 TX 的 live window 都不会清除 gate。
 
 普通 physical write 的关键字段：
 
@@ -502,14 +659,39 @@ start_run end_run checkpoint ping
     "cursor": {"epoch": "uuid", "after_seq": 811},
     "expected_generation": 3,
     "expected_tx_offset": 300
-  },
-  "cooperative": false
+  }
 }
 ```
 
-`data` 是待写 bytes 的 base64 表示。后端在物理动作边界检查 Control/fence、Run、generation、sequence precondition 与 pacing budget。成功 result 是 `write_accepted` 并返回 TX event seq；确认后的同一批 bytes 再通过 `0x03` TX data frame 分发。
+`data` 是待写 bytes 的 base64 表示。后端在物理动作边界检查 Control/fence、Run、Human read gate、generation、sequence precondition 与 pacing budget。成功 result 是 `write_accepted` 并返回 TX event seq；确认后的同一批 bytes 再通过 `0x03` TX data frame 分发。v7 Human 客户端不借用 Agent fence，也不使用旧 `write.cooperative` 逃生路径，而是使用 `send_human_command`。
 
 `send_break` 发送 UART line condition，不是字节；duration 为 1–5000 ms。
+
+### 权威命令捕获
+
+Agent 在 command capture 得到终态后发送：
+
+```json
+{
+  "type": "record_command_capture",
+  "request_id": "uuid",
+  "port": "COM4",
+  "report": {
+    "daemon_epoch": "uuid",
+    "generation": 3,
+    "run_id": "uuid",
+    "operation_id": "uuid",
+    "tx_event_seq": 812,
+    "evidence_from_seq": 812,
+    "evidence_through_seq": 826,
+    "completion": "prompt",
+    "completion_detail": "root@router:~# ",
+    "confidence": "high"
+  }
+}
+```
+
+`seriald` 不直接信任客户端的范围。它要求 epoch 与当前 daemon 一致、范围包含 `tx_event_seq` 且不超出 head，并从 replay ring 证明范围内没有 gap、没有 generation 边界；指定 TX 必须是同一 Agent actor、Run、operation 和 generation 的 confirmed `tx`。验证通过后，daemon 从事件本身派生 TX/RX stream offsets，持久化 `command_capture_completed`，并返回 `command_capture_recorded {capture}`。即使 Run 已结束或串口已断开，只要同一 daemon epoch 的证据仍在 ring 中且范围不跨 generation，仍可补记；证据已淘汰、不连续或身份不符时拒绝，不能伪造精确边界。
 
 ### Server messages
 
@@ -518,7 +700,16 @@ welcome snapshot replay_begin ready timeline
 result error gap lagged
 ```
 
-`result` 通过 `request_id` 对应请求。命令结果类型包括 Control grant/queue/renew/release、write accepted、Break sent、Trigger state、Run state、checkpoint 和 pong。
+`result` 通过 `request_id` 对应请求。v7 新增或关键结果为：
+
+```text
+run_start_pending run_start_granted run_start_denied
+run_start_timed_out run_start_cancelled
+human_command_accepted run_context_acknowledged
+command_capture_recorded
+```
+
+其余结果包括 Control grant/renew/release、write accepted、Break sent、Trigger state、非 Agent Run state、checkpoint 和 pong。`control_queued` 仅保留在线 enum 中供反序列化兼容；v7 daemon 不产生该结果。
 
 `error`：
 
@@ -537,39 +728,42 @@ result error gap lagged
 ```text
 bad_request not_found conflict
 control_required stale_fence port_offline cursor_ahead
-sequence_boundary_changed resource_exhausted idempotency_expired
+sequence_boundary_changed user_read_required
+resource_exhausted idempotency_expired
 config_revision_mismatch profile_change_busy
 port_not_found port_busy port_access_denied port_io
 break_unsupported regex_invalid query_budget_exceeded
 unavailable internal
 ```
 
-`retryable` 只说明错误类别可能在状态改变后恢复，不代表客户端应自动重放物理动作。连接丢失、timeout、partial write 或结果未确认时必须先观察时间线。
+`user_read_required` 是 daemon 的稳定线协议错误：最新 Human TX 尚未被 Agent Run owner 的 ACK 覆盖，检查发生在物理 action 前，保证本请求零字节。MCP 将它投影为 model-facing `user_command_used`，并要求先完成包含该 TX 的 live `read`。`retryable` 只说明错误类别可能在状态改变后恢复，不代表客户端应自动重放物理动作。连接丢失、timeout、partial write 或结果未确认时必须先观察时间线。
 
 ## Run、Control 与 Trigger 语义
 
-Control lease 绑定一个 actor、周期、generation 和 fence。续租不改变物理所有权；Takeover 产生新 fence 并使旧写入失效。
+Control lease 绑定一个 actor、周期、generation 和 fence。续租不改变物理所有权；Human Takeover 产生新 fence 并使旧写入失效。不存在 Control queue，也不存在 Agent `AcquireControl` bypass。
 
-Run 只能在当前 Control 上开始。Run 是审计与证据区间，不重置设备。结束或中止形成明确 timeline event。
+Agent Run 只能由 `request_run_start` 原子创建：idle 直接 grant+Run；Human holder 则必须由该 holder 批准后原子 transfer+Run。Run 是审计与证据区间，不重置设备；结束或中止形成明确 timeline event。Human/script 的旧 `start_run` 仍要求自己已持有 Control，Agent 使用它会被拒绝。
 
-Trigger spec 包含 optional initial write、optional start literal、action bytes、interval、stop literals、timeout、max fires 和 optional pacing。所有 Trigger 写入仍走同一 Control/fence/Run/confirmed TX 路径。
+Agent Run 的 `run_context` 是 daemon-authoritative revision gate。Human cooperative TX 不窃取 Agent lease，但会把所有后续 Agent physical action 锁在 `user_read_required`，直到精确 live evidence 被 ACK；结束/中止 Run 会删除该 context。
+
+Trigger spec 包含 optional initial write、optional start literal、action bytes、interval、stop literals、timeout、max fires 和 optional pacing。所有 Trigger 写入仍走同一 Control/fence/Run/read-gate/confirmed TX 路径。Human cooperative command 会先让活动 Trigger 停止并收敛，避免 Trigger 与 Human TX 在 driver 边界竞态。
 
 ## MCP Streamable HTTP
 
-`serial-mcp --listen 127.0.0.1:3211` 提供：
+`serial-mcp --listen 127.0.0.1:3211`（默认单机）提供：
 
 ```text
 GET  /health
 POST /mcp
 ```
 
-`GET /health` 只用于统一启动器确认固定 loopback 端口的进程身份和它所连接的 `seriald`，不是 MCP host 的 session 或工具接口。当前响应示例：
+`GET /health` 只用于统一启动器确认 port 3211 上 adapter 的进程身份和它所连接的 `seriald`，不是 MCP host 的 session 或工具接口。当前响应示例：
 
 ```json
 {
   "status": "ok",
   "service": "serial-mcp",
-  "protocol_version": 6,
+  "protocol_version": 7,
   "pid": 12345,
   "seriald_endpoint": "http://127.0.0.1:3210",
   "seriald_server_id": "uuid",
@@ -577,7 +771,11 @@ POST /mcp
 }
 ```
 
-统一启动器只在 `service`、`protocol_version=6` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
+统一启动器只在 `service`、`protocol_version=7` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
+
+统一启动时，MCP listener 使用已验证 `active-endpoint.json.address` 的精确 IP，并固定使用 port 3211；只有 seriald 原本是 IPv4/IPv6 通配 bind 时，活动地址才先转换为 `127.0.0.1`/`::1`。因此 host-only 场景会得到例如 `192.168.56.109:3211`，不会悄悄改成 loopback，也不会绑定所有接口。
+
+HTTP MCP 没有认证和 TLS。`--listen` 必须是一个精确的单播接口地址：拒绝 `0.0.0.0`、`::`、multicast 和 IPv4 broadcast；非 loopback 只适用于可信 host-only VM 网络，启动时会警告，并要求主机防火墙限制访问。不要把它暴露到 LAN、公共网络或不可信 bridge。
 
 实现是 sessionless JSON-RPC：
 
@@ -586,10 +784,22 @@ POST /mcp
 - `GET /mcp` 返回 method not allowed；
 - 支持 MCP protocol `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`；
 - `MCP-Protocol-Version` 若存在必须是支持值；
-- 仅允许监听 `127.0.0.1`；
-- `Origin` 若存在，只接受同端口的 `localhost` 或 `127.0.0.1`。
+- listener 必须是一个精确 loopback 或可信 host-only IP；
+- `Origin` 省略时允许；存在时必须是无 credentials/path/query/fragment 的 `http://` origin，端口与 listener 相同；host 必须是 listener 的精确 numeric IP，只有 listener 为 loopback 时额外接受 `localhost`。
 
-initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回 17 项；`tools/call` 的成功与工具错误都放在 MCP tool result 中，结构化值位于 `structuredContent`，紧凑 JSON 文本位于 `content[0].text`。`devices` 是唯一发现工具，只公开 `port`、两级机型身份、Agent 所需状态和有效 Shell/U-Boot 提示符，不公开 Profile 名、Transport/UART、EOL/echo 或写入节奏。`run_end` 以可选 `outcome=completed|aborted` 区分正常完成与异常终止，默认 `completed`；正常完成后立即尝试释放 Control，异常终止只在 `ControlReleased` 权威确认后成功。
+`Origin` 检查只降低浏览器跨站请求风险，不替代认证；非浏览器客户端可以不发送该 header。
+
+initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回固定 16 项：
+
+```text
+devices model_identity_set read command command_sequence signal trigger wait
+search monitor_start monitor_list monitor_status monitor_incidents monitor_stop
+run_start run_end
+```
+
+`tools/call` 的成功与工具错误都放在 MCP tool result 中，结构化值位于 `structuredContent`，紧凑 JSON 文本位于 `content[0].text`。`devices` 是唯一发现工具，只公开 `port`、两级机型身份、Agent 所需状态和有效 Shell/U-Boot 提示符，不公开 Profile 名、Transport/UART、EOL/echo 或写入节奏。`run_start` 在 idle 时直接返回 Run，Human holder 存在时等待显式审批；否决、超时、取消或任一相关连接断开都不返回 Run。`run_end` 以可选 `outcome=completed|aborted` 区分正常完成与异常终止，默认 `completed`；正常完成后立即尝试释放 Control，异常终止只在 `ControlReleased` 权威确认后成功。
+
+`command`/`command_sequence` 完成后必须取得 daemon 的 `command_capture_recorded`，才能把捕获范围作为权威历史交付。若 Human command gate 未确认，物理工具的结构化错误是 `user_command_used`、`no_bytes_written=true`；只有包含准确 Human TX 的 live `read(scope=tail|continue)` 会返回并完成 acknowledgement，`wait` 和 archive read 不会。
 
 stdio transport 使用每行一个 JSON-RPC frame。stdout 只写 MCP frame，诊断写 stderr。并发 request 的响应次序可以与请求次序不同，但每个 frame 由一个 writer 完整写出。
 

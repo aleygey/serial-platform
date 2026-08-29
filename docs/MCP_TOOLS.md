@@ -1,6 +1,6 @@
 # Serial MCP Tools
 
-`serial-mcp` 把 Serial Platform 收敛为 17 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
+`serial-mcp` 把 Serial Platform 收敛为 16 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
 
 ```sh
 serial mcp --dump-tools
@@ -20,7 +20,7 @@ serial-mcp --dump-tools
 serial
 ```
 
-会在下面地址启动 sessionless Streamable HTTP MCP：
+默认配置会在下面地址启动 sessionless Streamable HTTP MCP：
 
 ```text
 http://127.0.0.1:3211/mcp
@@ -28,7 +28,11 @@ http://127.0.0.1:3211/mcp
 
 MCP host 对该 URL 发送 JSON-RPC `POST`。notification 返回 HTTP 202；没有持久 HTTP session 或 SSE GET channel。
 
-统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 再保证本地 HTTP MCP `127.0.0.1:3211` 可用；Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
+统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 从实际 `ActiveEndpoint` 继承精确 IP，并在该 IP 的 3211 端口保证 HTTP MCP 可用。例如后端活动地址为 `192.168.56.109:3210` 时，MCP 地址是 `http://192.168.56.109:3211/mcp`，不会另外绑定 localhost。后端 wildcard bind 发布为可连接的 loopback `ActiveEndpoint`，因此 `0.0.0.0` / `::` 分别收敛为 `127.0.0.1:3211` / `[::1]:3211`。health 检查、进程复用、启动等待和最终输出都使用同一个目标地址；复用还会核对当前 Serial wire protocol v7、后端 endpoint、server ID 和 daemon epoch。Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
+
+HTTP MCP 没有认证。listener 只接受精确 loopback 或可信 host-only 网卡的 unicast 地址，拒绝 wildcard、broadcast 和 multicast。非 loopback 部署必须限制在可信 host-only 网络，并使用主机防火墙限制来源，不能把 3211 端口暴露到普通局域网或公网。
+
+原生 MCP host 可以不发送 `Origin`。若发送，必须精确为 `http://<listener-IP>:<listener-port>`；只在 loopback listener 上额外接受 `localhost`。不接受其他主机名、不同 IP/端口、HTTPS、credentials、path、query 或 fragment；IPv6 地址使用方括号形式。
 
 App→`serial` 与 `serial`→App 都会复用同一后端。两者只停止自己启动的进程；外部 owner 退出时，仍在运行的客户端不会自动 failover，重新启动后才重新发现或创建后端。
 
@@ -44,7 +48,7 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 
 支持 MCP protocol：`2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`。
 
-## 17 个工具
+## 16 个工具
 
 | Tool | Required | Optional | 作用 |
 |---|---|---|---|
@@ -53,7 +57,6 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 | `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq` | 从实时 ring 或指定历史周期读取有界文本 |
 | `command` | `run_handle`, `command`, `description` | `expect`, `regex`, `timeout_seconds` | 追加有效 EOL、写入、捕获 RX 并保留任务说明 |
 | `command_sequence` | `run_handle`, `description`, `steps` | 每步 matcher/timeout | 一次完成 1–8 步已知依赖交互 |
-| `input` | `run_handle`, `text` | — | 不追加 EOL，写入精确 UTF-8 bytes |
 | `signal` | `run_handle`, `signal` | Break 的 `duration_ms` | Ctrl-C/D/Z byte 或 UART Break |
 | `trigger` | `run_handle`, `action` | `kickoff`, start/stop matcher 与硬上限 | 在后端执行一次有界低延迟反应 |
 | `wait` | `run_handle` | `expect`, `regex`, `timeout_seconds` | 从 live cursor 等待 RX 边界 |
@@ -63,13 +66,13 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 | `monitor_status` | `monitor_id` | — | 读取一个 Monitor 的权威状态 |
 | `monitor_incidents` | `monitor_id` | `after` | 读取 incident tail 或向前分页 |
 | `monitor_stop` | `monitor_id` | — | 停止未来匹配，保留 incident |
-| `run_start` | `port`, `label` | — | 排队获取 Control，开始 Run，返回 `run_handle` |
+| `run_start` | `port`, `label` | — | 空闲时原子开始 Run；Human 持有时等待 TUI/App 明确审批 |
 | `run_end` | `run_handle` | `outcome` | 正常完成 Run，或经权威确认后异常中止并释放 Control |
 
 ## 标准工作流
 
 1. 调用 `devices`，明确选择 `port`，核对一级 `model_family`、二级 `model_name`、有效 Shell/U-Boot 提示符和当前连接/工作流状态。
-2. 调用 `run_start`，在本次 Agent 工作流中保存返回的 `run_handle`。`run_id` 只用于审计和查询。
+2. 调用 `run_start`。端口空闲时会原子获得 Control 并开始 Run；Human 持有时调用会等待其在 TUI/App 批准。成功后在本次 Agent 工作流中保存返回的 `run_handle`；`run_id` 只用于审计和查询。
 3. 普通 Shell/Bootloader 命令使用 `command`；已知的多轮依赖交互使用一次 `command_sequence`。
 4. 需要补充观察时使用 `wait`、`read`、`search` 或 Monitor。
 5. 在最终 Agent 回复前调用 `run_end`。正常完成可省略 `outcome`；异常结束传 `outcome="aborted"`。只有明确把活动 Run 交给后续 Agent 工作流时才保持它打开。
@@ -83,12 +86,22 @@ Run 只界定证据，不复位设备，也不证明当前状态干净。Agent �
 ```json
 {
   "port": "COM4",
+  "approval_id": "uuid",
   "run_id": "uuid",
   "run_handle": "22-character-handle",
   "cursor": {"epoch": "uuid", "after_seq": 120},
   "cleanup_required": "Call run_end ..."
 }
 ```
+
+`run_start` 是一个原子后端操作，不再先排队取得 Control、再另行开始 Run：
+
+- 端口空闲时，`seriald` 原子授予 fenced Control 并创建 Run，立即返回成功；
+- 当前精确 Human Control holder 占用端口时，`seriald` 创建只面向该 Human 的有时限审批，adapter 以相同 request ID 和相同请求内容轮询；Human 在 TUI/App 批准后才原子转移 Control、创建 Run；
+- Human 拒绝、审批超时、后端取消、adapter 清理取消、调用方或 WebSocket 断连、端口 generation 变化等终态都不创建 Run，也不写入任何串口 bytes；
+- adapter 的审批等待有界，接近本地上限时会先取消 pending 请求；如果不能确认取消，则关闭 Agent 连接，让后端清理 pending 状态。
+
+因此不要在 MCP host 超时后自行假设批准成功，也不要盲目重试写操作。HTTP/stdio host 的 tool timeout 建议至少 130 秒，以覆盖最长 120 秒本地等待及响应收敛。`approval_id` 是这次原子授权的审计身份，不代替 `run_handle`。
 
 `run_handle` 固定 22 个 URL-safe 字符，仅由当前 `serial-mcp` 进程解析。所有 Run-scoped 工具只需要这一个值，因此小模型不必在每次调用中同时复制端口、Run ID 和其他底层状态。
 
@@ -105,7 +118,7 @@ Run 只界定证据，不复位设备，也不证明当前状态干净。Agent �
 
 ## `devices`
 
-Input：
+请求：
 
 ```json
 {}
@@ -173,6 +186,14 @@ scope：
 }
 ```
 
+如果 Human 在活动 Agent Run 中发送了命令，`seriald` 会关闭后续 Agent 物理动作门禁，直到 Agent 明确读到这次 Human TX。只有满足下列条件的读取才会确认该上下文：
+
+- `scope=tail` 或 `scope=continue` 的实时读取；
+- 返回事件确实包含当前 daemon epoch、当前 Run 最新 revision 对应的那一条 Human TX；
+- 返回 cursor 的 through sequence 已覆盖该 TX。
+
+成功时，结果附加 `user_command_context_revision`、`user_command_seq` 和 `user_command_acknowledged=true`。一次有界实时读取没有覆盖该 TX 时会返回 `user_command_acknowledged=false` 和继续读取提示，门禁仍保持关闭。`scope=archive` 永远不确认；`wait` 即使观察到相同输出也永远不确认。
+
 ## `command`
 
 ```json
@@ -223,6 +244,10 @@ scope：
 
 effective `echo=on` 时，adapter 识别并移除设备自身的 command+EOL echo。缺少应有回显、gap、第三方 TX、timeout 或 truncation 会降低 `confidence` 并添加 `warnings`。不确定的物理写入不自动重试。
 
+捕获结束后，adapter 会把权威 TX event、证据区间、completion 和 confidence 通过 `RecordCommandCapture` 持久化到 `seriald`。成功结果中的 `authoritative_capture` 是后端确认的 `CommandCaptureCompleted`，包含最终 record event 以及 TX/RX stream offset 范围；它是 TUI/App 定位旧命令证据的权威边界，不依赖后来修改的 Profile。
+
+如果串口 TX 已被确认，但 `RecordCommandCapture` 失败，工具会失败并明确说明命令可能已经作用于设备；当 `command_sequence` 已有可返回的逐步结果时，其结构化 `failure.phase` 为 `record_capture`。此时不得重发命令来“补记录”；应检查权威 TX/RX timeline，并只通过运维或后端恢复证据记录。
+
 ## `command_sequence`
 
 用于 Agent 已经知道后续步骤、但每一步必须等待设备提示的交互。例如登录：
@@ -261,13 +286,7 @@ adapter 在写第一步前验证完整计划，并为整个 sequence 持有该�
 
 每个已确认步骤保留独立 TX、description 和 matcher，整体由 `sequence_id` 与 sequence description 分组。结果包含 `requested_steps`、`completed_steps`、逐步结果、最终 cursor 和 Run 状态。TUI 先把这次 `command_sequence` 显示为一个 action；展开后可逐步选择、跳转并高亮每一步自己的 RX 捕获范围。
 
-## `input`
-
-```json
-{"run_handle":"abcdefghijklmnopqrstuv","text":"exact bytes"}
-```
-
-写入 `text` 的 UTF-8 bytes，不追加 Model Profile EOL。1–4096 bytes。结果返回 `write=confirmed`、`kind=input`、bytes 和 cursor。
+每个已执行步骤也分别持久化自己的 `authoritative_capture`。如果某一步在 TX 已确认后无法记录 capture，sequence 会在 capture 记录阶段停止，所有后续步骤不再写入；同样不得盲目重发已执行步骤。
 
 ## `signal`
 
@@ -317,7 +336,7 @@ Trigger 在后端内调度，避免每个 action 都经过一次 Agent 往返。
 }
 ```
 
-`expect` 与 `regex` 互斥；均省略时使用 Profile prompt，仍没有 prompt 时使用 quiet boundary。wait 从 `run_start`、`command`、`command_sequence` 或上次 wait 保存的 live cursor 开始，避免两个调用之间的 RX 丢失窗口。
+`expect` 与 `regex` 互斥；均省略时使用 Profile prompt，仍没有 prompt 时使用 quiet boundary。wait 从 `run_start`、`command`、`command_sequence` 或上次 wait 保存的 live cursor 开始，避免两个调用之间的 RX 丢失窗口。`wait` 只等待 RX 边界，不会确认 Human command 或解除物理动作门禁；需要使用真正覆盖 Human TX 的 `read(scope=tail|continue)`。
 
 ## `search`
 
@@ -434,20 +453,21 @@ adapter 记住每端口上次成功操作的 cursor。两个操作之间出现�
 
 没有第三方变化时省略该字段，减少 Agent context。
 
-在 `command`、`command_sequence`、`input`、`signal`、`trigger` 前，adapter 把已观察 cursor、generation 和 TX offset 作为后端原子 precondition。若 ring 无法证明上下文连续，或有第三方 TX/重开/gap，工具在物理动作前返回：
+在 `command`、`command_sequence`、`signal`、`trigger` 前，adapter 把已观察 cursor、generation 和 TX offset 作为后端原子 precondition。若 ring 无法证明上下文连续，或有第三方 TX、重开或 gap，工具会在物理动作前拒绝，并返回 `no_bytes_written=true`；Agent 应先实时读取并重新判断设备状态。
+
+Human intervention 使用更严格、可证明的 Run context gate。人工在活动 Agent Run 中直接按 Enter 发送命令时，命令立即作为 Human TX 写入和审计，不会借用 Agent fence，也不会转移 Agent Control。Agent 后续的 `command`、`command_sequence`、`signal` 或 `trigger` 会在发送前收到：
 
 ```json
 {
   "error": {
-    "code": "context_changed",
+    "code": "user_command_used",
     "no_bytes_written": true,
-    "recent_context": {},
-    "retry_hint": "Call read(scope=tail) or wait ..."
+    "retry_hint": "Call read(scope=tail) or read(scope=continue) until the Human TX is returned and acknowledged. wait and archive reads do not clear this gate."
   }
 }
 ```
 
-这也是人工在 Agent 占用串口时使用 `Alt+Enter` cooperative write 后的语义：下一次 Agent 物理写不会暗中继续执行，而是以 MCP tool error 返回上述结构，且 `no_bytes_written=true`。Agent 应先调用 `read(scope=tail)` 或 `wait` 阅读并确认新状态；该观察调用是确认边界，之后再决定是否重试。没有第三方变化时省略 `recent_context`。
+Agent 必须调用 `read(scope=tail)` 或 `read(scope=continue)`，并让返回范围实际包含最新 Human TX。即使此前的 `wait` 已把普通 live cursor 推到这条 TX 之后，下一次 live read 也会根据 daemon 的 pending Run context 临时从该 TX 前一序号重新读取，不会永久越过门禁证据。只有该实时读取成功提交 exact Run revision 和覆盖该 TX 的 through sequence 后，门禁才解除；读取范围没覆盖或该 TX 已从 live ring 淘汰时，结果会明确标记 `user_command_acknowledged=false` 和 gap/warning，绝不伪造确认。`wait`、`search`、Monitor 和 `read(scope=archive)` 都不能清除门禁。解除门禁只表示 Agent 已看到人工干预，不代表原计划仍安全；重试前仍应根据新串口状态重新决策。
 
 ## 结果、截断与取消
 

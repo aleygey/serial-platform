@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron'
 import { DesktopCoordinator } from './coordinator'
-import type { DesktopPreferences, ModelFamily, ModelProfile, SerialConfigurationDraft } from '../shared/contracts'
+import type { DesktopPreferences, ModelFamily, ModelProfile, RunStartDecision, SerialConfigurationDraft } from '../shared/contracts'
 import { HELP, startupAction } from './startup'
 import { GracefulQuitGate } from './graceful-quit'
 
@@ -64,6 +64,12 @@ function installIpc(): void {
   ipcMain.handle('serial:refresh', () => coordinator!.refresh())
   ipcMain.handle('serial:send-command', (_event, port: string, command: string) =>
     coordinator!.sendCommand(port, command))
+  ipcMain.handle('serial:decide-run-start', (
+    _event,
+    port: string,
+    approvalId: string,
+    decision: RunStartDecision
+  ) => coordinator!.decideRunStart(port, approvalId, decision))
   ipcMain.handle('serial:set-port-open', (_event, port: string, open: boolean) =>
     coordinator!.setPortOpen(port, open))
   ipcMain.handle('serial:save-serial-configuration', (

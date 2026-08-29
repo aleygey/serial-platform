@@ -1,6 +1,6 @@
 # Serial Platform Architecture
 
-本文描述 Serial Platform 的当前架构。具体 JSON 契约以 [protocol v6](./docs/PROTOCOL.md) 为准，Agent 工具以 [MCP 工具目录](./docs/MCP_TOOLS.md) 或 `serial mcp --dump-tools` 为准。
+本文描述 Serial Platform 的当前架构。具体 JSON 契约以 [protocol v7](./docs/PROTOCOL.md) 为准，Agent 工具以 [MCP 工具目录](./docs/MCP_TOOLS.md) 或 `serial mcp --dump-tools` 为准。
 
 ## 产品边界
 
@@ -28,11 +28,11 @@ Serial Platform 是通用的人/Agent 协同串口平台：后端独占物理 UA
 | 组件 | 责任 |
 |---|---|
 | `serial` | 统一入口；离线 setup；一次启动后端、HTTP MCP 和前台 TUI；分发其他子命令 |
-| `seriald` | 物理串口所有权、Control/Run/Trigger、journal、HTTP v1 和 WebSocket v6 |
+| `seriald` | 物理串口所有权、Control/Run/Trigger、journal、HTTP v1 和 WebSocket v7 |
 | `serialctl` | 人工 setup、Profile 管理、诊断、历史查询和全屏 TUI |
-| `serial-mcp` | 面向 Agent 的 17 工具；支持 stdio 与 sessionless Streamable HTTP |
+| `serial-mcp` | 面向 Agent 的 16 工具；支持 stdio 与 sessionless Streamable HTTP |
 | Electron App | 本地服务生命周期、三栏控制台、配置页和桌面快捷键 |
-| `serial-protocol` | 跨组件 DTO、v6 WebSocket 消息和二进制帧 codec |
+| `serial-protocol` | 跨组件 DTO、v7 WebSocket 消息和二进制帧 codec |
 
 `seriald` 是唯一直接打开物理串口的组件。其余组件只通过 HTTP/WebSocket 访问后端，因此多个 TUI、桌面窗口和 Agent 可以观察同一条时间线，而不会争抢 OS 句柄。
 
@@ -138,28 +138,41 @@ Model Profile 不包含 `model_names`，也不规定设备必须属于哪个系�
 
 ### Control
 
-普通写入需要 Control lease。lease 包含 Control ID、`daemon_epoch`、`generation` 和单调 fence；旧连接或旧 fence 的写入会被拒绝。客户端负责续租，后端负责队列、公平授予、超时和撤销。
+普通写入需要 Control lease。lease 包含 Control ID、`daemon_epoch`、`generation` 和单调 fence；旧连接或旧 fence 的写入会被拒绝。客户端负责续租，后端负责超时和撤销。
 
-Agent 只能排队获取 Control，不能主动 Takeover。人可以显式 Takeover；这会撤销 Agent Control 并中止其 Run。人也可以在明确选择时向当前 Agent Run 注入一条 cooperative write，这条写入被独立审计，但不会转移 Agent Control。
+v7 没有通用 Control waiter queue。已有 holder 时，`AcquireControl(mode=queue)` 立即返回 busy；释放、到期或断连不会提升隐藏 waiter，`CancelAcquire` 只保留为返回 `removed=false` 的兼容 no-op。Agent 也不能调用 `AcquireControl` 绕过 Run 边界。Human 仍可以明确 Takeover；这会撤销旧 Control、停止相关 Trigger 并中止 Agent Run，而不是一次普通命令的默认路径。
+
+Human 普通命令走 `SendHumanCommand`，授权和物理写入都在同一个端口 actor 中决定，绝不排队：
+
+- Control 空闲时，先原子授予该 Human lease，再写入；
+- 该 Human 已是 holder 时，按普通 owned write 写入；
+- Agent 持有 Control 且同一 Agent 有活动 Run 时，按 cooperative write 写入，不借用 Agent fence，也不转移 lease；活动 Trigger 会先停止并收敛；
+- 任何其他 owner、没有匹配的活动 Agent Run、端口或 generation 已变化时，立即冲突。
+
+Human TX 是普通 confirmed `tx` timeline event，并带 `human_command=true`。若属于 cooperative write，还带 `interfered_run_id` 和新的 `context_revision`；部分写入只要确认了至少一个 byte，也会形成 TX、推进 revision 并按不确定物理结果处理。
 
 ### Run
 
 Run 是证据边界，不是设备复位，也不保证设备状态干净。一个端口同时最多一个活动 Run。
 
-MCP `run_start` 完成 Control 获取和 Run 创建，返回：
+MCP `run_start` 使用单个 v7 `RequestRunStart` 完成授权与 Run 创建，返回：
 
 - `run_id`：时间线中的公开审计 ID；
 - `run_handle`：22 字符、仅当前 adapter 进程解析的工作流句柄。
 
+端口 idle 时，`seriald` 在同一个 Slot turn 中原子 grant Agent Control 并创建 Run，不暴露“有 Agent Control、没有 Run”的中间状态。若当前 holder 是 Human，daemon 创建仅由该精确 holder 决策的 `PendingRunStartApproval`；snapshot 的 `pending_run_start` 和 `run_start_requested` timeline event 立即向 UI 投影。批准时再次核对 daemon epoch、generation、Human Control ID/fence、Run 和 Trigger，然后在同一个 turn 原子 transfer+Run；否决、超时、请求方取消、任一相关连接断开、holder 改变、重配或物理重连全部 fail closed，不创建 Run，也不写串口。其他 owner、活动 Run/Trigger 或已有另一项审批都立即冲突，不进入 Control queue。
+
+Agent 用同一 request ID 和完全相同参数幂等轮询 pending/terminal 结果。只有 requester Agent 能取消，只有 approval 指定的当前 Human holder 能 approve/deny。五类 timeline 投影 `run_start_requested`、`run_start_approved`、`run_start_denied`、`run_start_timed_out`、`run_start_cancelled` 都保留完整 approval，方便 TUI/App 在 snapshot 与实时事件之间无损收敛。
+
 后续 Run-scoped 工具只传 `run_handle`。adapter 内部解析端口、Run 和 Control 状态，并在物理动作前再次检查。工作流收口统一调用 `run_end`：`outcome=completed` 表示正常完成且是默认值，记录 `RunEnded` 后立即尝试释放 Control；`outcome=aborted` 只有在收到权威的 `ControlReleased` 后才成功，并记录 `RunAborted`。默认 1800 秒的孤立 Run 回收只处理 Agent 中断或遗弃，`0` 表示不限时。该设置写在共享 `serialctl.toml`；未使用命令行 override 的 adapter 会在运行中自动加载修改。
 
-### 串行上下文保护
+### 串行上下文与 Human read gate
 
-Agent 物理动作带 daemon-enforced sequence precondition：上一游标、预期 generation 和预期 TX offset。新的 RX 不阻止写入，但 generation 变化、第三方 TX、显式 gap 或 replay ring 边界不足会在零字节写入时拒绝动作。
+Agent 物理动作仍带 daemon-enforced sequence precondition：上一游标、预期 generation 和预期 TX offset。新的 RX 不阻止写入，但 generation 变化、第三方 TX、显式 gap 或 replay ring 边界不足会以 `sequence_boundary_changed` 在零字节写入时拒绝动作。adapter 还会在必要时附加有界 `recent_context`，例如 Takeover、其他 actor 写入、Run 中止或端口重配；摘要不暴露行为 Profile 名。
 
-adapter 在结果中只在必要时附加 `recent_context`：例如用户 Takeover、其他 Agent 写入、Run 中止、端口重配或机型系列/具体机型变化。摘要不会暴露行为 Profile 名；如果连续两次操作之间没有第三方干扰，不增加该字段。
+Human 在活动 Agent Run 中成功发送命令后，daemon 的 `run_context.revision` 递增，`last_human_command_seq` 指向最新 Human TX。此后该 Run owner 的 `Write`、UART Break 和 `TriggerStart` 都在触碰物理 writer 前返回 `UserReadRequired`，保证零字节。线协议稳定 error code 是 `user_read_required`，MCP 向模型暴露 `user_command_used`、`no_bytes_written=true`。
 
-人工在 Agent Run 中使用 `Alt+Enter` 是绑定到该 Run 的 cooperative write，不转移 Control。它仍然改变了真实串口上下文，因此 Agent 下一次 `command`、`command_sequence`、`input`、`signal` 或 `trigger` 会在写前返回 `context_changed`，并明确给出 `no_bytes_written=true` 与 `recent_context`。Agent 调用 `read(scope=tail)` 或 `wait` 阅读并确认新状态后，才决定是否重试。
+解除 gate 必须证明 Agent 实际读到了这条人工 TX：只有 `read(scope=tail|continue)` 的 live-ring 响应同时包含同一 daemon epoch、精确 seq、`direction=tx` 且 `human_command=true` 的事件，并且返回 cursor 覆盖该 seq，adapter 才发送 `AcknowledgeRunContext`。daemon 只接受当前 Agent Control/Run owner、精确最新 revision 且 `through_seq >= last_human_command_seq` 的 ACK。若 `wait` 已推进普通 live cursor 越过该 TX，下一次 live read 会临时从 `last_human_command_seq-1` 重新读取；若事件已被 ring 淘汰则明确返回 gap/warning，仍不会确认。`wait`、`search`、`read(scope=archive)`、不含该 TX 的 bounded live read，以及单纯移动 cursor 都不会清除 gate；Agent 必须先 live read，再决定下一条 command。
 
 ## 时间线与持久 journal
 
@@ -189,25 +202,42 @@ journal 使用分段二进制记录、CRC 和断尾恢复。默认单段 64 MiB�
 
 ## Agent 命令与输出定位
 
-`command` 在确认 TX 前附加：
+`command`/`command_sequence` 的每一步都先产生带 `run_id`、`operation_id` 和 description 的 confirmed TX。捕获完成后，adapter 向 daemon 发送 `RecordCommandCapture`，报告：
 
-- `command_description`
-- `command_capture_matchers`
-- 可选 `command_sequence_*` 分组字段
+- daemon epoch 与 serial generation；
+- Run、operation 和 confirmed TX event seq；
+- 包含该 TX 的 `evidence_from_seq..=evidence_through_seq`；
+- completion（literal/prompt/regex/quiet/signal/run-aborted/timeout/disconnected）、可选 detail 和 confidence。
 
-`command_capture_matchers` 是数组，元素结构为：
+`seriald` 不信任客户端自行声明的精确性：它从 replay ring 证明证据仍保留、范围没有 gap 且不跨 generation，并验证 TX 的 actor、Run、operation 与 generation 全部匹配。然后 daemon 从原始 timeline 派生 TX/RX stream offsets，持久化 `CommandCaptureCompleted` event，在 `metadata.capture` 保存完整 DTO，并以 `CommandCaptureRecorded` 返回同一权威记录。证据已淘汰、不连续、跨代或身份不符时拒绝记录；命令已经写入的情况下，adapter 会明确提示只恢复证据工作流，绝不盲目重发命令。
+
+权威 capture 同时保留 sequence 边界和尽量精确的 byte offset：
 
 ```json
-{"kind":"contains|regex|shell_prompt|uboot_prompt","value":"..."}
+{
+  "run_id": "uuid",
+  "operation_id": "uuid",
+  "tx_event_seq": 812,
+  "evidence_from_seq": 812,
+  "evidence_through_seq": 826,
+  "completion": "prompt",
+  "completion_detail": "root@router:~# ",
+  "confidence": "high",
+  "record_event_seq": 827,
+  "tx_stream_offset_start": 300,
+  "tx_stream_offset_end": 311,
+  "rx_stream_offset_start": 20480,
+  "rx_stream_offset_end": 20742
+}
 ```
 
-显式 `expect` 或 `regex` 产生一个 matcher；没有显式边界时，adapter 持久化当前 Model Profile 的 Shell/U-Boot matcher（0–2 个）；quiet completion 不添加 matcher。
+TUI 和 App 以这条 durable capture 作为命令历史定位的主索引：先按 operation 关联，再优先使用 epoch/sequence evidence 与 stream offsets；本地窗口不足时按精确范围从 journal 回取。只有区间连续完整且没有 gap 才显示和高亮 RX；retention、缺失、预算超限或查询失败都不能伪装成完整输出。
 
-TUI 和 App 从该命令 TX 后的 RX 开始寻找第一个匹配边界，并高亮 TX 对应的设备回显与完成边界之间的 RX 区域。因为 matcher 随 TX 一起持久化，后来修改 Model Profile 不会改变旧命令的定位语义。TUI 只在本地同周期窗口能够证明 TX 到匹配边界完整连续时直接高亮；本地记录淘汰或命令属于旧周期时，复用精确证据查询从 journal 回取。retention gap、序号缺失、预算超限或查询失败都不会留下局部高亮，而是返回实时尾并显示原因。找不到边界时只显示临时命令提示，不把 TX 注入 RX 历史。
+TX 上的 `command_capture_matchers` 仍随 description 和可选 `command_sequence_*` 分组字段持久化，但只用于读取旧历史或 capture event 缺失时的 legacy fallback。v7 新记录不能把 matcher 的再次扫描结果冒充 daemon-validated capture；后来修改 Model Profile 也不会改写任何已经持久化的 matcher 或 capture。
 
 `command_sequence` 在一个 MCP 调用中执行 1–8 个已知依赖步骤。每个非最终步骤必须配置 `expect` 或 `regex`；只有匹配后才发送下一条，任何失败都会停止剩余写入。每个步骤保留独立描述、命令 bytes、matcher 与执行状态，整体用 `sequence_id` 和总任务描述分组。
 
-任务与命令记录使用三层树模型：第一层是 Run 及其状态，第二层是 `command` / `command_sequence` action 的 description，第三层是实际发送的命令。普通 `command` 只有一个第三层子项；`command_sequence` 按 step 顺序列出多个子项，上下选择 step 后按该 step 的 TX 起点、下一 step 上界和 matcher 独立查询、定位并高亮。没有 matcher 时只显示临时命令文本；有 matcher 但本地证据不完整时必须等待 journal 的完整连续结果，不改写串口历史，也不降级展示局部尾部。
+任务与命令记录使用三层树模型：第一层是 Run 及其状态，第二层是 `command` / `command_sequence` action 的 description，第三层是实际发送的命令。普通 `command` 只有一个第三层子项；`command_sequence` 按 step 顺序列出多个子项，每个 step 按自己的 operation/capture 独立定位。还没有权威 capture 时只显示 pending/临时状态；本地证据不完整时必须等待 journal 的完整连续结果，不改写串口历史，也不降级展示局部尾部。
 
 ## Trigger 与 Monitor
 
@@ -215,7 +245,7 @@ TUI 和 App 从该命令 TX 后的 RX 开始寻找第一个匹配边界，并高
 
 Trigger 是后端内的有界低延迟反应：可先执行一次 kickoff，再按间隔发送 action，并由 RX literal、超时或最大发送次数结束。matcher 在 kickoff 前就已启用，避免短窗口跨 Agent/VM/network 往返。
 
-Trigger 不包含设备厂商语义。每次写入仍经过 Control、Run、fence、generation、pacing 和确认审计。观察 gap、Control/Run 丢失或物理重开都会终止 Trigger。
+Trigger 不包含设备厂商语义。每次写入仍经过 Control、Run、fence、Human read gate、generation、pacing 和确认审计。观察 gap、Control/Run 丢失、Human cooperative command 或物理重开都会终止 Trigger。
 
 ### Monitor
 
@@ -232,11 +262,13 @@ TUI 从上到下由四部分组成：
 3. Agent 任务与命令历史：两条 powerline 风格分隔栏之间；
 4. 人工命令输入。
 
-任务与命令记录按旧到新排列，最新 Run 在底部。新的 Agent action 到达时，TUI 自动退回它所属的 Run；同一 action 的 TX 分块或后续 sequence step 只合并进原记录。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。默认用 `↑` / `↓` 在当前层选择，按 `→` 按 Run → description → 具体命令逐层展开，按 `←` 逐层返回；滚轮和 PgUp/PgDn 浏览当前层级，带 `Ctrl-]` 前缀的 PgUp/PgDn 才滚动串口输出。
+任务与命令记录按旧到新排列，最新 Run 在底部。新的 Agent action 到达时，TUI 自动退回它所属的 Run；同一 action 的 TX 分块或后续 sequence step 只合并进原记录。Monitor 新 incident 只更新对应 Monitor，不强制改变当前选择。默认用 `↑` / `↓` 在当前层选择，按 `→` 按 Run → description → 具体命令逐层展开，按 `←` 逐层返回；展开的长详情用 `Shift+↑` / `Shift+↓` 滚动，滚轮和 PgUp/PgDn 始终滚动串口输出。
 
 主终端只渲染 RX。普通 command 进入后定位完整捕获区间；command sequence 进入后逐步选择和定位；Monitor 进入后显示 matcher，继续进入可选择 incident，并按 `serial_range` 跳转到证据。命令捕获与 Monitor incident 共用同一条精确 journal 证据链：范围属于旧的后端周期或已从 TUI 本地窗口淘汰时，按持久周期和序号边界回取；只有区间完整连续时才显示并高亮 RX，retention gap、缺失、超限或查询失败会返回实时尾并明确提示。双击选词与拖选使用可见高亮，选择不会因为实时刷新立即消失。
 
-持久历史搜索支持文本/正则、大小写、RX/TX、当前周期、保留周期和当前 Run。结果在独立视图中显示，不把旧周期内容混入当前实时终端。
+TUI 从 snapshot 的 `pending_run_start` 与五类 Run-start timeline event 投影审批状态；只有 approval 中指定的当前 Human holder 能批准或否决。批准是 daemon 内原子 transfer+Run，UI 不自行先 release Control。人工命令直接调用 `SendHumanCommand`，不会进入 Control queue；Agent Run 中的 cooperative 结果会标明该 Run 与 context revision，供操作员理解为什么 Agent 必须先读到这条 TX。
+
+`Ctrl-] /` 在串口输出右上角打开即时查找框。输入即在清洗后的显示行中匹配并把主输出定位到最新命中的上下文；Enter/F3 与 Shift+Enter/Shift+F3 循环切换结果，Alt 组合切换文本/正则、大小写、方向和范围。结果锚定 epoch/sequence/行内 offset，实时追加按 100 ms 合并刷新；当前本地窗口已淘汰更早内容时明确显示范围不完整，不把有界空结果冒充全 journal 未命中。完整持久历史仍由 `serial logs` 或 MCP archive 查询。
 
 配置菜单只有四个主入口：
 
@@ -253,11 +285,11 @@ Electron 主进程负责：
 
 - 解析配置 endpoint，并发现同一 data root 已验证的活动 endpoint；
 - 在需要时启动随包的本地 `seriald`；
-- 连接 HTTP v1 与 WebSocket v6；
+- 连接 HTTP v1 与 WebSocket v7；
 - 持久设置、服务退出和优雅清理；
 - 向 renderer 暴露窄而类型化的 IPC。
 
-renderer 是 React 视图，不直接访问后端。控制台为三栏布局：端口、RX 终端、Agent 历史；命令输入位于中间栏底部。配置页明确分成串口/Transport Profile、行为 Model Profile 与独立的两级 Model Family 机型目录。系统/浅色/深色主题使用相同设计变量。
+renderer 是 React 视图，不直接访问后端。控制台为三栏布局：端口、RX 终端、Agent 历史；人工命令位于中间栏底部。终端右上角的 VS Code 风格 Find Widget 默认隐藏，Cmd/Ctrl+F 或 F3 显式打开，输入即定位，支持循环导航、跨 RX event 匹配和稳定 `n/total`；追加只扫描查询长度所需的尾部重叠区与新增文本，并仅重绘命中状态变化的 chunk。Run-start approval 由 snapshot/timeline 驱动，只有指定 Human holder 可以 approve/deny，终态按 `approval_id` 收敛。命令历史优先读取 `command_capture_completed.metadata.capture` 的 daemon-validated evidence，旧 matcher 只作兼容回退。配置页明确分成串口/Transport Profile、行为 Model Profile 与独立的两级 Model Family 机型目录。系统/浅色/深色主题使用相同设计变量。
 
 端口历史在内存视图中有界，权威完整记录仍在后端 journal。桌面搜索和命令区域定位不会改变原始事件。
 
@@ -266,13 +298,27 @@ renderer 是 React 视图，不直接访问后端。控制台为三栏布局：�
 `serial-mcp` 支持两种 transport：
 
 - stdio：newline-delimited JSON-RPC，供 MCP host 直接启动；
-- Streamable HTTP：`POST http://127.0.0.1:3211/mcp`，sessionless，仅监听 loopback。
+- Streamable HTTP：sessionless `POST http://<exact-interface-ip>:3211/mcp`；默认单机是 `127.0.0.1`。
 
-两者共享 17 个工具和相同结构化结果。HTTP notification 返回 202；`GET /mcp` 不提供 SSE session。若请求带 `Origin`，只接受相同本地监听端口的 `localhost` 或 `127.0.0.1` origin。
+统一启动器从已验证的 `active-endpoint.json.address` 取 seriald 的精确 IP，再把 MCP 端口固定为 3211：seriald 绑定 `192.168.56.109:3210` 时 MCP 就绑定 `192.168.56.109:3211`；只有 seriald 的 IPv4/IPv6 bind 是通配地址时，活动 endpoint 才先转换为可连接的 `127.0.0.1`/`::1`。它不会把 host-only 配置悄悄改成 loopback，也不会让 MCP 监听所有接口。
 
-MCP 公开面中，`devices` 是唯一的设备发现工具：它返回串口名、两级机型身份、Agent 需要的连接/Control/Run/Trigger/cursor 状态和当前有效的 Shell/U-Boot 提示符。它不返回行为 Model Profile 名、Transport/UART 参数、EOL/echo 或写入节奏。`model_identity_set` 只绑定或解绑人工预先配置的 family/name；Profile 和 Model Family 目录仍由 TUI、Electron 或 HTTP 配置。
+Streamable HTTP 没有认证和 TLS。listener 必须是一个精确单播地址，拒绝 IPv4/IPv6 unspecified、multicast 和 IPv4 broadcast；非 loopback 只允许用于受信 host-only VM interface，进程会打印安全警告，并要求用主机防火墙限制访问。`Origin` 可以省略；存在时必须是同端口、无 credentials/path/query/fragment 的 `http://` origin，host 是 listener 的精确 numeric IP。仅当 listener 本身为 loopback 时额外允许 `localhost`。这项检查是浏览器跨站缓解，不是认证，不能据此把 endpoint 暴露到 LAN 或公共网络。
 
-HTTP adapter 还提供仅供统一启动器使用的本地 `GET /health`。启动器据此确认 3211 上确实是 protocol v6 `serial-mcp`，并且它连接的 `server_id`、`daemon_epoch` 和 endpoint 与当前选中的 `seriald` 完全一致；普通 TCP listener、旧协议 adapter 或连接到另一后端的 adapter 都不会被误复用。HTTP adapter 在启动时固定这组后端身份，若同一 endpoint 换成新的 daemon epoch，会拒绝重连，重启 adapter 后才会发布并使用新身份。
+两种 transport 共享以下固定 16 个工具和相同结构化结果：
+
+```text
+devices model_identity_set read command command_sequence signal trigger wait
+search monitor_start monitor_list monitor_status monitor_incidents monitor_stop
+run_start run_end
+```
+
+HTTP notification 返回 202；`GET /mcp` 不提供 SSE session。
+
+MCP 公开面中，`devices` 是唯一的设备发现工具：它返回串口名、两级机型身份、Agent 需要的连接/Control/Run/Trigger/cursor、pending Run-start 与 Human read-gate 状态，以及当前有效的 Shell/U-Boot 提示符。它不返回行为 Model Profile 名、Transport/UART 参数、EOL/echo 或写入节奏。`model_identity_set` 只绑定或解绑人工预先配置的 family/name；Profile 和 Model Family 目录仍由 TUI、Electron 或 HTTP 配置。
+
+HTTP adapter 还提供仅供统一启动器使用的 `GET /health`。启动器据此确认精确 IP:3211 上确实是 protocol v7 `serial-mcp`，并且它连接的 `server_id`、`daemon_epoch` 和 endpoint 与当前选中的 `seriald` 完全一致；普通 TCP listener、旧协议 adapter 或连接到另一后端的 adapter 都不会被误复用。HTTP adapter 在启动时固定这组后端身份，若同一 endpoint 换成新的 daemon epoch，会拒绝重连，重启 adapter 后才会发布并使用新身份。
+
+`run_start` 在 idle 时得到原子 grant+Run，在 Human holder 存在时等待该 holder 的显式批准。`command` 和 `command_sequence` 只有在 daemon 持久化权威 capture 后才把完成范围交付给模型。Human command 触发 read gate 时，物理工具返回 `user_command_used`；live `read(scope=tail|continue)` 必须实际包含 Human TX 才会 ACK，`wait` 和 archive read 不会。
 
 没有命令行 timeout override 时，adapter 监视共享 `serialctl.toml` 的 `orphan_run_timeout_seconds`；TUI 保存设置后运行中的 stdio/HTTP MCP 自动应用新值。
 
@@ -289,9 +335,9 @@ serial
   └── serialctl     foreground TUI
 ```
 
-每个 resolved data root 在打开 journal 前取得 `data/seriald.lock`，保证只有一个后端实例。后端监听成功后发布 `data/active-endpoint.json`，其中记录实际 endpoint、Socket 地址、`server_id`、`daemon_epoch`、protocol version 和 PID。发现端只有在 `/api/v1/health` 返回 `status=ok`，且身份、周期和 protocol v6 与记录完全一致时才接受该端点；失效记录不阻塞新实例取得 lock 并覆写。通配 bind 发布本机可连接的 loopback 地址。
+每个 resolved data root 在打开 journal 前取得 `data/seriald.lock`，保证只有一个后端实例。后端监听成功后发布 `data/active-endpoint.json`，其中记录实际 endpoint、Socket 地址、`server_id`、`daemon_epoch`、protocol version 和 PID。发现端只有在 `/api/v1/health` 返回 `status=ok`，且身份、周期和 protocol v7 与记录完全一致时才接受该端点；失效记录不阻塞新实例取得 lock 并覆写。精确 bind 保留其 IP，通配 bind 发布本机可连接的 loopback 地址。
 
-活动端点是运行时事实，因此默认 endpoint 和自定义 endpoint 使用相同规则。App 先启动时，随后运行的 `serial` 复用 App 的后端；`serial` 先启动时，App 发现并复用该后端。App 对 preferred endpoint 也要求有效的 protocol v6 health 和服务身份，发现 marker 时还会逐项核对 health。两者并发首启时，首个进程取得 data-root lock，失败的一方等待并重新发现 winner；全新配置也只原子创建一次，所有启动器读取同一个 `server_id`。两者只管理自己启动的进程：拥有后端的一方退出后，仍在运行的外部客户端不会自动 failover，重新启动后才重新发现或创建服务。`serial` 在选定后端后再保证本地 HTTP MCP 可用，并只回收自己补齐的 MCP 进程。
+活动端点是运行时事实，因此默认 endpoint 和自定义 endpoint 使用相同规则。App 先启动时，随后运行的 `serial` 复用 App 的后端；`serial` 先启动时，App 发现并复用该后端。App 对 preferred endpoint 也要求有效的 protocol v7 health 和服务身份，发现 marker 时还会逐项核对 health。两者并发首启时，首个进程取得 data-root lock，失败的一方等待并重新发现 winner；全新配置也只原子创建一次，所有启动器读取同一个 `server_id`。两者只管理自己启动的进程：拥有后端的一方退出后，仍在运行的外部客户端不会自动 failover，重新启动后才重新发现或创建服务。`serial` 在选定后端后再保证该精确活动 IP 上的 HTTP MCP 可用，并只回收自己补齐的 MCP 进程。
 
 ### 分开运行
 

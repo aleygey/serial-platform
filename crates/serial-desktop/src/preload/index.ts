@@ -12,6 +12,8 @@ const bridge: DesktopBridge = {
   bootstrap: () => ipcRenderer.invoke('serial:bootstrap'),
   refresh: () => ipcRenderer.invoke('serial:refresh'),
   sendCommand: (port, command) => ipcRenderer.invoke('serial:send-command', port, command),
+  decideRunStart: (port, approvalId, decision) =>
+    ipcRenderer.invoke('serial:decide-run-start', port, approvalId, decision),
   setPortOpen: (port, open) => ipcRenderer.invoke('serial:set-port-open', port, open),
   saveSerialConfiguration: (draft: SerialConfigurationDraft, expectedRevision: number) =>
     ipcRenderer.invoke('serial:save-serial-configuration', draft, expectedRevision),

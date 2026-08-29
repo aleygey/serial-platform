@@ -1,11 +1,14 @@
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
+import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import type {
-  DesktopSnapshot,
+  Actor,
   ModelFamily,
   ModelProfile,
+  PendingRunStartApproval,
   PortDescriptor,
+  RunStartDecision,
   SerialConfigurationDraft,
   PortSnapshot,
   TimelineEvent,
@@ -19,6 +22,7 @@ import {
   type WireControl
 } from './protocol'
 import { ReconnectLoop } from './reconnect-loop'
+import { isApprovalActionable } from '../shared/run-start'
 
 interface StatusResponse {
   server_id: string
@@ -52,6 +56,7 @@ interface ConfigurationSnapshot {
 }
 
 const CONFIGURATION_SNAPSHOT_ATTEMPTS = 3
+const SOCKET_HANDSHAKE_TIMEOUT_MS = 5_000
 
 interface ConfigurePortsResponse {
   ports: PortSnapshot[]
@@ -62,20 +67,32 @@ interface EventQueryResponse {
   events: Record<string, unknown>[]
 }
 
-interface Lease {
-  id: string
-  fence: number
-  owner: { id: string }
-}
-
 interface PendingRequest {
   resolve: (value: unknown) => void
   reject: (reason: Error) => void
-  port?: string
+  outcomeUncertainOnTransportLoss: boolean
+  outcomeUncertainErrorCodes: readonly string[]
+}
+
+interface PendingWelcome {
+  socket: WebSocket
+  expectedServerId: string
+  expectedDaemonEpoch: string
+  resolve: (actor: Actor) => void
+  reject: (reason: Error) => void
+}
+
+interface HumanCommandAccepted {
+  type: 'human_command_accepted'
+  event_seq: number
+  mode: 'owned' | 'cooperative'
+  interfered_run_id?: string
+  context_revision?: number
 }
 
 export interface ServerData {
   status: StatusResponse
+  actor?: Actor
   availablePorts: PortDescriptor[]
   transportProfiles: TransportProfile[]
   modelProfiles: ModelProfile[]
@@ -91,6 +108,23 @@ class SerialHttpError extends Error {
 
 export class ConfigurationConflictError extends Error {}
 
+export class SerialCommandError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+    readonly retryable = false
+  ) {
+    super(message)
+  }
+}
+
+export class HumanCommandOutcomeUncertainError extends Error {
+  constructor(detail?: string) {
+    super(detail ? `${HUMAN_COMMAND_UNCERTAIN_MESSAGE}（${detail}）` : HUMAN_COMMAND_UNCERTAIN_MESSAGE)
+    this.name = 'HumanCommandOutcomeUncertainError'
+  }
+}
+
 export class SerialClient extends EventEmitter {
   readonly endpoint: string
   private status?: StatusResponse
@@ -100,13 +134,12 @@ export class SerialClient extends EventEmitter {
   private modelFamilies: ModelFamily[] = []
   private readonly events = new Map<string, TimelineEvent[]>()
   private socket?: WebSocket
-  private renewTimer?: NodeJS.Timeout
+  private readySocket?: WebSocket
   private stopped = false
   private connectionVersion = 0
-  private actorId?: string
-  private readonly leases = new Map<string, Lease>()
+  private actor?: Actor
   private readonly pending = new Map<string, PendingRequest>()
-  private readonly acquiring = new Map<string, Promise<Lease>>()
+  private pendingWelcome?: PendingWelcome
   private readonly reconnectLoop: ReconnectLoop
 
   constructor(endpoint: string) {
@@ -139,9 +172,9 @@ export class SerialClient extends EventEmitter {
     this.stopped = false
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
-    const data = await this.refresh(true)
+    await this.refresh(true)
     await this.openSocket(this.connectionVersion)
-    return data
+    return this.data()
   }
 
   async refresh(loadHistory = false): Promise<ServerData> {
@@ -151,6 +184,7 @@ export class SerialClient extends EventEmitter {
     ])
     const { status, transport, profiles, families } = configuration
     assertCompatibleProtocol(status.protocol_version)
+    this.reconcileEventEpochs(status)
     this.status = status
     this.availablePorts = availablePorts
     this.transportProfiles = transport.profiles
@@ -166,6 +200,7 @@ export class SerialClient extends EventEmitter {
     if (!this.status) throw new Error('尚未连接后端')
     return {
       status: this.status,
+      actor: this.actor ? structuredClone(this.actor) : undefined,
       availablePorts: [...this.availablePorts],
       transportProfiles: structuredClone(this.transportProfiles),
       modelProfiles: structuredClone(this.modelProfiles),
@@ -261,52 +296,69 @@ export class SerialClient extends EventEmitter {
   }
 
   async sendCommand(port: string, command: string): Promise<void> {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('实时连接尚未建立')
-    const lease = await this.acquire(port)
+    const socket = this.readySocket
+    if (!socket || this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error('实时连接尚未建立')
+    }
     const configured = this.status?.ports.find((item) => item.config.port === port)
+    if (!configured) throw new Error(`未找到串口 ${port}`)
     const eol = configured?.effective_write_eol ?? '\r'
-    await this.control({
-      type: 'write',
-      request_id: randomUUID(),
+    const result = await this.control(buildHumanCommandMessage({
+      requestId: randomUUID(),
+      operationId: randomUUID(),
       port,
-      control_id: lease.id,
-      fence: lease.fence,
-      data: Buffer.from(`${command}${eol}`).toString('base64'),
-      operation_id: randomUUID(),
-      expected_run_id: null,
-      pacing: null,
-      description: null,
-      command_sequence: null,
-      command_capture_matchers: [],
-      sequence_precondition: null,
-      cooperative: false
-    })
+      expectedGeneration: configured.generation,
+      data: Buffer.from(`${command}${eol}`).toString('base64')
+    }), socket, {
+      outcomeUncertainOnTransportLoss: true,
+      outcomeUncertainErrorCodes: ['write_outcome_uncertain']
+    }) as HumanCommandAccepted
+    if (result?.type !== 'human_command_accepted') {
+      throw new HumanCommandOutcomeUncertainError('后端返回了未知的人工命令结果')
+    }
+    if (result.mode === 'cooperative') {
+      this.emit('notice', '人工命令已介入 Agent Run；Agent 必须先读取最新串口输出后才能继续。')
+    }
+  }
+
+  async decideRunStart(port: string, approvalId: string, decision: RunStartDecision): Promise<void> {
+    const configured = this.status?.ports.find((item) => item.config.port === port)
+    const approval = configured?.pending_run_start
+    if (!configured || !approval || approval.id !== approvalId || !isApprovalActionable(configured, approval, this.actor)) {
+      throw new Error('该 Run 启动审批已失效，请等待最新状态')
+    }
+    const result = await this.control(buildRunStartDecisionMessage(
+      randomUUID(),
+      port,
+      approvalId,
+      decision
+    )) as { type?: string; approval_id?: string }
+    if (![
+      'run_start_granted',
+      'run_start_denied',
+      'run_start_timed_out',
+      'run_start_cancelled'
+    ].includes(String(result?.type))) throw new Error('后端返回了未知的 Run 启动审批结果')
+    if (configured.pending_run_start?.id === approvalId) configured.pending_run_start = null
+    this.emit('snapshot', configured)
   }
 
   async stop(): Promise<void> {
     this.stopped = true
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
-    this.stopRenewingLeases()
     const socket = this.socket
     this.socket = undefined
+    this.readySocket = undefined
     if (socket?.readyState === WebSocket.OPEN) {
-      for (const [port, lease] of this.leases) {
-        socket.send(
-          encodeControl({
-            type: 'release_control',
-            request_id: randomUUID(),
-            port,
-            control_id: lease.id,
-            fence: lease.fence
-          })
-        )
-      }
       socket.close()
+    } else if (socket && socket.readyState !== WebSocket.CLOSED) {
+      socket.terminate()
     }
-    this.rejectPending(new Error('实时连接已关闭'))
-    this.leases.clear()
-    this.acquiring.clear()
+    const error = new Error('实时连接已关闭')
+    if (socket) this.rejectSocketHandshake(socket, error)
+    this.rejectPending(error)
+    this.actor = undefined
   }
 
   private async loadHistory(configured: PortSnapshot): Promise<void> {
@@ -322,90 +374,159 @@ export class SerialClient extends EventEmitter {
       `/api/v1/ports/${encodeURIComponent(configured.config.port)}/events?${query}`
     )
     const history = response.events.map(normalizeTimelineEvent).sort((a, b) => a.seq - b.seq)
+    if (history.some((event) => (
+      event.port !== configured.config.port
+      || event.daemon_epoch !== configured.daemon_epoch
+      || event.seq > configured.head_seq
+    ))) {
+      throw new Error(`串口 ${configured.config.port} 的历史响应跨越了后端周期或查询上界`)
+    }
     this.events.set(configured.config.port, history)
   }
 
   private async openSocket(version = this.connectionVersion): Promise<void> {
     if (!this.status || this.stopped) return
+    const expectedStatus = this.status
     const socket = new WebSocket(this.endpoint.replace(/^http/, 'ws') + '/api/v1/ws')
     socket.binaryType = 'nodebuffer'
     this.socket = socket
     try {
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('实时连接超时')), 5_000)
-        socket.once('open', () => {
+        const timer = setTimeout(() => finish(new Error('实时连接超时')), SOCKET_HANDSHAKE_TIMEOUT_MS)
+        const onOpen = (): void => finish()
+        const onError = (error: Error): void => finish(error)
+        const onClose = (): void => finish(new Error('实时连接在握手前关闭'))
+        const finish = (error?: Error): void => {
           clearTimeout(timer)
-          resolve()
-        })
-        socket.once('error', (error) => {
-          clearTimeout(timer)
-          reject(error)
-        })
+          socket.off('open', onOpen)
+          socket.off('error', onError)
+          socket.off('close', onClose)
+          if (error) reject(error)
+          else resolve()
+        }
+        socket.once('open', onOpen)
+        socket.once('error', onError)
+        socket.once('close', onClose)
       })
-    } catch (error) {
-      if (this.socket === socket) this.socket = undefined
-      socket.removeAllListeners()
-      socket.on('error', () => undefined)
-      socket.terminate()
-      throw error
-    }
-    if (this.stopped || version !== this.connectionVersion || this.socket !== socket) {
-      if (this.socket === socket) this.socket = undefined
-      socket.close()
-      return
-    }
-    socket.on('message', (data) => this.onSocketMessage(Buffer.from(data as Buffer)))
-    socket.on('close', () => this.onSocketClose(socket))
-    socket.on('error', (error) => this.emit('error', error))
-    socket.send(
-      encodeControl({
+
+      if (this.stopped || version !== this.connectionVersion || this.socket !== socket) {
+        throw new Error('实时连接握手已取消')
+      }
+      socket.on('message', (data) => this.onSocketMessage(socket, Buffer.from(data as Buffer)))
+      socket.on('close', () => this.onSocketClose(socket))
+      socket.on('error', (error) => {
+        this.emit('error', error)
+        if (this.readySocket !== socket) {
+          const failure = asError(error)
+          this.rejectSocketHandshake(socket, failure)
+          this.rejectPending(failure)
+        }
+      })
+
+      const helloRequestId = randomUUID()
+      const welcome = this.waitForWelcome(socket, expectedStatus)
+      const helloResult = this.control({
         type: 'hello',
-        request_id: randomUUID(),
+        request_id: helloRequestId,
         protocol_version: SERIAL_PROTOCOL_VERSION,
         client_name: 'serial-platform-desktop',
         actor_kind: 'human'
-      })
-    )
-    socket.send(
-      encodeControl({
+      }, socket)
+      const [actor, accepted] = await withTimeout(
+        Promise.all([welcome, helloResult]),
+        SOCKET_HANDSHAKE_TIMEOUT_MS,
+        '后端未确认 Hello'
+      )
+      const acceptedActor = actorValue((accepted as Record<string, unknown>)?.actor)
+      if ((accepted as Record<string, unknown>)?.type !== 'hello_accepted' || acceptedActor?.id !== actor.id) {
+        throw new Error('后端返回了与 Welcome 不一致的 Hello 结果')
+      }
+      if (this.status !== expectedStatus) throw new Error('后端状态在实时握手期间发生变化')
+
+      const subscriptions = expectedStatus.ports.map((configured) => ({
+        port: configured.config.port,
+        cursor: this.authoritativeCursor(configured),
+        tail_events: 1000
+      }))
+      const attachResult = await withTimeout(this.control({
         type: 'attach',
         request_id: randomUUID(),
-        subscriptions: this.status.ports.map((configured) => ({
-          port: configured.config.port,
-          cursor: {
-            epoch: configured.daemon_epoch,
-            after_seq: this.events.get(configured.config.port)?.at(-1)?.seq ?? 0
-          },
-          tail_events: 1000
-        }))
-      })
-    )
-    this.stopRenewingLeases()
-    this.renewTimer = setInterval(() => void this.renewLeases(), 10_000)
-    this.emit('connected')
+        subscriptions
+      }, socket), SOCKET_HANDSHAKE_TIMEOUT_MS, '后端未确认 Attach') as Record<string, unknown>
+      const attached = Array.isArray(attachResult?.ports)
+        ? attachResult.ports.map(String).sort()
+        : undefined
+      const expectedPorts = subscriptions.map((subscription) => subscription.port).sort()
+      if (attachResult?.type !== 'attached' || !attached || !sameStrings(attached, expectedPorts)) {
+        throw new Error('后端未确认完整的权威端口订阅')
+      }
+      if (
+        this.stopped
+        || version !== this.connectionVersion
+        || this.socket !== socket
+        || this.status !== expectedStatus
+      ) {
+        throw new Error('实时连接握手已取消')
+      }
+      this.actor = actor
+      this.readySocket = socket
+      this.emit('snapshot')
+      this.emit('connected')
+    } catch (error) {
+      const failure = asError(error)
+      if (this.socket === socket) this.socket = undefined
+      if (this.readySocket === socket) this.readySocket = undefined
+      this.actor = undefined
+      this.rejectSocketHandshake(socket, failure)
+      this.rejectPending(failure)
+      socket.removeAllListeners()
+      socket.on('error', () => undefined)
+      if (socket.readyState !== WebSocket.CLOSED) socket.terminate()
+      throw failure
+    }
   }
 
-  private onSocketMessage(data: Buffer): void {
+  private onSocketMessage(socket: WebSocket, data: Buffer): void {
+    if (this.socket !== socket) return
     try {
       const frame = decodeFrame(data)
       if (frame.kind === 'timeline') {
         this.appendEvent(frame.event)
         return
       }
-      this.handleControl(frame.message)
+      this.handleControl(socket, frame.message)
     } catch (error) {
-      this.emit('error', error)
+      const failure = asError(error)
+      this.emit('error', failure)
+      if (this.readySocket === socket) socket.terminate()
+      else {
+        this.rejectSocketHandshake(socket, failure)
+        this.rejectPending(failure)
+        socket.terminate()
+      }
     }
   }
 
-  private handleControl(message: WireControl): void {
+  private handleControl(socket: WebSocket, message: WireControl): void {
     if (message.type === 'welcome') {
-      const actor = message.actor as { id?: string } | undefined
-      this.actorId = actor?.id
+      const pending = this.pendingWelcome
+      if (!pending || pending.socket !== socket) throw new Error('后端发送了非预期的 Welcome')
+      const actor = actorValue(message.actor)
+      if (
+        message.protocol_version !== SERIAL_PROTOCOL_VERSION
+        || message.server_id !== pending.expectedServerId
+        || message.daemon_epoch !== pending.expectedDaemonEpoch
+        || actor?.kind !== 'human'
+      ) {
+        throw new Error('WebSocket Welcome 与已验证的后端身份不一致')
+      }
+      this.pendingWelcome = undefined
+      pending.resolve(actor)
       return
     }
     if (message.type === 'snapshot') {
       const configured = message.port as PortSnapshot
+      this.assertSnapshotIdentity(configured)
       if (this.status) {
         const index = this.status.ports.findIndex((item) => item.config.port === configured.config.port)
         if (index >= 0) this.status.ports[index] = configured
@@ -418,19 +539,14 @@ export class SerialClient extends EventEmitter {
         ...(message.event as Record<string, unknown>),
         replay: message.replay
       })
-      this.observeControlTimeline(event)
+      this.assertTimelineIdentity(event)
+      this.observeTimelineState(event)
       this.appendEvent(event)
       return
     }
     if (message.type === 'result') {
       const requestId = String(message.request_id ?? '')
       const result = message.result as Record<string, unknown>
-      if (result?.type === 'control_granted') {
-        const lease = result.lease as Lease
-        const port = this.pending.get(requestId)?.port
-        if (port) this.leases.set(port, lease)
-      }
-      if (result?.type === 'control_queued') return
       const pending = this.pending.get(requestId)
       this.pending.delete(requestId)
       pending?.resolve(result)
@@ -438,13 +554,23 @@ export class SerialClient extends EventEmitter {
     }
     if (message.type === 'error') {
       const requestId = message.request_id ? String(message.request_id) : undefined
-      const error = new Error(String(message.message ?? '后端拒绝请求'))
+      const code = message.code ? String(message.code) : undefined
+      const error = new SerialCommandError(
+        String(message.message ?? '后端拒绝请求'),
+        code,
+        Boolean(message.retryable)
+      )
       if (requestId) {
         const pending = this.pending.get(requestId)
         this.pending.delete(requestId)
-        pending?.reject(error)
+        if (pending) {
+          pending.reject(code && pending.outcomeUncertainErrorCodes.includes(code)
+            ? new HumanCommandOutcomeUncertainError(error.message)
+            : error)
+        }
+        else throw error
       } else {
-        this.emit('error', error)
+        throw error
       }
       return
     }
@@ -454,83 +580,149 @@ export class SerialClient extends EventEmitter {
   }
 
   private appendEvent(event: TimelineEvent): void {
-    const items = this.events.get(event.port) ?? []
+    this.assertTimelineIdentity(event)
+    let items = this.events.get(event.port) ?? []
+    if (items.some((item) => item.daemon_epoch !== event.daemon_epoch)) {
+      items = []
+    }
     const last = items.at(-1)
-    if (last?.daemon_epoch === event.daemon_epoch && last.seq >= event.seq) return
+    if (last && last.seq >= event.seq) return
     items.push(event)
     if (items.length > 12_000) items.splice(0, items.length - 12_000)
     this.events.set(event.port, items)
     this.emit('timeline', event)
   }
 
-  private observeControlTimeline(event: TimelineEvent): void {
-    if (event.kind === 'control_granted') {
-      const lease = event.metadata.lease as Lease | undefined
-      if (lease && lease.owner?.id === this.actorId) {
-        this.leases.set(event.port, lease)
-        for (const [requestId, pending] of this.pending) {
-          if (pending.port !== event.port) continue
-          this.pending.delete(requestId)
-          pending.resolve({ type: 'control_granted', lease })
-        }
+  private observeTimelineState(event: TimelineEvent): void {
+    const configured = this.status?.ports.find((item) => item.config.port === event.port)
+    if (!configured) return
+    if (event.kind === 'run_start_requested') {
+      const approval = pendingRunStartApproval(event.metadata.approval)
+      if (approval) {
+        configured.pending_run_start = approval
+        this.emit('snapshot', configured)
+      }
+      return
+    }
+    if ([
+      'run_start_approved',
+      'run_start_denied',
+      'run_start_timed_out',
+      'run_start_cancelled'
+    ].includes(event.kind)) {
+      const approvalId = typeof event.metadata.approval_id === 'string'
+        ? event.metadata.approval_id
+        : pendingRunStartApproval(event.metadata.approval)?.id
+      if (!approvalId || configured.pending_run_start?.id === approvalId) {
+        configured.pending_run_start = null
+        this.emit('snapshot', configured)
       }
     }
-    if (['control_released', 'control_revoked', 'control_expired'].includes(event.kind)) {
-      if (event.actor?.id === this.actorId) this.leases.delete(event.port)
+  }
+
+  private reconcileEventEpochs(next: StatusResponse): void {
+    for (const configured of next.ports) {
+      if (configured.daemon_epoch !== next.daemon_epoch) {
+        throw new Error(`串口 ${configured.config.port} 的 snapshot 与后端周期不一致`)
+      }
+    }
+    const previous = this.status
+    if (
+      previous
+      && (previous.server_id !== next.server_id || previous.daemon_epoch !== next.daemon_epoch)
+    ) {
+      this.events.clear()
+    }
+    const configuredPorts = new Set(next.ports.map((configured) => configured.config.port))
+    for (const port of this.events.keys()) {
+      if (!configuredPorts.has(port)) this.events.delete(port)
+    }
+    for (const configured of next.ports) {
+      const items = this.events.get(configured.config.port)
+      if (items?.some((event) => event.daemon_epoch !== configured.daemon_epoch)) {
+        this.events.delete(configured.config.port)
+      }
     }
   }
 
-  private acquire(port: string): Promise<Lease> {
-    const current = this.leases.get(port)
-    if (current) return Promise.resolve(current)
-    const existing = this.acquiring.get(port)
-    if (existing) return existing
-    const request = this.control({
-      type: 'acquire_control',
-      request_id: randomUUID(),
-      port,
-      mode: 'queue',
-      ttl_ms: 30_000
-    }, port).then((result) => {
-      const lease = (result as { lease: Lease }).lease
-      this.leases.set(port, lease)
-      return lease
-    }).finally(() => this.acquiring.delete(port))
-    this.acquiring.set(port, request)
-    return request
+  private authoritativeCursor(configured: PortSnapshot): { epoch: string; after_seq: number } {
+    let items = this.events.get(configured.config.port)
+    if (items?.some((event) => event.daemon_epoch !== configured.daemon_epoch)) {
+      this.events.delete(configured.config.port)
+      items = undefined
+    }
+    const seq = items?.at(-1)?.seq
+    return {
+      epoch: configured.daemon_epoch,
+      after_seq: typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0
+    }
   }
 
-  private control(message: WireControl, port?: string): Promise<unknown> {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+  private assertSnapshotIdentity(configured: PortSnapshot): void {
+    if (!configured?.config?.port || !this.status) throw new Error('后端发送了无效的端口 snapshot')
+    if (configured.daemon_epoch !== this.status.daemon_epoch) {
+      throw new Error(`串口 ${configured.config.port} 的 snapshot 来自另一后端周期`)
+    }
+  }
+
+  private assertTimelineIdentity(event: TimelineEvent): void {
+    if (!this.status || event.daemon_epoch !== this.status.daemon_epoch) {
+      throw new Error(`串口 ${event.port} 的 timeline 来自另一后端周期`)
+    }
+    const configured = this.status.ports.find((item) => item.config.port === event.port)
+    if (configured && event.daemon_epoch !== configured.daemon_epoch) {
+      throw new Error(`串口 ${event.port} 的 timeline 与权威 snapshot 周期不一致`)
+    }
+  }
+
+  private waitForWelcome(socket: WebSocket, expected: StatusResponse): Promise<Actor> {
+    if (this.pendingWelcome) throw new Error('已有未完成的 WebSocket Welcome')
+    return new Promise((resolve, reject) => {
+      this.pendingWelcome = {
+        socket,
+        expectedServerId: expected.server_id,
+        expectedDaemonEpoch: expected.daemon_epoch,
+        resolve,
+        reject
+      }
+    })
+  }
+
+  private rejectSocketHandshake(socket: WebSocket, error: Error): void {
+    if (this.pendingWelcome?.socket !== socket) return
+    const pending = this.pendingWelcome
+    this.pendingWelcome = undefined
+    pending.reject(error)
+  }
+
+  private control(
+    message: WireControl,
+    socket = this.socket,
+    options: {
+      outcomeUncertainOnTransportLoss?: boolean
+      outcomeUncertainErrorCodes?: readonly string[]
+    } = {}
+  ): Promise<unknown> {
+    if (!socket || this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('实时连接尚未建立'))
     }
     const requestId = String(message.request_id)
     return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject, port })
-      this.socket?.send(encodeControl(message), (error) => {
+      const outcomeUncertainOnTransportLoss = Boolean(options.outcomeUncertainOnTransportLoss)
+      this.pending.set(requestId, {
+        resolve,
+        reject,
+        outcomeUncertainOnTransportLoss,
+        outcomeUncertainErrorCodes: options.outcomeUncertainErrorCodes ?? []
+      })
+      socket.send(encodeControl(message), (error) => {
         if (!error) return
         this.pending.delete(requestId)
-        reject(error)
+        reject(outcomeUncertainOnTransportLoss
+          ? new HumanCommandOutcomeUncertainError(asError(error).message)
+          : error)
       })
     })
-  }
-
-  private async renewLeases(): Promise<void> {
-    for (const [port, lease] of this.leases) {
-      try {
-        const result = (await this.control({
-          type: 'renew_control',
-          request_id: randomUUID(),
-          port,
-          control_id: lease.id,
-          fence: lease.fence,
-          ttl_ms: 30_000
-        })) as { lease?: Lease }
-        if (result.lease) this.leases.set(port, result.lease)
-      } catch {
-        this.leases.delete(port)
-      }
-    }
   }
 
   private async reconnectSocket(): Promise<void> {
@@ -538,10 +730,12 @@ export class SerialClient extends EventEmitter {
     this.reconnectLoop.cancel()
     const socket = this.socket
     this.socket = undefined
+    this.readySocket = undefined
     if (socket) socket.close()
-    this.stopRenewingLeases()
-    this.rejectPending(new Error('配置已更新，正在重建实时连接'))
-    this.leases.clear()
+    const error = new Error('配置已更新，正在重建实时连接')
+    if (socket) this.rejectSocketHandshake(socket, error)
+    this.rejectPending(error)
+    this.actor = undefined
     try {
       await this.openSocket(this.connectionVersion)
     } catch (error) {
@@ -552,11 +746,17 @@ export class SerialClient extends EventEmitter {
 
   private onSocketClose(socket: WebSocket): void {
     if (this.stopped || this.socket !== socket) return
+    const wasReady = this.readySocket === socket
     this.socket = undefined
-    this.stopRenewingLeases()
-    this.rejectPending(new Error('实时连接中断'))
-    this.leases.clear()
-    this.emit('disconnected')
+    if (wasReady) this.readySocket = undefined
+    const error = new Error('实时连接中断')
+    this.rejectSocketHandshake(socket, error)
+    this.rejectPending(error)
+    this.actor = undefined
+    if (wasReady) {
+      this.emit('disconnected')
+      this.emit('snapshot')
+    }
     this.reconnectLoop.schedule()
   }
 
@@ -567,13 +767,12 @@ export class SerialClient extends EventEmitter {
     await this.openSocket(version)
   }
 
-  private stopRenewingLeases(): void {
-    if (this.renewTimer) clearInterval(this.renewTimer)
-    this.renewTimer = undefined
-  }
-
   private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error)
+    for (const pending of this.pending.values()) {
+      pending.reject(pending.outcomeUncertainOnTransportLoss
+        ? new HumanCommandOutcomeUncertainError(error.message)
+        : error)
+    }
     this.pending.clear()
   }
 
@@ -635,6 +834,109 @@ export class SerialClient extends EventEmitter {
       throw new SerialHttpError(response.status, detail)
     }
     return response.json()
+  }
+}
+
+function pendingRunStartApproval(value: unknown): PendingRunStartApproval | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const approval = value as Record<string, unknown>
+  const requester = actorValue(approval.requester)
+  const requiredApprover = actorValue(approval.required_approver)
+  if (
+    typeof approval.id !== 'string'
+    || typeof approval.port !== 'string'
+    || typeof approval.label !== 'string'
+    || typeof approval.daemon_epoch !== 'string'
+    || typeof approval.expected_control_id !== 'string'
+    || !requester
+    || !requiredApprover
+  ) return undefined
+  return {
+    id: approval.id,
+    port: approval.port,
+    requester,
+    required_approver: requiredApprover,
+    label: approval.label,
+    metadata: approval.metadata && typeof approval.metadata === 'object'
+      ? approval.metadata as Record<string, unknown>
+      : {},
+    control_ttl_ms: finiteNumber(approval.control_ttl_ms),
+    daemon_epoch: approval.daemon_epoch,
+    generation: finiteNumber(approval.generation),
+    expected_control_id: approval.expected_control_id,
+    expected_fence: finiteNumber(approval.expected_fence),
+    requested_wall_time_ns: finiteNumber(approval.requested_wall_time_ns),
+    expires_wall_time_ns: finiteNumber(approval.expires_wall_time_ns)
+  }
+}
+
+function actorValue(value: unknown): Actor | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const actor = value as Record<string, unknown>
+  if (
+    typeof actor.id !== 'string'
+    || typeof actor.label !== 'string'
+    || !['human', 'agent', 'script', 'system'].includes(String(actor.kind))
+  ) return undefined
+  return { id: actor.id, label: actor.label, kind: actor.kind as Actor['kind'] }
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+export function buildHumanCommandMessage(value: {
+  requestId: string
+  operationId: string
+  port: string
+  expectedGeneration: number
+  data: string
+}): WireControl {
+  return {
+    type: 'send_human_command',
+    request_id: value.requestId,
+    port: value.port,
+    expected_generation: value.expectedGeneration,
+    data: value.data,
+    operation_id: value.operationId,
+    description: null
+  }
+}
+
+export function buildRunStartDecisionMessage(
+  requestId: string,
+  port: string,
+  approvalId: string,
+  decision: RunStartDecision
+): WireControl {
+  return {
+    type: 'decide_run_start',
+    request_id: requestId,
+    port,
+    approval_id: approvalId,
+    decision
   }
 }
 

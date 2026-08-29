@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{BufRead, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
 
@@ -18,10 +18,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use serial_protocol::{
     DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES, DEFAULT_TRIGGER_TIMEOUT_MS,
-    MAX_COMMAND_DESCRIPTION_BYTES, MAX_MONITOR_MATCHERS, MAX_MONITOR_PATTERN_BYTES,
-    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
-    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, McpHealthResponse,
+    MAX_COMMAND_CAPTURE_DETAIL_BYTES, MAX_COMMAND_DESCRIPTION_BYTES, MAX_MONITOR_MATCHERS,
+    MAX_MONITOR_PATTERN_BYTES, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS,
+    McpHealthResponse,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -33,7 +34,7 @@ use crate::tools::AgentTools;
 const LATEST_PROTOCOL: &str = "2025-11-25";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
-const SERVER_INSTRUCTIONS: &str = "Inspect devices before executing commands. Confirm the selected port's model_family and model_name match the physically connected device. If they do not match, call model_identity_set with the exact existing family/name; if the identity is not in the human-managed catalog, ask the user to create it in the TUI/App first. command, command_sequence, and wait automatically use the command_prompts reported by devices; pass expect or regex to override prompt matching for a call. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. Runs scope evidence only. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. run_end defaults to outcome=completed; use outcome=aborted only to deliberately abort the owned Run and immediately release control. Every command requires a concise purpose for durable history. Use command_sequence for dependent interactions such as username then password; every non-final step needs an explicit expect or regex boundary, and a failed step prevents later writes. input and signal are raw. Monitor Jobs persist after this MCP process exits; stop them when no longer needed.";
+const SERVER_INSTRUCTIONS: &str = "Inspect devices before executing commands. Confirm the selected port's model_family and model_name match the physically connected device. If they do not match, call model_identity_set with the exact existing family/name; if the identity is not in the human-managed catalog, ask the user to create it in the TUI/App first. command, command_sequence, and wait automatically use the command_prompts reported by devices; pass expect or regex to override prompt matching for a call. Start a Run before writes and pass the opaque run_handle returned by run_start to every Run-scoped tool. If a Human currently owns the port, run_start waits for explicit approval in the TUI/App and returns no Run on denial, timeout, cancellation, or disconnect. Runs scope evidence only. Before the final reply, call run_end unless deliberately handing the live Run to a continuing agent workflow. run_end defaults to outcome=completed; use outcome=aborted only to deliberately abort the owned Run and immediately release control. Every command requires a concise purpose, and its completed RX evidence boundary is durably recorded. If a Human command changes an active Agent Run, physical tools return user_command_used; call live read(scope=tail or continue) until that Human TX is returned and acknowledged. wait and archive reads never clear this gate. Use command_sequence for dependent interactions such as username then password; every non-final step needs an explicit expect or regex boundary, and a failed step prevents later writes. signal sends explicit control bytes or UART Break. Monitor Jobs persist after this MCP process exits; stop them when no longer needed.";
 
 pub async fn serve_stdio(tools: AgentTools) -> Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
@@ -191,8 +192,12 @@ pub async fn serve_http(
     managed: bool,
     health: McpHealthResponse,
 ) -> Result<()> {
-    if listen.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
-        anyhow::bail!("Streamable HTTP MCP must listen on 127.0.0.1");
+    validate_http_listen(listen)?;
+    if !listen.ip().is_loopback() {
+        eprintln!(
+            "serial-mcp: warning: exposing unauthenticated MCP on {listen}; bind only to a \
+             trusted host-only VM interface and restrict it with the host firewall"
+        );
     }
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let state = HttpState {
@@ -317,8 +322,39 @@ fn origin_allowed(headers: &HeaderMap, listen: SocketAddr) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
         return false;
     };
-    let local_host = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
-    local_host && url.port_or_known_default() == Some(listen.port())
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port_or_known_default() != Some(listen.port())
+    {
+        return false;
+    }
+    match url.host_str() {
+        Some("localhost") => listen.ip().is_loopback(),
+        Some(host) => host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|origin_ip| origin_ip == listen.ip()),
+        None => false,
+    }
+}
+
+fn validate_http_listen(listen: SocketAddr) -> Result<()> {
+    let ip = listen.ip();
+    let invalid = match ip {
+        IpAddr::V4(ip) => ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast(),
+        IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
+    };
+    if invalid {
+        anyhow::bail!(
+            "Streamable HTTP MCP requires an exact loopback or trusted host-only interface \
+             address; do not use {ip}"
+        );
+    }
+    Ok(())
 }
 
 enum Input {
@@ -493,10 +529,10 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
             | "run_end"
             | "command"
             | "command_sequence"
-            | "input"
             | "signal"
             | "trigger"
             | "monitor_stop"
+            | "run_start"
     );
     let open_world = matches!(
         name,
@@ -504,11 +540,11 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
             | "read"
             | "command"
             | "command_sequence"
-            | "input"
             | "signal"
             | "trigger"
             | "wait"
             | "search"
+            | "run_start"
     );
     json!({
         "name": name, "description": description, "inputSchema": input_schema,
@@ -544,7 +580,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "read",
-            "Read bounded serial output; archive requires epoch.",
+            "Read bounded serial output; a live tail/continue that includes a pending Human TX acknowledges it, while archive never does.",
             object(
                 json!({
                     "port":{"type":"string"},
@@ -565,8 +601,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "run_handle":run_handle_schema(),
                     "command":{"type":"string","maxLength":4096,"description":"Empty sends Enter."},
                     "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose, for example: 查看样机内存。"},
-                    "expect":{"type":"string","minLength":1},
-                    "regex":{"type":"string","minLength":1,"maxLength":4096},
+                    "expect":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_CAPTURE_DETAIL_BYTES},
+                    "regex":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_CAPTURE_DETAIL_BYTES},
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
                 &["run_handle", "command", "description"],
@@ -590,8 +626,8 @@ pub fn tool_definitions() -> Vec<Value> {
                             "properties":{
                                 "command":{"type":"string","maxLength":4096,"description":"Empty sends Enter; command plus effective EOL is limited to 4096 UTF-8 bytes."},
                                 "description":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_DESCRIPTION_BYTES,"description":"Concise human-readable purpose retained with this step's TX audit."},
-                                "expect":{"type":"string","minLength":1,"maxLength":4096},
-                                "regex":{"type":"string","minLength":1,"maxLength":4096},
+                                "expect":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_CAPTURE_DETAIL_BYTES},
+                                "regex":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_CAPTURE_DETAIL_BYTES},
                                 "timeout_seconds":{"type":"integer","minimum":1,"maximum":120,"description":"Per-step deadline; defaults to 10 seconds."}
                             },
                             "required":["command","description"],
@@ -600,18 +636,6 @@ pub fn tool_definitions() -> Vec<Value> {
                     }
                 }),
                 &["run_handle", "description", "steps"],
-            ),
-            false,
-        ),
-        tool(
-            "input",
-            "Write exact UTF-8 bytes without EOL in the active Run.",
-            object(
-                json!({
-                    "run_handle":run_handle_schema(),
-                    "text":{"type":"string","minLength":1,"maxLength":4096}
-                }),
-                &["run_handle", "text"],
             ),
             false,
         ),
@@ -648,12 +672,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "wait",
-            "Wait for RX using a literal, regex, prompt, or quiet boundary.",
+            "Wait for RX using a literal, regex, prompt, or quiet boundary. This never acknowledges a pending Human command; use live read for that.",
             object(
                 json!({
                     "run_handle":run_handle_schema(),
-                    "expect":{"type":"string","minLength":1},
-                    "regex":{"type":"string","minLength":1,"maxLength":4096},
+                    "expect":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_CAPTURE_DETAIL_BYTES},
+                    "regex":{"type":"string","minLength":1,"maxLength":MAX_COMMAND_CAPTURE_DETAIL_BYTES},
                     "timeout_seconds":{"type":"integer","minimum":1,"maximum":120}
                 }),
                 &["run_handle"],
@@ -756,7 +780,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "run_start",
-            "Confirm the physical DUT by serial, telnet, web UI, or a human, then acquire control and return one opaque run_handle.",
+            "Start a Run immediately when idle, or wait for the Human owner to approve in the TUI/App. Denial, timeout, cancellation, or disconnect creates no Run and writes no bytes.",
             object(
                 json!({
                     "port":{"type":"string"},"label":{"type":"string","minLength":1,"maxLength":128}
@@ -811,6 +835,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_http_app() -> Router {
+        test_http_app_on("127.0.0.1:3211".parse().unwrap())
+    }
+
+    fn test_http_app_on(listen: SocketAddr) -> Router {
         let endpoint = "http://127.0.0.1:1".to_string();
         let tools = AgentTools::new(
             crate::api::ApiClient::new(endpoint.clone()).unwrap(),
@@ -826,7 +854,7 @@ mod tests {
         let state = HttpState {
             tools,
             active_requests: Arc::new(Mutex::new(HashMap::new())),
-            listen: "127.0.0.1:3211".parse().unwrap(),
+            listen,
             health: McpHealthResponse {
                 status: "ok".into(),
                 service: "serial-mcp".into(),
@@ -948,6 +976,80 @@ mod tests {
         assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn host_only_http_listener_accepts_only_its_exact_numeric_origin() {
+        let notification = || {
+            Body::from(json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string())
+        };
+        let allowed = test_http_app_on("192.168.56.109:3211".parse().unwrap())
+            .oneshot(
+                Request::post("/mcp")
+                    .header("origin", "http://192.168.56.109:3211")
+                    .body(notification())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::ACCEPTED);
+
+        for origin in [
+            "http://localhost:3211",
+            "http://192.168.56.110:3211",
+            "http://serial-host.local:3211",
+            "http://192.168.56.109:9999",
+            "https://192.168.56.109:3211",
+            "http://user@192.168.56.109:3211",
+            "http://192.168.56.109:3211/path",
+        ] {
+            let response = test_http_app_on("192.168.56.109:3211".parse().unwrap())
+                .oneshot(
+                    Request::post("/mcp")
+                        .header("origin", origin)
+                        .body(notification())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_http_listener_accepts_its_exact_bracketed_origin() {
+        let response = test_http_app_on("[fd00::109]:3211".parse().unwrap())
+            .oneshot(
+                Request::post("/mcp")
+                    .header("origin", "http://[fd00::109]:3211")
+                    .body(Body::from(
+                        json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn http_listener_requires_one_exact_unicast_interface() {
+        assert!(validate_http_listen("127.0.0.1:3211".parse().unwrap()).is_ok());
+        assert!(validate_http_listen("[::1]:3211".parse().unwrap()).is_ok());
+        assert!(validate_http_listen("192.168.56.109:3211".parse().unwrap()).is_ok());
+        assert!(validate_http_listen("[fd00::109]:3211".parse().unwrap()).is_ok());
+        for invalid in [
+            "0.0.0.0:3211",
+            "224.0.0.1:3211",
+            "255.255.255.255:3211",
+            "[::]:3211",
+            "[ff02::1]:3211",
+        ] {
+            assert!(
+                validate_http_listen(invalid.parse().unwrap()).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
     #[test]
     fn tool_names_form_the_stable_agent_surface() {
         let names: Vec<_> = tool_definitions()
@@ -962,7 +1064,6 @@ mod tests {
                 "read",
                 "command",
                 "command_sequence",
-                "input",
                 "signal",
                 "trigger",
                 "wait",
@@ -986,6 +1087,9 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("command_prompts"));
         assert!(SERVER_INSTRUCTIONS.contains("expect or regex"));
         assert!(SERVER_INSTRUCTIONS.contains("Before the final reply, call run_end"));
+        assert!(SERVER_INSTRUCTIONS.contains("explicit approval in the TUI/App"));
+        assert!(SERVER_INSTRUCTIONS.contains("user_command_used"));
+        assert!(SERVER_INSTRUCTIONS.contains("archive reads never clear"));
         assert!(SERVER_INSTRUCTIONS.contains("Every command requires"));
         assert!(SERVER_INSTRUCTIONS.contains("Use command_sequence"));
         assert!(SERVER_INSTRUCTIONS.contains("every non-final step"));
@@ -1008,10 +1112,10 @@ mod tests {
             "model_identity_set",
             "command",
             "command_sequence",
-            "input",
             "signal",
             "trigger",
             "monitor_stop",
+            "run_start",
             "run_end",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
@@ -1022,11 +1126,11 @@ mod tests {
             "read",
             "command",
             "command_sequence",
-            "input",
             "signal",
             "trigger",
             "wait",
             "search",
+            "run_start",
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
             assert_eq!(tool["annotations"]["openWorldHint"], true, "{name}");
@@ -1100,6 +1204,10 @@ mod tests {
             command["inputSchema"]["properties"]["description"]["maxLength"],
             MAX_COMMAND_DESCRIPTION_BYTES
         );
+        assert_eq!(
+            command["inputSchema"]["properties"]["expect"]["maxLength"],
+            MAX_COMMAND_CAPTURE_DETAIL_BYTES
+        );
         for hidden in ["eol", "quiet_ms", "chunk_size", "inter_char_delay_ms"] {
             assert!(command["inputSchema"]["properties"].get(hidden).is_none());
         }
@@ -1115,7 +1223,7 @@ mod tests {
         );
         assert_eq!(
             command["inputSchema"]["properties"]["regex"]["maxLength"],
-            4096
+            MAX_COMMAND_CAPTURE_DETAIL_BYTES
         );
         assert!(
             command["inputSchema"]["properties"]["timeout_seconds"]
@@ -1150,7 +1258,11 @@ mod tests {
         assert!(wait["inputSchema"]["properties"].get("after_seq").is_none());
         assert_eq!(
             wait["inputSchema"]["properties"]["regex"]["maxLength"],
-            4096
+            MAX_COMMAND_CAPTURE_DETAIL_BYTES
+        );
+        assert_eq!(
+            wait["inputSchema"]["properties"]["expect"]["maxLength"],
+            MAX_COMMAND_CAPTURE_DETAIL_BYTES
         );
     }
 
@@ -1201,8 +1313,14 @@ mod tests {
             item["properties"]["description"]["maxLength"],
             MAX_COMMAND_DESCRIPTION_BYTES
         );
-        assert_eq!(item["properties"]["regex"]["maxLength"], 4096);
-        assert_eq!(item["properties"]["expect"]["maxLength"], 4096);
+        assert_eq!(
+            item["properties"]["regex"]["maxLength"],
+            MAX_COMMAND_CAPTURE_DETAIL_BYTES
+        );
+        assert_eq!(
+            item["properties"]["expect"]["maxLength"],
+            MAX_COMMAND_CAPTURE_DETAIL_BYTES
+        );
         assert_eq!(item["properties"]["timeout_seconds"]["minimum"], 1);
         assert_eq!(item["properties"]["timeout_seconds"]["maximum"], 120);
         assert!(
@@ -1348,7 +1466,6 @@ mod tests {
             "model_identity_set",
             "command",
             "command_sequence",
-            "input",
             "signal",
             "trigger",
             "monitor_start",
@@ -1431,7 +1548,6 @@ mod tests {
         for name in [
             "command",
             "command_sequence",
-            "input",
             "signal",
             "trigger",
             "wait",

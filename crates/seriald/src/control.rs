@@ -1,5 +1,4 @@
 use serial_protocol::{Actor, ControlLease, ControlMode};
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -13,13 +12,13 @@ pub const MAX_TTL_MS: u64 = 60_000;
 /// useful serial-console lease and makes monotonic deadline arithmetic harder
 /// to bound defensively.
 pub const MAX_CONTROL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
-/// Default bound for the control wait queue. Overridable through the daemon
-/// `[control]` configuration.
+/// Legacy v6 configuration default retained for config compatibility. Generic
+/// control queueing is disabled in v7.
 pub const MAX_WAITERS: usize = 128;
-/// Default lifetime of a queued acquire request. Overridable through the
-/// daemon `[control]` configuration.
+/// Default lifetime of a pending Run-start approval. This reuses the existing
+/// `[control].wait_timeout` setting for backwards-compatible configuration.
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Hard ceiling for a configured queued-acquire lifetime.
+/// Hard ceiling for a configured Run-start approval lifetime.
 pub const MAX_CONTROL_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Runtime control limits, usually derived from the daemon configuration.
@@ -54,13 +53,6 @@ impl ControlLimits {
 }
 
 #[derive(Debug, Clone)]
-struct Waiter {
-    actor: Actor,
-    ttl_ms: u64,
-    deadline: Instant,
-}
-
-#[derive(Debug, Clone)]
 struct ActiveLease {
     // The protocol timestamps are informational. Only this deadline authorizes expiry.
     lease: ControlLease,
@@ -73,7 +65,6 @@ pub struct ControlState {
     generation: u64,
     next_fence: u64,
     current: Option<ActiveLease>,
-    queue: VecDeque<Waiter>,
     limits: ControlLimits,
 }
 
@@ -81,10 +72,7 @@ pub struct ControlState {
 pub enum AcquireOutcome {
     Granted(ControlLease),
     AlreadyHeld(ControlLease),
-    Queued {
-        position: usize,
-    },
-    QueueFull,
+    Busy(ControlLease),
     TakenOver {
         revoked: ControlLease,
         granted: ControlLease,
@@ -105,6 +93,8 @@ pub enum ControlError {
     StaleFence,
     #[error("control lease has expired")]
     Expired,
+    #[error("write control is held by another actor")]
+    Busy,
 }
 
 impl ControlState {
@@ -114,7 +104,6 @@ impl ControlState {
             generation,
             next_fence: 1,
             current: None,
-            queue: VecDeque::new(),
             limits: limits.bounded(),
         }
     }
@@ -136,39 +125,61 @@ impl ControlState {
                 return AcquireOutcome::AlreadyHeld(current.lease.clone());
             }
             if mode == ControlMode::Queue {
-                let position = if let Some(index) = self
-                    .queue
-                    .iter()
-                    .position(|waiter| waiter.actor.id == actor.id)
-                {
-                    let ttl_ms = self.clamp_ttl(ttl_ms);
-                    let deadline = monotonic_deadline(monotonic_now, self.limits.wait_timeout);
-                    let waiter = &mut self.queue[index];
-                    waiter.ttl_ms = ttl_ms;
-                    waiter.deadline = deadline;
-                    index + 1
-                } else {
-                    if self.queue.len() >= self.limits.max_waiters {
-                        return AcquireOutcome::QueueFull;
-                    }
-                    self.queue.push_back(Waiter {
-                        ttl_ms: self.clamp_ttl(ttl_ms),
-                        deadline: monotonic_deadline(monotonic_now, self.limits.wait_timeout),
-                        actor,
-                    });
-                    self.queue.len()
-                };
-                return AcquireOutcome::Queued { position };
+                return AcquireOutcome::Busy(current.lease.clone());
             }
 
             let revoked = self.current.take().expect("checked above").lease;
-            self.queue.retain(|waiter| waiter.actor.id != actor.id);
             let granted = self.grant(actor, ttl_ms, wall_now_ns, monotonic_now);
             return AcquireOutcome::TakenOver { revoked, granted };
         }
 
         let granted = self.grant(actor, ttl_ms, wall_now_ns, monotonic_now);
         AcquireOutcome::Granted(granted)
+    }
+
+    /// Grants a lease only while the slot is idle. Unlike the legacy acquire
+    /// RPC, this is the primitive used by atomic Run start and Human-command
+    /// transitions, so it can never queue or revoke an unrelated owner.
+    pub fn grant_if_idle(
+        &mut self,
+        actor: Actor,
+        ttl_ms: u64,
+        wall_now_ns: i64,
+        monotonic_now: Instant,
+    ) -> Result<ControlLease, ControlError> {
+        if self.current.is_some() {
+            return Err(ControlError::Busy);
+        }
+        Ok(self.grant(actor, ttl_ms, wall_now_ns, monotonic_now))
+    }
+
+    /// Atomically replaces one exact, still-live lease with a lease for
+    /// `actor`. This is the approval commit point: validation and transfer
+    /// happen in one mutable Slot turn, with no idle interval in between.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_exact(
+        &mut self,
+        expected_owner_id: &str,
+        expected_control_id: Uuid,
+        expected_fence: u64,
+        actor: Actor,
+        ttl_ms: u64,
+        wall_now_ns: i64,
+        monotonic_now: Instant,
+    ) -> Result<(ControlLease, ControlLease), ControlError> {
+        self.validate(
+            expected_owner_id,
+            expected_control_id,
+            expected_fence,
+            monotonic_now,
+        )?;
+        let revoked = self.current.take().expect("validated").lease;
+        let granted = self.grant(actor, ttl_ms, wall_now_ns, monotonic_now);
+        Ok((revoked, granted))
+    }
+
+    pub fn approval_timeout(&self) -> Duration {
+        self.limits.wait_timeout
     }
 
     pub fn renew(
@@ -200,8 +211,11 @@ impl ControlState {
     ) -> Result<ReleaseOutcome, ControlError> {
         self.validate(actor_id, control_id, fence, monotonic_now)?;
         let released = self.current.take().expect("validated").lease;
-        let promoted = self.promote(wall_now_ns, monotonic_now);
-        Ok(ReleaseOutcome { released, promoted })
+        let _ = (wall_now_ns, monotonic_now);
+        Ok(ReleaseOutcome {
+            released,
+            promoted: None,
+        })
     }
 
     pub fn validate(
@@ -264,7 +278,6 @@ impl ControlState {
     }
 
     pub fn expire(&mut self, wall_now_ns: i64, monotonic_now: Instant) -> Option<ReleaseOutcome> {
-        self.queue.retain(|waiter| monotonic_now < waiter.deadline);
         if self
             .current
             .as_ref()
@@ -273,17 +286,19 @@ impl ControlState {
             return None;
         }
         let released = self.current.take().expect("checked above").lease;
-        let promoted = self.promote(wall_now_ns, monotonic_now);
-        Some(ReleaseOutcome { released, promoted })
+        let _ = wall_now_ns;
+        Some(ReleaseOutcome {
+            released,
+            promoted: None,
+        })
     }
 
     pub fn disconnect(
         &mut self,
         actor_id: &str,
         wall_now_ns: i64,
-        monotonic_now: Instant,
+        _monotonic_now: Instant,
     ) -> Option<ReleaseOutcome> {
-        self.queue.retain(|waiter| waiter.actor.id != actor_id);
         if self
             .current
             .as_ref()
@@ -292,8 +307,11 @@ impl ControlState {
             return None;
         }
         let released = self.current.take().expect("checked above").lease;
-        let promoted = self.promote(wall_now_ns, monotonic_now);
-        Some(ReleaseOutcome { released, promoted })
+        let _ = wall_now_ns;
+        Some(ReleaseOutcome {
+            released,
+            promoted: None,
+        })
     }
 
     pub fn change_generation(
@@ -303,10 +321,12 @@ impl ControlState {
         monotonic_now: Instant,
     ) -> Option<ReleaseOutcome> {
         self.generation = generation;
-        self.queue.clear();
         let released = self.current.take()?.lease;
-        let promoted = self.promote(wall_now_ns, monotonic_now);
-        Some(ReleaseOutcome { released, promoted })
+        let _ = (wall_now_ns, monotonic_now);
+        Some(ReleaseOutcome {
+            released,
+            promoted: None,
+        })
     }
 
     fn grant(
@@ -334,28 +354,11 @@ impl ControlState {
         lease
     }
 
-    fn promote(&mut self, wall_now_ns: i64, monotonic_now: Instant) -> Option<ControlLease> {
-        while let Some(waiter) = self.queue.pop_front() {
-            if monotonic_now < waiter.deadline {
-                return Some(self.grant(waiter.actor, waiter.ttl_ms, wall_now_ns, monotonic_now));
-            }
-        }
-        None
-    }
-
-    /// Removes a queued acquire request for the actor. Returns `true` when a
-    /// waiter was removed. The current holder is unaffected: an actor that
-    /// already holds control must release the lease instead.
+    /// Generic acquire queueing is disabled in protocol v7. Retained for the
+    /// legacy CancelAcquire RPC, which therefore always reports no removal.
     pub fn cancel(&mut self, actor_id: &str) -> bool {
-        let Some(index) = self
-            .queue
-            .iter()
-            .position(|waiter| waiter.actor.id == actor_id)
-        else {
-            return false;
-        };
-        self.queue.remove(index).expect("index was just found");
-        true
+        let _ = actor_id;
+        false
     }
 
     fn clamp_ttl(&self, ttl_ms: u64) -> u64 {
@@ -397,79 +400,59 @@ mod tests {
     }
 
     #[test]
-    fn queue_promotes_in_order() {
-        let epoch = Uuid::new_v4();
-        let mut state = ControlState::new(epoch, 1, ControlLimits::default());
-        let monotonic_now = Instant::now();
-        let AcquireOutcome::Granted(first) =
-            state.acquire(actor("a"), ControlMode::Queue, 30_000, 0, monotonic_now)
-        else {
-            panic!("expected grant");
-        };
-        assert_eq!(
-            state.acquire(actor("b"), ControlMode::Queue, 30_000, 0, monotonic_now,),
-            AcquireOutcome::Queued { position: 1 }
-        );
-        let released = state
-            .release("a", first.id, first.fence, 1, monotonic_now)
-            .unwrap();
-        assert_eq!(released.promoted.unwrap().owner.id, "b");
-    }
-
-    #[test]
-    fn control_wait_queue_is_bounded() {
-        let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
-        let now = Instant::now();
-        let AcquireOutcome::Granted(_) =
-            state.acquire(actor("owner"), ControlMode::Queue, 10_000, 0, now)
-        else {
-            panic!("first actor should hold control");
-        };
-        for index in 0..MAX_WAITERS {
-            assert!(matches!(
-                state.acquire(
-                    actor(&format!("waiter-{index}")),
-                    ControlMode::Queue,
-                    10_000,
-                    0,
-                    now,
-                ),
-                AcquireOutcome::Queued { .. }
-            ));
-        }
-        assert_eq!(
-            state.acquire(actor("one-too-many"), ControlMode::Queue, 10_000, 0, now,),
-            AcquireOutcome::QueueFull
-        );
-    }
-
-    #[test]
-    fn expired_waiter_is_never_promoted_late() {
+    fn protocol_v7_queue_mode_is_immediate_busy_and_never_promotes() {
         let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
         let now = Instant::now();
         let AcquireOutcome::Granted(owner) =
-            state.acquire(actor("owner"), ControlMode::Queue, MAX_TTL_MS, 0, now)
+            state.acquire(actor("owner"), ControlMode::Queue, 30_000, 0, now)
         else {
-            panic!("first actor should hold control");
+            panic!("idle acquire must grant");
         };
         assert!(matches!(
-            state.acquire(
-                actor("short-lived-waiter"),
-                ControlMode::Queue,
-                MIN_TTL_MS,
-                0,
-                now,
-            ),
-            AcquireOutcome::Queued { position: 1 }
+            state.acquire(actor("other"), ControlMode::Queue, 30_000, 0, now),
+            AcquireOutcome::Busy(lease) if lease.id == owner.id
         ));
-
-        let after_waiter_deadline = now + WAIT_TIMEOUT + Duration::from_millis(1);
         let released = state
-            .expire(1, after_waiter_deadline)
-            .expect("owner and waiter should expire together");
-        assert_eq!(released.released.id, owner.id);
+            .release("owner", owner.id, owner.fence, 1, now)
+            .unwrap();
         assert!(released.promoted.is_none());
         assert!(state.current().is_none());
+    }
+
+    #[test]
+    fn exact_approval_transfer_is_atomic_and_fenced() {
+        let mut state = ControlState::new(Uuid::new_v4(), 7, ControlLimits::default());
+        let now = Instant::now();
+        let human = state.grant_if_idle(actor("human"), 30_000, 0, now).unwrap();
+        let agent = Actor {
+            id: "agent".into(),
+            label: "agent".into(),
+            kind: ActorKind::Agent,
+        };
+        assert_eq!(
+            state.transfer_exact(
+                "human",
+                human.id,
+                human.fence.saturating_add(1),
+                agent.clone(),
+                30_000,
+                1,
+                now,
+            ),
+            Err(ControlError::StaleFence)
+        );
+        assert_eq!(state.current().unwrap().id, human.id);
+
+        let (revoked, granted) = state
+            .transfer_exact("human", human.id, human.fence, agent, 30_000, 2, now)
+            .unwrap();
+        assert_eq!(revoked.id, human.id);
+        assert_eq!(granted.owner.kind, ActorKind::Agent);
+        assert!(granted.fence > revoked.fence);
+        assert_eq!(
+            state.validate("human", human.id, human.fence, now),
+            Err(ControlError::StaleFence)
+        );
     }
 
     #[test]
@@ -609,82 +592,6 @@ mod tests {
     }
 
     #[test]
-    fn acquire_does_not_implicitly_expire_or_promote() {
-        let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
-        let monotonic_now = Instant::now();
-        let AcquireOutcome::Granted(first) =
-            state.acquire(actor("a"), ControlMode::Queue, MIN_TTL_MS, 0, monotonic_now)
-        else {
-            panic!("expected grant");
-        };
-        assert_eq!(
-            state.acquire(actor("b"), ControlMode::Queue, MAX_TTL_MS, 0, monotonic_now,),
-            AcquireOutcome::Queued { position: 1 }
-        );
-
-        let after_deadline = monotonic_now + Duration::from_millis(MIN_TTL_MS + 1);
-        assert_eq!(
-            state.acquire(
-                actor("c"),
-                ControlMode::Queue,
-                MIN_TTL_MS,
-                i64::MAX,
-                after_deadline,
-            ),
-            AcquireOutcome::Queued { position: 2 }
-        );
-        assert_eq!(
-            state.current().expect("lease is still present").id,
-            first.id
-        );
-
-        let expired = state
-            .expire(i64::MIN, after_deadline)
-            .expect("caller explicitly applies expiration");
-        assert_eq!(expired.released.id, first.id);
-        assert_eq!(
-            expired.promoted.expect("first waiter is promoted").owner.id,
-            "b"
-        );
-    }
-
-    #[test]
-    fn cancel_removes_waiter_and_preserves_queue_order() {
-        let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
-        let now = Instant::now();
-        let AcquireOutcome::Granted(owner) =
-            state.acquire(actor("owner"), ControlMode::Queue, 30_000, 0, now)
-        else {
-            panic!("expected grant");
-        };
-        for id in ["b", "c", "d"] {
-            assert!(matches!(
-                state.acquire(actor(id), ControlMode::Queue, 30_000, 0, now),
-                AcquireOutcome::Queued { .. }
-            ));
-        }
-
-        assert!(state.cancel("c"));
-
-        let first = state
-            .release("owner", owner.id, owner.fence, 1, now)
-            .unwrap();
-        let promoted_b = first.promoted.expect("b is promoted first");
-        assert_eq!(promoted_b.owner.id, "b");
-        let second = state
-            .release("b", promoted_b.id, promoted_b.fence, 2, now)
-            .unwrap();
-        assert_eq!(
-            second
-                .promoted
-                .expect("d is promoted once c cancelled")
-                .owner
-                .id,
-            "d"
-        );
-    }
-
-    #[test]
     fn cancel_unknown_actor_returns_false() {
         let mut state = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
         let now = Instant::now();
@@ -710,29 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_limits_bound_the_wait_queue() {
-        let limits = ControlLimits {
-            max_waiters: 1,
-            ..ControlLimits::default()
-        };
-        let mut state = ControlState::new(Uuid::new_v4(), 1, limits);
-        let now = Instant::now();
-        let AcquireOutcome::Granted(_) =
-            state.acquire(actor("owner"), ControlMode::Queue, 30_000, 0, now)
-        else {
-            panic!("expected grant");
-        };
-        assert!(matches!(
-            state.acquire(actor("b"), ControlMode::Queue, 30_000, 0, now),
-            AcquireOutcome::Queued { position: 1 }
-        ));
-        assert_eq!(
-            state.acquire(actor("c"), ControlMode::Queue, 30_000, 0, now),
-            AcquireOutcome::QueueFull
-        );
-    }
-
-    #[test]
     fn custom_limits_clamp_the_ttl_ceiling() {
         let limits = ControlLimits {
             max_ttl_ms: 10_000,
@@ -749,47 +633,20 @@ mod tests {
     }
 
     #[test]
-    fn extreme_runtime_limits_are_bounded_without_deadline_or_wall_overflow() {
+    fn extreme_runtime_limits_bound_lease_and_approval_deadlines() {
         let limits = ControlLimits {
             max_ttl_ms: u64::MAX,
             wait_timeout: Duration::MAX,
-            max_waiters: 4,
+            max_waiters: usize::MAX,
         };
         let mut state = ControlState::new(Uuid::new_v4(), 1, limits);
         assert_eq!(state.limits.max_ttl_ms, MAX_CONTROL_TTL_MS);
-        assert_eq!(state.limits.wait_timeout, MAX_CONTROL_WAIT_TIMEOUT);
-
-        let started = Instant::now();
-        let AcquireOutcome::Granted(owner) = state.acquire(
-            actor("owner"),
-            ControlMode::Queue,
-            u64::MAX,
-            i64::MAX - 1,
-            started,
-        ) else {
-            panic!("expected grant");
-        };
-        assert_eq!(owner.expires_wall_time_ns, i64::MAX);
-        assert!(matches!(
-            state.acquire(
-                actor("waiter"),
-                ControlMode::Queue,
-                u64::MAX,
-                i64::MIN,
-                started,
-            ),
-            AcquireOutcome::Queued { position: 1 }
-        ));
-
-        let after_wait_ceiling = started + MAX_CONTROL_WAIT_TIMEOUT + Duration::from_millis(1);
-        assert!(state.expire(i64::MAX, after_wait_ceiling).is_none());
-        let released = state
-            .release("owner", owner.id, owner.fence, i64::MAX, after_wait_ceiling)
+        assert_eq!(state.approval_timeout(), MAX_CONTROL_WAIT_TIMEOUT);
+        let now = Instant::now();
+        let lease = state
+            .grant_if_idle(actor("owner"), u64::MAX, i64::MAX - 1, now)
             .unwrap();
-        assert!(
-            released.promoted.is_none(),
-            "the bounded one-hour waiter must not survive until owner release"
-        );
+        assert_eq!(lease.expires_wall_time_ns, i64::MAX);
     }
 
     #[test]

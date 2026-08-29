@@ -70,7 +70,14 @@ export function AgentHistory({ items, selectedCommand, onSelect }: Props): React
               <div className="command-steps">
                 {item.commands.map((command, commandIndex) => (
                   <button
-                    className={`command-step ${selectedCommand?.id === command.id && selectedCommand.firstSeq === command.firstSeq ? 'is-selected' : ''}`}
+                    className={`command-step ${
+                      selectedCommand?.id === command.id
+                      && selectedCommand.firstSeq === command.firstSeq
+                      && selectedCommand.daemonEpoch === command.daemonEpoch
+                      && selectedCommand.generation === command.generation
+                        ? 'is-selected'
+                        : ''
+                    }`}
                     key={`${command.id}:${command.firstSeq}`}
                     onClick={() => onSelect(command)}
                     type="button"

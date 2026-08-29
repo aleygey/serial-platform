@@ -3,8 +3,10 @@ import type {
   DesktopEvent,
   DesktopPreferences,
   DesktopSnapshot,
+  HumanCommandSubmission,
   ModelFamily,
   ModelProfile,
+  RunStartDecision,
   SerialConfigurationDraft,
   TimelineEvent
 } from '../shared/contracts'
@@ -13,6 +15,7 @@ import { createOfflineSnapshot } from '../shared/offline-snapshot'
 import { LocalService } from './local-service'
 import {
   ConfigurationConflictError,
+  HumanCommandOutcomeUncertainError,
   SerialClient,
   serialdIdentityMatches,
   type ServerData
@@ -63,11 +66,25 @@ export class DesktopCoordinator {
     return snapshot
   }
 
-  async sendCommand(port: string, command: string): Promise<void> {
-    if (this.qaMode) return
+  async sendCommand(port: string, command: string): Promise<HumanCommandSubmission> {
+    if (this.qaMode) return { status: 'accepted' }
     const value = command.replace(/[\r\n]+$/, '')
-    if (!value) return
-    await this.requireClient().sendCommand(port, value)
+    if (!value) return { status: 'rejected', message: '命令不能为空' }
+    try {
+      await this.requireClient().sendCommand(port, value)
+      return { status: 'accepted' }
+    } catch (error) {
+      const message = errorMessage(error)
+      return error instanceof HumanCommandOutcomeUncertainError
+        ? { status: 'uncertain', message }
+        : { status: 'rejected', message }
+    }
+  }
+
+  async decideRunStart(port: string, approvalId: string, decision: RunStartDecision): Promise<void> {
+    if (this.qaMode) return
+    await this.requireClient().decideRunStart(port, approvalId, decision)
+    await this.publishSnapshot()
   }
 
   async setPortOpen(port: string, open: boolean): Promise<void> {
@@ -306,6 +323,7 @@ export class DesktopCoordinator {
       connectionMessage: this.connectionMessage,
       serverId: data.status.server_id,
       daemonEpoch: data.status.daemon_epoch,
+      actor: data.actor,
       configRevision: data.status.config_revision,
       configuredPorts: data.status.ports,
       availablePorts: data.availablePorts,

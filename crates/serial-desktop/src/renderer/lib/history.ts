@@ -2,6 +2,8 @@ import type { TimelineEvent } from '../../shared/contracts'
 
 export interface AgentCommand {
   id: string
+  daemonEpoch: string
+  generation: number
   firstSeq: number
   operationId?: string
   stepIndex?: number
@@ -10,6 +12,20 @@ export interface AgentCommand {
     kind: 'contains' | 'regex' | 'shell_prompt' | 'uboot_prompt'
     value: string
   }>
+  capture?: CommandCaptureEvidence
+}
+
+export interface CommandCaptureEvidence {
+  daemonEpoch: string
+  generation: number
+  operationId: string
+  txEventSeq: number
+  evidenceFromSeq: number
+  evidenceThroughSeq: number
+  rxStreamOffsetStart?: number
+  rxStreamOffsetEnd?: number
+  completion: string
+  confidence: string
 }
 
 export type AgentHistoryItem =
@@ -30,14 +46,27 @@ export type AgentHistoryItem =
     }
 
 export interface MatchRange {
+  daemonEpoch: string
+  generation: number
   fromSeq: number
   throughSeq: number
+  evidenceFromSeq: number
+  evidenceThroughSeq: number
+  fromStreamOffset?: number
+  throughStreamOffset?: number
+  inferred: boolean
+  hasVisibleOutput: boolean
 }
 
 export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
   const items: AgentHistoryItem[] = []
   const runs = new Map<string, Extract<AgentHistoryItem, { kind: 'run' }>>()
   const commandGroups = new Map<string, Extract<AgentHistoryItem, { kind: 'command' }>>()
+  const captures = new Map<string, CommandCaptureEvidence>()
+  for (const event of events) {
+    const capture = commandCapture(event)
+    if (capture) captures.set(capture.operationId, capture)
+  }
   for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
     if (['run_started', 'run_ended', 'run_aborted'].includes(event.kind) && event.run_id) {
       const metadata = event.metadata.run as { label?: unknown } | undefined
@@ -90,11 +119,14 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
     } else {
       group.commands.push({
         id: commandKey,
+        daemonEpoch: event.daemon_epoch,
+        generation: event.generation,
         firstSeq: event.seq,
         operationId,
         stepIndex,
         text: event.text,
-        captureMatchers: captureMatchers(event)
+        captureMatchers: captureMatchers(event),
+        capture: operationId ? captures.get(operationId) : undefined
       })
     }
     group.commands.sort((a, b) => (a.stepIndex ?? Number.MAX_SAFE_INTEGER) - (b.stepIndex ?? Number.MAX_SAFE_INTEGER) || a.firstSeq - b.firstSeq)
@@ -106,9 +138,51 @@ export function locateCommandOutput(
   events: TimelineEvent[],
   command: AgentCommand
 ): MatchRange | undefined {
+  const capture = command.capture
+  if (
+    capture
+    && capture.daemonEpoch === command.daemonEpoch
+    && capture.generation === command.generation
+    && capture.txEventSeq >= command.firstSeq
+    && capture.evidenceThroughSeq >= capture.evidenceFromSeq
+  ) {
+    const visible = events.filter((event) => (
+      event.direction === 'rx'
+      && event.daemon_epoch === capture.daemonEpoch
+      && event.generation === capture.generation
+      && event.seq >= capture.evidenceFromSeq
+      && event.seq <= capture.evidenceThroughSeq
+    ))
+    return {
+      daemonEpoch: capture.daemonEpoch,
+      generation: capture.generation,
+      fromSeq: visible[0]?.seq ?? capture.evidenceFromSeq,
+      throughSeq: visible.at(-1)?.seq ?? capture.evidenceThroughSeq,
+      evidenceFromSeq: capture.evidenceFromSeq,
+      evidenceThroughSeq: capture.evidenceThroughSeq,
+      fromStreamOffset: capture.rxStreamOffsetStart,
+      throughStreamOffset: capture.rxStreamOffsetEnd,
+      inferred: false,
+      hasVisibleOutput: visible.length > 0
+    }
+  }
   const target = command.text.replace(/[\r\n]+$/g, '')
   if (!target) return undefined
-  const candidates = events.filter((event) => event.direction === 'rx' && event.seq >= command.firstSeq)
+  const ordered = events
+    .filter((event) => event.daemon_epoch === command.daemonEpoch && event.generation === command.generation)
+    .sort((left, right) => left.seq - right.seq)
+  const boundary = ordered.find((event) => (
+    event.seq > command.firstSeq
+    && (
+      (event.direction === 'tx' && (command.operationId ? event.operation_id !== command.operationId : true))
+      || isCommandBoundary(event.kind)
+    )
+  ))?.seq
+  const candidates = ordered.filter((event) => (
+    event.direction === 'rx'
+    && event.seq >= command.firstSeq
+    && (boundary === undefined || event.seq < boundary)
+  ))
   const combined = candidates.map((event) => event.text).join('')
   if (!command.captureMatchers?.length) return undefined
   let matcherStart = -1
@@ -126,6 +200,9 @@ export function locateCommandOutput(
       } catch {
         continue
       }
+    } else if (matcher.kind === 'shell_prompt' || matcher.kind === 'uboot_prompt') {
+      const found = findCompletedPrompt(combined, matcher.value)
+      if (found) ({ start, end } = found)
     } else {
       start = combined.indexOf(matcher.value)
       end = start < 0 ? -1 : start + matcher.value.length
@@ -139,8 +216,64 @@ export function locateCommandOutput(
   const commandOffset = combined.indexOf(target)
   const startOffset = commandOffset >= 0 && commandOffset <= matcherStart ? commandOffset : 0
   return {
+    daemonEpoch: command.daemonEpoch,
+    generation: command.generation,
     fromSeq: sequenceAtOffset(candidates, startOffset),
-    throughSeq: sequenceAtOffset(candidates, Math.max(startOffset, matcherEnd - 1))
+    throughSeq: sequenceAtOffset(candidates, Math.max(startOffset, matcherEnd - 1)),
+    evidenceFromSeq: command.firstSeq,
+    evidenceThroughSeq: sequenceAtOffset(candidates, Math.max(startOffset, matcherEnd - 1)),
+    inferred: true,
+    hasVisibleOutput: true
+  }
+}
+
+/**
+ * A persisted profile prompt is a command boundary only at the end of a
+ * terminal line (or the current document). In particular, `root# show` is an
+ * echoed command prefix, not the prompt that completed that command. A target
+ * may reset prompt styling before its newline, so accept only SGR resets in
+ * that narrow suffix.
+ */
+function findCompletedPrompt(text: string, prompt: string): { start: number; end: number } | undefined {
+  if (!prompt) return undefined
+  let from = 0
+  while (from <= text.length - prompt.length) {
+    const start = text.indexOf(prompt, from)
+    if (start < 0) return undefined
+    const end = start + prompt.length
+    const suffix = text.slice(end)
+    if (/^(?:(?:\u001b\[(?:0)?m))*(?:\r\n|\r|\n|$)/u.test(suffix)) return { start, end }
+    from = start + Math.max(1, prompt.length)
+  }
+  return undefined
+}
+
+function commandCapture(event: TimelineEvent): CommandCaptureEvidence | undefined {
+  if (event.kind !== 'command_capture_completed') return undefined
+  const value = event.metadata.capture
+  if (!value || typeof value !== 'object') return undefined
+  const capture = value as Record<string, unknown>
+  const operationId = stringValue(capture.operation_id)
+  const daemonEpoch = stringValue(capture.daemon_epoch)
+  const generation = integerValue(capture.generation)
+  const txEventSeq = integerValue(capture.tx_event_seq)
+  const evidenceFromSeq = integerValue(capture.evidence_from_seq)
+  const evidenceThroughSeq = integerValue(capture.evidence_through_seq)
+  if (
+    !operationId || !daemonEpoch || generation === undefined || txEventSeq === undefined
+    || evidenceFromSeq === undefined || evidenceThroughSeq === undefined
+  ) return undefined
+  return {
+    daemonEpoch,
+    generation,
+    operationId,
+    txEventSeq,
+    evidenceFromSeq,
+    evidenceThroughSeq,
+    rxStreamOffsetStart: integerValue(capture.rx_stream_offset_start),
+    rxStreamOffsetEnd: integerValue(capture.rx_stream_offset_end),
+    completion: stringValue(capture.completion) ?? 'unknown',
+    confidence: stringValue(capture.confidence) ?? 'unknown'
   }
 }
 
@@ -182,4 +315,19 @@ function stringMetadata(event: TimelineEvent, key: string): string | undefined {
 function numberMetadata(event: TimelineEvent, key: string): number | undefined {
   const value = event.metadata[key]
   return typeof value === 'number' && Number.isInteger(value) ? value : undefined
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined
+}
+
+function integerValue(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function isCommandBoundary(kind: string): boolean {
+  return [
+    'serial_opening', 'serial_opened', 'serial_open_failed', 'serial_closed',
+    'port_reconfigured', 'port_removed', 'trigger_started', 'break', 'gap', 'logging_degraded'
+  ].includes(kind)
 }

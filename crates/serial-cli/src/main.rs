@@ -2,7 +2,8 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     io::{Error, ErrorKind, IsTerminal as _, Read as _, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    net::SocketAddr,
+    net::TcpStream,
     path::PathBuf,
     process::{self, Child, Command, ExitStatus, Stdio},
     str::FromStr as _,
@@ -32,7 +33,8 @@ Usage:
   serial paths [seriald options]
 
 The unified command manages sibling components from the same release package.
-The default MCP endpoint is http://127.0.0.1:3211/mcp.
+The unified MCP endpoint uses the selected seriald interface IP on port 3211;
+wildcard seriald binds fall back to loopback.
 ";
 
 const SETUP_HELP: &str = "\
@@ -50,6 +52,7 @@ Usage: serial setup [--root DIR]
 const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_IDENTITY_WAIT: Duration = Duration::from_secs(2);
 const MCP_IDENTITY_POLL: Duration = Duration::from_millis(50);
+const MCP_HTTP_PORT: u16 = 3211;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Component {
@@ -231,23 +234,27 @@ fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
 
     let mut mcp = None;
     let result = (|| {
-        let mcp_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3211);
+        let mcp_address = mcp_listen_address(&active);
         if tcp_ready(mcp_address) {
             if wait_for_matching_mcp(mcp_address, &active, MCP_IDENTITY_WAIT).is_none() {
                 return Err(Error::new(
                     ErrorKind::AddrInUse,
-                    "127.0.0.1:3211 is occupied, but it is not protocol v6 serial-mcp connected to the selected seriald",
+                    format!(
+                        "{mcp_address} is occupied, but it is not protocol {PROTOCOL_VERSION} \
+                         serial-mcp connected to the selected seriald"
+                    ),
                 ));
             }
         } else {
             let mut command = Command::new(required_sibling(component_program(Component::Mcp))?);
             configure_managed_child(&mut command);
+            let mcp_listen = mcp_address.to_string();
             command
                 .args([
                     "--endpoint",
                     &endpoint,
                     "--listen",
-                    "127.0.0.1:3211",
+                    &mcp_listen,
                     "--managed",
                 ])
                 .stdin(Stdio::piped())
@@ -256,7 +263,7 @@ fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
             mcp = wait_for_mcp_child(command.spawn()?, mcp_address, &active)?;
         }
 
-        println!("seriald {endpoint}  |  MCP http://127.0.0.1:3211/mcp");
+        println!("seriald {endpoint}  |  MCP http://{mcp_address}/mcp");
         let console = required_sibling(component_program(Component::Console))?;
         Command::new(console)
             .env("SERIALD_ENDPOINT", &endpoint)
@@ -265,6 +272,10 @@ fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
     stop_child(&mut mcp);
     stop_child(&mut daemon);
     result
+}
+
+fn mcp_listen_address(seriald: &ActiveEndpoint) -> SocketAddr {
+    SocketAddr::new(seriald.address.ip(), MCP_HTTP_PORT)
 }
 
 fn config_store(args: &[OsString]) -> Result<ConfigStore, String> {
@@ -646,7 +657,7 @@ fn wait_for_mcp_child(
             return Err(Error::new(
                 ErrorKind::TimedOut,
                 format!(
-                    "serial-mcp did not publish a matching protocol v6 identity on {address}{suffix}"
+                    "serial-mcp did not publish a matching protocol v{PROTOCOL_VERSION} identity on {address}{suffix}"
                 ),
             ));
         }
@@ -938,6 +949,45 @@ mod tests {
         assert!(SETUP_HELP.contains("机型 Profile"));
         assert!(SETUP_HELP.contains("一级机型名"));
         assert!(SETUP_HELP.contains("二级机型名"));
+    }
+
+    #[test]
+    fn unified_mcp_inherits_the_selected_seriald_interface() {
+        let server_id = uuid::Uuid::new_v4();
+        let daemon_epoch = uuid::Uuid::new_v4();
+        let host_only = ActiveEndpoint::new(
+            "192.168.56.109:4321".parse().unwrap(),
+            server_id,
+            daemon_epoch,
+            42,
+        );
+        assert_eq!(
+            mcp_listen_address(&host_only),
+            "192.168.56.109:3211".parse().unwrap()
+        );
+
+        let ipv6 = ActiveEndpoint::new(
+            "[fd00::109]:4321".parse().unwrap(),
+            server_id,
+            daemon_epoch,
+            42,
+        );
+        assert_eq!(
+            mcp_listen_address(&ipv6),
+            "[fd00::109]:3211".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn wildcard_seriald_bind_keeps_unified_mcp_on_loopback() {
+        let server_id = uuid::Uuid::new_v4();
+        let daemon_epoch = uuid::Uuid::new_v4();
+        let ipv4 =
+            ActiveEndpoint::new("0.0.0.0:3210".parse().unwrap(), server_id, daemon_epoch, 42);
+        assert_eq!(mcp_listen_address(&ipv4), "127.0.0.1:3211".parse().unwrap());
+
+        let ipv6 = ActiveEndpoint::new("[::]:3210".parse().unwrap(), server_id, daemon_epoch, 42);
+        assert_eq!(mcp_listen_address(&ipv6), "[::1]:3211".parse().unwrap());
     }
 
     #[test]

@@ -9,14 +9,15 @@ use regex_syntax::ParserBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandCaptureMatcher, CommandCaptureMatcherKind, ConfigurePortsRequest,
+    Actor, ActorKind, CommandCaptureCompletionKind, CommandCaptureConfidence,
+    CommandCaptureMatcher, CommandCaptureMatcherKind, CommandCaptureReport, ConfigurePortsRequest,
     CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES,
     DEFAULT_TRIGGER_TIMEOUT_MS, Direction, EchoMode, EventKind, EventQuery, EventQueryResponse,
-    MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES, MAX_MONITOR_MATCHERS,
-    MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
-    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
-    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MAX_BREAK_DURATION_MS, MAX_COMMAND_CAPTURE_DETAIL_BYTES, MAX_COMMAND_DESCRIPTION_BYTES,
+    MAX_MONITOR_MATCHERS, MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
     MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, MonitorMatcher, PROTOCOL_VERSION,
     SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse, TriggerInfo,
     TriggerSpec, TriggerStatus, WritePacing,
@@ -30,15 +31,17 @@ use crate::{
     capture::{Capture, CaptureOptions, CommandBoundary, Completion, CompletionPattern},
     config::CaptureLimits,
     render::{MatchExcerptOptions, MatchExcerptPattern, RenderOptions, render_events},
-    session::{SequenceBoundaryRejected, SessionHandle},
+    session::{SequenceBoundaryRejected, SessionHandle, UserCommandUsed, WriteOutcomeUncertain},
 };
 
 const DEFAULT_TEXT_CHARS: usize = 16_000;
 const MAX_WRITE_BYTES: usize = 4096;
-const MAX_REGEX_BYTES: usize = 4096;
 const MAX_COMMAND_SEQUENCE_STEPS: usize = 8;
 const MAX_COMMAND_SEQUENCE_TOTAL_WRITE_BYTES: usize = MAX_COMMAND_SEQUENCE_STEPS * MAX_WRITE_BYTES;
 const MAX_COMMAND_SEQUENCE_TIMEOUT_SECONDS: u64 = 300;
+const WRITE_OUTCOME_UNCERTAIN_RETRY_HINT: &str = "Do not retry automatically. Inspect the exact \
+    operation in the TX/control timeline and confirm the device's current state before deciding \
+    whether another physical action is safe.";
 const MAX_MONITOR_DESCRIPTION_BYTES: usize = 1024;
 const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
 const TRIGGER_STATUS_MARGIN: Duration =
@@ -79,11 +82,27 @@ impl CommandStepFailure {
             .downcast_ref::<SequenceBoundaryRejected>()
             .is_some()
     }
+
+    fn is_user_command_used(&self) -> bool {
+        self.error.downcast_ref::<UserCommandUsed>().is_some()
+    }
+
+    fn is_write_outcome_uncertain(&self) -> bool {
+        self.error.downcast_ref::<WriteOutcomeUncertain>().is_some()
+    }
 }
 
 struct SequenceStop {
     code: &'static str,
     message: String,
+}
+
+#[derive(Default)]
+struct HumanReadAcknowledgement {
+    pending_revision: Option<u64>,
+    human_command_seq: Option<u64>,
+    acknowledged: bool,
+    warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -95,7 +114,7 @@ impl std::fmt::Display for ContextChanged {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "serial context changed since the previous Agent operation; no bytes were written; inspect recent_context with read(scope=tail) or wait, then retry"
+            "serial context changed since the previous Agent operation; no bytes were written; inspect recent_context with a live read(scope=tail or continue), then retry"
         )
     }
 }
@@ -103,16 +122,47 @@ impl std::fmt::Display for ContextChanged {
 impl std::error::Error for ContextChanged {}
 
 pub(crate) fn structured_tool_error(error: &anyhow::Error) -> Option<Value> {
-    let changed = error.downcast_ref::<ContextChanged>()?;
-    Some(json!({
-        "error": {
-            "code": "context_changed",
-            "message": changed.to_string(),
-            "no_bytes_written": true,
-            "recent_context": changed.recent_context,
-            "retry_hint": "Call read(scope=tail) or wait to confirm the new serial state, then retry the operation."
-        }
-    }))
+    if let Some(changed) = error.downcast_ref::<ContextChanged>() {
+        return Some(json!({
+            "error": {
+                "code": "context_changed",
+                "message": changed.to_string(),
+                "no_bytes_written": true,
+                "recent_context": changed.recent_context,
+                "retry_hint": "Call read(scope=tail) to confirm the new serial state, then retry the operation."
+            }
+        }));
+    }
+    if let Some(used) = error.downcast_ref::<UserCommandUsed>() {
+        return Some(json!({
+            "error": {
+                "code": "user_command_used",
+                "message": used.to_string(),
+                "no_bytes_written": true,
+                "retry_hint": "Call read(scope=tail) or read(scope=continue) until the Human TX is returned and acknowledged. wait and archive reads do not clear this gate."
+            }
+        }));
+    }
+    error
+        .downcast_ref::<WriteOutcomeUncertain>()
+        .map(|uncertain| {
+            json!({
+                "error": write_outcome_uncertain_details(uncertain.to_string()),
+            })
+        })
+}
+
+fn write_outcome_uncertain_details(message: String) -> Value {
+    json!({
+        "source": "seriald",
+        "code": "write_outcome_uncertain",
+        "message": message,
+        "outcome": "uncertain",
+        "no_bytes_written": false,
+        "retryable": false,
+        "automatic_retry_allowed": false,
+        "retry_hint": WRITE_OUTCOME_UNCERTAIN_RETRY_HINT,
+    })
 }
 
 #[derive(Clone)]
@@ -153,7 +203,6 @@ impl AgentTools {
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,
             "command_sequence" => self.command_sequence(parse(arguments)?).await,
-            "input" => self.input(parse(arguments)?).await,
             "signal" => self.signal(parse(arguments)?).await,
             "trigger" => self.trigger(parse(arguments)?).await,
             "wait" => self.wait(parse(arguments)?).await,
@@ -179,14 +228,7 @@ impl AgentTools {
     async fn attach_recent_context(&self, tool_name: &str, output: &mut Value) {
         if !matches!(
             tool_name,
-            "read"
-                | "command"
-                | "command_sequence"
-                | "input"
-                | "signal"
-                | "trigger"
-                | "wait"
-                | "run_start"
+            "read" | "command" | "command_sequence" | "signal" | "trigger" | "wait" | "run_start"
         ) {
             return;
         }
@@ -209,7 +251,10 @@ impl AgentTools {
             return;
         };
         let current = Cursor { epoch, after_seq };
-        let is_observation = matches!(tool_name, "read" | "wait");
+        // Only a live read is an acknowledgement boundary. wait deliberately
+        // does not clear the gate, and a live read that failed to cover/ACK a
+        // pending Human TX reports `user_command_acknowledged=false`.
+        let is_observation = tool_observes_serial_context(tool_name, output);
         let previous = self
             .operation_cursors
             .lock()
@@ -277,7 +322,7 @@ impl AgentTools {
     /// Fails before a physical action whenever the bounded live history shows
     /// a third-party action, or cannot prove that none occurred. The caller
     /// deliberately does not advance the operation cursor on failure: a
-    /// subsequent read/wait is the explicit acknowledgement boundary.
+    /// subsequent live read is the explicit acknowledgement boundary.
     async fn ensure_serial_context_unchanged(&self, slot: &SlotSnapshot) -> Result<()> {
         if let Some(recent_context) = self
             .pending_context
@@ -477,9 +522,19 @@ impl AgentTools {
         if args.through_seq.is_some() && scope != "archive" {
             bail!("through_seq is only valid with scope=archive");
         }
+        // `wait` intentionally does not acknowledge Human intervention, but
+        // it may advance the ordinary live cursor beyond that TX. While the
+        // daemon gate is pending, force the next live read to start immediately
+        // before the exact Human event so the proof remains recoverable. The
+        // daemon still returns an explicit ring gap if that event was evicted;
+        // in that case we never fabricate an acknowledgement.
+        let human_recovery_cursor = pending_human_read_cursor(&slot);
         let (epoch, response) = match scope {
             "tail" => {
-                let response = self.api.live_tail(&args.port, 200, None).await?;
+                let response = self
+                    .api
+                    .live_tail(&args.port, 200, human_recovery_cursor.as_ref())
+                    .await?;
                 let epoch = response
                     .next_cursor
                     .as_ref()
@@ -488,10 +543,13 @@ impl AgentTools {
                 (epoch, response)
             }
             "continue" => {
-                let cursor = self.live_cursor(&slot.config.port).unwrap_or(Cursor {
-                    epoch: slot.daemon_epoch,
-                    after_seq: slot.head_seq,
-                });
+                let cursor = human_recovery_cursor
+                    .clone()
+                    .or_else(|| self.live_cursor(&slot.config.port))
+                    .unwrap_or(Cursor {
+                        epoch: slot.daemon_epoch,
+                        after_seq: slot.head_seq,
+                    });
                 let response = self.api.live_tail(&args.port, 1_000, Some(&cursor)).await?;
                 let response_epoch = response
                     .next_cursor
@@ -529,6 +587,12 @@ impl AgentTools {
             }
             _ => bail!("scope must be tail, continue, or archive"),
         };
+        let human_ack = if scope == "archive" {
+            HumanReadAcknowledgement::default()
+        } else {
+            self.acknowledge_human_context_from_read(&slot, epoch, &response)
+                .await
+        };
         let mut output = render_response(
             &slot,
             epoch,
@@ -552,6 +616,9 @@ impl AgentTools {
             output["bounded_continue"] = json!(true);
             output["limit_events"] = json!(1_000);
         }
+        if let Some(cursor) = human_recovery_cursor {
+            output["user_command_recovery_after_seq"] = json!(cursor.after_seq);
+        }
         if output["cursor"]["epoch"] == json!(slot.daemon_epoch)
             && let Some(after_seq) = output["cursor"]["after_seq"].as_u64()
         {
@@ -563,7 +630,123 @@ impl AgentTools {
                 },
             );
         }
+        if let Some(revision) = human_ack.pending_revision {
+            output["user_command_context_revision"] = json!(revision);
+            output["user_command_seq"] = json!(human_ack.human_command_seq);
+            output["user_command_acknowledged"] = json!(human_ack.acknowledged);
+            if !human_ack.acknowledged {
+                output["user_command_retry_hint"] = json!(
+                    "Read the live tail/continuation that contains the Human TX event. wait and \
+                     scope=archive do not acknowledge it."
+                );
+            }
+            if let Some(warning) = human_ack.warning {
+                output["user_command_acknowledgement_warning"] = json!(warning);
+            }
+        }
         Ok(output)
+    }
+
+    async fn acknowledge_human_context_from_read(
+        &self,
+        initial_slot: &SlotSnapshot,
+        response_epoch: Uuid,
+        response: &EventQueryResponse,
+    ) -> HumanReadAcknowledgement {
+        let (slot, status_warning) = match self.slot(&initial_slot.config.port).await {
+            Ok(slot) => (slot, None),
+            Err(error) => (
+                initial_slot.clone(),
+                Some(format!(
+                    "could not refresh Run context after the read, so no acknowledgement was sent: \
+                     {error}"
+                )),
+            ),
+        };
+        let Some(context) = slot.run_context.as_ref() else {
+            return HumanReadAcknowledgement::default();
+        };
+        if context.revision <= context.acknowledged_revision
+            || context.last_human_command_seq.is_none()
+        {
+            return HumanReadAcknowledgement::default();
+        }
+        let human_command_seq = context
+            .last_human_command_seq
+            .expect("pending context has a Human command sequence");
+        let mut acknowledgement = HumanReadAcknowledgement {
+            pending_revision: Some(context.revision),
+            human_command_seq: Some(human_command_seq),
+            acknowledged: false,
+            warning: status_warning,
+        };
+        if response_epoch != slot.daemon_epoch {
+            acknowledgement.warning = Some(
+                "the read belongs to a different daemon epoch and cannot acknowledge the live \
+                 Human command"
+                    .into(),
+            );
+            return acknowledgement;
+        }
+        let covers_human_tx =
+            live_read_covers_human_tx(response, slot.daemon_epoch, human_command_seq);
+        let through_seq = response
+            .next_cursor
+            .as_ref()
+            .filter(|cursor| cursor.epoch == slot.daemon_epoch)
+            .map(|cursor| cursor.after_seq)
+            .or_else(|| response.events.last().map(|event| event.seq));
+        if !covers_human_tx || through_seq.is_none_or(|through| through < human_command_seq) {
+            acknowledgement.warning = Some(
+                "this bounded live read did not include the pending Human TX event, so the \
+                 physical-action gate remains closed"
+                    .into(),
+            );
+            return acknowledgement;
+        }
+        if slot.active_run.as_ref().map(|run| run.id) != Some(context.run_id) {
+            acknowledgement.warning = Some(
+                "the pending Run context no longer matches the active Run; no acknowledgement \
+                 was sent"
+                    .into(),
+            );
+            return acknowledgement;
+        }
+        match self
+            .session
+            .acknowledge_run_context(
+                slot.config.port.clone(),
+                context.run_id,
+                context.revision,
+                through_seq.expect("coverage checked a live through sequence"),
+            )
+            .await
+        {
+            Ok(acknowledged)
+                if acknowledged.run_id == context.run_id
+                    && acknowledged.acknowledged_revision >= context.revision
+                    && acknowledged
+                        .acknowledged_through_seq
+                        .is_some_and(|through| through >= human_command_seq) =>
+            {
+                acknowledgement.acknowledged = true;
+                acknowledgement.warning = None;
+            }
+            Ok(acknowledged) => {
+                acknowledgement.warning = Some(format!(
+                    "seriald returned an incomplete Run-context acknowledgement (revision {}, \
+                     through {:?}); the physical-action gate remains closed",
+                    acknowledged.acknowledged_revision, acknowledged.acknowledged_through_seq
+                ));
+            }
+            Err(error) => {
+                acknowledgement.warning = Some(format!(
+                    "the Human TX was read, but seriald did not acknowledge it; retry the live \
+                     read before another physical action: {error}"
+                ));
+            }
+        }
+        acknowledgement
     }
 
     async fn search(&self, args: SearchArgs) -> Result<Value> {
@@ -1040,6 +1223,8 @@ impl AgentTools {
                 Ok(executed) => executed,
                 Err(failure) => {
                     let boundary_changed = failure.is_sequence_boundary_rejection();
+                    let user_command_used = failure.is_user_command_used();
+                    let write_outcome_uncertain = failure.is_write_outcome_uncertain();
                     if step_outputs.is_empty() {
                         if boundary_changed {
                             return Err(self
@@ -1048,6 +1233,23 @@ impl AgentTools {
                         }
                         return Err(failure.error);
                     }
+                    let mut failure_details = if write_outcome_uncertain {
+                        write_outcome_uncertain_details(failure.error.to_string())
+                    } else {
+                        json!({
+                            "code": if boundary_changed {
+                                "sequence_boundary_changed"
+                            } else if user_command_used {
+                                "user_command_used"
+                            } else {
+                                "step_error"
+                            },
+                            "message": failure.error.to_string(),
+                        })
+                    };
+                    failure_details["step_index"] = json!(step_index);
+                    failure_details["phase"] = json!(failure.phase);
+                    failure_details["next_step_sent"] = json!(false);
                     let mut output = command_sequence_output(
                         &slot,
                         run_id,
@@ -1056,13 +1258,7 @@ impl AgentTools {
                         requested_steps,
                         completed_steps,
                         step_outputs,
-                        Some(json!({
-                            "step_index": step_index,
-                            "phase": failure.phase,
-                            "code": if boundary_changed { "sequence_boundary_changed" } else { "step_error" },
-                            "message": failure.error.to_string(),
-                            "next_step_sent": false,
-                        })),
+                        Some(failure_details),
                     );
                     let run_open = self
                         .session
@@ -1271,6 +1467,35 @@ impl AgentTools {
             echo_ambiguous,
             rx_event_count,
         );
+        let (capture_completion, completion_detail) =
+            command_capture_completion(&result.completion);
+        let authoritative_capture = self
+            .session
+            .record_command_capture(
+                slot.config.port.clone(),
+                CommandCaptureReport {
+                    daemon_epoch: slot.daemon_epoch,
+                    generation: slot.generation,
+                    run_id: expected_run_id,
+                    operation_id,
+                    tx_event_seq: write.event_seq,
+                    evidence_from_seq: write.event_seq,
+                    evidence_through_seq: last_seq.max(write.event_seq),
+                    completion: capture_completion,
+                    completion_detail,
+                    confidence: command_capture_confidence(confidence),
+                },
+            )
+            .await
+            .map_err(|error| CommandStepFailure {
+                phase: "record_capture",
+                error: anyhow!(
+                    "the command write was confirmed at event {}, but seriald did not persist \
+                     its completed capture boundary; do not blindly resend the command. Inspect \
+                     the TX/RX timeline and retry only the evidence-recording workflow: {error}",
+                    write.event_seq
+                ),
+            })?;
         let cursor = Cursor {
             epoch: slot.daemon_epoch,
             after_seq: last_seq,
@@ -1289,6 +1514,7 @@ impl AgentTools {
             "run_id": expected_run_id,
             "operation_id": operation_id,
             "event_seq": write.event_seq,
+            "authoritative_capture": authoritative_capture,
             "description": prepared.description,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
         });
@@ -1319,29 +1545,6 @@ impl AgentTools {
             echo_ambiguous,
             no_rx,
         })
-    }
-
-    async fn input(&self, args: InputArgs) -> Result<Value> {
-        let run_use = self
-            .session
-            .authorize_run_use(args.run_handle.clone())
-            .await?;
-        let _write_guard = self.write_guard(&run_use.port).await;
-        let slot = self.slot_online_for_physical_action(&run_use.port).await?;
-        matching_active_run(&slot, run_use.run_id, "input")?;
-        self.ensure_serial_context_unchanged(&slot).await?;
-        let bytes = args.text.into_bytes();
-        if bytes.is_empty() {
-            bail!("input text must not be empty");
-        }
-        if bytes.len() > MAX_WRITE_BYTES {
-            bail!("input text exceeds {MAX_WRITE_BYTES} UTF-8 bytes");
-        }
-        let mut output = self
-            .write_raw(&slot, bytes, "input", run_use.run_id, run_use.run_token)
-            .await?;
-        attach_run_state(&mut output, &args.run_handle, true);
-        Ok(output)
     }
 
     async fn signal(&self, args: SignalArgs) -> Result<Value> {
@@ -1439,7 +1642,7 @@ impl AgentTools {
         expected_run_id: Uuid,
         run_token: Uuid,
     ) -> Result<Value> {
-        let active_run = matching_active_run(slot, expected_run_id, "input/signal")?;
+        let active_run = matching_active_run(slot, expected_run_id, "signal")?;
         let operation_id = Uuid::new_v4();
         let byte_count = bytes.len();
         let write = match self
@@ -1822,12 +2025,7 @@ impl AgentTools {
         }
         let started = self
             .session
-            .start_run_with_handle(
-                args.port.clone(),
-                args.label,
-                BTreeMap::new(),
-                Duration::from_secs(15),
-            )
+            .start_run_with_handle(args.port.clone(), args.label, BTreeMap::new())
             .await?;
         let run = started.run;
         self.remember_live_cursor(
@@ -1839,6 +2037,7 @@ impl AgentTools {
         );
         Ok(json!({
             "port": args.port,
+            "approval_id": started.approval_id,
             "run_id": run.id,
             "run_handle": started.run_handle,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
@@ -2090,6 +2289,40 @@ impl AgentTools {
             .clone();
         lock.lock_owned().await
     }
+}
+
+fn tool_observes_serial_context(tool_name: &str, output: &Value) -> bool {
+    tool_name == "read"
+        && output.get("scope").and_then(Value::as_str) != Some("archive")
+        && output
+            .get("user_command_acknowledged")
+            .and_then(Value::as_bool)
+            != Some(false)
+}
+
+fn pending_human_read_cursor(slot: &SlotSnapshot) -> Option<Cursor> {
+    let context = slot.run_context.as_ref()?;
+    if context.revision <= context.acknowledged_revision {
+        return None;
+    }
+    let human_command_seq = context.last_human_command_seq?;
+    Some(Cursor {
+        epoch: slot.daemon_epoch,
+        after_seq: human_command_seq.saturating_sub(1),
+    })
+}
+
+fn live_read_covers_human_tx(
+    response: &EventQueryResponse,
+    daemon_epoch: Uuid,
+    human_command_seq: u64,
+) -> bool {
+    response.events.iter().any(|event| {
+        event.seq == human_command_seq
+            && event.daemon_epoch == daemon_epoch
+            && event.direction == Direction::Tx
+            && event.metadata.get("human_command").and_then(Value::as_bool) == Some(true)
+    })
 }
 
 fn summarize_recent_context(
@@ -2384,8 +2617,10 @@ fn validate_command_sequence_shape(steps: &[CommandSequenceStepArgs]) -> Result<
                 if expect.is_empty() {
                     bail!("steps[{index}].expect must not be empty");
                 }
-                if expect.len() > MAX_REGEX_BYTES {
-                    bail!("steps[{index}].expect must not exceed {MAX_REGEX_BYTES} UTF-8 bytes");
+                if expect.len() > MAX_COMMAND_CAPTURE_DETAIL_BYTES {
+                    bail!(
+                        "steps[{index}].expect must not exceed {MAX_COMMAND_CAPTURE_DETAIL_BYTES} UTF-8 bytes"
+                    );
                 }
             }
             (None, Some(pattern)) => {
@@ -2822,6 +3057,54 @@ fn completion_kind(completion: &Completion) -> &'static str {
     }
 }
 
+fn command_capture_completion(
+    completion: &Completion,
+) -> (CommandCaptureCompletionKind, Option<String>) {
+    match completion {
+        Completion::Pattern(value) => (CommandCaptureCompletionKind::Literal, Some(value.clone())),
+        Completion::Prompt(value) => (CommandCaptureCompletionKind::Prompt, Some(value.clone())),
+        Completion::Regex(value) => (CommandCaptureCompletionKind::Regex, Some(value.clone())),
+        Completion::Quiet => (CommandCaptureCompletionKind::Quiet, None),
+        Completion::Signal(value) => (CommandCaptureCompletionKind::Signal, Some(value.clone())),
+        Completion::RunAborted { reason, .. } => (
+            CommandCaptureCompletionKind::RunAborted,
+            Some(bounded_internal_capture_detail(reason)),
+        ),
+        Completion::Timeout => (CommandCaptureCompletionKind::Timeout, None),
+        Completion::Disconnected(reason) => (
+            CommandCaptureCompletionKind::Disconnected,
+            Some(bounded_internal_capture_detail(reason)),
+        ),
+    }
+}
+
+/// Internal transport/Run diagnostics do not come from the validated matcher
+/// input path and can include an arbitrarily long nested error. Bound them
+/// before the post-TX capture RPC, without ever truncating matcher variants.
+fn bounded_internal_capture_detail(value: &str) -> String {
+    if value.len() <= MAX_COMMAND_CAPTURE_DETAIL_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_COMMAND_CAPTURE_DETAIL_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn command_capture_confidence(confidence: &str) -> CommandCaptureConfidence {
+    match confidence {
+        "high" => CommandCaptureConfidence::High,
+        "medium" => CommandCaptureConfidence::Medium,
+        "low" => CommandCaptureConfidence::Low,
+        "partial" => CommandCaptureConfidence::Partial,
+        "interfered" => CommandCaptureConfidence::Interfered,
+        "incomplete" => CommandCaptureConfidence::Incomplete,
+        "unreliable" => CommandCaptureConfidence::Unreliable,
+        other => unreachable!("command_confidence returned unknown label {other:?}"),
+    }
+}
+
 fn command_write_status(echo_missing: bool, echo_ambiguous: bool) -> &'static str {
     if echo_missing || echo_ambiguous {
         "uncertain"
@@ -3032,6 +3315,9 @@ fn requested_completion(
         if expect.is_empty() {
             bail!("expect must not be empty");
         }
+        if expect.len() > MAX_COMMAND_CAPTURE_DETAIL_BYTES {
+            bail!("expect must not exceed {MAX_COMMAND_CAPTURE_DETAIL_BYTES} UTF-8 bytes");
+        }
         return Ok((
             vec![CompletionPattern::Literal(expect.to_string())],
             None,
@@ -3106,7 +3392,9 @@ mod completion_tests {
             tx_offset: 0,
             rx_overflow_bytes: 0,
             control: None,
+            pending_run_start: None,
             active_run: None,
+            run_context: None,
             active_trigger: None,
             logging: serial_protocol::LoggingState::Healthy,
             effective_shell_prompt: shell.map(str::to_owned),
@@ -3272,6 +3560,29 @@ mod completion_tests {
     }
 
     #[test]
+    fn explicit_matchers_preserve_control_characters_through_the_shared_bound() {
+        let matcher = format!("{}\n\u{0000}tail", "界".repeat(100));
+        assert!(matcher.len() > MAX_COMMAND_DESCRIPTION_BYTES);
+
+        let (_, _, _, contains) =
+            requested_completion(Some(&matcher), None, &slot(None, None), true).unwrap();
+        assert_eq!(contains[0].value, matcher);
+
+        let (_, _, _, regex) =
+            requested_completion(None, Some(&matcher), &slot(None, None), true).unwrap();
+        assert_eq!(regex[0].value, matcher);
+        let (kind, detail) = command_capture_completion(&Completion::Regex(matcher.clone()));
+        assert_eq!(kind, CommandCaptureCompletionKind::Regex);
+        assert_eq!(detail.as_deref(), Some(matcher.as_str()));
+
+        let maximum = "x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES);
+        assert!(requested_completion(Some(&maximum), None, &slot(None, None), true).is_ok());
+        let oversized = "x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES + 1);
+        assert!(requested_completion(Some(&oversized), None, &slot(None, None), true).is_err());
+        assert!(requested_completion(None, Some(&oversized), &slot(None, None), true).is_err());
+    }
+
+    #[test]
     fn recent_context_reports_human_model_identity_switches_without_profile_names() {
         let epoch = Uuid::new_v4();
         let event = serial_protocol::TimelineEvent {
@@ -3382,6 +3693,237 @@ mod completion_tests {
             .expect("an ambiguous intermediate echo must stop the sequence");
         assert_eq!(stop.code, "echo_uncertain");
     }
+
+    #[test]
+    fn command_capture_report_maps_every_completion_and_confidence_exactly() {
+        let run_id = Uuid::new_v4();
+        let cases = [
+            (
+                Completion::Pattern("ready".into()),
+                CommandCaptureCompletionKind::Literal,
+                Some("ready"),
+            ),
+            (
+                Completion::Prompt("root# ".into()),
+                CommandCaptureCompletionKind::Prompt,
+                Some("root# "),
+            ),
+            (
+                Completion::Regex("ready\\s+#".into()),
+                CommandCaptureCompletionKind::Regex,
+                Some("ready\\s+#"),
+            ),
+            (Completion::Quiet, CommandCaptureCompletionKind::Quiet, None),
+            (
+                Completion::Signal("ctrl_c".into()),
+                CommandCaptureCompletionKind::Signal,
+                Some("ctrl_c"),
+            ),
+            (
+                Completion::RunAborted {
+                    run_id,
+                    reason: "takeover".into(),
+                },
+                CommandCaptureCompletionKind::RunAborted,
+                Some("takeover"),
+            ),
+            (
+                Completion::Timeout,
+                CommandCaptureCompletionKind::Timeout,
+                None,
+            ),
+            (
+                Completion::Disconnected("closed".into()),
+                CommandCaptureCompletionKind::Disconnected,
+                Some("closed"),
+            ),
+        ];
+        for (completion, expected_kind, expected_detail) in cases {
+            let (kind, detail) = command_capture_completion(&completion);
+            assert_eq!(kind, expected_kind);
+            assert_eq!(detail.as_deref(), expected_detail);
+        }
+        for (label, expected) in [
+            ("high", CommandCaptureConfidence::High),
+            ("medium", CommandCaptureConfidence::Medium),
+            ("low", CommandCaptureConfidence::Low),
+            ("partial", CommandCaptureConfidence::Partial),
+            ("interfered", CommandCaptureConfidence::Interfered),
+            ("incomplete", CommandCaptureConfidence::Incomplete),
+            ("unreliable", CommandCaptureConfidence::Unreliable),
+        ] {
+            assert_eq!(command_capture_confidence(label), expected);
+        }
+    }
+
+    #[test]
+    fn command_capture_bounds_internal_reasons_but_never_truncates_legal_matchers() {
+        let legal_matcher = format!(
+            "{}\n\u{0000}",
+            "x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES - 2)
+        );
+        assert_eq!(legal_matcher.len(), MAX_COMMAND_CAPTURE_DETAIL_BYTES);
+        for completion in [
+            Completion::Pattern(legal_matcher.clone()),
+            Completion::Prompt(legal_matcher.clone()),
+            Completion::Regex(legal_matcher.clone()),
+        ] {
+            let (_, detail) = command_capture_completion(&completion);
+            assert_eq!(detail.as_deref(), Some(legal_matcher.as_str()));
+        }
+
+        let oversized_reason =
+            format!("{}界tail", "r".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES - 1));
+        for completion in [
+            Completion::Disconnected(oversized_reason.clone()),
+            Completion::RunAborted {
+                run_id: Uuid::new_v4(),
+                reason: oversized_reason.clone(),
+            },
+        ] {
+            let (_, detail) = command_capture_completion(&completion);
+            let detail = detail.expect("internal completion has a bounded detail");
+            assert!(detail.len() <= MAX_COMMAND_CAPTURE_DETAIL_BYTES);
+            assert!(oversized_reason.starts_with(&detail));
+            assert!(detail.is_char_boundary(detail.len()));
+        }
+    }
+
+    #[test]
+    fn human_command_gate_requires_exact_live_tx_and_only_read_can_acknowledge() {
+        let epoch = Uuid::new_v4();
+        let human_seq = 41;
+        let human_tx = serial_protocol::TimelineEvent {
+            port: "COM4".into(),
+            daemon_epoch: epoch,
+            seq: human_seq,
+            generation: 1,
+            wall_time_ns: 1,
+            monotonic_time_ns: 1,
+            kind: EventKind::Tx,
+            direction: Direction::Tx,
+            actor: Some(Actor {
+                id: "human:test".into(),
+                label: "human".into(),
+                kind: ActorKind::Human,
+            }),
+            run_id: Some(Uuid::new_v4()),
+            operation_id: Some(Uuid::new_v4()),
+            stream_offset_start: Some(0),
+            stream_offset_end: Some(1),
+            data: vec![b'\n'],
+            metadata: BTreeMap::from([("human_command".into(), json!(true))]),
+            durable: true,
+        };
+        let response = EventQueryResponse {
+            events: vec![human_tx.clone()],
+            next_cursor: Some(Cursor {
+                epoch,
+                after_seq: human_seq,
+            }),
+            truncated: false,
+            first_available_seq: Some(1),
+            gaps: Vec::new(),
+        };
+        assert!(live_read_covers_human_tx(&response, epoch, human_seq));
+        assert!(!live_read_covers_human_tx(&response, epoch, human_seq + 1));
+        let mut not_human = response.clone();
+        not_human.events[0].metadata.clear();
+        assert!(!live_read_covers_human_tx(&not_human, epoch, human_seq));
+
+        assert!(tool_observes_serial_context(
+            "read",
+            &json!({"scope":"tail","user_command_acknowledged":true})
+        ));
+        assert!(!tool_observes_serial_context(
+            "read",
+            &json!({"scope":"tail","user_command_acknowledged":false})
+        ));
+        assert!(!tool_observes_serial_context(
+            "read",
+            &json!({"scope":"archive"})
+        ));
+        assert!(!tool_observes_serial_context(
+            "wait",
+            &json!({"scope":"tail"})
+        ));
+
+        let mut gated = slot(None, None);
+        gated.daemon_epoch = epoch;
+        gated.head_seq = human_seq + 500;
+        gated.run_context = Some(serial_protocol::RunContextState {
+            run_id: Uuid::new_v4(),
+            revision: 4,
+            last_human_command_seq: Some(human_seq),
+            acknowledged_revision: 3,
+            acknowledged_through_seq: Some(human_seq.saturating_sub(1)),
+        });
+        assert_eq!(
+            pending_human_read_cursor(&gated),
+            Some(Cursor {
+                epoch,
+                after_seq: human_seq - 1,
+            }),
+            "a wait cursor beyond the Human TX must not make the next live read start too late"
+        );
+
+        gated
+            .run_context
+            .as_mut()
+            .expect("Run context")
+            .acknowledged_revision = 4;
+        assert_eq!(pending_human_read_cursor(&gated), None);
+
+        let mut evicted_window = response;
+        evicted_window.events = vec![human_tx];
+        evicted_window.events[0].seq = human_seq + 400;
+        evicted_window.next_cursor = Some(Cursor {
+            epoch,
+            after_seq: human_seq + 500,
+        });
+        assert!(
+            !live_read_covers_human_tx(&evicted_window, epoch, human_seq),
+            "a newer tail after ring eviction must never masquerade as the exact Human TX"
+        );
+    }
+
+    #[test]
+    fn user_read_required_has_stable_structured_tool_error() {
+        let error: anyhow::Error = UserCommandUsed {
+            message: "seriald UserReadRequired".into(),
+        }
+        .into();
+        let structured = structured_tool_error(&error).unwrap();
+        assert_eq!(structured["error"]["code"], "user_command_used");
+        assert_eq!(structured["error"]["no_bytes_written"], true);
+        assert!(
+            structured["error"]["retry_hint"]
+                .as_str()
+                .unwrap()
+                .contains("archive reads do not clear")
+        );
+    }
+
+    #[test]
+    fn uncertain_physical_write_has_non_retryable_structured_tool_error() {
+        let error: anyhow::Error = WriteOutcomeUncertain {
+            message: "write may have reached the DUT".into(),
+        }
+        .into();
+        let structured = structured_tool_error(&error).unwrap();
+        assert_eq!(structured["error"]["source"], "seriald");
+        assert_eq!(structured["error"]["code"], "write_outcome_uncertain");
+        assert_eq!(structured["error"]["outcome"], "uncertain");
+        assert_eq!(structured["error"]["no_bytes_written"], false);
+        assert_eq!(structured["error"]["retryable"], false);
+        assert_eq!(structured["error"]["automatic_retry_allowed"], false);
+        assert!(
+            structured["error"]["retry_hint"]
+                .as_str()
+                .unwrap()
+                .starts_with("Do not retry automatically")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3439,8 +3981,8 @@ fn compile_regex(value: &str, field: &str) -> Result<regex::Regex> {
     if value.is_empty() {
         bail!("{field} must not be empty");
     }
-    if value.len() > MAX_REGEX_BYTES {
-        bail!("{field} must not exceed {MAX_REGEX_BYTES} UTF-8 bytes");
+    if value.len() > MAX_COMMAND_CAPTURE_DETAIL_BYTES {
+        bail!("{field} must not exceed {MAX_COMMAND_CAPTURE_DETAIL_BYTES} UTF-8 bytes");
     }
     regex::Regex::new(value).with_context(|| format!("{field} is not a valid regex"))
 }
@@ -3693,6 +4235,26 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
             "owner": actor_summary(&run.owner)
         })
     });
+    let pending_run_start = slot.pending_run_start.as_ref().map(|approval| {
+        json!({
+            "id": approval.id,
+            "label": approval.label,
+            "requester": actor_summary(&approval.requester),
+            "required_approver": actor_summary(&approval.required_approver),
+            "requested_wall_time_ns": approval.requested_wall_time_ns,
+            "expires_wall_time_ns": approval.expires_wall_time_ns,
+        })
+    });
+    let run_context = slot.run_context.as_ref().map(|context| {
+        json!({
+            "run_id": context.run_id,
+            "revision": context.revision,
+            "last_human_command_seq": context.last_human_command_seq,
+            "acknowledged_revision": context.acknowledged_revision,
+            "acknowledged_through_seq": context.acknowledged_through_seq,
+            "user_read_required": context.revision > context.acknowledged_revision,
+        })
+    });
     let active_trigger = slot.active_trigger.as_ref().map(|trigger| {
         json!({
             "id": trigger.id,
@@ -3722,7 +4284,9 @@ fn slot_summary(slot: &SlotSnapshot) -> Value {
         "cursor": {"epoch": slot.daemon_epoch, "after_seq": slot.head_seq},
         "generation": slot.generation,
         "control": control,
+        "pending_run_start": pending_run_start,
         "active_run": active_run,
+        "run_context": run_context,
         "active_trigger": active_trigger,
         "logging": slot.logging,
         "rx_overflow_bytes": slot.rx_overflow_bytes,
@@ -3839,12 +4403,6 @@ struct CommandSequenceStepArgs {
     expect: Option<String>,
     regex: Option<String>,
     timeout_seconds: Option<u64>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InputArgs {
-    run_handle: String,
-    text: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -5,16 +5,18 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde_json::{Value, json};
 use serial_protocol::{
-    Actor, ActorKind, CommandCaptureMatcher, CommandResult, CommandSequenceAuditContext,
-    ControlMode, Cursor, DataBits, Direction, ErrorCode, EventKind, FlowControl, LoggingState,
-    MAX_BREAK_DURATION_MS, MAX_COMMAND_DESCRIPTION_BYTES, MAX_PHYSICAL_WRITE_TIMEOUT_MS,
-    MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES, MAX_TRIGGER_INITIAL_WRITE_BYTES,
-    MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES, MAX_TRIGGER_PATTERNS,
-    MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelProfile, Parity, RunInfo, RunStatus,
-    SequenceWritePrecondition, SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits,
-    TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerSpec, TriggerStatus,
-    WritePacing, apply_transport_profile, resolve_model_settings, resolve_transport_settings,
+    Actor, ActorKind, CommandCaptureCompleted, CommandCaptureMatcher, CommandCaptureReport,
+    CommandResult, CommandSequenceAuditContext, ControlMode, Cursor, DataBits, Direction,
+    ErrorCode, EventKind, FlowControl, HumanCommandMode, LoggingState, MAX_BREAK_DURATION_MS,
+    MAX_COMMAND_CAPTURE_DETAIL_BYTES, MAX_COMMAND_CAPTURE_MATCHERS, MAX_COMMAND_DESCRIPTION_BYTES,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
+    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
+    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
+    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, ModelProfile, Parity, PendingRunStartApproval,
+    RunContextState, RunInfo, RunStartDecision, RunStatus, SequenceWritePrecondition,
+    SerialSettings, SessionState, SlotConfig, SlotSnapshot, StopBits, TargetActivity,
+    TimelineEvent, TransportProfile, TriggerInfo, TriggerSpec, TriggerStatus, WritePacing,
+    apply_transport_profile, resolve_model_settings, resolve_transport_settings,
 };
 #[cfg(windows)]
 use serialport::COMPort;
@@ -114,6 +116,13 @@ pub enum SlotError {
         operation_id: Option<Uuid>,
         message: String,
     },
+    #[error(
+        "physical action outcome is uncertain (operation={operation_id:?}): {message}; inspect the timeline/device state and do not automatically retry"
+    )]
+    WriteOutcomeUncertain {
+        operation_id: Option<Uuid>,
+        message: String,
+    },
     #[error("{0}")]
     Control(#[from] ControlError),
     #[error("an active Run already exists")]
@@ -122,6 +131,28 @@ pub enum SlotError {
     NoActiveRun,
     #[error("the Run id does not match the active Run")]
     RunMismatch,
+    #[error("only an Agent may request a Run start, and only a Human may decide one")]
+    RunStartActorKind,
+    #[error("Run-start approval {approval_id} was not found")]
+    RunStartApprovalNotFound { approval_id: Uuid },
+    #[error("only the exact Human control holder named by this approval may decide it")]
+    RunStartApprovalNotApprover,
+    #[error("another Run-start approval is already pending")]
+    RunStartApprovalPending,
+    #[error("serial generation does not match the current session")]
+    GenerationMismatch,
+    #[error(
+        "a Human used command input during Run {run_id}; read timeline through sequence {last_human_command_seq} and acknowledge context revision {revision} before the next physical action (no bytes were written)"
+    )]
+    UserReadRequired {
+        run_id: Uuid,
+        revision: u64,
+        last_human_command_seq: u64,
+    },
+    #[error("Run context acknowledgement does not cover the latest Human command")]
+    RunContextNotCovered,
+    #[error("command capture evidence is invalid: {reason}")]
+    InvalidCommandCapture { reason: String },
     #[error(
         "serial write expected active Run {expected_run_id}, but no Run is active (no bytes were written)"
     )]
@@ -179,8 +210,6 @@ pub enum SlotError {
         "the port has reached its bounded write idempotency history for this daemon epoch; restart seriald before accepting more writes"
     )]
     WriteIdempotencyCapacity,
-    #[error("the write-control wait queue is full; retry after another waiter leaves")]
-    ControlQueueFull,
     #[error(
         "label must be non-empty, trimmed, at most {MAX_LABEL_BYTES} bytes, and contain no control characters"
     )]
@@ -350,7 +379,9 @@ impl SlotHandle {
                 last_rx_instant: None,
                 logging: LoggingState::Healthy,
                 control: ControlState::new(daemon_epoch, 0, control_limits),
+                pending_run_start: None,
                 active_run: None,
+                run_context: None,
                 port: None,
                 port_events: None,
                 active_trigger: None,
@@ -439,6 +470,57 @@ impl SlotHandle {
         .await
     }
 
+    pub async fn request_run_start(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        label: String,
+        metadata: BTreeMap<String, Value>,
+        ttl_ms: u64,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::RequestRunStart {
+            request_id,
+            actor,
+            label,
+            metadata,
+            ttl_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn decide_run_start(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        approval_id: Uuid,
+        decision: RunStartDecision,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::DecideRunStart {
+            request_id,
+            actor,
+            approval_id,
+            decision,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn cancel_run_start(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        approval_id: Uuid,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::CancelRunStart {
+            request_id,
+            actor,
+            approval_id,
+            reply,
+        })
+        .await
+    }
+
     pub async fn renew_control(
         &self,
         request_id: Uuid,
@@ -475,9 +557,8 @@ impl SlotHandle {
         .await
     }
 
-    /// Cancels a queued acquire request. `control_id` is part of the wire
-    /// contract for forward compatibility; the actor matches the queued
-    /// waiter by actor identity because waiters hold no lease yet.
+    /// Legacy v6 compatibility endpoint. Generic acquire queueing is disabled
+    /// in v7, so this always reports `removed: false` and never changes state.
     pub async fn cancel_acquire(
         &self,
         request_id: Uuid,
@@ -489,6 +570,32 @@ impl SlotHandle {
             actor,
             control_id,
             reply,
+        })
+        .await
+    }
+
+    pub async fn send_human_command(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        expected_generation: u64,
+        data: Vec<u8>,
+        operation_id: Option<Uuid>,
+        description: Option<String>,
+    ) -> Result<CommandResult, SlotError> {
+        if data.len() > MAX_WRITE_BYTES {
+            return Err(SlotError::WriteTooLarge);
+        }
+        self.physical_request(operation_id, "the Human command", |reply| {
+            SlotCommand::SendHumanCommand {
+                request_id,
+                actor,
+                expected_generation,
+                data,
+                operation_id,
+                description,
+                reply,
+            }
         })
         .await
     }
@@ -513,21 +620,23 @@ impl SlotHandle {
         if data.len() > MAX_WRITE_BYTES {
             return Err(SlotError::WriteTooLarge);
         }
-        self.request(|reply| SlotCommand::Write {
-            request_id,
-            actor,
-            control_id,
-            fence,
-            data,
-            operation_id,
-            expected_run_id,
-            pacing,
-            description,
-            command_capture_matchers,
-            command_sequence,
-            sequence_precondition,
-            cooperative,
-            reply,
+        self.physical_request(operation_id, "the serial write", |reply| {
+            SlotCommand::Write {
+                request_id,
+                actor,
+                control_id,
+                fence,
+                data,
+                operation_id,
+                expected_run_id,
+                pacing,
+                description,
+                command_capture_matchers,
+                command_sequence,
+                sequence_precondition,
+                cooperative,
+                reply,
+            }
         })
         .await
     }
@@ -544,16 +653,18 @@ impl SlotHandle {
         expected_run_id: Option<Uuid>,
         sequence_precondition: Option<SequenceWritePrecondition>,
     ) -> Result<CommandResult, SlotError> {
-        self.request(|reply| SlotCommand::SendBreak {
-            request_id,
-            actor,
-            control_id,
-            fence,
-            duration_ms,
-            operation_id,
-            expected_run_id,
-            sequence_precondition,
-            reply,
+        self.physical_request(operation_id, "the BREAK signal", |reply| {
+            SlotCommand::SendBreak {
+                request_id,
+                actor,
+                control_id,
+                fence,
+                duration_ms,
+                operation_id,
+                expected_run_id,
+                sequence_precondition,
+                reply,
+            }
         })
         .await
     }
@@ -572,18 +683,20 @@ impl SlotHandle {
         sequence_precondition: Option<SequenceWritePrecondition>,
         spec: TriggerSpec,
     ) -> Result<CommandResult, SlotError> {
-        self.request(|reply| SlotCommand::StartTrigger {
-            request_id,
-            actor,
-            control_id,
-            fence,
-            daemon_epoch,
-            generation,
-            operation_id,
-            expected_run_id,
-            sequence_precondition,
-            spec,
-            reply,
+        self.physical_request(operation_id, "the Trigger start", |reply| {
+            SlotCommand::StartTrigger {
+                request_id,
+                actor,
+                control_id,
+                fence,
+                daemon_epoch,
+                generation,
+                operation_id,
+                expected_run_id,
+                sequence_precondition,
+                spec,
+                reply,
+            }
         })
         .await
     }
@@ -693,6 +806,40 @@ impl SlotHandle {
         .await
     }
 
+    pub async fn acknowledge_run_context(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::AcknowledgeRunContext {
+            request_id,
+            actor,
+            run_id,
+            revision,
+            through_seq,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn record_command_capture(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        report: CommandCaptureReport,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(|reply| SlotCommand::RecordCommandCapture {
+            request_id,
+            actor,
+            report: Box::new(report),
+            reply,
+        })
+        .await
+    }
+
     pub async fn disconnect_actor(&self, actor_id: String) {
         let _ = self
             .commands
@@ -793,6 +940,33 @@ impl SlotHandle {
             .map_err(|_| SlotError::Closed)?;
         result.await.map_err(|_| SlotError::ReplyDropped)?
     }
+
+    async fn physical_request(
+        &self,
+        operation_id: Option<Uuid>,
+        action: &'static str,
+        make: impl FnOnce(oneshot::Sender<Result<CommandResult, SlotError>>) -> SlotCommand,
+    ) -> Result<CommandResult, SlotError> {
+        self.request(make)
+            .await
+            .map_err(|error| map_physical_request_error(error, operation_id, action))
+    }
+}
+
+fn map_physical_request_error(
+    error: SlotError,
+    operation_id: Option<Uuid>,
+    action: &'static str,
+) -> SlotError {
+    match error {
+        SlotError::ReplyDropped => SlotError::WriteOutcomeUncertain {
+            operation_id,
+            message: format!(
+                "the Slot stopped before confirming {action}; the physical action may have occurred"
+            ),
+        },
+        other => other,
+    }
 }
 
 enum SlotCommand {
@@ -801,6 +975,27 @@ enum SlotCommand {
         actor: Actor,
         mode: ControlMode,
         ttl_ms: u64,
+        reply: Reply,
+    },
+    RequestRunStart {
+        request_id: Uuid,
+        actor: Actor,
+        label: String,
+        metadata: BTreeMap<String, Value>,
+        ttl_ms: u64,
+        reply: Reply,
+    },
+    DecideRunStart {
+        request_id: Uuid,
+        actor: Actor,
+        approval_id: Uuid,
+        decision: RunStartDecision,
+        reply: Reply,
+    },
+    CancelRunStart {
+        request_id: Uuid,
+        actor: Actor,
+        approval_id: Uuid,
         reply: Reply,
     },
     Renew {
@@ -822,6 +1017,15 @@ enum SlotCommand {
         request_id: Uuid,
         actor: Actor,
         control_id: Uuid,
+        reply: Reply,
+    },
+    SendHumanCommand {
+        request_id: Uuid,
+        actor: Actor,
+        expected_generation: u64,
+        data: Vec<u8>,
+        operation_id: Option<Uuid>,
+        description: Option<String>,
         reply: Reply,
     },
     Write {
@@ -905,6 +1109,20 @@ enum SlotCommand {
         control_id: Uuid,
         fence: u64,
         label: String,
+        reply: Reply,
+    },
+    AcknowledgeRunContext {
+        request_id: Uuid,
+        actor: Actor,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+        reply: Reply,
+    },
+    RecordCommandCapture {
+        request_id: Uuid,
+        actor: Actor,
+        report: Box<CommandCaptureReport>,
         reply: Reply,
     },
     DisconnectActor {
@@ -1016,7 +1234,8 @@ impl std::fmt::Display for PortBreakFailure {
     }
 }
 
-fn classify_break_failure(phase: &str, error: impl std::fmt::Display) -> PortBreakFailure {
+fn classify_break_assert_failure(error: impl std::fmt::Display) -> PortBreakFailure {
+    let phase = "failed to assert BREAK";
     let message = format!("{phase}: {error}");
     let normalized = message.to_ascii_lowercase();
     if normalized.contains("not supported")
@@ -1027,6 +1246,30 @@ fn classify_break_failure(phase: &str, error: impl std::fmt::Display) -> PortBre
     } else {
         PortBreakFailure::Failed(message)
     }
+}
+
+fn finish_break_after_assert(
+    cancelled: bool,
+    clear_result: Result<(), String>,
+) -> PortBreakOutcome {
+    // Once BREAK has been asserted, even an "unsupported" clear error is an
+    // uncertain physical state: the line may still be held low. Never
+    // downgrade cleanup failures to BreakUnsupported, because workers must
+    // close the current handle and let the slot reopen the port.
+    let clear_error = clear_result
+        .err()
+        .map(|error| PortBreakFailure::Failed(format!("failed to clear BREAK: {error}")));
+    let error = match (cancelled, clear_error) {
+        (false, None) => None,
+        (false, Some(error)) => Some(error),
+        (true, None) => Some(PortBreakFailure::Failed(
+            "BREAK was cancelled because the port is closing".into(),
+        )),
+        (true, Some(error)) => Some(PortBreakFailure::Failed(format!(
+            "BREAK was cancelled because the port is closing; {error}"
+        ))),
+    };
+    PortBreakOutcome { error, cancelled }
 }
 
 fn break_failure_closes_port(error: Option<&PortBreakFailure>) -> bool {
@@ -1285,6 +1528,12 @@ enum PendingReconfiguration {
     ModelProfile { model_profile: Option<ModelProfile> },
 }
 
+struct PendingRunStartState {
+    approval: PendingRunStartApproval,
+    deadline: Instant,
+    requester_fingerprint: Vec<u8>,
+}
+
 struct SlotActor {
     config: SlotConfig,
     transport_profile: Option<TransportProfile>,
@@ -1310,7 +1559,9 @@ struct SlotActor {
     last_rx_instant: Option<Instant>,
     logging: LoggingState,
     control: ControlState,
+    pending_run_start: Option<PendingRunStartState>,
     active_run: Option<RunInfo>,
+    run_context: Option<RunContextState>,
     port: Option<PortWorker>,
     port_events: Option<mpsc::Receiver<PortEvent>>,
     active_trigger: Option<ActiveTrigger>,
@@ -1405,6 +1656,7 @@ impl SlotActor {
 
     async fn maintain(&mut self) {
         self.expire_control().await;
+        self.expire_pending_run_start().await;
 
         if self.target_activity == TargetActivity::Active
             && self
@@ -1446,10 +1698,12 @@ impl SlotActor {
             Ok(stream) => {
                 self.endpoint_present = true;
                 self.generation = self.generation.saturating_add(1);
-                if let Some(released) =
+                let released =
                     self.control
-                        .change_generation(self.generation, wall_time_ns(), Instant::now())
-                {
+                        .change_generation(self.generation, wall_time_ns(), Instant::now());
+                self.cancel_pending_run_start("serial_generation_changed")
+                    .await;
+                if let Some(released) = released {
                     self.abort_run(
                         "serial generation changed",
                         Some(released.released.owner.clone()),
@@ -1598,10 +1852,12 @@ impl SlotActor {
         self.state_reason = Some(reason.clone());
         self.state_code = Some(ErrorCode::PortIo);
         self.target_activity = TargetActivity::Unknown;
-        if let Some(released) =
+        let released =
             self.control
-                .change_generation(self.generation, wall_time_ns(), Instant::now())
-        {
+                .change_generation(self.generation, wall_time_ns(), Instant::now());
+        self.cancel_pending_run_start("serial_port_disconnected")
+            .await;
+        if let Some(released) = released {
             self.abort_run(
                 "serial port disconnected",
                 Some(released.released.owner.clone()),
@@ -1640,10 +1896,11 @@ impl SlotActor {
                     self.request_trigger_stop(TriggerStatus::ControlLost, None)
                         .await;
                 }
-                if let Some(released) =
-                    self.control
-                        .disconnect(&actor_id, wall_time_ns(), Instant::now())
-                {
+                let released = self
+                    .control
+                    .disconnect(&actor_id, wall_time_ns(), Instant::now());
+                self.cancel_pending_for_disconnect(&actor_id).await;
+                if let Some(released) = released {
                     self.abort_run(
                         "controlling client disconnected",
                         Some(released.released.owner.clone()),
@@ -1708,14 +1965,19 @@ impl SlotActor {
             return false;
         }
 
+        self.expire_pending_run_start().await;
+
         if let Some(fingerprint) = request.write_fingerprint() {
             // Expire/promote first so cache hits are authorized against the
             // current lease, not against the actor or fence from the original
             // connection.
             self.expire_control().await;
-            if let Err(error) =
-                request.validate_write_authorization(&self.control, self.active_run.as_ref())
-            {
+            if let Err(error) = request.validate_write_authorization(
+                &self.control,
+                self.active_run.as_ref(),
+                self.run_context.as_ref(),
+                self.generation,
+            ) {
                 let _ = reply.send(Err(error));
                 return false;
             }
@@ -1782,6 +2044,12 @@ impl SlotActor {
                 if self.port.is_none() {
                     return Err(SlotError::PortOffline);
                 }
+                if actor.kind == ActorKind::Agent {
+                    return Err(SlotError::RunStartActorKind);
+                }
+                if mode == ControlMode::Takeover && actor.kind != ActorKind::Human {
+                    return Err(ControlError::NotOwner.into());
+                }
                 match self.control.acquire(
                     actor.clone(),
                     mode,
@@ -1796,11 +2064,10 @@ impl SlotActor {
                     AcquireOutcome::AlreadyHeld(lease) => {
                         Ok(CommandResult::ControlGranted { lease })
                     }
-                    AcquireOutcome::Queued { position } => {
-                        Ok(CommandResult::ControlQueued { position })
-                    }
-                    AcquireOutcome::QueueFull => Err(SlotError::ControlQueueFull),
+                    AcquireOutcome::Busy(_) => Err(ControlError::Busy.into()),
                     AcquireOutcome::TakenOver { revoked, granted } => {
+                        self.cancel_pending_run_start("Human control holder changed")
+                            .await;
                         if self
                             .active_trigger
                             .as_ref()
@@ -1827,6 +2094,279 @@ impl SlotActor {
                         Ok(CommandResult::ControlGranted { lease: granted })
                     }
                 }
+            }
+            SlotRequest::RequestRunStart {
+                actor,
+                request_id,
+                label,
+                metadata: run_metadata,
+                ttl_ms,
+            } => {
+                if actor.kind != ActorKind::Agent {
+                    return Err(SlotError::RunStartActorKind);
+                }
+                if self.port.is_none() {
+                    return Err(SlotError::PortOffline);
+                }
+                if self.active_trigger.is_some() {
+                    return Err(SlotError::TriggerActive);
+                }
+                if self.active_run.is_some() {
+                    return Err(SlotError::RunAlreadyActive);
+                }
+                if let Some(pending) = self.pending_run_start.as_ref() {
+                    if pending.approval.id == request_id
+                        && pending.approval.requester.id == actor.id
+                    {
+                        let fingerprint = serde_json::to_vec(&(
+                            "request_run_start",
+                            &actor.id,
+                            &label,
+                            &run_metadata,
+                            ttl_ms,
+                        ))
+                        .expect("Run-start fields are serializable");
+                        if fingerprint != pending.requester_fingerprint {
+                            return Err(SlotError::RequestIdReused);
+                        }
+                        return Ok(CommandResult::RunStartPending {
+                            approval: Box::new(pending.approval.clone()),
+                        });
+                    }
+                    return Err(SlotError::RunStartApprovalPending);
+                }
+                let now = Instant::now();
+                let wall_now = wall_time_ns();
+                match self.control.current().cloned() {
+                    None => {
+                        let lease =
+                            self.control
+                                .grant_if_idle(actor.clone(), ttl_ms, wall_now, now)?;
+                        let run = self.install_run(actor.clone(), label, run_metadata, 1);
+                        self.emit_control_granted(&lease).await;
+                        self.emit_run_started(actor.clone(), &run).await;
+                        let approval = PendingRunStartApproval {
+                            id: request_id,
+                            port: self.config.port.clone(),
+                            requester: actor.clone(),
+                            required_approver: system_actor(),
+                            label: run.label.clone(),
+                            metadata: run.metadata.clone(),
+                            control_ttl_ms: ttl_ms,
+                            daemon_epoch: self.daemon_epoch,
+                            generation: self.generation,
+                            expected_control_id: lease.id,
+                            expected_fence: lease.fence,
+                            requested_wall_time_ns: wall_now,
+                            expires_wall_time_ns: wall_now,
+                        };
+                        self.emit(
+                            EventKind::RunStartApproved,
+                            Direction::None,
+                            Vec::new(),
+                            Some(actor),
+                            None,
+                            metadata([
+                                ("approval_id", json!(request_id)),
+                                (
+                                    "approval",
+                                    serde_json::to_value(&approval).unwrap_or(Value::Null),
+                                ),
+                                ("run", serde_json::to_value(&run).unwrap_or(Value::Null)),
+                            ]),
+                        )
+                        .await;
+                        Ok(CommandResult::RunStartGranted {
+                            approval_id: request_id,
+                            lease,
+                            run,
+                        })
+                    }
+                    Some(current) if current.owner.kind == ActorKind::Human => {
+                        let timeout = self.control.approval_timeout();
+                        let expires_wall_time_ns = wall_now.saturating_add(
+                            timeout
+                                .as_nanos()
+                                .min(i64::MAX as u128)
+                                .try_into()
+                                .unwrap_or(i64::MAX),
+                        );
+                        let approval = PendingRunStartApproval {
+                            id: request_id,
+                            port: self.config.port.clone(),
+                            requester: actor.clone(),
+                            required_approver: current.owner.clone(),
+                            label,
+                            metadata: run_metadata,
+                            control_ttl_ms: ttl_ms,
+                            daemon_epoch: self.daemon_epoch,
+                            generation: self.generation,
+                            expected_control_id: current.id,
+                            expected_fence: current.fence,
+                            requested_wall_time_ns: wall_now,
+                            expires_wall_time_ns,
+                        };
+                        self.pending_run_start = Some(PendingRunStartState {
+                            approval: approval.clone(),
+                            deadline: now.checked_add(timeout).unwrap_or(now),
+                            requester_fingerprint: serde_json::to_vec(&(
+                                "request_run_start",
+                                &actor.id,
+                                &approval.label,
+                                &approval.metadata,
+                                ttl_ms,
+                            ))
+                            .expect("Run-start fields are serializable"),
+                        });
+                        self.emit(
+                            EventKind::RunStartRequested,
+                            Direction::None,
+                            Vec::new(),
+                            Some(actor),
+                            None,
+                            metadata([
+                                ("approval_id", json!(approval.id)),
+                                (
+                                    "approval",
+                                    serde_json::to_value(&approval).unwrap_or(Value::Null),
+                                ),
+                            ]),
+                        )
+                        .await;
+                        Ok(CommandResult::RunStartPending {
+                            approval: Box::new(approval),
+                        })
+                    }
+                    Some(_) => Err(ControlError::Busy.into()),
+                }
+            }
+            SlotRequest::DecideRunStart {
+                actor,
+                approval_id,
+                decision,
+            } => {
+                if actor.kind != ActorKind::Human {
+                    return Err(SlotError::RunStartActorKind);
+                }
+                let pending = self
+                    .pending_run_start
+                    .as_ref()
+                    .ok_or(SlotError::RunStartApprovalNotFound { approval_id })?;
+                if pending.approval.id != approval_id {
+                    return Err(SlotError::RunStartApprovalNotFound { approval_id });
+                }
+                if pending.approval.required_approver.id != actor.id {
+                    return Err(SlotError::RunStartApprovalNotApprover);
+                }
+                let approval = pending.approval.clone();
+                if decision == RunStartDecision::Deny {
+                    self.pending_run_start = None;
+                    let result = CommandResult::RunStartDenied { approval_id };
+                    self.cache_run_start_terminal(&approval, result.clone());
+                    self.emit_run_start_terminal(
+                        EventKind::RunStartDenied,
+                        &approval,
+                        Some(actor),
+                        None,
+                    )
+                    .await;
+                    return Ok(result);
+                }
+                if self.port.is_none() {
+                    self.cancel_pending_run_start("port_offline").await;
+                    return Err(SlotError::PortOffline);
+                }
+                if approval.daemon_epoch != self.daemon_epoch
+                    || approval.generation != self.generation
+                {
+                    self.cancel_pending_run_start("generation_changed").await;
+                    return Err(SlotError::GenerationMismatch);
+                }
+                if self.active_trigger.is_some() {
+                    self.cancel_pending_run_start("trigger_active").await;
+                    return Err(SlotError::TriggerActive);
+                }
+                if self.active_run.is_some() {
+                    self.cancel_pending_run_start("run_active").await;
+                    return Err(SlotError::RunAlreadyActive);
+                }
+                let transfer = self.control.transfer_exact(
+                    &approval.required_approver.id,
+                    approval.expected_control_id,
+                    approval.expected_fence,
+                    approval.requester.clone(),
+                    approval.control_ttl_ms,
+                    wall_time_ns(),
+                    Instant::now(),
+                );
+                let (revoked, lease) = match transfer {
+                    Ok(transfer) => transfer,
+                    Err(error) => {
+                        self.cancel_pending_run_start("approval fence became stale")
+                            .await;
+                        return Err(error.into());
+                    }
+                };
+                self.pending_run_start = None;
+                let run = self.install_run(
+                    approval.requester.clone(),
+                    approval.label.clone(),
+                    approval.metadata.clone(),
+                    2,
+                );
+                self.emit(
+                    EventKind::ControlRevoked,
+                    Direction::None,
+                    Vec::new(),
+                    Some(actor.clone()),
+                    None,
+                    metadata([(
+                        "lease",
+                        serde_json::to_value(&revoked).unwrap_or(Value::Null),
+                    )]),
+                )
+                .await;
+                self.emit_control_granted(&lease).await;
+                self.emit_run_started(approval.requester.clone(), &run)
+                    .await;
+                let result = CommandResult::RunStartGranted {
+                    approval_id,
+                    lease,
+                    run: run.clone(),
+                };
+                self.cache_run_start_terminal(&approval, result.clone());
+                self.emit_run_start_terminal(
+                    EventKind::RunStartApproved,
+                    &approval,
+                    Some(actor),
+                    Some(&run),
+                )
+                .await;
+                Ok(result)
+            }
+            SlotRequest::CancelRunStart { actor, approval_id } => {
+                let pending = self
+                    .pending_run_start
+                    .as_ref()
+                    .ok_or(SlotError::RunStartApprovalNotFound { approval_id })?;
+                if pending.approval.id != approval_id {
+                    return Err(SlotError::RunStartApprovalNotFound { approval_id });
+                }
+                if actor.kind != ActorKind::Agent || pending.approval.requester.id != actor.id {
+                    return Err(SlotError::RunStartActorKind);
+                }
+                let approval = pending.approval.clone();
+                self.pending_run_start = None;
+                let result = CommandResult::RunStartCancelled { approval_id };
+                self.cache_run_start_terminal(&approval, result.clone());
+                self.emit_run_start_terminal(
+                    EventKind::RunStartCancelled,
+                    &approval,
+                    Some(actor),
+                    None,
+                )
+                .await;
+                Ok(result)
             }
             SlotRequest::Renew {
                 actor,
@@ -1859,6 +2399,8 @@ impl SlotActor {
                     wall_time_ns(),
                     Instant::now(),
                 )?;
+                self.cancel_pending_run_start("Human control holder released control")
+                    .await;
                 self.request_trigger_stop(TriggerStatus::ControlLost, None)
                     .await;
                 self.abort_run("control released", Some(actor)).await;
@@ -1866,11 +2408,159 @@ impl SlotActor {
                     .await;
                 Ok(CommandResult::ControlReleased)
             }
-            // The wire `control_id` is ignored: a queued waiter holds no lease
-            // yet, so the request is matched by actor identity.
+            // Generic acquire queueing is disabled in v7; retain the RPC as a
+            // harmless compatibility no-op.
             SlotRequest::CancelAcquire { actor, .. } => Ok(CommandResult::AcquireCancelled {
                 removed: self.control.cancel(&actor.id),
             }),
+            SlotRequest::SendHumanCommand {
+                actor,
+                expected_generation,
+                data,
+                operation_id,
+                description,
+            } => {
+                if actor.kind != ActorKind::Human {
+                    return Err(ControlError::NotOwner.into());
+                }
+                if expected_generation != self.generation {
+                    return Err(SlotError::GenerationMismatch);
+                }
+                if self.port.is_none() {
+                    return Err(SlotError::PortOffline);
+                }
+                if data.is_empty() {
+                    return Err(SlotError::EmptyWrite);
+                }
+                let current = self.control.current().cloned();
+                let (mode, owned_lease, interfered_run_id) = match current {
+                    None => {
+                        let lease = self.control.grant_if_idle(
+                            actor.clone(),
+                            60_000,
+                            wall_time_ns(),
+                            Instant::now(),
+                        )?;
+                        self.emit_control_granted(&lease).await;
+                        (HumanCommandMode::Owned, Some(lease), None)
+                    }
+                    Some(lease) if lease.owner.id == actor.id => {
+                        self.control.current_remaining_ttl(Instant::now())?;
+                        (HumanCommandMode::Owned, Some(lease), None)
+                    }
+                    Some(lease) if lease.owner.kind == ActorKind::Agent => {
+                        let run = self.active_run.as_ref().ok_or(ControlError::Busy)?;
+                        if run.owner.id != lease.owner.id || run.status != RunStatus::Active {
+                            return Err(ControlError::Busy.into());
+                        }
+                        self.control.current_remaining_ttl(Instant::now())?;
+                        (HumanCommandMode::Cooperative, None, Some(run.id))
+                    }
+                    Some(_) => return Err(ControlError::Busy.into()),
+                };
+
+                if self.active_trigger.is_some() {
+                    if mode == HumanCommandMode::Cooperative {
+                        self.quiesce_trigger_for_human_command().await;
+                    } else {
+                        return Err(SlotError::TriggerActive);
+                    }
+                }
+                let total = data.len();
+                let effective_settings = self.effective_serial_settings();
+                let pacing = WritePacing::resolve(None, &effective_settings);
+                let write_timeout = write_deadline(
+                    total,
+                    pacing.chunk_size as usize,
+                    Duration::from_millis(pacing.chunk_delay_ms),
+                )
+                .map_err(|required_ms| SlotError::WriteDeadlineExceeded {
+                    required_ms,
+                    maximum_ms: duration_millis_saturating(MAX_WRITE_TIMEOUT),
+                })?;
+                let authorization_now = Instant::now();
+                ensure_lease_covers_write(
+                    self.control.current_remaining_ttl(authorization_now)?,
+                    write_timeout,
+                )?;
+                let Some(port) = &self.port else {
+                    return Err(SlotError::PortOffline);
+                };
+                let (reply, result) = oneshot::channel();
+                port.commands
+                    .send(PortCommand::Write {
+                        data: data.clone(),
+                        pacing,
+                        deadline: tokio::time::Instant::from_std(authorization_now + write_timeout),
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| SlotError::PortOffline)?;
+                let outcome = result.await.map_err(|_| SlotError::PartialWrite {
+                    written: 0,
+                    total,
+                    generation: self.generation,
+                    event_seq: None,
+                    operation_id,
+                    message: "serial writer stopped before confirming the Human command outcome; the physical write may have occurred".into(),
+                })?;
+                let (event_seq, context_revision) = if outcome.written > 0 {
+                    let mut event_metadata = write_event_metadata(
+                        outcome.written != total,
+                        mode == HumanCommandMode::Cooperative,
+                        description,
+                        Vec::new(),
+                        None,
+                    );
+                    event_metadata.insert("human_command".into(), json!(true));
+                    let context_revision = if let Some(run_id) = interfered_run_id {
+                        let context = self.run_context.get_or_insert(RunContextState {
+                            run_id,
+                            revision: 0,
+                            last_human_command_seq: None,
+                            acknowledged_revision: 0,
+                            acknowledged_through_seq: None,
+                        });
+                        context.revision = context.revision.saturating_add(1);
+                        context.last_human_command_seq = Some(self.seq.saturating_add(1));
+                        event_metadata.insert("context_revision".into(), json!(context.revision));
+                        event_metadata.insert("interfered_run_id".into(), json!(run_id));
+                        Some(context.revision)
+                    } else {
+                        None
+                    };
+                    let seq = self
+                        .emit(
+                            EventKind::Tx,
+                            Direction::Tx,
+                            data[..outcome.written].to_vec(),
+                            Some(actor),
+                            operation_id,
+                            event_metadata,
+                        )
+                        .await;
+                    (Some(seq), context_revision)
+                } else {
+                    (None, None)
+                };
+                if outcome.written != total || outcome.error.is_some() {
+                    return Err(SlotError::PartialWrite {
+                        written: outcome.written,
+                        total,
+                        generation: self.generation,
+                        event_seq,
+                        operation_id,
+                        message: outcome.error.unwrap_or_else(|| "short serial write".into()),
+                    });
+                }
+                Ok(CommandResult::HumanCommandAccepted {
+                    event_seq: event_seq.expect("full non-empty Human command emits TX"),
+                    mode,
+                    lease: owned_lease,
+                    interfered_run_id,
+                    context_revision,
+                })
+            }
             SlotRequest::Write {
                 actor,
                 control_id,
@@ -1971,11 +2661,22 @@ impl SlotActor {
                         command_sequence,
                     );
                     if cooperative && let Some(run) = self.active_run.as_ref() {
+                        event_metadata.insert("human_command".into(), json!(true));
                         event_metadata.insert("interfered_run_id".into(), json!(run.id));
                         event_metadata.insert(
                             "interfered_run_owner".into(),
                             serde_json::to_value(&run.owner).unwrap_or(Value::Null),
                         );
+                        let context = self.run_context.get_or_insert(RunContextState {
+                            run_id: run.id,
+                            revision: 0,
+                            last_human_command_seq: None,
+                            acknowledged_revision: 0,
+                            acknowledged_through_seq: None,
+                        });
+                        context.revision = context.revision.saturating_add(1);
+                        context.last_human_command_seq = Some(self.seq.saturating_add(1));
+                        event_metadata.insert("context_revision".into(), json!(context.revision));
                     }
                     Some(
                         self.emit(
@@ -2051,9 +2752,11 @@ impl SlotActor {
                     .map_err(|_| SlotError::PortOffline)?;
                 result
                     .await
-                    .map_err(|_| SlotError::BreakFailed {
-                        message: "serial writer stopped before confirming that BREAK was cleared"
-                            .into(),
+                    .map_err(|_| SlotError::WriteOutcomeUncertain {
+                        operation_id,
+                        message:
+                            "serial writer stopped before confirming that BREAK was cleared; the physical signal may have occurred"
+                                .into(),
                     })?
                     .map_err(|error| match error {
                         PortBreakFailure::Unsupported(_) => SlotError::BreakUnsupported,
@@ -2244,6 +2947,9 @@ impl SlotActor {
                 metadata: run_metadata,
                 ..
             } => {
+                if actor.kind == ActorKind::Agent {
+                    return Err(SlotError::RunStartActorKind);
+                }
                 if self.active_trigger.is_some() {
                     return Err(SlotError::TriggerActive);
                 }
@@ -2262,6 +2968,7 @@ impl SlotActor {
                     metadata: run_metadata,
                 };
                 self.active_run = Some(run.clone());
+                self.run_context = None;
                 self.emit(
                     EventKind::RunStarted,
                     Direction::None,
@@ -2289,6 +2996,7 @@ impl SlotActor {
                 self.request_trigger_stop(TriggerStatus::RunLost, None)
                     .await;
                 let mut ended = self.active_run.take().expect("checked above");
+                self.run_context = None;
                 ended.status = RunStatus::Completed;
                 ended.end_seq = Some(self.seq.saturating_add(1));
                 self.emit_with_run(
@@ -2324,6 +3032,322 @@ impl SlotActor {
                     .await;
                 Ok(CommandResult::CheckpointCreated { event_seq: seq })
             }
+            SlotRequest::AcknowledgeRunContext {
+                actor,
+                run_id,
+                revision,
+                through_seq,
+            } => {
+                if actor.kind != ActorKind::Agent {
+                    return Err(ControlError::NotOwner.into());
+                }
+                let run = self.active_run.as_ref().ok_or(SlotError::NoActiveRun)?;
+                if run.id != run_id {
+                    return Err(SlotError::RunMismatch);
+                }
+                if run.owner.id != actor.id {
+                    return Err(ControlError::NotOwner.into());
+                }
+                let lease = self.control.current().ok_or(ControlError::NotOwner)?;
+                if lease.owner.id != actor.id {
+                    return Err(ControlError::NotOwner.into());
+                }
+                self.control.current_remaining_ttl(Instant::now())?;
+                let context = self
+                    .run_context
+                    .as_mut()
+                    .ok_or(SlotError::RunContextNotCovered)?;
+                let latest = context.last_human_command_seq.unwrap_or(0);
+                if context.run_id != run_id
+                    || revision != context.revision
+                    || through_seq < latest
+                    || through_seq > self.seq
+                {
+                    return Err(SlotError::RunContextNotCovered);
+                }
+                context.acknowledged_revision = revision;
+                context.acknowledged_through_seq = Some(through_seq);
+                let context = context.clone();
+                self.publish_snapshot().await;
+                Ok(CommandResult::RunContextAcknowledged { context })
+            }
+            SlotRequest::RecordCommandCapture { actor, report } => {
+                if actor.kind != ActorKind::Agent {
+                    return Err(ControlError::NotOwner.into());
+                }
+                if report.daemon_epoch != self.daemon_epoch {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: "daemon epoch changed".into(),
+                    });
+                }
+                if report.evidence_through_seq > self.seq {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: "evidence cursor is ahead of the timeline".into(),
+                    });
+                }
+                let after_seq = report.evidence_from_seq.saturating_sub(1);
+                let replay = self
+                    .ring
+                    .lock()
+                    .await
+                    .replay(
+                        self.daemon_epoch,
+                        Some(&Cursor {
+                            epoch: self.daemon_epoch,
+                            after_seq,
+                        }),
+                        report.evidence_through_seq,
+                        RING_EVENTS,
+                    )
+                    .map_err(|error| SlotError::InvalidCommandCapture {
+                        reason: error.to_string(),
+                    })?;
+                if let Some(gap) = replay.gap {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: format!("timeline gap: {:?}", gap.reason),
+                    });
+                }
+                if replay
+                    .events
+                    .iter()
+                    .any(|event| event.kind == EventKind::Gap)
+                {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: "evidence crosses a receive gap".into(),
+                    });
+                }
+                if replay
+                    .events
+                    .iter()
+                    .any(|event| event.generation != report.generation)
+                {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: "evidence crosses a serial generation boundary".into(),
+                    });
+                }
+                let tx = replay
+                    .events
+                    .iter()
+                    .find(|event| event.seq == report.tx_event_seq)
+                    .ok_or_else(|| SlotError::InvalidCommandCapture {
+                        reason: "authoritative TX event is no longer available".into(),
+                    })?;
+                if tx.kind != EventKind::Tx
+                    || tx.direction != Direction::Tx
+                    || tx.generation != report.generation
+                    || tx.run_id != Some(report.run_id)
+                    || tx.operation_id != Some(report.operation_id)
+                    || tx.actor.as_ref().is_none_or(|owner| owner.id != actor.id)
+                {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: "TX identity does not match actor, Run, and operation".into(),
+                    });
+                }
+                let rx_stream_offset_start = replay
+                    .events
+                    .iter()
+                    .filter(|event| event.direction == Direction::Rx)
+                    .filter_map(|event| event.stream_offset_start)
+                    .min();
+                let rx_stream_offset_end = replay
+                    .events
+                    .iter()
+                    .filter(|event| event.direction == Direction::Rx)
+                    .filter_map(|event| event.stream_offset_end)
+                    .max();
+                let capture = CommandCaptureCompleted {
+                    daemon_epoch: report.daemon_epoch,
+                    generation: report.generation,
+                    run_id: report.run_id,
+                    operation_id: report.operation_id,
+                    tx_event_seq: report.tx_event_seq,
+                    evidence_from_seq: report.evidence_from_seq,
+                    evidence_through_seq: report.evidence_through_seq,
+                    completion: report.completion,
+                    completion_detail: report.completion_detail.clone(),
+                    confidence: report.confidence,
+                    record_event_seq: self.seq.saturating_add(1),
+                    tx_stream_offset_start: tx.stream_offset_start,
+                    tx_stream_offset_end: tx.stream_offset_end,
+                    rx_stream_offset_start,
+                    rx_stream_offset_end,
+                };
+                self.emit_inner(
+                    EventKind::CommandCaptureCompleted,
+                    Direction::None,
+                    Vec::new(),
+                    Some(actor),
+                    Some(report.operation_id),
+                    Some(report.run_id),
+                    metadata([(
+                        "capture",
+                        serde_json::to_value(&capture).unwrap_or(Value::Null),
+                    )]),
+                )
+                .await;
+                Ok(CommandResult::CommandCaptureRecorded {
+                    capture: Box::new(capture),
+                })
+            }
+        }
+    }
+
+    fn install_run(
+        &mut self,
+        actor: Actor,
+        label: String,
+        run_metadata: BTreeMap<String, Value>,
+        events_before_start: u64,
+    ) -> RunInfo {
+        let run = RunInfo {
+            id: Uuid::new_v4(),
+            owner: actor.clone(),
+            label,
+            status: RunStatus::Active,
+            start_seq: self
+                .seq
+                .saturating_add(events_before_start)
+                .saturating_add(1),
+            end_seq: None,
+            metadata: run_metadata,
+        };
+        self.active_run = Some(run.clone());
+        self.run_context = (actor.kind == ActorKind::Agent).then_some(RunContextState {
+            run_id: run.id,
+            revision: 0,
+            last_human_command_seq: None,
+            acknowledged_revision: 0,
+            acknowledged_through_seq: None,
+        });
+        run
+    }
+
+    async fn emit_run_started(&mut self, actor: Actor, run: &RunInfo) {
+        self.emit_inner(
+            EventKind::RunStarted,
+            Direction::None,
+            Vec::new(),
+            Some(actor),
+            None,
+            Some(run.id),
+            metadata([("run", serde_json::to_value(run).unwrap_or(Value::Null))]),
+        )
+        .await;
+    }
+
+    fn cache_run_start_terminal(
+        &mut self,
+        approval: &PendingRunStartApproval,
+        result: CommandResult,
+    ) {
+        let key = (approval.requester.id.clone(), approval.id);
+        let fingerprint = serde_json::to_vec(&(
+            "request_run_start",
+            &approval.requester.id,
+            &approval.label,
+            &approval.metadata,
+            approval.control_ttl_ms,
+        ))
+        .expect("Run-start fields are serializable");
+        if let Some(cached) = self.request_cache.get_mut(&key) {
+            if cached.fingerprint == fingerprint {
+                cached.result = Ok(result);
+            }
+            return;
+        }
+        self.cache_result(key, fingerprint, Ok(result));
+    }
+
+    async fn emit_run_start_terminal(
+        &mut self,
+        kind: EventKind,
+        approval: &PendingRunStartApproval,
+        actor: Option<Actor>,
+        run: Option<&RunInfo>,
+    ) {
+        let mut values = metadata([
+            ("approval_id", json!(approval.id)),
+            (
+                "approval",
+                serde_json::to_value(approval).unwrap_or(Value::Null),
+            ),
+        ]);
+        if let Some(run) = run {
+            values.insert(
+                "run".into(),
+                serde_json::to_value(run).unwrap_or(Value::Null),
+            );
+        }
+        self.emit_inner(
+            kind,
+            Direction::None,
+            Vec::new(),
+            actor,
+            None,
+            run.map(|run| run.id),
+            values,
+        )
+        .await;
+    }
+
+    async fn expire_pending_run_start(&mut self) {
+        if self
+            .pending_run_start
+            .as_ref()
+            .is_none_or(|pending| Instant::now() < pending.deadline)
+        {
+            return;
+        }
+        let pending = self.pending_run_start.take().expect("deadline was checked");
+        let result = CommandResult::RunStartTimedOut {
+            approval_id: pending.approval.id,
+        };
+        self.cache_run_start_terminal(&pending.approval, result);
+        self.emit_run_start_terminal(
+            EventKind::RunStartTimedOut,
+            &pending.approval,
+            Some(system_actor()),
+            None,
+        )
+        .await;
+    }
+
+    async fn cancel_pending_run_start(&mut self, reason: &str) {
+        let Some(pending) = self.pending_run_start.take() else {
+            return;
+        };
+        let result = CommandResult::RunStartCancelled {
+            approval_id: pending.approval.id,
+        };
+        self.cache_run_start_terminal(&pending.approval, result);
+        let mut values = metadata([
+            ("approval_id", json!(pending.approval.id)),
+            (
+                "approval",
+                serde_json::to_value(&pending.approval).unwrap_or(Value::Null),
+            ),
+            ("reason", json!(reason)),
+        ]);
+        values.insert("cancelled_by".into(), json!("system"));
+        self.emit_inner(
+            EventKind::RunStartCancelled,
+            Direction::None,
+            Vec::new(),
+            Some(system_actor()),
+            None,
+            None,
+            values,
+        )
+        .await;
+    }
+
+    async fn cancel_pending_for_disconnect(&mut self, actor_id: &str) {
+        if self.pending_run_start.as_ref().is_some_and(|pending| {
+            pending.approval.requester.id == actor_id
+                || pending.approval.required_approver.id == actor_id
+        }) {
+            self.cancel_pending_run_start("requester_or_approver_disconnected")
+                .await;
         }
     }
 
@@ -2343,6 +3367,8 @@ impl SlotActor {
         let Some(released) = self.control.expire(wall_time_ns(), Instant::now()) else {
             return;
         };
+        self.cancel_pending_run_start("Human control approval lease expired")
+            .await;
         self.request_trigger_stop(TriggerStatus::ControlLost, None)
             .await;
         self.abort_run(
@@ -2379,8 +3405,10 @@ impl SlotActor {
                 .await;
         }
         let Some(mut run) = self.active_run.take() else {
+            self.run_context = None;
             return;
         };
+        self.run_context = None;
         run.status = RunStatus::Aborted;
         run.end_seq = Some(self.seq.saturating_add(1));
         self.emit_with_run(
@@ -2901,6 +3929,41 @@ impl SlotActor {
         self.finish_stopped_trigger_if_idle().await;
     }
 
+    /// Stops an Agent Trigger and drains its one in-flight physical write
+    /// before a cooperative Human command is enqueued. This preserves the
+    /// authoritative TX/RX event order and guarantees that no scheduled Agent
+    /// action can land after the Human intervention gate is established.
+    async fn quiesce_trigger_for_human_command(&mut self) {
+        self.mark_trigger_stopping(TriggerStatus::Cancelled, None);
+        while self
+            .active_trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.write_in_flight.is_some())
+        {
+            enum DrainEvent {
+                TriggerWrite(Option<TriggerWriteResult>),
+                Port(Option<PortEvent>),
+            }
+            let next = tokio::select! {
+                result = self.trigger_write_result_rx.recv() => DrainEvent::TriggerWrite(result),
+                event = async {
+                    match self.port_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => DrainEvent::Port(event),
+            };
+            match next {
+                DrainEvent::TriggerWrite(Some(result)) => {
+                    self.handle_trigger_write_result(result).await;
+                }
+                DrainEvent::Port(Some(event)) => self.handle_port_event(event).await,
+                DrainEvent::TriggerWrite(None) | DrainEvent::Port(None) => break,
+            }
+        }
+        self.finish_stopped_trigger_if_idle().await;
+    }
+
     async fn finish_stopped_trigger_if_idle(&mut self) {
         let should_finish = self.active_trigger.as_ref().is_some_and(|trigger| {
             trigger.write_in_flight.is_none() && trigger.pending_terminal.is_some()
@@ -3221,7 +4284,12 @@ impl SlotActor {
             tx_offset: self.tx_offset,
             rx_overflow_bytes: self.rx_overflow_bytes,
             control: self.control.current().cloned(),
+            pending_run_start: self
+                .pending_run_start
+                .as_ref()
+                .map(|pending| pending.approval.clone()),
             active_run: self.active_run.clone(),
+            run_context: self.run_context.clone(),
             active_trigger: self
                 .active_trigger
                 .as_ref()
@@ -3263,10 +4331,11 @@ impl SlotActor {
         self.stop_port().await;
         self.settle_trigger_write_after_port_stop().await;
         self.finish_stopped_trigger_if_idle().await;
-        if let Some(released) =
+        let released =
             self.control
-                .change_generation(self.generation, wall_time_ns(), Instant::now())
-        {
+                .change_generation(self.generation, wall_time_ns(), Instant::now());
+        self.cancel_pending_run_start("port_reconfiguration").await;
+        if let Some(released) = released {
             self.abort_run(
                 "port reconfiguration",
                 Some(released.released.owner.clone()),
@@ -3615,10 +4684,11 @@ impl SlotActor {
         self.stop_port().await;
         self.settle_trigger_write_after_port_stop().await;
         self.finish_stopped_trigger_if_idle().await;
-        if let Some(released) =
+        let released =
             self.control
-                .change_generation(self.generation, wall_time_ns(), Instant::now())
-        {
+                .change_generation(self.generation, wall_time_ns(), Instant::now());
+        self.cancel_pending_run_start("daemon_shutdown").await;
+        if let Some(released) = released {
             self.abort_run("port shutdown", Some(released.released.owner.clone()))
                 .await;
             self.emit_release(released, EventKind::ControlRevoked).await;
@@ -3743,6 +4813,22 @@ enum SlotRequest {
         mode: ControlMode,
         ttl_ms: u64,
     },
+    RequestRunStart {
+        actor: Actor,
+        request_id: Uuid,
+        label: String,
+        metadata: BTreeMap<String, Value>,
+        ttl_ms: u64,
+    },
+    DecideRunStart {
+        actor: Actor,
+        approval_id: Uuid,
+        decision: RunStartDecision,
+    },
+    CancelRunStart {
+        actor: Actor,
+        approval_id: Uuid,
+    },
     Renew {
         actor: Actor,
         control_id: Uuid,
@@ -3757,6 +4843,13 @@ enum SlotRequest {
     CancelAcquire {
         actor: Actor,
         control_id: Uuid,
+    },
+    SendHumanCommand {
+        actor: Actor,
+        expected_generation: u64,
+        data: Vec<u8>,
+        operation_id: Option<Uuid>,
+        description: Option<String>,
     },
     Write {
         actor: Actor,
@@ -3825,6 +4918,16 @@ enum SlotRequest {
         fence: u64,
         label: String,
     },
+    AcknowledgeRunContext {
+        actor: Actor,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+    },
+    RecordCommandCapture {
+        actor: Actor,
+        report: Box<CommandCaptureReport>,
+    },
 }
 
 impl SlotRequest {
@@ -3832,9 +4935,11 @@ impl SlotRequest {
         match self {
             Self::Write {
                 description,
+                command_capture_matchers,
                 command_sequence,
                 ..
             } => {
+                validate_command_capture_matchers(command_capture_matchers)?;
                 if let Some(description) = description {
                     validate_command_description(description)?;
                 }
@@ -3846,7 +4951,16 @@ impl SlotRequest {
                 }
                 Ok(())
             }
+            Self::SendHumanCommand { description, .. } => {
+                if let Some(description) = description {
+                    validate_command_description(description)?;
+                }
+                Ok(())
+            }
             Self::StartRun {
+                label, metadata, ..
+            }
+            | Self::RequestRunStart {
                 label, metadata, ..
             } => {
                 validate_label(label)?;
@@ -3861,6 +4975,27 @@ impl SlotRequest {
                 if encoded_bytes > MAX_RUN_METADATA_BYTES {
                     return Err(SlotError::RunMetadataTooLarge {
                         actual: encoded_bytes,
+                    });
+                }
+                Ok(())
+            }
+            Self::RecordCommandCapture { report, .. } => {
+                if report
+                    .completion_detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.len() > MAX_COMMAND_CAPTURE_DETAIL_BYTES)
+                {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: format!(
+                            "completion_detail exceeds {MAX_COMMAND_CAPTURE_DETAIL_BYTES} UTF-8 bytes"
+                        ),
+                    });
+                }
+                if report.evidence_from_seq > report.tx_event_seq
+                    || report.tx_event_seq > report.evidence_through_seq
+                {
+                    return Err(SlotError::InvalidCommandCapture {
+                        reason: "evidence must contain tx_event_seq".into(),
                     });
                 }
                 Ok(())
@@ -3881,6 +5016,22 @@ impl SlotRequest {
     /// connection-scoped authorization data and change after reconnect.
     fn write_fingerprint(&self) -> Option<Vec<u8>> {
         match self {
+            Self::SendHumanCommand {
+                expected_generation,
+                data,
+                operation_id,
+                description,
+                ..
+            } => Some(
+                serde_json::to_vec(&(
+                    "send_human_command",
+                    expected_generation,
+                    data,
+                    operation_id,
+                    description,
+                ))
+                .expect("Human command fields are serializable"),
+            ),
             Self::Write {
                 data,
                 operation_id,
@@ -3951,8 +5102,39 @@ impl SlotRequest {
         &self,
         control: &ControlState,
         active_run: Option<&RunInfo>,
+        run_context: Option<&RunContextState>,
+        generation: u64,
     ) -> Result<(), SlotError> {
         match self {
+            Self::SendHumanCommand {
+                actor,
+                expected_generation,
+                ..
+            } => {
+                if actor.kind != ActorKind::Human {
+                    return Err(ControlError::NotOwner.into());
+                }
+                if *expected_generation != generation {
+                    return Err(SlotError::GenerationMismatch);
+                }
+                match control.current() {
+                    None => Ok(()),
+                    Some(lease) if lease.owner.id == actor.id => {
+                        control.current_remaining_ttl(Instant::now())?;
+                        Ok(())
+                    }
+                    Some(lease) if lease.owner.kind == ActorKind::Agent => {
+                        control.current_remaining_ttl(Instant::now())?;
+                        let run = active_run.ok_or(ControlError::Busy)?;
+                        if run.owner.id == lease.owner.id && run.status == RunStatus::Active {
+                            Ok(())
+                        } else {
+                            Err(ControlError::Busy.into())
+                        }
+                    }
+                    Some(_) => Err(ControlError::Busy.into()),
+                }
+            }
             Self::Write {
                 actor,
                 control_id,
@@ -3962,6 +5144,7 @@ impl SlotRequest {
                 cooperative,
                 ..
             } => {
+                validate_agent_run_context(actor, active_run, run_context)?;
                 if *cooperative {
                     if pacing.is_some() {
                         return Err(ControlError::NotOwner.into());
@@ -3986,6 +5169,7 @@ impl SlotRequest {
                 expected_run_id,
                 ..
             } => {
+                validate_agent_run_context(actor, active_run, run_context)?;
                 control.validate(&actor.id, *control_id, *fence, Instant::now())?;
                 validate_expected_write_run(*expected_run_id, actor, active_run)?;
                 Ok(())
@@ -4001,6 +5185,21 @@ impl SlotRequest {
                 mode,
                 ttl_ms,
             } => serde_json::to_vec(&("acquire", &actor.id, mode, ttl_ms)),
+            Self::RequestRunStart {
+                actor,
+                label,
+                metadata,
+                ttl_ms,
+                ..
+            } => serde_json::to_vec(&("request_run_start", &actor.id, label, metadata, ttl_ms)),
+            Self::DecideRunStart {
+                actor,
+                approval_id,
+                decision,
+            } => serde_json::to_vec(&("decide_run_start", &actor.id, approval_id, decision)),
+            Self::CancelRunStart { actor, approval_id } => {
+                serde_json::to_vec(&("cancel_run_start", &actor.id, approval_id))
+            }
             Self::Renew {
                 actor,
                 control_id,
@@ -4015,6 +5214,20 @@ impl SlotRequest {
             Self::CancelAcquire { actor, control_id } => {
                 serde_json::to_vec(&("cancel_acquire", &actor.id, control_id))
             }
+            Self::SendHumanCommand {
+                actor,
+                expected_generation,
+                data,
+                operation_id,
+                description,
+            } => serde_json::to_vec(&(
+                "send_human_command",
+                &actor.id,
+                expected_generation,
+                data,
+                operation_id,
+                description,
+            )),
             Self::Write {
                 actor,
                 control_id,
@@ -4130,6 +5343,21 @@ impl SlotRequest {
                 fence,
                 label,
             } => serde_json::to_vec(&("checkpoint", &actor.id, control_id, fence, label)),
+            Self::AcknowledgeRunContext {
+                actor,
+                run_id,
+                revision,
+                through_seq,
+            } => serde_json::to_vec(&(
+                "acknowledge_run_context",
+                &actor.id,
+                run_id,
+                revision,
+                through_seq,
+            )),
+            Self::RecordCommandCapture { actor, report } => {
+                serde_json::to_vec(&("record_command_capture", &actor.id, report))
+            }
         }
         .expect("port request fields are serializable")
     }
@@ -4152,6 +5380,30 @@ fn validate_expected_write_run(
     }
     if active_run.owner.id != actor.id {
         return Err(SlotError::WriteRunNotOwner { expected_run_id });
+    }
+    Ok(())
+}
+
+fn validate_agent_run_context(
+    actor: &Actor,
+    active_run: Option<&RunInfo>,
+    run_context: Option<&RunContextState>,
+) -> Result<(), SlotError> {
+    if actor.kind != ActorKind::Agent {
+        return Ok(());
+    }
+    let (Some(run), Some(context)) = (active_run, run_context) else {
+        return Ok(());
+    };
+    if run.owner.id != actor.id || context.run_id != run.id {
+        return Ok(());
+    }
+    if context.acknowledged_revision < context.revision {
+        return Err(SlotError::UserReadRequired {
+            run_id: run.id,
+            revision: context.revision,
+            last_human_command_seq: context.last_human_command_seq.unwrap_or(0),
+        });
     }
     Ok(())
 }
@@ -4212,6 +5464,26 @@ fn validate_command_description(description: &str) -> Result<(), SlotError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_command_capture_matchers(matchers: &[CommandCaptureMatcher]) -> Result<(), SlotError> {
+    if matchers.len() > MAX_COMMAND_CAPTURE_MATCHERS {
+        return Err(SlotError::InvalidCommandCapture {
+            reason: format!(
+                "command_capture_matchers contains more than {MAX_COMMAND_CAPTURE_MATCHERS} entries"
+            ),
+        });
+    }
+    if matchers.iter().any(|matcher| {
+        matcher.value.is_empty() || matcher.value.len() > MAX_COMMAND_CAPTURE_DETAIL_BYTES
+    }) {
+        return Err(SlotError::InvalidCommandCapture {
+            reason: format!(
+                "command_capture_matcher values must be non-empty and at most {MAX_COMMAND_CAPTURE_DETAIL_BYTES} UTF-8 bytes"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_command_sequence_audit(audit: &CommandSequenceAuditContext) -> Result<(), SlotError> {
@@ -4472,9 +5744,11 @@ fn is_cacheable_write_result(result: &Result<CommandResult, SlotError>) -> bool 
     matches!(
         result,
         Ok(CommandResult::WriteAccepted { .. })
+            | Ok(CommandResult::HumanCommandAccepted { .. })
             | Ok(CommandResult::BreakSent { .. })
             | Ok(CommandResult::TriggerStarted { .. })
             | Err(SlotError::PartialWrite { .. })
+            | Err(SlotError::WriteOutcomeUncertain { .. })
             | Err(SlotError::BreakFailed { .. })
     )
 }
@@ -4537,6 +5811,49 @@ impl SlotCommand {
                 },
                 reply,
             },
+            SlotCommand::RequestRunStart {
+                request_id,
+                actor,
+                label,
+                metadata,
+                ttl_ms,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::RequestRunStart {
+                    actor,
+                    request_id,
+                    label,
+                    metadata,
+                    ttl_ms,
+                },
+                reply,
+            },
+            SlotCommand::DecideRunStart {
+                request_id,
+                actor,
+                approval_id,
+                decision,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::DecideRunStart {
+                    actor,
+                    approval_id,
+                    decision,
+                },
+                reply,
+            },
+            SlotCommand::CancelRunStart {
+                request_id,
+                actor,
+                approval_id,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::CancelRunStart { actor, approval_id },
+                reply,
+            },
             SlotCommand::Renew {
                 request_id,
                 actor,
@@ -4577,6 +5894,25 @@ impl SlotCommand {
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
                 request: SlotRequest::CancelAcquire { actor, control_id },
+                reply,
+            },
+            SlotCommand::SendHumanCommand {
+                request_id,
+                actor,
+                expected_generation,
+                data,
+                operation_id,
+                description,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::SendHumanCommand {
+                    actor,
+                    expected_generation,
+                    data,
+                    operation_id,
+                    description,
+                },
                 reply,
             },
             SlotCommand::Write {
@@ -4753,6 +6089,33 @@ impl SlotCommand {
                 },
                 reply,
             },
+            SlotCommand::AcknowledgeRunContext {
+                request_id,
+                actor,
+                run_id,
+                revision,
+                through_seq,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::AcknowledgeRunContext {
+                    actor,
+                    run_id,
+                    revision,
+                    through_seq,
+                },
+                reply,
+            },
+            SlotCommand::RecordCommandCapture {
+                request_id,
+                actor,
+                report,
+                reply,
+            } => CommandDisposition::Request {
+                key: (actor.id.clone(), request_id),
+                request: SlotRequest::RecordCommandCapture { actor, report },
+                reply,
+            },
             SlotCommand::DisconnectActor { actor_id } => {
                 CommandDisposition::Disconnect { actor_id }
             }
@@ -4828,7 +6191,9 @@ fn initial_snapshot(
         tx_offset: 0,
         rx_overflow_bytes: 0,
         control: None,
+        pending_run_start: None,
         active_run: None,
+        run_context: None,
         active_trigger: None,
         logging: LoggingState::Healthy,
         effective_shell_prompt: resolved.shell_prompt,
@@ -5643,7 +7008,7 @@ async fn send_break_async(
 ) -> PortBreakOutcome {
     if let Err(error) = port.set_break() {
         return PortBreakOutcome {
-            error: Some(classify_break_failure("failed to assert BREAK", error)),
+            error: Some(classify_break_assert_failure(error)),
             cancelled: false,
         };
     }
@@ -5654,20 +7019,7 @@ async fn send_break_async(
         }
         _ = tokio::time::sleep(duration) => {}
     }
-    let clear = port
-        .clear_break()
-        .map_err(|error| classify_break_failure("failed to clear BREAK", error));
-    let error = match (cancelled, clear.err()) {
-        (false, None) => None,
-        (false, Some(error)) => Some(error),
-        (true, None) => Some(PortBreakFailure::Failed(
-            "BREAK was cancelled because the port is closing".into(),
-        )),
-        (true, Some(error)) => Some(PortBreakFailure::Failed(format!(
-            "BREAK was cancelled because the port is closing; {error}"
-        ))),
-    };
-    PortBreakOutcome { error, cancelled }
+    finish_break_after_assert(cancelled, port.clear_break())
 }
 
 #[cfg(windows)]
@@ -5698,7 +7050,7 @@ where
 {
     if let Err(error) = port.assert_break() {
         return PortBreakOutcome {
-            error: Some(classify_break_failure("failed to assert BREAK", error)),
+            error: Some(classify_break_assert_failure(error)),
             cancelled: false,
         };
     }
@@ -5715,20 +7067,7 @@ where
                 .min(WINDOWS_PORT_POLL_INTERVAL),
         );
     }
-    let clear = port
-        .clear_break_signal()
-        .map_err(|error| classify_break_failure("failed to clear BREAK", error));
-    let error = match (cancelled, clear.err()) {
-        (false, None) => None,
-        (false, Some(error)) => Some(error),
-        (true, None) => Some(PortBreakFailure::Failed(
-            "BREAK was cancelled because the port is closing".into(),
-        )),
-        (true, Some(error)) => Some(PortBreakFailure::Failed(format!(
-            "BREAK was cancelled because the port is closing; {error}"
-        ))),
-    };
-    PortBreakOutcome { error, cancelled }
+    finish_break_after_assert(cancelled, port.clear_break_signal())
 }
 
 #[cfg(windows)]
@@ -6405,7 +7744,7 @@ mod tests {
         }
         assert_ne!(unguarded.write_fingerprint(), guarded.write_fingerprint());
         assert!(matches!(
-            classify_break_failure("assert BREAK", "operation not supported"),
+            classify_break_assert_failure("operation not supported"),
             PortBreakFailure::Unsupported(_)
         ));
         assert!(!break_failure_closes_port(Some(
@@ -6414,6 +7753,51 @@ mod tests {
         assert!(break_failure_closes_port(Some(&PortBreakFailure::Failed(
             "uncertain".into()
         ))));
+    }
+
+    #[test]
+    fn unsupported_clear_after_break_assertion_is_uncertain_and_closes_port() {
+        let success = finish_break_after_assert(false, Ok(()));
+        assert!(!success.cancelled);
+        assert_eq!(success.error, None);
+        assert!(!break_failure_closes_port(success.error.as_ref()));
+
+        let outcome = finish_break_after_assert(
+            false,
+            Err("operation not supported by the serial driver".into()),
+        );
+
+        assert!(!outcome.cancelled);
+        assert!(matches!(
+            outcome.error.as_ref(),
+            Some(PortBreakFailure::Failed(message))
+                if message.contains("failed to clear BREAK")
+                    && message.contains("operation not supported")
+        ));
+        assert!(break_failure_closes_port(outcome.error.as_ref()));
+
+        let cancelled = finish_break_after_assert(
+            true,
+            Err("operation not supported while cancelling BREAK".into()),
+        );
+        assert!(cancelled.cancelled);
+        assert!(matches!(
+            cancelled.error.as_ref(),
+            Some(PortBreakFailure::Failed(message))
+                if message.contains("BREAK was cancelled")
+                    && message.contains("operation not supported")
+        ));
+        assert!(break_failure_closes_port(cancelled.error.as_ref()));
+
+        let cancelled_after_clear = finish_break_after_assert(true, Ok(()));
+        assert!(cancelled_after_clear.cancelled);
+        assert!(matches!(
+            cancelled_after_clear.error.as_ref(),
+            Some(PortBreakFailure::Failed(message)) if message.contains("BREAK was cancelled")
+        ));
+        assert!(break_failure_closes_port(
+            cancelled_after_clear.error.as_ref()
+        ));
     }
 
     #[test]
@@ -6622,6 +8006,101 @@ mod tests {
             request(Some("查看样机内存")).fingerprint(),
             request(Some("查看样机负载")).fingerprint()
         );
+    }
+
+    #[test]
+    fn command_capture_detail_accepts_full_matcher_syntax_and_enforces_shared_bound() {
+        let actor = Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Agent,
+        };
+        let request = |detail: Option<String>| SlotRequest::RecordCommandCapture {
+            actor: actor.clone(),
+            report: Box::new(CommandCaptureReport {
+                daemon_epoch: Uuid::new_v4(),
+                generation: 1,
+                run_id: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
+                tx_event_seq: 10,
+                evidence_from_seq: 10,
+                evidence_through_seq: 12,
+                completion: serial_protocol::CommandCaptureCompletionKind::Regex,
+                completion_detail: detail,
+                confidence: serial_protocol::CommandCaptureConfidence::High,
+            }),
+        };
+
+        let matcher = format!("{}\n\u{0000}tail", "界".repeat(100));
+        assert!(matcher.len() > MAX_COMMAND_DESCRIPTION_BYTES);
+        assert!(request(Some(matcher)).validate_business_fields().is_ok());
+        assert!(
+            request(Some("x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES)))
+                .validate_business_fields()
+                .is_ok()
+        );
+        assert!(matches!(
+            request(Some("x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES + 1)))
+                .validate_business_fields(),
+            Err(SlotError::InvalidCommandCapture { .. })
+        ));
+    }
+
+    #[test]
+    fn command_write_capture_matchers_are_bounded_before_physical_write() {
+        let actor = Actor {
+            id: "agent:test".into(),
+            label: "test".into(),
+            kind: ActorKind::Agent,
+        };
+        let request = |command_capture_matchers| SlotRequest::Write {
+            actor: actor.clone(),
+            control_id: Uuid::new_v4(),
+            fence: 7,
+            data: b"status\r".to_vec(),
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(Uuid::new_v4()),
+            pacing: None,
+            description: Some("查看状态".into()),
+            command_capture_matchers,
+            command_sequence: None,
+            sequence_precondition: None,
+            cooperative: false,
+        };
+        let matcher = CommandCaptureMatcher {
+            kind: serial_protocol::CommandCaptureMatcherKind::Regex,
+            value: format!("{}\n\u{0000}tail", "x".repeat(300)),
+        };
+        assert!(matcher.value.len() > MAX_COMMAND_DESCRIPTION_BYTES);
+        assert!(
+            request(vec![matcher.clone()])
+                .validate_business_fields()
+                .is_ok()
+        );
+        assert!(
+            request(vec![CommandCaptureMatcher {
+                value: "x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES),
+                ..matcher.clone()
+            }])
+            .validate_business_fields()
+            .is_ok()
+        );
+        for invalid in [
+            vec![CommandCaptureMatcher {
+                value: String::new(),
+                ..matcher.clone()
+            }],
+            vec![CommandCaptureMatcher {
+                value: "x".repeat(MAX_COMMAND_CAPTURE_DETAIL_BYTES + 1),
+                ..matcher.clone()
+            }],
+            vec![matcher; MAX_COMMAND_CAPTURE_MATCHERS + 1],
+        ] {
+            assert!(matches!(
+                request(invalid).validate_business_fields(),
+                Err(SlotError::InvalidCommandCapture { .. })
+            ));
+        }
     }
 
     #[test]
@@ -7047,7 +8526,7 @@ mod tests {
         };
         assert!(
             request
-                .validate_write_authorization(&control, Some(&run))
+                .validate_write_authorization(&control, Some(&run), None, 1)
                 .is_ok()
         );
 
@@ -7065,7 +8544,7 @@ mod tests {
         }
         assert!(
             non_cooperative
-                .validate_write_authorization(&control, Some(&run))
+                .validate_write_authorization(&control, Some(&run), None, 1)
                 .is_err(),
             "a Human must not borrow the Agent's ordinary fenced lease"
         );
@@ -7076,6 +8555,64 @@ mod tests {
             validate_cooperative_write(&human, Some(Uuid::new_v4()), &control, Some(&run),),
             Err(SlotError::WriteRunMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn agent_physical_action_is_fenced_until_latest_human_tx_is_acknowledged() {
+        let mut control = ControlState::new(Uuid::new_v4(), 1, ControlLimits::default());
+        let agent = Actor {
+            id: "agent:owner".into(),
+            label: "owner".into(),
+            kind: ActorKind::Agent,
+        };
+        let lease = control
+            .grant_if_idle(agent.clone(), 30_000, 1, Instant::now())
+            .unwrap();
+        let run = RunInfo {
+            id: Uuid::new_v4(),
+            owner: agent.clone(),
+            label: "run".into(),
+            status: RunStatus::Active,
+            start_seq: 1,
+            end_seq: None,
+            metadata: BTreeMap::new(),
+        };
+        let request = SlotRequest::Write {
+            actor: agent,
+            control_id: lease.id,
+            fence: lease.fence,
+            data: b"next\r".to_vec(),
+            operation_id: Some(Uuid::new_v4()),
+            expected_run_id: Some(run.id),
+            pacing: None,
+            description: Some("next step".into()),
+            command_capture_matchers: Vec::new(),
+            command_sequence: None,
+            sequence_precondition: None,
+            cooperative: false,
+        };
+        let mut context = RunContextState {
+            run_id: run.id,
+            revision: 2,
+            last_human_command_seq: Some(44),
+            acknowledged_revision: 1,
+            acknowledged_through_seq: Some(31),
+        };
+        assert!(matches!(
+            request.validate_write_authorization(&control, Some(&run), Some(&context), 1),
+            Err(SlotError::UserReadRequired {
+                run_id,
+                revision: 2,
+                last_human_command_seq: 44,
+            }) if run_id == run.id
+        ));
+        context.acknowledged_revision = 2;
+        context.acknowledged_through_seq = Some(44);
+        assert!(
+            request
+                .validate_write_authorization(&control, Some(&run), Some(&context), 1)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -7232,6 +8769,34 @@ mod tests {
             operation_id: None,
             message: "outcome unknown".into(),
         })));
+        assert!(is_cacheable_write_result(&Err(
+            SlotError::WriteOutcomeUncertain {
+                operation_id: Some(Uuid::new_v4()),
+                message: "reply lost after physical dispatch".into(),
+            }
+        )));
+    }
+
+    #[test]
+    fn only_a_dropped_post_dispatch_reply_becomes_an_uncertain_physical_outcome() {
+        let operation_id = Some(Uuid::new_v4());
+        assert!(matches!(
+            map_physical_request_error(
+                SlotError::ReplyDropped,
+                operation_id,
+                "the serial write"
+            ),
+            SlotError::WriteOutcomeUncertain {
+                operation_id: mapped,
+                message,
+            } if mapped == operation_id
+                && message.contains("physical action may have occurred")
+        ));
+        assert_eq!(
+            map_physical_request_error(SlotError::Closed, operation_id, "the serial write"),
+            SlotError::Closed,
+            "failure before the Slot accepts the request proves no physical dispatch"
+        );
     }
 
     #[test]

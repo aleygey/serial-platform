@@ -177,6 +177,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "未提供命令用途",
     ),
     ("ui.run.command.empty", "<empty TX>", "<空发送内容>"),
+    ("ui.run.capture.exact", "exact", "精确证据"),
+    ("ui.run.capture.inferred", "legacy inferred", "旧记录推断"),
+    ("ui.run.command.evidence", "[{}] {}", "[{}] {}"),
     ("ui.monitor.status.running", "monitoring", "监控中"),
     ("ui.monitor.status.completed", "completed", "已完成"),
     ("ui.monitor.status.stopped", "stopped", "已停止"),
@@ -287,6 +290,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("error.stale_fence", "stale_fence", "控制权凭据已失效"),
     ("error.port_offline", "port_offline", "串口离线"),
     ("error.cursor_ahead", "cursor_ahead", "历史游标超前"),
+    (
+        "error.user_read_required",
+        "user_read_required",
+        "用户已输入命令，Agent 必须先读取新上下文",
+    ),
+    (
+        "error.write_outcome_uncertain",
+        "write_outcome_uncertain",
+        "物理发送结果不确定",
+    ),
     ("error.resource_exhausted", "resource_exhausted", "资源不足"),
     (
         "error.idempotency_expired",
@@ -1105,8 +1118,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // ---- Durable serial-output search ----
     (
         "ui.output.search.title",
-        " persistent serial history search ",
-        " 持久串口历史搜索 ",
+        " find in serial output ",
+        " 在串口输出中查找 ",
     ),
     ("ui.output.search.query", " Search text ", " 搜索内容 "),
     ("ui.output.search.matcher.literal", "text", "普通文本"),
@@ -1163,6 +1176,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "ui.output.search.filter.keys",
         "F2/Tab match · F3 case · F4 direction · F5 scope",
         "F2/Tab 匹配方式 · F3 大小写 · F4 方向 · F5 范围",
+    ),
+    (
+        "ui.output.search.quick.keys",
+        "Enter/F3 next · Shift+Enter previous · Esc close · Alt+R/C/D/S filters",
+        "Enter/F3 下一项 · Shift+Enter 上一项 · Esc 关闭 · Alt+R/C/D/S 筛选",
+    ),
+    (
+        "ui.output.search.quick.partial",
+        "⚠ older local output was evicted; shown matches are complete only for retained rows",
+        "⚠ 更早的本地输出已淘汰；当前匹配仅对仍保留的行完整",
     ),
     (
         "ui.output.search.loading",
@@ -1242,6 +1265,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "编码后的匹配表达式超过持久日志的 {} 字节上限。",
     ),
     (
+        "ui.output.search.zero.width",
+        "Zero-width regular expressions cannot be navigated; require at least one character per match.",
+        "无法导航零宽正则匹配；请让每个匹配至少包含一个字符。",
+    ),
+    (
         "ui.output.search.no.run",
         "This port has no active Agent task to search.",
         "当前串口没有可搜索的 Agent 任务。",
@@ -1270,6 +1298,32 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "ui.output.search.timeout",
         "history search exceeded the {}-second total deadline",
         "串口历史搜索超过 {} 秒总时限",
+    ),
+    (
+        "ui.run.approval.title",
+        " Agent requests this serial port ",
+        " Agent 请求接管串口 ",
+    ),
+    (
+        "ui.run.approval.request",
+        "{} requests Run “{}”",
+        "{} 请求启动 Run“{}”",
+    ),
+    ("ui.run.approval.port", "Port: {}", "串口：{}"),
+    (
+        "ui.run.approval.effect",
+        "Approving atomically transfers control to the Agent and starts the Run.",
+        "批准后将原子地把串口控制权交给 Agent，并立即启动 Run。",
+    ),
+    (
+        "ui.run.approval.expires",
+        "Request expires at {} and fails closed if unanswered.",
+        "请求将在 {} 到期；未确认时默认拒绝。",
+    ),
+    (
+        "ui.run.approval.keys",
+        "Enter / Y approve · Esc / N deny",
+        "Enter / Y 批准 · Esc / N 拒绝",
     ),
     (
         "ui.output.model.unconfigured",
@@ -1372,20 +1426,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.search.output", "Ctrl-] /", "Ctrl-] /"),
     (
         "help.desc.search.output",
-        "Search persistent serial history",
-        "搜索持久串口历史",
+        "Open find-in-output; type to jump and use Enter/Shift+Enter to navigate",
+        "打开输出查找；输入即定位，Enter/Shift+Enter 切换结果",
     ),
     ("help.key.enter", "Enter", "Enter"),
     (
         "help.desc.enter",
-        "Send input or a bare effective Profile EOL (CR if configured empty), then follow the live tail",
-        "发送命令或单独的有效 Profile 换行符（明确配置为空时发 CR），然后回到串口底部",
-    ),
-    ("help.key.alt.enter", "Alt-Enter", "Alt-Enter"),
-    (
-        "help.desc.alt.enter",
-        "Send cooperative input during an Agent Run",
-        "Agent 任务中协同发送输入",
+        "Send immediately (including during an Agent Run) and follow the live tail",
+        "立即发送（包括 Agent 任务运行期间）并回到串口底部",
     ),
     ("help.key.input.search", "Ctrl-R", "Ctrl-R"),
     (
@@ -1460,6 +1508,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "st.disconnected.uncertain",
         "disconnected: {}; {} sent write outcome(s) uncertain; inspect TX before retrying",
         "连接已断开：{}；有 {} 次发送结果未确认，重试前请先检查发送记录",
+    ),
+    (
+        "st.write.outcome.uncertain",
+        "write outcome is uncertain: {}; inspect the timeline and device state before any manual retry; automatic retry is disabled",
+        "物理发送结果不确定：{}；任何人工重试前请先检查时间线和设备状态；已禁止自动重试",
     ),
     (
         "st.welcome",
@@ -1552,6 +1605,51 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("st.detached", "detached {} port(s)", "已停止监视 {} 个串口"),
     ("st.run.started", "run started: {}", "Agent 任务已开始：{}"),
     ("st.run.ended", "run ended: {}", "Agent 任务已结束：{}"),
+    (
+        "st.run.approval.modal",
+        "answer the Agent Run-start request first",
+        "请先处理 Agent 的 Run 启动请求",
+    ),
+    (
+        "st.run.approval.pending",
+        "the Run-start decision is already being submitted",
+        "Run 启动决定正在提交",
+    ),
+    (
+        "st.run.approval.approving",
+        "approving Agent takeover and Run start…",
+        "正在批准 Agent 接管并启动 Run……",
+    ),
+    (
+        "st.run.approval.denying",
+        "denying Agent Run start…",
+        "正在拒绝 Agent 启动 Run……",
+    ),
+    (
+        "st.run.approval.approved",
+        "Agent takeover approved; Run started: {}",
+        "已批准 Agent 接管；Run 已启动：{}",
+    ),
+    (
+        "st.run.approval.closed",
+        "the Agent Run-start request is closed",
+        "Agent 的 Run 启动请求已结束",
+    ),
+    (
+        "st.human.command.intervened",
+        "{} Human command confirmed at #{}; Agent context revision is now {}",
+        "{} 用户命令已在 #{} 确认；Agent 上下文版本现为 {}",
+    ),
+    (
+        "st.human.command.too.long",
+        "Human command is {} bytes; the atomic command limit is {} bytes",
+        "用户命令为 {} 字节；原子命令上限为 {} 字节",
+    ),
+    (
+        "st.port.not.ready",
+        "the selected port is not attached and live; the Human command was not sent",
+        "所选串口尚未接入实时会话；用户命令未发送",
+    ),
     (
         "st.checkpoint",
         "checkpoint created at sequence {}",
@@ -1659,8 +1757,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.prefix.hint",
-        "command prefix: 1-9 serial port, m menu, o profiles, h command purposes, l/r mode, PgUp/PgDn scroll, t takeover, u queue, c release/cancel, ? help",
-        "快捷键前缀：1-9 串口，m 菜单，o Profile，h 命令用途，l/r 模式，PgUp/PgDn 滚动，t 接管，u 队列，c 释放/取消，? 帮助",
+        "command prefix: 1-9 serial port, m menu, o profiles, h command purposes, / find, l/r mode, PgUp/PgDn scroll, t takeover, c release, ? help",
+        "快捷键前缀：1-9 串口，m 菜单，o Profile，h 命令用途，/ 查找，l/r 模式，PgUp/PgDn 滚动，t 接管，c 释放，? 帮助",
     ),
     (
         "st.line.mode",
@@ -1789,6 +1887,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "串口输出已定位到命令序号 #{}",
     ),
     (
+        "st.run.jump.exact",
+        "serial output positioned using the daemon-recorded command boundary at #{}",
+        "已按 daemon 记录的命令边界定位到 #{}",
+    ),
+    (
+        "st.run.jump.inferred",
+        "legacy command #{} positioned using an inferred matcher boundary",
+        "旧命令 #{} 已按推断的匹配边界定位",
+    ),
+    (
         "st.run.jump.overlay",
         "command sequence #{} has no verifiable output boundary; showing the command only",
         "命令序号 #{} 没有可验证的输出边界，仅显示命令本身",
@@ -1802,6 +1910,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "st.run.jump.journal",
         "exact command evidence loaded from the journal at sequence #{}",
         "已从日志定位命令序号 #{} 的完整证据",
+    ),
+    (
+        "st.run.jump.journal.exact",
+        "daemon-recorded command evidence loaded from the journal at #{}",
+        "已从日志加载 daemon 记录的命令证据 #{}",
     ),
     (
         "st.run.jump.gap",
@@ -1879,9 +1992,9 @@ static STRINGS: &[(&str, &str, &str)] = &[
         "粘贴目标串口已不存在",
     ),
     (
-        "st.paste.queued",
-        "confirmed paste queued for {}",
-        "已将确认后的粘贴加入 {} 的发送队列",
+        "st.paste.submitted",
+        "confirmed paste submitted immediately to {}",
+        "已将确认后的粘贴立即提交到 {}",
     ),
     (
         "st.no.port",
@@ -1931,6 +2044,31 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("d.ev.run_started", "run_started", "Agent 任务开始"),
     ("d.ev.run_ended", "run_ended", "Agent 任务结束"),
     ("d.ev.run_aborted", "run_aborted", "Agent 任务中止"),
+    (
+        "d.ev.run_start_requested",
+        "run_start_requested",
+        "Agent 请求启动任务",
+    ),
+    (
+        "d.ev.run_start_approved",
+        "run_start_approved",
+        "Agent 启动请求已批准",
+    ),
+    (
+        "d.ev.run_start_denied",
+        "run_start_denied",
+        "Agent 启动请求已拒绝",
+    ),
+    (
+        "d.ev.run_start_timed_out",
+        "run_start_timed_out",
+        "Agent 启动请求已超时",
+    ),
+    (
+        "d.ev.run_start_cancelled",
+        "run_start_cancelled",
+        "Agent 启动请求已取消",
+    ),
     ("d.run.start", "RUN START", "Agent 任务开始"),
     ("d.run.end", "RUN END", "Agent 任务结束"),
     ("d.run.abort", "RUN ABORTED", "Agent 任务中止"),
@@ -1950,6 +2088,11 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("d.break.duration", "BREAK · {} ms", "串口 BREAK · {} 毫秒"),
     ("d.ev.checkpoint", "checkpoint", "检查点"),
     ("d.ev.logging_degraded", "logging_degraded", "日志降级"),
+    (
+        "d.ev.command_capture_completed",
+        "command_capture_completed",
+        "命令输出证据已记录",
+    ),
     ("d.ev.gap", "gap", "历史缺失"),
     ("d.event.detail", "{}: {}", "{}：{}"),
     ("d.run.abort.reason", "reason: {}", "原因：{}"),

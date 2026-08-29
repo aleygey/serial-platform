@@ -27,14 +27,14 @@ use ratatui::{
 #[cfg(test)]
 use serial_protocol::WritePacing;
 use serial_protocol::{
-    Actor, ArchiveSummary, ClientMessage, CommandCaptureMatcher, CommandCaptureMatcherKind,
-    CommandResult, ControlLease, ControlMode, Cursor, DataBits, Direction, EchoMode, EventKind,
-    EventQuery, FlowControl, GapRange, LoggingState, MAX_MODEL_FAMILIES,
-    MAX_MODEL_NAMES_PER_FAMILY, ModelFamily, ModelProfile, MonitorIncident, MonitorMatcher,
-    MonitorStatus, MonitorView, Parity, PortDescriptor, ResolvedModelSettings,
-    ResolvedTransportSettings, RunInfo, RunStatus, ServerMessage, SessionState, SlotSnapshot,
-    StopBits, TargetActivity, TimelineEvent, TransportProfile, TriggerInfo, TriggerStatus,
-    WireFrame,
+    Actor, ArchiveSummary, ClientMessage, CommandCaptureCompleted, CommandCaptureMatcher,
+    CommandCaptureMatcherKind, CommandResult, ControlLease, ControlMode, Cursor, DataBits,
+    Direction, EchoMode, EventKind, EventQuery, FlowControl, GapRange, HumanCommandMode,
+    LoggingState, MAX_MODEL_FAMILIES, MAX_MODEL_NAMES_PER_FAMILY, ModelFamily, ModelProfile,
+    MonitorIncident, MonitorMatcher, MonitorStatus, MonitorView, Parity, PendingRunStartApproval,
+    PortDescriptor, ResolvedModelSettings, ResolvedTransportSettings, RunInfo, RunStartDecision,
+    RunStatus, ServerMessage, SessionState, SlotSnapshot, StopBits, TargetActivity, TimelineEvent,
+    TransportProfile, TriggerInfo, TriggerStatus, WireFrame,
 };
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -44,9 +44,9 @@ use crate::{
     api::ApiClient,
     config::{DEFAULT_ORPHAN_RUN_TIMEOUT_SECONDS, LoadedConfig, MIN_ORPHAN_RUN_TIMEOUT_SECONDS},
     display::{
-        DisplayLine, RunBoundary, TerminalStreamParser, error_code_label, format_event_plain,
-        format_wall_time_local, gap_line, gap_reason_label, highlight_spans, pad_display,
-        safe_inline, trigger_status_label,
+        DisplayLine, RunBoundary, TerminalStreamParser, error_code_label, format_wall_time_local,
+        gap_line, gap_reason_label, highlight_spans, pad_display, safe_inline,
+        trigger_status_label,
     },
     history::{StartupHistory, StartupHistoryTarget, load_startup_histories},
     i18n::{self, tr, trf},
@@ -89,6 +89,11 @@ const OUTPUT_SEARCH_ARCHIVE_LIMIT: usize = 4;
 const OUTPUT_SEARCH_QUERY_BYTES: usize = 4_096;
 const OUTPUT_SEARCH_HTTP_QUERY_LIMIT: usize = 8;
 const OUTPUT_SEARCH_DEADLINE: Duration = Duration::from_secs(10);
+const OUTPUT_SEARCH_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+/// Only this many exact occurrences are materialized/highlighted at once.
+/// The compact per-line index still counts every retained occurrence, and
+/// navigation transparently rematerializes pages across the whole result set.
+const OUTPUT_SEARCH_LOCAL_MATCH_PAGE: usize = 512;
 const EXACT_EVIDENCE_PAGE_EVENTS: usize = 5_000;
 const EXACT_EVIDENCE_PAGE_BYTES: usize = 1024 * 1024;
 const EXACT_EVIDENCE_MAX_EVENTS: usize = 20_000;
@@ -201,7 +206,6 @@ enum PendingWriteKind {
     /// A bare Enter under a Profile whose configured EOL is empty. It sends a
     /// physical CR, but its editable command payload is still logically empty.
     BareEnter,
-    Raw,
 }
 
 impl PendingWriteKind {
@@ -275,20 +279,7 @@ fn append_pending_write(
     operation_id: Option<Uuid>,
     kind: PendingWriteKind,
 ) {
-    let mut remaining = data;
-    if kind == PendingWriteKind::Raw
-        && let Some(last) = queue.back_mut()
-        && last.kind == PendingWriteKind::Raw
-        && last.operation_id == operation_id
-        && last.data.len() < MAX_WRITE_BYTES
-    {
-        let append = remaining
-            .len()
-            .min(MAX_WRITE_BYTES.saturating_sub(last.data.len()));
-        last.data.extend_from_slice(&remaining[..append]);
-        remaining = &remaining[append..];
-    }
-    for chunk in remaining.chunks(MAX_WRITE_BYTES) {
+    for chunk in data.chunks(MAX_WRITE_BYTES) {
         queue.push_back(PendingWrite {
             data: chunk.to_vec(),
             operation_id,
@@ -324,6 +315,13 @@ fn pop_last_queued_line(queue: &mut VecDeque<PendingWrite>) -> Option<Vec<u8>> {
     Some(chunks.into_iter().flatten().collect())
 }
 
+#[derive(Debug, Clone)]
+enum HumanCommandRecovery {
+    None,
+    LineDraft(String),
+    Paste(PendingPaste),
+}
+
 #[derive(Debug)]
 enum PendingRequest {
     Acquire {
@@ -342,7 +340,14 @@ enum PendingRequest {
     Write {
         port: String,
         operation_id: Option<Uuid>,
-        cooperative: bool,
+    },
+    HumanCommand {
+        port: String,
+        recovery: HumanCommandRecovery,
+    },
+    RunStartDecision {
+        port: String,
+        approval_id: Uuid,
     },
 }
 
@@ -353,7 +358,9 @@ impl PendingRequest {
             | Self::Renew { port }
             | Self::Release { port }
             | Self::CancelAcquire { port }
-            | Self::Write { port, .. } => port,
+            | Self::Write { port, .. }
+            | Self::HumanCommand { port, .. }
+            | Self::RunStartDecision { port, .. } => port,
         }
     }
 }
@@ -487,6 +494,7 @@ struct RunCommandStep {
     last_seq: u64,
     data: Vec<u8>,
     capture_matchers: Vec<CommandCaptureMatcher>,
+    authoritative_capture: Option<CommandCaptureCompleted>,
     truncated: bool,
 }
 
@@ -545,6 +553,7 @@ impl RunCommandStep {
             last_seq: event.seq,
             data,
             capture_matchers: Self::capture_matchers(event),
+            authoritative_capture: None,
             truncated,
         }
     }
@@ -835,6 +844,41 @@ enum OutputSearchPhase {
     Results,
 }
 
+/// One exact occurrence in the display-normalized terminal document.  The
+/// logical line index is stable while live rows append, unlike a visual row
+/// (which changes when the terminal is resized and the line wraps again).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputSearchMatch {
+    /// Exact zero-based position among every retained match, not merely the
+    /// currently materialized highlight page.
+    ordinal: usize,
+    line_index: usize,
+    byte_start: usize,
+    byte_end: usize,
+    daemon_epoch: Option<Uuid>,
+    seq: u64,
+}
+
+#[derive(Debug)]
+struct OutputSearchLineIndex {
+    source_line_index: usize,
+    rendered_line_index: usize,
+    match_count: usize,
+    cumulative_end: usize,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct LocalOutputSearchIndex {
+    expression: regex::Regex,
+    lines: Vec<OutputSearchLineIndex>,
+    total_matches: usize,
+    /// Kept for structural performance tests: the index is linear in retained
+    /// document bytes/lines, never in the number of occurrences.
+    scanned_lines: usize,
+    scanned_bytes: usize,
+}
+
 #[derive(Debug)]
 struct OutputSearchState {
     port: String,
@@ -849,6 +893,15 @@ struct OutputSearchState {
     direction: OutputSearchDirection,
     scope: OutputSearchScope,
     phase: OutputSearchPhase,
+    /// Bounded highlight page over the terminal document currently rendered
+    /// by the console. `local_index` retains exact counts for every result;
+    /// `results` remains the retained-journal result set used by the older
+    /// scoped query worker and recovery tests.
+    matches: Vec<OutputSearchMatch>,
+    /// Compact exact counts for every matching retained line. `matches` is a
+    /// bounded page around `selected`, while this index makes every ordinal
+    /// reachable without retaining millions of occurrence structs.
+    local_index: Option<LocalOutputSearchIndex>,
     results: Vec<TimelineEvent>,
     selected: usize,
     detail_scroll: usize,
@@ -856,6 +909,9 @@ struct OutputSearchState {
     partial: bool,
     scanned_archives: usize,
     error: Option<String>,
+    document_dirty: bool,
+    follow_new_matches: bool,
+    last_document_refresh: Instant,
 }
 
 impl OutputSearchState {
@@ -871,12 +927,6 @@ impl OutputSearchState {
                 OutputSearchScope::CurrentEpoch
             }
         };
-    }
-
-    fn begin_editing(&mut self) {
-        self.phase = OutputSearchPhase::Editing;
-        self.error = None;
-        self.cursor = self.cursor.min(self.query.len());
     }
 }
 
@@ -1107,6 +1157,29 @@ impl SlotView {
                     self.selected_monitor_incident = None;
                     self.run_detail_scroll = 0;
                 }
+            }
+            EventKind::CommandCaptureCompleted => {
+                let Some(capture) = event.metadata.get("capture").and_then(|value| {
+                    serde_json::from_value::<CommandCaptureCompleted>(value.clone()).ok()
+                }) else {
+                    return;
+                };
+                let Some(run) = self
+                    .run_history
+                    .iter_mut()
+                    .find(|run| run.id == capture.run_id)
+                else {
+                    return;
+                };
+                let Some(step) = run
+                    .commands
+                    .iter_mut()
+                    .flat_map(|command| command.steps.iter_mut())
+                    .find(|step| step.operation_id == Some(capture.operation_id))
+                else {
+                    return;
+                };
+                step.authoritative_capture = Some(capture);
             }
             _ => {}
         }
@@ -1684,6 +1757,7 @@ impl SlotView {
     }
 }
 
+#[derive(Debug, Clone)]
 struct PendingPaste {
     port: String,
     bytes: Vec<u8>,
@@ -2444,6 +2518,7 @@ struct OutputSearchRequest {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum OutputSearchIoCommand {
     Query(OutputSearchRequest),
     Cancel { request_id: Uuid },
@@ -2505,6 +2580,10 @@ struct CommandEvidenceTarget {
     sequence_id: Option<Uuid>,
     sequence_step_index: Option<usize>,
     operation_ids: Vec<Uuid>,
+    /// Daemon-validated evidence is authoritative for v0.8.5+ commands.
+    /// `None` identifies legacy history and is the only path allowed to rerun
+    /// the old prompt/contains/regex reconstruction.
+    authoritative_range: Option<(u64, u64)>,
 }
 
 impl CommandEvidenceTarget {
@@ -2521,6 +2600,7 @@ impl CommandEvidenceTarget {
             && self.sequence_id == other.sequence_id
             && self.sequence_step_index == other.sequence_step_index
             && self.operation_ids == other.operation_ids
+            && self.authoritative_range == other.authoritative_range
     }
 
     fn owns_tx(
@@ -2873,6 +2953,75 @@ impl App {
         self.current().snapshot.config.port.clone()
     }
 
+    fn pending_run_start_approval(&self) -> Option<PendingRunStartApproval> {
+        let actor = self.actor.as_ref()?;
+        self.ports
+            .iter()
+            .filter_map(|slot| {
+                let approval = slot.snapshot.pending_run_start.as_ref()?;
+                let control = slot.snapshot.control.as_ref()?;
+                (approval.required_approver.id == actor.id
+                    && approval.required_approver.kind == actor.kind
+                    && control.owner == approval.required_approver
+                    && control.id == approval.expected_control_id
+                    && control.fence == approval.expected_fence
+                    && control.epoch == approval.daemon_epoch
+                    && control.generation == approval.generation
+                    && slot.snapshot.daemon_epoch == approval.daemon_epoch
+                    && slot.snapshot.generation == approval.generation)
+                    .then_some(approval)
+            })
+            .min_by_key(|approval| approval.requested_wall_time_ns)
+            .cloned()
+    }
+
+    fn handle_run_start_approval_key(
+        &mut self,
+        key: KeyEvent,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) -> bool {
+        let Some(approval) = self.pending_run_start_approval() else {
+            return false;
+        };
+        let decision = match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => RunStartDecision::Approve,
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => RunStartDecision::Deny,
+            _ => return true,
+        };
+        if self.pending_requests.values().any(|pending| {
+            matches!(
+                pending,
+                PendingRequest::RunStartDecision {
+                    approval_id,
+                    ..
+                } if *approval_id == approval.id
+            )
+        }) {
+            self.status = tr("st.run.approval.pending").into();
+            return true;
+        }
+        let request_id = Uuid::new_v4();
+        if self.send_message(
+            commands,
+            ClientMessage::DecideRunStart {
+                request_id,
+                port: approval.port.clone(),
+                approval_id: approval.id,
+                decision,
+            },
+            Some(PendingRequest::RunStartDecision {
+                port: approval.port,
+                approval_id: approval.id,
+            }),
+        ) {
+            self.status = match decision {
+                RunStartDecision::Approve => tr("st.run.approval.approving").into(),
+                RunStartDecision::Deny => tr("st.run.approval.denying").into(),
+            };
+        }
+        true
+    }
+
     fn current_model_name(&self) -> String {
         self.current()
             .snapshot
@@ -2902,6 +3051,8 @@ impl App {
             direction: OutputSearchDirection::Both,
             scope: OutputSearchScope::CurrentEpoch,
             phase: OutputSearchPhase::Editing,
+            matches: Vec::new(),
+            local_index: None,
             results: Vec::new(),
             selected: 0,
             detail_scroll: 0,
@@ -2909,10 +3060,229 @@ impl App {
             partial: false,
             scanned_archives: 0,
             error: None,
+            document_dirty: false,
+            follow_new_matches: true,
+            last_document_refresh: Instant::now(),
         });
         self.status = tr("st.output.search.open").into();
     }
 
+    fn refresh_output_search(&mut self, prefer_latest: bool) {
+        let Some(search) = self.output_search.as_ref() else {
+            return;
+        };
+        let query = search.query_text();
+        let matcher = search.matcher;
+        let case_sensitive = search.case_sensitive;
+        let direction = search.direction;
+        let scope = search.scope;
+        let previous = current_output_search_match(search);
+        let previous_selected = search.selected;
+        let port = search.port.clone();
+        let Some(view) = self
+            .ports
+            .iter()
+            .find(|view| view.snapshot.config.port == port)
+        else {
+            return;
+        };
+        let current_run = view.active_agent_run().map(|run| OutputSearchRun {
+            id: run.id,
+            start_seq: run.start_seq,
+            through_seq: view.snapshot.head_seq,
+        });
+        let indexed = if scope == OutputSearchScope::CurrentRun && current_run.is_none() {
+            Err(tr("ui.output.search.no.run").into())
+        } else if query.is_empty() {
+            Ok(None)
+        } else {
+            local_output_search_index(
+                view,
+                &query,
+                matcher,
+                case_sensitive,
+                direction,
+                scope,
+                current_run,
+            )
+            .map(Some)
+        };
+        let resolved = indexed.map(|index| {
+            index.map(|index| {
+                let selected = if index.total_matches == 0 {
+                    0
+                } else if prefer_latest {
+                    index.total_matches - 1
+                } else {
+                    previous
+                        .and_then(|anchor| locate_output_search_anchor(view, &index, anchor))
+                        .unwrap_or_else(|| previous_selected.min(index.total_matches - 1))
+                };
+                let matches = materialize_output_search_page(view, &index, selected);
+                (index, matches, selected)
+            })
+        });
+        let partial = view.local_history_truncated;
+        let current_epoch = view.snapshot.daemon_epoch;
+        let head_seq = view.snapshot.head_seq;
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        search.current_epoch = current_epoch;
+        search.head_seq = head_seq;
+        search.current_run = current_run;
+        match resolved {
+            Ok(Some((index, matches, selected))) => {
+                search.local_index = Some(index);
+                search.matches = matches;
+                search.selected = selected;
+                search.error = None;
+            }
+            Ok(None) => {
+                search.local_index = None;
+                search.matches.clear();
+                search.selected = 0;
+                search.error = None;
+            }
+            Err(error) => {
+                search.local_index = None;
+                search.matches.clear();
+                search.selected = 0;
+                search.error = Some(error);
+            }
+        }
+        search.partial = partial;
+        search.phase = OutputSearchPhase::Editing;
+        search.document_dirty = false;
+        search.last_document_refresh = Instant::now();
+    }
+
+    fn jump_to_output_search_match(&mut self) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let Some(target) = self
+            .output_search
+            .as_ref()
+            .and_then(current_output_search_match)
+        else {
+            // An empty query/result set must not leave stale match colours in
+            // an already frozen viewport. Preserve its position while
+            // rebuilding the rows without search styling.
+            if self.current().scroll_snapshot.is_some() {
+                let scroll = self.current().scroll_from_bottom;
+                let rows = all_output_visual_rows(self, layout.output_inner.width)
+                    .into_iter()
+                    .map(|row| row.line)
+                    .collect();
+                let view = self.current_mut();
+                view.scroll_snapshot = Some(ScrollSnapshot { rows });
+                view.scroll_from_bottom = scroll;
+            }
+            return;
+        };
+        let rows = all_output_visual_rows(self, layout.output_inner.width);
+        let Some(target_row) = rows
+            .iter()
+            .position(|row| row.entry_index == Some(target.line_index))
+        else {
+            return;
+        };
+        let row_count = rows.len();
+        let visible = usize::from(layout.output_inner.height).max(1);
+        // Put the selected occurrence near the middle of the console so its
+        // surrounding serial context is immediately visible.
+        let end = target_row
+            .saturating_add(visible / 2)
+            .saturating_add(1)
+            .min(row_count)
+            .max((target_row + 1).min(row_count));
+        let scroll_from_bottom = row_count.saturating_sub(end);
+        let view = self.current_mut();
+        view.scroll_snapshot = Some(ScrollSnapshot {
+            rows: rows.into_iter().map(|row| row.line).collect(),
+        });
+        view.scroll_from_bottom = scroll_from_bottom;
+        view.unseen = 0;
+    }
+
+    fn navigate_output_search(&mut self, backwards: bool) {
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        let total = local_output_search_total(search);
+        if total == 0 {
+            return;
+        }
+        search.selected = if backwards {
+            search.selected.checked_sub(1).unwrap_or(total - 1)
+        } else {
+            (search.selected + 1) % total
+        };
+        self.refresh_output_search_page();
+        self.jump_to_output_search_match();
+    }
+
+    fn refresh_output_search_page(&mut self) {
+        let Some(search) = self.output_search.as_ref() else {
+            return;
+        };
+        let Some(index) = search.local_index.as_ref() else {
+            return;
+        };
+        if search
+            .matches
+            .iter()
+            .any(|item| item.ordinal == search.selected)
+        {
+            return;
+        }
+        let selected = search.selected;
+        let port = search.port.clone();
+        let Some(view) = self
+            .ports
+            .iter()
+            .find(|view| view.snapshot.config.port == port)
+        else {
+            return;
+        };
+        let matches = materialize_output_search_page(view, index, selected);
+        if let Some(search) = self.output_search.as_mut() {
+            search.matches = matches;
+        }
+    }
+
+    fn mark_output_search_document_dirty(&mut self, port: &str) {
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        if search.port != port || search.query.is_empty() {
+            return;
+        }
+        if !search.document_dirty {
+            let total = local_output_search_total(search);
+            search.follow_new_matches = total > 0 && search.selected + 1 == total;
+        }
+        search.document_dirty = true;
+    }
+
+    fn refresh_output_search_if_due(&mut self, now: Instant) {
+        let Some(search) = self.output_search.as_ref() else {
+            return;
+        };
+        if !search.document_dirty
+            || now.saturating_duration_since(search.last_document_refresh)
+                < OUTPUT_SEARCH_REFRESH_INTERVAL
+        {
+            return;
+        }
+        let prefer_latest = search.follow_new_matches;
+        self.refresh_output_search(prefer_latest);
+        self.jump_to_output_search_match();
+        self.dirty = true;
+    }
+
+    #[allow(dead_code)]
     fn submit_output_search(&mut self, search: &mut OutputSearchState) {
         let query = search.query_text();
         if query.is_empty() {
@@ -2984,113 +3354,105 @@ impl App {
             return;
         };
         let mut keep_open = true;
-        match search.phase {
-            OutputSearchPhase::Editing => match key.code {
-                KeyCode::Esc => keep_open = false,
-                KeyCode::Enter => self.submit_output_search(&mut search),
-                KeyCode::F(2) | KeyCode::Tab => {
-                    search.matcher = search.matcher.toggled();
-                    search.error = None;
+        let mut refresh = false;
+        let mut prefer_latest = false;
+        let mut navigate = None;
+        match key.code {
+            KeyCode::Esc => keep_open = false,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                keep_open = false;
+            }
+            KeyCode::Enter | KeyCode::F(3) => {
+                navigate = Some(key.modifiers.contains(KeyModifiers::SHIFT));
+            }
+            KeyCode::Up => navigate = Some(true),
+            KeyCode::Down => navigate = Some(false),
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                search.matcher = search.matcher.toggled();
+                refresh = true;
+                prefer_latest = true;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::ALT) => {
+                search.case_sensitive = !search.case_sensitive;
+                refresh = true;
+                prefer_latest = true;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                search.direction = search.direction.next();
+                refresh = true;
+                prefer_latest = true;
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
+                search.cycle_scope();
+                refresh = true;
+                prefer_latest = true;
+            }
+            KeyCode::Left => search.cursor = search.cursor.saturating_sub(1),
+            KeyCode::Right => search.cursor = (search.cursor + 1).min(search.query.len()),
+            KeyCode::Home => search.cursor = 0,
+            KeyCode::End => search.cursor = search.query.len(),
+            KeyCode::Backspace => {
+                if search.cursor > 0 {
+                    search.cursor -= 1;
+                    search.query.remove(search.cursor);
                 }
-                KeyCode::F(3) => {
-                    search.case_sensitive = !search.case_sensitive;
-                    search.error = None;
+                refresh = true;
+                prefer_latest = true;
+            }
+            KeyCode::Delete => {
+                if search.cursor < search.query.len() {
+                    search.query.remove(search.cursor);
                 }
-                KeyCode::F(4) => {
-                    search.direction = search.direction.next();
-                    search.error = None;
+                refresh = true;
+                prefer_latest = true;
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && !character.is_control() =>
+            {
+                let mut candidate = search.query.clone();
+                candidate.insert(search.cursor, character);
+                if candidate.iter().collect::<String>().len() <= OUTPUT_SEARCH_QUERY_BYTES {
+                    search.query = candidate;
+                    search.cursor += 1;
+                    refresh = true;
+                    prefer_latest = true;
                 }
-                KeyCode::F(5) => {
-                    search.cycle_scope();
-                    search.error = None;
-                }
-                KeyCode::Left => search.cursor = search.cursor.saturating_sub(1),
-                KeyCode::Right => search.cursor = (search.cursor + 1).min(search.query.len()),
-                KeyCode::Home => search.cursor = 0,
-                KeyCode::End => search.cursor = search.query.len(),
-                KeyCode::Backspace => {
-                    if search.cursor > 0 {
-                        search.cursor -= 1;
-                        search.query.remove(search.cursor);
-                    }
-                    search.error = None;
-                }
-                KeyCode::Delete => {
-                    if search.cursor < search.query.len() {
-                        search.query.remove(search.cursor);
-                    }
-                    search.error = None;
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    keep_open = false;
-                }
-                KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                        && !character.is_control() =>
-                {
-                    let mut candidate = search.query.clone();
-                    candidate.insert(search.cursor, character);
-                    if candidate.iter().collect::<String>().len() <= OUTPUT_SEARCH_QUERY_BYTES {
-                        search.query = candidate;
-                        search.cursor += 1;
-                        search.error = None;
-                    }
-                }
-                _ => {}
-            },
-            OutputSearchPhase::Loading(_) => match key.code {
-                KeyCode::Esc => keep_open = false,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    keep_open = false
-                }
-                _ => {}
-            },
-            OutputSearchPhase::Results => match key.code {
-                KeyCode::Esc => keep_open = false,
-                KeyCode::Char('/') | KeyCode::Char('e' | 'E') => search.begin_editing(),
-                KeyCode::Char('r' | 'R') => self.submit_output_search(&mut search),
-                KeyCode::F(2) | KeyCode::Tab => {
-                    search.matcher = search.matcher.toggled();
-                    search.begin_editing();
-                }
-                KeyCode::F(3) => {
-                    search.case_sensitive = !search.case_sensitive;
-                    search.begin_editing();
-                }
-                KeyCode::F(4) => {
-                    search.direction = search.direction.next();
-                    search.begin_editing();
-                }
-                KeyCode::F(5) => {
-                    search.cycle_scope();
-                    search.begin_editing();
-                }
-                KeyCode::Up | KeyCode::Char('N') => {
-                    search.selected = search.selected.saturating_sub(1);
-                    search.detail_scroll = 0;
-                }
-                KeyCode::Down | KeyCode::Char('n') => {
-                    search.selected =
-                        (search.selected + 1).min(search.results.len().saturating_sub(1));
-                    search.detail_scroll = 0;
-                }
-                KeyCode::PageUp => search.detail_scroll = search.detail_scroll.saturating_sub(5),
-                KeyCode::PageDown => search.detail_scroll = search.detail_scroll.saturating_add(5),
-                KeyCode::Home => {
-                    search.selected = 0;
-                    search.detail_scroll = 0;
-                }
-                KeyCode::End => {
-                    search.selected = search.results.len().saturating_sub(1);
-                    search.detail_scroll = 0;
-                }
-                _ => {}
-            },
+            }
+            _ => {}
         }
         if keep_open {
+            if refresh {
+                // Query/filter edits are debounced. Clear the old page now so
+                // stale highlights never masquerade as results for the new
+                // expression while the bounded index rebuild is pending.
+                search.local_index = None;
+                search.matches.clear();
+                search.selected = 0;
+                search.error = None;
+                search.document_dirty = true;
+                search.follow_new_matches = prefer_latest;
+                search.last_document_refresh = Instant::now();
+            }
             self.output_search = Some(search);
+            if refresh {
+                self.dirty = true;
+            } else if let Some(backwards) = navigate {
+                if self
+                    .output_search
+                    .as_ref()
+                    .is_some_and(|search| search.document_dirty)
+                {
+                    let prefer_latest = self
+                        .output_search
+                        .as_ref()
+                        .is_some_and(|search| search.follow_new_matches);
+                    self.refresh_output_search(prefer_latest);
+                }
+                self.navigate_output_search(backwards);
+            }
         } else {
             if let OutputSearchPhase::Loading(request_id) = search.phase
                 && let Some(commands) = self.output_search_commands.as_ref()
@@ -3103,22 +3465,28 @@ impl App {
     }
 
     fn handle_output_search_paste(&mut self, value: String) {
-        let Some(search) = self.output_search.as_mut() else {
-            return;
-        };
-        if search.phase != OutputSearchPhase::Editing {
-            return;
-        }
-        for character in value.chars().filter(|character| !character.is_control()) {
-            let mut candidate = search.query.clone();
-            candidate.insert(search.cursor, character);
-            if candidate.iter().collect::<String>().len() > OUTPUT_SEARCH_QUERY_BYTES {
-                break;
+        {
+            let Some(search) = self.output_search.as_mut() else {
+                return;
+            };
+            for character in value.chars().filter(|character| !character.is_control()) {
+                let mut candidate = search.query.clone();
+                candidate.insert(search.cursor, character);
+                if candidate.iter().collect::<String>().len() > OUTPUT_SEARCH_QUERY_BYTES {
+                    break;
+                }
+                search.query = candidate;
+                search.cursor += 1;
             }
-            search.query = candidate;
-            search.cursor += 1;
+            search.error = None;
+            search.local_index = None;
+            search.matches.clear();
+            search.selected = 0;
+            search.document_dirty = true;
+            search.follow_new_matches = true;
+            search.last_document_refresh = Instant::now();
         }
-        search.error = None;
+        self.dirty = true;
     }
 
     fn handle_output_search_io_event(&mut self, event: OutputSearchIoEvent) {
@@ -3288,9 +3656,14 @@ impl App {
                         "st.monitor.jump.journal",
                         &[&target.seq_start.to_string(), &target.seq_end.to_string()],
                     ),
-                    ExactEvidenceTarget::Command(target) => {
-                        trf("st.run.jump.journal", &[&target.seq_start.to_string()])
-                    }
+                    ExactEvidenceTarget::Command(target) => trf(
+                        if target.authoritative_range.is_some() {
+                            "st.run.jump.journal.exact"
+                        } else {
+                            "st.run.jump.journal"
+                        },
+                        &[&target.seq_start.to_string()],
+                    ),
                 };
             }
             ExactEvidenceIoEvent::Failed { failure, .. } => {
@@ -3414,7 +3787,12 @@ impl App {
                 let newly_uncertain = self
                     .pending_requests
                     .values()
-                    .filter(|request| matches!(request, PendingRequest::Write { .. }))
+                    .filter(|request| {
+                        matches!(
+                            request,
+                            PendingRequest::Write { .. } | PendingRequest::HumanCommand { .. }
+                        )
+                    })
                     .count();
                 self.uncertain_write_outcomes = self
                     .uncertain_write_outcomes
@@ -3530,15 +3908,15 @@ impl App {
                 retryable,
             } => {
                 let mut discarded_suffix = String::new();
-                let mut cooperative_slot = None;
+                let mut write_outcome_uncertain = false;
                 if let Some(request_id) = request_id {
                     match self.pending_requests.remove(&request_id) {
-                        Some(PendingRequest::Acquire { port, .. })
-                        | Some(PendingRequest::Write {
-                            port,
-                            cooperative: false,
-                            ..
-                        }) => {
+                        Some(PendingRequest::Write { port, .. })
+                            if code == serial_protocol::ErrorCode::WriteOutcomeUncertain =>
+                        {
+                            write_outcome_uncertain = true;
+                            self.uncertain_write_outcomes =
+                                self.uncertain_write_outcomes.saturating_add(1);
                             self.queued_controls.remove(&port);
                             let discarded = self
                                 .pending_writes
@@ -3550,34 +3928,64 @@ impl App {
                                     trf("st.discarded.chunks", &[&port, &discarded.to_string()]);
                             }
                         }
-                        Some(PendingRequest::Write {
-                            port,
-                            cooperative: true,
-                            ..
-                        }) => {
-                            // Cooperative input never owns the queued Human
-                            // suffix or its acquire request. A rejection (for
-                            // example an Agent lease expiring at the boundary)
-                            // ends only this one opportunistic write.
-                            cooperative_slot = Some(port);
+                        Some(PendingRequest::HumanCommand { .. })
+                            if code == serial_protocol::ErrorCode::WriteOutcomeUncertain =>
+                        {
+                            write_outcome_uncertain = true;
+                            self.uncertain_write_outcomes =
+                                self.uncertain_write_outcomes.saturating_add(1);
                         }
+                        Some(PendingRequest::Acquire { port, .. })
+                        | Some(PendingRequest::Write { port, .. }) => {
+                            self.queued_controls.remove(&port);
+                            let discarded = self
+                                .pending_writes
+                                .remove(&port)
+                                .map_or(0, |writes| writes.len());
+                            self.inflight_writes.remove(&port);
+                            if discarded > 0 {
+                                discarded_suffix =
+                                    trf("st.discarded.chunks", &[&port, &discarded.to_string()]);
+                            }
+                        }
+                        Some(PendingRequest::HumanCommand { port, recovery }) => match recovery {
+                            HumanCommandRecovery::LineDraft(submitted)
+                                if self.current().snapshot.config.port == port
+                                    && self.current().draft.is_empty() =>
+                            {
+                                let view = self.current_mut();
+                                view.draft = submitted.chars().collect();
+                                view.draft_cursor = view.draft.len();
+                            }
+                            HumanCommandRecovery::Paste(paste)
+                                if self.pending_paste.is_none()
+                                    && self.slot_index(&port).is_some() =>
+                            {
+                                self.pending_paste = Some(paste);
+                            }
+                            HumanCommandRecovery::None
+                            | HumanCommandRecovery::LineDraft(_)
+                            | HumanCommandRecovery::Paste(_) => {}
+                        },
+                        Some(PendingRequest::RunStartDecision { .. }) => {}
                         _ => {}
                     }
                 }
-                self.status = format!(
-                    "{}：{}{discarded_suffix}{}",
-                    error_code_label(code),
-                    safe_inline(&message),
-                    if retryable { tr("st.retryable") } else { "" }
-                );
-                if let Some(port) = cooperative_slot {
-                    // A queue-mode acquire can be granted while the
-                    // cooperative request is still in flight. That grant
-                    // deliberately waits behind all writes; once this request
-                    // is rejected, resume the untouched ordinary queue if the
-                    // Human now owns the lease.
-                    self.flush_pending_writes(&port, commands);
-                }
+                self.status = if write_outcome_uncertain
+                    || code == serial_protocol::ErrorCode::WriteOutcomeUncertain
+                {
+                    format!(
+                        "{}{discarded_suffix}",
+                        trf("st.write.outcome.uncertain", &[&safe_inline(&message)])
+                    )
+                } else {
+                    format!(
+                        "{}：{}{discarded_suffix}{}",
+                        error_code_label(code),
+                        safe_inline(&message),
+                        if retryable { tr("st.retryable") } else { "" }
+                    )
+                };
             }
             ServerMessage::Gap {
                 port,
@@ -3674,6 +4082,56 @@ impl App {
                 }
                 self.status = trf("st.queued", &[&position.to_string()]);
             }
+            CommandResult::RunStartPending { approval } => {
+                if let Some(index) = self.slot_index(&approval.port) {
+                    self.ports[index].snapshot.pending_run_start = Some(*approval);
+                }
+                self.status = tr("st.run.approval.modal").into();
+            }
+            CommandResult::RunStartGranted {
+                approval_id,
+                lease,
+                run,
+            } => {
+                let port = match pending {
+                    Some(PendingRequest::RunStartDecision { port, .. }) => port,
+                    _ => self
+                        .ports
+                        .iter()
+                        .find(|slot| {
+                            slot.snapshot
+                                .pending_run_start
+                                .as_ref()
+                                .is_some_and(|approval| approval.id == approval_id)
+                        })
+                        .map(|slot| slot.snapshot.config.port.clone())
+                        .unwrap_or_else(|| self.selected_port()),
+                };
+                self.install_lease(&port, lease);
+                if let Some(index) = self.slot_index(&port) {
+                    self.ports[index].snapshot.pending_run_start = None;
+                    self.ports[index].snapshot.active_run = Some(run.clone());
+                }
+                self.status = trf("st.run.approval.approved", &[&run.label]);
+                self.pending_requests.retain(|_, request| {
+                    !matches!(request, PendingRequest::RunStartDecision { approval_id: pending, .. } if *pending == approval_id)
+                });
+            }
+            CommandResult::RunStartDenied { approval_id }
+            | CommandResult::RunStartTimedOut { approval_id }
+            | CommandResult::RunStartCancelled { approval_id } => {
+                for slot in &mut self.ports {
+                    if slot
+                        .snapshot
+                        .pending_run_start
+                        .as_ref()
+                        .is_some_and(|approval| approval.id == approval_id)
+                    {
+                        slot.snapshot.pending_run_start = None;
+                    }
+                }
+                self.status = tr("st.run.approval.closed").into();
+            }
             CommandResult::ControlRenewed { lease } => {
                 if let Some(PendingRequest::Renew { port }) = pending {
                     self.install_lease(&port, lease);
@@ -3712,15 +4170,30 @@ impl App {
                 }
             }
             CommandResult::WriteAccepted { event_seq } => {
-                if let Some(PendingRequest::Write {
-                    port, cooperative, ..
-                }) = pending
-                {
+                if let Some(PendingRequest::Write { port, .. }) = pending {
                     self.status = trf("st.write.confirmed", &[&port, &event_seq.to_string()]);
-                    if !cooperative {
-                        self.acknowledge_inflight_write(&port);
-                    }
+                    self.acknowledge_inflight_write(&port);
                     self.flush_pending_writes(&port, commands);
+                }
+            }
+            CommandResult::HumanCommandAccepted {
+                event_seq,
+                mode,
+                lease,
+                interfered_run_id,
+                context_revision,
+            } => {
+                if let Some(PendingRequest::HumanCommand { port, .. }) = pending {
+                    if let Some(lease) = lease {
+                        self.install_lease(&port, lease);
+                    }
+                    self.status = match (mode, interfered_run_id, context_revision) {
+                        (HumanCommandMode::Cooperative, Some(_), Some(revision)) => trf(
+                            "st.human.command.intervened",
+                            &[&port, &event_seq.to_string(), &revision.to_string()],
+                        ),
+                        _ => trf("st.write.confirmed", &[&port, &event_seq.to_string()]),
+                    };
                 }
             }
             CommandResult::BreakSent { event_seq } => {
@@ -3759,6 +4232,8 @@ impl App {
             CommandResult::CheckpointCreated { event_seq } => {
                 self.status = trf("st.checkpoint", &[&event_seq.to_string()]);
             }
+            CommandResult::RunContextAcknowledged { .. }
+            | CommandResult::CommandCaptureRecorded { .. } => {}
         }
     }
 
@@ -3773,6 +4248,7 @@ impl App {
             let selected = index == self.selected;
             if replay {
                 self.ports[index].push_event(event, selected);
+                self.mark_output_search_document_dirty(&port);
                 return;
             }
 
@@ -3829,6 +4305,7 @@ impl App {
                 });
                 self.flush_pending_writes(&port, commands);
             }
+            self.mark_output_search_document_dirty(&port);
         }
     }
 
@@ -3888,8 +4365,34 @@ impl App {
             }
             EventKind::RunEnded | EventKind::RunAborted => {
                 snapshot.active_run = None;
+                snapshot.run_context = None;
                 slot.mark_trigger_stopping();
             }
+            EventKind::RunStartRequested => {
+                snapshot.pending_run_start = event.metadata.get("approval").and_then(|value| {
+                    serde_json::from_value::<PendingRunStartApproval>(value.clone()).ok()
+                });
+            }
+            EventKind::RunStartApproved => {
+                snapshot.pending_run_start = None;
+                if let Some(lease) = event
+                    .metadata
+                    .get("lease")
+                    .and_then(|value| serde_json::from_value::<ControlLease>(value.clone()).ok())
+                {
+                    snapshot.control = Some(lease);
+                }
+                if let Some(run) = event
+                    .metadata
+                    .get("run")
+                    .and_then(|value| serde_json::from_value::<RunInfo>(value.clone()).ok())
+                {
+                    snapshot.active_run = Some(run);
+                }
+            }
+            EventKind::RunStartDenied
+            | EventKind::RunStartTimedOut
+            | EventKind::RunStartCancelled => snapshot.pending_run_start = None,
             EventKind::TriggerStarted => {
                 snapshot.active_trigger = event
                     .metadata
@@ -3940,10 +4443,43 @@ impl App {
                 snapshot.control = None;
                 snapshot.active_run = None;
                 snapshot.active_trigger = None;
+                snapshot.pending_run_start = None;
+                snapshot.run_context = None;
                 slot.clear_trigger_projection();
             }
-            EventKind::Tx => slot.observe_trigger_tx(event),
-            EventKind::Break | EventKind::Checkpoint => {}
+            EventKind::Tx => {
+                if event
+                    .metadata
+                    .get("human_command")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && let (Some(run), Some(revision)) = (
+                        snapshot.active_run.as_ref(),
+                        event
+                            .metadata
+                            .get("context_revision")
+                            .and_then(serde_json::Value::as_u64),
+                    )
+                {
+                    let acknowledged_revision = snapshot
+                        .run_context
+                        .as_ref()
+                        .map_or(0, |context| context.acknowledged_revision);
+                    let acknowledged_through_seq = snapshot
+                        .run_context
+                        .as_ref()
+                        .and_then(|context| context.acknowledged_through_seq);
+                    snapshot.run_context = Some(serial_protocol::RunContextState {
+                        run_id: run.id,
+                        revision,
+                        last_human_command_seq: Some(event.seq),
+                        acknowledged_revision,
+                        acknowledged_through_seq,
+                    });
+                }
+                slot.observe_trigger_tx(event);
+            }
+            EventKind::CommandCaptureCompleted | EventKind::Break | EventKind::Checkpoint => {}
         }
     }
 
@@ -4056,6 +4592,10 @@ impl App {
         true
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Retained for explicitly fenced, multi-chunk internal operations and
+    /// their recovery tests. Interactive keyboard and paste input must use
+    /// `request_human_bytes` so it can never create a Control waiter.
     fn request_write(
         &mut self,
         commands: &mpsc::Sender<NetworkCommand>,
@@ -4075,90 +4615,64 @@ impl App {
         commands: &mpsc::Sender<NetworkCommand>,
         data: Vec<u8>,
     ) -> bool {
-        self.request_write_batch_with_kind(commands, vec![data], None, PendingWriteKind::Raw)
+        self.request_human_bytes(commands, data, None, HumanCommandRecovery::None)
     }
 
-    /// Sends an explicit Human/Agent cooperative write without acquiring or
-    /// taking over the Agent's control lease. The daemon independently checks
-    /// the same lease/Run relationship; this local gate keeps an accidental
-    /// Alt+Enter from becoming an opaque rejected request.
-    fn request_cooperative_write(
+    fn request_human_command(
+        &mut self,
+        commands: &mpsc::Sender<NetworkCommand>,
+        data: Vec<u8>,
+        submitted: String,
+        operation_id: Uuid,
+    ) -> bool {
+        self.request_human_bytes(
+            commands,
+            data,
+            Some(operation_id),
+            HumanCommandRecovery::LineDraft(submitted),
+        )
+    }
+
+    fn request_human_bytes(
         &mut self,
         commands: &mpsc::Sender<NetworkCommand>,
         data: Vec<u8>,
         operation_id: Option<Uuid>,
+        recovery: HumanCommandRecovery,
     ) -> bool {
-        if !self.transport_connected || !self.hello_accepted {
-            self.status = tr("st.not.ready").into();
+        if data.is_empty() {
+            return true;
+        }
+        if data.len() > MAX_WRITE_BYTES {
+            self.status = trf(
+                "st.human.command.too.long",
+                &[&data.len().to_string(), &MAX_WRITE_BYTES.to_string()],
+            );
             return false;
         }
-        if !self.slot_ready(self.selected) {
-            self.status = trf("st.not.live", &[&self.selected_port()]);
+        let index = self.selected;
+        if !self.slot_ready(index) {
+            self.status = tr("st.port.not.ready").into();
             return false;
         }
-        let human = self
-            .actor
-            .as_ref()
-            .is_some_and(|actor| actor.kind == serial_protocol::ActorKind::Human);
-        let matching_run_id = self
-            .current()
-            .snapshot
-            .control
-            .as_ref()
-            .zip(self.current().active_agent_run())
-            .and_then(|(lease, run)| {
-                (lease.owner.kind == serial_protocol::ActorKind::Agent
-                    && lease.owner.id == run.owner.id)
-                    .then_some(run.id)
-            });
-        let Some(expected_run_id) = matching_run_id.filter(|_| human) else {
-            self.status = tr("st.cooperative.unavailable").into();
-            return false;
-        };
-
-        let port = self.selected_port();
+        let port = self.ports[index].snapshot.config.port.clone();
+        let expected_generation = self.ports[index].snapshot.generation;
         let sent = self.send_message(
             commands,
-            ClientMessage::Write {
+            ClientMessage::SendHumanCommand {
                 request_id: Uuid::new_v4(),
                 port: port.clone(),
-                control_id: Uuid::nil(),
-                fence: 0,
+                expected_generation,
                 data,
                 operation_id,
-                // Bind this exceptional write to the exact Agent Run that
-                // justified cooperation. The daemon rejects delayed/replayed
-                // input after that Run ends or a successor begins.
-                expected_run_id: Some(expected_run_id),
-                pacing: None,
                 description: None,
-                command_sequence: None,
-                command_capture_matchers: Vec::new(),
-                sequence_precondition: None,
-                cooperative: true,
             },
-            Some(PendingRequest::Write {
-                port,
-                operation_id,
-                cooperative: true,
-            }),
+            Some(PendingRequest::HumanCommand { port, recovery }),
         );
         if sent {
-            self.status = tr("st.cooperative.sent").into();
+            self.ports[index].last_manual_activity = Some(Instant::now());
         }
         sent
-    }
-
-    fn request_write_batch(
-        &mut self,
-        commands: &mpsc::Sender<NetworkCommand>,
-        writes: Vec<Vec<u8>>,
-    ) -> bool {
-        let writes = writes
-            .into_iter()
-            .map(|write| (write, Some(Uuid::new_v4())))
-            .collect();
-        self.request_write_operations(commands, writes, PendingWriteKind::Line)
     }
 
     fn request_write_batch_with_kind(
@@ -4233,8 +4747,8 @@ impl App {
         if self.owns_control(self.selected) {
             let flushed = self.flush_pending_writes(&port, commands);
             // A saturated outbound channel leaves the complete operation in
-            // the visible local queue. Treat that as accepted local enqueue so
-            // Enter may clear the draft without risking a later duplicate.
+            // the bounded internal queue. Treat that as locally retained so
+            // its owner can retry without risking a later duplicate.
             return flushed || self.pending_writes.contains_key(&port);
         }
 
@@ -4313,6 +4827,7 @@ impl App {
         self.release_slot_control(commands, port, lease, false);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn remove_last_queued_line(
         &mut self,
         restore_to_editor: bool,
@@ -4419,6 +4934,7 @@ impl App {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn open_queue_selection(&mut self) {
         let port = self.selected_port();
         let count = self
@@ -4877,7 +5393,14 @@ impl App {
             view.scroll_from_bottom = scroll_from_bottom;
             view.unseen = 0;
             self.pending_exact_evidence = None;
-            self.status = trf("st.run.jump", &[&target.seq_start.to_string()]);
+            self.status = trf(
+                if target.authoritative_range.is_some() {
+                    "st.run.jump.exact"
+                } else {
+                    "st.run.jump.inferred"
+                },
+                &[&target.seq_start.to_string()],
+            );
             return true;
         }
         self.query_exact_evidence(ExactEvidenceTarget::Command(target))
@@ -4905,13 +5428,44 @@ impl App {
             .filter(|(index, _)| step_index.is_none_or(|selected| *index == selected))
             .filter_map(|(_, step)| step.operation_id)
             .collect();
+        let selected_steps = record
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| step_index.is_none_or(|selected| *index == selected))
+            .map(|(_, step)| step)
+            .collect::<Vec<_>>();
+        let authoritative_range = (!selected_steps.is_empty()
+            && selected_steps
+                .iter()
+                .all(|step| step.authoritative_capture.is_some()))
+        .then(|| {
+            let from = selected_steps
+                .iter()
+                .filter_map(|step| step.authoritative_capture.as_ref())
+                .map(|capture| capture.evidence_from_seq)
+                .min()
+                .expect("non-empty captures were checked");
+            let through = selected_steps
+                .iter()
+                .filter_map(|step| step.authoritative_capture.as_ref())
+                .map(|capture| capture.evidence_through_seq)
+                .max()
+                .expect("non-empty captures were checked");
+            (from, through)
+        });
         let next_command = step_index
             .and_then(|index| record.steps.get(index + 1).map(|step| step.first_seq))
             .or_else(|| view.next_run_command_seq(key));
-        let query_end_seq = next_command
-            .map(|sequence| sequence.saturating_sub(1))
-            .unwrap_or(view.snapshot.head_seq.max(view.last_seq))
-            .max(write_end_seq);
+        let query_end_seq = authoritative_range.map_or_else(
+            || {
+                next_command
+                    .map(|sequence| sequence.saturating_sub(1))
+                    .unwrap_or(view.snapshot.head_seq.max(view.last_seq))
+                    .max(write_end_seq)
+            },
+            |(_, through)| through.max(write_end_seq),
+        );
         Some(CommandEvidenceTarget {
             key,
             step_index,
@@ -4926,6 +5480,7 @@ impl App {
             sequence_id: record.sequence_id,
             sequence_step_index: step.and_then(|step| step.step_index),
             operation_ids,
+            authoritative_range,
         })
     }
 
@@ -5270,8 +5825,9 @@ impl App {
                 fence: lease.fence,
                 data,
                 operation_id,
-                // Human writes are governed by the fenced control lease, not
-                // by an Agent Run boundary.
+                // This internal path is governed by the fenced control lease,
+                // not by an Agent Run boundary. Interactive Human input uses
+                // SendHumanCommand instead.
                 expected_run_id: None,
                 pacing: None,
                 description: None,
@@ -5283,7 +5839,6 @@ impl App {
             Some(PendingRequest::Write {
                 port: port.to_string(),
                 operation_id,
-                cooperative: false,
             }),
         )
     }
@@ -5297,7 +5852,9 @@ impl App {
             Event::Paste(value) => {
                 self.reset_software_cursor_blink(Instant::now());
                 self.clear_text_selection();
-                if self.output_search.is_some() {
+                if self.pending_run_start_approval().is_some() {
+                    self.status = tr("st.run.approval.modal").into();
+                } else if self.output_search.is_some() {
                     self.handle_output_search_paste(value);
                 } else if self.menu.is_some() {
                     self.handle_menu_paste(value);
@@ -5325,6 +5882,13 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         self.clear_text_selection();
+        // An Agent Run-start approval is a fail-closed modal. It preempts
+        // search/menu/input so an Enter intended for another pane can never
+        // be mistaken for consent after the dialog appeared.
+        if self.handle_run_start_approval_key(key, commands) {
+            self.dirty = true;
+            return;
+        }
         if self.output_search.is_some() {
             self.handle_output_search_key(key);
             self.dirty = true;
@@ -5697,9 +6261,6 @@ impl App {
                 self.acquire_control(commands, ControlMode::Takeover);
             }
             KeyCode::Char('c' | 'C') => self.release_control(commands),
-            KeyCode::Char('d' | 'D') => self.remove_last_queued_line(false, commands),
-            KeyCode::Char('e' | 'E') => self.remove_last_queued_line(true, commands),
-            KeyCode::Char('u' | 'U') => self.open_queue_selection(),
             KeyCode::Char('p' | 'P') => self.confirm_paste(commands),
             KeyCode::Char('/') => {
                 self.open_output_search();
@@ -5738,22 +6299,16 @@ impl App {
                 if bare_enter_fallback {
                     bytes.push(b'\r');
                 }
-                let operation_id = Some(Uuid::new_v4());
-                let cooperative = key.modifiers.contains(KeyModifiers::ALT);
-                let accepted = if cooperative {
-                    self.request_cooperative_write(commands, bytes.clone(), operation_id)
-                } else if bare_enter_fallback {
-                    self.request_write_batch_with_kind(
-                        commands,
-                        vec![bytes],
-                        operation_id,
-                        PendingWriteKind::BareEnter,
-                    )
-                } else {
-                    self.request_write(commands, bytes, operation_id)
-                };
+                let operation_id = Uuid::new_v4();
+                // Enter has one immediate, non-queued meaning. The daemon
+                // atomically resolves idle/self-owned/Agent-Run ownership; an
+                // Agent Run receives this as a cooperative Human intervention
+                // and its next physical action is read-gated. Alt+Enter is no
+                // longer a separate input mode.
+                let accepted =
+                    self.request_human_command(commands, bytes, value.clone(), operation_id);
                 // Enter always returns the console view to the live tail. If
-                // the write could not be queued, retain the draft and error
+                // the request could not be sent or accepted, retain the draft and error
                 // status so the user can retry without retyping it.
                 self.current_mut().follow();
                 if !accepted {
@@ -5882,15 +6437,15 @@ impl App {
         };
         let previous = self.selected;
         self.selected = index;
-        let accepted = if paste.raw {
-            self.request_raw_write(commands, paste.bytes)
+        let (data, operation_id) = if paste.raw {
+            (paste.bytes.clone(), None)
         } else {
             let text = String::from_utf8_lossy(&paste.bytes);
             let eol = self.current().effective_write_eol().to_string();
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             let writes = normalized
                 .split_inclusive('\n')
-                .map(|line| {
+                .flat_map(|line| {
                     let visible = safe_inline(line.trim_end_matches('\n'));
                     let mut command = Vec::with_capacity(visible.len() + eol.len());
                     command.extend_from_slice(visible.as_bytes());
@@ -5898,11 +6453,19 @@ impl App {
                     command
                 })
                 .collect::<Vec<_>>();
-            self.request_write_batch(commands, writes)
+            (writes, Some(Uuid::new_v4()))
         };
+        let accepted = self.request_human_bytes(
+            commands,
+            data,
+            operation_id,
+            HumanCommandRecovery::Paste(paste.clone()),
+        );
         self.selected = previous;
         if accepted {
-            self.status = trf("st.paste.queued", &[&paste.port]);
+            self.status = trf("st.paste.submitted", &[&paste.port]);
+        } else {
+            self.pending_paste = Some(paste);
         }
     }
 
@@ -7837,7 +8400,9 @@ impl App {
             | PendingRequest::Renew { port }
             | PendingRequest::Release { port }
             | PendingRequest::CancelAcquire { port }
-            | PendingRequest::Write { port, .. } => configured.contains(port),
+            | PendingRequest::Write { port, .. }
+            | PendingRequest::HumanCommand { port, .. }
+            | PendingRequest::RunStartDecision { port, .. } => configured.contains(port),
         });
         port_set_changed
     }
@@ -8463,6 +9028,16 @@ fn command_evidence_end_seq(
     target: &CommandEvidenceTarget,
     events: &[TimelineEvent],
 ) -> Option<u64> {
+    if let Some((_, through_seq)) = target.authoritative_range {
+        return exact_evidence_is_complete(
+            &target.port,
+            target.daemon_epoch,
+            target.seq_start,
+            through_seq,
+            events,
+        )
+        .then_some(through_seq);
+    }
     if target.matchers.is_empty() {
         return exact_evidence_is_complete(
             &target.port,
@@ -9498,7 +10073,9 @@ async fn run_loop(
                 }
             },
             _ = render_tick.tick() => {
-                if app.update_software_cursor_blink(Instant::now()) {
+                let now = Instant::now();
+                app.refresh_output_search_if_due(now);
+                if app.update_software_cursor_blink(now) {
                     app.dirty = true;
                 }
                 if app.dirty {
@@ -9780,8 +10357,65 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_menu(frame, app, menu, area);
     }
     if let Some(search) = app.output_search.as_ref() {
-        draw_output_search(frame, search, area, app.software_cursor_visible);
+        draw_output_search(
+            frame,
+            search,
+            app.layout.map_or(area, |layout| layout.output_area),
+            app.software_cursor_visible,
+        );
     }
+    if let Some(approval) = app.pending_run_start_approval() {
+        draw_run_start_approval(frame, &approval, area);
+    }
+}
+
+fn draw_run_start_approval(frame: &mut Frame<'_>, approval: &PendingRunStartApproval, area: Rect) {
+    let popup = centered_rect(
+        area.width.saturating_sub(4).clamp(1, 72),
+        area.height.saturating_sub(4).clamp(1, 11),
+        area,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(tr("ui.run.approval.title"))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = vec![
+        Line::from(Span::styled(
+            trf(
+                "ui.run.approval.request",
+                &[
+                    &safe_inline(&approval.requester.label),
+                    &safe_inline(&approval.label),
+                ],
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(trf("ui.run.approval.port", &[&safe_inline(&approval.port)])),
+        Line::from(tr("ui.run.approval.effect")),
+        Line::from(trf(
+            "ui.run.approval.expires",
+            &[&format_wall_time_local(approval.expires_wall_time_ns)],
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            tr("ui.run.approval.keys"),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(rows)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn output_search_matcher_label(matcher: OutputSearchMatcher) -> &'static str {
@@ -9827,6 +10461,7 @@ fn output_search_filters(search: &OutputSearchState) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn output_search_target(search: &OutputSearchState) -> String {
     let epoch = search.current_epoch.to_string();
     let epoch = &epoch[..8];
@@ -9854,6 +10489,7 @@ fn output_search_target(search: &OutputSearchState) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn output_search_event_summary(event: &TimelineEvent, width: u16) -> String {
     let direction = match event.direction {
         Direction::Rx => "RX",
@@ -9884,18 +10520,21 @@ fn output_search_event_summary(event: &TimelineEvent, width: u16) -> String {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct OutputSearchResultFooter {
     integrity: String,
     navigation: String,
     limits: Option<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn trim_output_search_footer_separator(value: String) -> String {
     value
         .trim_start_matches(|character: char| character.is_whitespace() || character == '·')
         .to_owned()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn output_search_result_footer(search: &OutputSearchState) -> OutputSearchResultFooter {
     let position = if search.results.is_empty() {
         "0".to_owned()
@@ -9943,9 +10582,17 @@ fn draw_output_search(
     area: Rect,
     cursor_visible: bool,
 ) {
-    let width = area.width.saturating_sub(4).clamp(1, 110);
-    let height = area.height.saturating_sub(2).clamp(1, 34);
-    let popup = centered_rect(width, height, area);
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let width = area.width.saturating_sub(2).clamp(2, 64);
+    let height = area.height.saturating_sub(2).clamp(3, 5);
+    let popup = Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(width + 1)),
+        y: area.y.saturating_add(1),
+        width,
+        height,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -9957,181 +10604,57 @@ fn draw_output_search(
         return;
     }
 
-    match search.phase {
-        OutputSearchPhase::Editing | OutputSearchPhase::Loading(_) => {
-            let chunks = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Length(4),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-            let (query, cursor_column) = line_input_projection(
-                &search.query,
-                search.cursor,
-                chunks[0].width.saturating_sub(2),
-            );
-            frame.render_widget(
-                Paragraph::new(if search.phase == OutputSearchPhase::Editing {
-                    line_with_software_cursor(query, cursor_column, cursor_visible)
-                } else {
-                    Line::from(query)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(tr("ui.output.search.query")),
-                ),
-                chunks[0],
-            );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(output_search_filters(search)),
-                    Line::from(output_search_target(search)),
-                    Line::from(tr("ui.output.search.filter.keys")),
-                ])
-                .style(Style::default().fg(Color::LightCyan)),
-                chunks[1],
-            );
-            let message = if let Some(error) = search.error.as_deref() {
-                Line::from(Span::styled(
-                    safe_inline(error),
-                    Style::default().fg(Color::LightRed),
-                ))
-            } else if matches!(search.phase, OutputSearchPhase::Loading(_)) {
-                Line::from(Span::styled(
-                    tr("ui.output.search.loading"),
-                    Style::default().fg(Color::Yellow),
-                ))
+    let counter = output_search_quick_counter(search);
+    let query_width = inner
+        .width
+        .saturating_sub(UnicodeWidthStr::width(counter.as_str()) as u16);
+    let (query, cursor_column) = line_input_projection(&search.query, search.cursor, query_width);
+    let query = line_with_software_cursor(query, cursor_column, cursor_visible);
+    let mut first = query.spans;
+    first.push(Span::styled(
+        counter,
+        Style::default()
+            .fg(if local_output_search_total(search) == 0 {
+                Color::DarkGray
             } else {
-                Line::from(tr("ui.output.search.boundary.note"))
-            };
-            frame.render_widget(
-                Paragraph::new(message).wrap(Wrap { trim: false }),
-                chunks[2],
-            );
-            frame.render_widget(
-                Paragraph::new(tr("ui.output.search.edit.footer"))
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray)),
-                chunks[3],
-            );
-        }
-        OutputSearchPhase::Results => {
-            let detail_height = inner.height.saturating_div(3).clamp(3, 8);
-            let desired_footer_height = if search.partial { 5 } else { 2 };
-            // On short terminals retain room for the result list and detail;
-            // the compact integrity warning always remains the first row.
-            let footer_height = desired_footer_height.min(inner.height.saturating_sub(9).max(2));
-            let chunks = Layout::vertical([
-                Constraint::Length(4),
-                Constraint::Min(2),
-                Constraint::Length(detail_height),
-                Constraint::Length(footer_height),
-            ])
-            .split(inner);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(trf(
-                        "ui.output.search.result.query",
-                        &[&safe_inline(&search.query_text())],
-                    )),
-                    Line::from(output_search_filters(search)),
-                    Line::from(output_search_target(search)),
-                    Line::from(Span::styled(
-                        tr("ui.output.search.completion.block"),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ]),
-                chunks[0],
-            );
-            let visible = chunks[1].height as usize;
-            let start = search
-                .selected
-                .saturating_sub(visible.saturating_sub(1))
-                .min(search.results.len().saturating_sub(visible));
-            let rows = if search.results.is_empty() {
-                vec![Line::from(Span::styled(
-                    tr("ui.output.search.none"),
-                    Style::default().fg(Color::DarkGray),
-                ))]
-            } else {
-                search
-                    .results
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(visible)
-                    .map(|(index, event)| {
-                        let marker = if index == search.selected {
-                            "› "
-                        } else {
-                            "  "
-                        };
-                        Line::from(Span::styled(
-                            format!(
-                                "{marker}{}",
-                                output_search_event_summary(
-                                    event,
-                                    chunks[1].width.saturating_sub(2)
-                                )
-                            ),
-                            if index == search.selected {
-                                Style::default()
-                                    .fg(Color::LightCyan)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default()
-                            },
-                        ))
-                    })
-                    .collect()
-            };
-            frame.render_widget(Paragraph::new(rows), chunks[1]);
-            let detail = search.results.get(search.selected).map_or_else(
-                || tr("ui.output.search.no.detail").to_owned(),
-                format_event_plain,
-            );
-            frame.render_widget(
-                Paragraph::new(detail)
-                    .block(
-                        Block::default()
-                            .borders(Borders::TOP)
-                            .title(tr("ui.output.search.detail")),
-                    )
-                    .wrap(Wrap { trim: false })
-                    .scroll((search.detail_scroll.min(u16::MAX as usize) as u16, 0)),
-                chunks[2],
-            );
-            let footer = output_search_result_footer(search);
-            let integrity_style = if search.partial || !search.gaps.is_empty() {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let mut footer_lines = vec![
-                Line::from(Span::styled(footer.integrity, integrity_style)),
-                Line::from(Span::styled(
-                    footer.navigation,
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ];
-            if let Some(limits) = footer.limits {
-                footer_lines.push(Line::from(Span::styled(
-                    limits,
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            frame.render_widget(
-                Paragraph::new(footer_lines)
-                    .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: false }),
-                chunks[3],
-            );
-        }
-    }
+                Color::LightCyan
+            })
+            .add_modifier(Modifier::BOLD),
+    ));
+    let filters = output_search_filters(search);
+    let status = if let Some(error) = search.error.as_deref() {
+        Span::styled(safe_inline(error), Style::default().fg(Color::LightRed))
+    } else if search.partial {
+        Span::styled(
+            tr("ui.output.search.quick.partial"),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        Span::styled(
+            tr("ui.output.search.quick.keys"),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let lines = vec![
+        Line::from(first),
+        Line::from(Span::styled(
+            truncate_display(&filters, inner.width as usize),
+            Style::default().fg(Color::LightCyan),
+        )),
+        Line::from(status),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn output_search_quick_counter(search: &OutputSearchState) -> String {
+    let total = local_output_search_total(search);
+    let position = if total == 0 { 0 } else { search.selected + 1 };
+    let total = if search.partial && !search.query.is_empty() {
+        format!("{total}+")
+    } else {
+        total.to_string()
+    };
+    format!(" {position}/{total} ")
 }
 
 fn session_state_label(state: SessionState) -> &'static str {
@@ -10259,6 +10782,7 @@ struct OutputVisualRow {
     line: Line<'static>,
     daemon_epoch: Option<Uuid>,
     seq: u64,
+    entry_index: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -10387,6 +10911,30 @@ fn command_capture_for_target(
     target: &CommandEvidenceTarget,
     entries: &[&DisplayLine],
 ) -> CommandCapture {
+    if let Some((from_seq, through_seq)) = target.authoritative_range {
+        let relevant = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.daemon_epoch == Some(target.daemon_epoch)
+                    && entry.event_kind == EventKind::Rx
+                    && entry.seq >= from_seq
+                    && entry.seq <= through_seq
+                    && entry.run_boundary.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let start = relevant.iter().copied().min();
+        let end = relevant.iter().copied().max();
+        return CommandCapture {
+            start,
+            end,
+            command: target.command.clone(),
+            highlight_available: start.is_some() && end.is_some(),
+            sequence: target.seq_start,
+            incident_epoch: Some(target.daemon_epoch),
+        };
+    }
     let matchers = command_boundary_matchers(&target.matchers);
     let mut rx = entries
         .iter()
@@ -10593,6 +11141,8 @@ fn command_capture(app: &App, entries: &[&DisplayLine]) -> Option<CommandCapture
 
 const COMMAND_CAPTURE_BACKGROUND: Color = Color::Rgb(28, 53, 66);
 const COMMAND_FALLBACK_BACKGROUND: Color = Color::LightCyan;
+const OUTPUT_SEARCH_MATCH_BACKGROUND: Color = Color::Rgb(62, 54, 18);
+const OUTPUT_SEARCH_CURRENT_BACKGROUND: Color = Color::Rgb(120, 86, 8);
 
 fn command_capture_line(mut line: Line<'static>) -> Line<'static> {
     let background = COMMAND_CAPTURE_BACKGROUND;
@@ -10651,6 +11201,22 @@ fn wrap_command_fallback_line(command: &str, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn output_search_line(mut line: Line<'static>, current: bool, width: u16) -> Line<'static> {
+    let background = if current {
+        OUTPUT_SEARCH_CURRENT_BACKGROUND
+    } else {
+        OUTPUT_SEARCH_MATCH_BACKGROUND
+    };
+    line.style = line.style.patch(Style::default().bg(background));
+    for span in &mut line.spans {
+        span.style = span.style.patch(Style::default().bg(background));
+        if current {
+            span.style = span.style.add_modifier(Modifier::BOLD);
+        }
+    }
+    fill_visual_row_background(line, width, background)
+}
+
 fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec<OutputVisualRow> {
     if width == 0 {
         return Vec::new();
@@ -10660,6 +11226,17 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
     let shell_prompt = view.effective_shell_prompt();
     let uboot_prompt = view.effective_uboot_prompt();
     let source_width = detailed_source_width(width as usize);
+    let search_lines = app.output_search.as_ref().map(|search| {
+        let mut lines = HashMap::new();
+        for item in &search.matches {
+            let current = item.ordinal == search.selected;
+            lines
+                .entry(item.line_index)
+                .and_modify(|selected| *selected |= current)
+                .or_insert(current);
+        }
+        lines
+    });
     let mut rows = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if capture
@@ -10674,6 +11251,7 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
                         line,
                         daemon_epoch: None,
                         seq: capture.sequence,
+                        entry_index: None,
                     }),
             );
         }
@@ -10695,15 +11273,26 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
             uboot_prompt,
             width as usize,
         );
-        let visual_lines = if highlighted {
+        let mut visual_lines = if highlighted {
             wrap_command_capture_line(line, width)
         } else {
             wrap_timeline_line(line, width)
         };
+        let search_state = search_lines
+            .as_ref()
+            .and_then(|lines| lines.get(&index))
+            .copied();
+        if let Some(current) = search_state {
+            visual_lines = visual_lines
+                .into_iter()
+                .map(|line| output_search_line(line, current, width))
+                .collect();
+        }
         rows.extend(visual_lines.into_iter().map(|line| OutputVisualRow {
             line,
             daemon_epoch: entry.daemon_epoch,
             seq: entry.seq,
+            entry_index: Some(index),
         }));
     }
     if let Some(capture) = capture.filter(|capture| capture.start.is_none()) {
@@ -10714,6 +11303,7 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
                     line,
                     daemon_epoch: None,
                     seq: capture.sequence,
+                    entry_index: None,
                 }),
         );
     }
@@ -10852,7 +11442,7 @@ fn command_evidence_snapshot(
     ) {
         return None;
     }
-    if target.matchers.is_empty() {
+    if target.matchers.is_empty() && target.authoritative_range.is_none() {
         return Some(ScrollSnapshot {
             rows: wrap_command_fallback_line(&target.command, width),
         });
@@ -12106,7 +12696,6 @@ fn help_lines(_app: &App) -> Vec<Line<'static>> {
         Line::default(),
         help_heading("help.group.line"),
         help_shortcut("help.key.enter", "help.desc.enter"),
-        help_shortcut("help.key.alt.enter", "help.desc.alt.enter"),
         help_shortcut("help.key.input.search", "help.desc.input.search"),
         help_shortcut("help.key.complete", "help.desc.complete"),
         help_shortcut("help.key.paste", "help.desc.paste"),
@@ -13036,6 +13625,7 @@ fn find_history_match(history: &[String], query: &str, before: Option<usize>) ->
         .rposition(|entry| entry.contains(query))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn output_search_filter(
     query: &str,
     matcher: OutputSearchMatcher,
@@ -13049,6 +13639,202 @@ fn output_search_filter(
         (OutputSearchMatcher::Regex, true) => (None, Some(query.to_owned())),
         (OutputSearchMatcher::Regex, false) => (None, Some(format!("(?i:{query})"))),
     }
+}
+
+fn local_output_search_index(
+    view: &SlotView,
+    query: &str,
+    matcher: OutputSearchMatcher,
+    case_sensitive: bool,
+    direction: OutputSearchDirection,
+    scope: OutputSearchScope,
+    current_run: Option<OutputSearchRun>,
+) -> Result<LocalOutputSearchIndex, String> {
+    let pattern = match matcher {
+        OutputSearchMatcher::Literal => regex::escape(query),
+        OutputSearchMatcher::Regex => query.to_owned(),
+    };
+    // Compile exactly once per query.  Compiling per serial event was the
+    // primary avoidable CPU cost in the old search path.
+    let expression = regex::RegexBuilder::new(&pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|error| safe_inline(&error.to_string()))?;
+    if expression.is_match("") {
+        return Err(tr("ui.output.search.zero.width").into());
+    }
+    let line_offset = usize::from(view.local_history_truncated);
+    let mut lines = Vec::new();
+    let mut total_matches = 0usize;
+    let mut scanned_lines = 0usize;
+    let mut scanned_bytes = 0usize;
+    for (index, line) in view
+        .lines
+        .iter()
+        .chain(view.pending_line.iter())
+        .enumerate()
+    {
+        if !local_output_search_line_allowed(view, line, direction, scope, current_run) {
+            continue;
+        }
+        scanned_lines += 1;
+        scanned_bytes = scanned_bytes.saturating_add(line.text.len());
+        let mut match_count = 0usize;
+        for found in expression.find_iter(&line.text) {
+            if found.start() == found.end() {
+                return Err(tr("ui.output.search.zero.width").into());
+            }
+            match_count += 1;
+        }
+        if match_count == 0 {
+            continue;
+        }
+        // Every retained match consumes at least one byte (zero-width regexes
+        // are rejected above), so MAX_BYTES_PER_SLOT also proves this exact
+        // addition cannot overflow usize.
+        total_matches += match_count;
+        lines.push(OutputSearchLineIndex {
+            source_line_index: index,
+            rendered_line_index: index + line_offset,
+            match_count,
+            cumulative_end: total_matches,
+        });
+    }
+    Ok(LocalOutputSearchIndex {
+        expression,
+        lines,
+        total_matches,
+        scanned_lines,
+        scanned_bytes,
+    })
+}
+
+fn local_output_search_line_allowed(
+    view: &SlotView,
+    line: &DisplayLine,
+    direction: OutputSearchDirection,
+    scope: OutputSearchScope,
+    current_run: Option<OutputSearchRun>,
+) -> bool {
+    let allowed_direction = match direction {
+        OutputSearchDirection::Both => matches!(line.event_kind, EventKind::Rx | EventKind::Tx),
+        OutputSearchDirection::Rx => line.event_kind == EventKind::Rx,
+        OutputSearchDirection::Tx => line.event_kind == EventKind::Tx,
+    };
+    allowed_direction
+        && match scope {
+            OutputSearchScope::CurrentEpoch => {
+                line.daemon_epoch == Some(view.snapshot.daemon_epoch)
+            }
+            OutputSearchScope::Retained => true,
+            OutputSearchScope::CurrentRun => current_run.is_some_and(|run| {
+                line.daemon_epoch == Some(view.snapshot.daemon_epoch)
+                    && line.seq >= run.start_seq
+                    && line.seq <= run.through_seq
+            }),
+        }
+}
+
+fn output_search_source_line(view: &SlotView, index: usize) -> Option<&DisplayLine> {
+    view.lines.get(index).or_else(|| {
+        (index == view.lines.len())
+            .then_some(view.pending_line.as_ref())
+            .flatten()
+    })
+}
+
+fn materialize_output_search_page(
+    view: &SlotView,
+    index: &LocalOutputSearchIndex,
+    selected: usize,
+) -> Vec<OutputSearchMatch> {
+    if index.total_matches == 0 {
+        return Vec::new();
+    }
+    let selected = selected.min(index.total_matches - 1);
+    let page_start = (selected / OUTPUT_SEARCH_LOCAL_MATCH_PAGE) * OUTPUT_SEARCH_LOCAL_MATCH_PAGE;
+    let page_end = page_start
+        .saturating_add(OUTPUT_SEARCH_LOCAL_MATCH_PAGE)
+        .min(index.total_matches);
+    let first_line = index
+        .lines
+        .partition_point(|line| line.cumulative_end <= page_start);
+    let mut matches = Vec::with_capacity(page_end - page_start);
+    for indexed_line in &index.lines[first_line..] {
+        let line_start = indexed_line
+            .cumulative_end
+            .saturating_sub(indexed_line.match_count);
+        if line_start >= page_end {
+            break;
+        }
+        let Some(line) = output_search_source_line(view, indexed_line.source_line_index) else {
+            break;
+        };
+        let local_start = page_start.saturating_sub(line_start);
+        let local_end = (page_end - line_start).min(indexed_line.match_count);
+        matches.extend(
+            index
+                .expression
+                .find_iter(&line.text)
+                .filter(|found| found.start() < found.end())
+                .enumerate()
+                .skip(local_start)
+                .take(local_end.saturating_sub(local_start))
+                .map(|(local_ordinal, found)| OutputSearchMatch {
+                    ordinal: line_start + local_ordinal,
+                    line_index: indexed_line.rendered_line_index,
+                    byte_start: found.start(),
+                    byte_end: found.end(),
+                    daemon_epoch: line.daemon_epoch,
+                    seq: line.seq,
+                }),
+        );
+    }
+    matches
+}
+
+fn locate_output_search_anchor(
+    view: &SlotView,
+    index: &LocalOutputSearchIndex,
+    anchor: OutputSearchMatch,
+) -> Option<usize> {
+    let locate = |indexed_line: &OutputSearchLineIndex| {
+        let line = output_search_source_line(view, indexed_line.source_line_index)?;
+        if line.daemon_epoch != anchor.daemon_epoch || line.seq != anchor.seq {
+            return None;
+        }
+        let line_start = indexed_line
+            .cumulative_end
+            .saturating_sub(indexed_line.match_count);
+        index
+            .expression
+            .find_iter(&line.text)
+            .filter(|found| found.start() < found.end())
+            .enumerate()
+            .find(|(_, found)| found.start() == anchor.byte_start && found.end() == anchor.byte_end)
+            .map(|(local_ordinal, _)| line_start + local_ordinal)
+    };
+    index
+        .lines
+        .iter()
+        .find(|line| line.rendered_line_index == anchor.line_index)
+        .and_then(locate)
+        .or_else(|| index.lines.iter().find_map(locate))
+}
+
+fn local_output_search_total(search: &OutputSearchState) -> usize {
+    search
+        .local_index
+        .as_ref()
+        .map_or(0, |index| index.total_matches)
+}
+
+fn current_output_search_match(search: &OutputSearchState) -> Option<OutputSearchMatch> {
+    search
+        .matches
+        .iter()
+        .find(|item| item.ordinal == search.selected)
+        .copied()
 }
 
 fn raw_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
@@ -13100,10 +13886,7 @@ fn raw_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{BTreeMap, HashSet},
-        sync::Mutex,
-    };
+    use std::{collections::BTreeMap, sync::Mutex};
 
     use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
@@ -13123,6 +13906,42 @@ mod tests {
 
     fn accept_clipboard_copy(_text: &str) -> Result<()> {
         Ok(())
+    }
+
+    fn flush_output_search_debounce(app: &mut App) {
+        let due = app
+            .output_search
+            .as_ref()
+            .expect("output search")
+            .last_document_refresh
+            + OUTPUT_SEARCH_REFRESH_INTERVAL;
+        app.refresh_output_search_if_due(due);
+    }
+
+    fn retained_output_line(epoch: Uuid, seq: u64, text: String) -> DisplayLine {
+        let bytes = text.len();
+        DisplayLine {
+            daemon_epoch: Some(epoch),
+            seq,
+            event_kind: EventKind::Rx,
+            source: "RX".into(),
+            text,
+            source_style: Style::default(),
+            marker_color: None,
+            solid_style: None,
+            run_boundary: None,
+            echoed: false,
+            bytes,
+        }
+    }
+
+    fn fill_retained_output(app: &mut App, count: usize, text: &str) {
+        let epoch = app.current().snapshot.daemon_epoch;
+        for offset in 0..count {
+            let line = retained_output_line(epoch, offset as u64 + 1, text.to_owned());
+            app.ports[0].buffered_bytes += line.bytes;
+            app.ports[0].lines.push_back(line);
+        }
     }
 
     #[test]
@@ -13167,9 +13986,21 @@ mod tests {
             &commands,
         );
 
-        let (_, data, operation_id) = take_write(&mut received);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("immediate ETX Human command")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand {
+            data, operation_id, ..
+        } = message
+        else {
+            panic!("LINE Ctrl-C must not use Write/AcquireControl")
+        };
         assert_eq!(data, vec![0x03]);
         assert_eq!(operation_id, None);
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
         assert!(app.current().draft.is_empty());
         assert_eq!(app.current().draft_cursor, 0);
         assert_eq!(app.current().scroll_from_bottom, 0);
@@ -13198,9 +14029,21 @@ mod tests {
             &commands,
         );
 
-        let (_, data, operation_id) = take_write(&mut received);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("immediate ETX Human command")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand {
+            data, operation_id, ..
+        } = message
+        else {
+            panic!("RAW Ctrl-C must not use Write/AcquireControl")
+        };
         assert_eq!(data, vec![0x03]);
         assert_eq!(operation_id, None);
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
         assert_eq!(app.current_mode(), InputMode::Raw);
         assert!(!app.should_quit);
     }
@@ -13652,14 +14495,20 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_keeps_sent_unacknowledged_write_warning_visible() {
+    fn disconnect_marks_fenced_and_human_write_outcomes_uncertain() {
         let mut app = App::new(vec![snapshot()], None);
         app.pending_requests.insert(
             Uuid::new_v4(),
             PendingRequest::Write {
                 port: "COM3".into(),
                 operation_id: Some(Uuid::new_v4()),
-                cooperative: false,
+            },
+        );
+        app.pending_requests.insert(
+            Uuid::new_v4(),
+            PendingRequest::HumanCommand {
+                port: "COM3".into(),
+                recovery: HumanCommandRecovery::None,
             },
         );
         let (commands, _) = mpsc::channel(4);
@@ -13675,7 +14524,7 @@ mod tests {
             &commands,
         );
 
-        assert_eq!(app.uncertain_write_outcomes, 1);
+        assert_eq!(app.uncertain_write_outcomes, 2);
         assert!(app.pending_requests.is_empty());
     }
 
@@ -13741,74 +14590,121 @@ mod tests {
     }
 
     #[test]
-    fn raw_queue_is_not_lossily_converted_into_a_line_draft() {
-        let _guard = crate::i18n::lang_test_lock();
+    fn raw_keys_are_immediate_human_commands_and_never_request_queued_control() {
         let mut app = ready_app_with_foreign_control();
-        let (commands, _received) = mpsc::channel(4);
-        assert!(app.request_raw_write(&commands, vec![0x03]));
+        let agent = app.ports[0]
+            .snapshot
+            .control
+            .as_ref()
+            .expect("Agent control")
+            .owner
+            .clone();
+        let mut run = agent_run("interactive diagnosis");
+        run.owner = agent;
+        app.ports[0].snapshot.active_run = Some(run);
+        app.ports[0].mode = InputMode::Raw;
+        let (commands, mut received) = mpsc::channel(8);
 
-        app.remove_last_queued_line(true, &commands);
-
-        assert_eq!(app.pending_writes["COM3"][0].data, vec![0x03]);
-        assert!(app.ports[0].draft.is_empty());
-        assert_eq!(app.status, tr("st.queue.raw.only"));
-    }
-
-    #[test]
-    fn one_hundred_queued_raw_characters_coalesce_into_one_unsent_block() {
-        let mut app = ready_app_with_foreign_control();
-        let (commands, mut received) = mpsc::channel(4);
-        let expected = (0..100)
-            .map(|index| b'a' + (index % 26) as u8)
-            .collect::<Vec<_>>();
-
-        for &byte in &expected {
-            assert!(app.request_raw_write(&commands, vec![byte]));
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        ] {
+            app.handle_raw_key(key, &commands);
         }
 
-        let queued = app.pending_writes.get("COM3").expect("queued RAW data");
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].data, expected);
-        assert_eq!(queued[0].kind, PendingWriteKind::Raw);
-        let NetworkCommand::Send { message, .. } =
-            received.try_recv().expect("one queued control request")
-        else {
-            panic!("expected control request")
-        };
-        assert!(matches!(message, ClientMessage::AcquireControl { .. }));
+        for expected in [b"\r".as_slice(), b"x".as_slice(), b"\x1b[A".as_slice()] {
+            let NetworkCommand::Send { message, .. } =
+                received.try_recv().expect("immediate Human command")
+            else {
+                panic!("expected outbound Human command")
+            };
+            let ClientMessage::SendHumanCommand {
+                data,
+                expected_generation,
+                operation_id,
+                ..
+            } = message
+            else {
+                panic!("RAW input must not acquire or queue control")
+            };
+            assert_eq!(data, expected);
+            assert_eq!(expected_generation, 1);
+            assert_eq!(operation_id, None);
+        }
         assert!(received.try_recv().is_err());
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(!app.queued_controls.contains_key("COM3"));
+        assert_eq!(
+            app.pending_requests
+                .values()
+                .filter(|request| matches!(request, PendingRequest::HumanCommand { .. }))
+                .count(),
+            3
+        );
+        assert!(!app.pending_requests.values().any(|request| matches!(
+            request,
+            PendingRequest::Acquire {
+                mode: ControlMode::Queue,
+                ..
+            }
+        )));
     }
 
     #[test]
-    fn raw_queue_capacity_rejects_the_whole_new_input_without_partial_append() {
+    fn prefix_escape_byte_is_an_immediate_human_command() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            &commands,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+            &commands,
+        );
+
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("immediate prefix escape")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand {
+            data, operation_id, ..
+        } = message
+        else {
+            panic!("prefix escape must not use Write/AcquireControl")
+        };
+        assert_eq!(data, vec![0x1d]);
+        assert_eq!(operation_id, None);
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
+    }
+
+    #[test]
+    fn oversized_raw_input_is_rejected_without_queueing_or_partial_send() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_foreign_control();
-        let (commands, _received) = mpsc::channel(4);
+        let (commands, mut received) = mpsc::channel(4);
 
-        assert!(
-            app.request_raw_write(&commands, vec![b'x'; MAX_PENDING_BYTES]),
-            "queue rejected its documented exact capacity: {}",
-            app.status
+        assert!(!app.request_raw_write(&commands, vec![b'x'; MAX_WRITE_BYTES + 1]));
+
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_requests.is_empty());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
+        assert_eq!(
+            app.status,
+            trf(
+                "st.human.command.too.long",
+                &[
+                    &(MAX_WRITE_BYTES + 1).to_string(),
+                    &MAX_WRITE_BYTES.to_string()
+                ]
+            )
         );
-        let before = app
-            .pending_writes
-            .get("COM3")
-            .expect("full bounded RAW queue")
-            .iter()
-            .map(|write| write.data.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(before.len(), MAX_PENDING_WRITES);
-
-        assert!(!app.request_raw_write(&commands, vec![b'y']));
-        let after = app
-            .pending_writes
-            .get("COM3")
-            .expect("previous accepted RAW queue remains authoritative")
-            .iter()
-            .map(|write| write.data.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(after, before);
-        assert_eq!(app.status, tr("st.writeq.full"));
     }
 
     #[test]
@@ -13899,9 +14795,10 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_line_paste_is_one_ordered_chunked_write() {
+    fn oversized_confirmed_line_paste_is_retained_without_partial_send() {
+        let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
-        let (commands, mut received) = mpsc::channel(8);
+        let (commands, mut received) = mpsc::channel(4);
         app.pending_paste = Some(PendingPaste {
             port: "COM3".into(),
             bytes: vec![b'x'; MAX_WRITE_BYTES + 1],
@@ -13910,31 +14807,27 @@ mod tests {
 
         app.confirm_paste(&commands);
 
-        let (first_id, first_data, operation_id) = take_write(&mut received);
-        assert_eq!(first_data, vec![b'x'; MAX_WRITE_BYTES]);
-        let operation_id = operation_id.expect("line paste operation ID");
-        assert_eq!(app.pending_writes["COM3"].len(), 2);
-
-        app.handle_result(
-            first_id,
-            CommandResult::WriteAccepted { event_seq: 1 },
-            &commands,
+        assert!(received.try_recv().is_err());
+        let paste = app.pending_paste.as_ref().expect("paste remains retryable");
+        assert_eq!(paste.port, "COM3");
+        assert_eq!(paste.bytes, vec![b'x'; MAX_WRITE_BYTES + 1]);
+        assert!(!paste.raw);
+        assert!(app.pending_requests.is_empty());
+        assert!(app.pending_writes.is_empty());
+        assert_eq!(
+            app.status,
+            trf(
+                "st.human.command.too.long",
+                &[
+                    &(MAX_WRITE_BYTES + 2).to_string(),
+                    &MAX_WRITE_BYTES.to_string()
+                ]
+            )
         );
-        let (second_id, second_data, second_operation) = take_write(&mut received);
-        assert_ne!(first_id, second_id);
-        assert_eq!(second_data, b"x\r");
-        assert_eq!(second_operation, Some(operation_id));
-        assert_eq!(app.pending_writes["COM3"].len(), 2);
-        app.handle_result(
-            second_id,
-            CommandResult::WriteAccepted { event_seq: 2 },
-            &commands,
-        );
-        assert!(!app.pending_writes.contains_key("COM3"));
     }
 
     #[test]
-    fn confirmed_multiline_paste_assigns_each_command_a_distinct_operation() {
+    fn confirmed_multiline_paste_is_one_atomic_human_command() {
         let mut app = ready_app_with_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
@@ -13945,26 +14838,42 @@ mod tests {
 
         app.confirm_paste(&commands);
 
-        let (first_id, first_data, first_operation) = take_write(&mut received);
-        let first_operation = first_operation.expect("first line paste operation ID");
-        assert_eq!(first_data, b"pwd\r");
-        assert_eq!(app.pending_writes["COM3"].len(), 2);
-
-        app.handle_result(
-            first_id,
-            CommandResult::WriteAccepted { event_seq: 1 },
-            &commands,
-        );
-        let (_, second_data, second_operation) = take_write(&mut received);
-        assert_eq!(second_data, b"version\r");
-        assert!(second_operation.is_some());
-        assert_ne!(second_operation, Some(first_operation));
-        assert_eq!(app.pending_writes["COM3"].len(), 1);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("atomic Human paste command")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand {
+            data,
+            expected_generation,
+            operation_id,
+            ..
+        } = message
+        else {
+            panic!("LINE paste must not use Write/AcquireControl")
+        };
+        assert_eq!(data, b"pwd\rversion\r");
+        assert_eq!(expected_generation, 1);
+        assert!(operation_id.is_some());
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_paste.is_none());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
     }
 
     #[test]
-    fn foreign_control_multiline_paste_creates_oldest_first_independent_cards() {
+    fn foreign_agent_control_multiline_paste_never_acquires_or_queues_control() {
         let mut app = ready_app_with_foreign_control();
+        let agent = app.ports[0]
+            .snapshot
+            .control
+            .as_ref()
+            .expect("Agent control")
+            .owner
+            .clone();
+        let mut run = agent_run("interactive diagnosis");
+        run.owner = agent;
+        app.ports[0].snapshot.active_run = Some(run);
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
             port: "COM3".into(),
@@ -13974,45 +14883,36 @@ mod tests {
 
         app.confirm_paste(&commands);
 
-        let NetworkCommand::Send { message, .. } = received.try_recv().expect("queue-mode acquire")
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("cooperative Human command")
         else {
-            panic!("expected queue-mode acquire")
+            panic!("expected outbound Human command")
         };
-        assert!(matches!(
-            message,
-            ClientMessage::AcquireControl {
+        let ClientMessage::SendHumanCommand {
+            data,
+            expected_generation,
+            ..
+        } = message
+        else {
+            panic!("paste must not acquire or queue control")
+        };
+        assert_eq!(data, b"first\rsecond\rthird\r");
+        assert_eq!(expected_generation, 1);
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
+        assert!(!app.pending_requests.values().any(|request| matches!(
+            request,
+            PendingRequest::Acquire {
                 mode: ControlMode::Queue,
                 ..
             }
-        ));
-        assert!(received.try_recv().is_err());
-
-        let operations = queued_line_operations(&app.pending_writes["COM3"]);
-        assert_eq!(operations.len(), 3);
-        assert_eq!(operations[0].data, b"first\r");
-        assert_eq!(operations[1].data, b"second\r");
-        assert_eq!(operations[2].data, b"third\r");
-        let ids = operations
-            .iter()
-            .map(|operation| operation.operation_id.expect("LINE operation ID"))
-            .collect::<HashSet<_>>();
-        assert_eq!(ids.len(), 3);
-
-        app.remove_queued_line_operation(1, true, &commands);
-        assert_eq!(app.current().draft.iter().collect::<String>(), "second");
-        let remaining = queued_line_operations(&app.pending_writes["COM3"])
-            .into_iter()
-            .map(|operation| operation.data)
-            .collect::<Vec<_>>();
-        assert_eq!(remaining, vec![b"first\r".to_vec(), b"third\r".to_vec()]);
-        assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Acquire { port, .. } if port == "COM3")
-        ));
+        )));
     }
 
     #[test]
-    fn confirmed_raw_paste_preserves_one_unmodified_burst() {
-        let mut app = ready_app_with_control();
+    fn confirmed_raw_paste_is_one_unmodified_immediate_human_command() {
+        let mut app = ready_app_with_foreign_control();
         let (commands, mut received) = mpsc::channel(8);
         app.pending_paste = Some(PendingPaste {
             port: "COM3".into(),
@@ -14022,10 +14922,163 @@ mod tests {
 
         app.confirm_paste(&commands);
 
-        let (_, data, operation_id) = take_write(&mut received);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("immediate RAW paste")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand {
+            data, operation_id, ..
+        } = message
+        else {
+            panic!("RAW paste must not use Write/AcquireControl")
+        };
         assert_eq!(data, b"pwd\nversion\n");
         assert_eq!(operation_id, None);
-        assert!(app.pending_writes.contains_key("COM3"));
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_paste.is_none());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
+    }
+
+    #[test]
+    fn short_raw_paste_is_immediate_and_does_not_append_an_eol() {
+        let mut app = ready_app_with_foreign_control();
+        app.ports[0].mode = InputMode::Raw;
+        app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_paste("abc".into(), &commands);
+
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("immediate short RAW paste")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand {
+            data, operation_id, ..
+        } = message
+        else {
+            panic!("short RAW paste must not use Write/AcquireControl")
+        };
+        assert_eq!(data, b"abc");
+        assert_eq!(operation_id, None);
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_paste.is_none());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
+    }
+
+    #[test]
+    fn rejected_human_paste_is_restored_for_an_explicit_retry() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(8);
+        app.pending_paste = Some(PendingPaste {
+            port: "COM3".into(),
+            bytes: b"first\nsecond\n".to_vec(),
+            raw: false,
+        });
+
+        app.confirm_paste(&commands);
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("submitted paste")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let request_id = match message {
+            ClientMessage::SendHumanCommand { request_id, .. } => request_id,
+            _ => panic!("paste must use SendHumanCommand"),
+        };
+        assert!(app.pending_paste.is_none());
+
+        app.handle_server_message(
+            ServerMessage::Error {
+                request_id: Some(request_id),
+                code: serial_protocol::ErrorCode::PortOffline,
+                message: "control changed".into(),
+                retryable: true,
+            },
+            &commands,
+        );
+
+        let restored = app.pending_paste.as_ref().expect("rejected paste restored");
+        assert_eq!(restored.port, "COM3");
+        assert_eq!(restored.bytes, b"first\nsecond\n");
+        assert!(!restored.raw);
+        assert!(app.pending_writes.is_empty());
+    }
+
+    #[test]
+    fn uncertain_human_paste_is_not_restored_or_automatically_resent() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(8);
+        app.pending_paste = Some(PendingPaste {
+            port: "COM3".into(),
+            bytes: b"might have run\n".to_vec(),
+            raw: false,
+        });
+
+        app.confirm_paste(&commands);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("submitted Human paste")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let request_id = match message {
+            ClientMessage::SendHumanCommand { request_id, .. } => request_id,
+            _ => panic!("paste must use SendHumanCommand"),
+        };
+
+        app.handle_server_message(
+            ServerMessage::Error {
+                request_id: Some(request_id),
+                code: serial_protocol::ErrorCode::WriteOutcomeUncertain,
+                message: "serial writer acknowledgement was lost".into(),
+                // The error code is authoritative even if an older daemon
+                // accidentally marks the envelope retryable.
+                retryable: true,
+            },
+            &commands,
+        );
+
+        assert!(app.pending_paste.is_none());
+        assert_eq!(app.uncertain_write_outcomes, 1);
+        assert!(app.pending_requests.is_empty());
+        assert!(app.pending_writes.is_empty());
+        assert!(received.try_recv().is_err(), "uncertain paste was resent");
+        assert_eq!(
+            app.status,
+            trf(
+                "st.write.outcome.uncertain",
+                &["serial writer acknowledgement was lost"]
+            )
+        );
+    }
+
+    #[test]
+    fn locally_unsent_human_paste_stays_available_when_outbound_is_full() {
+        let mut app = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(1);
+        commands
+            .try_send(NetworkCommand::Shutdown)
+            .expect("fill outbound channel");
+        app.pending_paste = Some(PendingPaste {
+            port: "COM3".into(),
+            bytes: b"retry me\n".to_vec(),
+            raw: true,
+        });
+
+        app.confirm_paste(&commands);
+
+        let restored = app.pending_paste.as_ref().expect("unsent paste retained");
+        assert_eq!(restored.port, "COM3");
+        assert_eq!(restored.bytes, b"retry me\n");
+        assert!(restored.raw);
+        assert!(matches!(received.try_recv(), Ok(NetworkCommand::Shutdown)));
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_requests.is_empty());
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
     }
 
     #[test]
@@ -14540,19 +15593,15 @@ mod tests {
     fn output_search_integrity_warning_is_visible_before_navigation_at_80_columns() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = App::new(vec![snapshot()], None);
+        app.ports[0].local_history_truncated = true;
         app.open_output_search();
-        let search = app.output_search.as_mut().expect("search");
-        search.query = "boot failure".chars().collect();
-        search.phase = OutputSearchPhase::Results;
-        search.results = vec![event(EventKind::Rx, Direction::Rx, 1, b"boot failure")];
-        search.partial = true;
-        search.scanned_archives = 4;
-        search.gaps.push(GapRange {
-            epoch: search.current_epoch,
-            first_seq: 10,
-            last_seq: 12,
-            reason: serial_protocol::GapReason::Retention,
-        });
+        for character in "boot failure".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -14564,13 +15613,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        let integrity = rendered
-            .find("PARTIAL · 1 journal gap(s)")
-            .expect("compact partial/gap warning remains visible at 80 columns");
-        let navigation = rendered
-            .find("1/1 · 4 archives")
-            .expect("navigation is rendered on its own following line");
-        assert!(integrity < navigation);
+        assert!(
+            rendered.contains("older local output was evicted"),
+            "the quick-find widget must disclose local retention loss"
+        );
     }
 
     #[test]
@@ -14749,16 +15795,20 @@ mod tests {
     }
 
     #[test]
-    fn output_search_prefix_builds_run_scoped_query_and_plain_escape_cancels_loading() {
+    fn output_search_prefix_matches_display_rows_immediately_and_escape_closes() {
         let mut current = snapshot();
         current.head_seq = 80;
         let mut run = agent_run("inspect boot");
         run.start_seq = 20;
         current.active_run = Some(run.clone());
         let mut app = App::new(vec![current], None);
-        let (search_commands, mut received) = mpsc::channel(4);
-        app.output_search_commands = Some(search_commands);
         let (network_commands, _network_rx) = mpsc::channel(1);
+        let mut first = event(EventKind::Rx, Direction::Rx, 25, b"Error one\n");
+        first.daemon_epoch = app.current().snapshot.daemon_epoch;
+        let mut second = event(EventKind::Rx, Direction::Rx, 30, b"Error two\n");
+        second.daemon_epoch = app.current().snapshot.daemon_epoch;
+        app.ports[0].push_event(first, true);
+        app.ports[0].push_event(second, true);
 
         app.handle_prefix_key(
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
@@ -14770,95 +15820,65 @@ mod tests {
                 KeyModifiers::NONE,
             ));
         }
-        app.handle_output_search_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
-        app.handle_output_search_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
-        app.handle_output_search_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
-        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        flush_output_search_debounce(&mut app);
+        let search = app.output_search.as_ref().expect("quick find");
+        assert_eq!(search.matches.len(), 2);
+        assert_eq!(search.selected, 1, "quick find starts at the newest match");
+        assert_eq!(search.current_run.map(|scope| scope.id), Some(run.id));
 
-        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("journal query")
-        else {
-            panic!("expected a search query");
-        };
-        assert_eq!(request.scope, OutputSearchScope::CurrentRun);
-        assert_eq!(request.direction, OutputSearchDirection::Rx);
-        assert_eq!(request.current_run.map(|scope| scope.id), Some(run.id));
-        assert_eq!(request.contains, None);
-        assert_eq!(request.regex.as_deref(), Some("(?i:Error)"));
-        assert!(matches!(
-            app.output_search.as_ref().map(|search| search.phase),
-            Some(OutputSearchPhase::Loading(id)) if id == request.request_id
-        ));
-
-        // The Esc arm must not inherit the Ctrl-C guard.
         app.handle_output_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.output_search.is_none());
-        assert!(matches!(
-            received.try_recv(),
-            Ok(OutputSearchIoCommand::Cancel { request_id }) if request_id == request.request_id
-        ));
     }
 
     #[test]
-    fn output_search_submit_refreshes_the_current_epoch_head() {
+    fn output_search_typing_refreshes_the_current_epoch_head() {
         let mut current = snapshot();
         current.head_seq = 100;
         let epoch = current.daemon_epoch;
         let mut app = App::new(vec![current], None);
         app.open_output_search();
-        let (commands, mut received) = mpsc::channel(2);
-        app.output_search_commands = Some(commands);
-        {
-            let search = app.output_search.as_mut().expect("search");
-            search.query = "needle".chars().collect();
-            search.cursor = search.query.len();
-        }
         app.ports[0].snapshot.head_seq = 101;
 
-        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for character in "needle".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
 
-        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("query") else {
-            panic!("expected query");
-        };
-        assert_eq!(request.current_epoch, epoch);
-        assert_eq!(request.head_seq, 101);
-        let search = app.output_search.as_ref().expect("loading search");
+        let search = app.output_search.as_ref().expect("quick find");
+        assert_eq!(search.current_epoch, epoch);
         assert_eq!(search.head_seq, 101);
-        assert!(output_search_target(search).contains("#101"));
     }
 
     #[test]
-    fn output_search_submit_switches_to_the_new_authoritative_epoch() {
+    fn output_search_typing_switches_to_the_new_authoritative_epoch() {
         let mut current = snapshot();
         current.head_seq = 100;
         let old_epoch = current.daemon_epoch;
         let mut app = App::new(vec![current], None);
         app.open_output_search();
-        let (commands, mut received) = mpsc::channel(2);
-        app.output_search_commands = Some(commands);
-        {
-            let search = app.output_search.as_mut().expect("search");
-            search.query = "boot".chars().collect();
-            search.cursor = search.query.len();
-        }
         let new_epoch = Uuid::new_v4();
         app.ports[0].snapshot.daemon_epoch = new_epoch;
         app.ports[0].snapshot.head_seq = 7;
 
-        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for character in "boot".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
 
-        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("query") else {
-            panic!("expected query");
-        };
-        assert_ne!(request.current_epoch, old_epoch);
-        assert_eq!(request.current_epoch, new_epoch);
-        assert_eq!(request.head_seq, 7);
-        let search = app.output_search.as_ref().expect("loading search");
+        let search = app.output_search.as_ref().expect("quick find");
+        assert_ne!(search.current_epoch, old_epoch);
         assert_eq!(search.current_epoch, new_epoch);
-        assert!(output_search_target(search).contains(&new_epoch.to_string()[..8]));
+        assert_eq!(search.head_seq, 7);
     }
 
     #[test]
-    fn output_search_run_scope_rebinds_to_the_active_run_on_every_submit() {
+    fn output_search_run_scope_rebinds_to_the_active_run_on_every_edit() {
         let _guard = crate::i18n::lang_test_lock();
         let mut current = snapshot();
         current.head_seq = 100;
@@ -14867,43 +15887,48 @@ mod tests {
         current.active_run = Some(first_run.clone());
         let mut app = App::new(vec![current], None);
         app.open_output_search();
-        let (commands, mut received) = mpsc::channel(2);
-        app.output_search_commands = Some(commands);
         {
             let search = app.output_search.as_mut().expect("search");
             search.scope = OutputSearchScope::CurrentRun;
-            search.query = "login".chars().collect();
-            search.cursor = search.query.len();
         }
         let mut replacement = agent_run("replacement");
         replacement.start_seq = 105;
         app.ports[0].snapshot.active_run = Some(replacement.clone());
         app.ports[0].snapshot.head_seq = 120;
+        let mut matching = event(EventKind::Rx, Direction::Rx, 110, b"login ready\n");
+        matching.daemon_epoch = app.current().snapshot.daemon_epoch;
+        app.ports[0].push_event(matching, true);
 
-        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for character in "login".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
 
-        let OutputSearchIoCommand::Query(request) = received.try_recv().expect("query") else {
-            panic!("expected query");
-        };
         assert_ne!(replacement.id, first_run.id);
-        assert_eq!(request.current_run.map(|run| run.id), Some(replacement.id));
-        assert_eq!(request.current_run.map(|run| run.start_seq), Some(105));
-        assert_eq!(request.current_run.map(|run| run.through_seq), Some(120));
+        let search = app.output_search.as_ref().expect("quick find");
+        assert_eq!(search.current_run.map(|run| run.id), Some(replacement.id));
+        assert_eq!(search.current_run.map(|run| run.start_seq), Some(105));
+        assert_eq!(search.current_run.map(|run| run.through_seq), Some(120));
+        assert_eq!(search.matches.len(), 1);
 
         let mut without_run = snapshot();
         without_run.head_seq = 121;
         let mut app = App::new(vec![without_run], None);
         app.open_output_search();
-        let (commands, mut no_query) = mpsc::channel(1);
-        app.output_search_commands = Some(commands);
         {
             let search = app.output_search.as_mut().expect("search");
             search.scope = OutputSearchScope::CurrentRun;
-            search.query = "login".chars().collect();
-            search.cursor = search.query.len();
         }
-        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(no_query.try_recv().is_err());
+        for character in "login".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
         assert!(
             app.output_search
                 .as_ref()
@@ -14913,36 +15938,357 @@ mod tests {
     }
 
     #[test]
-    fn output_search_results_navigate_records_and_scroll_selected_detail() {
+    fn output_search_results_navigate_cyclically_between_display_matches() {
         let mut app = App::new(vec![snapshot()], None);
+        let epoch = app.current().snapshot.daemon_epoch;
+        let mut first = event(EventKind::Rx, Direction::Rx, 1, b"needle older\n");
+        first.daemon_epoch = epoch;
+        let mut second = event(EventKind::Rx, Direction::Rx, 2, b"needle newest\n");
+        second.daemon_epoch = epoch;
+        app.ports[0].push_event(first, true);
+        app.ports[0].push_event(second, true);
         app.open_output_search();
-        let request_id = Uuid::new_v4();
-        app.output_search.as_mut().expect("search").phase = OutputSearchPhase::Loading(request_id);
-        let first = event(EventKind::Rx, Direction::Rx, 2, b"newest match");
-        let second = event(EventKind::Tx, Direction::Tx, 1, b"older match");
-        app.handle_output_search_io_event(OutputSearchIoEvent::Completed {
-            request_id,
-            response: OutputSearchResponse {
-                events: vec![first, second],
-                gaps: Vec::new(),
-                partial: true,
-                scanned_archives: 2,
-            },
-        });
-
-        app.handle_output_search_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        for character in "needle".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
         assert_eq!(
-            app.output_search
-                .as_ref()
-                .map(|search| search.detail_scroll),
-            Some(5)
+            app.output_search.as_ref().map(|search| search.selected),
+            Some(1)
         );
         app.handle_output_search_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let search = app.output_search.as_ref().expect("results remain open");
+        assert_eq!(
+            app.output_search.as_ref().map(|search| search.selected),
+            Some(0)
+        );
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        let search = app.output_search.as_ref().expect("quick find remains open");
         assert_eq!(search.selected, 1);
-        assert_eq!(search.detail_scroll, 0);
-        assert!(search.partial);
-        assert_eq!(search.scanned_archives, 2);
+        assert_eq!(search.matches.len(), 2);
+    }
+
+    #[test]
+    fn output_search_million_hit_fixture_has_exact_total_and_bounded_materialization() {
+        let mut app = App::new(vec![snapshot()], None);
+        let bytes_per_line = MAX_BYTES_PER_SLOT / MAX_LINES_PER_SLOT;
+        fill_retained_output(&mut app, MAX_LINES_PER_SLOT, &"a".repeat(bytes_per_line));
+        assert!(app.current().buffered_bytes <= MAX_BYTES_PER_SLOT);
+
+        let started = Instant::now();
+        let index = local_output_search_index(
+            app.current(),
+            "a",
+            OutputSearchMatcher::Literal,
+            true,
+            OutputSearchDirection::Both,
+            OutputSearchScope::CurrentEpoch,
+            None,
+        )
+        .expect("dense index");
+        let elapsed = started.elapsed();
+        let expected = MAX_LINES_PER_SLOT * bytes_per_line;
+        assert_eq!(index.total_matches, expected);
+        assert_eq!(index.lines.len(), MAX_LINES_PER_SLOT);
+        assert_eq!(index.scanned_lines, MAX_LINES_PER_SLOT);
+        assert_eq!(index.scanned_bytes, expected);
+
+        let latest_page =
+            materialize_output_search_page(app.current(), &index, index.total_matches - 1);
+        assert!(latest_page.len() <= OUTPUT_SEARCH_LOCAL_MATCH_PAGE);
+        assert_eq!(
+            latest_page.last().map(|item| item.ordinal),
+            Some(expected - 1)
+        );
+        assert_eq!(
+            latest_page.last().map(|item| item.seq),
+            Some(MAX_LINES_PER_SLOT as u64)
+        );
+        // Structural assertions above prove occurrence memory is page-bounded;
+        // this generous guard catches accidental per-hit allocation/scanning
+        // regressions without depending on release-mode timings.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "dense index took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn output_search_exact_ordinals_cross_pages_and_cycle_first_to_last() {
+        let mut app = App::new(vec![snapshot()], None);
+        fill_retained_output(&mut app, OUTPUT_SEARCH_LOCAL_MATCH_PAGE * 2 + 1, "needle");
+        app.open_output_search();
+        for character in "needle".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        flush_output_search_debounce(&mut app);
+
+        let total = OUTPUT_SEARCH_LOCAL_MATCH_PAGE * 2 + 1;
+        let search = app.output_search.as_ref().expect("quick find");
+        assert_eq!(local_output_search_total(search), total);
+        assert_eq!(
+            search.selected,
+            total - 1,
+            "quick find defaults to the newest exact match"
+        );
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(total as u64)
+        );
+        assert!(search.matches.len() <= OUTPUT_SEARCH_LOCAL_MATCH_PAGE);
+        assert_eq!(
+            output_search_quick_counter(search),
+            format!(" {total}/{total} ")
+        );
+
+        app.output_search.as_mut().expect("quick find").selected =
+            OUTPUT_SEARCH_LOCAL_MATCH_PAGE - 1;
+        app.refresh_output_search_page();
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let search = app.output_search.as_ref().expect("next materialized page");
+        assert_eq!(search.selected, OUTPUT_SEARCH_LOCAL_MATCH_PAGE);
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(OUTPUT_SEARCH_LOCAL_MATCH_PAGE as u64 + 1)
+        );
+
+        app.output_search.as_mut().expect("quick find").selected = total - 1;
+        app.refresh_output_search_page();
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let search = app.output_search.as_ref().expect("wrapped to first");
+        assert_eq!(search.selected, 0);
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(1)
+        );
+        assert!(search.matches.len() <= OUTPUT_SEARCH_LOCAL_MATCH_PAGE);
+
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        let search = app.output_search.as_ref().expect("wrapped to latest");
+        assert_eq!(search.selected, total - 1);
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(total as u64)
+        );
+    }
+
+    #[test]
+    fn output_search_query_and_append_rebuild_only_after_debounce() {
+        let mut app = App::new(vec![snapshot()], None);
+        fill_retained_output(&mut app, 2, "hit");
+        app.open_output_search();
+        for character in "hit".chars() {
+            app.handle_output_search_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        let first_due = app
+            .output_search
+            .as_ref()
+            .expect("pending query")
+            .last_document_refresh;
+        assert!(
+            app.output_search
+                .as_ref()
+                .expect("pending query")
+                .document_dirty
+        );
+        assert_eq!(
+            local_output_search_total(app.output_search.as_ref().unwrap()),
+            0
+        );
+        app.refresh_output_search_if_due(
+            first_due + OUTPUT_SEARCH_REFRESH_INTERVAL - Duration::from_nanos(1),
+        );
+        assert_eq!(
+            local_output_search_total(app.output_search.as_ref().unwrap()),
+            0
+        );
+        app.refresh_output_search_if_due(first_due + OUTPUT_SEARCH_REFRESH_INTERVAL);
+        assert_eq!(
+            local_output_search_total(app.output_search.as_ref().unwrap()),
+            2
+        );
+
+        let epoch = app.current().snapshot.daemon_epoch;
+        app.ports[0].push_line(retained_output_line(epoch, 3, "hit".into()), true);
+        app.mark_output_search_document_dirty("COM3");
+        let refreshed_at = app
+            .output_search
+            .as_ref()
+            .expect("dirty after append")
+            .last_document_refresh;
+        app.refresh_output_search_if_due(
+            refreshed_at + OUTPUT_SEARCH_REFRESH_INTERVAL - Duration::from_nanos(1),
+        );
+        assert_eq!(
+            local_output_search_total(app.output_search.as_ref().unwrap()),
+            2
+        );
+        app.refresh_output_search_if_due(refreshed_at + OUTPUT_SEARCH_REFRESH_INTERVAL);
+        let search = app.output_search.as_ref().expect("refreshed append");
+        assert_eq!(local_output_search_total(search), 3);
+        assert_eq!(
+            search.selected, 2,
+            "a latest selection follows appended matches"
+        );
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(3)
+        );
+
+        app.output_search.as_mut().expect("search").selected = 0;
+        app.ports[0].push_line(retained_output_line(epoch, 4, "hit".into()), true);
+        app.mark_output_search_document_dirty("COM3");
+        flush_output_search_debounce(&mut app);
+        let search = app.output_search.as_ref().expect("anchored append");
+        assert_eq!(local_output_search_total(search), 4);
+        assert_eq!(
+            search.selected, 0,
+            "an older selection must not jump to the tail"
+        );
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn output_search_truncate_reindexes_every_match_and_marks_total_as_lower_bound() {
+        let mut app = App::new(vec![snapshot()], None);
+        fill_retained_output(&mut app, MAX_LINES_PER_SLOT, "x");
+        app.open_output_search();
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        flush_output_search_debounce(&mut app);
+
+        let anchor_ordinal = OUTPUT_SEARCH_LOCAL_MATCH_PAGE + 17;
+        app.output_search.as_mut().expect("search").selected = anchor_ordinal;
+        app.refresh_output_search_page();
+        let anchor_seq = current_output_search_match(app.output_search.as_ref().unwrap())
+            .expect("anchor")
+            .seq;
+
+        let epoch = app.current().snapshot.daemon_epoch;
+        app.ports[0].push_line(
+            retained_output_line(epoch, MAX_LINES_PER_SLOT as u64 + 1, "x".into()),
+            true,
+        );
+        assert!(app.current().local_history_truncated);
+        app.mark_output_search_document_dirty("COM3");
+        flush_output_search_debounce(&mut app);
+
+        let search = app.output_search.as_ref().expect("reindexed search");
+        assert_eq!(local_output_search_total(search), MAX_LINES_PER_SLOT);
+        assert_eq!(search.selected, anchor_ordinal - 1);
+        assert_eq!(
+            current_output_search_match(search).map(|item| item.seq),
+            Some(anchor_seq)
+        );
+        assert!(search.matches.len() <= OUTPUT_SEARCH_LOCAL_MATCH_PAGE);
+        assert_eq!(
+            output_search_quick_counter(search),
+            format!(" {anchor_ordinal}/{MAX_LINES_PER_SLOT}+ ")
+        );
+    }
+
+    #[test]
+    fn output_search_rejects_contextual_zero_width_regex_without_materializing_matches() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = App::new(vec![snapshot()], None);
+        fill_retained_output(&mut app, 1_000, "payload");
+        let error = local_output_search_index(
+            app.current(),
+            r"\b",
+            OutputSearchMatcher::Regex,
+            true,
+            OutputSearchDirection::Both,
+            OutputSearchScope::CurrentEpoch,
+            None,
+        )
+        .expect_err("zero-width expressions are not navigable");
+        assert_eq!(error, tr("ui.output.search.zero.width"));
+    }
+
+    #[test]
+    fn run_start_approval_is_exact_fail_closed_and_submitted_once() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = ready_app_with_control();
+        let control = app
+            .current()
+            .snapshot
+            .control
+            .clone()
+            .expect("Human control");
+        let approval_id = Uuid::new_v4();
+        let approval = PendingRunStartApproval {
+            id: approval_id,
+            port: "COM3".into(),
+            requester: Actor {
+                id: "agent:approval".into(),
+                label: "Approval Agent".into(),
+                kind: ActorKind::Agent,
+            },
+            required_approver: control.owner.clone(),
+            label: "inspect boot".into(),
+            metadata: BTreeMap::new(),
+            control_ttl_ms: CONTROL_TTL_MS,
+            daemon_epoch: control.epoch,
+            generation: control.generation,
+            expected_control_id: control.id,
+            expected_fence: control.fence,
+            requested_wall_time_ns: 1,
+            expires_wall_time_ns: i64::MAX,
+        };
+        app.ports[0].snapshot.pending_run_start = Some(approval.clone());
+        assert_eq!(app.pending_run_start_approval(), Some(approval));
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("Run-start decision")
+        else {
+            panic!("expected Run-start decision")
+        };
+        let ClientMessage::DecideRunStart {
+            request_id,
+            port,
+            approval_id: sent_approval_id,
+            decision,
+        } = message
+        else {
+            panic!("approval modal must not send a Human command")
+        };
+        assert_eq!(port, "COM3");
+        assert_eq!(sent_approval_id, approval_id);
+        assert_eq!(decision, RunStartDecision::Approve);
+        assert!(matches!(
+            app.pending_requests.get(&request_id),
+            Some(PendingRequest::RunStartDecision {
+                approval_id: pending,
+                ..
+            }) if *pending == approval_id
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+        assert!(received.try_recv().is_err(), "duplicate approval was sent");
+        assert_eq!(app.status, tr("st.run.approval.pending"));
+
+        app.ports[0]
+            .snapshot
+            .control
+            .as_mut()
+            .expect("Human control")
+            .fence += 1;
+        assert!(
+            app.pending_run_start_approval().is_none(),
+            "a stale fence must hide the approval fail-closed"
+        );
     }
 
     #[test]
@@ -15035,34 +16381,24 @@ mod tests {
     }
 
     #[test]
-    fn queued_no_eol_bare_enter_remains_an_empty_editable_command() {
-        let _guard = crate::i18n::lang_test_lock();
+    fn no_eol_bare_enter_is_immediate_and_never_creates_an_editable_queue_card() {
         let mut app = ready_app_with_foreign_control();
         app.ports[0].snapshot.effective_write_eol = Some(String::new());
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
 
-        let NetworkCommand::Send { message, .. } =
-            received.try_recv().expect("queue-mode control request")
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("Human command")
         else {
-            panic!("expected control request")
+            panic!("expected Human command")
         };
-        assert!(matches!(message, ClientMessage::AcquireControl { .. }));
-        assert_eq!(app.pending_writes["COM3"][0].data, b"\r");
-        assert_eq!(
-            app.pending_writes["COM3"][0].kind,
-            PendingWriteKind::BareEnter
-        );
-
-        let cards = queue_cards(&app, 80);
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].command, tr("ui.queue.empty"));
-        assert!(input_title(&app, InputMode::Line).contains(tr("ui.queue.empty")));
-
-        app.remove_last_queued_line(true, &commands);
+        let ClientMessage::SendHumanCommand { data, .. } = message else {
+            panic!("expected SendHumanCommand")
+        };
+        assert_eq!(data, b"\r");
         assert!(app.current().draft.is_empty());
         assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(queue_cards(&app, 80).is_empty());
     }
 
     #[test]
@@ -15084,50 +16420,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_enter_on_an_unowned_free_port_acquires_then_sends_without_agent_warning() {
+    fn empty_enter_on_an_unowned_free_port_uses_one_atomic_human_command_request() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
         app.ports[0].snapshot.control = None;
         app.ports[0].snapshot.active_run = None;
         app.ports[0].snapshot.effective_write_eol = Some("\r".into());
-        let actor = app.actor.clone().expect("connected Human actor");
-        let epoch = app.current().snapshot.daemon_epoch;
-        let generation = app.current().snapshot.generation;
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
 
         let NetworkCommand::Send { message, .. } =
-            received.try_recv().expect("queue-mode control request")
+            received.try_recv().expect("atomic Human command")
         else {
-            panic!("expected control request")
+            panic!("expected Human command")
         };
-        let ClientMessage::AcquireControl { request_id, .. } = message else {
-            panic!("expected AcquireControl")
+        let ClientMessage::SendHumanCommand {
+            data,
+            expected_generation,
+            ..
+        } = message
+        else {
+            panic!("expected SendHumanCommand")
         };
-        let port = app.selected_port();
-        assert_eq!(app.status, trf("st.requesting.control", &[&port]));
+        assert_eq!(data, b"\r");
+        assert_eq!(expected_generation, 1);
         assert!(app.current().active_agent_run().is_none());
-
-        app.handle_result(
-            request_id,
-            CommandResult::ControlGranted {
-                lease: ControlLease {
-                    id: Uuid::new_v4(),
-                    owner: actor,
-                    epoch,
-                    generation,
-                    fence: 2,
-                    issued_wall_time_ns: 1,
-                    expires_wall_time_ns: i64::MAX,
-                },
-            },
-            &commands,
-        );
-
-        let (_, bytes, operation_id) = take_write(&mut received);
-        assert_eq!(bytes, b"\r");
-        assert!(operation_id.is_some());
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]
@@ -15185,6 +16505,8 @@ mod tests {
             control: None,
             active_run: None,
             active_trigger: None,
+            pending_run_start: None,
+            run_context: None,
             logging: LoggingState::Healthy,
             effective_shell_prompt: None,
             effective_uboot_prompt: None,
@@ -15342,16 +16664,21 @@ mod tests {
         else {
             panic!("expected outbound write")
         };
-        let ClientMessage::Write {
-            request_id,
-            data,
-            operation_id,
-            ..
-        } = message
-        else {
-            panic!("expected outbound write")
-        };
-        (request_id, data, operation_id)
+        match message {
+            ClientMessage::Write {
+                request_id,
+                data,
+                operation_id,
+                ..
+            }
+            | ClientMessage::SendHumanCommand {
+                request_id,
+                data,
+                operation_id,
+                ..
+            } => (request_id, data, operation_id),
+            _ => panic!("expected outbound write or Human command"),
+        }
     }
 
     fn event(kind: EventKind, direction: Direction, seq: u64, data: &[u8]) -> TimelineEvent {
@@ -16004,6 +17331,70 @@ mod tests {
         assert!(app.current().selected_run_command.is_none());
         assert!(app.current().expanded_run.is_none());
         assert_eq!(app.current().selected_run, Some(run.id));
+    }
+
+    #[test]
+    fn command_history_uses_daemon_capture_range_instead_of_legacy_matchers() {
+        let mut current = snapshot();
+        let run = agent_run("capture range");
+        current.active_run = Some(run.clone());
+        current.head_seq = 20;
+        let epoch = current.daemon_epoch;
+        let operation_id = Uuid::new_v4();
+        let mut app = App::new(vec![current], None);
+
+        let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"show version\r");
+        tx.daemon_epoch = epoch;
+        tx.actor = Some(run.owner.clone());
+        tx.run_id = Some(run.id);
+        tx.operation_id = Some(operation_id);
+        tx.metadata.insert(
+            "command_description".into(),
+            serde_json::json!("read version"),
+        );
+        tx.metadata.insert(
+            "command_capture_matchers".into(),
+            serde_json::json!([{"kind":"contains","value":"root#"}]),
+        );
+        app.ports[0].push_event(tx, true);
+
+        let capture = CommandCaptureCompleted {
+            daemon_epoch: epoch,
+            generation: 1,
+            run_id: run.id,
+            operation_id,
+            tx_event_seq: 2,
+            evidence_from_seq: 2,
+            evidence_through_seq: 7,
+            completion: serial_protocol::CommandCaptureCompletionKind::Prompt,
+            completion_detail: Some("root#".into()),
+            confidence: serial_protocol::CommandCaptureConfidence::High,
+            record_event_seq: 9,
+            tx_stream_offset_start: Some(0),
+            tx_stream_offset_end: Some(13),
+            rx_stream_offset_start: Some(10),
+            rx_stream_offset_end: Some(40),
+        };
+        let mut completed = event(EventKind::CommandCaptureCompleted, Direction::None, 9, &[]);
+        completed.daemon_epoch = epoch;
+        completed.actor = Some(run.owner.clone());
+        completed.run_id = Some(run.id);
+        completed.operation_id = Some(operation_id);
+        completed
+            .metadata
+            .insert("capture".into(), serde_json::to_value(capture).unwrap());
+        app.ports[0].push_event(completed, true);
+
+        let key = app.current().run_command_keys()[0];
+        let target = app
+            .command_evidence_target(key, Some(0))
+            .expect("command evidence target");
+        assert_eq!(target.authoritative_range, Some((2, 7)));
+        assert_eq!(target.query_end_seq, 7);
+        assert!(
+            !target.matchers.is_empty(),
+            "legacy matcher remains only as fallback metadata"
+        );
     }
 
     #[test]
@@ -18443,6 +19834,7 @@ mod tests {
             sequence_id: Some(Uuid::new_v4()),
             sequence_step_index: Some(1),
             operation_ids: Vec::new(),
+            authoritative_range: None,
         };
         let mut events = vec![
             event(EventKind::Tx, Direction::Tx, 4, b"show final\r"),
@@ -19406,7 +20798,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_enter_during_foreign_agent_run_queues_eol_and_requests_control() {
+    fn empty_enter_during_foreign_agent_run_sends_one_immediate_human_command() {
         let mut app = ready_app_with_foreign_control();
         app.ports[0].snapshot.active_run = Some(agent_run("diagnose boot"));
         app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
@@ -19415,12 +20807,21 @@ mod tests {
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
 
-        let NetworkCommand::Send { message, .. } = received.try_recv().expect("control request")
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("Human command")
         else {
-            panic!("expected control request")
+            panic!("expected Human command")
         };
-        assert!(matches!(message, ClientMessage::AcquireControl { .. }));
-        assert_eq!(app.pending_writes["COM3"][0].data, b"\r\n");
+        let ClientMessage::SendHumanCommand {
+            data,
+            expected_generation,
+            ..
+        } = message
+        else {
+            panic!("Enter must not queue or acquire control")
+        };
+        assert_eq!(data, b"\r\n");
+        assert_eq!(expected_generation, 1);
+        assert!(!app.pending_writes.contains_key("COM3"));
         assert_eq!(app.current().scroll_from_bottom, 0);
         assert!(app.current().draft.is_empty());
     }
@@ -19445,7 +20846,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_sends_matching_agent_cooperative_write_without_acquire() {
+    fn alt_enter_has_the_same_single_human_command_semantics_as_enter() {
         let mut app = ready_app_with_foreign_control();
         let agent = app
             .current()
@@ -19457,7 +20858,6 @@ mod tests {
             .clone();
         let mut run = agent_run("diagnose boot");
         run.owner = agent;
-        let run_id = run.id;
         app.ports[0].snapshot.active_run = Some(run);
         app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
         app.ports[0].draft = "show version".chars().collect();
@@ -19466,45 +20866,33 @@ mod tests {
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &commands);
 
-        let NetworkCommand::Send { message, .. } = received.try_recv().expect("cooperative write")
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("Human command")
         else {
-            panic!("expected cooperative write")
+            panic!("expected Human command")
         };
-        let ClientMessage::Write {
-            control_id,
-            fence,
+        let ClientMessage::SendHumanCommand {
             data,
             operation_id,
-            expected_run_id,
-            pacing,
-            cooperative,
+            expected_generation,
             ..
         } = message
         else {
-            panic!("expected Write, not AcquireControl")
+            panic!("expected SendHumanCommand, not Write/AcquireControl")
         };
-        assert!(cooperative);
-        assert_eq!(control_id, Uuid::nil());
-        assert_eq!(fence, 0);
         assert_eq!(data, b"show version\r\n");
         assert!(operation_id.is_some());
-        assert_eq!(expected_run_id, Some(run_id));
-        assert_eq!(pacing, None);
+        assert_eq!(expected_generation, 1);
         assert!(received.try_recv().is_err());
         assert!(app.current().draft.is_empty());
         assert!(!app.pending_writes.contains_key("COM3"));
         assert!(app.pending_requests.values().any(|request| matches!(
             request,
-            PendingRequest::Write {
-                port,
-                cooperative: true,
-                ..
-            } if port == "COM3"
+            PendingRequest::HumanCommand { port, .. } if port == "COM3"
         )));
     }
 
     #[test]
-    fn rejected_cooperative_write_preserves_ordinary_queue_and_acquire() {
+    fn rejected_human_command_restores_draft_and_never_creates_a_queue() {
         let mut app = ready_app_with_foreign_control();
         let agent = app
             .current()
@@ -19518,72 +20906,92 @@ mod tests {
         run.owner = agent;
         app.ports[0].snapshot.active_run = Some(run);
 
-        let queued_operation = Uuid::new_v4();
-        app.pending_writes.insert(
-            "COM3".into(),
-            VecDeque::from([PendingWrite {
-                data: b"ordinary queued\r".to_vec(),
-                operation_id: Some(queued_operation),
-                kind: PendingWriteKind::Line,
-            }]),
-        );
-        let acquire_request = Uuid::new_v4();
-        app.pending_requests.insert(
-            acquire_request,
-            PendingRequest::Acquire {
-                port: "COM3".into(),
-                mode: ControlMode::Queue,
-            },
-        );
-        app.queued_controls.insert(
-            "COM3".into(),
-            QueuedControl {
-                _position: 2,
-                since: Instant::now(),
-            },
-        );
         app.ports[0].draft = "cooperative at expiry".chars().collect();
         app.ports[0].draft_cursor = app.ports[0].draft.len();
         let (commands, mut received) = mpsc::channel(4);
 
         app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &commands);
-        let NetworkCommand::Send { message, .. } = received.try_recv().expect("cooperative write")
+        let NetworkCommand::Send { message, .. } = received.try_recv().expect("Human command")
         else {
-            panic!("expected cooperative write")
+            panic!("expected Human command")
         };
-        let ClientMessage::Write {
-            request_id,
-            cooperative,
-            ..
-        } = message
-        else {
-            panic!("expected cooperative Write")
+        let ClientMessage::SendHumanCommand { request_id, .. } = message else {
+            panic!("expected SendHumanCommand")
         };
-        assert!(cooperative);
 
         app.handle_server_message(
             ServerMessage::Error {
                 request_id: Some(request_id),
                 code: serial_protocol::ErrorCode::ControlRequired,
-                message: "Agent lease expired before cooperative write".into(),
+                message: "Agent Run changed before Human command".into(),
                 retryable: true,
             },
             &commands,
         );
 
-        let queue = app
-            .pending_writes
-            .get("COM3")
-            .expect("ordinary queue must survive");
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].data, b"ordinary queued\r");
-        assert_eq!(queue[0].operation_id, Some(queued_operation));
-        assert!(matches!(
-            app.pending_requests.get(&acquire_request),
-            Some(PendingRequest::Acquire { port, .. }) if port == "COM3"
-        ));
-        assert_eq!(app.queued_controls["COM3"]._position, 2);
+        assert_eq!(
+            app.current().draft.iter().collect::<String>(),
+            "cooperative at expiry"
+        );
+        assert!(!app.pending_writes.contains_key("COM3"));
+        assert!(app.queued_controls.is_empty());
         assert!(!app.pending_requests.contains_key(&request_id));
+    }
+
+    #[test]
+    fn uncertain_human_command_is_not_restored_or_automatically_resent() {
+        let _guard = crate::i18n::lang_test_lock();
+        let mut app = ready_app_with_foreign_control();
+        let agent = app
+            .current()
+            .snapshot
+            .control
+            .as_ref()
+            .unwrap()
+            .owner
+            .clone();
+        let mut run = agent_run("uncertain command");
+        run.owner = agent;
+        app.ports[0].snapshot.active_run = Some(run);
+        app.ports[0].draft = "reboot".chars().collect();
+        app.ports[0].draft_cursor = app.ports[0].draft.len();
+        let (commands, mut received) = mpsc::channel(4);
+
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+        let NetworkCommand::Send { message, .. } =
+            received.try_recv().expect("submitted Human command")
+        else {
+            panic!("expected outbound Human command")
+        };
+        let ClientMessage::SendHumanCommand { request_id, .. } = message else {
+            panic!("expected SendHumanCommand")
+        };
+        assert!(app.current().draft.is_empty());
+
+        app.handle_server_message(
+            ServerMessage::Error {
+                request_id: Some(request_id),
+                code: serial_protocol::ErrorCode::WriteOutcomeUncertain,
+                message: "reply lost after physical dispatch".into(),
+                retryable: false,
+            },
+            &commands,
+        );
+
+        assert!(app.current().draft.is_empty());
+        assert_eq!(app.current().history, vec!["reboot"]);
+        assert_eq!(app.uncertain_write_outcomes, 1);
+        assert!(!app.pending_requests.contains_key(&request_id));
+        assert!(app.pending_writes.is_empty());
+        assert!(app.queued_controls.is_empty());
+        assert!(received.try_recv().is_err(), "uncertain command was resent");
+        assert_eq!(
+            app.status,
+            trf(
+                "st.write.outcome.uncertain",
+                &["reply lost after physical dispatch"]
+            )
+        );
     }
 
     #[test]
@@ -20061,7 +21469,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_selector_is_reachable_from_the_prefix_shortcut() {
+    fn removed_queue_selector_prefix_no_longer_changes_focus() {
         let mut app = App::new(vec![snapshot()], None);
         let queue = app.pending_writes.entry("COM3".into()).or_default();
         for command in ["first", "second"] {
@@ -20083,13 +21491,9 @@ mod tests {
             &commands,
         );
 
-        assert_eq!(app.focus, PaneFocus::Queue);
-        assert_eq!(
-            app.queue_selection
-                .as_ref()
-                .map(|selection| selection.selected),
-            Some(0)
-        );
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert!(app.queue_selection.is_none());
+        assert_eq!(app.status, tr("st.unknown.prefix"));
     }
 
     #[test]
@@ -20118,7 +21522,6 @@ mod tests {
             PendingRequest::Write {
                 port: "COM3".into(),
                 operation_id: Some(sending_id),
-                cooperative: false,
             },
         );
         let (commands, _) = mpsc::channel(1);
@@ -20195,7 +21598,7 @@ mod tests {
         let (_, data, _) = take_write(&mut received);
         assert_eq!(data, b"retry after full\r");
         assert!(app.pending_requests.values().any(
-            |request| matches!(request, PendingRequest::Write { port, cooperative: false, .. } if port == "COM3")
+            |request| matches!(request, PendingRequest::Write { port, .. } if port == "COM3")
         ));
         assert_eq!(queued_line_count(&app.pending_writes["COM3"]), 1);
     }

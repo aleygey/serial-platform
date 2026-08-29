@@ -46,6 +46,9 @@ export interface PortSnapshot {
   endpoint_present: boolean
   session_state: SessionState
   state_reason?: string | null
+  control?: ControlLease | null
+  pending_run_start?: PendingRunStartApproval | null
+  run_context?: RunContextState | null
   effective_shell_prompt?: string | null
   effective_uboot_prompt?: string | null
   effective_write_eol?: string | null
@@ -66,6 +69,49 @@ export interface Actor {
   kind: 'human' | 'agent' | 'script' | 'system'
 }
 
+export interface ControlLease {
+  id: string
+  owner: Actor
+  epoch: string
+  generation: number
+  fence: number
+  issued_wall_time_ns: number
+  expires_wall_time_ns: number
+}
+
+export interface PendingRunStartApproval {
+  id: string
+  port: string
+  requester: Actor
+  required_approver: Actor
+  label: string
+  metadata: Record<string, unknown>
+  control_ttl_ms: number
+  daemon_epoch: string
+  generation: number
+  expected_control_id: string
+  expected_fence: number
+  requested_wall_time_ns: number
+  expires_wall_time_ns: number
+}
+
+export interface RunContextState {
+  run_id: string
+  revision: number
+  last_human_command_seq?: number | null
+  acknowledged_revision: number
+  acknowledged_through_seq?: number | null
+}
+
+export type RunStartDecision = 'approve' | 'deny'
+
+export const HUMAN_COMMAND_UNCERTAIN_MESSAGE = '人工命令的物理写入结果不确定。请先查看串口时间线，勿直接重发。'
+
+export type HumanCommandSubmission =
+  | { status: 'accepted' }
+  | { status: 'rejected'; message: string }
+  | { status: 'uncertain'; message: string }
+
 export interface TimelineEvent {
   port: string
   daemon_epoch: string
@@ -77,6 +123,8 @@ export interface TimelineEvent {
   actor?: Actor | null
   run_id?: string | null
   operation_id?: string | null
+  stream_offset_start?: number | null
+  stream_offset_end?: number | null
   text: string
   metadata: Record<string, unknown>
   durable: boolean
@@ -102,6 +150,7 @@ export interface DesktopSnapshot {
   connectionMessage: string
   serverId?: string
   daemonEpoch?: string
+  actor?: Actor
   configRevision: number
   configuredPorts: PortSnapshot[]
   availablePorts: PortDescriptor[]
@@ -125,7 +174,8 @@ export interface SerialConfigurationDraft {
 export interface DesktopBridge {
   bootstrap(): Promise<DesktopSnapshot>
   refresh(): Promise<DesktopSnapshot>
-  sendCommand(port: string, command: string): Promise<void>
+  sendCommand(port: string, command: string): Promise<HumanCommandSubmission>
+  decideRunStart(port: string, approvalId: string, decision: RunStartDecision): Promise<void>
   setPortOpen(port: string, open: boolean): Promise<void>
   saveSerialConfiguration(draft: SerialConfigurationDraft, expectedRevision: number): Promise<void>
   saveModelProfiles(profiles: ModelProfile[], expectedRevision: number): Promise<void>

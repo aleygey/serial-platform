@@ -10,7 +10,7 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 - **一个物理写入者**：`seriald` 独占串口句柄，通过带 fencing 的 Control 串行化人和 Agent 的写入。
 - **同一份事实记录**：RX、确认后的 TX、Control、Run、Trigger、断连和重配事件进入同一条带序号时间线。
 - **历史跨客户端重开保留**：日志由后端持久化；关闭再打开 TUI 或 App 不会清空已有串口记录。
-- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 17 个 MCP 工具；三者共享同一个后端状态。
+- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 16 个 MCP 工具；三者共享同一个后端状态。
 - **配置分层清楚**：Transport Profile 管物理 UART 参数；Model Profile 只管提示符、换行、设备回显解析和写入节奏；Model Family 目录独立管理“一级机型系列 → 二级具体机型”，与行为 Profile 可以独立切换。
 
 ## 快速开始
@@ -37,7 +37,7 @@ serial
 不带子命令的 `serial` 会一次完成三件事：
 
 1. 启动或复用本地 `seriald` 后端；
-2. 在 `http://127.0.0.1:3211/mcp` 启动 sessionless Streamable HTTP MCP；
+2. 在活动 `seriald` 的精确监听 IP 上启动 sessionless Streamable HTTP MCP（默认是 `http://127.0.0.1:3211/mcp`）；
 3. 在前台打开 TUI。
 
 若首次运行时还没有配置，`serial` 会先执行同样的简洁离线配置。退出前台 TUI 时，只结束本次 `serial` 自己启动的后端和 MCP 子进程；复用的外部后端不受影响。
@@ -136,7 +136,7 @@ TUI 顶部只显示串口名和连接状态；串口输出标题只显示当前�
 - `↑` / `↓` 在当前层选择；`→` 从 Run 进入 action description，再进入具体命令；`←` 逐层返回。
 - 展开的 Agent 详情超过面板高度时，用 `Shift+↑` / `Shift+↓` 滚动详情；普通方向键仍只控制历史树。
 - 滚轮和 `PgUp` / `PgDn` 始终滚动串口输出，不会改变 Agent 历史选择或焦点；`Ctrl-] PgUp` / `Ctrl-] PgDn` 也执行同一操作。
-- `Ctrl-] /` 搜索持久串口历史，可切换普通文本/正则、大小写、RX/TX 和当前周期/保留周期/当前 Run。
+- `Ctrl-] /` 在串口输出右上角打开即时查找框；输入时直接定位，Enter/F3 与 Shift+Enter/Shift+F3 在结果间循环，并保留命中位置的上下文。可切换普通文本/正则、大小写、RX/TX 和当前周期/当前 Run；本地旧行已淘汰时会明确提示范围不完整。
 - `Alt-1` 到 `Alt-9` 快速切换端口；`Ctrl-] ?` 打开完整帮助。
 
 任务与命令记录按从旧到新排列，采用 Run 标题 → action description → 具体命令的三层树。第二层缩进 4 列且不混入命令；第三层缩进 8 列，普通 `command` 显示一条，`command_sequence` 按 step 顺序显示多条。新的 Agent action 到达时，TUI 退回它所属的 Run；同一 sequence 的后续 step 或同一 TX 的分块只更新原 action。进入 action 或具体 step 时会定位并高亮设备回显、返回内容和完成边界。命令属于旧的后端周期或本地窗口已淘汰完整捕获区间时，TUI 会按原周期、命令序号和持久 matcher 从 journal 精确回取；只有从 TX 到完成边界完整连续时才显示 RX 高亮。retention gap、缺失、超限或查询失败会回到实时尾并明确提示，不把局部尾部伪装成完整结果。没有 matcher 时只临时显示命令文本，不污染串口历史。
@@ -158,7 +158,7 @@ TUI 菜单分成“修改当前串口配置”“创建配置”“设置”“�
 每个平台发行包都包含现代桌面客户端：
 
 - 左侧端口栏：串口名、机型名、连接状态和打开/关闭操作；
-- 中间 RX 终端：持久历史、实时输出、文本搜索、地址/关键词着色和命令区域高亮；
+- 中间 RX 终端：持久历史、实时输出、VS Code 风格右上角即时查找、地址/关键词着色和命令区域高亮；
 - 右侧 Agent 历史：从旧到新展示 Run、普通命令和命令序列；
 - 底部命令栏：面向当前端口发送人工命令；
 - 独立配置页：分别编辑串口/Transport Profile、行为 Model Profile 与两级 Model Family 机型目录；
@@ -166,34 +166,36 @@ TUI 菜单分成“修改当前串口配置”“创建配置”“设置”“�
 
 App 默认连接配置的本地后端；后端不存在且启用了自动启动时，App 会启动随包提供的服务，并只管理自己启动的进程。渲染进程只通过类型化 IPC 与主进程通信，不直接访问串口或后端网络。
 
-快捷键：`Ctrl/Cmd+,` 打开配置，`Ctrl/Cmd+1` 返回控制台，`Ctrl/Cmd+F` 搜索终端，`Ctrl/Cmd+K` 聚焦命令输入，`Esc` 返回控制台。
+快捷键：`Ctrl/Cmd+,` 打开配置，`Ctrl/Cmd+1` 返回控制台，`Ctrl/Cmd+F` 打开终端查找，`F3` / `Shift+F3` 切换结果，`Ctrl/Cmd+K` 聚焦命令输入，`Esc` 关闭当前浮层或返回控制台。
 
 ## Agent 与 MCP
 
-`serial-mcp` 暴露 17 个工具：
+`serial-mcp` 暴露 16 个工具：
 
 ```text
 devices              model_identity_set   read
-command              command_sequence     input
-signal               trigger              wait
-search               monitor_start        monitor_list
-monitor_status       monitor_incidents    monitor_stop
-run_start            run_end
+command              command_sequence     signal
+trigger              wait                 search
+monitor_start        monitor_list         monitor_status
+monitor_incidents    monitor_stop         run_start
+run_end
 ```
 
 所有设备选择参数都叫 `port`。典型流程是：
 
 1. `devices` 检查端口、`model_family` / `model_name`、连接与工作流状态，以及当前有效的 Shell/U-Boot 提示符；
-2. `run_start(port, label)` 获取本次工作流的 `run_handle`；
+2. `run_start(port, label)` 获取本次工作流的 `run_handle`；端口空闲时原子开始，当前由人持有时等待 TUI/App 中的明确批准，批准后原子转交并开始；
 3. 使用 `command`，或用一次 `command_sequence` 完成“账号 → 等待密码提示 → 密码”这类已知依赖交互；
 4. 用 `read`、`wait`、`search` 或 Monitor 补充证据；
 5. 在 Agent 最终回复前调用 `run_end`；正常完成使用默认 `outcome=completed`，异常终止使用 `outcome=aborted`。
+
+统一入口会让 HTTP MCP 跟随实际活动 endpoint 的精确 IP：loopback 后端仍只监听 loopback，显式单播地址（例如 `192.168.56.109`）则监听同一地址的 3211 端口。MCP 拒绝通配、广播和组播地址，并要求浏览器 `Origin` 精确匹配监听 IP 与端口。非 loopback MCP 没有内置认证，只应部署在可信 host-only 网卡上并配合主机防火墙，不能直接暴露到不受信网络。
 
 `run_handle` 是 MCP 进程内的工作流句柄；Agent 不需要传 Control ID、fence、generation、请求 UUID 或续租参数。`run_end` 的 `outcome` 可选 `completed` 或 `aborted`，默认正常完成；`completed` 关闭 Run 并立即尝试释放 Control，`aborted` 只有在 Control 已被权威释放后才成功。默认孤立 Run 回收时间是 30 分钟。
 
 `devices` 是 Agent 唯一的设备发现工具。它不暴露行为 Model Profile 名、Transport/UART 参数、EOL/echo 或写入节奏。`model_identity_set` 只能绑定或解绑由人通过 TUI、App 或 HTTP 预先配置的两级机型名，不创建机型目录。
 
-`monitor_start` 的 `matchers` 可同时配置 1–16 个文本或正则条件，按 OR 匹配；incident 返回实际命中的条件和精确 `serial_range`。如果人工在活动 Agent Run 中用 `Alt+Enter` 写入，Agent 下一次物理写会在发送前返回 `context_changed`、`no_bytes_written=true` 和 `recent_context`；调用 `read` 或 `wait` 确认新状态后再决定是否重试。
+`monitor_start` 的 `matchers` 可同时配置 1–16 个文本或正则条件，按 OR 匹配；incident 返回实际命中的条件和精确 `serial_range`。人工在活动 Agent Run 中直接按 Enter 发送命令时不会排队，也不再区分 Alt+Enter；该命令立即写入并记录干预。Agent 下一次物理写会在发送前返回 `user_command_used`、`no_bytes_written=true` 和紧凑上下文，必须先用实时 `read` 覆盖这次人工 TX 后再决定是否重试；`wait` 和归档读取不会清除这一门禁。
 
 详见 [MCP 工具目录](./docs/MCP_TOOLS.md) 和 [adapter 配置](./adapters/README.md)。
 
@@ -217,7 +219,7 @@ physical UART
     ▼
 seriald ── durable journal
     ├── HTTP v1 configuration / diagnostics / history
-    ├── WebSocket protocol v6 realtime and control
+    ├── WebSocket protocol v7 realtime and control
     ├── serialctl TUI
     ├── Electron App
     └── serial-mcp ── stdio or Streamable HTTP ── Agent
@@ -226,14 +228,14 @@ seriald ── durable journal
 - `seriald` 是唯一持有物理串口句柄的进程。
 - `serialctl` 提供离线之外的配置、诊断、日志查询和 TUI。
 - `serial-mcp` 把同一 HTTP/WebSocket 能力收敛为 Agent 友好的工具。
-- Electron App 管理本地服务生命周期并复用 v6 接口。
+- Electron App 管理本地服务生命周期并复用 v7 接口。
 - `serial` 是统一入口。
 
 文档入口：
 
 - [架构与交互设计](./DOCUMENTATION.md)：产品边界、配置模型、Control/Run、历史投影和启动所有权；
-- [protocol v6](./docs/PROTOCOL.md)：HTTP v1、WebSocket v6、Timeline、Monitor 与 MCP transport 线协议；
-- [MCP 工具契约](./docs/MCP_TOOLS.md)：17 个工具的输入、结果和 Agent 工作流；
+- [protocol v7](./docs/PROTOCOL.md)：HTTP v1、WebSocket v7、Timeline、Monitor 与 MCP transport 线协议；
+- [MCP 工具契约](./docs/MCP_TOOLS.md)：16 个工具的输入、结果和 Agent 工作流；
 - [Adapter 配置](./adapters/README.md)：stdio/Streamable HTTP host 接入；
 - [Roadmap](./ROADMAP.md)：当前能力、发布质量门槛和非目标。
 

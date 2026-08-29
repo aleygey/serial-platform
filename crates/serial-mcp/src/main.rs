@@ -24,8 +24,9 @@ struct Args {
     /// seriald HTTP origin, normally the Windows host-only address from a Linux VM.
     #[arg(long, env = "SERIALD_ENDPOINT")]
     endpoint: Option<String>,
-    /// Serve sessionless MCP Streamable HTTP on this loopback address instead
-    /// of stdio. The unified `serial` launcher uses 127.0.0.1:3211.
+    /// Serve sessionless MCP Streamable HTTP on this exact interface address
+    /// instead of stdio. Non-loopback addresses must be trusted host-only VM
+    /// interfaces; the endpoint has no authentication.
     #[arg(long, env = "SERIAL_MCP_LISTEN")]
     listen: Option<SocketAddr>,
     /// Exit cleanly when the parent launcher closes stdin.

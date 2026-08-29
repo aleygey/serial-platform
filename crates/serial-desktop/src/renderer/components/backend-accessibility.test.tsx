@@ -2,7 +2,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { createOfflineSnapshot } from '../../shared/offline-snapshot'
 import { createQaSnapshot } from '../../shared/qa-fixture'
-import { WindowBar } from '../App'
+import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../../shared/contracts'
+import { mergeDesktopSnapshotEvent, submitHumanCommand, WindowBar } from '../App'
 import { resolveBackendControl } from '../lib/backend-control'
 import {
   ModelEditor,
@@ -15,12 +16,65 @@ import {
   validateModelProfileCatalog
 } from './SettingsPage'
 import { PortRail } from './PortRail'
-import { TerminalPane } from './TerminalPane'
+import { CommandStatusHint, resolveCommandSubmission } from './CommandBar'
+import { TerminalFindWidget, TerminalPane } from './TerminalPane'
 
 const action = async (): Promise<void> => undefined
 const saveAction = async (): Promise<boolean> => true
 
 describe('desktop backend controls', () => {
+  it('isolates an outcome-uncertain Human command but preserves a definitely rejected draft', async () => {
+    const setToast = vi.fn()
+    const rejected = await submitHumanCommand(
+      async () => ({ status: 'rejected', message: 'daemon rejected' }),
+      setToast
+    )
+    expect(resolveCommandSubmission('version', rejected)).toEqual({
+      draft: 'version',
+      commitToHistory: false
+    })
+
+    const uncertain = await submitHumanCommand(
+      async () => { throw new Error('IPC channel closed') },
+      setToast
+    )
+    expect(uncertain).toEqual({
+      status: 'uncertain',
+      message: HUMAN_COMMAND_UNCERTAIN_MESSAGE
+    })
+    expect(resolveCommandSubmission('version', uncertain)).toEqual({
+      draft: '',
+      commitToHistory: false,
+      uncertainty: HUMAN_COMMAND_UNCERTAIN_MESSAGE
+    })
+    expect(setToast).toHaveBeenLastCalledWith({
+      kind: 'error',
+      message: HUMAN_COMMAND_UNCERTAIN_MESSAGE
+    })
+
+    const warning = renderToStaticMarkup(
+      <CommandStatusHint sending={false} uncertainty={HUMAN_COMMAND_UNCERTAIN_MESSAGE} />
+    )
+    expect(warning).toContain('role="alert"')
+    expect(warning).toContain('先查看串口时间线，勿直接重发')
+  })
+
+  it('merges a live timeline event buffered before bootstrap resolves without crossing epochs', () => {
+    const snapshot = createQaSnapshot()
+    const port = snapshot.configuredPorts[0]
+    const event = {
+      ...snapshot.events.COM6.at(-1)!,
+      seq: snapshot.events.COM6.at(-1)!.seq + 1,
+      text: 'late bootstrap output\n'
+    }
+    const merged = mergeDesktopSnapshotEvent(snapshot, { type: 'timeline', event })
+    expect(merged?.events.COM6.at(-1)).toMatchObject({ seq: event.seq, text: event.text })
+
+    const wrongEpoch = { ...event, daemon_epoch: 'restarted-daemon', seq: 1 }
+    expect(mergeDesktopSnapshotEvent(snapshot, { type: 'timeline', event: wrongEpoch }))
+      .toBe(snapshot)
+  })
+
   it('exposes a reachable stop action only for an App-owned backend', () => {
     const owned = createQaSnapshot()
     const ownedMarkup = renderToStaticMarkup(
@@ -171,5 +225,47 @@ describe('desktop backend controls', () => {
     )
     expect(unboundTerminal).toContain('未配置机型')
     expect(unboundTerminal).not.toContain('TL-AS7230 Shell</strong>')
+  })
+
+  it('keeps find hidden until explicitly opened and exposes accessible navigation', () => {
+    const snapshot = createQaSnapshot()
+    const terminal = renderToStaticMarkup(
+      <TerminalPane configuredPort={snapshot.configuredPorts[0]} events={snapshot.events.COM6} onClearCommand={vi.fn()} />
+    )
+    expect(terminal).toContain('aria-label="在串口输出中查找"')
+    expect(terminal).not.toContain('aria-label="查找串口输出"')
+
+    const widget = renderToStaticMarkup(
+      <TerminalFindWidget
+        current={2}
+        total={5}
+        query="ready"
+        onQuery={vi.fn()}
+        onPrevious={vi.fn()}
+        onNext={vi.fn()}
+        onClose={vi.fn()}
+      />
+    )
+    expect(widget).toContain('role="search"')
+    expect(widget).toContain('2/5')
+    expect(widget).toContain('aria-label="上一个匹配项 (Shift+Enter)"')
+    expect(widget).toContain('aria-label="下一个匹配项 (Enter)"')
+    expect(widget).toContain('aria-label="关闭查找 (Escape)"')
+
+    const denseWidget = renderToStaticMarkup(
+      <TerminalFindWidget
+        current={960_000}
+        total={960_000}
+        highlighted={256}
+        query="a"
+        onQuery={vi.fn()}
+        onPrevious={vi.fn()}
+        onNext={vi.fn()}
+        onClose={vi.fn()}
+      />
+    )
+    expect(denseWidget).toContain('960000/960000')
+    expect(denseWidget).not.toContain('960000/960000+')
+    expect(denseWidget).toContain('共 960000 项；所有匹配均可导航，当前仅高亮附近 256 项以保持流畅')
   })
 })

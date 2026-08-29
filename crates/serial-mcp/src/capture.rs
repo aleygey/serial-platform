@@ -414,7 +414,7 @@ impl Capture {
             // cannot masquerade as the requested boundary.
             rolling.clear();
         }
-        if accepted.observed_post_tx_rx {
+        if accepted.observed_quiet_activity {
             watcher.observe_rx(now);
         }
         if !accepted.matching_rx.is_empty() {
@@ -554,7 +554,10 @@ struct AcceptedEvents {
     /// expose post-TX bytes here before deciding whether a complete echo will
     /// arrive, while still retaining those events for lossless output.
     matching_rx: Vec<u8>,
-    observed_post_tx_rx: bool,
+    /// RX that is eligible to arm a quiet completion. A configured echo by
+    /// itself is transport activity, not command output, so it must not start
+    /// the quiet timer before the target has had a chance to respond.
+    observed_quiet_activity: bool,
     /// Replace, rather than append to, the rolling matcher view. Used both
     /// when a complete echo is stripped and while an incomplete echo's safe
     /// fallback view is recomputed.
@@ -563,8 +566,8 @@ struct AcceptedEvents {
 
 impl AcceptedEvents {
     fn single(event: TimelineEvent) -> Self {
-        let observed_post_tx_rx = event.direction == serial_protocol::Direction::Rx;
-        let matching_rx = if observed_post_tx_rx {
+        let observed_quiet_activity = event.direction == serial_protocol::Direction::Rx;
+        let matching_rx = if observed_quiet_activity {
             event.data.clone()
         } else {
             Vec::new()
@@ -572,7 +575,7 @@ impl AcceptedEvents {
         Self {
             events: vec![event],
             matching_rx,
-            observed_post_tx_rx,
+            observed_quiet_activity,
             reset_matching: false,
         }
     }
@@ -581,16 +584,17 @@ impl AcceptedEvents {
         Self {
             events: Vec::new(),
             matching_rx: Vec::new(),
-            observed_post_tx_rx: false,
+            observed_quiet_activity: false,
             reset_matching: false,
         }
     }
 
     fn pending_rx(data: Vec<u8>) -> Self {
+        let observed_quiet_activity = !data.is_empty();
         Self {
             events: Vec::new(),
             matching_rx: data,
-            observed_post_tx_rx: true,
+            observed_quiet_activity,
             // Recomputed from the entire pending RX window so a partial echo
             // can retract bytes that must not be used as completion evidence.
             reset_matching: true,
@@ -598,26 +602,26 @@ impl AcceptedEvents {
     }
 
     fn after_echo(events: Vec<TimelineEvent>) -> Self {
-        let matching_rx = events
+        let matching_rx: Vec<u8> = events
             .iter()
             .filter(|event| event.direction == serial_protocol::Direction::Rx)
             .flat_map(|event| event.data.iter().copied())
             .collect();
+        let observed_quiet_activity = !matching_rx.is_empty();
         Self {
             events,
             matching_rx,
-            // The echo itself is authoritative post-TX RX evidence even when
-            // it has no following output bytes.
-            observed_post_tx_rx: true,
+            observed_quiet_activity,
             reset_matching: true,
         }
     }
 
     fn after_retained_echo(events: Vec<TimelineEvent>, matching_rx: Vec<u8>) -> Self {
+        let observed_quiet_activity = !matching_rx.is_empty();
         Self {
             events,
             matching_rx,
-            observed_post_tx_rx: true,
+            observed_quiet_activity,
             reset_matching: true,
         }
     }
@@ -1182,15 +1186,15 @@ fn matched_pattern(text: &str, patterns: &[CompletionPattern]) -> Option<Complet
     let text = terminal_text(text.as_bytes());
     patterns.iter().find_map(|pattern| match pattern {
         CompletionPattern::Literal(pattern) => {
-            let pattern = terminal_text(pattern.as_bytes());
-            (!pattern.is_empty() && text.contains(pattern.as_str()))
-                .then_some(Completion::Pattern(pattern))
+            let normalized = terminal_text(pattern.as_bytes());
+            (!normalized.is_empty() && text.contains(normalized.as_str()))
+                .then(|| Completion::Pattern(pattern.clone()))
         }
         CompletionPattern::Prompt(prompt) => {
-            let prompt = terminal_text(prompt.as_bytes());
-            let prompt = prompt.trim_end_matches('\n');
-            (!prompt.is_empty() && text.split('\n').any(|line| line.ends_with(prompt)))
-                .then(|| Completion::Prompt(prompt.to_string()))
+            let normalized = terminal_text(prompt.as_bytes());
+            let normalized = normalized.trim_end_matches('\n');
+            (!normalized.is_empty() && text.split('\n').any(|line| line.ends_with(normalized)))
+                .then(|| Completion::Prompt(prompt.clone()))
         }
     })
 }
@@ -1320,6 +1324,31 @@ mod tests {
                 ]
             ),
             Some(Completion::Pattern("SigmaStar #".into()))
+        );
+    }
+
+    #[test]
+    fn completion_keeps_exact_bounded_matcher_instead_of_expanding_controls() {
+        let literal = format!(
+            "{}\n\u{0000}",
+            "x".repeat(serial_protocol::MAX_COMMAND_CAPTURE_DETAIL_BYTES - 2)
+        );
+        assert_eq!(
+            literal.len(),
+            serial_protocol::MAX_COMMAND_CAPTURE_DETAIL_BYTES
+        );
+        let displayed = terminal_text(literal.as_bytes());
+        assert!(displayed.len() > literal.len());
+        assert_eq!(
+            matched_pattern(&displayed, &[CompletionPattern::Literal(literal.clone())]),
+            Some(Completion::Pattern(literal))
+        );
+
+        let prompt = format!("{}\u{0007}# ", "p".repeat(300));
+        let displayed = terminal_text(prompt.as_bytes());
+        assert_eq!(
+            matched_pattern(&displayed, &[CompletionPattern::Prompt(prompt.clone())]),
+            Some(Completion::Prompt(prompt))
         );
     }
 
@@ -1489,7 +1518,7 @@ mod tests {
         ));
         assert!(accepted.reset_matching);
         rolling.clear();
-        assert!(accepted.observed_post_tx_rx);
+        assert!(accepted.observed_quiet_activity);
         prompt.observe_rx(tokio::time::Instant::now());
         append_rolling(
             &mut rolling,
@@ -1549,7 +1578,7 @@ mod tests {
             None,
         ));
         assert!(accepted.reset_matching);
-        assert!(accepted.observed_post_tx_rx);
+        assert!(accepted.observed_quiet_activity);
         rolling.clear();
         prompt.observe_rx(tokio::time::Instant::now());
         append_rolling(
@@ -1642,7 +1671,7 @@ mod tests {
         second_event.stream_offset_end = Some(second_start + second_rx.len() as u64);
         let accepted = boundary.accept(second_event);
         assert!(accepted.reset_matching);
-        assert!(accepted.observed_post_tx_rx);
+        assert!(accepted.observed_quiet_activity);
         assert_eq!(accepted.matching_rx, b"result\r\n[root@dut ~]# ");
         assert_eq!(accepted.events.len(), 2);
         assert_eq!(accepted.events[0].data, first_rx.as_bytes());
@@ -1816,6 +1845,78 @@ mod tests {
         quiet.observe_rx(after_gap);
         assert_eq!(
             quiet.poll("", after_gap + Duration::from_secs(1)),
+            Some(Completion::Quiet)
+        );
+    }
+
+    #[test]
+    fn partial_echo_does_not_arm_quiet_completion() {
+        let operation_id = Uuid::new_v4();
+        let mut boundary = CommandBoundaryTracker::new(
+            CommandBoundary {
+                tx_event_seq: 10,
+                operation_id,
+                expected_echo: Some(b"very-long-command\r".to_vec()),
+            },
+            CaptureLimits::default(),
+        );
+        boundary.accept(event(
+            10,
+            Direction::Tx,
+            b"very-long-command\r",
+            Some(operation_id),
+        ));
+
+        let partial_at = tokio::time::Instant::now();
+        let accepted = boundary.accept(event(11, Direction::Rx, b"very-long-com", None));
+        assert!(accepted.reset_matching);
+        assert!(accepted.matching_rx.is_empty());
+        assert!(!accepted.observed_quiet_activity);
+
+        let mut quiet = watcher(&[], true, false);
+        if accepted.observed_quiet_activity {
+            quiet.observe_rx(partial_at);
+        }
+        assert_eq!(quiet.quiet_deadline(), None);
+        assert_eq!(quiet.poll("", partial_at + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn complete_echo_waits_for_delayed_real_output_before_arming_quiet() {
+        let operation_id = Uuid::new_v4();
+        let mut boundary = CommandBoundaryTracker::new(
+            CommandBoundary {
+                tx_event_seq: 10,
+                operation_id,
+                expected_echo: Some(b"status\r".to_vec()),
+            },
+            CaptureLimits::default(),
+        );
+        boundary.accept(event(10, Direction::Tx, b"status\r", Some(operation_id)));
+
+        let echo_at = tokio::time::Instant::now();
+        let echoed = boundary.accept(event(11, Direction::Rx, b"status\r\r\n", None));
+        assert!(boundary.echo_observed);
+        assert!(echoed.matching_rx.is_empty());
+        assert!(!echoed.observed_quiet_activity);
+
+        let mut quiet = watcher(&[], true, false);
+        if echoed.observed_quiet_activity {
+            quiet.observe_rx(echo_at);
+        }
+        let output_at = echo_at + Duration::from_secs(1);
+        assert_eq!(quiet.poll("", output_at), None);
+
+        let output = boundary.accept(event(12, Direction::Rx, b"real output\r\n", None));
+        assert_eq!(output.matching_rx, b"real output\r\n");
+        assert!(output.observed_quiet_activity);
+        quiet.observe_rx(output_at);
+        assert_eq!(
+            quiet.poll("real output\r\n", output_at + Duration::from_millis(299)),
+            None
+        );
+        assert_eq!(
+            quiet.poll("real output\r\n", output_at + Duration::from_millis(300)),
             Some(Completion::Quiet)
         );
     }

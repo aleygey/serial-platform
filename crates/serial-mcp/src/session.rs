@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,10 +9,11 @@ use futures_util::{SinkExt, StreamExt};
 use rand::TryRngCore;
 use serde_json::Value;
 use serial_protocol::{
-    Actor, ActorKind, ClientMessage, CommandCaptureMatcher, CommandResult,
-    CommandSequenceAuditContext, ControlLease, ControlMode, ErrorCode, PROTOCOL_VERSION, RunInfo,
-    SequenceWritePrecondition, ServerMessage, TriggerInfo, TriggerSpec, TriggerStatus, WireFrame,
-    WritePacing, decode_wire_frame, encode_client_control,
+    Actor, ActorKind, ClientMessage, CommandCaptureCompleted, CommandCaptureMatcher,
+    CommandCaptureReport, CommandResult, CommandSequenceAuditContext, ControlLease, ErrorCode,
+    PROTOCOL_VERSION, RunContextState, RunInfo, SequenceWritePrecondition, ServerMessage,
+    TriggerInfo, TriggerSpec, TriggerStatus, WireFrame, WritePacing, decode_wire_frame,
+    encode_client_control,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -35,10 +36,12 @@ const RPC_SERVICE_MARGIN: Duration = Duration::from_secs(5);
 /// seriald caps one physical write at 15 seconds. The adapter must not call a
 /// correctly progressing write uncertain before that legal server deadline.
 const WRITE_RPC_TIMEOUT: Duration = Duration::from_secs(20);
-// The session task serializes requests and lease renewal on one socket.
-// Keeping queue waits at 15 seconds prevents one blocked Slot from starving
-// the 20-second renewal cadence of leases held for other Slots.
-const MAX_CONTROL_WAIT: Duration = Duration::from_secs(15);
+/// Human approval normally expires at seriald's configured deadline (60s by
+/// default). This process-local ceiling keeps both HTTP and stdio MCP calls
+/// bounded even if a daemon reports a malformed or unexpectedly long expiry.
+const RUN_START_MAX_WAIT: Duration = Duration::from_secs(120);
+const RUN_START_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RUN_START_EXPIRY_GRACE: Duration = Duration::from_secs(2);
 const RUN_HANDLE_BYTES: usize = 16;
 const RUN_HANDLE_CHARS: usize = 22;
 
@@ -111,7 +114,9 @@ pub struct SessionHandle {
 }
 
 /// Public Run identity plus the one opaque MCP capability issued to its caller.
+#[derive(Debug)]
 pub struct StartedRun {
+    pub approval_id: Uuid,
     pub run: RunInfo,
     pub run_handle: String,
 }
@@ -226,7 +231,18 @@ enum SessionRequest {
         port: String,
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
-        control_wait: Duration,
+        reply: Reply,
+    },
+    AcknowledgeRunContext {
+        port: String,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+        reply: Reply,
+    },
+    RecordCommandCapture {
+        port: String,
+        report: CommandCaptureReport,
         reply: Reply,
     },
     EndRun {
@@ -245,6 +261,14 @@ enum SessionRequest {
 
 type Reply = oneshot::Sender<Result<SessionResponse>>;
 
+struct RunStartPolicy<'a> {
+    max_wait: Duration,
+    cleanup_margin: Duration,
+    poll_interval: Duration,
+    expiry_grace: Duration,
+    caller: Option<&'a Reply>,
+}
+
 // Responses cross a single oneshot and are consumed immediately. Keeping the
 // protocol values inline avoids an allocation on every session RPC.
 #[allow(clippy::large_enum_variant)]
@@ -256,6 +280,8 @@ enum SessionResponse {
     Run(RunInfo),
     RunStarted(StartedRun),
     RunAuthorized(AuthorizedRunUse),
+    RunContext(RunContextState),
+    CommandCapture(CommandCaptureCompleted),
     RunAborted,
     RunOwnership { retained: bool },
 }
@@ -369,7 +395,6 @@ impl SessionHandle {
         port: String,
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
-        control_wait: Duration,
     ) -> Result<StartedRun> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -377,13 +402,56 @@ impl SessionHandle {
                 port,
                 label,
                 metadata,
-                control_wait,
                 reply,
             })
             .await
             .context("serial session task stopped")?;
         match receive(response).await? {
             SessionResponse::RunStarted(started) => Ok(started),
+            _ => bail!("serial session returned the wrong response type"),
+        }
+    }
+
+    pub async fn acknowledge_run_context(
+        &self,
+        port: String,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+    ) -> Result<RunContextState> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::AcknowledgeRunContext {
+                port,
+                run_id,
+                revision,
+                through_seq,
+                reply,
+            })
+            .await
+            .context("serial session task stopped")?;
+        match receive(response).await? {
+            SessionResponse::RunContext(context) => Ok(context),
+            _ => bail!("serial session returned the wrong response type"),
+        }
+    }
+
+    pub async fn record_command_capture(
+        &self,
+        port: String,
+        report: CommandCaptureReport,
+    ) -> Result<CommandCaptureCompleted> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::RecordCommandCapture {
+                port,
+                report,
+                reply,
+            })
+            .await
+            .context("serial session task stopped")?;
+        match receive(response).await? {
+            SessionResponse::CommandCapture(capture) => Ok(capture),
             _ => bail!("serial session returned the wrong response type"),
         }
     }
@@ -719,13 +787,36 @@ impl SessionState {
                 port,
                 label,
                 metadata,
-                control_wait,
                 reply,
             } => {
                 let result = self
-                    .start_run(port, label, metadata, control_wait)
+                    .start_run_observed(port, label, metadata, &reply)
                     .await
                     .map(SessionResponse::RunStarted);
+                send_reply(reply, result);
+            }
+            SessionRequest::AcknowledgeRunContext {
+                port,
+                run_id,
+                revision,
+                through_seq,
+                reply,
+            } => {
+                let result = self
+                    .acknowledge_run_context(port, run_id, revision, through_seq)
+                    .await
+                    .map(SessionResponse::RunContext);
+                send_reply(reply, result);
+            }
+            SessionRequest::RecordCommandCapture {
+                port,
+                report,
+                reply,
+            } => {
+                let result = self
+                    .record_command_capture(port, report)
+                    .await
+                    .map(SessionResponse::CommandCapture);
                 send_reply(reply, result);
             }
             SessionRequest::SendBreak {
@@ -977,119 +1068,6 @@ impl SessionState {
         }
     }
 
-    async fn acquire_control(&mut self, port: &str, wait: Duration) -> Result<ControlLease> {
-        self.connect().await?;
-        if let Some(lease) = self.leases.get(port).cloned() {
-            let request_id = Uuid::new_v4();
-            let renew = ClientMessage::RenewControl {
-                request_id,
-                port: port.to_string(),
-                control_id: lease.id,
-                fence: lease.fence,
-                ttl_ms: LEASE_TTL_MS,
-            };
-            match self.call(renew).await {
-                Ok(CommandResult::ControlRenewed { lease }) => {
-                    self.leases.insert(port.to_string(), lease.clone());
-                    return Ok(lease);
-                }
-                Ok(_) | Err(_) => {
-                    self.leases.remove(port);
-                }
-            }
-        }
-
-        let deadline = tokio::time::Instant::now() + wait;
-        loop {
-            let request = ClientMessage::AcquireControl {
-                request_id: Uuid::new_v4(),
-                port: port.to_string(),
-                mode: ControlMode::Queue,
-                ttl_ms: LEASE_TTL_MS,
-            };
-            let rpc_timeout = request_timeout(&request, Some(wait));
-            match self.call_with_timeout(request, rpc_timeout).await? {
-                CommandResult::ControlGranted { lease } => {
-                    self.leases.insert(port.to_string(), lease.clone());
-                    return Ok(lease);
-                }
-                CommandResult::ControlQueued { position } => {
-                    if tokio::time::Instant::now() >= deadline {
-                        self.cancel_queued_acquire(port).await.with_context(|| {
-                            format!(
-                                "timed out queued at position {position} and failed to cancel the \
-                                 pending write-control request"
-                            )
-                        })?;
-                        bail!(
-                            "write control remained queued at position {position}; the queued \
-                             acquire was cancelled and no takeover was attempted"
-                        );
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                other => bail!("unexpected acquire result: {other:?}"),
-            }
-        }
-    }
-
-    async fn cancel_queued_acquire(&mut self, port: &str) -> Result<()> {
-        let cancel = ClientMessage::CancelAcquire {
-            request_id: Uuid::new_v4(),
-            port: port.to_string(),
-            // Queued actors have no lease ID. seriald matches cancellation by
-            // actor identity and intentionally ignores this wire field.
-            control_id: Uuid::nil(),
-        };
-        let removed = match self.call(cancel).await? {
-            CommandResult::AcquireCancelled { removed } => removed,
-            other => bail!("unexpected cancel-acquire result: {other:?}"),
-        };
-        if removed {
-            return Ok(());
-        }
-
-        // The waiter can be granted between the deadline check and cancel.
-        // Resolve that race without disconnecting this actor (which may own
-        // valid Runs on other Slots): reacquire returns AlreadyHeld when the
-        // grant won, then release that exact lease; otherwise cancel the newly
-        // observed queue entry.
-        let probe = ClientMessage::AcquireControl {
-            request_id: Uuid::new_v4(),
-            port: port.to_string(),
-            mode: ControlMode::Queue,
-            ttl_ms: LEASE_TTL_MS,
-        };
-        match self.call(probe).await? {
-            CommandResult::ControlGranted { lease } => {
-                let release = ClientMessage::ReleaseControl {
-                    request_id: Uuid::new_v4(),
-                    port: port.to_string(),
-                    control_id: lease.id,
-                    fence: lease.fence,
-                };
-                match self.call(release).await? {
-                    CommandResult::ControlReleased => Ok(()),
-                    other => bail!("unexpected raced-acquire release result: {other:?}"),
-                }
-            }
-            CommandResult::ControlQueued { .. } => {
-                match self
-                    .call(ClientMessage::CancelAcquire {
-                        request_id: Uuid::new_v4(),
-                        port: port.to_string(),
-                        control_id: Uuid::nil(),
-                    })
-                    .await?
-                {
-                    CommandResult::AcquireCancelled { .. } => Ok(()),
-                    other => bail!("unexpected second cancel-acquire result: {other:?}"),
-                }
-            }
-            other => bail!("unexpected acquire race probe result: {other:?}"),
-        }
-    }
-
     async fn renew_owned_run_control(
         &mut self,
         port: &str,
@@ -1181,11 +1159,19 @@ impl SessionState {
         match self.call(request).await {
             Ok(CommandResult::TriggerStarted { trigger }) => Ok(*trigger),
             Ok(other) => bail!("unexpected trigger-start result: {other:?}"),
+            Err(error) if is_user_read_required(&error) => {
+                Err(anyhow::Error::new(UserCommandUsed {
+                    message: error.to_string(),
+                }))
+            }
             Err(error) if is_sequence_boundary_rejection(&error) => {
                 Err(anyhow::Error::new(SequenceBoundaryRejected {
                     message: error.to_string(),
                 }))
             }
+            Err(error) if daemon_reports_write_outcome_uncertain(&error) => Err(
+                physical_write_outcome_uncertain("Trigger start", request_id, operation_id, error),
+            ),
             Err(error) if is_control_loss_rejection(&error) => {
                 self.disconnect();
                 bail!(
@@ -1237,11 +1223,19 @@ impl SessionState {
         match self.call_with_timeout(request, timeout).await {
             Ok(CommandResult::BreakSent { event_seq }) => Ok(event_seq),
             Ok(other) => bail!("unexpected Break result: {other:?}"),
+            Err(error) if is_user_read_required(&error) => {
+                Err(anyhow::Error::new(UserCommandUsed {
+                    message: error.to_string(),
+                }))
+            }
             Err(error) if is_sequence_boundary_rejection(&error) => {
                 Err(anyhow::Error::new(SequenceBoundaryRejected {
                     message: error.to_string(),
                 }))
             }
+            Err(error) if daemon_reports_write_outcome_uncertain(&error) => Err(
+                physical_write_outcome_uncertain("Break", request_id, operation_id, error),
+            ),
             Err(error) if is_expected_run_rejection(&error) => {
                 self.disconnect();
                 bail!(
@@ -1403,11 +1397,19 @@ impl SessionState {
         match self.call_with_timeout(request, rpc_timeout).await {
             Ok(CommandResult::WriteAccepted { event_seq }) => Ok(event_seq),
             Ok(other) => bail!("unexpected write result: {other:?}"),
+            Err(error) if is_user_read_required(&error) => {
+                Err(anyhow::Error::new(UserCommandUsed {
+                    message: error.to_string(),
+                }))
+            }
             Err(error) if is_sequence_boundary_rejection(&error) => {
                 Err(anyhow::Error::new(SequenceBoundaryRejected {
                     message: error.to_string(),
                 }))
             }
+            Err(error) if daemon_reports_write_outcome_uncertain(&error) => Err(
+                physical_write_outcome_uncertain("write", request_id, operation_id, error),
+            ),
             Err(error) if is_expected_run_rejection(&error) => {
                 self.disconnect();
                 bail!(
@@ -1437,13 +1439,64 @@ impl SessionState {
         }
     }
 
+    #[cfg(test)]
     async fn start_run(
         &mut self,
         port: String,
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
-        control_wait: Duration,
     ) -> Result<StartedRun> {
+        self.start_run_with_policy(
+            port,
+            label,
+            metadata,
+            RunStartPolicy {
+                max_wait: RUN_START_MAX_WAIT,
+                cleanup_margin: DEFAULT_RPC_TIMEOUT,
+                poll_interval: RUN_START_POLL_INTERVAL,
+                expiry_grace: RUN_START_EXPIRY_GRACE,
+                caller: None,
+            },
+        )
+        .await
+    }
+
+    async fn start_run_observed(
+        &mut self,
+        port: String,
+        label: String,
+        metadata: std::collections::BTreeMap<String, Value>,
+        reply: &Reply,
+    ) -> Result<StartedRun> {
+        self.start_run_with_policy(
+            port,
+            label,
+            metadata,
+            RunStartPolicy {
+                max_wait: RUN_START_MAX_WAIT,
+                cleanup_margin: DEFAULT_RPC_TIMEOUT,
+                poll_interval: RUN_START_POLL_INTERVAL,
+                expiry_grace: RUN_START_EXPIRY_GRACE,
+                caller: Some(reply),
+            },
+        )
+        .await
+    }
+
+    async fn start_run_with_policy(
+        &mut self,
+        port: String,
+        label: String,
+        metadata: std::collections::BTreeMap<String, Value>,
+        policy: RunStartPolicy<'_>,
+    ) -> Result<StartedRun> {
+        let RunStartPolicy {
+            max_wait,
+            cleanup_margin,
+            poll_interval,
+            expiry_grace,
+            caller,
+        } = policy;
         if let Some(run) = self.owned_runs.get(&port) {
             bail!(
                 "serial-mcp already owns active Run {} on port {port:?}",
@@ -1460,37 +1513,253 @@ impl SessionState {
                 break candidate;
             }
         };
-        let lease = self.acquire_control(&port, control_wait).await?;
-        let request = ClientMessage::StartRun {
-            request_id: Uuid::new_v4(),
+        let request_id = Uuid::new_v4();
+        let request = ClientMessage::RequestRunStart {
+            request_id,
             port: port.clone(),
-            control_id: lease.id,
-            fence: lease.fence,
             label,
             metadata,
+            ttl_ms: LEASE_TTL_MS,
         };
-        match self.call(request).await {
-            Ok(CommandResult::RunStarted { run }) => {
-                let run_token = Uuid::new_v4();
-                self.owned_runs.insert(
-                    port,
-                    OwnedRun::new_with_handle(
-                        run.id,
-                        run_token,
-                        run_handle.clone(),
-                        Instant::now(),
-                    ),
+        let hard_deadline = tokio::time::Instant::now() + max_wait;
+        // Reserve one bounded RPC window for CancelRunStart. A responsive
+        // pending approval is therefore cleaned up before the 120-second
+        // process-local hard ceiling, not 5 seconds after it.
+        let hard_approval_deadline = hard_deadline - cleanup_margin.min(max_wait);
+        let mut pending_approval: Option<serial_protocol::PendingRunStartApproval> = None;
+        let mut approval_deadline = hard_approval_deadline;
+        let mut next_renewal = tokio::time::Instant::now() + RENEW_INTERVAL;
+
+        loop {
+            if caller.is_some_and(oneshot::Sender::is_closed) {
+                if let Some(approval) = pending_approval.as_ref() {
+                    self.cancel_run_start(&port, approval.id).await?;
+                }
+                bail!(
+                    "run_start caller disconnected; the pending approval was cancelled, no Run \
+                     remains owned by this MCP, and no bytes were written"
                 );
-                Ok(StartedRun { run, run_handle })
             }
+            if tokio::time::Instant::now() >= approval_deadline {
+                let approval_id = pending_approval
+                    .as_ref()
+                    .map(|approval| approval.id)
+                    .context(
+                        "run_start exceeded its local approval deadline before seriald returned a \
+                     pending approval identity; no Run was created and no bytes were written",
+                    )?;
+                self.cancel_run_start(&port, approval_id).await?;
+                bail!(
+                    "run_start approval {approval_id} timed out locally and was cancelled; no \
+                     Run was created and no bytes were written"
+                );
+            }
+
+            let poll_timeout = approval_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(DEFAULT_RPC_TIMEOUT);
+            if poll_timeout.is_zero() {
+                continue;
+            }
+            let result = self.call_with_timeout(request.clone(), poll_timeout).await;
+            match result {
+                Ok(CommandResult::RunStartGranted {
+                    approval_id,
+                    lease,
+                    run,
+                }) => {
+                    if approval_id != request_id {
+                        self.disconnect();
+                        bail!(
+                            "seriald returned a mismatched run_start grant; the connection was \
+                             closed so no Run remains owned by this MCP and no bytes were written"
+                        );
+                    }
+                    let run_token = Uuid::new_v4();
+                    self.leases.insert(port.clone(), lease);
+                    self.owned_runs.insert(
+                        port.clone(),
+                        OwnedRun::new_with_handle(
+                            run.id,
+                            run_token,
+                            run_handle.clone(),
+                            Instant::now(),
+                        ),
+                    );
+                    if caller.is_some_and(oneshot::Sender::is_closed) {
+                        self.best_effort_release(&port).await;
+                        bail!(
+                            "run_start caller disconnected as approval was granted; the new Run \
+                             was immediately released, no Run remains owned by this MCP, and no \
+                             bytes were written"
+                        );
+                    }
+                    return Ok(StartedRun {
+                        approval_id,
+                        run,
+                        run_handle,
+                    });
+                }
+                Ok(CommandResult::RunStartPending { approval }) => {
+                    let request_content_matches = match &request {
+                        ClientMessage::RequestRunStart {
+                            label,
+                            metadata,
+                            ttl_ms,
+                            ..
+                        } => {
+                            approval.label == *label
+                                && approval.metadata == *metadata
+                                && approval.control_ttl_ms == *ttl_ms
+                        }
+                        _ => unreachable!("run_start polls one RequestRunStart message"),
+                    };
+                    let requester_matches = self.actor.as_ref().is_some_and(|actor| {
+                        approval.requester.id == actor.id
+                            && approval.requester.kind == ActorKind::Agent
+                    });
+                    if approval.id != request_id
+                        || approval.port != port
+                        || !request_content_matches
+                        || !requester_matches
+                        || approval.required_approver.kind != ActorKind::Human
+                    {
+                        self.disconnect();
+                        bail!(
+                            "seriald returned a mismatched run_start approval identity or request \
+                             body; the connection was closed so the pending request is cancelled; \
+                             no Run was created and no bytes were written"
+                        );
+                    }
+                    if pending_approval
+                        .as_ref()
+                        .is_some_and(|previous| previous != approval.as_ref())
+                    {
+                        self.disconnect();
+                        bail!(
+                            "seriald changed the run_start approval while polling; the \
+                             connection was closed so no pending request remains; no Run was \
+                             created and no bytes were written"
+                        );
+                    }
+                    let expires_wall_time_ns = approval.expires_wall_time_ns;
+                    pending_approval = Some(*approval);
+                    approval_deadline = hard_approval_deadline.min(run_start_deadline(
+                        expires_wall_time_ns,
+                        max_wait,
+                        expiry_grace,
+                    ));
+                }
+                Ok(CommandResult::RunStartDenied { approval_id }) => bail!(
+                    "Human denied run_start approval {approval_id}; no Run was created and no \
+                     bytes were written"
+                ),
+                Ok(CommandResult::RunStartTimedOut { approval_id }) => bail!(
+                    "run_start approval {approval_id} expired without a Human decision; no Run \
+                     was created and no bytes were written"
+                ),
+                Ok(CommandResult::RunStartCancelled { approval_id }) => bail!(
+                    "run_start approval {approval_id} was cancelled; no Run was created and no \
+                     bytes were written"
+                ),
+                Ok(other) => {
+                    self.disconnect();
+                    bail!(
+                        "unexpected run_start result {other:?}; the connection was closed to \
+                         cancel any pending approval; no Run was accepted and no bytes were written"
+                    )
+                }
+                Err(error) => {
+                    // Disconnect is the authoritative cancellation boundary for
+                    // this Agent's pending request if polling itself fails.
+                    self.disconnect();
+                    return Err(error).context(
+                        "run_start approval polling failed; the Agent connection was closed to \
+                         cancel the pending request; no Run remains owned by this MCP and no bytes \
+                         were written",
+                    );
+                }
+            }
+
+            if tokio::time::Instant::now() >= next_renewal {
+                // A Human may take up to a minute to decide. Keep unrelated
+                // Runs held by this MCP session alive while this actor waits.
+                self.renew_all().await;
+                if self.socket.is_none() {
+                    bail!(
+                        "the Agent connection closed while run_start was waiting for Human \
+                         approval; pending state was cleared, no Run remains owned by this MCP, \
+                         and no bytes were written"
+                    );
+                }
+                next_renewal = tokio::time::Instant::now() + RENEW_INTERVAL;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    async fn cancel_run_start(&mut self, port: &str, approval_id: Uuid) -> Result<()> {
+        let cancel = ClientMessage::CancelRunStart {
+            request_id: Uuid::new_v4(),
+            port: port.to_string(),
+            approval_id,
+        };
+        match self.call(cancel).await {
+            Ok(CommandResult::RunStartCancelled {
+                approval_id: cancelled,
+            }) if cancelled == approval_id => Ok(()),
             Ok(other) => {
-                self.best_effort_release(&port).await;
-                bail!("unexpected start-run result: {other:?}")
+                self.disconnect();
+                bail!(
+                    "seriald did not confirm cancellation of run_start approval {approval_id} \
+                     (returned {other:?}); the connection was closed to clear pending state"
+                )
             }
             Err(error) => {
-                self.best_effort_release(&port).await;
-                Err(error)
+                self.disconnect();
+                Err(error).with_context(|| {
+                    format!(
+                        "failed to cancel run_start approval {approval_id}; the connection was \
+                         closed to clear pending state"
+                    )
+                })
             }
+        }
+    }
+
+    async fn acknowledge_run_context(
+        &mut self,
+        port: String,
+        run_id: Uuid,
+        revision: u64,
+        through_seq: u64,
+    ) -> Result<RunContextState> {
+        let request = ClientMessage::AcknowledgeRunContext {
+            request_id: Uuid::new_v4(),
+            port,
+            run_id,
+            revision,
+            through_seq,
+        };
+        match self.call(request).await? {
+            CommandResult::RunContextAcknowledged { context } => Ok(context),
+            other => bail!("unexpected run-context acknowledgement result: {other:?}"),
+        }
+    }
+
+    async fn record_command_capture(
+        &mut self,
+        port: String,
+        report: CommandCaptureReport,
+    ) -> Result<CommandCaptureCompleted> {
+        let request = ClientMessage::RecordCommandCapture {
+            request_id: Uuid::new_v4(),
+            port,
+            report: Box::new(report),
+        };
+        match self.call(request).await? {
+            CommandResult::CommandCaptureRecorded { capture } => Ok(*capture),
+            other => bail!("unexpected command-capture record result: {other:?}"),
         }
     }
 
@@ -1678,7 +1947,7 @@ impl SessionState {
     }
 
     async fn call(&mut self, request: ClientMessage) -> Result<CommandResult> {
-        let timeout = request_timeout(&request, None);
+        let timeout = request_timeout(&request);
         self.call_with_timeout(request, timeout).await
     }
 
@@ -1724,15 +1993,26 @@ impl SessionState {
     }
 }
 
-fn request_timeout(request: &ClientMessage, control_wait: Option<Duration>) -> Duration {
+fn request_timeout(request: &ClientMessage) -> Duration {
     match request {
         ClientMessage::Write { .. } => WRITE_RPC_TIMEOUT,
-        ClientMessage::AcquireControl { .. } => control_wait
-            .unwrap_or(MAX_CONTROL_WAIT)
-            .min(MAX_CONTROL_WAIT)
-            .saturating_add(RPC_SERVICE_MARGIN),
         _ => DEFAULT_RPC_TIMEOUT,
     }
+}
+
+fn run_start_deadline(
+    expires_wall_time_ns: i64,
+    max_wait: Duration,
+    grace: Duration,
+) -> tokio::time::Instant {
+    let now_wall_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let expires_wall_ns = u128::try_from(expires_wall_time_ns).unwrap_or_default();
+    let remaining_ns = expires_wall_ns.saturating_sub(now_wall_ns);
+    let remaining_ns = u64::try_from(remaining_ns).unwrap_or(u64::MAX);
+    tokio::time::Instant::now() + Duration::from_nanos(remaining_ns).min(max_wait) + grace
 }
 
 fn write_request_timeout(data_len: usize, pacing: WritePacing) -> Duration {
@@ -1792,7 +2072,10 @@ async fn wait_result(socket: &mut Socket, request_id: Uuid) -> Result<CommandRes
 fn daemon_error(code: ErrorCode, retryable: bool, message: String) -> anyhow::Error {
     anyhow::Error::new(DaemonRequestError {
         code,
-        retryable,
+        // An accepted physical write whose terminal result could not be
+        // confirmed is never safe for an automatic retry. Enforce that
+        // invariant locally even if an older or faulty daemon marks it true.
+        retryable: retryable && code != ErrorCode::WriteOutcomeUncertain,
         message,
     })
 }
@@ -1836,10 +2119,77 @@ impl std::fmt::Display for SequenceBoundaryRejected {
 
 impl std::error::Error for SequenceBoundaryRejected {}
 
+/// A Human command changed the active Agent Run's serial context. seriald
+/// rejects every physical Agent action until the Human TX has been read and
+/// acknowledged. The concrete marker becomes a stable MCP structured error.
+#[derive(Debug)]
+pub(crate) struct UserCommandUsed {
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for UserCommandUsed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "a Human command changed this Run's serial context; read the live timeline through \
+             that command before another physical action; no bytes were written: {}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for UserCommandUsed {}
+
+/// seriald accepted a physical action far enough that bytes or another
+/// physical effect may have reached the DUT, but could not confirm its
+/// terminal outcome. This concrete marker survives the session/tool layers so
+/// MCP clients receive a non-retryable structured result instead of a generic
+/// string that an Agent might retry automatically.
+#[derive(Debug)]
+pub(crate) struct WriteOutcomeUncertain {
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for WriteOutcomeUncertain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WriteOutcomeUncertain {}
+
+fn physical_write_outcome_uncertain(
+    action: &str,
+    request_id: Uuid,
+    operation_id: Uuid,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(WriteOutcomeUncertain {
+        message: format!(
+            "seriald could not confirm the {action} outcome after request {request_id} \
+             (operation {operation_id}); bytes or another physical effect may have reached the \
+             device. Do not retry automatically; inspect the TX/control timeline and current \
+             device state first: {error}"
+        ),
+    })
+}
+
 fn is_sequence_boundary_rejection(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<DaemonRequestError>()
         .is_some_and(|error| error.code == ErrorCode::SequenceBoundaryChanged)
+}
+
+fn is_user_read_required(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DaemonRequestError>()
+        .is_some_and(|error| error.code == ErrorCode::UserReadRequired)
+}
+
+fn daemon_reports_write_outcome_uncertain(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DaemonRequestError>()
+        .is_some_and(|error| error.code == ErrorCode::WriteOutcomeUncertain)
 }
 
 fn is_definite_prewrite_rejection(error: &anyhow::Error) -> bool {
@@ -1930,6 +2280,543 @@ fn ws_url(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestServerSocket = WebSocketStream<TcpStream>;
+
+    fn test_actor(kind: ActorKind) -> Actor {
+        Actor {
+            id: format!("{kind:?}:test"),
+            label: "test".into(),
+            kind,
+        }
+    }
+
+    fn test_lease(owner: Actor) -> ControlLease {
+        ControlLease {
+            id: Uuid::new_v4(),
+            owner,
+            epoch: Uuid::new_v4(),
+            generation: 7,
+            fence: 11,
+            issued_wall_time_ns: 1,
+            expires_wall_time_ns: i64::MAX,
+        }
+    }
+
+    fn test_run(owner: Actor, label: &str) -> RunInfo {
+        RunInfo {
+            id: Uuid::new_v4(),
+            owner,
+            label: label.into(),
+            status: serial_protocol::RunStatus::Active,
+            start_seq: 17,
+            end_seq: None,
+            metadata: Default::default(),
+        }
+    }
+
+    async fn run_start_test_state() -> (SessionState, TestServerSocket) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let server = accept.await.unwrap();
+        let mut state = SessionState::with_run_idle_ttl(
+            format!("http://{address}"),
+            "agent".into(),
+            Some(Duration::from_secs(1_800)),
+            None,
+        );
+        state.socket = Some(socket);
+        state.actor = Some(test_actor(ActorKind::Agent));
+        (state, server)
+    }
+
+    async fn receive_test_request(socket: &mut TestServerSocket) -> ClientMessage {
+        let frame = socket.next().await.unwrap().unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected binary client request");
+        };
+        serial_protocol::decode_client_control(&bytes).unwrap()
+    }
+
+    async fn send_test_result(
+        socket: &mut TestServerSocket,
+        request_id: Uuid,
+        result: CommandResult,
+    ) {
+        let response =
+            serial_protocol::encode_control(&ServerMessage::Result { request_id, result }).unwrap();
+        socket.send(Message::Binary(response.into())).await.unwrap();
+    }
+
+    async fn send_test_error(
+        socket: &mut TestServerSocket,
+        request_id: Uuid,
+        code: ErrorCode,
+        message: &str,
+        retryable: bool,
+    ) {
+        let response = serial_protocol::encode_control(&ServerMessage::Error {
+            request_id: Some(request_id),
+            code,
+            message: message.into(),
+            retryable,
+        })
+        .unwrap();
+        socket.send(Message::Binary(response.into())).await.unwrap();
+    }
+
+    fn pending_approval(
+        request_id: Uuid,
+        port: &str,
+        label: &str,
+    ) -> serial_protocol::PendingRunStartApproval {
+        serial_protocol::PendingRunStartApproval {
+            id: request_id,
+            port: port.into(),
+            requester: test_actor(ActorKind::Agent),
+            required_approver: test_actor(ActorKind::Human),
+            label: label.into(),
+            metadata: Default::default(),
+            control_ttl_ms: LEASE_TTL_MS,
+            daemon_epoch: Uuid::new_v4(),
+            generation: 7,
+            expected_control_id: Uuid::new_v4(),
+            expected_fence: 9,
+            requested_wall_time_ns: 1,
+            expires_wall_time_ns: i64::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_start_idle_uses_one_atomic_request_and_accepts_grant() {
+        let (mut state, mut server) = run_start_test_state().await;
+        let owner = test_actor(ActorKind::Agent);
+        let lease = test_lease(owner.clone());
+        let run = test_run(owner, "inspect boot");
+        let port = "COM7".to_string();
+        let (started, request) = tokio::join!(
+            state.start_run(port.clone(), "inspect boot".into(), Default::default()),
+            async {
+                let request = receive_test_request(&mut server).await;
+                let request_id = request.request_id();
+                send_test_result(
+                    &mut server,
+                    request_id,
+                    CommandResult::RunStartGranted {
+                        approval_id: request_id,
+                        lease: lease.clone(),
+                        run: run.clone(),
+                    },
+                )
+                .await;
+                request
+            }
+        );
+        let started = started.unwrap();
+        assert_eq!(started.approval_id, request.request_id());
+        assert_eq!(started.run.id, run.id);
+        assert!(matches!(
+            request,
+            ClientMessage::RequestRunStart {
+                request_id: _,
+                port: request_port,
+                label,
+                ttl_ms: LEASE_TTL_MS,
+                ..
+            } if request_port == port && label == "inspect boot"
+        ));
+        assert_eq!(state.leases[&port], lease);
+        assert_eq!(state.owned_runs[&port].id, run.id);
+    }
+
+    #[tokio::test]
+    async fn daemon_uncertain_write_stays_typed_and_never_retryable() {
+        let (mut state, mut server) = run_start_test_state().await;
+        let port = "COM13".to_string();
+        let run_id = Uuid::new_v4();
+        let run_token = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let lease = test_lease(state.actor.clone().unwrap());
+        state.leases.insert(port.clone(), lease.clone());
+        state.owned_runs.insert(
+            port.clone(),
+            OwnedRun::new_with_handle(
+                run_id,
+                run_token,
+                "abcdefghijklmnopqrstuv".into(),
+                Instant::now(),
+            ),
+        );
+
+        let (result, write_request) = tokio::join!(
+            state.write(
+                port.clone(),
+                b"reboot\r".to_vec(),
+                operation_id,
+                run_id,
+                run_token,
+                WritePacing {
+                    chunk_size: 4_096,
+                    chunk_delay_ms: 0,
+                },
+                Some("reboot the DUT".into()),
+                Vec::new(),
+                None,
+                None,
+            ),
+            async {
+                let renew = receive_test_request(&mut server).await;
+                assert!(matches!(renew, ClientMessage::RenewControl { .. }));
+                send_test_result(
+                    &mut server,
+                    renew.request_id(),
+                    CommandResult::ControlRenewed {
+                        lease: lease.clone(),
+                    },
+                )
+                .await;
+                let write = receive_test_request(&mut server).await;
+                send_test_error(
+                    &mut server,
+                    write.request_id(),
+                    ErrorCode::WriteOutcomeUncertain,
+                    "writer completion channel closed",
+                    true,
+                )
+                .await;
+                write
+            }
+        );
+
+        assert!(matches!(
+            write_request,
+            ClientMessage::Write {
+                operation_id: Some(request_operation_id),
+                ..
+            } if request_operation_id == operation_id
+        ));
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<WriteOutcomeUncertain>().is_some());
+        let message = error.to_string();
+        assert!(message.contains("Do not retry automatically"), "{message}");
+        assert!(message.contains("retryable=false"), "{message}");
+        assert!(!message.contains("retryable=true"), "{message}");
+        assert!(message.contains(&operation_id.to_string()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn pending_run_start_polls_the_exact_same_request_then_accepts_grant() {
+        let (mut state, mut server) = run_start_test_state().await;
+        let owner = test_actor(ActorKind::Agent);
+        let lease = test_lease(owner.clone());
+        let run = test_run(owner, "approved boot");
+        let (started, requests) = tokio::join!(
+            state.start_run("COM8".into(), "approved boot".into(), Default::default()),
+            async {
+                let first = receive_test_request(&mut server).await;
+                let request_id = first.request_id();
+                send_test_result(
+                    &mut server,
+                    request_id,
+                    CommandResult::RunStartPending {
+                        approval: Box::new(pending_approval(request_id, "COM8", "approved boot")),
+                    },
+                )
+                .await;
+                let second = receive_test_request(&mut server).await;
+                send_test_result(
+                    &mut server,
+                    second.request_id(),
+                    CommandResult::RunStartGranted {
+                        approval_id: second.request_id(),
+                        lease: lease.clone(),
+                        run: run.clone(),
+                    },
+                )
+                .await;
+                (first, second)
+            }
+        );
+        let started = started.unwrap();
+        assert_eq!(started.run.id, run.id);
+        assert_eq!(started.approval_id, requests.0.request_id());
+        assert_eq!(requests.0, requests.1);
+        assert!(matches!(requests.0, ClientMessage::RequestRunStart { .. }));
+    }
+
+    #[tokio::test]
+    async fn pending_run_start_surfaces_all_authoritative_terminal_outcomes() {
+        for (terminal, expected) in [
+            (0_u8, "Human denied"),
+            (1_u8, "expired without a Human decision"),
+            (2_u8, "was cancelled"),
+        ] {
+            let (mut state, mut server) = run_start_test_state().await;
+            let (result, ()) = tokio::join!(
+                state.start_run("COM9".into(), "terminal".into(), Default::default()),
+                async {
+                    let first = receive_test_request(&mut server).await;
+                    let request_id = first.request_id();
+                    send_test_result(
+                        &mut server,
+                        request_id,
+                        CommandResult::RunStartPending {
+                            approval: Box::new(pending_approval(request_id, "COM9", "terminal")),
+                        },
+                    )
+                    .await;
+                    let poll = receive_test_request(&mut server).await;
+                    assert_eq!(first, poll);
+                    let result = match terminal {
+                        0 => CommandResult::RunStartDenied {
+                            approval_id: request_id,
+                        },
+                        1 => CommandResult::RunStartTimedOut {
+                            approval_id: request_id,
+                        },
+                        _ => CommandResult::RunStartCancelled {
+                            approval_id: request_id,
+                        },
+                    };
+                    send_test_result(&mut server, request_id, result).await;
+                }
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("no Run was created"), "{error}");
+            assert!(error.contains("no bytes were written"), "{error}");
+            assert!(state.leases.is_empty());
+            assert!(state.owned_runs.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_run_start_deadline_cancels_pending_without_legacy_control_rpc() {
+        let (mut state, mut server) = run_start_test_state().await;
+        let (result, requests) = tokio::join!(
+            state.start_run_with_policy(
+                "COM10".into(),
+                "cancel me".into(),
+                Default::default(),
+                RunStartPolicy {
+                    max_wait: Duration::from_millis(10),
+                    cleanup_margin: Duration::ZERO,
+                    poll_interval: Duration::from_millis(1),
+                    expiry_grace: Duration::ZERO,
+                    caller: None,
+                },
+            ),
+            async {
+                let mut polled = Vec::new();
+                let mut approval = None;
+                loop {
+                    let request = receive_test_request(&mut server).await;
+                    match &request {
+                        ClientMessage::RequestRunStart {
+                            request_id,
+                            port,
+                            label,
+                            ..
+                        } => {
+                            polled.push(request.clone());
+                            let pending = approval
+                                .get_or_insert_with(|| pending_approval(*request_id, port, label));
+                            send_test_result(
+                                &mut server,
+                                *request_id,
+                                CommandResult::RunStartPending {
+                                    approval: Box::new(pending.clone()),
+                                },
+                            )
+                            .await;
+                        }
+                        ClientMessage::CancelRunStart {
+                            request_id,
+                            approval_id,
+                            ..
+                        } => {
+                            send_test_result(
+                                &mut server,
+                                *request_id,
+                                CommandResult::RunStartCancelled {
+                                    approval_id: *approval_id,
+                                },
+                            )
+                            .await;
+                            break (polled, request);
+                        }
+                        other => panic!("legacy or unexpected run_start RPC: {other:?}"),
+                    }
+                }
+            }
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out locally"), "{error}");
+        assert!(error.contains("no bytes were written"), "{error}");
+        assert!(!requests.0.is_empty());
+        assert!(requests.0.iter().all(|request| request == &requests.0[0]));
+        assert!(matches!(requests.1, ClientMessage::CancelRunStart { .. }));
+        assert!(state.leases.is_empty());
+        assert!(state.owned_runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_mcp_caller_cancels_pending_approval() {
+        let (mut state, mut server) = run_start_test_state().await;
+        let (reply, response) = oneshot::channel::<Result<SessionResponse>>();
+        let (result, cancel) = tokio::join!(
+            state.start_run_with_policy(
+                "COM12".into(),
+                "disconnected caller".into(),
+                Default::default(),
+                RunStartPolicy {
+                    max_wait: Duration::from_secs(1),
+                    cleanup_margin: Duration::ZERO,
+                    poll_interval: Duration::from_millis(1),
+                    expiry_grace: Duration::ZERO,
+                    caller: Some(&reply),
+                },
+            ),
+            async {
+                let request = receive_test_request(&mut server).await;
+                let request_id = request.request_id();
+                send_test_result(
+                    &mut server,
+                    request_id,
+                    CommandResult::RunStartPending {
+                        approval: Box::new(pending_approval(
+                            request_id,
+                            "COM12",
+                            "disconnected caller",
+                        )),
+                    },
+                )
+                .await;
+                drop(response);
+                let cancel = receive_test_request(&mut server).await;
+                let ClientMessage::CancelRunStart {
+                    request_id,
+                    approval_id,
+                    ..
+                } = cancel
+                else {
+                    panic!("dropped caller must cancel the pending run_start")
+                };
+                send_test_result(
+                    &mut server,
+                    request_id,
+                    CommandResult::RunStartCancelled { approval_id },
+                )
+                .await;
+                approval_id
+            }
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("caller disconnected"), "{error}");
+        assert!(error.contains("no Run remains owned"), "{error}");
+        assert_ne!(cancel, Uuid::nil());
+        assert!(state.leases.is_empty());
+        assert!(state.owned_runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_context_ack_and_command_capture_use_v7_rpcs() {
+        let (mut state, mut server) = run_start_test_state().await;
+        let port = "COM11".to_string();
+        let run_id = Uuid::new_v4();
+        let context = RunContextState {
+            run_id,
+            revision: 3,
+            last_human_command_seq: Some(44),
+            acknowledged_revision: 3,
+            acknowledged_through_seq: Some(47),
+        };
+        let (acknowledged, request) = tokio::join!(
+            state.acknowledge_run_context(port.clone(), run_id, 3, 47),
+            async {
+                let request = receive_test_request(&mut server).await;
+                send_test_result(
+                    &mut server,
+                    request.request_id(),
+                    CommandResult::RunContextAcknowledged {
+                        context: context.clone(),
+                    },
+                )
+                .await;
+                request
+            }
+        );
+        assert_eq!(acknowledged.unwrap(), context);
+        assert!(matches!(
+            request,
+            ClientMessage::AcknowledgeRunContext {
+                port: request_port,
+                run_id: request_run_id,
+                revision: 3,
+                through_seq: 47,
+                ..
+            } if request_port == port && request_run_id == run_id
+        ));
+
+        let report = CommandCaptureReport {
+            daemon_epoch: Uuid::new_v4(),
+            generation: 7,
+            run_id,
+            operation_id: Uuid::new_v4(),
+            tx_event_seq: 50,
+            evidence_from_seq: 50,
+            evidence_through_seq: 55,
+            completion: serial_protocol::CommandCaptureCompletionKind::Prompt,
+            completion_detail: Some("root# ".into()),
+            confidence: serial_protocol::CommandCaptureConfidence::High,
+        };
+        let completed = CommandCaptureCompleted {
+            daemon_epoch: report.daemon_epoch,
+            generation: report.generation,
+            run_id,
+            operation_id: report.operation_id,
+            tx_event_seq: report.tx_event_seq,
+            evidence_from_seq: report.evidence_from_seq,
+            evidence_through_seq: report.evidence_through_seq,
+            completion: report.completion,
+            completion_detail: report.completion_detail.clone(),
+            confidence: report.confidence,
+            record_event_seq: 56,
+            tx_stream_offset_start: Some(10),
+            tx_stream_offset_end: Some(15),
+            rx_stream_offset_start: Some(20),
+            rx_stream_offset_end: Some(30),
+        };
+        let (recorded, request) = tokio::join!(
+            state.record_command_capture(port.clone(), report.clone()),
+            async {
+                let request = receive_test_request(&mut server).await;
+                send_test_result(
+                    &mut server,
+                    request.request_id(),
+                    CommandResult::CommandCaptureRecorded {
+                        capture: Box::new(completed.clone()),
+                    },
+                )
+                .await;
+                request
+            }
+        );
+        assert_eq!(recorded.unwrap(), completed);
+        assert!(matches!(
+            request,
+            ClientMessage::RecordCommandCapture {
+                port: request_port,
+                report: request_report,
+                ..
+            } if request_port == port && *request_report == report
+        ));
+    }
 
     async fn abort_test_state(
         response: CommandResult,

@@ -1253,6 +1253,11 @@ fn event_kind_label(kind: EventKind) -> &'static str {
         EventKind::RunStarted => tr("d.ev.run_started"),
         EventKind::RunEnded => tr("d.ev.run_ended"),
         EventKind::RunAborted => tr("d.ev.run_aborted"),
+        EventKind::RunStartRequested => tr("d.ev.run_start_requested"),
+        EventKind::RunStartApproved => tr("d.ev.run_start_approved"),
+        EventKind::RunStartDenied => tr("d.ev.run_start_denied"),
+        EventKind::RunStartTimedOut => tr("d.ev.run_start_timed_out"),
+        EventKind::RunStartCancelled => tr("d.ev.run_start_cancelled"),
         EventKind::TriggerStarted => tr("d.ev.trigger_started"),
         EventKind::TriggerCompleted => tr("d.ev.trigger_completed"),
         EventKind::TriggerCancelled => tr("d.ev.trigger_cancelled"),
@@ -1260,6 +1265,7 @@ fn event_kind_label(kind: EventKind) -> &'static str {
         EventKind::Break => tr("d.ev.break"),
         EventKind::Checkpoint => tr("d.ev.checkpoint"),
         EventKind::LoggingDegraded => tr("d.ev.logging_degraded"),
+        EventKind::CommandCaptureCompleted => tr("d.ev.command_capture_completed"),
         EventKind::Gap => tr("d.ev.gap"),
     }
 }
@@ -1326,6 +1332,8 @@ pub fn error_code_label(code: ErrorCode) -> &'static str {
         ErrorCode::PortOffline => tr("error.port_offline"),
         ErrorCode::CursorAhead => tr("error.cursor_ahead"),
         ErrorCode::SequenceBoundaryChanged => tr("error.conflict"),
+        ErrorCode::UserReadRequired => tr("error.user_read_required"),
+        ErrorCode::WriteOutcomeUncertain => tr("error.write_outcome_uncertain"),
         ErrorCode::ResourceExhausted => tr("error.resource_exhausted"),
         ErrorCode::IdempotencyExpired => tr("error.idempotency_expired"),
         ErrorCode::ConfigRevisionMismatch => tr("error.config_revision_mismatch"),

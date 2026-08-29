@@ -1160,6 +1160,30 @@ async fn dispatch_slot_command(
                 .acquire_control(request_id, actor, mode, ttl_ms)
                 .await?
         }
+        ClientMessage::RequestRunStart {
+            label,
+            metadata,
+            ttl_ms,
+            ..
+        } => {
+            handle
+                .request_run_start(request_id, actor, label, metadata, ttl_ms)
+                .await?
+        }
+        ClientMessage::DecideRunStart {
+            approval_id,
+            decision,
+            ..
+        } => {
+            handle
+                .decide_run_start(request_id, actor, approval_id, decision)
+                .await?
+        }
+        ClientMessage::CancelRunStart { approval_id, .. } => {
+            handle
+                .cancel_run_start(request_id, actor, approval_id)
+                .await?
+        }
         ClientMessage::RenewControl {
             control_id,
             fence,
@@ -1179,6 +1203,24 @@ async fn dispatch_slot_command(
         }
         ClientMessage::CancelAcquire { control_id, .. } => {
             handle.cancel_acquire(request_id, actor, control_id).await?
+        }
+        ClientMessage::SendHumanCommand {
+            expected_generation,
+            data,
+            operation_id,
+            description,
+            ..
+        } => {
+            handle
+                .send_human_command(
+                    request_id,
+                    actor,
+                    expected_generation,
+                    data,
+                    operation_id,
+                    description,
+                )
+                .await?
         }
         ClientMessage::Write {
             control_id,
@@ -1321,6 +1363,21 @@ async fn dispatch_slot_command(
                 .checkpoint(request_id, actor, control_id, fence, label)
                 .await?
         }
+        ClientMessage::AcknowledgeRunContext {
+            run_id,
+            revision,
+            through_seq,
+            ..
+        } => {
+            handle
+                .acknowledge_run_context(request_id, actor, run_id, revision, through_seq)
+                .await?
+        }
+        ClientMessage::RecordCommandCapture { report, .. } => {
+            handle
+                .record_command_capture(request_id, actor, *report)
+                .await?
+        }
         _ => return Err(WsError::BadRequest("unsupported command".into())),
     };
     Ok((request_id, result))
@@ -1431,9 +1488,13 @@ fn spawn_live_forwarder(
 fn command_slot(message: &ClientMessage) -> Option<&str> {
     match message {
         ClientMessage::AcquireControl { port, .. }
+        | ClientMessage::RequestRunStart { port, .. }
+        | ClientMessage::DecideRunStart { port, .. }
+        | ClientMessage::CancelRunStart { port, .. }
         | ClientMessage::RenewControl { port, .. }
         | ClientMessage::ReleaseControl { port, .. }
         | ClientMessage::CancelAcquire { port, .. }
+        | ClientMessage::SendHumanCommand { port, .. }
         | ClientMessage::Write { port, .. }
         | ClientMessage::SendBreak { port, .. }
         | ClientMessage::TriggerStart { port, .. }
@@ -1441,7 +1502,9 @@ fn command_slot(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::TriggerCancel { port, .. }
         | ClientMessage::StartRun { port, .. }
         | ClientMessage::EndRun { port, .. }
-        | ClientMessage::Checkpoint { port, .. } => Some(port),
+        | ClientMessage::Checkpoint { port, .. }
+        | ClientMessage::AcknowledgeRunContext { port, .. }
+        | ClientMessage::RecordCommandCapture { port, .. } => Some(port),
         _ => None,
     }
 }
@@ -1510,6 +1573,9 @@ impl WsError {
                 SlotError::Control(crate::control::ControlError::NotOwner) => {
                     (ErrorCode::ControlRequired, false)
                 }
+                SlotError::Control(crate::control::ControlError::Busy) => {
+                    (ErrorCode::Conflict, true)
+                }
                 SlotError::Control(_) => (ErrorCode::StaleFence, false),
                 SlotError::CursorAhead => (ErrorCode::CursorAhead, false),
                 SlotError::RunAlreadyActive
@@ -1518,12 +1584,20 @@ impl WsError {
                 | SlotError::WriteRunMissing { .. }
                 | SlotError::WriteRunMismatch { .. }
                 | SlotError::WriteRunNotOwner { .. }
-                | SlotError::PartialWrite { .. }
                 | SlotError::TriggerActive
                 | SlotError::TriggerNotOwner { .. }
                 | SlotError::TriggerEpochMismatch
                 | SlotError::TriggerGenerationMismatch
+                | SlotError::GenerationMismatch
+                | SlotError::RunStartApprovalPending
+                | SlotError::RunContextNotCovered
                 | SlotError::RequestIdReused => (ErrorCode::Conflict, false),
+                SlotError::PartialWrite { .. }
+                | SlotError::WriteOutcomeUncertain { .. }
+                | SlotError::BreakFailed { .. } => (ErrorCode::WriteOutcomeUncertain, false),
+                SlotError::UserReadRequired { .. } => (ErrorCode::UserReadRequired, false),
+                SlotError::RunStartApprovalNotFound { .. } => (ErrorCode::NotFound, false),
+                SlotError::RunStartApprovalNotApprover => (ErrorCode::ControlRequired, false),
                 SlotError::SequenceBoundaryChanged { .. } => {
                     (ErrorCode::SequenceBoundaryChanged, false)
                 }
@@ -1531,10 +1605,8 @@ impl WsError {
                 SlotError::WriteLeaseTooShort { .. } => (ErrorCode::Conflict, true),
                 SlotError::WriteResultExpired => (ErrorCode::IdempotencyExpired, false),
                 SlotError::WriteIdempotencyCapacity => (ErrorCode::ResourceExhausted, false),
-                SlotError::ControlQueueFull => (ErrorCode::ResourceExhausted, true),
                 SlotError::TriggerNotFound { .. } => (ErrorCode::NotFound, false),
                 SlotError::BreakUnsupported => (ErrorCode::BreakUnsupported, false),
-                SlotError::BreakFailed { .. } => (ErrorCode::PortIo, false),
                 SlotError::WriteTooLarge
                 | SlotError::EmptyWrite
                 | SlotError::InvalidCommandDescription
@@ -1550,7 +1622,9 @@ impl WsError {
                 | SlotError::TriggerTotalBytesTooLarge
                 | SlotError::InvalidLabel
                 | SlotError::RunMetadataTooManyKeys { .. }
-                | SlotError::RunMetadataTooLarge { .. } => (ErrorCode::BadRequest, false),
+                | SlotError::RunMetadataTooLarge { .. }
+                | SlotError::RunStartActorKind
+                | SlotError::InvalidCommandCapture { .. } => (ErrorCode::BadRequest, false),
                 SlotError::SlotIdChanged => (ErrorCode::Internal, false),
             },
         }
@@ -1595,6 +1669,24 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if matches!(
+            &self,
+            Self::Slot(
+                SlotError::PartialWrite { .. }
+                    | SlotError::WriteOutcomeUncertain { .. }
+                    | SlotError::BreakFailed { .. }
+            )
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "code": ErrorCode::WriteOutcomeUncertain,
+                    "message": self.to_string(),
+                    "retryable": false,
+                })),
+            )
+                .into_response();
+        }
         if let Self::Journal(JournalError::QueryBudgetExceeded {
             phase,
             scanned_bytes,
@@ -1658,6 +1750,11 @@ impl IntoResponse for ApiError {
             Self::ConfigRevisionMismatch { .. } => {
                 (StatusCode::CONFLICT, ErrorCode::ConfigRevisionMismatch)
             }
+            Self::Slot(
+                SlotError::PartialWrite { .. }
+                | SlotError::WriteOutcomeUncertain { .. }
+                | SlotError::BreakFailed { .. },
+            ) => (StatusCode::CONFLICT, ErrorCode::WriteOutcomeUncertain),
             Self::Config(_)
             | Self::Registry(_)
             | Self::ConfigRollback { .. }
@@ -1693,6 +1790,56 @@ mod tests {
         routing::get,
     };
     use tower::ServiceExt;
+
+    #[test]
+    fn ambiguous_physical_writes_have_a_distinct_non_retryable_wire_error() {
+        let partial = super::WsError::Slot(crate::slot::SlotError::PartialWrite {
+            written: 2,
+            total: 4,
+            generation: 7,
+            event_seq: Some(42),
+            operation_id: Some(uuid::Uuid::new_v4()),
+            message: "driver acknowledgement was lost".into(),
+        });
+        assert_eq!(
+            partial.protocol_code(),
+            (serial_protocol::ErrorCode::WriteOutcomeUncertain, false)
+        );
+
+        let dropped = super::WsError::Slot(crate::slot::SlotError::WriteOutcomeUncertain {
+            operation_id: Some(uuid::Uuid::new_v4()),
+            message: "Slot reply was lost after dispatch".into(),
+        });
+        assert_eq!(
+            dropped.protocol_code(),
+            (serial_protocol::ErrorCode::WriteOutcomeUncertain, false)
+        );
+
+        let failed_break = super::WsError::Slot(crate::slot::SlotError::BreakFailed {
+            message: "failed to clear BREAK: operation not supported; BREAK may still be asserted"
+                .into(),
+        });
+        assert_eq!(
+            failed_break.protocol_code(),
+            (serial_protocol::ErrorCode::WriteOutcomeUncertain, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_physical_write_http_errors_are_also_explicitly_non_retryable() {
+        let response = axum::response::IntoResponse::into_response(super::ApiError::Slot(
+            crate::slot::SlotError::BreakFailed {
+                message:
+                    "failed to clear BREAK: operation not supported; BREAK may still be asserted"
+                        .into(),
+            },
+        ));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["code"], "write_outcome_uncertain");
+        assert_eq!(value["retryable"], false);
+    }
 
     #[tokio::test]
     async fn encoded_macos_device_path_round_trips_through_port_route() {

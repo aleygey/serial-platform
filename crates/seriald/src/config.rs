@@ -17,8 +17,8 @@ use std::{
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
-    EchoMode, FlowControl, MAX_MODEL_FAMILIES, MAX_MODEL_NAMES_PER_FAMILY, ModelFamily,
-    ModelProfile, SlotConfig, TransportProfile,
+    EchoMode, FlowControl, MAX_COMMAND_CAPTURE_DETAIL_BYTES, MAX_MODEL_FAMILIES,
+    MAX_MODEL_NAMES_PER_FAMILY, ModelFamily, ModelProfile, SlotConfig, TransportProfile,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -45,7 +45,6 @@ const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PORT_NAME_BYTES: usize = 512;
 const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_MODEL_NAME_BYTES: usize = 128;
-const MAX_PROMPT_PATTERN_BYTES: usize = 4096;
 const MAX_CONFIG_MIGRATION_RETRIES: usize = 8;
 const MAX_CONFIG_MIGRATION_BACKUPS: usize = 128;
 
@@ -119,9 +118,9 @@ impl Default for LoggingConfig {
 pub struct ControlConfig {
     /// Ceiling applied to client-requested lease TTLs.
     pub max_ttl_ms: u64,
-    /// Lifetime of a queued acquire request before it is dropped.
+    /// Lifetime of a pending Human Run-start approval before it is dropped.
     pub wait_timeout_ms: u64,
-    /// Bound for the per-slot control wait queue.
+    /// Legacy sizing field retained in schema 3; v7 has no Control wait queue.
     pub max_waiters: usize,
 }
 
@@ -828,7 +827,7 @@ pub enum ConfigValidationError {
     #[error("control.max_ttl_ms is {actual}, exceeding the configured lease ceiling of {limit} ms")]
     ControlMaxTtlTooLarge { actual: u64, limit: u64 },
     #[error(
-        "control.wait_timeout_ms is {actual}, exceeding the queued-acquire ceiling of {limit} ms"
+        "control.wait_timeout_ms is {actual}, exceeding the Run-start approval ceiling of {limit} ms"
     )]
     ControlWaitTimeoutTooLarge { actual: u64, limit: u64 },
     #[error("port at index {index} has invalid field {field}: {reason}")]
@@ -1138,7 +1137,7 @@ pub(crate) fn validate_model_profiles(
         ] {
             if pattern.is_some_and(|pattern| {
                 pattern.is_empty()
-                    || pattern.len() > MAX_PROMPT_PATTERN_BYTES
+                    || pattern.len() > MAX_COMMAND_CAPTURE_DETAIL_BYTES
                     || pattern.contains('\0')
             }) {
                 return Err(ConfigValidationError::InvalidModelProfile {
