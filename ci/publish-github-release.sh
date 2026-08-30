@@ -10,6 +10,7 @@ readonly GITHUB_REPOSITORY="aleygey/serial-platform"
 CURRENT_PHASE="startup"
 TEMP_DIR=""
 readonly RELEASE_NOT_FOUND_STATUS=44
+readonly RELEASE_ASSET_NOT_FOUND_STATUS=45
 
 log() {
     printf '\n==> %s\n' "$*"
@@ -41,16 +42,22 @@ asset_sha256() {
     sha256sum "$1" | awk '{print $1}'
 }
 
-download_asset() {
-    local tag="$1"
+download_asset_by_id() {
+    local asset_database_id="$1"
     local name="$2"
     local destination_dir="$3"
 
+    [[ "${asset_database_id}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "GitHub Release asset has an invalid database ID: ${asset_database_id}"
+
     mkdir -p "${destination_dir}"
-    gh release download "${tag}" \
-        --repo "${GITHUB_REPOSITORY}" \
-        --pattern "${name}" \
-        --dir "${destination_dir}"
+    if ! gh api --method GET \
+        -H 'Accept: application/octet-stream' \
+        "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_database_id}" \
+        >"${destination_dir}/${name}"; then
+        rm -f -- "${destination_dir}/${name}"
+        fail "could not download GitHub Release asset database ID ${asset_database_id}: ${name}"
+    fi
     [[ -f "${destination_dir}/${name}" ]] \
         || fail "GitHub Release asset download is missing: ${name}"
 }
@@ -64,6 +71,128 @@ assert_same_asset() {
     remote_digest="$(asset_sha256 "${remote_path}")"
     [[ "${local_digest}" == "${remote_digest}" ]] \
         || fail "GitHub Release already has a different asset: $(basename "${local_path}")"
+}
+
+verify_release_asset_if_present() {
+    local release_json="$1"
+    local name="$2"
+    local local_path="$3"
+    local destination_dir="$4"
+    local remote_count
+
+    remote_count="$(
+        jq --arg name "${name}" \
+            '[.assets[] | select(.name == $name)] | length' \
+            "${release_json}"
+    )"
+    case "${remote_count}" in
+        0)
+            return "${RELEASE_ASSET_NOT_FOUND_STATUS}"
+            ;;
+        1)
+            local asset_database_id
+            asset_database_id="$(
+                jq -er --arg name "${name}" '
+                    .assets[]
+                    | select(.name == $name)
+                    | .id
+                    | select(type == "number" and . > 0 and floor == .)
+                ' "${release_json}"
+            )"
+            download_asset_by_id \
+                "${asset_database_id}" \
+                "${name}" \
+                "${destination_dir}"
+            assert_same_asset \
+                "${local_path}" \
+                "${destination_dir}/${name}"
+            ;;
+        *)
+            fail "GitHub Release contains duplicate assets named ${name}"
+            ;;
+    esac
+}
+
+reconcile_release_asset() {
+    local release_database_id="$1"
+    local tag="$2"
+    local expected_draft="$3"
+    local name="$4"
+    local local_path="$5"
+    local working_dir="$6"
+    local before_upload_json="${working_dir}/before-upload.json"
+    local after_upload_json="${working_dir}/after-upload.json"
+
+    mkdir -p "${working_dir}"
+    fetch_release_snapshot_by_id \
+        "${release_database_id}" \
+        "${before_upload_json}"
+    assert_release_snapshot \
+        "${before_upload_json}" \
+        "${release_database_id}" \
+        "${tag}" \
+        "${expected_draft}"
+
+    if verify_release_asset_if_present \
+        "${before_upload_json}" \
+        "${name}" \
+        "${local_path}" \
+        "${working_dir}/existing"; then
+        log "Keeping identical existing asset ${name}"
+        return 0
+    else
+        local lookup_status=$?
+        [[ "${lookup_status}" -eq "${RELEASE_ASSET_NOT_FOUND_STATUS}" ]] \
+            || return "${lookup_status}"
+    fi
+
+    [[ "${expected_draft}" == "true" ]] \
+        || fail "published GitHub Release is missing asset: ${name}"
+
+    log "Uploading ${name}"
+    local upload_status=0
+    if gh release upload "${tag}" \
+        "${local_path}" \
+        --repo "${GITHUB_REPOSITORY}"; then
+        :
+    else
+        upload_status=$?
+        log "Upload returned exit code ${upload_status}; reconciling ${name} by Release database ID"
+    fi
+
+    # Upload responses can be lost after GitHub has committed an asset, and the
+    # list-releases response can briefly contain an older assets array. Resolve
+    # that ambiguity through the authoritative database-ID endpoint, then keep
+    # an existing asset only after downloading and hashing its exact bytes.
+    fetch_release_snapshot_by_id \
+        "${release_database_id}" \
+        "${after_upload_json}"
+    assert_release_snapshot \
+        "${after_upload_json}" \
+        "${release_database_id}" \
+        "${tag}" \
+        "${expected_draft}"
+    if verify_release_asset_if_present \
+        "${after_upload_json}" \
+        "${name}" \
+        "${local_path}" \
+        "${working_dir}/after-upload"; then
+        if [[ "${upload_status}" -eq 0 ]]; then
+            log "Verified uploaded asset ${name}"
+        else
+            log "Accepted ambiguous upload result for identical asset ${name}"
+        fi
+        return 0
+    else
+        local reconciliation_status=$?
+        [[ "${reconciliation_status}" -eq "${RELEASE_ASSET_NOT_FOUND_STATUS}" ]] \
+            || return "${reconciliation_status}"
+    fi
+
+    if [[ "${upload_status}" -eq 0 ]]; then
+        fail "GitHub reported a successful upload but the asset is absent: ${name}"
+    fi
+    fail "GitHub asset upload failed with exit code ${upload_status} and the asset is absent: ${name}"
 }
 
 assert_exact_release_asset_set() {
@@ -371,8 +500,17 @@ main() {
     release_database_id="$(jq -er '.id | select(type == "number" and . > 0 and floor == .)' "${release_json}")"
     local is_draft
     is_draft="$(jq -er '.draft | select(type == "boolean")' "${release_json}")"
+    local release_by_id_json="${TEMP_DIR}/release-by-id.json"
+    fetch_release_snapshot_by_id \
+        "${release_database_id}" \
+        "${release_by_id_json}"
+    assert_release_snapshot \
+        "${release_by_id_json}" \
+        "${release_database_id}" \
+        "${tag}" \
+        "${is_draft}"
     local remote_names_file="${TEMP_DIR}/remote-assets"
-    jq -r '.assets[].name' "${release_json}" | LC_ALL=C sort >"${remote_names_file}"
+    jq -r '.assets[].name' "${release_by_id_json}" | LC_ALL=C sort >"${remote_names_file}"
     local unexpected_remote
     unexpected_remote="$(comm -13 "${expected_assets_file}" "${remote_names_file}")"
     [[ -z "${unexpected_remote}" ]] \
@@ -380,39 +518,40 @@ main() {
 
     CURRENT_PHASE="asset-upload"
     for name in "${asset_names[@]}"; do
-        local remote_count
-        remote_count="$(jq --arg name "${name}" '[.assets[] | select(.name == $name)] | length' "${release_json}")"
-        case "${remote_count}" in
-            0)
-                [[ "${is_draft}" == "true" ]] \
-                    || fail "published GitHub Release is missing asset: ${name}"
-                log "Uploading ${name}"
-                gh release upload "${tag}" \
-                    "${ARTIFACT_DIR}/${name}" \
-                    --repo "${GITHUB_REPOSITORY}"
-                ;;
-            1)
-                local remote_dir="${TEMP_DIR}/existing/${name}"
-                download_asset "${tag}" "${name}" "${remote_dir}"
-                assert_same_asset \
-                    "${ARTIFACT_DIR}/${name}" \
-                    "${remote_dir}/${name}"
-                log "Keeping identical existing asset ${name}"
-                ;;
-            *)
-                fail "GitHub Release contains duplicate assets named ${name}"
-                ;;
-        esac
+        reconcile_release_asset \
+            "${release_database_id}" \
+            "${tag}" \
+            "${is_draft}" \
+            "${name}" \
+            "${ARTIFACT_DIR}/${name}" \
+            "${TEMP_DIR}/asset-reconciliation/${name}"
     done
 
     CURRENT_PHASE="remote-verification"
+    local uploaded_release_json="${TEMP_DIR}/release-after-uploads.json"
+    fetch_release_snapshot_by_id \
+        "${release_database_id}" \
+        "${uploaded_release_json}"
+    assert_release_snapshot \
+        "${uploaded_release_json}" \
+        "${release_database_id}" \
+        "${tag}" \
+        "${is_draft}"
     local verification_dir="${TEMP_DIR}/verification"
     for name in "${asset_names[@]}"; do
         local asset_dir="${verification_dir}/${name}"
-        download_asset "${tag}" "${name}" "${asset_dir}"
-        assert_same_asset \
+        if verify_release_asset_if_present \
+            "${uploaded_release_json}" \
+            "${name}" \
             "${ARTIFACT_DIR}/${name}" \
-            "${asset_dir}/${name}"
+            "${asset_dir}"; then
+            :
+        else
+            local verification_status=$?
+            [[ "${verification_status}" -eq "${RELEASE_ASSET_NOT_FOUND_STATUS}" ]] \
+                || return "${verification_status}"
+            fail "GitHub Release is missing asset after upload reconciliation: ${name}"
+        fi
     done
 
     # Close the upload-to-publish race with a fresh REST snapshot. The draft

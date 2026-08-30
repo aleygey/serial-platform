@@ -44,7 +44,16 @@ write_release_fixture() {
         --argjson id 4242 \
         --arg tag v0.8.0 \
         --argjson draft "${draft}" \
-        --args '$ARGS.positional | {id: $id, tag_name: $tag, draft: $draft, assets: map({name: .})}' \
+        --args '
+            $ARGS.positional
+            | to_entries
+            | {
+                id: $id,
+                tag_name: $tag,
+                draft: $draft,
+                assets: map({id: (5000 + .key), name: .value})
+            }
+        ' \
         "$@" >"${output}"
 }
 
@@ -127,6 +136,13 @@ expect_failure "published snapshot missing asset" assert_verified_release_snapsh
 # deliberately rejecting any accidental use of the tag endpoint.
 MOCK_GH_CALLS="${TEST_TEMP_DIR}/mock-gh-calls"
 MOCK_GH_MODE=valid
+MOCK_UPLOAD_ATTEMPTED=0
+single_asset_release="${TEST_TEMP_DIR}/single-asset-release.json"
+jq --arg name "${digest_name}" \
+    '.assets |= map(select(.name == $name))' \
+    "${valid_release}" >"${single_asset_release}"
+empty_asset_release="${TEST_TEMP_DIR}/empty-asset-release.json"
+jq '.assets = []' "${valid_release}" >"${empty_asset_release}"
 gh() {
     printf '%s\n' "$*" >>"${MOCK_GH_CALLS}"
     case "$*" in
@@ -158,6 +174,28 @@ gh() {
                     ;;
             esac
             ;;
+        *'/releases/assets/5001'*)
+            if [[ "${MOCK_GH_MODE}" == "asset_mismatch" ]]; then
+                printf 'different remote bytes\n'
+            else
+                cat "${TEST_ARTIFACT_DIR}/${digest_name}"
+            fi
+            ;;
+        *'release upload '* )
+            MOCK_UPLOAD_ATTEMPTED=1
+            case "${MOCK_GH_MODE}" in
+                upload_success)
+                    ;;
+                upload_ambiguous_same|upload_failure_absent|asset_mismatch)
+                    printf 'mock upload failure\n' >&2
+                    return 1
+                    ;;
+                *)
+                    printf 'unexpected upload mock mode: %s\n' "${MOCK_GH_MODE}" >&2
+                    return 2
+                    ;;
+            esac
+            ;;
         *'--method PATCH'*'/releases/4242'*)
             cat "${published_release}"
             ;;
@@ -172,6 +210,19 @@ gh() {
                     ;;
                 published_bad_assets)
                     cat "${published_missing_asset}"
+                    ;;
+                asset_existing)
+                    cat "${single_asset_release}"
+                    ;;
+                upload_success|upload_ambiguous_same|asset_mismatch)
+                    if [[ "${MOCK_UPLOAD_ATTEMPTED}" -eq 1 ]]; then
+                        cat "${single_asset_release}"
+                    else
+                        cat "${empty_asset_release}"
+                    fi
+                    ;;
+                upload_failure_absent)
+                    cat "${empty_asset_release}"
                     ;;
                 *)
                     cat "${valid_release}"
@@ -251,5 +302,55 @@ expect_failure "post-publish asset set changed" assert_verified_release_snapshot
 MOCK_GH_MODE=id_failure
 expect_failure "database-ID snapshot API failure" fetch_release_snapshot_by_id \
     4242 "${TEST_TEMP_DIR}/unavailable-id-snapshot.json"
+
+# Asset reconciliation must refresh by immutable Release database ID instead
+# of trusting the assets array embedded in release-list discovery. It must also
+# resolve a failed upload response only when the committed remote bytes are
+# exactly identical; it never overwrites an existing asset.
+: >"${MOCK_GH_CALLS}"
+MOCK_GH_MODE=asset_existing
+MOCK_UPLOAD_ATTEMPTED=0
+reconcile_release_asset \
+    4242 v0.8.0 true "${digest_name}" \
+    "${TEST_ARTIFACT_DIR}/${digest_name}" \
+    "${TEST_TEMP_DIR}/reconcile-existing"
+grep -q '/releases/4242' "${MOCK_GH_CALLS}"
+grep -q '/releases/assets/5001' "${MOCK_GH_CALLS}"
+if grep -q 'release upload' "${MOCK_GH_CALLS}"; then
+    printf 'existing asset reconciliation unexpectedly uploaded\n' >&2
+    exit 1
+fi
+
+: >"${MOCK_GH_CALLS}"
+MOCK_GH_MODE=upload_ambiguous_same
+MOCK_UPLOAD_ATTEMPTED=0
+reconcile_release_asset \
+    4242 v0.8.0 true "${digest_name}" \
+    "${TEST_ARTIFACT_DIR}/${digest_name}" \
+    "${TEST_TEMP_DIR}/reconcile-ambiguous"
+grep -q 'release upload' "${MOCK_GH_CALLS}"
+[[ "$(grep -c '/releases/4242' "${MOCK_GH_CALLS}")" -eq 2 ]]
+grep -q '/releases/assets/5001' "${MOCK_GH_CALLS}"
+
+MOCK_GH_MODE=upload_failure_absent
+MOCK_UPLOAD_ATTEMPTED=0
+expect_failure "failed upload with no committed asset" reconcile_release_asset \
+    4242 v0.8.0 true "${digest_name}" \
+    "${TEST_ARTIFACT_DIR}/${digest_name}" \
+    "${TEST_TEMP_DIR}/reconcile-absent"
+
+MOCK_GH_MODE=asset_mismatch
+MOCK_UPLOAD_ATTEMPTED=0
+expect_failure "failed upload committed different bytes" reconcile_release_asset \
+    4242 v0.8.0 true "${digest_name}" \
+    "${TEST_ARTIFACT_DIR}/${digest_name}" \
+    "${TEST_TEMP_DIR}/reconcile-mismatch"
+
+MOCK_GH_MODE=upload_success
+MOCK_UPLOAD_ATTEMPTED=0
+reconcile_release_asset \
+    4242 v0.8.0 true "${digest_name}" \
+    "${TEST_ARTIFACT_DIR}/${digest_name}" \
+    "${TEST_TEMP_DIR}/reconcile-success"
 
 printf 'publish-github-release helper tests passed\n'
