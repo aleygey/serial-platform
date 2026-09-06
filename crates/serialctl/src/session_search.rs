@@ -131,12 +131,14 @@ pub struct SessionArchive {
 impl SessionArchive {
     pub fn new() -> io::Result<Self> {
         let path = std::env::temp_dir().join(format!("serial-platform-session-{}", Uuid::new_v4()));
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(&path)?;
         let directory = Arc::new(Directory {
             path,
