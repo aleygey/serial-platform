@@ -45,6 +45,9 @@ use tokio_serial::{
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use uuid::Uuid;
 
+mod macro_runtime;
+use macro_runtime::{ActiveMacro, MacroCommand};
+
 const COMMAND_QUEUE: usize = 256;
 const PORT_EVENT_QUEUE: usize = 4_096;
 const PORT_WRITE_QUEUE: usize = 128;
@@ -179,6 +182,10 @@ pub enum SlotError {
     #[error("serial write must contain at least one byte")]
     EmptyWrite,
     #[error(
+        "Human LINE input metadata must exactly match the submitted command plus the configured EOL"
+    )]
+    InvalidHumanLineInput,
+    #[error(
         "command description must be non-empty, trimmed, at most {MAX_COMMAND_DESCRIPTION_BYTES} UTF-8 bytes, and contain no control characters"
     )]
     InvalidCommandDescription,
@@ -220,6 +227,12 @@ pub enum SlotError {
     RunMetadataTooLarge { actual: usize },
     #[error("a Trigger Job is already active on this port (no bytes were written)")]
     TriggerActive,
+    #[error("a macro is active on this port; stop it before another physical action")]
+    MacroActive,
+    #[error("macro execution {0} was not found")]
+    MacroNotFound(Uuid),
+    #[error("macro rejected: {0}")]
+    MacroInvalid(String),
     #[error("Trigger Job {trigger_id} was not found")]
     TriggerNotFound { trigger_id: Uuid },
     #[error("Trigger Job {trigger_id} belongs to another actor")]
@@ -385,6 +398,10 @@ impl SlotHandle {
                 port: None,
                 port_events: None,
                 active_trigger: None,
+                active_macro: None,
+                terminal_macros: HashMap::new(),
+                terminal_macro_order: VecDeque::new(),
+                macro_write_authorized: None,
                 terminal_triggers: HashMap::new(),
                 terminal_trigger_order: VecDeque::new(),
                 trigger_write_results,
@@ -583,6 +600,29 @@ impl SlotHandle {
         operation_id: Option<Uuid>,
         description: Option<String>,
     ) -> Result<CommandResult, SlotError> {
+        self.send_human_input(
+            request_id,
+            actor,
+            expected_generation,
+            data,
+            operation_id,
+            description,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_human_input(
+        &self,
+        request_id: Uuid,
+        actor: Actor,
+        expected_generation: u64,
+        data: Vec<u8>,
+        operation_id: Option<Uuid>,
+        description: Option<String>,
+        input: Option<serial_protocol::HumanLineInput>,
+    ) -> Result<CommandResult, SlotError> {
         if data.len() > MAX_WRITE_BYTES {
             return Err(SlotError::WriteTooLarge);
         }
@@ -594,6 +634,7 @@ impl SlotHandle {
                 data,
                 operation_id,
                 description,
+                input,
                 reply,
             }
         })
@@ -970,6 +1011,7 @@ fn map_physical_request_error(
 }
 
 enum SlotCommand {
+    Macro(Box<MacroCommand>),
     Acquire {
         request_id: Uuid,
         actor: Actor,
@@ -1026,6 +1068,7 @@ enum SlotCommand {
         data: Vec<u8>,
         operation_id: Option<Uuid>,
         description: Option<String>,
+        input: Option<serial_protocol::HumanLineInput>,
         reply: Reply,
     },
     Write {
@@ -1565,6 +1608,10 @@ struct SlotActor {
     port: Option<PortWorker>,
     port_events: Option<mpsc::Receiver<PortEvent>>,
     active_trigger: Option<ActiveTrigger>,
+    active_macro: Option<ActiveMacro>,
+    terminal_macros: HashMap<Uuid, serial_protocol::MacroExecutionInfo>,
+    terminal_macro_order: VecDeque<Uuid>,
+    macro_write_authorized: Option<Uuid>,
     terminal_triggers: HashMap<Uuid, TriggerInfo>,
     terminal_trigger_order: VecDeque<Uuid>,
     trigger_write_results: mpsc::Sender<TriggerWriteResult>,
@@ -1655,6 +1702,7 @@ impl SlotActor {
     }
 
     async fn maintain(&mut self) {
+        self.reap_macro().await;
         self.expire_control().await;
         self.expire_pending_run_start().await;
 
@@ -1881,6 +1929,13 @@ impl SlotActor {
     }
 
     async fn handle_command(&mut self, command: SlotCommand) -> bool {
+        let command = match command {
+            SlotCommand::Macro(command) => {
+                Box::pin(self.handle_macro_command(*command)).await;
+                return false;
+            }
+            other => other,
+        };
         let (key, request, reply) = match command.into_request() {
             CommandDisposition::Request {
                 key,
@@ -2102,6 +2157,9 @@ impl SlotActor {
                 metadata: run_metadata,
                 ttl_ms,
             } => {
+                if self.active_macro.is_some() {
+                    return Err(SlotError::MacroActive);
+                }
                 if actor.kind != ActorKind::Agent {
                     return Err(SlotError::RunStartActorKind);
                 }
@@ -2419,6 +2477,7 @@ impl SlotActor {
                 data,
                 operation_id,
                 description,
+                input,
             } => {
                 if actor.kind != ActorKind::Human {
                     return Err(ControlError::NotOwner.into());
@@ -2431,6 +2490,23 @@ impl SlotActor {
                 }
                 if data.is_empty() {
                     return Err(SlotError::EmptyWrite);
+                }
+                if let Some(input) = &input {
+                    let mut expected = input.command.as_bytes().to_vec();
+                    expected.extend_from_slice(
+                        resolve_model_settings(
+                            &SerialSettings::default(),
+                            self.model_profile.as_ref(),
+                        )
+                        .write_eol
+                        .as_bytes(),
+                    );
+                    if expected.is_empty() {
+                        expected.push(b'\r');
+                    }
+                    if expected != data || operation_id.is_none() {
+                        return Err(SlotError::InvalidHumanLineInput);
+                    }
                 }
                 let current = self.control.current().cloned();
                 let (mode, owned_lease, interfered_run_id) = match current {
@@ -2458,6 +2534,8 @@ impl SlotActor {
                     }
                     Some(_) => return Err(ControlError::Busy.into()),
                 };
+
+                self.stop_macro(serial_protocol::MacroStatus::InterruptedByUser, "a Human used command input; read the changed serial context before the next Agent command");
 
                 if self.active_trigger.is_some() {
                     if mode == HumanCommandMode::Cooperative {
@@ -2491,7 +2569,7 @@ impl SlotActor {
                     .send(PortCommand::Write {
                         data: data.clone(),
                         pacing,
-                        deadline: tokio::time::Instant::from_std(authorization_now + write_timeout),
+                        deadline: self.macro_write_deadline(authorization_now + write_timeout),
                         reply,
                     })
                     .await
@@ -2513,6 +2591,13 @@ impl SlotActor {
                         None,
                     );
                     event_metadata.insert("human_command".into(), json!(true));
+                    if outcome.written == total
+                        && outcome.error.is_none()
+                        && let Some(input) = &input
+                        && !input.command.is_empty()
+                    {
+                        event_metadata.insert("human_line_input".into(), json!(input.command));
+                    }
                     let context_revision = if let Some(run_id) = interfered_run_id {
                         let context = self.run_context.get_or_insert(RunContextState {
                             run_id,
@@ -2576,6 +2661,11 @@ impl SlotActor {
                 cooperative,
                 ..
             } => {
+                if self.active_macro.as_ref().is_some_and(|active| {
+                    self.macro_write_authorized != Some(active.id()) || active.is_stopping()
+                }) {
+                    return Err(SlotError::MacroActive);
+                }
                 if self.active_trigger.is_some() {
                     return Err(SlotError::TriggerActive);
                 }
@@ -2634,7 +2724,7 @@ impl SlotActor {
                     .send(PortCommand::Write {
                         data: data.clone(),
                         pacing,
-                        deadline: tokio::time::Instant::from_std(authorization_now + write_timeout),
+                        deadline: self.macro_write_deadline(authorization_now + write_timeout),
                         reply,
                     })
                     .await
@@ -2660,6 +2750,11 @@ impl SlotActor {
                         command_capture_matchers,
                         command_sequence,
                     );
+                    if let Some(active) = self.active_macro.as_ref()
+                        && self.macro_write_authorized == Some(active.id())
+                    {
+                        active.add_tx_metadata(&mut event_metadata);
+                    }
                     if cooperative && let Some(run) = self.active_run.as_ref() {
                         event_metadata.insert("human_command".into(), json!(true));
                         event_metadata.insert("interfered_run_id".into(), json!(run.id));
@@ -2715,6 +2810,9 @@ impl SlotActor {
                 expected_run_id,
                 sequence_precondition,
             } => {
+                if self.active_macro.is_some() {
+                    return Err(SlotError::MacroActive);
+                }
                 if self.active_trigger.is_some() {
                     return Err(SlotError::TriggerActive);
                 }
@@ -2785,6 +2883,9 @@ impl SlotActor {
                 sequence_precondition,
                 spec,
             } => {
+                if self.active_macro.is_some() {
+                    return Err(SlotError::MacroActive);
+                }
                 if self.active_trigger.is_some() {
                     return Err(SlotError::TriggerActive);
                 }
@@ -2947,6 +3048,9 @@ impl SlotActor {
                 metadata: run_metadata,
                 ..
             } => {
+                if self.active_macro.is_some() {
+                    return Err(SlotError::MacroActive);
+                }
                 if actor.kind == ActorKind::Agent {
                     return Err(SlotError::RunStartActorKind);
                 }
@@ -2987,6 +3091,9 @@ impl SlotActor {
                 run_id,
                 ..
             } => {
+                if self.active_macro.is_some() {
+                    return Err(SlotError::MacroActive);
+                }
                 self.control
                     .validate(&actor.id, control_id, fence, Instant::now())?;
                 let active = self.active_run.as_ref().ok_or(SlotError::NoActiveRun)?;
@@ -3395,6 +3502,7 @@ impl SlotActor {
     }
 
     async fn abort_run(&mut self, reason: &str, actor: Option<Actor>) {
+        self.stop_macro(serial_protocol::MacroStatus::Cancelled, reason);
         if let Some(run_id) = self.active_run.as_ref().map(|run| run.id)
             && self
                 .active_trigger
@@ -4125,7 +4233,8 @@ impl SlotActor {
             durable: false,
         };
 
-        let wait_for_journal = self.active_trigger.is_none() && !self.trigger_arming;
+        let wait_for_journal =
+            self.active_trigger.is_none() && self.active_macro.is_none() && !self.trigger_arming;
         let mut degradation = None;
         let event = match self.journal.try_append(event.clone()) {
             Ok(pending) if self.logging == LoggingState::Healthy && wait_for_journal => {
@@ -4373,6 +4482,9 @@ impl SlotActor {
         source: String,
         resume_on_rollback: bool,
     ) -> Result<(), SlotError> {
+        if self.active_macro.is_some() {
+            return Err(SlotError::ProfileChangeBusy);
+        }
         if config.port != self.config.port {
             return Err(SlotError::SlotIdChanged);
         }
@@ -4427,7 +4539,8 @@ impl SlotActor {
         if self.model_profile == model_profile {
             return Ok(false);
         }
-        if self.active_run.is_some() || self.active_trigger.is_some() {
+        if self.active_run.is_some() || self.active_trigger.is_some() || self.active_macro.is_some()
+        {
             return Err(SlotError::ProfileChangeBusy);
         }
         self.pending_reconfiguration = Some(PendingReconfiguration::ModelProfile { model_profile });
@@ -4764,6 +4877,10 @@ impl SlotActor {
     }
 
     async fn stop_port(&mut self) {
+        self.stop_macro(
+            serial_protocol::MacroStatus::Cancelled,
+            "serial port stopped",
+        );
         let mut reader_tail = ReaderTail::default();
         if let Some(port) = self.port.take() {
             let _ = port.cancel.send(true);
@@ -4850,6 +4967,7 @@ enum SlotRequest {
         data: Vec<u8>,
         operation_id: Option<Uuid>,
         description: Option<String>,
+        input: Option<serial_protocol::HumanLineInput>,
     },
     Write {
         actor: Actor,
@@ -4951,7 +5069,15 @@ impl SlotRequest {
                 }
                 Ok(())
             }
-            Self::SendHumanCommand { description, .. } => {
+            Self::SendHumanCommand {
+                description, input, ..
+            } => {
+                if input.as_ref().is_some_and(|input| {
+                    input.command.len() > MAX_WRITE_BYTES
+                        || input.command.chars().any(char::is_control)
+                }) {
+                    return Err(SlotError::InvalidHumanLineInput);
+                }
                 if let Some(description) = description {
                     validate_command_description(description)?;
                 }
@@ -5021,6 +5147,7 @@ impl SlotRequest {
                 data,
                 operation_id,
                 description,
+                input,
                 ..
             } => Some(
                 serde_json::to_vec(&(
@@ -5029,6 +5156,7 @@ impl SlotRequest {
                     data,
                     operation_id,
                     description,
+                    input,
                 ))
                 .expect("Human command fields are serializable"),
             ),
@@ -5220,6 +5348,7 @@ impl SlotRequest {
                 data,
                 operation_id,
                 description,
+                input,
             } => serde_json::to_vec(&(
                 "send_human_command",
                 &actor.id,
@@ -5227,6 +5356,7 @@ impl SlotRequest {
                 data,
                 operation_id,
                 description,
+                input,
             )),
             Self::Write {
                 actor,
@@ -5796,6 +5926,7 @@ enum CommandDisposition {
 impl SlotCommand {
     fn into_request(self) -> CommandDisposition {
         match self {
+            SlotCommand::Macro(_) => unreachable!("macro commands are handled before conversion"),
             SlotCommand::Acquire {
                 request_id,
                 actor,
@@ -5903,6 +6034,7 @@ impl SlotCommand {
                 data,
                 operation_id,
                 description,
+                input,
                 reply,
             } => CommandDisposition::Request {
                 key: (actor.id.clone(), request_id),
@@ -5912,6 +6044,7 @@ impl SlotCommand {
                     data,
                     operation_id,
                     description,
+                    input,
                 },
                 reply,
             },

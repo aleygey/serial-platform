@@ -1,0 +1,9 @@
+[package]
+name = "serial-macro"
+description = "Bounded, host-independent Macro Script v1 compiler and stepping virtual machine"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

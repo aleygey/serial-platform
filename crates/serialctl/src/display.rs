@@ -32,6 +32,9 @@ pub fn pad_display(value: &str, width: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub struct DisplayLine {
+    /// This row continues the same logical terminal line after the parser's
+    /// bounded 16 Ki-character storage split, not after an actual newline.
+    pub continues_previous: bool,
     /// Daemon epoch that produced this row. Synthetic local gap rows have no
     /// epoch and can never prove that an archived journal interval is present.
     pub daemon_epoch: Option<uuid::Uuid>,
@@ -473,9 +476,27 @@ impl TerminalStreamParser {
 
     pub fn pending_line(&self) -> Option<DisplayLine> {
         let context = self.context.as_ref()?;
-        self.terminal
-            .pending_text()
-            .map(|text| context.display_line(text))
+        self.terminal.pending_text().map(|text| {
+            context.display_line(ProjectedRow {
+                text,
+                continues_previous: self.terminal.continues_previous,
+            })
+        })
+    }
+
+    /// Position derived exclusively from the terminal stream, not local keys.
+    pub fn cursor_display_column(&self) -> usize {
+        let before: String = self
+            .terminal
+            .line
+            .iter()
+            .take(self.terminal.cursor)
+            .collect();
+        unicode_width::UnicodeWidthStr::width(before.as_str())
+            + self
+                .terminal
+                .cursor
+                .saturating_sub(self.terminal.line.len())
     }
 }
 
@@ -650,8 +671,10 @@ impl LineContext {
         self.echoed = false;
     }
 
-    fn display_line(&self, text: String) -> DisplayLine {
+    fn display_line(&self, row: ProjectedRow) -> DisplayLine {
+        let text = row.text;
         DisplayLine {
+            continues_previous: row.continues_previous,
             daemon_epoch: Some(self.identity.daemon_epoch),
             seq: self.seq,
             event_kind: self.kind,
@@ -679,7 +702,14 @@ enum EscapeState {
 }
 
 #[derive(Debug, Default)]
+struct ProjectedRow {
+    text: String,
+    continues_previous: bool,
+}
+
+#[derive(Debug, Default)]
 struct TerminalTextState {
+    continues_previous: bool,
     line: Vec<char>,
     cursor: usize,
     touched: bool,
@@ -690,7 +720,7 @@ struct TerminalTextState {
 }
 
 impl TerminalTextState {
-    fn consume(&mut self, byte: u8, rows: &mut Vec<String>) {
+    fn consume(&mut self, byte: u8, rows: &mut Vec<ProjectedRow>) {
         if self.escape != EscapeState::Ground {
             self.consume_escape(byte, rows);
             return;
@@ -733,7 +763,7 @@ impl TerminalTextState {
         }
     }
 
-    fn consume_escape(&mut self, byte: u8, rows: &mut Vec<String>) {
+    fn consume_escape(&mut self, byte: u8, rows: &mut Vec<ProjectedRow>) {
         // ECMA-48 CAN/SUB cancel any in-progress escape or control string.
         // They are safe synchronization points for a noisy UART stream.
         if matches!(byte, 0x18 | 0x1a) {
@@ -835,7 +865,7 @@ impl TerminalTextState {
         }
     }
 
-    fn recover_escape_with(&mut self, byte: u8, rows: &mut Vec<String>) {
+    fn recover_escape_with(&mut self, byte: u8, rows: &mut Vec<ProjectedRow>) {
         self.reset_escape();
         self.consume(byte, rows);
     }
@@ -875,6 +905,26 @@ impl TerminalTextState {
                     .min(MAX_STREAM_LINE_CHARS - 1)
             }
             b'D' => self.cursor = self.cursor.saturating_sub(first.max(1)),
+            // DCH / ICH / ECH used by remote readline-style editors.
+            b'P' => {
+                let start = self.cursor.min(self.line.len());
+                let end = start.saturating_add(first.max(1)).min(self.line.len());
+                self.line.drain(start..end);
+            }
+            b'@' => {
+                let count = first
+                    .max(1)
+                    .min(MAX_STREAM_LINE_CHARS.saturating_sub(self.cursor));
+                self.line.resize(self.line.len().max(self.cursor), ' ');
+                self.line
+                    .splice(self.cursor..self.cursor, std::iter::repeat_n(' ', count));
+                self.line.truncate(MAX_STREAM_LINE_CHARS);
+            }
+            b'X' => {
+                let start = self.cursor.min(self.line.len());
+                let end = start.saturating_add(first.max(1)).min(self.line.len());
+                self.line[start..end].fill(' ');
+            }
             b'H' | b'f' => {
                 let column = csi_parameter(parameters, 1, 1);
                 self.cursor = column
@@ -886,7 +936,7 @@ impl TerminalTextState {
         }
     }
 
-    fn drain_utf8(&mut self, finalize: bool, rows: &mut Vec<String>) {
+    fn drain_utf8(&mut self, finalize: bool, rows: &mut Vec<ProjectedRow>) {
         loop {
             match std::str::from_utf8(&self.utf8) {
                 Ok(text) => {
@@ -923,9 +973,10 @@ impl TerminalTextState {
         }
     }
 
-    fn write_char(&mut self, character: char, rows: &mut Vec<String>) {
+    fn write_char(&mut self, character: char, rows: &mut Vec<ProjectedRow>) {
         if self.cursor >= MAX_STREAM_LINE_CHARS {
             self.commit_row(rows);
+            self.continues_previous = true;
         }
         while self.line.len() < self.cursor {
             self.line.push(' ');
@@ -939,15 +990,19 @@ impl TerminalTextState {
         self.touched = true;
     }
 
-    fn commit_row(&mut self, rows: &mut Vec<String>) {
+    fn commit_row(&mut self, rows: &mut Vec<ProjectedRow>) {
         self.drain_utf8(true, rows);
-        rows.push(self.line.iter().collect());
+        rows.push(ProjectedRow {
+            text: self.line.iter().collect(),
+            continues_previous: self.continues_previous,
+        });
         self.line.clear();
         self.cursor = 0;
         self.touched = false;
+        self.continues_previous = false;
     }
 
-    fn finish_input(&mut self) -> Vec<String> {
+    fn finish_input(&mut self) -> Vec<ProjectedRow> {
         let mut completed = Vec::new();
         self.drain_utf8(true, &mut completed);
         self.reset_escape();
@@ -958,12 +1013,17 @@ impl TerminalTextState {
         (self.touched || !self.line.is_empty()).then(|| self.line.iter().collect())
     }
 
-    fn take_pending(&mut self) -> Option<String> {
+    fn take_pending(&mut self) -> Option<ProjectedRow> {
         let text = self.pending_text()?;
+        let row = ProjectedRow {
+            text,
+            continues_previous: self.continues_previous,
+        };
         self.line.clear();
         self.cursor = 0;
         self.touched = false;
-        Some(text)
+        self.continues_previous = false;
+        Some(row)
     }
 
     fn reset(&mut self) {
@@ -1016,6 +1076,7 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
     lines
         .into_iter()
         .map(|text| DisplayLine {
+            continues_previous: false,
             daemon_epoch: Some(event.daemon_epoch),
             seq: event.seq,
             event_kind: event.kind,
@@ -1034,6 +1095,7 @@ pub fn event_to_lines(event: &TimelineEvent) -> Vec<DisplayLine> {
 pub fn gap_line(seq: u64, text: impl Into<String>) -> DisplayLine {
     let text = text.into();
     DisplayLine {
+        continues_previous: false,
         daemon_epoch: None,
         seq,
         event_kind: EventKind::Gap,
@@ -2795,10 +2857,50 @@ mod tests {
         let batch = parser.push_event(&event_at(1, &bytes));
 
         assert_eq!(batch.completed.len(), 1);
+        assert!(!batch.completed[0].continues_previous);
+        assert!(batch.pending.as_ref().unwrap().continues_previous);
         assert_eq!(batch.completed[0].text.len(), MAX_STREAM_LINE_CHARS);
         assert_eq!(
             batch.pending.as_ref().map(|line| line.text.as_str()),
             Some("x")
         );
+
+        let completed = parser.push_event(&event_at(2, b"\nnew"));
+        assert!(completed.completed[0].continues_previous);
+        assert!(!completed.pending.as_ref().unwrap().continues_previous);
+        let flushed = parser.flush();
+        assert!(!flushed[0].continues_previous);
+    }
+
+    #[test]
+    fn raw_remote_delete_insert_erase_and_cursor_projection() {
+        let mut parser = TerminalStreamParser::new();
+        parser.push_event(&event_at(1, b"abcde\x1b[3G"));
+        assert_eq!(parser.cursor_display_column(), 2);
+        let deleted = parser.push_event(&event_at(2, b"\x1b[2P"));
+        assert_eq!(deleted.pending.unwrap().text, "abe");
+        let inserted = parser.push_event(&event_at(3, b"\x1b[2@"));
+        assert_eq!(inserted.pending.unwrap().text, "ab  e");
+        let written = parser.push_event(&event_at(4, b"XY"));
+        assert_eq!(written.pending.unwrap().text, "abXYe");
+        assert_eq!(parser.cursor_display_column(), 4);
+        let erased = parser.push_event(&event_at(5, b"\x1b[3G\x1b[2X"));
+        assert_eq!(erased.pending.unwrap().text, "ab  e");
+        assert_eq!(parser.cursor_display_column(), 2);
+        parser.reset();
+        parser.push_event(&event_at(6, "中a".as_bytes()));
+        assert_eq!(parser.cursor_display_column(), 3);
+    }
+
+    #[test]
+    fn physical_generation_breaks_storage_continuations() {
+        let mut parser = TerminalStreamParser::new();
+        parser.push_event(&event_at(1, &vec![b'x'; MAX_STREAM_LINE_CHARS + 1]));
+        let mut changed = event_at(2, b"new");
+        changed.generation += 1;
+        let batch = parser.push_event(&changed);
+        assert_eq!(batch.completed.len(), 1);
+        assert!(batch.completed[0].continues_previous);
+        assert!(!batch.pending.unwrap().continues_previous);
     }
 }

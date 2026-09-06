@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron'
 import { DesktopCoordinator } from './coordinator'
-import type { DesktopPreferences, ModelFamily, ModelProfile, RunStartDecision, SerialConfigurationDraft } from '../shared/contracts'
+import type { DesktopPreferences, MacroListQuery, MacroRunRequest, MacroSaveRequest, ModelFamily, ModelProfile, RunStartDecision, SerialConfigurationDraft } from '../shared/contracts'
 import { HELP, startupAction } from './startup'
 import { GracefulQuitGate } from './graceful-quit'
 
@@ -64,6 +64,12 @@ function installIpc(): void {
   ipcMain.handle('serial:refresh', () => coordinator!.refresh())
   ipcMain.handle('serial:send-command', (_event, port: string, command: string) =>
     coordinator!.sendCommand(port, command))
+  ipcMain.handle('serial:send-signal', (_event, port: string, signal: 'ctrl_c' | 'ctrl_d') => coordinator!.sendSignal(port, signal))
+  ipcMain.handle('serial:human-history', (_event, query: string, contains: boolean) => coordinator!.queryHumanHistory(query, contains))
+  ipcMain.handle('serial:macro-list', (_event, query: MacroListQuery) => coordinator!.listMacros(query))
+  ipcMain.handle('serial:macro-save', (_event, definition: MacroSaveRequest) => coordinator!.saveMacro(definition))
+  ipcMain.handle('serial:macro-run', (_event, port: string, spec: MacroRunRequest) => coordinator!.runMacro(port, spec))
+  ipcMain.handle('serial:macro-cancel', (_event, port: string, executionId: string) => coordinator!.cancelMacro(port, executionId))
   ipcMain.handle('serial:decide-run-start', (
     _event,
     port: string,

@@ -3,7 +3,9 @@
 pub mod api;
 pub mod config;
 pub mod control;
+mod human_history;
 pub mod journal;
+pub mod macros;
 pub mod monitor;
 pub mod registry;
 pub mod ring;

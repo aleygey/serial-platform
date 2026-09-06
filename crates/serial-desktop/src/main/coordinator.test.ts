@@ -114,7 +114,7 @@ function serverData(configRevision: number): ServerData {
     status: {
       server_id: '11111111-1111-4111-8111-111111111111',
       daemon_epoch: '22222222-2222-4222-8222-222222222222',
-      protocol_version: 7,
+      protocol_version: 8,
       config_revision: configRevision,
       ports: []
     },

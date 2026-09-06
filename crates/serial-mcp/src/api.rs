@@ -3,8 +3,9 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
 use serial_protocol::{
     ArchiveListResponse, ConfigurePortsRequest, ConfigurePortsResponse, CreateMonitorRequest,
-    Cursor, EventQuery, EventQueryResponse, HealthResponse, ModelFamilyListResponse,
-    MonitorIncidentListResponse, MonitorListResponse, MonitorResponse, StatusResponse,
+    Cursor, EventQuery, EventQueryResponse, HealthResponse, MacroListQuery, MacroListResponse,
+    MacroSaveRequest, MacroSaveResponse, ModelFamilyListResponse, MonitorIncidentListResponse,
+    MonitorListResponse, MonitorResponse, StatusResponse,
 };
 
 const MONITOR_INCIDENT_PAGE_LIMIT: usize = 20;
@@ -83,7 +84,16 @@ pub(crate) fn structured_http_error(error: &anyhow::Error) -> Option<Value> {
         "message": error.message,
         "retryable": retryable,
     });
-    for field in ["phase", "scanned_bytes", "elapsed_ms", "retry_hint"] {
+    for field in [
+        "phase",
+        "scanned_bytes",
+        "elapsed_ms",
+        "retry_hint",
+        "line",
+        "column",
+        "path",
+        "revision",
+    ] {
         if let Some(value) = error.fields.get(field) {
             structured[field] = value.clone();
         }
@@ -123,6 +133,24 @@ impl ApiClient {
 
     pub async fn model_families(&self) -> Result<ModelFamilyListResponse> {
         self.get_json("/api/v1/config/model-families").await
+    }
+
+    pub async fn macros(&self, query: &MacroListQuery) -> Result<MacroListResponse> {
+        let response = self
+            .request(self.client.get(self.url("/api/v1/macros")).query(query))
+            .send()
+            .await
+            .context("seriald macro catalog request failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn save_macro(&self, request: &MacroSaveRequest) -> Result<MacroSaveResponse> {
+        let response = self
+            .request(self.client.post(self.url("/api/v1/macros")).json(request))
+            .send()
+            .await
+            .context("seriald macro save failed")?;
+        decode_response(response).await
     }
 
     pub async fn configure_ports(

@@ -54,6 +54,13 @@ use crate::{
     ws::{self, NetworkCommand, NetworkEvent},
 };
 
+#[path = "tui_macros.rs"]
+mod macro_ui;
+
+use crate::session_search::{
+    ArchivedLine, SearchHandle, SearchHit, SearchProgress, SearchQuery, SessionArchive,
+};
+
 const MAX_LINES_PER_SLOT: usize = 20_000;
 const MAX_BYTES_PER_SLOT: usize = 4 * 1024 * 1024;
 const MAX_PENDING_WRITES: usize = 16;
@@ -706,6 +713,7 @@ impl RunHistoryEntry {
 }
 
 struct SlotView {
+    session_archive: Option<SessionArchive>,
     snapshot: SlotSnapshot,
     /// Live-only projection of Trigger transitions that are not published as
     /// replacement snapshots on an attached WebSocket. The durable lifecycle
@@ -743,7 +751,7 @@ struct SlotView {
     draft: Vec<char>,
     draft_cursor: usize,
     mode: InputMode,
-    history: Vec<String>,
+    history_browse: Option<HistoryBrowse>,
     history_search: Option<HistorySearch>,
     completion: Option<Completion>,
     last_manual_activity: Option<Instant>,
@@ -779,8 +787,15 @@ struct HistorySearch {
     query: String,
     saved_draft: Vec<char>,
     saved_cursor: usize,
-    /// Index into `SlotView::history` of the current match.
+    /// Index into the platform-wide Human LINE history.
     match_index: Option<usize>,
+}
+
+#[derive(Debug)]
+struct HistoryBrowse {
+    saved_draft: Vec<char>,
+    saved_cursor: usize,
+    index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,6 +896,9 @@ struct LocalOutputSearchIndex {
 
 #[derive(Debug)]
 struct OutputSearchState {
+    disk: Option<DiskSearch>,
+    session_mode: bool,
+    clean_snapshot: Option<Vec<Line<'static>>>,
     port: String,
     current_epoch: Uuid,
     head_seq: u64,
@@ -914,6 +932,92 @@ struct OutputSearchState {
     last_document_refresh: Instant,
 }
 
+#[derive(Debug)]
+struct DiskSource {
+    port: String,
+    archive: SessionArchive,
+    handle: SearchHandle,
+    progress: SearchProgress,
+    refreshed_revision: u64,
+}
+
+#[derive(Debug)]
+struct DiskSearch {
+    id: Uuid,
+    sources: Vec<DiskSource>,
+    total: usize,
+    complete: bool,
+    selected: Option<(String, SearchHit)>,
+    pending: Option<Uuid>,
+    coverage_errors: Vec<String>,
+}
+impl Drop for DiskSearch {
+    fn drop(&mut self) {
+        for source in &self.sources {
+            source.handle.cancel();
+        }
+    }
+}
+
+struct ArchivedViewport {
+    id: Uuid,
+    port: String,
+    handle: SearchHandle,
+    hit: SearchHit,
+    lines: Vec<ArchivedLine>,
+    pending: Option<Uuid>,
+}
+
+struct SessionSearchCommand {
+    request_id: Uuid,
+    query_id: Uuid,
+    port: String,
+    handle: SearchHandle,
+    ordinal: u64,
+    context_anchor: Option<(SearchHit, i8)>,
+}
+
+struct SessionSearchEvent {
+    request: SessionSearchCommand,
+    result: std::result::Result<(SearchHit, Vec<ArchivedLine>), String>,
+}
+
+fn spawn_session_search_io() -> (
+    mpsc::Sender<SessionSearchCommand>,
+    mpsc::Receiver<SessionSearchEvent>,
+) {
+    let (commands, mut requests) = mpsc::channel::<SessionSearchCommand>(8);
+    let (events, receive) = mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            let handle = request.handle.clone();
+            let ordinal = request.ordinal;
+            let anchor = request.context_anchor.as_ref().map(|(hit, _)| hit.clone());
+            let result = tokio::task::spawn_blocking(move || -> io::Result<_> {
+                let hit = match anchor {
+                    Some(hit) => hit,
+                    None => handle.page(ordinal, 1)?.into_iter().next().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::WouldBlock, "匹配结果仍在更新，请稍候")
+                    })?,
+                };
+                let context = handle.context(&hit, 128, 128)?;
+                Ok((hit, context))
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            if events
+                .send(SessionSearchEvent { request, result })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (commands, receive)
+}
+
 impl OutputSearchState {
     fn query_text(&self) -> String {
         self.query.iter().collect()
@@ -940,6 +1044,7 @@ struct Completion {
 impl SlotView {
     fn new(snapshot: SlotSnapshot) -> Self {
         let mut view = Self {
+            session_archive: None,
             last_epoch: Some(snapshot.daemon_epoch),
             last_seq: 0,
             snapshot,
@@ -959,7 +1064,7 @@ impl SlotView {
             draft: Vec::new(),
             draft_cursor: 0,
             mode: InputMode::Line,
-            history: Vec::new(),
+            history_browse: None,
             history_search: None,
             completion: None,
             last_manual_activity: None,
@@ -1571,6 +1676,20 @@ impl SlotView {
         }
         let follows_previous = self.last_epoch == Some(event.daemon_epoch)
             && self.last_seq.checked_add(1) == Some(event.seq);
+        if self.last_epoch == Some(event.daemon_epoch)
+            && !follows_previous
+            && let Some(archive) = &self.session_archive
+        {
+            archive.record_gap(format!(
+                "串口事件序列不连续：{} → {}",
+                self.last_seq, event.seq
+            ));
+        }
+        if event.kind == EventKind::Gap
+            && let Some(archive) = &self.session_archive
+        {
+            archive.record_gap("串口服务报告输出缺口");
+        }
         if self.last_epoch.is_some() && self.last_epoch != Some(event.daemon_epoch) {
             self.reset_stream();
             self.clear_run_history();
@@ -1604,6 +1723,9 @@ impl SlotView {
         self.stream.set_echo_reconciliation(false);
         let had_pending = self.pending_line.is_some();
         let batch = self.stream.push_event(&event);
+        if let Some(archive) = &self.session_archive {
+            archive.append(&batch);
+        }
         let completed_pending = batch.pending_committed;
         for line in batch.completed {
             self.push_line(line, selected);
@@ -1680,6 +1802,10 @@ impl SlotView {
     }
 
     fn push_gap(&mut self, seq: u64, message: impl Into<String>, selected: bool) {
+        let message = message.into();
+        if let Some(archive) = &self.session_archive {
+            archive.record_gap(message.clone());
+        }
         self.run_history_limited = true;
         self.command_evidence_events
             .push_back(CommandEvidenceEvent {
@@ -1703,6 +1829,9 @@ impl SlotView {
     }
 
     fn reset_stream(&mut self) {
+        if let Some(archive) = &self.session_archive {
+            archive.record_boundary();
+        }
         self.stream.reset();
         self.pending_line = None;
     }
@@ -2437,6 +2566,83 @@ fn valid_menu_name(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelTreeRow {
+    Unbound,
+    AddFamily,
+    Family(String),
+    AddModel(String),
+    Model(String, String),
+}
+
+fn model_tree_rows(menu: &MenuState) -> Vec<ModelTreeRow> {
+    let configuring = menu.page == MenuPage::ConfigureModelFamilies;
+    let mut rows = vec![if configuring {
+        ModelTreeRow::AddFamily
+    } else {
+        ModelTreeRow::Unbound
+    }];
+    if let Some(catalog) = &menu.catalog {
+        for family in &catalog.model_families {
+            rows.push(ModelTreeRow::Family(family.name.clone()));
+            if menu.model_family.as_deref() == Some(family.name.as_str()) {
+                for name in &family.model_names {
+                    rows.push(ModelTreeRow::Model(family.name.clone(), name.clone()));
+                }
+                if configuring {
+                    rows.push(ModelTreeRow::AddModel(family.name.clone()));
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn model_tree_lines(menu: &MenuState) -> Vec<Line<'static>> {
+    model_tree_rows(menu)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let text = match row {
+                ModelTreeRow::Unbound => tr("menu.value.unbound").to_owned(),
+                ModelTreeRow::AddFamily => tr("menu.model.family.add").to_owned(),
+                ModelTreeRow::Family(family) => {
+                    let expanded = menu.model_family.as_deref() == Some(family.as_str());
+                    let empty = menu
+                        .catalog
+                        .as_ref()
+                        .and_then(|catalog| {
+                            catalog
+                                .model_families
+                                .iter()
+                                .find(|item| item.name == family)
+                        })
+                        .is_some_and(|item| item.model_names.is_empty());
+                    format!(
+                        "{} {}{}",
+                        if expanded { "▾" } else { "▸" },
+                        safe_inline(&family),
+                        if expanded && empty { " (0)" } else { "" }
+                    )
+                }
+                ModelTreeRow::AddModel(_) => format!("    {}", tr("menu.model.name.add")),
+                ModelTreeRow::Model(family, name) => {
+                    let selected = menu.profile_editor.as_ref().is_some_and(|editor| {
+                        editor.model_family.as_deref() == Some(family.as_str())
+                            && editor.model_name.as_deref() == Some(name.as_str())
+                    });
+                    format!(
+                        "  {} {}",
+                        if selected { "✓" } else { " " },
+                        safe_inline(&name)
+                    )
+                }
+            };
+            selected_menu_line(index, menu.selected, text)
+        })
+        .collect()
+}
+
 fn menu_item_count(menu: &MenuState) -> usize {
     match menu.page {
         MenuPage::Root => 4,
@@ -2453,10 +2659,7 @@ fn menu_item_count(menu: &MenuState) -> usize {
             .catalog
             .as_ref()
             .map_or(0, |catalog| catalog.model_profiles.len()),
-        MenuPage::ConfigureModelFamilies => menu
-            .catalog
-            .as_ref()
-            .map_or(1, |catalog| catalog.model_families.len() + 1),
+        MenuPage::ConfigureModelFamilies => model_tree_rows(menu).len(),
         MenuPage::ConfigureModelNames => menu.catalog.as_ref().map_or(1, |catalog| {
             menu.model_family.as_deref().map_or(1, |family| {
                 catalog
@@ -2466,10 +2669,7 @@ fn menu_item_count(menu: &MenuState) -> usize {
                     .map_or(1, |family| family.model_names.len() + 1)
             })
         }),
-        MenuPage::ModelFamilies => menu
-            .catalog
-            .as_ref()
-            .map_or(1, |catalog| catalog.model_families.len() + 1),
+        MenuPage::ModelFamilies => model_tree_rows(menu).len(),
         MenuPage::ModelNames => menu.catalog.as_ref().map_or(0, |catalog| {
             menu.model_family.as_deref().map_or(0, |family| {
                 catalog
@@ -2772,6 +2972,28 @@ enum ExactEvidenceIoEvent {
 
 struct App {
     ports: Vec<SlotView>,
+    /// Oldest first, Human LINE submissions only; shared across all ports.
+    human_history: Vec<String>,
+    human_history_commands: Option<mpsc::Sender<()>>,
+    human_history_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    human_history_version: Option<(Uuid, u64)>,
+    /// Confirmed local writes not yet represented by a sufficiently new snapshot.
+    human_history_confirmed: Vec<(String, u64)>,
+    macro_panel: Option<macro_ui::Panel>,
+    macro_saved_panel: Option<macro_ui::Panel>,
+    macro_panel_id: Uuid,
+    macro_io_contexts: VecDeque<Uuid>,
+    macro_commands: Option<mpsc::Sender<macro_ui::IoCommand>>,
+    macro_executions: HashMap<String, serial_protocol::MacroExecutionInfo>,
+    macro_requests: HashMap<Uuid, String>,
+    /// Start is never replayed. Its stable operation ID permits read-only recovery.
+    macro_operations: HashMap<String, Uuid>,
+    macro_start_requests: HashMap<Uuid, String>,
+    macro_temporary_controls: HashMap<String, (Uuid, u64)>,
+    pending_macro_start: Option<(Uuid, String, serial_protocol::MacroRunSpec)>,
+    session_archiving: bool,
+    session_search_commands: Option<mpsc::Sender<SessionSearchCommand>>,
+    archived_view: Option<ArchivedViewport>,
     selected: usize,
     prefix_pending: bool,
     /// The prefix key was pressed while dismissing the help overlay. The
@@ -2847,6 +3069,25 @@ impl App {
             .unwrap_or(0);
         Self {
             ports,
+            human_history: Vec::new(),
+            human_history_commands: None,
+            human_history_generation: Default::default(),
+            human_history_version: None,
+            human_history_confirmed: Vec::new(),
+            macro_panel: None,
+            macro_saved_panel: None,
+            macro_panel_id: Uuid::new_v4(),
+            macro_io_contexts: VecDeque::new(),
+            macro_commands: None,
+            macro_executions: HashMap::new(),
+            macro_requests: HashMap::new(),
+            macro_operations: HashMap::new(),
+            macro_start_requests: HashMap::new(),
+            macro_temporary_controls: HashMap::new(),
+            pending_macro_start: None,
+            session_archiving: false,
+            session_search_commands: None,
+            archived_view: None,
             selected,
             prefix_pending: false,
             help_dismiss_prefix: false,
@@ -2893,6 +3134,9 @@ impl App {
     }
 
     fn software_cursor_active(&self) -> bool {
+        if self.macro_panel.is_some() {
+            return true;
+        }
         if let Some(menu) = self.menu.as_ref() {
             return menu.confirmation.is_none() && menu.prompt.is_some();
         }
@@ -2902,9 +3146,10 @@ impl App {
         !self.help
             && self.queue_selection.is_none()
             && self.focus == PaneFocus::Input
-            && self.current_mode() == InputMode::Line
             && self.current().history_search.is_none()
-            && !(self.current().draft.is_empty() && self.current().active_agent_run().is_some())
+            && (self.current_mode() == InputMode::Raw
+                || !(self.current().draft.is_empty()
+                    && self.current().active_agent_run().is_some()))
     }
 
     fn reset_software_cursor_blink(&mut self, now: Instant) {
@@ -3039,6 +3284,9 @@ impl App {
             through_seq: view.snapshot.head_seq,
         });
         self.output_search = Some(OutputSearchState {
+            disk: None,
+            session_mode: self.session_archiving,
+            clean_snapshot: None,
             port: view.snapshot.config.port.clone(),
             current_epoch: view.snapshot.daemon_epoch,
             head_seq: view.snapshot.head_seq,
@@ -3067,7 +3315,413 @@ impl App {
         self.status = tr("st.output.search.open").into();
     }
 
+    fn enable_session_archives(&mut self) {
+        self.session_archiving = true;
+        for view in &mut self.ports {
+            if view.session_archive.is_none() {
+                match SessionArchive::new() {
+                    Ok(archive) => {
+                        tracing::debug!(path = %archive.path().display(), port = %view.snapshot.config.port, "session search archive created");
+                        view.session_archive = Some(archive);
+                    }
+                    Err(error) => {
+                        self.status = format!("全会话存档不可用：{error}；仅可查找内存缓存");
+                        tracing::error!(%error, "cannot create session archive");
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_session_search(&mut self, prefer_latest: bool) -> bool {
+        let Some(search) = self.output_search.as_ref() else {
+            return false;
+        };
+        if !self.session_archiving
+            || search.matcher != OutputSearchMatcher::Literal
+            || search.scope == OutputSearchScope::CurrentRun
+            || search.direction == OutputSearchDirection::Tx
+            || search.query.is_empty()
+        {
+            return false;
+        }
+        if search.disk.is_some() {
+            return true;
+        }
+        let query = search.query_text();
+        let case_sensitive = search.case_sensitive;
+        let archives = self
+            .ports
+            .iter()
+            .filter(|view| {
+                search.scope == OutputSearchScope::Retained
+                    || view.snapshot.config.port == search.port
+            })
+            .filter_map(|view| {
+                view.session_archive
+                    .clone()
+                    .map(|archive| (view.snapshot.config.port.clone(), archive))
+            })
+            .collect::<Vec<_>>();
+        if archives.is_empty() {
+            return false;
+        }
+        let mut sources = Vec::new();
+        let mut errors = Vec::new();
+        for view in self.ports.iter().filter(|view| {
+            search.scope == OutputSearchScope::Retained || view.snapshot.config.port == search.port
+        }) {
+            if view.session_archive.is_none() {
+                errors.push(format!("{} 的会话存档不可用", view.snapshot.config.port));
+            }
+        }
+        for (port, archive) in archives {
+            match archive.search(SearchQuery {
+                query: query.clone(),
+                case_sensitive,
+            }) {
+                Ok(handle) => {
+                    let refreshed_revision = archive.revision();
+                    sources.push(DiskSource {
+                        port,
+                        archive,
+                        handle,
+                        progress: SearchProgress::default(),
+                        refreshed_revision,
+                    });
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        let search = self.output_search.as_mut().unwrap();
+        search.local_index = None;
+        search.matches.clear();
+        search.selected = 0;
+        search.clean_snapshot = None;
+        search.follow_new_matches = prefer_latest;
+        search.document_dirty = false;
+        search.last_document_refresh = Instant::now();
+        search.error = (!errors.is_empty()).then(|| errors.join("；"));
+        search.partial = !errors.is_empty();
+        search.disk = Some(DiskSearch {
+            id: Uuid::new_v4(),
+            sources,
+            total: 0,
+            complete: false,
+            selected: None,
+            pending: None,
+            coverage_errors: errors,
+        });
+        self.archived_view = None;
+        self.dirty = true;
+        true
+    }
+
+    fn poll_session_search(&mut self, now: Instant) {
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        if now.saturating_duration_since(search.last_document_refresh)
+            < OUTPUT_SEARCH_REFRESH_INTERVAL
+        {
+            return;
+        }
+        search.last_document_refresh = now;
+        let Some(disk) = search.disk.as_mut() else {
+            return;
+        };
+        let old_total = disk.total;
+        let mut total = 0usize;
+        let mut complete = true;
+        let mut gaps = disk.coverage_errors.clone();
+        let mut error = None;
+        for source in &mut disk.sources {
+            source.progress = source.handle.progress();
+            total = total.saturating_add(source.progress.matches.min(usize::MAX as u64) as usize);
+            complete &= source.progress.complete;
+            gaps.extend(source.progress.gaps.clone());
+            if source.progress.error.is_some() {
+                error = source.progress.error.clone();
+            }
+            let revision = source.archive.revision();
+            if source.progress.complete && revision != source.refreshed_revision {
+                match source.handle.refresh() {
+                    Ok(()) => {
+                        source.refreshed_revision = revision;
+                        complete = false;
+                    }
+                    Err(failure) if failure.kind() == io::ErrorKind::WouldBlock => complete = false,
+                    Err(failure) => error = Some(failure.to_string()),
+                }
+            }
+        }
+        disk.total = total;
+        disk.complete = complete;
+        search.partial = !gaps.is_empty() || error.is_some();
+        search.error = error
+            .or_else(|| (!gaps.is_empty()).then(|| format!("存档不完整：{}", gaps.join("；"))));
+        if total > 0 {
+            if search.follow_new_matches {
+                search.selected = total - 1;
+            } else if let Some((port, hit)) = &disk.selected {
+                let offset = disk
+                    .sources
+                    .iter()
+                    .take_while(|source| &source.port != port)
+                    .map(|source| source.progress.matches as usize)
+                    .sum::<usize>();
+                search.selected = offset.saturating_add(hit.ordinal as usize).min(total - 1);
+            } else {
+                search.selected = search.selected.min(total - 1);
+            }
+        }
+        let needs_fetch = total > 0
+            && disk.pending.is_none()
+            && (disk.selected.is_none()
+                || search.follow_new_matches && old_total != total
+                || disk.selected.as_ref().is_some_and(|(port, hit)| {
+                    hit.provisional
+                        && disk
+                            .sources
+                            .iter()
+                            .find(|source| &source.port == port)
+                            .is_some_and(|source| source.progress.revision != hit.revision)
+                }));
+        self.dirty = true;
+        if needs_fetch {
+            self.request_session_match();
+        }
+    }
+
+    fn request_session_match(&mut self) {
+        let Some(search) = self.output_search.as_mut() else {
+            return;
+        };
+        let Some(disk) = search.disk.as_mut() else {
+            return;
+        };
+        let mut ordinal = search.selected as u64;
+        let Some(source) = disk.sources.iter().find(|source| {
+            if ordinal < source.progress.matches {
+                true
+            } else {
+                ordinal = ordinal.saturating_sub(source.progress.matches);
+                false
+            }
+        }) else {
+            return;
+        };
+        let request_id = Uuid::new_v4();
+        let request = SessionSearchCommand {
+            request_id,
+            query_id: disk.id,
+            port: source.port.clone(),
+            handle: source.handle.clone(),
+            ordinal,
+            context_anchor: None,
+        };
+        // Invalidate any older navigation response, including when the bounded
+        // queue is full. Polling retries the latest selection without jumping back.
+        disk.pending = None;
+        if self
+            .session_search_commands
+            .as_ref()
+            .is_some_and(|commands| commands.try_send(request).is_ok())
+        {
+            disk.pending = Some(request_id);
+        }
+    }
+
+    fn handle_session_search_event(&mut self, event: SessionSearchEvent) {
+        let request = event.request;
+        let searching = request.context_anchor.is_none();
+        let valid = if searching {
+            self.output_search
+                .as_ref()
+                .and_then(|search| search.disk.as_ref())
+                .is_some_and(|disk| {
+                    disk.id == request.query_id && disk.pending == Some(request.request_id)
+                })
+        } else {
+            self.archived_view.as_ref().is_some_and(|view| {
+                view.id == request.query_id
+                    && view.pending == Some(request.request_id)
+                    && self.current().scroll_snapshot.is_some()
+                    && view.port == self.selected_port()
+            })
+        };
+        if !valid {
+            return;
+        }
+        if searching {
+            self.output_search
+                .as_mut()
+                .unwrap()
+                .disk
+                .as_mut()
+                .unwrap()
+                .pending = None;
+        } else if let Some(view) = self.archived_view.as_mut() {
+            view.pending = None;
+        }
+        match event.result {
+            Err(error) => {
+                if let Some(search) = self.output_search.as_mut() {
+                    search.error = Some(error.clone());
+                }
+                self.status = error;
+            }
+            Ok((hit, lines)) => {
+                if let Some(index) = self.slot_index(&request.port) {
+                    self.selected = index;
+                } else {
+                    return;
+                }
+                let direction = request
+                    .context_anchor
+                    .as_ref()
+                    .map_or(0, |(_, direction)| *direction);
+                self.show_archived_context(&lines, &hit, direction, searching);
+                if searching {
+                    self.status = format!("{} · {}", request.port, safe_inline(&hit.preview));
+                }
+                if searching
+                    && let Some(disk) = self
+                        .output_search
+                        .as_mut()
+                        .and_then(|search| search.disk.as_mut())
+                {
+                    disk.selected = Some((request.port.clone(), hit.clone()));
+                }
+                self.archived_view = Some(ArchivedViewport {
+                    id: request.query_id,
+                    port: request.port,
+                    handle: request.handle,
+                    hit,
+                    lines,
+                    pending: None,
+                });
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn show_archived_context(
+        &mut self,
+        lines: &[ArchivedLine],
+        hit: &SearchHit,
+        direction: i8,
+        highlight: bool,
+    ) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let width = layout.output_inner.width;
+        let source_width = detailed_source_width(width as usize);
+        let mut rows = Vec::new();
+        let mut clean = Vec::new();
+        let mut target = 0;
+        for entry in lines {
+            if entry.row_id == hit.row_id {
+                target = rows.len();
+            }
+            let line = timeline_line(
+                &entry.line,
+                self.detailed_timeline,
+                source_width,
+                self.current().effective_shell_prompt(),
+                self.current().effective_uboot_prompt(),
+                width as usize,
+            );
+            clean.extend(wrap_timeline_line(line.clone(), width));
+            let marked =
+                if highlight && entry.row_id >= hit.row_id && entry.row_id <= hit.end_row_id {
+                    let prefix = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.len())
+                        .sum::<usize>()
+                        .saturating_sub(entry.line.text.len());
+                    let start = if entry.row_id == hit.row_id {
+                        hit.byte_start
+                    } else {
+                        0
+                    };
+                    let end = if entry.row_id == hit.end_row_id {
+                        hit.byte_end
+                    } else {
+                        entry.line.text.len()
+                    };
+                    highlight_search_range(line, prefix + start, prefix + end)
+                } else {
+                    line
+                };
+            rows.extend(wrap_timeline_line(marked, width));
+        }
+        let height = layout.output_inner.height as usize;
+        let end = match direction {
+            -1 => target,
+            1 => target.saturating_add(height + 1),
+            _ => target.saturating_add(height / 2 + 1),
+        }
+        .min(rows.len())
+        .max(1);
+        let offset = rows.len().saturating_sub(end);
+        let view = self.current_mut();
+        view.scroll_snapshot = Some(ScrollSnapshot { rows });
+        view.scroll_from_bottom = offset;
+        if let Some(search) = self.output_search.as_mut() {
+            search.clean_snapshot = Some(clean);
+        }
+    }
+
+    fn extend_archived_context(&mut self, direction: i8) {
+        let Some(view) = self
+            .archived_view
+            .as_mut()
+            .filter(|view| view.pending.is_none())
+        else {
+            return;
+        };
+        if view.port != self.ports[self.selected].snapshot.config.port {
+            return;
+        }
+        let Some(boundary) = (if direction < 0 {
+            view.lines.first()
+        } else {
+            view.lines.last()
+        }) else {
+            return;
+        };
+        if direction < 0 && boundary.row_id == 0 {
+            return;
+        }
+        let mut hit = view.hit.clone();
+        hit.row_id = boundary.row_id;
+        hit.end_row_id = boundary.row_id;
+        hit.provisional = false;
+        let request_id = Uuid::new_v4();
+        let request = SessionSearchCommand {
+            request_id,
+            query_id: view.id,
+            port: view.port.clone(),
+            handle: view.handle.clone(),
+            ordinal: hit.ordinal,
+            context_anchor: Some((hit, direction)),
+        };
+        if self
+            .session_search_commands
+            .as_ref()
+            .is_some_and(|commands| commands.try_send(request).is_ok())
+        {
+            view.pending = Some(request_id);
+        }
+    }
+
     fn refresh_output_search(&mut self, prefer_latest: bool) {
+        if self.start_session_search(prefer_latest) {
+            return;
+        }
         let Some(search) = self.output_search.as_ref() else {
             return;
         };
@@ -3158,6 +3812,13 @@ impl App {
     }
 
     fn jump_to_output_search_match(&mut self) {
+        if self
+            .output_search
+            .as_ref()
+            .is_some_and(|search| search.disk.is_some())
+        {
+            return;
+        }
         let Some(layout) = self.layout else {
             return;
         };
@@ -3198,6 +3859,15 @@ impl App {
             .min(row_count)
             .max((target_row + 1).min(row_count));
         let scroll_from_bottom = row_count.saturating_sub(end);
+        let search = self.output_search.take();
+        let clean_rows = all_output_visual_rows(self, layout.output_inner.width)
+            .into_iter()
+            .map(|row| row.line)
+            .collect();
+        self.output_search = search;
+        if let Some(search) = self.output_search.as_mut() {
+            search.clean_snapshot = Some(clean_rows);
+        }
         let view = self.current_mut();
         view.scroll_snapshot = Some(ScrollSnapshot {
             rows: rows.into_iter().map(|row| row.line).collect(),
@@ -3219,6 +3889,12 @@ impl App {
         } else {
             (search.selected + 1) % total
         };
+        search.follow_new_matches = false;
+        if let Some(disk) = search.disk.as_mut() {
+            disk.selected = None;
+            self.request_session_match();
+            return;
+        }
         self.refresh_output_search_page();
         self.jump_to_output_search_match();
     }
@@ -3256,6 +3932,9 @@ impl App {
         let Some(search) = self.output_search.as_mut() else {
             return;
         };
+        if search.disk.is_some() {
+            return;
+        }
         if search.port != port || search.query.is_empty() {
             return;
         }
@@ -3267,6 +3946,14 @@ impl App {
     }
 
     fn refresh_output_search_if_due(&mut self, now: Instant) {
+        if self
+            .output_search
+            .as_ref()
+            .is_some_and(|search| search.disk.is_some())
+        {
+            self.poll_session_search(now);
+            return;
+        }
         let Some(search) = self.output_search.as_ref() else {
             return;
         };
@@ -3367,6 +4054,15 @@ impl App {
             }
             KeyCode::Up => navigate = Some(true),
             KeyCode::Down => navigate = Some(false),
+            KeyCode::PageUp | KeyCode::PageDown if search.disk.is_some() => {
+                self.output_search = Some(search);
+                if key.code == KeyCode::PageUp {
+                    self.scroll_up(10);
+                } else {
+                    self.scroll_down(10);
+                }
+                return;
+            }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
                 search.matcher = search.matcher.toggled();
                 refresh = true;
@@ -3425,10 +4121,16 @@ impl App {
         }
         if keep_open {
             if refresh {
+                self.archived_view = None;
+                if let Some(rows) = &search.clean_snapshot {
+                    self.current_mut().scroll_snapshot =
+                        Some(ScrollSnapshot { rows: rows.clone() });
+                }
                 // Query/filter edits are debounced. Clear the old page now so
                 // stale highlights never masquerade as results for the new
                 // expression while the bounded index rebuild is pending.
                 search.local_index = None;
+                search.disk = None;
                 search.matches.clear();
                 search.selected = 0;
                 search.error = None;
@@ -3460,15 +4162,29 @@ impl App {
                 let _ = commands.try_send(OutputSearchIoCommand::Cancel { request_id });
             }
             self.focus = search.previous_focus;
+            if let Some(rows) = search.clean_snapshot.take() {
+                self.current_mut().scroll_snapshot = Some(ScrollSnapshot { rows });
+            } else {
+                self.jump_to_output_search_match();
+            }
             self.status = tr("st.output.search.closed").into();
         }
     }
 
     fn handle_output_search_paste(&mut self, value: String) {
+        self.archived_view = None;
+        if let Some(rows) = self
+            .output_search
+            .as_ref()
+            .and_then(|search| search.clean_snapshot.clone())
+        {
+            self.current_mut().scroll_snapshot = Some(ScrollSnapshot { rows });
+        }
         {
             let Some(search) = self.output_search.as_mut() else {
                 return;
             };
+            search.disk = None;
             for character in value.chars().filter(|character| !character.is_control()) {
                 let mut candidate = search.query.clone();
                 candidate.insert(search.cursor, character);
@@ -3783,6 +4499,12 @@ impl App {
                 self.status = tr("st.transport").into();
             }
             NetworkEvent::Disconnected { reason } => {
+                if !self.macro_requests.is_empty() || self.pending_macro_start.is_some() {
+                    self.macro_failure("连接中断，宏执行结果暂不确定；重连后查询状态，不自动重放");
+                    self.macro_requests.clear();
+                    self.macro_start_requests.clear();
+                    self.pending_macro_start = None;
+                }
                 let old_actor_id = self.actor.take().map(|actor| actor.id);
                 let newly_uncertain = self
                     .pending_requests
@@ -3909,7 +4631,45 @@ impl App {
             } => {
                 let mut discarded_suffix = String::new();
                 let mut write_outcome_uncertain = false;
+                let mut macro_record_missing = false;
+                let mut macro_error_port = None;
                 if let Some(request_id) = request_id {
+                    if let Some(port) = self.macro_start_requests.remove(&request_id) {
+                        if code != serial_protocol::ErrorCode::WriteOutcomeUncertain {
+                            self.macro_operations.remove(&port);
+                            self.release_macro_temporary_control(&port, commands);
+                        }
+                    }
+                    let macro_port = self.macro_requests.remove(&request_id);
+                    if let Some(port) = &macro_port
+                        && code == serial_protocol::ErrorCode::NotFound
+                    {
+                        self.macro_operations.remove(port);
+                        self.macro_executions.remove(port);
+                        // NotFound cannot prove that no bytes reached the device.
+                        // Stop retrying; retain normal human lease/idle policy.
+                        self.macro_temporary_controls.remove(port);
+                        macro_record_missing = true;
+                    }
+                    macro_error_port = macro_port;
+                    if self
+                        .pending_macro_start
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| *id == request_id)
+                        && let Some((_, port, _)) = self.pending_macro_start.take()
+                    {
+                        macro_error_port = Some(port);
+                    }
+                    if let Some(port) = &macro_error_port {
+                        if let Some(panel) = self
+                            .macro_panel
+                            .as_mut()
+                            .filter(|panel| &panel.port == port)
+                        {
+                            panel.busy = false;
+                            panel.message = safe_inline(&message);
+                        }
+                    }
                     match self.pending_requests.remove(&request_id) {
                         Some(PendingRequest::Write { port, .. })
                             if code == serial_protocol::ErrorCode::WriteOutcomeUncertain =>
@@ -3971,7 +4731,9 @@ impl App {
                         _ => {}
                     }
                 }
-                self.status = if write_outcome_uncertain
+                self.status = if macro_record_missing {
+                    "宏执行记录不可恢复，无法证明设备未执行；不会自动重放".into()
+                } else if write_outcome_uncertain
                     || code == serial_protocol::ErrorCode::WriteOutcomeUncertain
                 {
                     format!(
@@ -3986,6 +4748,15 @@ impl App {
                         if retryable { tr("st.retryable") } else { "" }
                     )
                 };
+                if macro_record_missing
+                    && let Some(panel) = self
+                        .macro_panel
+                        .as_mut()
+                        .filter(|panel| Some(&panel.port) == macro_error_port.as_ref())
+                {
+                    panel.message = self.status.clone();
+                    panel.execution = None;
+                }
             }
             ServerMessage::Gap {
                 port,
@@ -4056,6 +4827,8 @@ impl App {
         commands: &mpsc::Sender<NetworkCommand>,
     ) {
         let pending = self.pending_requests.remove(&request_id);
+        self.macro_requests.remove(&request_id);
+        self.macro_start_requests.remove(&request_id);
         match result {
             CommandResult::ControlGranted { lease } => {
                 if let Some(PendingRequest::Acquire { port, mode }) = pending {
@@ -4066,6 +4839,23 @@ impl App {
                         ControlMode::Takeover => trf("st.takeover.granted", &[&port]),
                     };
                     self.flush_pending_writes(&port, commands);
+                    if self
+                        .pending_macro_start
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| *id == request_id)
+                        && let Some((_, port, spec)) = self.pending_macro_start.take()
+                    {
+                        if let Some(lease) = self
+                            .ports
+                            .iter()
+                            .find(|view| view.snapshot.config.port == port)
+                            .and_then(|view| view.snapshot.control.as_ref())
+                        {
+                            self.macro_temporary_controls
+                                .insert(port.clone(), (lease.id, lease.fence));
+                        }
+                        self.start_human_macro(&port, spec, commands);
+                    }
                 }
             }
             CommandResult::ControlQueued { position } => {
@@ -4183,7 +4973,13 @@ impl App {
                 interfered_run_id,
                 context_revision,
             } => {
-                if let Some(PendingRequest::HumanCommand { port, .. }) = pending {
+                if let Some(PendingRequest::HumanCommand { port, recovery }) = pending {
+                    if let HumanCommandRecovery::LineDraft(command) = recovery {
+                        self.record_human_history(command);
+                        if let Some(refresh) = &self.human_history_commands {
+                            let _ = refresh.try_send(());
+                        }
+                    }
                     if let Some(lease) = lease {
                         self.install_lease(&port, lease);
                     }
@@ -4198,6 +4994,11 @@ impl App {
             }
             CommandResult::BreakSent { event_seq } => {
                 self.status = trf("st.break.confirmed", &[&event_seq.to_string()]);
+            }
+            CommandResult::MacroStarted { execution }
+            | CommandResult::MacroStatus { execution }
+            | CommandResult::MacroCancelled { execution } => {
+                self.record_macro_execution(*execution, commands);
             }
             CommandResult::TriggerStarted { trigger }
             | CommandResult::TriggerStatus { trigger }
@@ -4246,6 +5047,16 @@ impl App {
         if let Some(index) = self.slot_index(&event.port) {
             let port = event.port.clone();
             let selected = index == self.selected;
+            if (self.ports[index].last_epoch != Some(event.daemon_epoch)
+                || event.seq > self.ports[index].last_seq)
+                && let Some(execution) = event.metadata.get("macro_execution").and_then(|value| {
+                    serde_json::from_value::<serial_protocol::MacroExecutionInfo>(value.clone())
+                        .ok()
+                })
+                && execution.port == port
+            {
+                self.record_macro_execution(execution, commands);
+            }
             if replay {
                 self.ports[index].push_event(event, selected);
                 self.mark_output_search_document_dirty(&port);
@@ -4666,10 +5477,22 @@ impl App {
                 data,
                 operation_id,
                 description: None,
+                input: match &recovery {
+                    HumanCommandRecovery::LineDraft(command) => {
+                        Some(serial_protocol::HumanLineInput {
+                            command: command.clone(),
+                        })
+                    }
+                    _ => None,
+                },
             },
             Some(PendingRequest::HumanCommand { port, recovery }),
         );
         if sent {
+            // Explicit human input means this is now the user's lease, not a
+            // temporary lease that macro completion may release underneath them.
+            self.macro_temporary_controls
+                .remove(&self.ports[index].snapshot.config.port);
             self.ports[index].last_manual_activity = Some(Instant::now());
         }
         sent
@@ -5693,6 +6516,9 @@ impl App {
             // Triggers are already guarded inside `flush_pending_writes`.
             self.flush_pending_writes(&port, commands);
             let operation_pending = self.pending_writes.contains_key(&port)
+                || self.macro_executions.get(&port).is_some_and(|execution| !execution.status.is_terminal())
+                || self.macro_operations.contains_key(&port)
+                || self.macro_requests.values().any(|pending| pending == &port)
                 || self.pending_requests.values().any(
                     |request| matches!(request, PendingRequest::Write { port: pending, .. } if pending == &port),
                 );
@@ -5854,6 +6680,9 @@ impl App {
                 self.clear_text_selection();
                 if self.pending_run_start_approval().is_some() {
                     self.status = tr("st.run.approval.modal").into();
+                } else if let Some(panel) = self.macro_panel.as_mut() {
+                    panel.paste(&value);
+                    self.dirty = true;
                 } else if self.output_search.is_some() {
                     self.handle_output_search_paste(value);
                 } else if self.menu.is_some() {
@@ -5865,8 +6694,11 @@ impl App {
             Event::Mouse(mouse) => self.handle_mouse(mouse, commands),
             Event::Resize(_, _) => {
                 self.clear_text_selection();
+                let archive_port = self.archived_view.as_ref().map(|view| view.port.as_str());
                 for slot in &mut self.ports {
-                    slot.follow();
+                    if archive_port != Some(slot.snapshot.config.port.as_str()) {
+                        slot.follow();
+                    }
                 }
                 self.queue_selection = None;
                 self.focus = PaneFocus::Input;
@@ -5886,6 +6718,12 @@ impl App {
         // search/menu/input so an Enter intended for another pane can never
         // be mistaken for consent after the dialog appeared.
         if self.handle_run_start_approval_key(key, commands) {
+            self.dirty = true;
+            return;
+        }
+        if let Some(panel) = self.macro_panel.as_mut() {
+            let action = panel.key(key);
+            self.handle_macro_action(action, commands);
             self.dirty = true;
             return;
         }
@@ -5968,6 +6806,14 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // This Human signal is independent of the local LINE draft.
+                // Modal editors above retain ownership of their own keys.
+                self.request_raw_write(commands, vec![0x04]);
+                self.current_mut().follow();
+                self.dirty = true;
+                return;
+            }
             KeyCode::PageUp | KeyCode::PageDown => {
                 // Paging always belongs to the serial viewport. Agent history
                 // navigation is deliberately isolated to the direction keys
@@ -5981,15 +6827,27 @@ impl App {
                 return;
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
-                if self.current().history_action_keys().is_empty() {
-                    // Direction keys are reserved for Agent/Monitor history,
-                    // but an empty history must not open or focus a dead pane.
-                    self.dirty = true;
-                    return;
+                if self.focus == PaneFocus::RunHistory {
+                    self.handle_run_history_key(key);
+                } else {
+                    self.focus = PaneFocus::Input;
+                    match self.current_mode() {
+                        InputMode::Line => self.handle_line_key(key, commands),
+                        InputMode::Raw => self.handle_raw_key(key, commands),
+                    }
                 }
-                self.run_panel_visible = true;
-                self.focus = PaneFocus::RunHistory;
+                self.dirty = true;
+                return;
+            }
+            KeyCode::Enter | KeyCode::Home | KeyCode::End | KeyCode::Tab | KeyCode::BackTab
+                if self.focus == PaneFocus::RunHistory =>
+            {
                 self.handle_run_history_key(key);
+                self.dirty = true;
+                return;
+            }
+            KeyCode::Esc if self.focus == PaneFocus::RunHistory => {
+                self.focus = PaneFocus::Input;
                 self.dirty = true;
                 return;
             }
@@ -6001,6 +6859,11 @@ impl App {
             | KeyCode::Char(_)
                 if !key.modifiers.contains(KeyModifiers::ALT) =>
             {
+                if self.focus == PaneFocus::RunHistory && self.current_mode() == InputMode::Raw {
+                    self.handle_run_history_key(key);
+                    self.dirty = true;
+                    return;
+                }
                 let leaving_history = self.focus == PaneFocus::RunHistory;
                 self.focus = PaneFocus::Input;
                 if leaving_history {
@@ -6237,10 +7100,12 @@ impl App {
                 self.status = tr("st.raw.mode").into();
             }
             KeyCode::Char('f' | 'F') | KeyCode::End => {
+                self.archived_view = None;
                 self.current_mut().follow();
                 self.status = tr("st.follow").into();
             }
             KeyCode::Char('v' | 'V') => {
+                self.archived_view = None;
                 for slot in &mut self.ports {
                     slot.follow();
                 }
@@ -6253,6 +7118,18 @@ impl App {
             }
             KeyCode::Char('g' | 'G') => self.toggle_language(),
             KeyCode::Char('m' | 'M') => self.open_menu(),
+            KeyCode::Char('a' | 'A') => {
+                let port = self.selected_port();
+                let mut panel = self
+                    .macro_saved_panel
+                    .take()
+                    .unwrap_or_else(|| macro_ui::Panel::new(port.clone()));
+                let action = panel.reopen(port.clone());
+                panel.execution = self.macro_executions.get(&port).cloned();
+                self.macro_panel = Some(panel);
+                self.macro_panel_id = Uuid::new_v4();
+                self.handle_macro_action(action, commands);
+            }
             KeyCode::Char('o' | 'O') => self.open_profiles_menu(),
             KeyCode::Char('h' | 'H') => self.toggle_run_history_panel(),
             KeyCode::PageUp => self.scroll_up(10),
@@ -6277,14 +7154,294 @@ impl App {
         }
     }
 
+    fn handle_macro_action(
+        &mut self,
+        action: macro_ui::Action,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
+        let io = match action {
+            macro_ui::Action::None => return,
+            macro_ui::Action::Close => {
+                self.macro_saved_panel = self.macro_panel.take();
+                return;
+            }
+            macro_ui::Action::List(drafts) => macro_ui::IoCommand::List(drafts),
+            macro_ui::Action::Load(id) => macro_ui::IoCommand::Load(id),
+            macro_ui::Action::Save(request) => macro_ui::IoCommand::Save(request),
+            macro_ui::Action::Run(spec) => {
+                if let Some(port) = self.macro_panel.as_ref().map(|panel| panel.port.clone()) {
+                    self.start_human_macro(&port, spec, commands);
+                }
+                return;
+            }
+            macro_ui::Action::Stop => {
+                if let Some(port) = self.macro_panel.as_ref().map(|panel| panel.port.clone()) {
+                    self.stop_human_macro(&port, commands);
+                }
+                return;
+            }
+        };
+        let sent = self
+            .macro_commands
+            .as_ref()
+            .is_some_and(|commands| commands.try_send(io).is_ok());
+        if sent {
+            self.macro_io_contexts.push_back(self.macro_panel_id);
+        }
+        if let Some(panel) = self.macro_panel.as_mut() {
+            panel.busy = sent;
+            if !sent {
+                panel.message = "宏目录服务暂不可用，请稍后重试".into();
+            }
+        }
+    }
+
+    fn macro_failure(&mut self, message: &str) {
+        self.status = message.into();
+        if let Some(panel) = self.macro_panel.as_mut() {
+            panel.busy = false;
+            panel.message = message.into();
+        }
+    }
+
+    fn release_macro_temporary_control(
+        &mut self,
+        port: &str,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
+        let Some((id, fence)) = self.macro_temporary_controls.remove(port) else {
+            return;
+        };
+        let Some(index) = self
+            .slot_index(port)
+            .filter(|index| self.owns_control(*index))
+        else {
+            return;
+        };
+        if let Some(lease) = self.ports[index]
+            .snapshot
+            .control
+            .clone()
+            .filter(|lease| lease.id == id && lease.fence == fence)
+        {
+            self.release_slot_control(commands, port.to_owned(), lease, false);
+        }
+    }
+
+    fn record_macro_execution(
+        &mut self,
+        execution: serial_protocol::MacroExecutionInfo,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
+        let port = execution.port.clone();
+        if self.macro_executions.get(&port).is_some_and(|old| {
+            old.started_at_ns > execution.started_at_ns
+                || old.id == execution.id
+                    && old.status.is_terminal()
+                    && !execution.status.is_terminal()
+        }) {
+            return;
+        }
+        if execution.status.is_terminal() {
+            if self.macro_operations.get(&port) == Some(&execution.id) {
+                self.macro_operations.remove(&port);
+            }
+            if execution.status == serial_protocol::MacroStatus::InterruptedByUser {
+                self.macro_temporary_controls.remove(&port);
+            } else {
+                self.release_macro_temporary_control(&port, commands);
+            }
+        }
+        self.status = format!("Macro {} · {:?}", execution.id, execution.status);
+        if let Some(panel) = self.macro_panel.as_mut().filter(|panel| panel.port == port) {
+            panel.busy = false;
+            panel.message = self.status.clone();
+            panel.execution = Some(execution.clone());
+        }
+        self.macro_executions.insert(port, execution);
+    }
+
+    fn start_human_macro(
+        &mut self,
+        port: &str,
+        spec: serial_protocol::MacroRunSpec,
+        commands: &mpsc::Sender<NetworkCommand>,
+    ) {
+        let Some(index) = self
+            .slot_index(port)
+            .filter(|index| self.slot_ready(*index))
+        else {
+            self.macro_failure("串口尚未就绪，宏未发送");
+            return;
+        };
+        if self.macro_operations.contains_key(port)
+            || self
+                .macro_executions
+                .get(port)
+                .is_some_and(|execution| !execution.status.is_terminal())
+        {
+            self.macro_failure("此串口已有宏在执行，请先停止或等待完成");
+            return;
+        }
+        if self.ports[index].snapshot.control.is_none() {
+            let request_id = Uuid::new_v4();
+            let sent = self.send_message(
+                commands,
+                ClientMessage::AcquireControl {
+                    request_id,
+                    port: port.to_owned(),
+                    mode: ControlMode::Queue,
+                    ttl_ms: CONTROL_TTL_MS,
+                },
+                Some(PendingRequest::Acquire {
+                    port: port.to_owned(),
+                    mode: ControlMode::Queue,
+                }),
+            );
+            if sent {
+                self.pending_macro_start = Some((request_id, port.to_owned(), spec));
+                if let Some(panel) = self.macro_panel.as_mut() {
+                    panel.busy = true;
+                    panel.message = "正在申请空闲串口…".into();
+                }
+            } else {
+                self.macro_failure("无法请求串口控制，宏未发送");
+            }
+            return;
+        }
+        if !self.owns_control(index) {
+            self.macro_failure("串口正由 Agent 或其他用户占用；请完成交接后再运行宏");
+            return;
+        }
+        let snapshot = &self.ports[index].snapshot;
+        let lease = snapshot.control.as_ref().unwrap();
+        let request_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let message = ClientMessage::MacroStart {
+            request_id,
+            port: port.to_owned(),
+            control_id: lease.id,
+            fence: lease.fence,
+            daemon_epoch: snapshot.daemon_epoch,
+            generation: snapshot.generation,
+            operation_id,
+            expected_run_id: None,
+            sequence_precondition: None,
+            spec,
+        };
+        if self.send_message(commands, message, None) {
+            self.macro_requests.insert(request_id, port.to_owned());
+            self.macro_start_requests
+                .insert(request_id, port.to_owned());
+            self.macro_operations.insert(port.to_owned(), operation_id);
+            self.ports[index].last_manual_activity = Some(Instant::now());
+            if let Some(panel) = self.macro_panel.as_mut() {
+                panel.busy = true;
+                panel.message = "正在启动宏…".into();
+            }
+        } else {
+            self.release_macro_temporary_control(port, commands);
+            self.macro_failure("宏启动请求未发送，请重试");
+        }
+    }
+
+    fn stop_human_macro(&mut self, port: &str, commands: &mpsc::Sender<NetworkCommand>) {
+        let Some(execution) = self
+            .macro_executions
+            .get(port)
+            .filter(|execution| !execution.status.is_terminal())
+        else {
+            return;
+        };
+        let execution_id = execution.id;
+        let Some(index) = self
+            .slot_index(port)
+            .filter(|index| self.owns_control(*index))
+        else {
+            self.macro_failure("当前客户端不持有宏的控制权，无法停止");
+            return;
+        };
+        let lease = self.ports[index].snapshot.control.as_ref().unwrap();
+        let request_id = Uuid::new_v4();
+        if self.send_message(
+            commands,
+            ClientMessage::MacroCancel {
+                request_id,
+                port: port.to_owned(),
+                control_id: lease.id,
+                fence: lease.fence,
+                execution_id,
+            },
+            None,
+        ) {
+            self.macro_requests.insert(request_id, port.to_owned());
+        }
+    }
+
+    fn poll_human_macros(&mut self, commands: &mpsc::Sender<NetworkCommand>) {
+        if !self.transport_connected || !self.hello_accepted {
+            return;
+        }
+        let mut running = self.macro_operations.clone();
+        for execution in self
+            .macro_executions
+            .values()
+            .filter(|execution| !execution.status.is_terminal())
+        {
+            running
+                .entry(execution.port.clone())
+                .or_insert(execution.id);
+        }
+        for (port, execution_id) in running {
+            if self.macro_requests.values().any(|pending| pending == &port) {
+                continue;
+            }
+            let request_id = Uuid::new_v4();
+            if self.send_message(
+                commands,
+                ClientMessage::MacroStatus {
+                    request_id,
+                    port: port.clone(),
+                    execution_id,
+                },
+                None,
+            ) {
+                self.macro_requests.insert(request_id, port);
+            }
+        }
+    }
+
     fn handle_line_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
         if self.current().history_search.is_some() {
             self.handle_history_search_key(key);
             return;
         }
-        // Any key other than Tab confirms the current completion candidate.
-        if key.code != KeyCode::Tab && self.current().completion.is_some() {
-            self.current_mut().completion = None;
+        if self.current().completion.is_some() {
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => {
+                    self.cycle_completion(false);
+                    return;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.cycle_completion(true);
+                    return;
+                }
+                KeyCode::Enter => {
+                    let completion = self.current_mut().completion.take().unwrap();
+                    let view = self.current_mut();
+                    view.draft = completion.candidates[completion.current].chars().collect();
+                    view.draft_cursor = view.draft.len();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.current_mut().completion = None;
+                    return;
+                }
+                _ => self.current_mut().completion = None,
+            }
+        }
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.current_mut().history_browse = None;
         }
         match key.code {
             KeyCode::Enter => {
@@ -6316,12 +7473,6 @@ impl App {
                 }
                 {
                     let view = self.current_mut();
-                    if !value.is_empty() {
-                        view.history.push(value);
-                        if view.history.len() > 500 {
-                            view.history.remove(0);
-                        }
-                    }
                     view.draft.clear();
                     view.draft_cursor = 0;
                 }
@@ -6330,6 +7481,8 @@ impl App {
                 self.start_history_search();
             }
             KeyCode::Tab => self.complete_draft(),
+            KeyCode::Up => self.browse_human_history(false),
+            KeyCode::Down => self.browse_human_history(true),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -6342,31 +7495,68 @@ impl App {
             KeyCode::Backspace => {
                 let view = self.current_mut();
                 if view.draft_cursor > 0 {
-                    view.draft_cursor -= 1;
-                    view.draft.remove(view.draft_cursor);
+                    let start = if key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        previous_word(&view.draft, view.draft_cursor)
+                    } else {
+                        previous_grapheme(&view.draft, view.draft_cursor)
+                    };
+                    view.draft.drain(start..view.draft_cursor);
+                    view.draft_cursor = start;
                 }
             }
             KeyCode::Delete => {
                 let view = self.current_mut();
                 if view.draft_cursor < view.draft.len() {
-                    view.draft.remove(view.draft_cursor);
+                    let end = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        next_word(&view.draft, view.draft_cursor)
+                    } else {
+                        next_grapheme(&view.draft, view.draft_cursor)
+                    };
+                    view.draft.drain(view.draft_cursor..end);
                 }
             }
             KeyCode::Left => {
                 let view = self.current_mut();
-                view.draft_cursor = view.draft_cursor.saturating_sub(1);
+                view.draft_cursor = if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    previous_word(&view.draft, view.draft_cursor)
+                } else {
+                    previous_grapheme(&view.draft, view.draft_cursor)
+                };
             }
             KeyCode::Right => {
+                if self.accept_history_suggestion() {
+                    return;
+                }
                 let view = self.current_mut();
-                view.draft_cursor = (view.draft_cursor + 1).min(view.draft.len());
+                view.draft_cursor = if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    next_word(&view.draft, view.draft_cursor)
+                } else {
+                    next_grapheme(&view.draft, view.draft_cursor)
+                };
             }
             KeyCode::Home => self.current_mut().draft_cursor = 0,
             KeyCode::End => {
+                if self.accept_history_suggestion() {
+                    return;
+                }
                 let length = self.current().draft.len();
                 self.current_mut().draft_cursor = length;
             }
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
+            KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.request_raw_write(commands, vec![0x04]);
+                self.current_mut().follow();
+            }
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 {
                     let view = self.current_mut();
@@ -6484,12 +7674,13 @@ impl App {
     }
 
     fn handle_history_search_key(&mut self, key: KeyEvent) {
+        let history = self.human_history.clone();
         match key.code {
             KeyCode::Enter => {
                 let view = self.current_mut();
                 if let Some(search) = view.history_search.take() {
                     if let Some(index) = search.match_index {
-                        view.draft = view.history[index].chars().collect();
+                        view.draft = history[index].chars().collect();
                         view.draft_cursor = view.draft.len();
                     } else {
                         view.draft = search.saved_draft;
@@ -6509,15 +7700,15 @@ impl App {
                 let view = self.current_mut();
                 if let Some(search) = &mut view.history_search {
                     search.match_index =
-                        find_history_match(&view.history, &search.query, search.match_index)
-                            .or_else(|| find_history_match(&view.history, &search.query, None));
+                        find_history_match(&history, &search.query, search.match_index)
+                            .or_else(|| find_history_match(&history, &search.query, None));
                 }
             }
             KeyCode::Backspace => {
                 let view = self.current_mut();
                 if let Some(search) = &mut view.history_search {
                     search.query.pop();
-                    search.match_index = find_history_match(&view.history, &search.query, None);
+                    search.match_index = find_history_match(&history, &search.query, None);
                 }
             }
             KeyCode::Char(character)
@@ -6528,7 +7719,7 @@ impl App {
                 let view = self.current_mut();
                 if let Some(search) = &mut view.history_search {
                     search.query.push(character);
-                    search.match_index = find_history_match(&view.history, &search.query, None);
+                    search.match_index = find_history_match(&history, &search.query, None);
                 }
             }
             _ => {}
@@ -6620,6 +7811,15 @@ impl App {
             return;
         }
 
+        if matches!(
+            menu.page,
+            MenuPage::ModelFamilies | MenuPage::ConfigureModelFamilies
+        ) && self.handle_model_tree_key(&mut menu, key)
+        {
+            self.menu = Some(menu);
+            return;
+        }
+
         let mut keep_open = true;
         let count = menu_item_count(&menu);
         match key.code {
@@ -6690,6 +7890,136 @@ impl App {
             menu.selected = menu.selected.min(count.saturating_sub(1));
             self.menu = Some(menu);
         }
+    }
+
+    fn handle_model_tree_key(&mut self, menu: &mut MenuState, key: KeyEvent) -> bool {
+        if menu.busy
+            && matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Right | KeyCode::Delete | KeyCode::Char('d' | 'D')
+            )
+        {
+            menu.message = tr("menu.busy").into();
+            return true;
+        }
+        let rows = model_tree_rows(menu);
+        let Some(row) = rows.get(menu.selected).cloned() else {
+            return false;
+        };
+        let configuring = menu.page == MenuPage::ConfigureModelFamilies;
+        match key.code {
+            KeyCode::Left => match row {
+                ModelTreeRow::Model(family, _) | ModelTreeRow::AddModel(family) => {
+                    menu.selected = rows
+                        .iter()
+                        .position(|row| *row == ModelTreeRow::Family(family.clone()))
+                        .unwrap_or(0);
+                }
+                ModelTreeRow::Family(family)
+                    if menu.model_family.as_deref() == Some(family.as_str()) =>
+                {
+                    menu.model_family = None;
+                    menu.selected = model_tree_rows(menu)
+                        .iter()
+                        .position(|row| *row == ModelTreeRow::Family(family.clone()))
+                        .unwrap_or(0);
+                }
+                _ => {
+                    return false;
+                }
+            },
+            KeyCode::Right | KeyCode::Enter => match row {
+                ModelTreeRow::Family(family) => {
+                    let expanded = menu.model_family.as_deref() == Some(family.as_str());
+                    menu.model_family = Some(family.clone());
+                    let rows = model_tree_rows(menu);
+                    menu.selected = rows
+                        .iter()
+                        .position(|row| *row == ModelTreeRow::Family(family.clone()))
+                        .unwrap_or(0);
+                    if expanded
+                        && menu.selected + 1 < rows.len()
+                        && matches!(
+                            rows[menu.selected + 1],
+                            ModelTreeRow::Model(_, _) | ModelTreeRow::AddModel(_)
+                        )
+                    {
+                        menu.selected += 1;
+                    }
+                }
+                ModelTreeRow::Model(family, name) if !configuring && key.code == KeyCode::Enter => {
+                    if let Some(editor) = menu.profile_editor.as_mut() {
+                        editor.model_family = Some(family);
+                        editor.model_name = Some(name);
+                        while menu.page != MenuPage::Profiles && menu.back() {}
+                        self.submit_current_profile_updates(menu);
+                    }
+                }
+                ModelTreeRow::Unbound if key.code == KeyCode::Enter => {
+                    Self::clear_current_model_identity(menu);
+                    self.submit_current_profile_updates(menu);
+                }
+                ModelTreeRow::AddFamily if key.code == KeyCode::Enter => {
+                    Self::begin_create_prompt(
+                        menu,
+                        tr("menu.prompt.model.family"),
+                        String::new(),
+                        MenuPromptPurpose::CreateModelFamily,
+                    );
+                }
+                ModelTreeRow::AddModel(family) if key.code == KeyCode::Enter => {
+                    Self::begin_create_prompt(
+                        menu,
+                        tr("menu.prompt.model.name"),
+                        String::new(),
+                        MenuPromptPurpose::CreateModelName { family },
+                    );
+                }
+                _ => {}
+            },
+            KeyCode::Delete | KeyCode::Char('d' | 'D') if configuring => {
+                // Existing deletion validation and dependency confirmation are
+                // retained; only their selected item is adapted from the tree.
+                let page = menu.page;
+                let selected = menu.selected;
+                match row {
+                    ModelTreeRow::Family(ref name) => {
+                        menu.selected = menu
+                            .catalog
+                            .as_ref()
+                            .and_then(|catalog| {
+                                catalog
+                                    .model_families
+                                    .iter()
+                                    .position(|family| &family.name == name)
+                            })
+                            .map_or(0, |index| index + 1);
+                    }
+                    ModelTreeRow::Model(ref family, ref name) => {
+                        menu.page = MenuPage::ConfigureModelNames;
+                        menu.selected = menu
+                            .catalog
+                            .as_ref()
+                            .and_then(|catalog| {
+                                catalog
+                                    .model_families
+                                    .iter()
+                                    .find(|item| &item.name == family)?
+                                    .model_names
+                                    .iter()
+                                    .position(|item| item == name)
+                            })
+                            .map_or(0, |index| index + 1);
+                    }
+                    _ => return true,
+                }
+                self.begin_selected_model_name_deletion(menu);
+                menu.page = page;
+                menu.selected = selected;
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn handle_menu_choice_key(
@@ -6889,6 +8219,7 @@ impl App {
                     };
                     if valid {
                         menu.message = tr("menu.current.modified").into();
+                        self.submit_current_profile_updates(menu);
                         return;
                     }
                     menu.message = tr("menu.current.value.invalid").into();
@@ -7410,6 +8741,9 @@ impl App {
         };
         if changed {
             menu.message = tr("menu.current.modified").into();
+            if menu.page == MenuPage::Profiles {
+                self.submit_current_profile_updates(menu);
+            }
         }
     }
 
@@ -7640,20 +8974,24 @@ impl App {
                 );
             }
             CurrentProfileRow::ModelName => {
-                let selected = menu
+                let selection = menu.profile_editor.as_ref().and_then(|editor| {
+                    Some(ModelTreeRow::Model(
+                        editor.model_family.clone()?,
+                        editor.model_name.clone()?,
+                    ))
+                });
+                menu.model_family = menu
                     .profile_editor
                     .as_ref()
-                    .and_then(|editor| editor.model_family.as_deref())
-                    .and_then(|current| {
-                        menu.catalog
-                            .as_ref()?
-                            .model_families
-                            .iter()
-                            .position(|family| family.name == current)
-                    })
-                    .map_or(0, |index| index + 1);
+                    .and_then(|editor| editor.model_family.clone());
                 menu.push(MenuPage::ModelFamilies);
-                menu.selected = selected;
+                menu.selected = selection
+                    .and_then(|selected| {
+                        model_tree_rows(menu)
+                            .iter()
+                            .position(|row| row == &selected)
+                    })
+                    .unwrap_or(0);
             }
             CurrentProfileRow::WriteEol => {
                 if !Self::profile_editable(menu, false) {
@@ -8198,6 +9536,13 @@ impl App {
             menu.message = tr("menu.busy").into();
             return;
         }
+        if matches!(
+            menu.page,
+            MenuPage::ModelFamilies | MenuPage::ConfigureModelFamilies
+        ) {
+            self.handle_model_tree_key(menu, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            return;
+        }
         match menu.page {
             MenuPage::Root => match menu.selected {
                 0 => {
@@ -8386,6 +9731,9 @@ impl App {
             .iter()
             .position(|view| view.snapshot.config.port == preferred_port)
             .unwrap_or_else(|| self.selected.min(self.ports.len().saturating_sub(1)));
+        if self.session_archiving {
+            self.enable_session_archives();
+        }
         let configured = configured_ports
             .iter()
             .collect::<std::collections::HashSet<_>>();
@@ -8461,14 +9809,22 @@ impl App {
                         MenuSuccess::ModelFamilyCreated(name)
                             if menu.page == MenuPage::ConfigureModelFamilies =>
                         {
-                            if let Some(index) = menu.catalog.as_ref().and_then(|catalog| {
-                                catalog
-                                    .model_families
-                                    .iter()
-                                    .position(|family| family.name == name.as_str())
-                            }) {
-                                menu.selected = index + 1;
-                            }
+                            menu.model_family = Some(name.clone());
+                            menu.selected = model_tree_rows(menu)
+                                .iter()
+                                .position(|row| *row == ModelTreeRow::AddModel(name.clone()))
+                                .unwrap_or(0);
+                        }
+                        MenuSuccess::ModelNameCreated { family, model_name }
+                            if menu.page == MenuPage::ConfigureModelFamilies =>
+                        {
+                            menu.model_family = Some(family.clone());
+                            menu.selected = model_tree_rows(menu)
+                                .iter()
+                                .position(|row| {
+                                    *row == ModelTreeRow::Model(family.clone(), model_name.clone())
+                                })
+                                .unwrap_or(0);
                         }
                         MenuSuccess::ModelNameCreated { family, model_name }
                             if menu.page == MenuPage::ConfigureModelNames
@@ -8560,18 +9916,14 @@ impl App {
     }
 
     fn complete_draft(&mut self) {
-        let view = self.current_mut();
-        if let Some(completion) = &mut view.completion {
-            completion.current = (completion.current + 1) % completion.candidates.len();
-            let candidate = completion.candidates[completion.current].clone();
-            view.draft = candidate.chars().collect();
-            view.draft_cursor = view.draft.len();
+        if self.current().completion.is_some() {
+            self.cycle_completion(false);
             return;
         }
-        let prefix = view.draft.iter().collect::<String>();
+        let prefix = self.current().draft.iter().collect::<String>();
         let mut seen = std::collections::HashSet::new();
-        let candidates = view
-            .history
+        let candidates = self
+            .human_history
             .iter()
             .rev()
             .filter(|entry| entry.starts_with(&prefix))
@@ -8581,17 +9933,229 @@ impl App {
         if candidates.is_empty() {
             return;
         }
-        let first = candidates[0].clone();
-        view.completion = Some(Completion {
+        self.current_mut().completion = Some(Completion {
             candidates,
             current: 0,
         });
-        view.draft = first.chars().collect();
+    }
+
+    fn cycle_completion(&mut self, backwards: bool) {
+        if let Some(completion) = self.current_mut().completion.as_mut() {
+            let count = completion.candidates.len();
+            completion.current = if backwards {
+                (completion.current + count - 1) % count
+            } else {
+                (completion.current + 1) % count
+            };
+        }
+    }
+
+    /// Replace the bounded cache from the daemon's platform-wide history.
+    /// Reset index-based navigation before applying a new ordering.
+    fn set_platform_history(&mut self, commands: Vec<String>) {
+        let previous = &self.human_history;
+        let selected = self
+            .ports
+            .iter()
+            .map(|view| {
+                (
+                    view.history_search
+                        .as_ref()
+                        .and_then(|search| search.match_index)
+                        .and_then(|index| previous.get(index))
+                        .cloned(),
+                    view.history_browse
+                        .as_ref()
+                        .and_then(|browse| previous.get(browse.index))
+                        .cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::HashSet::new();
+        self.human_history = commands
+            .into_iter()
+            .rev()
+            .filter(|command| !command.is_empty() && seen.insert(command.clone()))
+            .take(crate::api::HUMAN_HISTORY_MAX_ENTRIES)
+            .collect();
+        self.human_history.reverse();
+        for (view, (search_selection, browse_selection)) in self.ports.iter_mut().zip(selected) {
+            if let Some(search) = &mut view.history_search {
+                search.match_index = search_selection
+                    .and_then(|selection| {
+                        self.human_history
+                            .iter()
+                            .position(|command| command == &selection)
+                    })
+                    .or_else(|| find_history_match(&self.human_history, &search.query, None));
+            }
+            if let Some(mut browse) = view.history_browse.take() {
+                if let Some(index) = browse_selection.and_then(|selection| {
+                    self.human_history
+                        .iter()
+                        .position(|command| command == &selection)
+                }) {
+                    browse.index = index;
+                    view.history_browse = Some(browse);
+                } else {
+                    view.draft = browse.saved_draft;
+                    view.draft_cursor = browse.saved_cursor;
+                }
+            }
+            // Open completion menus keep their immutable candidate snapshot.
+            // Refreshing another client's history cannot change Enter's target.
+        }
+        self.dirty = true;
+    }
+
+    fn record_human_history(&mut self, command: String) {
+        if command.is_empty() {
+            return;
+        }
+        self.human_history_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let minimum_revision = self
+            .human_history_version
+            .map_or(0, |(_, revision)| revision.saturating_add(1));
+        self.human_history_confirmed
+            .retain(|(known, _)| known != &command);
+        self.human_history_confirmed
+            .push((command.clone(), minimum_revision));
+        if self.human_history_confirmed.len() > crate::api::HUMAN_HISTORY_MAX_ENTRIES {
+            self.human_history_confirmed.remove(0);
+        }
+        let mut commands = self.human_history.clone();
+        commands.push(command);
+        self.set_platform_history(commands);
+    }
+
+    fn handle_human_history_event(&mut self, event: HumanHistoryEvent) {
+        if event.local_generation
+            != self
+                .human_history_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(refresh) = &self.human_history_commands {
+                let _ = refresh.try_send(());
+            }
+            return;
+        }
+        let history = event.history;
+        if let Some((server, revision)) = self.human_history_version {
+            if server == history.server_id && revision > history.revision {
+                return;
+            }
+            if server != history.server_id {
+                self.human_history_confirmed.clear();
+            }
+        }
+        self.human_history_version = Some((history.server_id, history.revision));
+        let revisions = history
+            .entries
+            .iter()
+            .map(|entry| (entry.command.as_str(), entry.revision))
+            .collect::<HashMap<_, _>>();
+        self.human_history_confirmed.retain(|(command, minimum)| {
+            revisions
+                .get(command.as_str())
+                .is_none_or(|revision| revision < minimum)
+        });
+        let commands = history
+            .entries
+            .into_iter()
+            .rev()
+            .map(|entry| entry.command)
+            .chain(
+                self.human_history_confirmed
+                    .iter()
+                    .map(|(command, _)| command.clone()),
+            )
+            .collect();
+        self.set_platform_history(commands);
+        if let Some(warning) = history.warning {
+            self.status = safe_inline(&warning);
+        }
+    }
+
+    fn browse_human_history(&mut self, newer: bool) {
+        if self.human_history.is_empty() {
+            return;
+        }
+        let count = self.human_history.len();
+        let mut browse = match self.current_mut().history_browse.take() {
+            Some(browse) => browse,
+            None if newer => return,
+            None => HistoryBrowse {
+                saved_draft: self.current().draft.clone(),
+                saved_cursor: self.current().draft_cursor,
+                index: count,
+            },
+        };
+        browse.index = if newer {
+            browse.index.saturating_add(1)
+        } else {
+            browse.index.saturating_sub(1)
+        };
+        if browse.index >= count {
+            let view = self.current_mut();
+            view.draft = browse.saved_draft;
+            view.draft_cursor = browse.saved_cursor;
+        } else {
+            let draft = self.human_history[browse.index].chars().collect();
+            let view = self.current_mut();
+            view.draft = draft;
+            view.draft_cursor = view.draft.len();
+            view.history_browse = Some(browse);
+        }
+    }
+
+    fn history_suggestion(&self) -> Option<&str> {
+        let view = self.current();
+        if self.focus != PaneFocus::Input
+            || view.mode != InputMode::Line
+            || view.draft.is_empty()
+            || view.draft_cursor != view.draft.len()
+            || view.completion.is_some()
+            || view.history_search.is_some()
+        {
+            return None;
+        }
+        let prefix = view.draft.iter().collect::<String>();
+        self.human_history
+            .iter()
+            .rev()
+            .find(|entry| entry.len() > prefix.len() && entry.starts_with(&prefix))
+            .map(String::as_str)
+    }
+
+    fn accept_history_suggestion(&mut self) -> bool {
+        let Some(suggestion) = self.history_suggestion().map(str::to_owned) else {
+            return false;
+        };
+        let view = self.current_mut();
+        view.draft = suggestion.chars().collect();
         view.draft_cursor = view.draft.len();
+        true
     }
 
     fn scroll_up(&mut self, amount: usize) {
         self.cancel_pending_evidence_jump_for_manual_scroll();
+        if self.archived_view.as_ref().is_some_and(|view| {
+            view.port == self.selected_port() && self.current().scroll_snapshot.is_some()
+        }) {
+            let height = self
+                .layout
+                .map_or(0, |layout| layout.output_inner.height as usize);
+            let max = self
+                .current()
+                .scroll_snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.rows.len().saturating_sub(height));
+            if self.current().scroll_from_bottom >= max {
+                self.extend_archived_context(-1);
+                return;
+            }
+        }
         if self.current().scroll_snapshot.is_none() {
             let Some(layout) = self.layout else {
                 // Before the first draw there is no trustworthy visual width.
@@ -8633,6 +10197,19 @@ impl App {
 
     fn scroll_down(&mut self, amount: usize) {
         self.cancel_pending_evidence_jump_for_manual_scroll();
+        if self.current().scroll_from_bottom <= amount
+            && self.archived_view.as_ref().is_some_and(|view| {
+                view.port == self.selected_port()
+                    && self.current().scroll_snapshot.is_some()
+                    && view
+                        .lines
+                        .last()
+                        .is_some_and(|line| line.row_id + 1 < view.handle.progress().total_rows)
+            })
+        {
+            self.extend_archived_context(1);
+            return;
+        }
         let view = self.current_mut();
         view.scroll_from_bottom = view.scroll_from_bottom.saturating_sub(amount);
         if view.scroll_from_bottom == 0 {
@@ -8654,6 +10231,58 @@ struct MenuIo {
 
 struct MonitorIo {
     events: mpsc::Receiver<MonitorIoEvent>,
+}
+
+struct HumanHistoryIo {
+    commands: mpsc::Sender<()>,
+    events: mpsc::Receiver<HumanHistoryEvent>,
+}
+
+struct HumanHistoryEvent {
+    local_generation: u64,
+    history: serial_protocol::HumanCommandHistoryResponse,
+}
+
+fn spawn_human_history_io(
+    api: ApiClient,
+    confirmation_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> HumanHistoryIo {
+    let (commands, mut refresh) = mpsc::channel(1);
+    let (event_tx, events) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut version = None;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {},
+                command = refresh.recv() => { if command.is_none() { break; } },
+                _ = event_tx.closed() => break,
+            }
+            let local_generation =
+                confirmation_generation.load(std::sync::atomic::Ordering::Acquire);
+            match api.human_command_history().await {
+                Ok(history) => {
+                    let next = (history.server_id, history.revision, local_generation);
+                    if version != Some(next) {
+                        if event_tx
+                            .send(HumanHistoryEvent {
+                                local_generation,
+                                history,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        version = Some(next);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "cannot refresh Human command history"),
+            }
+        }
+    });
+    HumanHistoryIo { commands, events }
 }
 
 enum MonitorIoEvent {
@@ -9919,6 +11548,7 @@ pub async fn run(
         .map(StartupHistoryTarget::from)
         .collect::<Vec<_>>();
     let mut app = App::new(status.ports, initial_port.as_deref());
+    app.enable_session_archives();
     app.human_idle_release = Duration::from_secs(
         loaded
             .config
@@ -9945,6 +11575,13 @@ pub async fn run(
     let mut exact_evidence_io = spawn_exact_evidence_io(api.clone());
     app.exact_evidence_commands = Some(exact_evidence_io.commands.clone());
     let mut monitor_io = spawn_monitor_io(api.clone());
+    let mut human_history_io =
+        spawn_human_history_io(api.clone(), app.human_history_generation.clone());
+    app.human_history_commands = Some(human_history_io.commands.clone());
+    let mut macro_io = macro_ui::spawn(api.clone());
+    app.macro_commands = Some(macro_io.commands.clone());
+    let (session_commands, mut session_events) = spawn_session_search_io();
+    app.session_search_commands = Some(session_commands);
     let mut network = ws::spawn(endpoint, ports, initial_cursors);
 
     let mut terminal = enter_terminal(app.mouse_capture)?;
@@ -9961,6 +11598,9 @@ pub async fn run(
             output_search: &mut output_search_io.events,
             exact_evidence: &mut exact_evidence_io.events,
             monitor: &mut monitor_io.events,
+            human_history: &mut human_history_io.events,
+            macros: &mut macro_io.events,
+            session_search: &mut session_events,
         },
     )
     .await;
@@ -9983,6 +11623,9 @@ struct RunLoopEvents<'a> {
     output_search: &'a mut mpsc::Receiver<OutputSearchIoEvent>,
     exact_evidence: &'a mut mpsc::Receiver<ExactEvidenceIoEvent>,
     monitor: &'a mut mpsc::Receiver<MonitorIoEvent>,
+    human_history: &'a mut mpsc::Receiver<HumanHistoryEvent>,
+    macros: &'a mut mpsc::Receiver<macro_ui::IoEvent>,
+    session_search: &'a mut mpsc::Receiver<SessionSearchEvent>,
 }
 
 async fn run_loop(
@@ -9995,6 +11638,9 @@ async fn run_loop(
     let mut network_events_open = true;
     let mut output_search_events_open = true;
     let mut exact_evidence_events_open = true;
+    let mut human_history_events_open = true;
+    let mut macro_events_open = true;
+    let mut session_search_events_open = true;
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renew_tick = tokio::time::interval(Duration::from_secs(10));
@@ -10056,8 +11702,28 @@ async fn run_loop(
                     app.handle_monitor_io_event(event);
                 }
             },
+            event = io_events.human_history.recv(), if human_history_events_open => {
+                if let Some(event) = event {
+                    app.handle_human_history_event(event);
+                } else { human_history_events_open = false; }
+            },
+            event = io_events.macros.recv(), if macro_events_open => {
+                if let Some(event) = event {
+                    let current = app.macro_io_contexts.pop_front() == Some(app.macro_panel_id);
+                    if current && let Some(panel) = app.macro_panel.as_mut() {
+                        let action = panel.event(event);
+                        app.handle_macro_action(action, commands);
+                        app.dirty = true;
+                    }
+                } else { macro_events_open = false; }
+            },
+            event = io_events.session_search.recv(), if session_search_events_open => {
+                if let Some(event) = event { app.handle_session_search_event(event); }
+                else { session_search_events_open = false; }
+            },
             _ = renew_tick.tick() => app.maintain_controls(commands),
             _ = activity_tick.tick() => {
+                app.poll_human_macros(commands);
                 let now = Instant::now();
                 let selection_changed = app.expire_mouse_selection(now);
                 let status_notice_changed = app.expire_status_notice(now);
@@ -10306,6 +11972,10 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let output_area = chunks[1];
     let run_history_area = show_run_history_bar.then_some(chunks[3]);
     let input_area = chunks[6];
+    let archive_resize = app
+        .layout
+        .is_some_and(|old| old.output_inner.width != inset_border(output_area).width)
+        && app.current().scroll_snapshot.is_some();
     app.layout = Some(ConsoleLayout {
         output_area,
         output_inner: inset_border(output_area),
@@ -10313,6 +11983,22 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         run_history_area,
         run_history_inner: run_history_area,
     });
+    if archive_resize
+        && let Some((lines, hit)) = app
+            .archived_view
+            .as_ref()
+            .filter(|view| view.port == app.selected_port())
+            .map(|view| (view.lines.clone(), view.hit.clone()))
+    {
+        app.show_archived_context(
+            &lines,
+            &hit,
+            0,
+            app.output_search
+                .as_ref()
+                .is_some_and(|search| search.disk.is_some()),
+        );
+    }
     app.clamp_run_detail_scroll();
 
     draw_tabs(frame, app, chunks[0]);
@@ -10355,6 +12041,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if let Some(menu) = app.menu.as_ref() {
         draw_menu(frame, app, menu, area);
+    }
+    if let Some(panel) = app.macro_panel.as_ref() {
+        panel.draw(frame, app.software_cursor_visible);
     }
     if let Some(search) = app.output_search.as_ref() {
         draw_output_search(
@@ -10450,6 +12139,26 @@ fn output_search_scope_label(scope: OutputSearchScope) -> &'static str {
 }
 
 fn output_search_filters(search: &OutputSearchState) -> String {
+    if search.session_mode {
+        let scope = if search.scope == OutputSearchScope::Retained {
+            "本次会话 · 所有串口"
+        } else {
+            "本次会话 · 当前串口"
+        };
+        let session_literal = search.matcher == OutputSearchMatcher::Literal
+            && search.scope != OutputSearchScope::CurrentRun
+            && search.direction != OutputSearchDirection::Tx;
+        return format!(
+            "{} · {} · {}",
+            output_search_case_label(search.case_sensitive),
+            if search.disk.is_some() || search.query.is_empty() && session_literal {
+                scope
+            } else {
+                "仅内存范围（正则/Run/TX）"
+            },
+            "Alt-S 切换范围"
+        );
+    }
     trf(
         "ui.output.search.filters",
         &[
@@ -10649,12 +12358,16 @@ fn draw_output_search(
 fn output_search_quick_counter(search: &OutputSearchState) -> String {
     let total = local_output_search_total(search);
     let position = if total == 0 { 0 } else { search.selected + 1 };
-    let total = if search.partial && !search.query.is_empty() {
+    let scanning = search.disk.as_ref().is_some_and(|disk| !disk.complete);
+    let total = if (search.partial || scanning) && !search.query.is_empty() {
         format!("{total}+")
     } else {
         total.to_string()
     };
-    format!(" {position}/{total} ")
+    format!(
+        " {position}/{total}{} ",
+        if scanning { " 扫描中" } else { "" }
+    )
 }
 
 fn session_state_label(state: SessionState) -> &'static str {
@@ -10709,7 +12422,17 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let title = output_title(app);
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let configured = app.current().snapshot.config.model_name.is_some();
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        title,
+        Style::default()
+            .fg(if configured {
+                Color::LightCyan
+            } else {
+                Color::DarkGray
+            })
+            .add_modifier(Modifier::BOLD),
+    ));
     let inner = block.inner(area);
     let mut visual_lines = app.selection.as_ref().map_or_else(
         || visible_output_lines(app, inner),
@@ -10727,7 +12450,20 @@ fn draw_output(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn output_title(app: &App) -> String {
-    format!(" {} ", safe_inline(&app.current_model_name()))
+    let warning = app
+        .current()
+        .session_archive
+        .as_ref()
+        .is_some_and(|archive| !archive.gaps().is_empty());
+    format!(
+        " {}{} ",
+        safe_inline(&app.current_model_name()),
+        if warning {
+            " · 历史存档有缺口"
+        } else {
+            ""
+        }
+    )
 }
 
 fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
@@ -11144,6 +12880,37 @@ const COMMAND_FALLBACK_BACKGROUND: Color = Color::LightCyan;
 const OUTPUT_SEARCH_MATCH_BACKGROUND: Color = Color::Rgb(62, 54, 18);
 const OUTPUT_SEARCH_CURRENT_BACKGROUND: Color = Color::Rgb(120, 86, 8);
 
+fn highlight_search_range(line: Line<'static>, start: usize, end: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for span in line.spans {
+        let length = span.content.len();
+        let from = start.saturating_sub(offset).min(length);
+        let through = end.saturating_sub(offset).min(length);
+        if from < through
+            && span.content.is_char_boundary(from)
+            && span.content.is_char_boundary(through)
+        {
+            if from > 0 {
+                spans.push(Span::styled(span.content[..from].to_owned(), span.style));
+            }
+            spans.push(Span::styled(
+                span.content[from..through].to_owned(),
+                span.style
+                    .bg(OUTPUT_SEARCH_CURRENT_BACKGROUND)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if through < length {
+                spans.push(Span::styled(span.content[through..].to_owned(), span.style));
+            }
+        } else {
+            spans.push(span);
+        }
+        offset += length;
+    }
+    Line::from(spans).style(line.style)
+}
+
 fn command_capture_line(mut line: Line<'static>) -> Line<'static> {
     let background = COMMAND_CAPTURE_BACKGROUND;
     line.style = line.style.patch(Style::default().bg(background));
@@ -11265,7 +13032,7 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
                     entry.daemon_epoch == Some(epoch) && entry.event_kind == EventKind::Rx
                 })
         });
-        let line = timeline_line(
+        let mut line = timeline_line(
             entry,
             app.detailed_timeline,
             source_width,
@@ -11273,6 +13040,27 @@ fn render_output_entries(app: &App, entries: &[&DisplayLine], width: u16) -> Vec
             uboot_prompt,
             width as usize,
         );
+        if app.current_mode() == InputMode::Raw
+            && app.focus == PaneFocus::Input
+            && view.scroll_snapshot.is_none()
+            && view.scroll_from_bottom == 0
+            && app.output_search.is_none()
+            && app.menu.is_none()
+            && !app.help
+            && view
+                .pending_line
+                .as_ref()
+                .is_some_and(|pending| std::ptr::eq(pending, *entry))
+        {
+            let prefix = 2 + if app.detailed_timeline {
+                10 + source_width + 1
+            } else {
+                0
+            };
+            let cursor =
+                (prefix + view.stream.cursor_display_column()).min(u16::MAX as usize) as u16;
+            line = styled_line_with_software_cursor(line, cursor, app.software_cursor_visible);
+        }
         let mut visual_lines = if highlighted {
             wrap_command_capture_line(line, width)
         } else {
@@ -12374,7 +14162,8 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(search) = &app.current().history_search {
         let matched = search
             .match_index
-            .map(|index| safe_inline(&app.current().history[index]))
+            .and_then(|index| app.human_history.get(index))
+            .map(|value| safe_inline(value))
             .unwrap_or_default();
         let text = trf("ui.search.query", &[&search.query, &matched]);
         frame.render_widget(
@@ -12419,11 +14208,17 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     app.current().draft_cursor,
                     inner.width,
                 );
-                (
-                    Line::from(text),
-                    Some(cursor_column),
-                    input_title(app, InputMode::Line),
-                )
+                let mut line = Line::from(text);
+                if let Some(suggestion) = app.history_suggestion() {
+                    let prefix_bytes = app.current().draft.iter().collect::<String>().len();
+                    let remaining = inner.width.saturating_sub(cursor_column) as usize;
+                    let suffix = suggestion[prefix_bytes..].to_owned();
+                    line.spans.push(Span::styled(
+                        clip_display(&suffix, remaining),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                (line, Some(cursor_column), input_title(app, InputMode::Line))
             }
         }
         InputMode::Raw => {
@@ -12447,11 +14242,41 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let text = match (app.focus == PaneFocus::Input, cursor_column) {
         (true, Some(cursor)) => {
-            line_with_software_cursor(line_plain_text(&text), cursor, app.software_cursor_visible)
+            styled_line_with_software_cursor(text, cursor, app.software_cursor_visible)
         }
         _ => text,
     };
     frame.render_widget(Paragraph::new(text).block(block.title(title)), area);
+    if app.focus == PaneFocus::Input
+        && let Some(completion) = &app.current().completion
+    {
+        let height = (completion.candidates.len().min(6) + 2) as u16;
+        let height = height.min(area.y.saturating_sub(frame.area().y));
+        if height >= 3 {
+            let popup = Rect::new(area.x, area.y - height, area.width, height);
+            let start = completion.current.saturating_sub(4);
+            let rows: Vec<Line<'static>> = completion
+                .candidates
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(height.saturating_sub(2) as usize)
+                .map(|(index, command)| {
+                    selected_menu_line(index, completion.current, safe_inline(command))
+                })
+                .collect();
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(rows).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Tab / ↑↓ · Enter: accept · Esc: cancel ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                popup,
+            );
+        }
+    }
 }
 
 fn input_title(app: &App, mode: InputMode) -> String {
@@ -12529,43 +14354,79 @@ fn truncate_display(value: &str, max_width: usize) -> String {
 /// Returns one non-wrapping LINE-mode input row and the cursor column inside
 /// the bordered input area's inner rectangle. The view follows the logical
 /// cursor horizontally and counts CJK characters by terminal display width.
+fn previous_grapheme(draft: &[char], cursor: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = draft.iter().take(cursor).collect();
+    text.graphemes(true)
+        .next_back()
+        .map_or(0, |last| cursor.saturating_sub(last.chars().count()))
+}
+
+fn next_grapheme(draft: &[char], cursor: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text: String = draft.iter().skip(cursor).collect();
+    cursor
+        + text
+            .graphemes(true)
+            .next()
+            .map_or(0, |first| first.chars().count())
+}
+
+fn previous_word(draft: &[char], mut cursor: usize) -> usize {
+    while cursor > 0 && draft[cursor - 1].is_whitespace() {
+        cursor = previous_grapheme(draft, cursor);
+    }
+    while cursor > 0 && !draft[cursor - 1].is_whitespace() {
+        cursor = previous_grapheme(draft, cursor);
+    }
+    cursor
+}
+
+fn next_word(draft: &[char], mut cursor: usize) -> usize {
+    while cursor < draft.len() && !draft[cursor].is_whitespace() {
+        cursor = next_grapheme(draft, cursor);
+    }
+    while cursor < draft.len() && draft[cursor].is_whitespace() {
+        cursor = next_grapheme(draft, cursor);
+    }
+    cursor
+}
+
 fn line_input_projection(draft: &[char], cursor: usize, inner_width: u16) -> (String, u16) {
+    use unicode_segmentation::UnicodeSegmentation;
     const PREFIX: &str = "> ";
     let prefix_width = UnicodeWidthStr::width(PREFIX) as u16;
     if inner_width <= prefix_width {
         return (PREFIX.chars().take(inner_width as usize).collect(), 0);
     }
-
-    let cursor = cursor.min(draft.len());
-    // Reserve one terminal cell for the visible cursor, including when it is
-    // positioned just after the last character.
-    let before_budget = inner_width.saturating_sub(prefix_width).saturating_sub(1) as usize;
-    let mut start = cursor;
-    let mut before_width = 0usize;
+    let text: String = draft.iter().collect();
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    let mut scalars = 0;
+    let cursor_index = graphemes
+        .iter()
+        .take_while(|grapheme| {
+            scalars += grapheme.chars().count();
+            scalars <= cursor.min(draft.len())
+        })
+        .count();
+    let budget = inner_width.saturating_sub(prefix_width).saturating_sub(1) as usize;
+    let mut start = cursor_index;
+    let mut before_width = 0;
     while start > 0 {
-        let width = unicode_width::UnicodeWidthChar::width(draft[start - 1]).unwrap_or(0);
-        if before_width.saturating_add(width) > before_budget {
+        let width = UnicodeWidthStr::width(graphemes[start - 1]);
+        if before_width + width > budget {
             break;
         }
-        start -= 1;
         before_width += width;
+        start -= 1;
     }
-
-    let content_budget = inner_width.saturating_sub(prefix_width) as usize;
-    let mut visible = String::new();
-    let mut visible_width = 0usize;
-    for &character in &draft[start..] {
-        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-        if visible_width.saturating_add(width) > content_budget {
-            break;
-        }
-        visible.push(character);
-        visible_width += width;
-    }
-
+    let suffix = graphemes[start..].concat();
     (
-        format!("{PREFIX}{}", safe_inline(&visible)),
-        prefix_width.saturating_add(before_width as u16),
+        format!(
+            "{PREFIX}{}",
+            clip_display(&suffix, inner_width.saturating_sub(prefix_width) as usize)
+        ),
+        prefix_width + before_width as u16,
     )
 }
 
@@ -12578,32 +14439,58 @@ fn line_with_software_cursor(
     cursor_column: u16,
     cursor_visible: bool,
 ) -> Line<'static> {
-    let mut before = String::new();
-    let mut after = String::new();
-    let mut cursor = None;
+    styled_line_with_software_cursor(Line::from(text), cursor_column, cursor_visible)
+}
+
+fn styled_line_with_software_cursor(
+    text: Line<'static>,
+    cursor_column: u16,
+    cursor_visible: bool,
+) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut spans = Vec::new();
+    let mut marked = false;
     let mut column = 0u16;
-    for character in text.chars() {
-        let width = UnicodeWidthChar::width(character).unwrap_or(0).max(1) as u16;
-        if cursor.is_none() && column == cursor_column {
-            cursor = Some(character.to_string());
-        } else if cursor.is_some() {
-            after.push(character);
-        } else {
-            before.push(character);
+    for span in text.spans {
+        for grapheme in span.content.graphemes(true) {
+            let width = UnicodeWidthStr::width(grapheme) as u16;
+            let mut style = span.style;
+            if !marked && column == cursor_column && width > 0 {
+                marked = true;
+                if cursor_visible {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+            }
+            spans.push(Span::styled(grapheme.to_owned(), style));
+            column = column.saturating_add(width);
         }
-        column = column.saturating_add(width);
     }
-    let cursor = cursor.unwrap_or_else(|| " ".into());
-    let cursor_style = if cursor_visible {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-    };
-    Line::from(vec![
-        Span::raw(before),
-        Span::styled(cursor, cursor_style),
-        Span::raw(after),
-    ])
+    if !marked {
+        if column < cursor_column {
+            spans.push(Span::raw(" ".repeat((cursor_column - column) as usize)));
+        }
+        spans.push(Span::styled(
+            " ",
+            if cursor_visible {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            },
+        ));
+    }
+    Line::from(spans).style(text.style)
+}
+
+fn clip_display(value: &str, budget: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut used = 0;
+    value
+        .graphemes(true)
+        .take_while(|item| {
+            used += UnicodeWidthStr::width(*item);
+            used <= budget
+        })
+        .collect()
 }
 
 fn draw_help_line(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -12692,6 +14579,7 @@ fn help_lines(_app: &App) -> Vec<Line<'static>> {
         help_shortcut("help.key.follow", "help.desc.follow"),
         help_shortcut("help.key.menu", "help.desc.menu"),
         help_shortcut("help.key.profile", "help.desc.profile"),
+        help_shortcut("help.key.macros", "help.desc.macros"),
         help_shortcut("help.key.search.output", "help.desc.search.output"),
         Line::default(),
         help_heading("help.group.line"),
@@ -13167,341 +15055,312 @@ fn echo_index(value: Option<EchoMode>) -> usize {
 }
 
 fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
-    let mut rows =
-        match menu.page {
-            MenuPage::Root => [
-                tr("menu.root.profile"),
-                tr("menu.root.create"),
-                tr("menu.root.settings"),
-                tr("menu.root.help"),
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
-            .collect(),
-            MenuPage::Profiles => {
-                let Some(editor) = menu.profile_editor.as_ref() else {
-                    return vec![Line::from(tr("menu.loading"))];
-                };
-                let changed = editor.changed();
-                let values = [
-                    trf("menu.current.row.port", &[&safe_inline(&editor.port)]),
-                    trf(
-                        "menu.current.row.transport",
-                        &[&editor
-                            .transport_binding
-                            .as_deref()
-                            .map(safe_inline)
-                            .unwrap_or_else(|| tr("menu.value.unbound").into())],
-                    ),
-                    trf(
-                        "menu.current.row.baud",
-                        &[&editor.transport.baud_rate.to_string()],
-                    ),
-                    trf(
-                        "menu.current.row.data",
-                        &[data_bits_label(editor.transport.data_bits)],
-                    ),
-                    trf(
-                        "menu.current.row.parity",
-                        &[parity_label(editor.transport.parity)],
-                    ),
-                    trf(
-                        "menu.current.row.stop",
-                        &[stop_bits_label(editor.transport.stop_bits)],
-                    ),
-                    trf(
-                        "menu.current.row.flow",
-                        &[flow_control_label(editor.transport.flow_control)],
-                    ),
-                    trf("menu.current.row.dtr", &[on_off(editor.transport.dtr)]),
-                    trf("menu.current.row.rts", &[on_off(editor.transport.rts)]),
-                    trf(
-                        "menu.current.row.auto",
-                        &[enabled_disabled(editor.transport.auto_open)],
-                    ),
-                    trf(
-                        "menu.current.row.device",
-                        &[&editor
-                            .model_profile_binding
-                            .as_deref()
-                            .map(safe_inline)
-                            .unwrap_or_else(|| tr("menu.value.unbound").into())],
-                    ),
-                    trf(
-                        "menu.current.row.model.name",
-                        &[&editor
-                            .model_family
-                            .as_deref()
-                            .zip(editor.model_name.as_deref())
-                            .map(|(family, name)| {
-                                trf(
-                                    "menu.value.model.identity",
-                                    &[&safe_inline(family), &safe_inline(name)],
-                                )
-                            })
-                            .unwrap_or_else(|| tr("menu.value.unbound").into())],
-                    ),
-                    trf(
-                        "menu.current.row.eol",
-                        &[&eol_label(editor.device.write_eol.as_deref())],
-                    ),
-                    trf("menu.current.row.echo", &[echo_label(editor.device.echo)]),
-                    trf(
-                        "menu.current.row.shell",
-                        &[&optional_profile_value(
-                            editor.device.shell_prompt.as_deref(),
-                        )],
-                    ),
-                    trf(
-                        "menu.current.row.uboot",
-                        &[&optional_profile_value(
-                            editor.device.uboot_prompt.as_deref(),
-                        )],
-                    ),
-                    trf(
-                        "menu.current.row.chunk",
-                        &[&optional_number(editor.device.write_chunk_size)],
-                    ),
-                    trf(
-                        "menu.current.row.delay",
-                        &[&optional_number(editor.device.write_chunk_delay_ms)],
-                    ),
-                    if changed {
-                        tr("menu.current.row.apply.changed").into()
-                    } else {
-                        tr("menu.current.row.apply.clean").into()
-                    },
-                ];
-                let mut rows = Vec::with_capacity(values.len() + 4);
-                rows.push(menu_section_heading("menu.current.section.serial"));
-                rows.extend(
-                    values[..10]
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, text)| indented_menu_line(index, menu.selected, text)),
-                );
-                rows.push(menu_section_heading("menu.current.section.model"));
-                rows.extend(
-                    values[10..18]
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(offset, text)| {
-                            let index = offset + 10;
-                            indented_menu_line(index, menu.selected, text)
-                        }),
-                );
-                rows.push(Line::default());
-                rows.push(menu_section_heading("menu.current.section.actions"));
-                rows.push(indented_menu_line(18, menu.selected, values[18].clone()));
-                rows
-            }
-            MenuPage::CreateProfiles => [
-                tr("menu.create.transport"),
-                tr("menu.create.model"),
-                tr("menu.create.model.names"),
-                tr("menu.delete.transport"),
-                tr("menu.delete.device"),
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
-            .collect(),
-            MenuPage::CreateTransportProfile => {
-                let Some(profile) = menu.create_transport.as_ref() else {
-                    return vec![Line::from(tr("menu.loading"))];
-                };
-                let values = [
-                    trf("menu.create.row.name", &[&safe_inline(&profile.name)]),
-                    trf("menu.current.row.baud", &[&profile.baud_rate.to_string()]),
-                    trf(
-                        "menu.current.row.data",
-                        &[data_bits_label(profile.data_bits)],
-                    ),
-                    trf("menu.current.row.parity", &[parity_label(profile.parity)]),
-                    trf(
-                        "menu.current.row.stop",
-                        &[stop_bits_label(profile.stop_bits)],
-                    ),
-                    trf(
-                        "menu.current.row.flow",
-                        &[flow_control_label(profile.flow_control)],
-                    ),
-                    trf("menu.current.row.dtr", &[on_off(profile.dtr)]),
-                    trf("menu.current.row.rts", &[on_off(profile.rts)]),
-                    trf(
-                        "menu.current.row.auto",
-                        &[enabled_disabled(profile.auto_open)],
-                    ),
-                    tr("menu.create.row.save").into(),
-                ];
-                values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, text)| selected_menu_line(index, menu.selected, text))
-                    .collect()
-            }
-            MenuPage::CreateModelProfile => {
-                let Some(profile) = menu.create_model.as_ref() else {
-                    return vec![Line::from(tr("menu.loading"))];
-                };
-                let values = [
-                    trf("menu.create.row.name", &[&safe_inline(&profile.name)]),
-                    trf(
-                        "menu.current.row.eol",
-                        &[&eol_label(profile.write_eol.as_deref())],
-                    ),
-                    trf("menu.current.row.echo", &[echo_label(profile.echo)]),
-                    trf(
-                        "menu.current.row.shell",
-                        &[&optional_profile_value(profile.shell_prompt.as_deref())],
-                    ),
-                    trf(
-                        "menu.current.row.uboot",
-                        &[&optional_profile_value(profile.uboot_prompt.as_deref())],
-                    ),
-                    trf(
-                        "menu.current.row.chunk",
-                        &[&optional_number(profile.write_chunk_size)],
-                    ),
-                    trf(
-                        "menu.current.row.delay",
-                        &[&optional_number(profile.write_chunk_delay_ms)],
-                    ),
-                    tr("menu.create.row.save").into(),
-                ];
-                values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, text)| selected_menu_line(index, menu.selected, text))
-                    .collect()
-            }
-            MenuPage::DeleteTransportProfiles => menu
-                .catalog
-                .as_ref()
-                .map(|catalog| {
-                    catalog
-                        .transport_profiles
-                        .iter()
-                        .enumerate()
-                        .map(|(index, profile)| {
-                            selected_menu_line(index, menu.selected, safe_inline(&profile.name))
+    let mut rows = match menu.page {
+        MenuPage::Root => [
+            tr("menu.root.profile"),
+            tr("menu.root.create"),
+            tr("menu.root.settings"),
+            tr("menu.root.help"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
+        .collect(),
+        MenuPage::Profiles => {
+            let Some(editor) = menu.profile_editor.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let changed = editor.changed();
+            let values = [
+                trf("menu.current.row.port", &[&safe_inline(&editor.port)]),
+                trf(
+                    "menu.current.row.transport",
+                    &[&editor
+                        .transport_binding
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
+                ),
+                trf(
+                    "menu.current.row.baud",
+                    &[&editor.transport.baud_rate.to_string()],
+                ),
+                trf(
+                    "menu.current.row.data",
+                    &[data_bits_label(editor.transport.data_bits)],
+                ),
+                trf(
+                    "menu.current.row.parity",
+                    &[parity_label(editor.transport.parity)],
+                ),
+                trf(
+                    "menu.current.row.stop",
+                    &[stop_bits_label(editor.transport.stop_bits)],
+                ),
+                trf(
+                    "menu.current.row.flow",
+                    &[flow_control_label(editor.transport.flow_control)],
+                ),
+                trf("menu.current.row.dtr", &[on_off(editor.transport.dtr)]),
+                trf("menu.current.row.rts", &[on_off(editor.transport.rts)]),
+                trf(
+                    "menu.current.row.auto",
+                    &[enabled_disabled(editor.transport.auto_open)],
+                ),
+                trf(
+                    "menu.current.row.device",
+                    &[&editor
+                        .model_profile_binding
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
+                ),
+                trf(
+                    "menu.current.row.model.name",
+                    &[&editor
+                        .model_family
+                        .as_deref()
+                        .zip(editor.model_name.as_deref())
+                        .map(|(family, name)| {
+                            trf(
+                                "menu.value.model.identity",
+                                &[&safe_inline(family), &safe_inline(name)],
+                            )
                         })
-                        .collect()
-                })
-                .filter(|rows: &Vec<Line<'static>>| !rows.is_empty())
-                .unwrap_or_else(|| vec![Line::from(tr("menu.delete.transport.empty"))]),
-            MenuPage::DeleteModelProfiles => menu
-                .catalog
-                .as_ref()
-                .map(|catalog| {
-                    catalog
-                        .model_profiles
-                        .iter()
-                        .enumerate()
-                        .map(|(index, profile)| {
-                            selected_menu_line(index, menu.selected, safe_inline(&profile.name))
-                        })
-                        .collect()
-                })
-                .filter(|rows: &Vec<Line<'static>>| !rows.is_empty())
-                .unwrap_or_else(|| vec![Line::from(tr("menu.delete.device.empty"))]),
-            MenuPage::ConfigureModelFamilies => {
-                let mut rows = vec![selected_menu_line(
-                    0,
-                    menu.selected,
-                    tr("menu.model.family.add").into(),
-                )];
-                if let Some(catalog) = menu.catalog.as_ref() {
-                    rows.extend(catalog.model_families.iter().enumerate().map(
-                        |(index, family)| {
-                            selected_menu_line(index + 1, menu.selected, safe_inline(&family.name))
-                        },
-                    ));
-                }
-                rows
-            }
-            MenuPage::ConfigureModelNames => {
-                let mut rows = vec![selected_menu_line(
-                    0,
-                    menu.selected,
-                    tr("menu.model.name.add").into(),
-                )];
-                if let Some(family) = menu.catalog.as_ref().and_then(|catalog| {
-                    let selected = menu.model_family.as_deref()?;
-                    catalog
-                        .model_families
-                        .iter()
-                        .find(|family| family.name == selected)
-                }) {
-                    rows.extend(family.model_names.iter().enumerate().map(|(index, name)| {
-                        selected_menu_line(index + 1, menu.selected, safe_inline(name))
-                    }));
-                }
-                rows
-            }
-            MenuPage::Settings => [tr("menu.root.display"), tr("menu.root.mcp")]
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())],
+                ),
+                trf(
+                    "menu.current.row.eol",
+                    &[&eol_label(editor.device.write_eol.as_deref())],
+                ),
+                trf("menu.current.row.echo", &[echo_label(editor.device.echo)]),
+                trf(
+                    "menu.current.row.shell",
+                    &[&optional_profile_value(
+                        editor.device.shell_prompt.as_deref(),
+                    )],
+                ),
+                trf(
+                    "menu.current.row.uboot",
+                    &[&optional_profile_value(
+                        editor.device.uboot_prompt.as_deref(),
+                    )],
+                ),
+                trf(
+                    "menu.current.row.chunk",
+                    &[&optional_number(editor.device.write_chunk_size)],
+                ),
+                trf(
+                    "menu.current.row.delay",
+                    &[&optional_number(editor.device.write_chunk_delay_ms)],
+                ),
+                if changed {
+                    tr("menu.current.row.apply.changed").into()
+                } else {
+                    tr("menu.current.row.apply.clean").into()
+                },
+            ];
+            let mut rows = Vec::with_capacity(values.len() + 4);
+            rows.push(menu_section_heading("menu.current.section.serial"));
+            rows.extend(
+                values[..10]
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, text)| indented_menu_line(index, menu.selected, text)),
+            );
+            rows.push(menu_section_heading("menu.current.section.model"));
+            rows.extend(
+                values[10..18]
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(offset, text)| {
+                        let index = offset + 10;
+                        indented_menu_line(index, menu.selected, text)
+                    }),
+            );
+            rows.push(Line::default());
+            rows.push(menu_section_heading("menu.current.section.actions"));
+            rows.push(indented_menu_line(18, menu.selected, values[18].clone()));
+            rows
+        }
+        MenuPage::CreateProfiles => [
+            tr("menu.create.transport"),
+            tr("menu.create.model"),
+            tr("menu.create.model.names"),
+            tr("menu.delete.transport"),
+            tr("menu.delete.device"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
+        .collect(),
+        MenuPage::CreateTransportProfile => {
+            let Some(profile) = menu.create_transport.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let values = [
+                trf("menu.create.row.name", &[&safe_inline(&profile.name)]),
+                trf("menu.current.row.baud", &[&profile.baud_rate.to_string()]),
+                trf(
+                    "menu.current.row.data",
+                    &[data_bits_label(profile.data_bits)],
+                ),
+                trf("menu.current.row.parity", &[parity_label(profile.parity)]),
+                trf(
+                    "menu.current.row.stop",
+                    &[stop_bits_label(profile.stop_bits)],
+                ),
+                trf(
+                    "menu.current.row.flow",
+                    &[flow_control_label(profile.flow_control)],
+                ),
+                trf("menu.current.row.dtr", &[on_off(profile.dtr)]),
+                trf("menu.current.row.rts", &[on_off(profile.rts)]),
+                trf(
+                    "menu.current.row.auto",
+                    &[enabled_disabled(profile.auto_open)],
+                ),
+                tr("menu.create.row.save").into(),
+            ];
+            values
                 .into_iter()
                 .enumerate()
-                .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
-                .collect(),
-            MenuPage::ModelFamilies => {
-                let mut rows = vec![selected_menu_line(
-                    0,
-                    menu.selected,
-                    tr("menu.value.unbound").into(),
-                )];
-                if let Some(catalog) = menu.catalog.as_ref() {
-                    rows.extend(catalog.model_families.iter().enumerate().map(
-                        |(index, family)| {
-                            selected_menu_line(index + 1, menu.selected, safe_inline(&family.name))
-                        },
-                    ));
-                }
-                rows
+                .map(|(index, text)| selected_menu_line(index, menu.selected, text))
+                .collect()
+        }
+        MenuPage::CreateModelProfile => {
+            let Some(profile) = menu.create_model.as_ref() else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            let values = [
+                trf("menu.create.row.name", &[&safe_inline(&profile.name)]),
+                trf(
+                    "menu.current.row.eol",
+                    &[&eol_label(profile.write_eol.as_deref())],
+                ),
+                trf("menu.current.row.echo", &[echo_label(profile.echo)]),
+                trf(
+                    "menu.current.row.shell",
+                    &[&optional_profile_value(profile.shell_prompt.as_deref())],
+                ),
+                trf(
+                    "menu.current.row.uboot",
+                    &[&optional_profile_value(profile.uboot_prompt.as_deref())],
+                ),
+                trf(
+                    "menu.current.row.chunk",
+                    &[&optional_number(profile.write_chunk_size)],
+                ),
+                trf(
+                    "menu.current.row.delay",
+                    &[&optional_number(profile.write_chunk_delay_ms)],
+                ),
+                tr("menu.create.row.save").into(),
+            ];
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| selected_menu_line(index, menu.selected, text))
+                .collect()
+        }
+        MenuPage::DeleteTransportProfiles => menu
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .transport_profiles
+                    .iter()
+                    .enumerate()
+                    .map(|(index, profile)| {
+                        selected_menu_line(index, menu.selected, safe_inline(&profile.name))
+                    })
+                    .collect()
+            })
+            .filter(|rows: &Vec<Line<'static>>| !rows.is_empty())
+            .unwrap_or_else(|| vec![Line::from(tr("menu.delete.transport.empty"))]),
+        MenuPage::DeleteModelProfiles => menu
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .model_profiles
+                    .iter()
+                    .enumerate()
+                    .map(|(index, profile)| {
+                        selected_menu_line(index, menu.selected, safe_inline(&profile.name))
+                    })
+                    .collect()
+            })
+            .filter(|rows: &Vec<Line<'static>>| !rows.is_empty())
+            .unwrap_or_else(|| vec![Line::from(tr("menu.delete.device.empty"))]),
+        MenuPage::ConfigureModelFamilies => model_tree_lines(menu),
+        MenuPage::ConfigureModelNames => {
+            let mut rows = vec![selected_menu_line(
+                0,
+                menu.selected,
+                tr("menu.model.name.add").into(),
+            )];
+            if let Some(family) = menu.catalog.as_ref().and_then(|catalog| {
+                let selected = menu.model_family.as_deref()?;
+                catalog
+                    .model_families
+                    .iter()
+                    .find(|family| family.name == selected)
+            }) {
+                rows.extend(family.model_names.iter().enumerate().map(|(index, name)| {
+                    selected_menu_line(index + 1, menu.selected, safe_inline(name))
+                }));
             }
-            MenuPage::ModelNames => menu
-                .catalog
-                .as_ref()
-                .and_then(|catalog| {
-                    let family = menu.model_family.as_deref()?;
-                    catalog
-                        .model_families
-                        .iter()
-                        .find(|candidate| candidate.name == family)
-                })
-                .map(|family| {
-                    family
-                        .model_names
-                        .iter()
-                        .enumerate()
-                        .map(|(index, name)| {
-                            selected_menu_line(index, menu.selected, safe_inline(name))
-                        })
-                        .collect()
-                })
-                .filter(|rows: &Vec<Line<'static>>| !rows.is_empty())
-                .unwrap_or_else(|| vec![Line::from(tr("menu.model.names.empty"))]),
-            MenuPage::DisplaySettings => vec![selected_menu_line(
-                0,
-                menu.selected,
-                trf(
-                    "menu.display.history.rows",
-                    &[&app.agent_history_rows.to_string()],
-                ),
-            )],
-            MenuPage::McpSettings => vec![selected_menu_line(
-                0,
-                menu.selected,
-                trf(
-                    "menu.run.timeout.row",
-                    &[&orphan_run_timeout_label(app.orphan_run_timeout_seconds)],
-                ),
-            )],
-            MenuPage::Help => help_lines(app),
-        };
+            rows
+        }
+        MenuPage::Settings => [tr("menu.root.display"), tr("menu.root.mcp")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
+            .collect(),
+        MenuPage::ModelFamilies => model_tree_lines(menu),
+        MenuPage::ModelNames => menu
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                let family = menu.model_family.as_deref()?;
+                catalog
+                    .model_families
+                    .iter()
+                    .find(|candidate| candidate.name == family)
+            })
+            .map(|family| {
+                family
+                    .model_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        selected_menu_line(index, menu.selected, safe_inline(name))
+                    })
+                    .collect()
+            })
+            .filter(|rows: &Vec<Line<'static>>| !rows.is_empty())
+            .unwrap_or_else(|| vec![Line::from(tr("menu.model.names.empty"))]),
+        MenuPage::DisplaySettings => vec![selected_menu_line(
+            0,
+            menu.selected,
+            trf(
+                "menu.display.history.rows",
+                &[&app.agent_history_rows.to_string()],
+            ),
+        )],
+        MenuPage::McpSettings => vec![selected_menu_line(
+            0,
+            menu.selected,
+            trf(
+                "menu.run.timeout.row",
+                &[&orphan_run_timeout_label(app.orphan_run_timeout_seconds)],
+            ),
+        )],
+        MenuPage::Help => help_lines(app),
+    };
 
     if let Some(anchor) = menu_selected_visual_row_base(menu) {
         if let Some(choice) = menu.choice.as_ref() {
@@ -13823,6 +15682,9 @@ fn locate_output_search_anchor(
 }
 
 fn local_output_search_total(search: &OutputSearchState) -> usize {
+    if let Some(disk) = &search.disk {
+        return disk.total;
+    }
     search
         .local_index
         .as_ref()
@@ -13921,6 +15783,7 @@ mod tests {
     fn retained_output_line(epoch: Uuid, seq: u64, text: String) -> DisplayLine {
         let bytes = text.len();
         DisplayLine {
+            continues_previous: false,
             daemon_epoch: Some(epoch),
             seq,
             event_kind: EventKind::Rx,
@@ -13942,6 +15805,614 @@ mod tests {
             app.ports[0].buffered_bytes += line.bytes;
             app.ports[0].lines.push_back(line);
         }
+    }
+
+    #[test]
+    fn human_ctrl_d_is_one_raw_byte_during_agent_run_and_preserves_draft() {
+        for mode in [InputMode::Line, InputMode::Raw] {
+            let mut app = ready_app_with_control();
+            let run = agent_run("active agent");
+            app.ports[0].snapshot.control.as_mut().unwrap().owner = run.owner.clone();
+            app.ports[0].snapshot.active_run = Some(run);
+            app.ports[0].mode = mode;
+            app.ports[0].draft = "unsent draft".chars().collect();
+            app.ports[0].draft_cursor = 3;
+            app.focus = PaneFocus::RunHistory;
+            let (commands, mut received) = mpsc::channel(2);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &commands,
+            );
+            let NetworkCommand::Send {
+                message:
+                    ClientMessage::SendHumanCommand {
+                        data,
+                        input,
+                        operation_id,
+                        ..
+                    },
+                ..
+            } = received.try_recv().unwrap()
+            else {
+                panic!("Human signal")
+            };
+            assert_eq!(data, [0x04]);
+            assert!(input.is_none() && operation_id.is_none());
+            assert_eq!(
+                app.current().draft.iter().collect::<String>(),
+                "unsent draft"
+            );
+            assert_eq!(app.current().draft_cursor, 3);
+            assert_eq!(app.focus, PaneFocus::RunHistory);
+            assert!(app.human_history.is_empty() && app.pending_writes.is_empty());
+            assert!(!app.should_quit);
+            assert!(received.try_recv().is_err());
+            app.menu = Some(MenuState::new());
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &commands,
+            );
+            assert!(
+                received.try_recv().is_err(),
+                "modal keys must not leak to the port"
+            );
+        }
+    }
+
+    fn history_event(
+        server_id: Uuid,
+        local_generation: u64,
+        revision: u64,
+        entries: &[(&str, u64)],
+    ) -> HumanHistoryEvent {
+        HumanHistoryEvent {
+            local_generation,
+            history: serial_protocol::HumanCommandHistoryResponse {
+                server_id,
+                revision,
+                entries: entries
+                    .iter()
+                    .map(
+                        |(command, entry_revision)| serial_protocol::HumanCommandHistoryEntry {
+                            id: Uuid::new_v4(),
+                            command: (*command).into(),
+                            port: "COM3".into(),
+                            wall_time_ns: 0,
+                            revision: *entry_revision,
+                            uses: 1,
+                        },
+                    )
+                    .collect(),
+                next_before_revision: None,
+                warning: None,
+            },
+        }
+    }
+
+    #[test]
+    fn late_human_history_reply_cannot_erase_or_reorder_newly_confirmed_commands() {
+        let mut app = ready_app_with_control();
+        let server = Uuid::new_v4();
+        app.handle_human_history_event(history_event(server, 0, 10, &[("old", 10)]));
+        app.record_human_history("new".into());
+        assert_eq!(app.human_history, vec!["old", "new"]);
+        app.handle_human_history_event(history_event(
+            server,
+            0,
+            12,
+            &[("other-client", 12), ("old", 10)],
+        ));
+        assert_eq!(
+            app.human_history,
+            vec!["old", "new"],
+            "an HTTP request started before local confirmation is stale"
+        );
+        app.handle_human_history_event(history_event(server, 1, 10, &[("old", 10)]));
+        assert_eq!(
+            app.human_history,
+            vec!["old", "new"],
+            "confirmed writes survive a not-yet-persisted response"
+        );
+        app.handle_human_history_event(history_event(
+            server,
+            1,
+            12,
+            &[("other-client", 12), ("new", 11), ("old", 10)],
+        ));
+        assert_eq!(app.human_history, vec!["old", "new", "other-client"]);
+        assert!(app.human_history_confirmed.is_empty());
+        app.handle_human_history_event(history_event(server, 1, 9, &[("obsolete", 9)]));
+        assert_eq!(app.human_history.last().unwrap(), "other-client");
+    }
+
+    #[test]
+    fn human_history_suggestions_reach_the_full_ten_thousand_entry_snapshot() {
+        let mut app = ready_app_with_control();
+        let mut history = vec!["rare startup command".to_owned()];
+        history.extend(
+            (1..crate::api::HUMAN_HISTORY_MAX_ENTRIES).map(|index| format!("entry-{index}")),
+        );
+        app.set_platform_history(history);
+        assert_eq!(app.human_history.len(), 10_000);
+        app.current_mut().draft = "rare".chars().collect();
+        app.current_mut().draft_cursor = 4;
+        assert_eq!(app.history_suggestion(), Some("rare startup command"));
+    }
+
+    #[test]
+    fn macro_status_error_on_one_port_preserves_another_ports_pending_acquire_and_modal() {
+        let mut app = ready_app_with_control();
+        let (commands, _) = mpsc::channel(8);
+        let pending_b = Uuid::new_v4();
+        app.pending_macro_start = Some((pending_b, "COM4".into(), test_macro_spec()));
+        app.macro_panel = Some(macro_ui::Panel::new("COM4".into()));
+        let request_a = Uuid::new_v4();
+        app.macro_requests.insert(request_a, "COM3".into());
+        app.macro_operations.insert("COM3".into(), Uuid::new_v4());
+        app.handle_server_message(
+            ServerMessage::Error {
+                request_id: Some(request_a),
+                code: serial_protocol::ErrorCode::NotFound,
+                message: "COM3 execution no longer retained".into(),
+                retryable: false,
+            },
+            &commands,
+        );
+        assert_eq!(app.pending_macro_start.as_ref().unwrap().0, pending_b);
+        assert_eq!(app.pending_macro_start.as_ref().unwrap().1, "COM4");
+        assert!(app.macro_panel.as_ref().unwrap().busy);
+        assert!(!app.macro_panel.as_ref().unwrap().message.contains("COM3"));
+        app.handle_server_message(
+            ServerMessage::Error {
+                request_id: Some(pending_b),
+                code: serial_protocol::ErrorCode::NotFound,
+                message: "COM4 unavailable".into(),
+                retryable: false,
+            },
+            &commands,
+        );
+        assert!(app.pending_macro_start.is_none());
+        assert!(!app.macro_panel.as_ref().unwrap().busy);
+        assert!(app.macro_panel.as_ref().unwrap().message.contains("COM4"));
+    }
+
+    async fn settle_session_search(app: &mut App, events: &mut mpsc::Receiver<SessionSearchEvent>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                app.poll_session_search(Instant::now() + OUTPUT_SEARCH_REFRESH_INTERVAL);
+                while let Ok(event) = events.try_recv() {
+                    app.handle_session_search_event(event);
+                }
+                if app
+                    .output_search
+                    .as_ref()
+                    .and_then(|search| search.disk.as_ref())
+                    .is_some_and(|disk| {
+                        disk.complete
+                            && disk.pending.is_none()
+                            && (disk.total == 0 || disk.selected.is_some())
+                    })
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("full-session search must settle without blocking the UI");
+    }
+
+    #[tokio::test]
+    async fn session_search_finds_evicted_rows_highlights_one_occurrence_and_preserves_context_on_escape()
+     {
+        let mut app = ready_app_with_control();
+        app.enable_session_archives();
+        let (commands, mut events) = spawn_session_search_io();
+        app.session_search_commands = Some(commands);
+        let mut payload = String::from("context-before\nneedle / needle\ncontext-after\n");
+        for index in 0..25_000 {
+            payload.push_str(&format!("later-{index:05}\n"));
+        }
+        let mut rx = event(EventKind::Rx, Direction::Rx, 1, payload.as_bytes());
+        rx.daemon_epoch = app.current().snapshot.daemon_epoch;
+        app.ports[0].push_event(rx, true);
+        assert!(
+            !app.current()
+                .lines
+                .iter()
+                .any(|line| line.text.contains("needle"))
+        );
+        assert_eq!(app.current().lines.len(), MAX_LINES_PER_SLOT);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.open_output_search();
+        app.output_search.as_mut().unwrap().query = "needle".chars().collect();
+        assert!(app.start_session_search(true));
+        settle_session_search(&mut app, &mut events).await;
+        assert_eq!(
+            app.output_search
+                .as_ref()
+                .unwrap()
+                .disk
+                .as_ref()
+                .unwrap()
+                .total,
+            2
+        );
+        assert!(!app.output_search.as_ref().unwrap().partial);
+        let selected = app
+            .output_search
+            .as_ref()
+            .unwrap()
+            .disk
+            .as_ref()
+            .unwrap()
+            .selected
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(selected.ordinal, 1);
+        assert_eq!(selected.byte_start, 9);
+        let snapshot = app.current().scroll_snapshot.as_ref().unwrap();
+        let plain = snapshot
+            .rows
+            .iter()
+            .map(line_plain_text)
+            .collect::<String>();
+        assert!(plain.contains("context-before"));
+        assert!(plain.contains("context-after"));
+        let highlighted = snapshot
+            .rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .filter(|span| span.style.bg == Some(OUTPUT_SEARCH_CURRENT_BACKGROUND))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            highlighted, "needle",
+            "only the chosen occurrence is highlighted"
+        );
+        app.navigate_output_search(true);
+        settle_session_search(&mut app, &mut events).await;
+        assert_eq!(
+            app.output_search
+                .as_ref()
+                .unwrap()
+                .disk
+                .as_ref()
+                .unwrap()
+                .selected
+                .as_ref()
+                .unwrap()
+                .1
+                .byte_start,
+            0
+        );
+        let offset = app.current().scroll_from_bottom;
+        let before = app
+            .current()
+            .scroll_snapshot
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(line_plain_text)
+            .collect::<String>();
+        app.handle_output_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.current().scroll_from_bottom, offset);
+        let after = app.current().scroll_snapshot.as_ref().unwrap();
+        assert_eq!(
+            after.rows.iter().map(line_plain_text).collect::<String>(),
+            before
+        );
+        assert!(
+            after
+                .rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| span.style.bg != Some(OUTPUT_SEARCH_CURRENT_BACKGROUND))
+        );
+        assert!(app.output_search.is_none());
+        let old_last = app
+            .archived_view
+            .as_ref()
+            .unwrap()
+            .lines
+            .last()
+            .unwrap()
+            .row_id;
+        app.extend_archived_context(1);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_session_search_event(event);
+        assert!(
+            app.archived_view
+                .as_ref()
+                .unwrap()
+                .lines
+                .last()
+                .unwrap()
+                .row_id
+                > old_last,
+            "after closing find, the reader can still page beyond the first context window"
+        );
+        assert!(
+            app.current()
+                .scroll_snapshot
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| span.style.bg != Some(OUTPUT_SEARCH_CURRENT_BACKGROUND))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_search_does_not_report_missing_coverage_as_a_complete_no_match() {
+        let mut app = ready_app_with_control();
+        app.enable_session_archives();
+        app.current()
+            .session_archive
+            .as_ref()
+            .unwrap()
+            .record_gap("test disconnected loss");
+        app.open_output_search();
+        app.output_search.as_mut().unwrap().query = "absent".chars().collect();
+        assert!(app.start_session_search(false));
+        let (_, mut events) = mpsc::channel(1);
+        settle_session_search(&mut app, &mut events).await;
+        let search = app.output_search.as_ref().unwrap();
+        assert_eq!(search.disk.as_ref().unwrap().total, 0);
+        assert!(search.partial);
+        assert!(
+            search
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("test disconnected loss")
+        );
+    }
+
+    fn test_macro_spec() -> serial_protocol::MacroRunSpec {
+        serial_protocol::MacroRunSpec {
+            macro_id: Some("reviewed".into()),
+            revision: Some(7),
+            script: None,
+            description: None,
+            args: BTreeMap::new(),
+            timeout_seconds: 30,
+        }
+    }
+
+    fn test_macro_execution(
+        app: &App,
+        id: Uuid,
+        status: serial_protocol::MacroStatus,
+    ) -> serial_protocol::MacroExecutionInfo {
+        serial_protocol::MacroExecutionInfo {
+            id,
+            port: app.selected_port(),
+            daemon_epoch: app.current().snapshot.daemon_epoch,
+            generation: app.current().snapshot.generation,
+            owner: app.actor.clone().unwrap(),
+            run_id: None,
+            macro_id: Some("reviewed".into()),
+            revision: Some(7),
+            description: "test reviewed macro".into(),
+            status,
+            started_at_ns: 1,
+            completed_at_ns: status.is_terminal().then_some(2),
+            line: 1,
+            column: 1,
+            writes: 1,
+            bytes_written: 5,
+            first_seq: 1,
+            through_seq: 2,
+            message: None,
+            outcome_uncertain: false,
+        }
+    }
+
+    #[test]
+    fn macro_does_not_take_foreign_control_and_lost_start_response_is_only_queried() {
+        let mut foreign = ready_app_with_foreign_control();
+        let (commands, mut received) = mpsc::channel(8);
+        foreign.start_human_macro("COM3", test_macro_spec(), &commands);
+        assert!(received.try_recv().is_err());
+        let mut app = ready_app_with_control();
+        app.start_human_macro("COM3", test_macro_spec(), &commands);
+        let NetworkCommand::Send {
+            message:
+                ClientMessage::MacroStart {
+                    operation_id, spec, ..
+                },
+            ..
+        } = received.try_recv().unwrap()
+        else {
+            panic!("MacroStart");
+        };
+        assert_eq!(spec.revision, Some(7));
+        app.macro_requests.clear(); // lost response: reconnect must never resend Start
+        app.macro_start_requests.clear();
+        app.poll_human_macros(&commands);
+        let NetworkCommand::Send {
+            message: ClientMessage::MacroStatus { execution_id, .. },
+            ..
+        } = received.try_recv().unwrap()
+        else {
+            panic!("only read-only MacroStatus");
+        };
+        assert_eq!(execution_id, operation_id);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn macro_releases_only_its_temporary_lease_and_terminal_state_never_regresses() {
+        for intervention in [false, true] {
+            let mut app = ready_app_with_control();
+            let port = app.selected_port();
+            let lease = app.current().snapshot.control.as_ref().unwrap();
+            app.macro_temporary_controls
+                .insert(port.clone(), (lease.id, lease.fence));
+            let (commands, mut received) = mpsc::channel(8);
+            let id = Uuid::new_v4();
+            app.macro_operations.insert(port.clone(), id);
+            if intervention {
+                app.request_human_bytes(&commands, vec![4], None, HumanCommandRecovery::None);
+                received.try_recv().unwrap();
+            }
+            let terminal = test_macro_execution(&app, id, serial_protocol::MacroStatus::Succeeded);
+            app.record_macro_execution(terminal, &commands);
+            if intervention {
+                assert!(received.try_recv().is_err());
+            } else {
+                assert!(matches!(
+                    received.try_recv().unwrap(),
+                    NetworkCommand::Send {
+                        message: ClientMessage::ReleaseControl { .. },
+                        ..
+                    }
+                ));
+            }
+            let late = test_macro_execution(&app, id, serial_protocol::MacroStatus::Running);
+            app.record_macro_execution(late, &commands);
+            assert_eq!(
+                app.macro_executions[&port].status,
+                serial_protocol::MacroStatus::Succeeded
+            );
+            assert!(!app.macro_operations.contains_key(&port));
+        }
+    }
+
+    #[test]
+    fn raw_arrows_forward_only_when_input_has_focus() {
+        let mut app = ready_app_with_control();
+        app.ports[0].mode = InputMode::Raw;
+        let (commands, mut received) = mpsc::channel(4);
+        for (key, bytes) in [
+            (KeyCode::Left, b"\x1b[D"),
+            (KeyCode::Right, b"\x1b[C"),
+            (KeyCode::Up, b"\x1b[A"),
+            (KeyCode::Down, b"\x1b[B"),
+        ] {
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &commands);
+            let NetworkCommand::Send {
+                message: ClientMessage::SendHumanCommand { data, input, .. },
+                ..
+            } = received.try_recv().unwrap()
+            else {
+                panic!("RAW key")
+            };
+            assert_eq!(data, bytes);
+            assert!(input.is_none());
+        }
+        app.focus = PaneFocus::RunHistory;
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &commands);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn ghost_recommendation_is_not_sent_until_explicitly_accepted() {
+        let mut app = ready_app_with_control();
+        app.set_platform_history(vec!["show version".into()]);
+        app.ports[0].draft = "show".chars().collect();
+        app.ports[0].draft_cursor = 4;
+        let (commands, mut received) = mpsc::channel(4);
+        assert_eq!(app.history_suggestion(), Some("show version"));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+        let NetworkCommand::Send {
+            message: ClientMessage::SendHumanCommand { data, input, .. },
+            ..
+        } = received.try_recv().unwrap()
+        else {
+            panic!("LINE command")
+        };
+        let mut expected = b"show".to_vec();
+        expected.extend_from_slice(app.current().effective_write_eol().as_bytes());
+        assert_eq!(data, expected);
+        assert_eq!(input.unwrap().command, "show");
+        app.ports[0].draft = "show".chars().collect();
+        app.ports[0].draft_cursor = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft_cursor, 2);
+        assert_eq!(app.current().draft.len(), 4);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft.len(), 4);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.current().draft.iter().collect::<String>(),
+            "show version"
+        );
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn platform_history_navigation_restores_each_ports_original_draft() {
+        let mut app = ready_app_with_control();
+        let mut other = app.current().snapshot.clone();
+        other.config.port = "COM4".into();
+        app.ports.push(SlotView::new(other));
+        app.set_platform_history(vec!["one".into(), "two".into()]);
+        let (commands, _) = mpsc::channel(1);
+        app.ports[0].draft = "first draft".chars().collect();
+        app.ports[0].draft_cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft.iter().collect::<String>(), "two");
+        app.selected = 1;
+        app.ports[1].draft = "second".chars().collect();
+        app.ports[1].draft_cursor = 2;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft.iter().collect::<String>(), "two");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft.iter().collect::<String>(), "second");
+        assert_eq!(app.current().draft_cursor, 2);
+        app.selected = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.current().draft.iter().collect::<String>(),
+            "first draft"
+        );
+        assert_eq!(app.current().draft_cursor, 3);
+    }
+
+    #[test]
+    fn unicode_editing_and_cursor_keep_graphemes_and_suggestion_style() {
+        let mut app = ready_app_with_control();
+        let (commands, _) = mpsc::channel(1);
+        app.ports[0].draft = "e\u{301}👩‍💻".chars().collect();
+        app.ports[0].draft_cursor = app.ports[0].draft.len();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &commands,
+        );
+        assert_eq!(app.current().draft.iter().collect::<String>(), "e\u{301}");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft_cursor, 0);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            &commands,
+        );
+        assert!(app.current().draft.is_empty());
+        let line = styled_line_with_software_cursor(
+            Line::from(vec![
+                Span::raw("x"),
+                Span::styled("中", Style::default().fg(Color::DarkGray)),
+            ]),
+            1,
+            true,
+        );
+        assert_eq!(line.spans[1].style.fg, Some(Color::DarkGray));
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -13968,7 +16439,7 @@ mod tests {
     fn line_ctrl_c_sends_etx_to_cancel_remote_continuation() {
         let mut app = ready_app_with_control();
         app.ports[0].snapshot.effective_write_eol = Some("\r\n".into());
-        app.ports[0].history.push("previous command".into());
+        app.human_history.push("previous command".into());
         app.ports[0].draft = "echo 'unterminated".chars().collect();
         app.ports[0].draft_cursor = app.ports[0].draft.len();
         app.ports[0].scroll_from_bottom = 5;
@@ -15460,7 +17931,7 @@ mod tests {
         let mut app = App::new(vec![snapshot()], None);
         {
             let view = &mut app.ports[0];
-            view.history = vec![
+            app.human_history = vec![
                 "show version".into(),
                 "reboot".into(),
                 "show interfaces".into(),
@@ -15526,7 +17997,7 @@ mod tests {
         let mut app = App::new(vec![snapshot()], None);
         {
             let view = &mut app.ports[0];
-            view.history = vec!["reboot".into()];
+            app.human_history = vec!["reboot".into()];
             view.draft = "keep me".chars().collect();
             view.draft_cursor = 7;
         }
@@ -16296,7 +18767,7 @@ mod tests {
         let mut app = App::new(vec![snapshot()], None);
         {
             let view = &mut app.ports[0];
-            view.history = vec![
+            app.human_history = vec![
                 "show version".into(),
                 "reset".into(),
                 "show interfaces".into(),
@@ -16309,10 +18780,13 @@ mod tests {
 
         for expected in ["show version", "show interfaces", "show version"] {
             app.handle_line_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commands);
-            assert_eq!(app.ports[0].draft.iter().collect::<String>(), expected);
+            let completion = app.current().completion.as_ref().unwrap();
+            assert_eq!(completion.candidates[completion.current], expected);
+            assert_eq!(app.current().draft.iter().collect::<String>(), "sh");
         }
 
-        // Any other key confirms the candidate and leaves completion mode.
+        // Enter accepts without submitting the candidate to the device.
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
         app.handle_line_key(
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
             &commands,
@@ -16327,8 +18801,9 @@ mod tests {
         app.ports[0].draft.clear();
         app.ports[0].draft_cursor = 0;
         app.handle_line_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &commands);
+        assert!(app.current().draft.is_empty());
         assert_eq!(
-            app.ports[0].draft.iter().collect::<String>(),
+            app.current().completion.as_ref().unwrap().candidates[0],
             "show version"
         );
     }
@@ -16862,6 +19337,7 @@ mod tests {
 
     fn stream_row(seq: u64, direction: Direction, text: &str) -> DisplayLine {
         DisplayLine {
+            continues_previous: false,
             daemon_epoch: None,
             seq,
             event_kind: match direction {
@@ -18445,19 +20921,6 @@ mod tests {
             );
         }
 
-        menu.selected = CurrentProfileRow::Port as usize;
-        app.activate_current_profile_row(&mut menu);
-        let mut choice = menu.choice.take().expect("serial-port choices");
-        choice.selected = choice
-            .options
-            .iter()
-            .position(|option| option.label == "/dev/ttyUSB7")
-            .expect("new detected Port");
-        app.handle_menu_choice_key(
-            &mut menu,
-            choice,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
         menu.selected = CurrentProfileRow::BaudRate as usize;
         app.activate_current_profile_row(&mut menu);
         let mut choice = menu.choice.take().expect("baud-rate choices");
@@ -18471,27 +20934,6 @@ mod tests {
             choice,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
-        menu.selected = CurrentProfileRow::DataBits as usize;
-        app.activate_current_profile_row(&mut menu);
-        let mut choice = menu.choice.take().expect("data-bit choices");
-        choice.selected = 0;
-        app.handle_menu_choice_key(
-            &mut menu,
-            choice,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
-        menu.selected = CurrentProfileRow::Echo as usize;
-        app.activate_current_profile_row(&mut menu);
-        let mut choice = menu.choice.take().expect("echo choices");
-        choice.selected = 2;
-        app.handle_menu_choice_key(
-            &mut menu,
-            choice,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
-        menu.selected = CurrentProfileRow::Apply as usize;
-        app.activate_current_profile_row(&mut menu);
-
         assert!(
             received.try_recv().is_err(),
             "shared profile updates must not submit before explicit confirmation"
@@ -18501,7 +20943,7 @@ mod tests {
             .take()
             .expect("shared profile impact confirmation");
         let confirmation_text = confirmation.lines.join("\n");
-        for expected in ["COM3", "COM4", "COM5"] {
+        for expected in ["COM3", "COM4"] {
             assert!(
                 confirmation_text.contains(expected),
                 "confirmation must list every affected Port: {confirmation_text}"
@@ -18523,9 +20965,9 @@ mod tests {
         };
         let CurrentProfileUpdate {
             current_port,
-            new_port: Some(new_port),
+            new_port: None,
             transport: Some(transport),
-            device: Some(device),
+            device: None,
             revisions,
             ..
         } = *update
@@ -18533,14 +20975,12 @@ mod tests {
             panic!("expected a current-profile update")
         };
         assert_eq!(current_port, "COM3");
-        assert_eq!(new_port, "/dev/ttyUSB7");
         assert_eq!(revisions.config, Some(41));
         assert_eq!(revisions.transport, Some(41));
         assert_eq!(revisions.device, Some(41));
         assert_eq!(revisions.model_family, Some(41));
         assert_eq!(transport.baud_rate, 921_600);
-        assert_eq!(transport.data_bits, DataBits::Five);
-        assert_eq!(device.echo, Some(EchoMode::Off));
+        assert_eq!(transport.data_bits, DataBits::Eight);
     }
 
     #[test]
@@ -18747,7 +21187,10 @@ mod tests {
 
         menu.busy = false;
         menu.page = MenuPage::ConfigureModelFamilies;
-        menu.selected = 2;
+        menu.selected = model_tree_rows(&menu)
+            .iter()
+            .position(|row| *row == ModelTreeRow::Family("Unused Family".into()))
+            .unwrap();
         app.menu = Some(menu);
         app.handle_menu_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         let mut menu = app.menu.take().unwrap();
@@ -18888,29 +21331,40 @@ mod tests {
         let mut menu = MenuState::new();
         menu.page = MenuPage::Profiles;
         menu.catalog = Some(catalog);
-        menu.busy = false;
         app.refresh_current_profile_editor(&mut menu);
-
+        menu.busy = false;
         menu.selected = CurrentProfileRow::ModelName as usize;
         app.activate_current_profile_row(&mut menu);
         assert_eq!(menu.page, MenuPage::ModelFamilies);
-        assert_eq!(menu.selected, 1, "the bound family should be preselected");
-        let rows = menu_rows(&app, &menu)
-            .iter()
-            .map(line_plain_text)
-            .collect::<Vec<_>>();
-        assert!(rows[0].contains(tr("menu.value.unbound")));
-
-        app.menu = Some(menu);
-        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.menu.as_ref().unwrap().page, MenuPage::ModelFamilies);
-        app.handle_menu_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        let menu = app.menu.take().unwrap();
-        assert_eq!(menu.page, MenuPage::ModelNames);
+        assert_eq!(
+            model_tree_rows(&menu)[menu.selected],
+            ModelTreeRow::Model("DUT Console".into(), "DUT Console 1.0".into())
+        );
         let before = menu.profile_editor.as_ref().unwrap().model_name.clone();
         app.menu = Some(menu);
-        app.handle_menu_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.menu.as_ref().unwrap().page, MenuPage::ModelNames);
+        app.handle_menu_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_menu_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.page, MenuPage::ModelFamilies);
+        assert!(
+            menu.model_family.is_none(),
+            "left collapses in the same page"
+        );
+        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.page, MenuPage::ModelFamilies);
+        assert_eq!(menu.profile_editor.as_ref().unwrap().model_name, before);
+        assert!(
+            received.try_recv().is_err(),
+            "expanding never submits a partial identity"
+        );
+        let menu = app.menu.as_mut().unwrap();
+        menu.selected = model_tree_rows(menu)
+            .iter()
+            .position(|row| *row == ModelTreeRow::Family("Empty Family".into()))
+            .unwrap();
+        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             app.menu
                 .as_ref()
@@ -18919,68 +21373,44 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .model_name,
-            before,
-            "Right expands hierarchy but never confirms a concrete model"
+            before
         );
-        app.handle_menu_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.menu.as_ref().unwrap().page, MenuPage::ModelFamilies);
-        app.handle_menu_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(received.try_recv().is_err());
+        app.handle_menu_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let mut menu = app.menu.take().unwrap();
-
         assert_eq!(menu.page, MenuPage::Profiles);
-        let editor = menu.profile_editor.as_ref().unwrap();
-        assert_eq!(editor.model_profile_binding.as_deref(), Some("dut-console"));
-        assert_eq!(editor.model_name.as_deref(), Some("DUT Console 1.0"));
-
+        assert_eq!(menu.profile_editor.as_ref().unwrap().model_name, before);
         menu.selected = CurrentProfileRow::ModelName as usize;
         app.activate_current_profile_row(&mut menu);
-        menu.selected = 2;
-        app.menu = Some(menu);
-        app.handle_menu_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.menu.as_ref().unwrap().page, MenuPage::ModelNames);
-        assert_eq!(menu_item_count(app.menu.as_ref().unwrap()), 0);
-        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.menu.as_ref().unwrap().page, MenuPage::ModelNames);
-        assert_eq!(
-            app.menu
-                .as_ref()
-                .unwrap()
-                .profile_editor
-                .as_ref()
-                .unwrap()
-                .model_name
-                .as_deref(),
-            Some("DUT Console 1.0"),
-            "an empty family cannot become a partial identity binding"
-        );
-        app.handle_menu_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        let mut menu = app.menu.take().unwrap();
         menu.selected = 0;
         app.menu = Some(menu);
         app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let mut menu = app.menu.take().unwrap();
+        let menu = app.menu.as_ref().unwrap();
         assert_eq!(menu.page, MenuPage::Profiles);
-        let editor = menu.profile_editor.as_ref().unwrap();
-        assert_eq!(editor.model_profile_binding.as_deref(), Some("dut-console"));
-        assert!(editor.model_family.is_none());
-        assert!(editor.model_name.is_none());
-
-        menu.selected = CurrentProfileRow::Apply as usize;
-        app.activate_current_profile_row(&mut menu);
+        assert!(menu.profile_editor.as_ref().unwrap().model_family.is_none());
+        assert!(menu.profile_editor.as_ref().unwrap().model_name.is_none());
+        assert_eq!(
+            menu.profile_editor
+                .as_ref()
+                .unwrap()
+                .model_profile_binding
+                .as_deref(),
+            Some("dut-console")
+        );
         let MenuIoCommand::Mutation { mutation } = received
             .try_recv()
-            .expect("cleared identity configuration mutation")
+            .expect("Enter immediately applies the complete identity")
         else {
-            panic!("expected current-profile mutation")
+            panic!("expected update")
         };
         let MenuMutation::UpdateCurrentProfiles(update) = *mutation else {
-            panic!("expected current-profile update")
+            panic!("expected profiles update")
         };
         assert_eq!(update.model_family, Some(None));
         assert_eq!(update.model_name, Some(None));
         assert_eq!(update.revisions.config, Some(41));
         assert_eq!(update.revisions.model_family, Some(41));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]
@@ -19292,6 +21722,13 @@ mod tests {
             .join("\n");
         assert!(!history.contains("第一条"));
         assert!(!history.contains("第二条"));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
+        assert_eq!(
+            app.focus,
+            PaneFocus::Input,
+            "arrows must not steal input focus"
+        );
+        app.focus = PaneFocus::RunHistory;
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
         assert_eq!(app.focus, PaneFocus::RunHistory);
         assert!(app.current().selected_run_command.is_none());
@@ -20753,8 +23190,15 @@ mod tests {
         assert_eq!(line.spans[2].content, "b");
 
         let end = line_with_software_cursor("a中b".into(), 4, true);
-        assert_eq!(end.spans[1].content, " ");
-        assert!(end.spans[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(end.spans.last().unwrap().content, " ");
+        assert!(
+            end.spans
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
 
         let hidden = line_with_software_cursor("a中b".into(), 1, false);
         assert_eq!(hidden.spans[1].content, "中");
@@ -20840,7 +23284,7 @@ mod tests {
             app.current().draft.iter().collect::<String>(),
             "must survive"
         );
-        assert!(app.current().history.is_empty());
+        assert!(app.human_history.is_empty());
         assert!(!app.pending_writes.contains_key("COM3"));
         assert!(received.try_recv().is_err());
     }
@@ -20979,7 +23423,10 @@ mod tests {
         );
 
         assert!(app.current().draft.is_empty());
-        assert_eq!(app.current().history, vec!["reboot"]);
+        assert!(
+            app.human_history.is_empty(),
+            "uncertain writes do not enter completion history"
+        );
         assert_eq!(app.uncertain_write_outcomes, 1);
         assert!(!app.pending_requests.contains_key(&request_id));
         assert!(app.pending_writes.is_empty());
@@ -21242,8 +23689,12 @@ mod tests {
             });
         menu.selected = 2;
         app.activate_menu_item(&mut menu);
-        assert_eq!(menu.page, MenuPage::ConfigureModelNames);
+        assert_eq!(menu.page, MenuPage::ConfigureModelFamilies);
         assert_eq!(menu.model_family.as_deref(), Some("Router Family"));
+        menu.selected = model_tree_rows(&menu)
+            .iter()
+            .position(|row| *row == ModelTreeRow::AddModel("Router Family".into()))
+            .unwrap();
         app.menu = Some(menu);
         app.handle_menu_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert!(app.menu.as_ref().unwrap().prompt.is_none());

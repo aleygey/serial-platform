@@ -112,6 +112,14 @@ export type HumanCommandSubmission =
   | { status: 'rejected'; message: string }
   | { status: 'uncertain'; message: string }
 
+export interface HumanCommandHistory {
+  server_id: string
+  revision: number
+  entries: { id: string; command: string; port: string; wall_time_ns: number; revision: number; uses: number }[]
+  next_before_revision?: number | null
+  warning?: string | null
+}
+
 export interface TimelineEvent {
   port: string
   daemon_epoch: string
@@ -129,6 +137,89 @@ export interface TimelineEvent {
   metadata: Record<string, unknown>
   durable: boolean
   replay?: boolean
+}
+
+export interface MacroParameter {
+  type: 'string' | 'integer' | 'boolean'
+  default?: string | number | boolean
+  minimum?: number
+  maximum?: number
+  description?: string
+}
+
+export interface MacroSummary {
+  id: string
+  name: string
+  description: string
+  language_version: number
+  revision: number
+  parameters: Record<string, MacroParameter>
+  shared: boolean
+  applies_to?: { model_family: string; model_names: string[] } | null
+}
+
+export interface MacroDefinition extends MacroSummary {
+  script: string
+  updated_at_ns: number
+}
+
+export interface MacroListQuery {
+  id?: string
+  query?: string
+  include_drafts?: boolean
+  offset?: number
+  limit?: number
+}
+
+export interface MacroListResponse {
+  catalog_revision: number
+  macros: MacroSummary[]
+  definition?: MacroDefinition | null
+  total: number
+  next_offset?: number | null
+}
+
+export interface MacroSaveRequest {
+  id: string
+  name: string
+  description: string
+  parameters: Record<string, MacroParameter>
+  script: string
+  expected_revision?: number
+  shared?: boolean
+  applies_to?: MacroSummary['applies_to']
+}
+
+export interface MacroRunRequest {
+  macro_id?: string
+  revision?: number
+  script?: string
+  description?: string
+  args: Record<string, string | number | boolean>
+  timeout_seconds: number
+}
+
+export interface MacroExecution {
+  id: string
+  port: string
+  daemon_epoch: string
+  generation: number
+  owner: Actor
+  run_id?: string | null
+  macro_id?: string | null
+  revision?: number | null
+  description: string
+  status: 'running' | 'stopping' | 'succeeded' | 'timed_out' | 'cancelled' | 'interrupted_by_user' | 'failed'
+  started_at_ns: number
+  completed_at_ns?: number | null
+  line: number
+  column: number
+  writes: number
+  bytes_written: number
+  first_seq: number
+  through_seq: number
+  message?: string | null
+  outcome_uncertain: boolean
 }
 
 export interface DesktopPreferences {
@@ -158,6 +249,7 @@ export interface DesktopSnapshot {
   modelProfiles: ModelProfile[]
   modelFamilies: ModelFamily[]
   events: Record<string, TimelineEvent[]>
+  humanHistory?: HumanCommandHistory
   preferences: DesktopPreferences
   service: ServiceState
 }
@@ -175,6 +267,12 @@ export interface DesktopBridge {
   bootstrap(): Promise<DesktopSnapshot>
   refresh(): Promise<DesktopSnapshot>
   sendCommand(port: string, command: string): Promise<HumanCommandSubmission>
+  sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<HumanCommandSubmission>
+  queryHumanHistory(query: string, contains?: boolean): Promise<HumanCommandHistory>
+  listMacros(query: MacroListQuery): Promise<MacroListResponse>
+  saveMacro(definition: MacroSaveRequest): Promise<{ catalog_revision: number; definition: MacroDefinition }>
+  runMacro(port: string, spec: MacroRunRequest): Promise<MacroExecution>
+  cancelMacro(port: string, executionId: string): Promise<MacroExecution>
   decideRunStart(port: string, approvalId: string, decision: RunStartDecision): Promise<void>
   setPortOpen(port: string, open: boolean): Promise<void>
   saveSerialConfiguration(draft: SerialConfigurationDraft, expectedRevision: number): Promise<void>
@@ -189,6 +287,7 @@ export interface DesktopBridge {
 export type DesktopEvent =
   | { type: 'snapshot'; snapshot: DesktopSnapshot }
   | { type: 'timeline'; event: TimelineEvent }
+  | { type: 'macro'; execution: MacroExecution }
   | { type: 'connection'; state: ConnectionState; message: string }
   | { type: 'service'; service: ServiceState }
   | { type: 'notice'; message: string }

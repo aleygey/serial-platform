@@ -4,6 +4,10 @@ import type {
   DesktopPreferences,
   DesktopSnapshot,
   HumanCommandSubmission,
+  MacroListQuery,
+  MacroSaveRequest,
+  MacroRunRequest,
+  MacroExecution,
   ModelFamily,
   ModelProfile,
   RunStartDecision,
@@ -69,7 +73,6 @@ export class DesktopCoordinator {
   async sendCommand(port: string, command: string): Promise<HumanCommandSubmission> {
     if (this.qaMode) return { status: 'accepted' }
     const value = command.replace(/[\r\n]+$/, '')
-    if (!value) return { status: 'rejected', message: '命令不能为空' }
     try {
       await this.requireClient().sendCommand(port, value)
       return { status: 'accepted' }
@@ -86,6 +89,34 @@ export class DesktopCoordinator {
     await this.requireClient().decideRunStart(port, approvalId, decision)
     await this.publishSnapshot()
   }
+
+  async sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<HumanCommandSubmission> {
+    if (this.qaMode) return { status: 'accepted' }
+    try {
+      await this.requireClient().sendSignal(port, signal)
+      return { status: 'accepted' }
+    } catch (error) {
+      const message = errorMessage(error)
+      return error instanceof HumanCommandOutcomeUncertainError
+        ? { status: 'uncertain', message } : { status: 'rejected', message }
+    }
+  }
+
+  async queryHumanHistory(query: string, contains = false) {
+    if (this.qaMode) return { server_id: 'qa', revision: 0, entries: [] }
+    return this.requireClient().queryHumanHistory(query, contains)
+  }
+
+  async listMacros(query: MacroListQuery) {
+    return this.requireClient().listMacros(query)
+  }
+
+  async saveMacro(definition: MacroSaveRequest) {
+    return this.requireClient().saveMacro(definition)
+  }
+
+  async runMacro(port: string, spec: MacroRunRequest) { return this.requireClient().runMacro(port, spec) }
+  async cancelMacro(port: string, executionId: string) { return this.requireClient().cancelMacro(port, executionId) }
 
   async setPortOpen(port: string, open: boolean): Promise<void> {
     if (this.qaMode) return
@@ -196,6 +227,7 @@ export class DesktopCoordinator {
   }
 
   private bindClient(client: SerialClient): void {
+    client.on('macro', (execution: MacroExecution) => this.emit({ type: 'macro', execution }))
     client.on('timeline', (event: TimelineEvent) => this.emit({ type: 'timeline', event }))
     client.on('snapshot', () => void this.publishSnapshot())
     client.on('connected', () => this.setConnection('connected', '实时连接已建立'))
@@ -331,6 +363,7 @@ export class DesktopCoordinator {
       modelProfiles: data.modelProfiles,
       modelFamilies: data.modelFamilies,
       events: data.events,
+      humanHistory: data.humanHistory,
       preferences: this.preferences!,
       service: this.service.state()
     }

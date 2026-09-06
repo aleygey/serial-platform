@@ -8,9 +8,9 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 
 - **端口就是设备位**：公开接口只使用操作系统串口名，例如 `COM4` 或 `/dev/cu.usbserial-210`。没有额外的设备位名称。
 - **一个物理写入者**：`seriald` 独占串口句柄，通过带 fencing 的 Control 串行化人和 Agent 的写入。
-- **同一份事实记录**：RX、确认后的 TX、Control、Run、Trigger、断连和重配事件进入同一条带序号时间线。
+- **同一份事实记录**：RX、确认后的 TX、Control、Run、Macro、断连和重配事件进入同一条带序号时间线。
 - **历史跨客户端重开保留**：日志由后端持久化；关闭再打开 TUI 或 App 不会清空已有串口记录。
-- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 16 个 MCP 工具；三者共享同一个后端状态。
+- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 18 个 MCP 工具；三者共享同一个后端状态。
 - **配置分层清楚**：Transport Profile 管物理 UART 参数；Model Profile 只管提示符、换行、设备回显解析和写入节奏；Model Family 目录独立管理“一级机型系列 → 二级具体机型”，与行为 Profile 可以独立切换。
 
 ## 快速开始
@@ -45,6 +45,8 @@ serial
 从 v0.8.0 升级到 v0.8.1 时，首次启动会把 `seriald.toml` 从 schema 2 自动、无损迁移到 schema 3：串口参数、行为 Profile、机型身份、端口绑定、安装身份和配置 revision 都会保留。原始文件会先保存为同目录下的 `seriald.toml.schema2.bak`（若文件名已占用则使用编号后缀），不需要删除配置或重新运行 setup。
 
 同一本地数据目录只运行一个 `seriald`。`serial` 和 App 会自动发现并验证该后端；无论使用默认还是自定义地址、先启动 App 还是先运行 `serial`，后启动的一方都会复用同一个服务。
+
+当前 Macro/人工历史使用 Serial wire protocol v8。更新时 seriald、TUI/CLI、App 和 MCP 应使用同一构建并重启，MCP 宿主需要刷新工具列表；不要混用 v7 后端和新客户端。现有配置文件无需删除。
 
 App 和 `serial` 只停止自己启动的进程。拥有后端的一方退出后，另一方不会自动接管或启动替代后端；重新启动后才重新发现或创建服务。
 
@@ -132,11 +134,12 @@ TUI 顶部只显示串口名和连接状态；串口输出标题只显示当前�
 
 默认操作围绕键盘设计：
 
-- 输入任意可打印字符会直接进入命令输入行；按 Enter 总会发送并返回串口底部：有内容时发送“内容 + Profile EOL”，空输入时发送 Profile EOL；若 Profile 明确配置为无 EOL，空输入仍发送一个 `CR`。
-- `↑` / `↓` 在当前层选择；`→` 从 Run 进入 action description，再进入具体命令；`←` 逐层返回。
+- LINE 输入使用平台共用、持久化的人工命令历史。灰字是未接受的建议，行末 `→` 或 End 接受；行中左右键仍移动光标。Enter 仅发送已编辑内容，Tab 菜单打开时 Enter 只回填候选。空 Enter 发送 Profile EOL；显式无 EOL 的空输入仍发送一个 `CR`。
+- 输入焦点下 `↑` / `↓` 浏览人工历史并可恢复草稿；Agent 历史焦点下方向键才操作 Run → action → 命令树。RAW 焦点下方向键直接透传。Ctrl-D 单独发送 `0x04`，不追加 EOL、不清空草稿。
 - 展开的 Agent 详情超过面板高度时，用 `Shift+↑` / `Shift+↓` 滚动详情；普通方向键仍只控制历史树。
 - 滚轮和 `PgUp` / `PgDn` 始终滚动串口输出，不会改变 Agent 历史选择或焦点；`Ctrl-] PgUp` / `Ctrl-] PgDn` 也执行同一操作。
-- `Ctrl-] /` 在串口输出右上角打开即时查找框；输入时直接定位，Enter/F3 与 Shift+Enter/Shift+F3 在结果间循环，并保留命中位置的上下文。可切换普通文本/正则、大小写、RX/TX 和当前周期/当前 Run；本地旧行已淘汰时会明确提示范围不完整。
+- `Ctrl-] /` 在串口输出右上角查找；默认对本次打开以来采集到的完整会话做字面搜索，Enter/F3 与反向快捷键在结果间切换。日志持续落盘，旧行被内存缓存淘汰后仍可定位并在主输出栏浏览上下文；Esc 清除高亮但保留阅读位置。后台扫描/缺口/记录失败均明确显示，不把不完整范围当成零命中。
+- `Ctrl-] a` 打开宏目录，查看或编辑脚本、参数、共享状态与适用机型，按固定 revision 试运行或停止。
 - `Alt-1` 到 `Alt-9` 快速切换端口；`Ctrl-] ?` 打开完整帮助。
 
 任务与命令记录按从旧到新排列，采用 Run 标题 → action description → 具体命令的三层树。第二层缩进 4 列且不混入命令；第三层缩进 8 列，普通 `command` 显示一条，`command_sequence` 按 step 顺序显示多条。新的 Agent action 到达时，TUI 退回它所属的 Run；同一 sequence 的后续 step 或同一 TX 的分块只更新原 action。进入 action 或具体 step 时会定位并高亮设备回显、返回内容和完成边界。命令属于旧的后端周期或本地窗口已淘汰完整捕获区间时，TUI 会按原周期、命令序号和持久 matcher 从 journal 精确回取；只有从 TX 到完成边界完整连续时才显示 RX 高亮。retention gap、缺失、超限或查询失败会回到实时尾并明确提示，不把局部尾部伪装成完整结果。没有 matcher 时只临时显示命令文本，不污染串口历史。
@@ -170,12 +173,13 @@ App 默认连接配置的本地后端；后端不存在且启用了自动启动�
 
 ## Agent 与 MCP
 
-`serial-mcp` 暴露 16 个工具：
+`serial-mcp` 暴露 18 个工具：
 
 ```text
 devices              model_identity_set   read
 command              command_sequence     signal
-trigger              wait                 search
+macro_list           macro_save           macro_run
+wait                 search
 monitor_start        monitor_list         monitor_status
 monitor_incidents    monitor_stop         run_start
 run_end
@@ -185,7 +189,7 @@ run_end
 
 1. `devices` 检查端口、`model_family` / `model_name`、连接与工作流状态，以及当前有效的 Shell/U-Boot 提示符；
 2. `run_start(port, label)` 获取本次工作流的 `run_handle`；端口空闲时原子开始，当前由人持有时等待 TUI/App 中的明确批准，批准后原子转交并开始；
-3. 使用 `command`，或用一次 `command_sequence` 完成“账号 → 等待密码提示 → 密码”这类已知依赖交互；
+3. 使用 `command`，或用 `command_sequence` 完成已知线性依赖；循环、条件和可重复流程使用 `macro_list/save/run`，详见 [Macro Script v1](./docs/MACRO_SCRIPT_V1.md)；
 4. 用 `read`、`wait`、`search` 或 Monitor 补充证据；
 5. 在 Agent 最终回复前调用 `run_end`；正常完成使用默认 `outcome=completed`，异常终止使用 `outcome=aborted`。
 
@@ -219,7 +223,7 @@ physical UART
     ▼
 seriald ── durable journal
     ├── HTTP v1 configuration / diagnostics / history
-    ├── WebSocket protocol v7 realtime and control
+    ├── WebSocket protocol v8 realtime and control
     ├── serialctl TUI
     ├── Electron App
     └── serial-mcp ── stdio or Streamable HTTP ── Agent
@@ -228,14 +232,16 @@ seriald ── durable journal
 - `seriald` 是唯一持有物理串口句柄的进程。
 - `serialctl` 提供离线之外的配置、诊断、日志查询和 TUI。
 - `serial-mcp` 把同一 HTTP/WebSocket 能力收敛为 Agent 友好的工具。
-- Electron App 管理本地服务生命周期并复用 v7 接口。
+- Electron App 管理本地服务生命周期并复用 v8 接口。
 - `serial` 是统一入口。
 
 文档入口：
 
 - [架构与交互设计](./DOCUMENTATION.md)：产品边界、配置模型、Control/Run、历史投影和启动所有权；
-- [protocol v7](./docs/PROTOCOL.md)：HTTP v1、WebSocket v7、Timeline、Monitor 与 MCP transport 线协议；
-- [MCP 工具契约](./docs/MCP_TOOLS.md)：16 个工具的输入、结果和 Agent 工作流；
+- [protocol v8](./docs/PROTOCOL.md)：HTTP v1、WebSocket v8、Timeline、Monitor 与 MCP transport 线协议；
+- [MCP 工具契约](./docs/MCP_TOOLS.md)：18 个工具的输入、结果和 Agent 工作流；
+- [Macro Script v1](./docs/MACRO_SCRIPT_V1.md)：宏语言、参数、共享和执行边界；
+- [输入与搜索操作](./docs/INPUT_AND_SEARCH.md)：补全、焦点、同页配置、全会话搜索与 TUI 宏页面；
 - [Adapter 配置](./adapters/README.md)：stdio/Streamable HTTP host 接入；
 - [Roadmap](./ROADMAP.md)：当前能力、发布质量门槛和非目标。
 

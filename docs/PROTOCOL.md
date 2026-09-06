@@ -1,4 +1,4 @@
-# Serial Platform Protocol v7
+# Serial Platform Protocol v8
 
 本文是 `seriald` HTTP/WebSocket 和 `serial-mcp` transport 的当前线协议说明。Rust DTO 与编码实现位于 `serial-protocol`；Agent 工具参数见 [MCP_TOOLS.md](./MCP_TOOLS.md)。
 
@@ -31,7 +31,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "address": "127.0.0.1:3210",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 7,
+  "protocol_version": 8,
   "pid": 12345
 }
 ```
@@ -40,7 +40,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 
 ## HTTP v1
 
-`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=7`；路由仍保持 `/api/v1/...`。
+`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=8`；路由仍保持 `/api/v1/...`。
 
 ### 路由
 
@@ -64,7 +64,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `GET` / `PUT` / `DELETE` | `/api/v1/monitors/{monitor_id}` | 读取/更新/停止 Monitor |
 | `GET` | `/api/v1/monitors/{monitor_id}/incidents` | 分页读取 incident |
 | `POST` | `/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | 确认 incident |
-| `GET` | `/api/v1/ws` | WebSocket protocol v7 |
+| `GET` | `/api/v1/ws` | WebSocket protocol v8 |
 
 ### Health
 
@@ -74,7 +74,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "server_id": "uuid",
   "daemon_epoch": "uuid",
   "uptime_ms": 1200,
-  "protocol_version": 7
+  "protocol_version": 8
 }
 ```
 
@@ -86,7 +86,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 {
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 7,
+  "protocol_version": 8,
   "config_revision": 12,
   "sequence_write_precondition_supported": true,
   "serial_context_precondition_supported": true,
@@ -449,7 +449,7 @@ Monitor spec：
 
 列表 query 可使用 `port` 和 `status`。incident query：`after_incident_seq`、`limit`、`include_acked`。incident 响应提供 `next_cursor`、`truncated`、`first_available_incident_seq` 和 `retention_gap`。
 
-## WebSocket protocol v7
+## WebSocket protocol v8
 
 连接地址：`GET /api/v1/ws`。
 
@@ -477,7 +477,7 @@ Monitor spec：
 {
   "type": "hello",
   "request_id": "uuid",
-  "protocol_version": 7,
+  "protocol_version": 8,
   "client_name": "serialctl",
   "actor_kind": "human"
 }
@@ -490,7 +490,7 @@ Monitor spec：
   "type": "welcome",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 7,
+  "protocol_version": 8,
   "actor": {"id": "...", "label": "serialctl", "kind": "human"}
 }
 ```
@@ -523,6 +523,7 @@ acquire_control renew_control release_control cancel_acquire
 request_run_start decide_run_start cancel_run_start
 send_human_command write send_break
 trigger_start trigger_status trigger_cancel
+macro_start macro_status macro_cancel
 start_run end_run checkpoint
 acknowledge_run_context record_command_capture ping
 ```
@@ -620,7 +621,7 @@ Human 普通输入统一使用 `send_human_command`；它把授权判断和物�
 
 `owned` 且本次从 idle 获得 Control 时还返回 `lease`；不适用的可选字段省略。
 
-确认了至少一个 Human TX byte 后，活动 Agent Run 的 `run_context.revision` 才递增，`last_human_command_seq` 指向该 TX event。此时属于该 Run owner 的下一次 `write`、`send_break` 或 `trigger_start` 会在进入串口 writer 前返回 `user_read_required`，保证零字节写入。
+确认了至少一个 Human TX byte 后，活动 Agent Run 的 `run_context.revision` 才递增，`last_human_command_seq` 指向该 TX event。此时属于该 Run owner 的下一次 `write`、`send_break`、`macro_start` 或兼容 `trigger_start` 会在进入串口 writer 前返回 `user_read_required`，保证零字节写入。
 
 只有该 Agent Run owner 可以确认最新 revision：
 
@@ -738,7 +739,50 @@ unavailable internal
 
 `user_read_required` 是 daemon 的稳定线协议错误：最新 Human TX 尚未被 Agent Run owner 的 ACK 覆盖，检查发生在物理 action 前，保证本请求零字节。MCP 将它投影为 model-facing `user_command_used`，并要求先完成包含该 TX 的 live `read`。`retryable` 只说明错误类别可能在状态改变后恢复，不代表客户端应自动重放物理动作。连接丢失、timeout、partial write 或结果未确认时必须先观察时间线。
 
-## Run、Control 与 Trigger 语义
+## v8 人工历史与 Macro
+
+新增 HTTP 目录接口（与串口物理写入分离）：
+
+| Method | Path | 说明 |
+| --- | --- | --- |
+| GET | `/api/v1/history/commands` | 平台共用人工 LINE 历史，支持 prefix、contains、before_revision、limit；返回 server_id、revision、entries、next_before_revision、warning |
+| GET | `/api/v1/macros` | 默认共享摘要；query/offset/limit 分页，include_drafts 显式包含草稿，id 返回完整 definition |
+| POST | `/api/v1/macros` | 保存完整定义；新建 shared 默认 false，更新要求 expected_revision；版本冲突 409、无此宏 404、脚本/参数错误 400 |
+
+人工 `send_human_command` 可额外提供 `"input":{"command":"status"}`。daemon 要求其 command + 有效 EOL 与实际 data 一致，且有 operation_id；仅确认完整发送后的非空 Human LINE 命令进入建议库。RAW/控制键省略 input；Agent/宏展开步骤不允许借此混入人工历史。建议库最多 10000 条不同命令，溢出或存储故障返回 warning；它不是原始 TX 审计的替代品。
+
+Macro 控制消息：
+
+```json
+{
+  "type": "macro_start",
+  "request_id": "uuid",
+  "port": "COM4",
+  "control_id": "uuid",
+  "fence": 3,
+  "daemon_epoch": "uuid",
+  "generation": 1,
+  "operation_id": "稳定的执行 UUID",
+  "expected_run_id": "Agent 当前 Run UUID；Human 为 null",
+  "sequence_precondition": null,
+  "spec": {
+    "macro_id": "enter_uboot",
+    "revision": 1,
+    "args": {"interval_ms": 50},
+    "timeout_seconds": 15
+  }
+}
+```
+
+也可使用 spec.script + description 代替 macro_id/revision/args。`macro_status` 只需要 request_id/port/execution_id；`macro_cancel` 另需 control_id/fence，且只能停止当前调用者拥有的执行。内部结果分别为 macro_started/macro_status/macro_cancelled，均包含 execution。
+
+execution.id 等于 operation_id；状态为 running/stopping/succeeded/timed_out/cancelled/interrupted_by_user/failed。结果包含 epoch、generation、owner、Run、固定宏 revision、时间、源码行列、确认 TX 数量/字节数、first_seq/through_seq、message 和 outcome_uncertain。只有 Slot actor 提交完成并释放宏 guard 后，status 才对外暴露终态。取消先停止后续动作，再确认在途写；stopping 不是完成。
+
+宏编译、参数、版本、Profile、适用机型和审计记录大小在首次 TX 前校验；源码/参数/Profile 快照写入 started checkpoint，每个 TX 附 macro_execution_id/macro_id/macro_revision/macro_line/macro_column，结束写入 completed checkpoint。同一 daemon epoch 内复用 operation_id 不会重放物理动作；结果状态缓存有界，无法恢复时返回 NotFound/过期错误，不表示设备未执行。
+
+单口宏与其他 Agent 物理写互斥，不隐式排队；原有 Control、Run、generation、fence 和 Human read gate 继续有效。Human Enter/RAW/Ctrl-D 停止后续宏步骤，保留原 Agent Run 的人工干预门槛。完整语言/参数规则见 [Macro Script v1](./MACRO_SCRIPT_V1.md)。
+
+## Run、Control 与兼容 Trigger 语义
 
 Control lease 绑定一个 actor、周期、generation 和 fence。续租不改变物理所有权；Human Takeover 产生新 fence 并使旧写入失效。不存在 Control queue，也不存在 Agent `AcquireControl` bypass。
 
@@ -746,7 +790,7 @@ Agent Run 只能由 `request_run_start` 原子创建：idle 直接 grant+Run；H
 
 Agent Run 的 `run_context` 是 daemon-authoritative revision gate。Human cooperative TX 不窃取 Agent lease，但会把所有后续 Agent physical action 锁在 `user_read_required`，直到精确 live evidence 被 ACK；结束/中止 Run 会删除该 context。
 
-Trigger spec 包含 optional initial write、optional start literal、action bytes、interval、stop literals、timeout、max fires 和 optional pacing。所有 Trigger 写入仍走同一 Control/fence/Run/read-gate/confirmed TX 路径。Human cooperative command 会先让活动 Trigger 停止并收敛，避免 Trigger 与 Human TX 在 driver 边界竞态。
+旧 Trigger wire 类型与历史解析保留兼容，但不再作为公开 MCP 工具。其 spec 包含 optional initial write、optional start literal、action bytes、interval、stop literals、timeout、max fires 和 optional pacing。所有旧 Trigger 写入仍走同一 Control/fence/Run/read-gate/confirmed TX 路径；与新 Macro 互斥。
 
 ## MCP Streamable HTTP
 
@@ -763,7 +807,7 @@ POST /mcp
 {
   "status": "ok",
   "service": "serial-mcp",
-  "protocol_version": 7,
+  "protocol_version": 8,
   "pid": 12345,
   "seriald_endpoint": "http://127.0.0.1:3210",
   "seriald_server_id": "uuid",
@@ -771,7 +815,7 @@ POST /mcp
 }
 ```
 
-统一启动器只在 `service`、`protocol_version=7` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
+统一启动器只在 `service`、`protocol_version=8` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
 
 统一启动时，MCP listener 使用已验证 `active-endpoint.json.address` 的精确 IP，并固定使用 port 3211；只有 seriald 原本是 IPv4/IPv6 通配 bind 时，活动地址才先转换为 `127.0.0.1`/`::1`。因此 host-only 场景会得到例如 `192.168.56.109:3211`，不会悄悄改成 loopback，也不会绑定所有接口。
 
@@ -789,10 +833,10 @@ HTTP MCP 没有认证和 TLS。`--listen` 必须是一个精确的单播接口�
 
 `Origin` 检查只降低浏览器跨站请求风险，不替代认证；非浏览器客户端可以不发送该 header。
 
-initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回固定 16 项：
+initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回固定 18 项：
 
 ```text
-devices model_identity_set read command command_sequence signal trigger wait
+devices model_identity_set read command command_sequence signal macro_list macro_save macro_run wait
 search monitor_start monitor_list monitor_status monitor_incidents monitor_stop
 run_start run_end
 ```

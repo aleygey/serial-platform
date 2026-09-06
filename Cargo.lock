@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "serial-cli"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "serde_json",
  "serial-protocol",
@@ -1969,8 +1969,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial-macro"
+version = "0.8.6"
+
+[[package]]
 name = "serial-mcp"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1995,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "serial-protocol"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "base64",
  "serde",
@@ -2006,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "serialctl"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2025,13 +2029,14 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
 ]
 
 [[package]]
 name = "seriald"
-version = "0.8.5"
+version = "0.8.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2046,6 +2051,7 @@ dependencies = [
  "regex-syntax",
  "serde",
  "serde_json",
+ "serial-macro",
  "serial-protocol",
  "serialport",
  "tempfile",

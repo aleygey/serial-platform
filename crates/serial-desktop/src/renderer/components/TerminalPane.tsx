@@ -127,7 +127,7 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
         <div className="terminal-title">
           <span className="heading-icon"><TerminalSquare size={15} /></span>
           <div>
-            <strong>{modelName}</strong>
+            <strong className={configuredPort?.config.model_name ? 'model-identity' : undefined}>{modelName}</strong>
             <small>{sessionLabel(configuredPort?.session_state)}</small>
           </div>
         </div>

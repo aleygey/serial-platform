@@ -1,6 +1,6 @@
 # Serial MCP Tools
 
-`serial-mcp` 把 Serial Platform 收敛为 16 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
+`serial-mcp` 把 Serial Platform 收敛为 18 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
 
 ```sh
 serial mcp --dump-tools
@@ -28,7 +28,7 @@ http://127.0.0.1:3211/mcp
 
 MCP host 对该 URL 发送 JSON-RPC `POST`。notification 返回 HTTP 202；没有持久 HTTP session 或 SSE GET channel。
 
-统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 从实际 `ActiveEndpoint` 继承精确 IP，并在该 IP 的 3211 端口保证 HTTP MCP 可用。例如后端活动地址为 `192.168.56.109:3210` 时，MCP 地址是 `http://192.168.56.109:3211/mcp`，不会另外绑定 localhost。后端 wildcard bind 发布为可连接的 loopback `ActiveEndpoint`，因此 `0.0.0.0` / `::` 分别收敛为 `127.0.0.1:3211` / `[::1]:3211`。health 检查、进程复用、启动等待和最终输出都使用同一个目标地址；复用还会核对当前 Serial wire protocol v7、后端 endpoint、server ID 和 daemon epoch。Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
+统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 从实际 `ActiveEndpoint` 继承精确 IP，并在该 IP 的 3211 端口保证 HTTP MCP 可用。例如后端活动地址为 `192.168.56.109:3210` 时，MCP 地址是 `http://192.168.56.109:3211/mcp`，不会另外绑定 localhost。后端 wildcard bind 发布为可连接的 loopback `ActiveEndpoint`，因此 `0.0.0.0` / `::` 分别收敛为 `127.0.0.1:3211` / `[::1]:3211`。health 检查、进程复用、启动等待和最终输出都使用同一个目标地址；复用还会核对当前 Serial wire protocol v8、后端 endpoint、server ID 和 daemon epoch。Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
 
 HTTP MCP 没有认证。listener 只接受精确 loopback 或可信 host-only 网卡的 unicast 地址，拒绝 wildcard、broadcast 和 multicast。非 loopback 部署必须限制在可信 host-only 网络，并使用主机防火墙限制来源，不能把 3211 端口暴露到普通局域网或公网。
 
@@ -48,17 +48,19 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 
 支持 MCP protocol：`2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`。
 
-## 16 个工具
+## 18 个工具
 
 | Tool | Required | Optional | 作用 |
 |---|---|---|---|
 | `devices` | — | `port` | 唯一设备发现入口；读取串口、两级机型身份、Agent 状态和有效 Shell/U-Boot 提示符 |
 | `model_identity_set` | `port`, `model_family`, `model_name` | — | 成对绑定已有系列/具体机型，或以两个 null 清空身份 |
-| `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq` | 从实时 ring 或指定历史周期读取有界文本 |
+| `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq`, `exclude_patterns` | 读取有界文本；按区分大小写的字面子串隐藏完整噪音行，只影响显示，人工 read-gate 确认时强制关闭 |
 | `command` | `run_handle`, `command`, `description` | `expect`, `regex`, `timeout_seconds` | 追加有效 EOL、写入、捕获 RX 并保留任务说明 |
 | `command_sequence` | `run_handle`, `description`, `steps` | 每步 matcher/timeout | 一次完成 1–8 步已知依赖交互 |
 | `signal` | `run_handle`, `signal` | Break 的 `duration_ms` | Ctrl-C/D/Z byte 或 UART Break |
-| `trigger` | `run_handle`, `action` | `kickoff`, start/stop matcher 与硬上限 | 在后端执行一次有界低延迟反应 |
+| `macro_list` | — | `id`, `query`, `include_drafts`, `offset`, `limit` | 查找共享摘要或读取完整脚本 |
+| `macro_save` | `id`, `name`, `description`, `script` | `parameters`, `shared`, `applies_to`, `expected_revision` | 校验并保存宏；新建默认不共享，更新带版本 |
+| `macro_run` | `run_handle` | `macro_id`+`revision`+`args` 或 `script`，`description`, `timeout_seconds` | 在 seriald 执行受限脚本，同步返回终态 |
 | `wait` | `run_handle` | `expect`, `regex`, `timeout_seconds` | 从 live cursor 等待 RX 边界 |
 | `search` | `port`, `query` | `regex`, `scope`, `run_id`, `epoch`, `after_seq` | 搜索当前 Run、当前 cursor 或归档 |
 | `monitor_start` | `port`, `matchers` | `description`, `idempotency_key` | 用一组 OR 条件创建持久 Monitor 并立即返回 |
@@ -303,28 +305,17 @@ adapter 在写第一步前验证完整计划，并为整个 sequence 持有该�
 
 Break 默认 250 ms，可用 `duration_ms` 设置 1–5000 ms。其他 signal 不接受 duration。Break 不是 NUL 或任何编码字节。
 
-## `trigger`
+## Macro Script v1
 
-```json
-{
-  "run_handle": "abcdefghijklmnopqrstuv",
-  "kickoff": {"text":"reboot","eol":"\r"},
-  "action": {"text":" ","eol":""},
-  "interval_ms": 20,
-  "stop_contains": ["=> "],
-  "timeout_ms": 5000,
-  "max_fires": 250
-}
-```
+公开 `trigger` 已替换为 `macro_list`、`macro_save`、`macro_run`。`command_sequence` 保留，不需要把简单线性步骤写成宏。
 
-- `kickoff` 可省略；
-- `action` 必填；
-- 普通调用省略 `start_contains`，kickoff 确认后立即允许 action；
-- `start_contains` 只用于必须等待 live RX gate 的场景；
-- `stop_contains` 最多 8 个 literal；
-- interval 5–1000 ms；timeout 100–30000 ms；max fires 1–1000。
+宏支持 let、if/else、for、while、break/continue，以及 cmd、watch、prompt、wait、expect、delay。cmd 自动追加 Profile EOL，不开放 input/raw/eol 参数。脚本执行器位于 seriald，不逐步回调 Agent，不运行宿主机 shell。
 
-Trigger 在后端内调度，避免每个 action 都经过一次 Agent 往返。结果的 `matched=true` 只说明 stop literal 被观察到，不证明更大的业务流程成功。
+保存默认为 shared:false；默认列表及 AI 上下文仅包含显式共享宏。一次性 script 直接 run、不入库；保存的宏使用固定 revision，编辑使用 expected_revision。macros 列表/保存是目录操作，不占串口；运行需要已授权 Run。
+
+macro_run 同步返回成功/超时/取消/人工中断/失败、源码行列、已确认发送次数与证据范围。不新增公开 status/cancel 工具，MCP 取消和 UI 停止使用内部协议。人工介入后必须 read，不自动续跑或重放；prompt 命中不证明设备业务状态。
+
+完整语言规则、可复制的 U-Boot 保存/执行参数、共享约束与限制见 [Macro Script v1](./MACRO_SCRIPT_V1.md)。
 
 ## `wait`
 
@@ -453,9 +444,9 @@ adapter 记住每端口上次成功操作的 cursor。两个操作之间出现�
 
 没有第三方变化时省略该字段，减少 Agent context。
 
-在 `command`、`command_sequence`、`signal`、`trigger` 前，adapter 把已观察 cursor、generation 和 TX offset 作为后端原子 precondition。若 ring 无法证明上下文连续，或有第三方 TX、重开或 gap，工具会在物理动作前拒绝，并返回 `no_bytes_written=true`；Agent 应先实时读取并重新判断设备状态。
+在 `command`、`command_sequence`、`signal`、`macro_run` 前，adapter 把已观察 cursor、generation 和 TX offset 作为后端原子 precondition。若 ring 无法证明上下文连续，或有第三方 TX、重开或 gap，工具会在物理动作前拒绝，并返回 `no_bytes_written=true`；Agent 应先实时读取并重新判断设备状态。
 
-Human intervention 使用更严格、可证明的 Run context gate。人工在活动 Agent Run 中直接按 Enter 发送命令时，命令立即作为 Human TX 写入和审计，不会借用 Agent fence，也不会转移 Agent Control。Agent 后续的 `command`、`command_sequence`、`signal` 或 `trigger` 会在发送前收到：
+Human intervention 使用更严格、可证明的 Run context gate。人工在活动 Agent Run 中直接按 Enter 发送命令时，命令立即作为 Human TX 写入和审计，不会借用 Agent fence，也不会转移 Agent Control。Agent 后续的 `command`、`command_sequence`、`signal` 或 `macro_run` 会在发送前收到：
 
 ```json
 {

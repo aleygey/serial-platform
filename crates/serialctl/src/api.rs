@@ -1,6 +1,6 @@
 use std::fmt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serial_protocol::{
@@ -65,6 +65,58 @@ pub struct ApiClient {
     endpoint: String,
 }
 
+pub(crate) const HUMAN_HISTORY_MAX_ENTRIES: usize = 10_000;
+
+/// Publish only a complete, single-revision snapshot. A concurrent update
+/// invalidates this bounded traversal; the caller retries on its next refresh.
+async fn collect_human_history_pages<F, Fut>(
+    mut fetch: F,
+) -> Result<serial_protocol::HumanCommandHistoryResponse>
+where
+    F: FnMut(Option<u64>) -> Fut,
+    Fut: std::future::Future<Output = Result<serial_protocol::HumanCommandHistoryResponse>>,
+{
+    let mut snapshot = None::<serial_protocol::HumanCommandHistoryResponse>;
+    let mut before = None;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..5 {
+        let page = fetch(before).await?;
+        ensure!(
+            page.entries.len() <= 2000,
+            "Human history page exceeds the negotiated limit"
+        );
+        let result = snapshot.get_or_insert_with(|| serial_protocol::HumanCommandHistoryResponse {
+            server_id: page.server_id,
+            revision: page.revision,
+            entries: Vec::new(),
+            next_before_revision: None,
+            warning: page.warning.clone(),
+        });
+        ensure!(
+            result.server_id == page.server_id && result.revision == page.revision,
+            "Human history changed during pagination; preserving the previous complete snapshot"
+        );
+        let next = page.next_before_revision;
+        for entry in page.entries {
+            if seen.insert(entry.command.clone()) {
+                result.entries.push(entry);
+            }
+        }
+        if let Some(warning) = page.warning {
+            result.warning = Some(warning);
+        }
+        if next.is_none() {
+            return Ok(snapshot.unwrap());
+        }
+        ensure!(next.is_some_and(|cursor| cursor > 0 && before.is_none_or(|previous| cursor < previous)),
+            "Human history pagination did not advance");
+        before = next;
+    }
+    bail!(
+        "Human history exceeds the 10000-entry snapshot bound; preserving the previous complete snapshot"
+    )
+}
+
 impl ApiClient {
     pub fn new(endpoint: String) -> Result<Self> {
         let endpoint = normalize_endpoint(&endpoint)?;
@@ -83,6 +135,54 @@ impl ApiClient {
 
     pub async fn status(&self) -> Result<StatusResponse> {
         self.get_json("/api/v1/status").await
+    }
+
+    pub async fn human_command_history(
+        &self,
+    ) -> Result<serial_protocol::HumanCommandHistoryResponse> {
+        collect_human_history_pages(|before_revision| async move {
+            let response = self
+                .client
+                .get(self.url("/api/v1/history/commands"))
+                .query(&serial_protocol::HumanCommandHistoryQuery {
+                    before_revision,
+                    limit: Some(2000),
+                    ..Default::default()
+                })
+                .send()
+                .await
+                .context("Human history request failed")?;
+            decode_response(response).await
+        })
+        .await
+    }
+
+    pub async fn macros(
+        &self,
+        query: &serial_protocol::MacroListQuery,
+    ) -> Result<serial_protocol::MacroListResponse> {
+        let response = self
+            .client
+            .get(self.url("/api/v1/macros"))
+            .query(query)
+            .send()
+            .await
+            .context("macro catalog request failed")?;
+        decode_response(response).await
+    }
+
+    pub async fn save_macro(
+        &self,
+        definition: &serial_protocol::MacroSaveRequest,
+    ) -> Result<serial_protocol::MacroSaveResponse> {
+        let response = self
+            .client
+            .post(self.url("/api/v1/macros"))
+            .json(definition)
+            .send()
+            .await
+            .context("macro save failed")?;
+        decode_response(response).await
     }
 
     pub async fn configuration_status(&self) -> Result<ConfigurationStatus> {
@@ -374,6 +474,122 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_page(
+        server_id: uuid::Uuid,
+        revision: u64,
+        newest: u64,
+        count: u64,
+        next: Option<u64>,
+    ) -> serial_protocol::HumanCommandHistoryResponse {
+        serial_protocol::HumanCommandHistoryResponse {
+            server_id,
+            revision,
+            entries: (newest + 1 - count..=newest)
+                .rev()
+                .map(|value| serial_protocol::HumanCommandHistoryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    command: format!("command-{value}"),
+                    port: "COM3".into(),
+                    wall_time_ns: 0,
+                    revision: value,
+                    uses: 1,
+                })
+                .collect(),
+            next_before_revision: next,
+            warning: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn human_history_fetches_all_five_pages_in_recent_first_order() {
+        let server = uuid::Uuid::new_v4();
+        let mut pages = (0..5)
+            .map(|page| {
+                let newest = 10_000 - page * 2_000;
+                history_page(
+                    server,
+                    10_000,
+                    newest,
+                    2_000,
+                    (page < 4).then_some(newest - 1_999),
+                )
+            })
+            .collect::<std::collections::VecDeque<_>>();
+        let mut cursors = Vec::new();
+        let snapshot = collect_human_history_pages(|before| {
+            cursors.push(before);
+            std::future::ready(Ok(pages.pop_front().unwrap()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cursors,
+            vec![None, Some(8001), Some(6001), Some(4001), Some(2001)]
+        );
+        assert_eq!(snapshot.entries.len(), HUMAN_HISTORY_MAX_ENTRIES);
+        assert_eq!(snapshot.entries.first().unwrap().command, "command-10000");
+        assert_eq!(snapshot.entries.last().unwrap().command, "command-1");
+        assert!(snapshot.next_before_revision.is_none());
+    }
+
+    #[tokio::test]
+    async fn human_history_rejects_mixed_revision_or_server_during_pagination() {
+        for change_server in [false, true] {
+            let server = uuid::Uuid::new_v4();
+            let mut pages = std::collections::VecDeque::from([
+                history_page(server, 5000, 5000, 1, Some(5000)),
+                history_page(
+                    if change_server {
+                        uuid::Uuid::new_v4()
+                    } else {
+                        server
+                    },
+                    if change_server { 5000 } else { 5001 },
+                    4999,
+                    1,
+                    None,
+                ),
+            ]);
+            let error =
+                collect_human_history_pages(|_| std::future::ready(Ok(pages.pop_front().unwrap())))
+                    .await
+                    .unwrap_err();
+            assert!(error.to_string().contains("changed during pagination"));
+        }
+    }
+
+    #[tokio::test]
+    async fn human_history_deduplicates_pages_and_rejects_a_stalled_cursor() {
+        let server = uuid::Uuid::new_v4();
+        let mut pages = std::collections::VecDeque::from([
+            history_page(server, 9, 9, 2, Some(8)),
+            history_page(server, 9, 8, 2, None),
+        ]);
+        let result =
+            collect_human_history_pages(|_| std::future::ready(Ok(pages.pop_front().unwrap())))
+                .await
+                .unwrap();
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["command-9", "command-8", "command-7"]
+        );
+        let mut pages = std::collections::VecDeque::from([
+            history_page(server, 9, 9, 1, Some(9)),
+            history_page(server, 9, 8, 1, Some(9)),
+        ]);
+        assert!(
+            collect_human_history_pages(|_| std::future::ready(Ok(pages.pop_front().unwrap())))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("did not advance")
+        );
+    }
 
     #[test]
     fn path_segments_are_percent_encoded() {

@@ -11,9 +11,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod features;
+pub use features::*;
+
 /// Shared protocol generation for HTTP DTOs, WebSocket control/timeline
 /// frames, and cross-component compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -955,6 +958,8 @@ pub enum ClientMessage {
         operation_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<HumanLineInput>,
     },
     Write {
         request_id: Uuid,
@@ -1013,6 +1018,32 @@ pub enum ClientMessage {
         /// Optional daemon-enforced, fail-closed serial-context boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sequence_precondition: Option<SequenceWritePrecondition>,
+    },
+    MacroStart {
+        request_id: Uuid,
+        port: String,
+        control_id: Uuid,
+        fence: u64,
+        daemon_epoch: Uuid,
+        generation: u64,
+        operation_id: Uuid,
+        #[serde(default)]
+        expected_run_id: Option<Uuid>,
+        #[serde(default)]
+        sequence_precondition: Option<SequenceWritePrecondition>,
+        spec: MacroRunSpec,
+    },
+    MacroStatus {
+        request_id: Uuid,
+        port: String,
+        execution_id: Uuid,
+    },
+    MacroCancel {
+        request_id: Uuid,
+        port: String,
+        control_id: Uuid,
+        fence: u64,
+        execution_id: Uuid,
     },
     TriggerStart {
         request_id: Uuid,
@@ -1112,6 +1143,9 @@ impl ClientMessage {
             | Self::SendHumanCommand { request_id, .. }
             | Self::Write { request_id, .. }
             | Self::SendBreak { request_id, .. }
+            | Self::MacroStart { request_id, .. }
+            | Self::MacroStatus { request_id, .. }
+            | Self::MacroCancel { request_id, .. }
             | Self::TriggerStart { request_id, .. }
             | Self::TriggerStatus { request_id, .. }
             | Self::TriggerCancel { request_id, .. }
@@ -1182,6 +1216,15 @@ pub enum CommandResult {
     },
     BreakSent {
         event_seq: u64,
+    },
+    MacroStarted {
+        execution: Box<MacroExecutionInfo>,
+    },
+    MacroStatus {
+        execution: Box<MacroExecutionInfo>,
+    },
+    MacroCancelled {
+        execution: Box<MacroExecutionInfo>,
     },
     TriggerStarted {
         trigger: Box<TriggerInfo>,
@@ -2491,7 +2534,7 @@ mod tests {
 
     #[test]
     fn protocol_v7_exposes_independent_model_identity_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
         let profile = serde_json::to_value(model_profile()).unwrap();
         assert!(profile.get("model_names").is_none());
         let family = serde_json::to_value(ModelFamily {
@@ -2572,10 +2615,14 @@ mod tests {
             data: b"status\r".to_vec(),
             operation_id: Some(Uuid::new_v4()),
             description: Some("operator status".into()),
+            input: Some(HumanLineInput {
+                command: "status".into(),
+            }),
         };
         let encoded = serde_json::to_value(&human_command).unwrap();
         assert_eq!(encoded["type"], "send_human_command");
         assert_eq!(encoded["data"], BASE64.encode(b"status\r"));
+        assert_eq!(encoded["input"]["command"], "status");
     }
 
     #[test]

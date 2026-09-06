@@ -120,8 +120,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "ui.input.raw.text",
-        "Keystrokes are sent directly. Ctrl-C sends ETX; Ctrl-] opens local commands.",
-        "按键会直接发送。Ctrl-C 发送 ETX；Ctrl-] 打开本地命令。",
+        "Focused keys go to the device. Ctrl-C / Ctrl-D send signals; Ctrl-] opens local commands.",
+        "输入区获焦后按键发送到设备；Ctrl-C / Ctrl-D 透传控制信号，Ctrl-] 打开本地命令。",
     ),
     (
         "ui.input.title.raw",
@@ -607,8 +607,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.current.modified",
-        "Draft changed; select Save and apply to submit it",
-        "草稿已修改；请选择“保存并应用配置修改”提交",
+        "Draft changed; Enter on a field applies it (shared profiles require confirmation)",
+        "草稿已修改；字段 Enter 即应用（共享 Profile 需确认影响范围）",
     ),
     (
         "menu.current.port.switched",
@@ -979,13 +979,13 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.footer.profiles",
-        "Tab/Shift+Tab switch port · ↑/↓ select · Enter edit · ← back · ? help",
-        "Tab/Shift+Tab 切换串口 · ↑/↓ 选择 · Enter 修改 · ← 返回 · ? 说明",
+        "Tab/Shift+Tab switch port · Enter edit/apply · ← back · ? help",
+        "Tab/Shift+Tab 切换串口 · Enter 编辑/应用 · ← 返回 · ? 说明",
     ),
     (
         "menu.footer.model.configure",
-        "↑/↓ select · Enter add/open · D/Delete remove · ← back · ? help",
-        "↑/↓ 选择 · Enter 新增/进入 · D/Delete 删除 · ← 返回 · ? 说明",
+        "↑/↓ select · Enter/→ expand/add · ← collapse · D/Delete remove · Esc back",
+        "↑/↓ 选择 · Enter/→ 原地展开/新增 · ← 折叠 · D/Delete 删除 · Esc 返回",
     ),
     (
         "menu.footer.delete",
@@ -1344,8 +1344,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     // ---- Bottom help line ----
     (
         "ui.helpline",
-        " Ctrl-] m menu · o profiles · h command purposes · ? help · {} · q quit ",
-        " Ctrl-] m 菜单 · o Profile · h 命令用途 · ? 帮助 · {} · q 退出 ",
+        " Ctrl-] m menu · o profiles · a macros · h purposes · ? help · {} · q quit ",
+        " Ctrl-] m 菜单 · o Profile · a 宏 · h 命令用途 · ? 帮助 · {} · q 退出 ",
     ),
     (
         "ui.scroll.plain",
@@ -1374,14 +1374,14 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.history.select", "Up / Down", "上 / 下"),
     (
         "help.desc.history.select",
-        "Select a Run, action description, or command",
-        "选择 Run、动作说明或具体命令",
+        "Input: browse Human history; focused Agent pane: select a Run or command",
+        "输入区：浏览人工历史；Agent 区获焦时：选择 Run 或命令",
     ),
     ("help.key.history.expand", "Right / Left", "右 / 左"),
     (
         "help.desc.history.expand",
-        "Move one level deeper or back in the three-level tree",
-        "在三层树中进入或返回一个层级",
+        "Input: edit cursor (Right at end accepts grey suggestion); Agent pane: expand/collapse",
+        "输入区：移动光标，行尾右键接受灰字；Agent 区：展开/折叠",
     ),
     (
         "help.key.history.detail",
@@ -1396,8 +1396,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.history.panel", "Ctrl-] h", "Ctrl-] h"),
     (
         "help.desc.history.panel",
-        "Show or hide Agent history",
-        "显示或隐藏 Agent 历史",
+        "Focus Agent history; repeat to hide it; Esc returns to input",
+        "聚焦 Agent 历史，再按隐藏；Esc 返回输入区",
     ),
     (
         "help.key.scroll",
@@ -1418,6 +1418,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.menu", "Ctrl-] m", "Ctrl-] m"),
     ("help.desc.menu", "Open configuration", "打开配置"),
     ("help.key.profile", "Ctrl-] o", "Ctrl-] o"),
+    ("help.key.macros", "Ctrl-] a", "Ctrl-] a"),
+    (
+        "help.desc.macros",
+        "Browse, edit and run reviewed macros",
+        "查看、编辑并运行已审核宏",
+    ),
     (
         "help.desc.profile",
         "Edit current serial configuration",
@@ -1444,8 +1450,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.complete", "Tab", "Tab"),
     (
         "help.desc.complete",
-        "Complete from input history",
-        "从输入历史补全",
+        "Show Human history candidates; Tab cycles, Enter fills only, Esc cancels",
+        "显示人工历史候选；Tab 切换，Enter 只回填，Esc 取消",
     ),
     ("help.key.paste", "Ctrl-Shift-V", "Ctrl-Shift-V"),
     (
@@ -1757,8 +1763,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "st.prefix.hint",
-        "command prefix: 1-9 serial port, m menu, o profiles, h command purposes, / find, l/r mode, PgUp/PgDn scroll, t takeover, c release, ? help",
-        "快捷键前缀：1-9 串口，m 菜单，o Profile，h 命令用途，/ 查找，l/r 模式，PgUp/PgDn 滚动，t 接管，c 释放，? 帮助",
+        "command prefix: 1-9 serial port, m menu, o profiles, a macros, h command purposes, / find, l/r mode, PgUp/PgDn scroll, t takeover, c release, ? help",
+        "快捷键前缀：1-9 串口，m 菜单，o Profile，a 宏，h 命令用途，/ 查找，l/r 模式，PgUp/PgDn 滚动，t 接管，c 释放，? 帮助",
     ),
     (
         "st.line.mode",

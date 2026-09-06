@@ -4,6 +4,14 @@ import WebSocket from 'ws'
 import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import type {
   Actor,
+  HumanCommandHistory,
+  MacroListQuery,
+  MacroListResponse,
+  MacroSaveRequest,
+  MacroDefinition,
+  MacroExecution,
+  MacroRunRequest,
+  ControlLease,
   ModelFamily,
   ModelProfile,
   PendingRunStartApproval,
@@ -98,6 +106,7 @@ export interface ServerData {
   modelProfiles: ModelProfile[]
   modelFamilies: ModelFamily[]
   events: Record<string, TimelineEvent[]>
+  humanHistory?: HumanCommandHistory
 }
 
 class SerialHttpError extends Error {
@@ -138,6 +147,10 @@ export class SerialClient extends EventEmitter {
   private stopped = false
   private connectionVersion = 0
   private actor?: Actor
+  private humanHistory?: HumanCommandHistory
+  private historyRefreshTimer?: ReturnType<typeof setTimeout>
+  private readonly macroSessions = new Map<string, { operationId: string; lease: ControlLease; execution: MacroExecution; release: boolean; timer?: ReturnType<typeof setTimeout>; renewedAt: number }>()
+  private readonly macroStartingPorts = new Set<string>()
   private readonly pending = new Map<string, PendingRequest>()
   private pendingWelcome?: PendingWelcome
   private readonly reconnectLoop: ReconnectLoop
@@ -186,10 +199,12 @@ export class SerialClient extends EventEmitter {
     assertCompatibleProtocol(status.protocol_version)
     this.reconcileEventEpochs(status)
     this.status = status
+    if (this.humanHistory?.server_id !== status.server_id) this.humanHistory = undefined
     this.availablePorts = availablePorts
     this.transportProfiles = transport.profiles
     this.modelProfiles = profiles.profiles
     this.modelFamilies = families.families
+    await this.refreshHumanHistory()
     if (loadHistory) {
       await Promise.all(status.ports.map((configured) => this.loadHistory(configured)))
     }
@@ -205,6 +220,7 @@ export class SerialClient extends EventEmitter {
       transportProfiles: structuredClone(this.transportProfiles),
       modelProfiles: structuredClone(this.modelProfiles),
       modelFamilies: structuredClone(this.modelFamilies),
+      humanHistory: this.humanHistory ? structuredClone(this.humanHistory) : undefined,
       events: Object.fromEntries([...this.events].map(([port, items]) => [port, [...items]]))
     }
   }
@@ -296,19 +312,154 @@ export class SerialClient extends EventEmitter {
   }
 
   async sendCommand(port: string, command: string): Promise<void> {
+    const configured = this.status?.ports.find((item) => item.config.port === port)
+    const eol = configured?.effective_write_eol ?? '\r'
+    const data = command + eol || '\r'
+    await this.sendHumanBytes(port, Buffer.from(data), { command })
+  }
+
+  async sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<void> {
+    if (signal !== 'ctrl_c' && signal !== 'ctrl_d') throw new Error('不支持的人工控制键')
+    await this.sendHumanBytes(port, Buffer.from([signal === 'ctrl_d' ? 0x04 : 0x03]))
+  }
+
+  async queryHumanHistory(query = '', contains = false): Promise<HumanCommandHistory> {
+    const parameters = new URLSearchParams({ limit: '1000' })
+    if (query) parameters.set(contains ? 'contains' : 'prefix', query)
+    return this.get<HumanCommandHistory>(`/api/v1/history/commands?${parameters}`)
+  }
+
+  private async refreshHumanHistory(): Promise<void> {
+    try {
+      const history = await this.queryHumanHistory()
+      if (this.status && history.server_id !== this.status.server_id) return
+      this.humanHistory = history
+    } catch (error) {
+      // An unavailable history must not disable the serial terminal itself.
+      this.emit('notice', `人工历史暂不可用：${asError(error).message}`)
+    }
+  }
+
+  async listMacros(query: MacroListQuery): Promise<MacroListResponse> {
+    const parameters = new URLSearchParams()
+    for (const [key, value] of Object.entries(query)) if (value !== undefined) parameters.set(key, String(value))
+    return this.get<MacroListResponse>(`/api/v1/macros?${parameters}`)
+  }
+
+  async saveMacro(definition: MacroSaveRequest): Promise<{ catalog_revision: number; definition: MacroDefinition }> {
+    return await this.request('/api/v1/macros', { method: 'POST', body: definition }) as { catalog_revision: number; definition: MacroDefinition }
+  }
+
+  async runMacro(port: string, spec: MacroRunRequest): Promise<MacroExecution> {
+    if (this.macroSessions.has(port) || this.macroStartingPorts.has(port)) throw new Error('该串口已有宏正在运行')
+    const socket = this.readySocket
+    if (!socket || socket !== this.socket) throw new Error('实时连接尚未建立')
+    const configured = this.status?.ports.find((item) => item.config.port === port)
+    if (!configured || configured.session_state !== 'online') throw new Error('串口尚未打开')
+    if (configured.control && configured.control.owner.id !== this.actor?.id) {
+      throw new Error('串口由其他人或 Agent 占用，请先在控制台结束当前任务并接管串口')
+    }
+    const owned = configured.control?.owner.id === this.actor?.id ? configured.control : undefined
+    this.macroStartingPorts.add(port)
+    const operationId = randomUUID()
+    let lease: ControlLease | undefined
+    let started = false
+    try {
+      const acquired = owned ? { lease: owned } : await this.control({
+        type: 'acquire_control', request_id: randomUUID(), port, mode: 'queue', ttl_ms: 15_000
+      }, socket) as { lease?: ControlLease }
+      if (!acquired.lease) throw new Error('无法获得串口控制权，未运行宏')
+      lease = acquired.lease
+      let result: { type?: string; execution?: MacroExecution }
+      try {
+        result = await this.control({
+          type: 'macro_start', request_id: randomUUID(), port, control_id: lease.id, fence: lease.fence,
+          daemon_epoch: lease.epoch, generation: lease.generation, operation_id: operationId,
+          expected_run_id: null, sequence_precondition: null, spec
+        }, socket, { outcomeUncertainOnTransportLoss: true, outcomeUncertainErrorCodes: ['write_outcome_uncertain'] }) as typeof result
+      } catch (error) {
+        if (!(error instanceof HumanCommandOutcomeUncertainError)) throw error
+        // The daemon execution id equals operation_id. Only observe that id;
+        // never replay MacroStart when the acknowledgement may have been lost.
+        const observed = await this.control({ type: 'macro_status', request_id: randomUUID(), port, execution_id: operationId }).catch(() => undefined) as { type?: string; execution?: MacroExecution } | undefined
+        if (observed?.type !== 'macro_status' || observed.execution?.id !== operationId || observed.execution.daemon_epoch !== lease.epoch || observed.execution.generation !== lease.generation) {
+          throw new Error(`宏启动结果无法确认（执行号 ${operationId}），未自动重试。请先查看串口记录并确认宏已停止。`)
+        }
+        result = { type: 'macro_started', execution: observed.execution }
+      }
+      if (result.type !== 'macro_started' || !result.execution) throw new Error('宏启动结果不明确，请查看串口记录，勿直接重试')
+      started = true
+      this.macroSessions.set(port, { operationId, lease, execution: result.execution, release: !owned, renewedAt: Date.now() })
+      this.emit('macro', result.execution)
+      this.scheduleMacroPoll(port)
+      return result.execution
+    } finally {
+      this.macroStartingPorts.delete(port)
+      if (!started && !owned && lease) await this.control({ type: 'release_control', request_id: randomUUID(), port, control_id: lease.id, fence: lease.fence }, socket).catch(() => undefined)
+    }
+  }
+
+  async cancelMacro(port: string, executionId: string): Promise<MacroExecution> {
+    const session = this.macroSessions.get(port)
+    if (!session || session.execution.id !== executionId) throw new Error('该宏不属于当前 App 执行会话')
+    const result = await this.control({
+      type: 'macro_cancel', request_id: randomUUID(), port, execution_id: executionId,
+      control_id: session.lease.id, fence: session.lease.fence
+    }) as { type?: string; execution?: MacroExecution }
+    if (result.type !== 'macro_cancelled' || !result.execution) throw new Error('后端未确认宏停止，请查看串口记录')
+    session.execution = result.execution
+    this.emit('macro', result.execution)
+    return result.execution
+  }
+
+  private scheduleMacroPoll(port: string): void {
+    const session = this.macroSessions.get(port)
+    if (!session || this.stopped) return
+    session.timer = setTimeout(() => { void this.pollMacro(port) }, 250)
+  }
+
+  private async pollMacro(port: string): Promise<void> {
+    const session = this.macroSessions.get(port)
+    if (!session || this.stopped) return
+    try {
+      const result = await this.control({ type: 'macro_status', request_id: randomUUID(), port, execution_id: session.execution.id }) as { type?: string; execution?: MacroExecution }
+      if (result.type !== 'macro_status' || !result.execution) throw new Error('后端未返回宏执行状态')
+      session.execution = result.execution
+      this.emit('macro', result.execution)
+      if (['running', 'stopping'].includes(result.execution.status) && Date.now() - session.renewedAt >= 3_000) {
+        const renewed = await this.control({
+          type: 'renew_control', request_id: randomUUID(), port, control_id: session.lease.id,
+          fence: session.lease.fence, ttl_ms: 15_000
+        }) as { lease?: ControlLease }
+        if (!renewed.lease) throw new Error('宏控制权续租失败')
+        session.lease = renewed.lease
+        session.renewedAt = Date.now()
+      }
+      if (['running', 'stopping'].includes(result.execution.status)) this.scheduleMacroPoll(port)
+      else {
+        this.macroSessions.delete(port)
+        if (session.release && result.execution.status !== 'interrupted_by_user') await this.control({ type: 'release_control', request_id: randomUUID(), port, control_id: session.lease.id, fence: session.lease.fence }).catch(() => undefined)
+      }
+    } catch (error) {
+      this.macroSessions.delete(port)
+      this.emit('macro', { ...session.execution, outcome_uncertain: true, message: `无法确认最新执行结果：${asError(error).message}。请先查看串口，勿直接重跑。` })
+    }
+  }
+
+  private async sendHumanBytes(port: string, data: Buffer, input?: { command: string }): Promise<void> {
     const socket = this.readySocket
     if (!socket || this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('实时连接尚未建立')
     }
     const configured = this.status?.ports.find((item) => item.config.port === port)
     if (!configured) throw new Error(`未找到串口 ${port}`)
-    const eol = configured?.effective_write_eol ?? '\r'
     const result = await this.control(buildHumanCommandMessage({
       requestId: randomUUID(),
       operationId: randomUUID(),
       port,
       expectedGeneration: configured.generation,
-      data: Buffer.from(`${command}${eol}`).toString('base64')
+      data: data.toString('base64'),
+      input
     }), socket, {
       outcomeUncertainOnTransportLoss: true,
       outcomeUncertainErrorCodes: ['write_outcome_uncertain']
@@ -344,6 +495,11 @@ export class SerialClient extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    for (const session of this.macroSessions.values()) if (session.timer) clearTimeout(session.timer)
+    this.macroSessions.clear()
+    this.macroStartingPorts.clear()
+    if (this.historyRefreshTimer) clearTimeout(this.historyRefreshTimer)
+    this.historyRefreshTimer = undefined
     this.stopped = true
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
@@ -580,6 +736,12 @@ export class SerialClient extends EventEmitter {
   }
 
   private appendEvent(event: TimelineEvent): void {
+    if (event.direction === 'tx' && event.actor?.kind === 'human' && !event.replay && !this.historyRefreshTimer) {
+      this.historyRefreshTimer = setTimeout(() => {
+        this.historyRefreshTimer = undefined
+        if (!this.stopped) void this.refreshHumanHistory().then(() => this.emit('snapshot'))
+      }, 150)
+    }
     this.assertTimelineIdentity(event)
     let items = this.events.get(event.port) ?? []
     if (items.some((item) => item.daemon_epoch !== event.daemon_epoch)) {
@@ -913,6 +1075,7 @@ export function buildHumanCommandMessage(value: {
   port: string
   expectedGeneration: number
   data: string
+  input?: { command: string }
 }): WireControl {
   return {
     type: 'send_human_command',
@@ -921,7 +1084,8 @@ export function buildHumanCommandMessage(value: {
     expected_generation: value.expectedGeneration,
     data: value.data,
     operation_id: value.operationId,
-    description: null
+    description: null,
+    ...(value.input ? { input: value.input } : {})
   }
 }
 

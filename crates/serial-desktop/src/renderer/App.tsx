@@ -1,16 +1,18 @@
-import { Command, LoaderCircle, Moon, Power, RefreshCw, Server, Settings2, Square, Sun, Wifi, WifiOff, X } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { Command, FileCode2, LoaderCircle, Moon, Power, RefreshCw, Server, Settings2, Square, Sun, Wifi, WifiOff, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import type {
   DesktopEvent,
   DesktopSnapshot,
   HumanCommandSubmission,
+  MacroExecution,
   RunStartDecision,
   ThemePreference
 } from '../shared/contracts'
 import { isApprovalActionable } from '../shared/run-start'
 import { AgentHistory } from './components/AgentHistory'
 import { CommandBar } from './components/CommandBar'
+import { MacroPage, type MacroDraftStore } from './components/MacroPage'
 import { PortRail } from './components/PortRail'
 import { SettingsPage } from './components/SettingsPage'
 import { TerminalPane } from './components/TerminalPane'
@@ -18,8 +20,9 @@ import { RunStartApprovalModal } from './components/RunStartApprovalModal'
 import { buildAgentHistory, locateCommandOutput, type AgentCommand } from './lib/history'
 import { resolveBackendControl } from './lib/backend-control'
 import iconUrl from './assets/icon.png'
+import type { CommandBuffer } from './lib/command-editor'
 
-type Page = 'console' | 'settings'
+type Page = 'console' | 'settings' | 'macros'
 
 export function App(): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>()
@@ -29,8 +32,13 @@ export function App(): React.JSX.Element {
   const [toast, setToast] = useState<{ kind: 'notice' | 'error'; message: string }>()
   const [expiredApprovals, setExpiredApprovals] = useState<Set<string>>(() => new Set())
   const [loadingMessage, setLoadingMessage] = useState('正在启动本地工作台…')
+  const [macroExecution, setMacroExecution] = useState<MacroExecution>()
+  const macroDrafts = useRef<MacroDraftStore>({ drafts: new Map() })
+  const commandDrafts = useRef(new Map<string, CommandBuffer>())
+  const humanHistory = useMemo(() => snapshot?.humanHistory?.entries.map((item) => item.command) ?? [], [snapshot?.humanHistory])
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
+    if (event.type === 'macro') setMacroExecution(event.execution)
     if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'connection' || event.type === 'service') {
       setSnapshot((current) => mergeDesktopSnapshotEvent(current, event))
     }
@@ -204,6 +212,13 @@ export function App(): React.JSX.Element {
     )
   }
 
+  if (page === 'macros') return <div className="app-frame">
+    <WindowBar snapshot={snapshot} page={page} onPage={setPage} onStartBackend={startBackend} onStopBackend={stopBackend} onSavePreferences={savePreferences} />
+    <MacroPage ports={snapshot.configuredPorts} modelFamilies={snapshot.modelFamilies} connected={snapshot.connection === 'connected'} selectedPort={selectedPort} drafts={macroDrafts.current} execution={macroExecution} onExecution={setMacroExecution} />
+    <Toast value={toast} onClose={() => setToast(undefined)} />
+    {pendingApproval && <RunStartApprovalModal approval={pendingApproval} key={pendingApproval.id} onDecide={decideRunStart} onExpired={() => setExpiredApprovals((current) => new Set(current).add(pendingApproval.id))} />}
+  </div>
+
   const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
   const events = selectedPort ? snapshot.events[selectedPort] ?? [] : []
   const history = buildAgentHistory(events)
@@ -239,12 +254,17 @@ export function App(): React.JSX.Element {
             onClearCommand={() => setSelectedCommand(undefined)}
           />
           <CommandBar
+            key={snapshot.serverId ?? snapshot.preferences.endpoint}
             port={selectedPort}
+            drafts={commandDrafts.current}
+            humanHistory={humanHistory}
+            onQueryHistory={async (query, contains) => (await window.serial.queryHumanHistory(query, contains)).entries.map((entry) => entry.command)}
             disabled={!configuredPort || configuredPort.session_state !== 'online' || snapshot.connection !== 'connected'}
             onSend={(command) => submitHumanCommand(
               () => window.serial.sendCommand(selectedPort!, command),
               setToast
             )}
+            onSignal={(signal) => submitHumanCommand(() => window.serial.sendSignal(selectedPort!, signal), setToast)}
           />
         </div>
         <AgentHistory items={history} selectedCommand={currentSelectedCommand} onSelect={setSelectedCommand} />
@@ -314,6 +334,7 @@ export function WindowBar({ snapshot, page, onPage, onStartBackend, onStopBacken
       <div className="brand-lockup"><BrandMark /><div><strong>Serial Platform</strong><small>Human × Agent Workspace</small></div></div>
       <nav className="view-tabs">
         <button className={page === 'console' ? 'is-active' : ''} onClick={() => onPage('console')} type="button"><Command size={14} /> 控制台</button>
+        <button className={page === 'macros' ? 'is-active' : ''} onClick={() => onPage('macros')} type="button"><FileCode2 size={14} /> 宏</button>
         <button className={page === 'settings' ? 'is-active' : ''} onClick={() => onPage('settings')} type="button"><Settings2 size={14} /> 配置</button>
       </nav>
       <div className="window-actions">

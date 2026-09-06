@@ -1,6 +1,6 @@
 # Serial Platform Architecture
 
-本文描述 Serial Platform 的当前架构。具体 JSON 契约以 [protocol v7](./docs/PROTOCOL.md) 为准，Agent 工具以 [MCP 工具目录](./docs/MCP_TOOLS.md) 或 `serial mcp --dump-tools` 为准。
+本文描述 Serial Platform 的当前架构。具体 JSON 契约以 [protocol v8](./docs/PROTOCOL.md) 为准，Agent 工具以 [MCP 工具目录](./docs/MCP_TOOLS.md) 或 `serial mcp --dump-tools` 为准。
 
 ## 产品边界
 
@@ -304,10 +304,10 @@ renderer 是 React 视图，不直接访问后端。控制台为三栏布局：�
 
 Streamable HTTP 没有认证和 TLS。listener 必须是一个精确单播地址，拒绝 IPv4/IPv6 unspecified、multicast 和 IPv4 broadcast；非 loopback 只允许用于受信 host-only VM interface，进程会打印安全警告，并要求用主机防火墙限制访问。`Origin` 可以省略；存在时必须是同端口、无 credentials/path/query/fragment 的 `http://` origin，host 是 listener 的精确 numeric IP。仅当 listener 本身为 loopback 时额外允许 `localhost`。这项检查是浏览器跨站缓解，不是认证，不能据此把 endpoint 暴露到 LAN 或公共网络。
 
-两种 transport 共享以下固定 16 个工具和相同结构化结果：
+两种 transport 共享以下固定 18 个工具和相同结构化结果：
 
 ```text
-devices model_identity_set read command command_sequence signal trigger wait
+devices model_identity_set read command command_sequence signal macro_list macro_save macro_run wait
 search monitor_start monitor_list monitor_status monitor_incidents monitor_stop
 run_start run_end
 ```
@@ -316,7 +316,7 @@ HTTP notification 返回 202；`GET /mcp` 不提供 SSE session。
 
 MCP 公开面中，`devices` 是唯一的设备发现工具：它返回串口名、两级机型身份、Agent 需要的连接/Control/Run/Trigger/cursor、pending Run-start 与 Human read-gate 状态，以及当前有效的 Shell/U-Boot 提示符。它不返回行为 Model Profile 名、Transport/UART 参数、EOL/echo 或写入节奏。`model_identity_set` 只绑定或解绑人工预先配置的 family/name；Profile 和 Model Family 目录仍由 TUI、Electron 或 HTTP 配置。
 
-HTTP adapter 还提供仅供统一启动器使用的 `GET /health`。启动器据此确认精确 IP:3211 上确实是 protocol v7 `serial-mcp`，并且它连接的 `server_id`、`daemon_epoch` 和 endpoint 与当前选中的 `seriald` 完全一致；普通 TCP listener、旧协议 adapter 或连接到另一后端的 adapter 都不会被误复用。HTTP adapter 在启动时固定这组后端身份，若同一 endpoint 换成新的 daemon epoch，会拒绝重连，重启 adapter 后才会发布并使用新身份。
+HTTP adapter 还提供仅供统一启动器使用的 `GET /health`。启动器据此确认精确 IP:3211 上确实是 protocol v8 `serial-mcp`，并且它连接的 `server_id`、`daemon_epoch` 和 endpoint 与当前选中的 `seriald` 完全一致；普通 TCP listener、旧协议 adapter 或连接到另一后端的 adapter 都不会被误复用。HTTP adapter 在启动时固定这组后端身份，若同一 endpoint 换成新的 daemon epoch，会拒绝重连，重启 adapter 后才会发布并使用新身份。
 
 `run_start` 在 idle 时得到原子 grant+Run，在 Human holder 存在时等待该 holder 的显式批准。`command` 和 `command_sequence` 只有在 daemon 持久化权威 capture 后才把完成范围交付给模型。Human command 触发 read gate 时，物理工具返回 `user_command_used`；live `read(scope=tail|continue)` 必须实际包含 Human TX 才会 ACK，`wait` 和 archive read 不会。
 
@@ -335,9 +335,9 @@ serial
   └── serialctl     foreground TUI
 ```
 
-每个 resolved data root 在打开 journal 前取得 `data/seriald.lock`，保证只有一个后端实例。后端监听成功后发布 `data/active-endpoint.json`，其中记录实际 endpoint、Socket 地址、`server_id`、`daemon_epoch`、protocol version 和 PID。发现端只有在 `/api/v1/health` 返回 `status=ok`，且身份、周期和 protocol v7 与记录完全一致时才接受该端点；失效记录不阻塞新实例取得 lock 并覆写。精确 bind 保留其 IP，通配 bind 发布本机可连接的 loopback 地址。
+每个 resolved data root 在打开 journal 前取得 `data/seriald.lock`，保证只有一个后端实例。后端监听成功后发布 `data/active-endpoint.json`，其中记录实际 endpoint、Socket 地址、`server_id`、`daemon_epoch`、protocol version 和 PID。发现端只有在 `/api/v1/health` 返回 `status=ok`，且身份、周期和 protocol v8 与记录完全一致时才接受该端点；失效记录不阻塞新实例取得 lock 并覆写。精确 bind 保留其 IP，通配 bind 发布本机可连接的 loopback 地址。
 
-活动端点是运行时事实，因此默认 endpoint 和自定义 endpoint 使用相同规则。App 先启动时，随后运行的 `serial` 复用 App 的后端；`serial` 先启动时，App 发现并复用该后端。App 对 preferred endpoint 也要求有效的 protocol v7 health 和服务身份，发现 marker 时还会逐项核对 health。两者并发首启时，首个进程取得 data-root lock，失败的一方等待并重新发现 winner；全新配置也只原子创建一次，所有启动器读取同一个 `server_id`。两者只管理自己启动的进程：拥有后端的一方退出后，仍在运行的外部客户端不会自动 failover，重新启动后才重新发现或创建服务。`serial` 在选定后端后再保证该精确活动 IP 上的 HTTP MCP 可用，并只回收自己补齐的 MCP 进程。
+活动端点是运行时事实，因此默认 endpoint 和自定义 endpoint 使用相同规则。App 先启动时，随后运行的 `serial` 复用 App 的后端；`serial` 先启动时，App 发现并复用该后端。App 对 preferred endpoint 也要求有效的 protocol v8 health 和服务身份，发现 marker 时还会逐项核对 health。两者并发首启时，首个进程取得 data-root lock，失败的一方等待并重新发现 winner；全新配置也只原子创建一次，所有启动器读取同一个 `server_id`。两者只管理自己启动的进程：拥有后端的一方退出后，仍在运行的外部客户端不会自动 failover，重新启动后才重新发现或创建服务。`serial` 在选定后端后再保证该精确活动 IP 上的 HTTP MCP 可用，并只回收自己补齐的 MCP 进程。
 
 ### 分开运行
 

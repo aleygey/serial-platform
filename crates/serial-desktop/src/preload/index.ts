@@ -12,6 +12,12 @@ const bridge: DesktopBridge = {
   bootstrap: () => ipcRenderer.invoke('serial:bootstrap'),
   refresh: () => ipcRenderer.invoke('serial:refresh'),
   sendCommand: (port, command) => ipcRenderer.invoke('serial:send-command', port, command),
+  sendSignal: (port, signal) => ipcRenderer.invoke('serial:send-signal', port, signal),
+  queryHumanHistory: (query, contains) => ipcRenderer.invoke('serial:human-history', query, contains),
+  listMacros: (query) => ipcRenderer.invoke('serial:macro-list', query),
+  saveMacro: (definition) => ipcRenderer.invoke('serial:macro-save', definition),
+  runMacro: (port, spec) => ipcRenderer.invoke('serial:macro-run', port, spec),
+  cancelMacro: (port, executionId) => ipcRenderer.invoke('serial:macro-cancel', port, executionId),
   decideRunStart: (port, approvalId, decision) =>
     ipcRenderer.invoke('serial:decide-run-start', port, approvalId, decision),
   setPortOpen: (port, open) => ipcRenderer.invoke('serial:set-port-open', port, open),

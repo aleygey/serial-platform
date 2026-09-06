@@ -7,6 +7,7 @@ mod doctor;
 mod history;
 mod i18n;
 mod profile;
+mod session_search;
 mod tui;
 mod ws;
 

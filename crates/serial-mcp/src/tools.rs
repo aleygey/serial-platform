@@ -11,20 +11,17 @@ use serde_json::{Value, json};
 use serial_protocol::{
     Actor, ActorKind, CommandCaptureCompletionKind, CommandCaptureConfidence,
     CommandCaptureMatcher, CommandCaptureMatcherKind, CommandCaptureReport, ConfigurePortsRequest,
-    CreateMonitorRequest, Cursor, DEFAULT_TRIGGER_INTERVAL_MS, DEFAULT_TRIGGER_MAX_FIRES,
-    DEFAULT_TRIGGER_TIMEOUT_MS, Direction, EchoMode, EventKind, EventQuery, EventQueryResponse,
+    CreateMonitorRequest, Cursor, Direction, EchoMode, EventKind, EventQuery, EventQueryResponse,
     MAX_BREAK_DURATION_MS, MAX_COMMAND_CAPTURE_DETAIL_BYTES, MAX_COMMAND_DESCRIPTION_BYTES,
     MAX_MONITOR_MATCHERS, MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES,
-    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MAX_TRIGGER_ACTION_BYTES, MAX_TRIGGER_FIRES,
-    MAX_TRIGGER_INITIAL_WRITE_BYTES, MAX_TRIGGER_INTERVAL_MS, MAX_TRIGGER_PATTERN_BYTES,
-    MAX_TRIGGER_PATTERNS, MAX_TRIGGER_TIMEOUT_MS, MAX_TRIGGER_TOTAL_BYTES, MIN_BREAK_DURATION_MS,
-    MIN_TRIGGER_INTERVAL_MS, MIN_TRIGGER_TIMEOUT_MS, MonitorMatcher, PROTOCOL_VERSION,
-    SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse, TriggerInfo,
-    TriggerSpec, TriggerStatus, WritePacing,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MIN_BREAK_DURATION_MS, MonitorMatcher, PROTOCOL_VERSION,
+    SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse, WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
+
+mod macros;
 
 use crate::{
     api::ApiClient,
@@ -43,10 +40,6 @@ const WRITE_OUTCOME_UNCERTAIN_RETRY_HINT: &str = "Do not retry automatically. In
     operation in the TX/control timeline and confirm the device's current state before deciding \
     whether another physical action is safe.";
 const MAX_MONITOR_DESCRIPTION_BYTES: usize = 1024;
-const TRIGGER_STATUS_POLL: Duration = Duration::from_millis(50);
-const TRIGGER_STATUS_MARGIN: Duration =
-    Duration::from_millis(MAX_PHYSICAL_WRITE_TIMEOUT_MS + 5_000);
-const TRIGGER_CANCEL_MARGIN: Duration = Duration::from_secs(5);
 
 struct PreparedCommandStep {
     bytes: Vec<u8>,
@@ -197,6 +190,9 @@ impl AgentTools {
     }
 
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
+        if name == "macro_run" {
+            return self.macro_run_cancellable(arguments, None).await;
+        }
         let mut output = match name {
             "devices" => self.devices(parse(arguments)?).await,
             "model_identity_set" => self.model_identity_set(parse(arguments)?).await,
@@ -204,7 +200,8 @@ impl AgentTools {
             "command" => self.command(parse(arguments)?).await,
             "command_sequence" => self.command_sequence(parse(arguments)?).await,
             "signal" => self.signal(parse(arguments)?).await,
-            "trigger" => self.trigger(parse(arguments)?).await,
+            "macro_list" => self.macro_list(parse(arguments)?).await,
+            "macro_save" => self.macro_save(parse(arguments)?).await,
             "wait" => self.wait(parse(arguments)?).await,
             "search" => self.search(parse(arguments)?).await,
             "monitor_start" => self.monitor_start(parse(arguments)?).await,
@@ -228,7 +225,7 @@ impl AgentTools {
     async fn attach_recent_context(&self, tool_name: &str, output: &mut Value) {
         if !matches!(
             tool_name,
-            "read" | "command" | "command_sequence" | "signal" | "trigger" | "wait" | "run_start"
+            "read" | "command" | "command_sequence" | "signal" | "macro_run" | "wait" | "run_start"
         ) {
             return;
         }
@@ -449,6 +446,7 @@ impl AgentTools {
         Ok(json!({
             "daemon_epoch": status.daemon_epoch,
             "ports": ports,
+            "macro_catalog": self.macro_context().await,
             "selection_note": "Choose a port explicitly and confirm model_family and model_name match the physically connected device before writing. If they do not match, call model_identity_set with the exact existing family/name; if that identity is not in the human-managed catalog, ask the user to create it in the TUI/App first. command, command_sequence, and wait automatically use command_prompts; pass expect or regex to override prompt matching for a call. A Run scopes evidence; it does not reset the device."
         }))
     }
@@ -517,6 +515,7 @@ impl AgentTools {
     }
 
     async fn read(&self, args: ReadArgs) -> Result<Value> {
+        validate_read_exclusions(&args.exclude_patterns)?;
         let slot = self.slot(&args.port).await?;
         let scope = args.scope.as_deref().unwrap_or("tail");
         if args.through_seq.is_some() && scope != "archive" {
@@ -593,7 +592,14 @@ impl AgentTools {
             self.acknowledge_human_context_from_read(&slot, epoch, &response)
                 .await
         };
-        let mut output = render_response(
+        let filtering_bypassed =
+            human_recovery_cursor.is_some() || human_ack.pending_revision.is_some();
+        let exclusions = if filtering_bypassed {
+            &[][..]
+        } else {
+            args.exclude_patterns.as_slice()
+        };
+        let mut output = render_response_with_exclusions(
             &slot,
             epoch,
             response,
@@ -606,7 +612,25 @@ impl AgentTools {
                 match_excerpt: None,
             },
             scope,
+            exclusions,
         );
+        if !args.exclude_patterns.is_empty() {
+            output["display_filter"] = json!({"exclude_patterns":args.exclude_patterns,"mode":"literal_substring_complete_rx_line","applied":!filtering_bypassed,"excluded_lines":output["excluded_lines"].as_u64().unwrap_or(0),"evidence_unchanged":true,"boundary_fragments_retained":true});
+            output["display_filter"]["effective_patterns"] = json!(exclusions);
+            if filtering_bypassed {
+                output["display_filter"]["bypass_reason"] =
+                    json!("Human intervention context must be shown unfiltered");
+            } else {
+                let warning = json!(
+                    "Display filtering is active: complete RX lines containing exclude_patterns may be hidden. An empty display does not prove no output. Remove exclude_patterns to inspect unfiltered evidence."
+                );
+                if let Some(warnings) = output.get_mut("warnings").and_then(Value::as_array_mut) {
+                    warnings.push(warning);
+                } else {
+                    output["warnings"] = json!([warning]);
+                }
+            }
+        }
         if scope == "tail" {
             output["source"] = json!("live_ring");
             output["bounded_tail"] = json!(true);
@@ -1687,336 +1711,6 @@ impl AgentTools {
         }))
     }
 
-    async fn trigger(&self, args: TriggerArgs) -> Result<Value> {
-        let run_use = self
-            .session
-            .authorize_run_use(args.run_handle.clone())
-            .await?;
-        let _write_guard = self.write_guard(&run_use.port).await;
-        let slot = self.slot_online_for_physical_action(&run_use.port).await?;
-        let active_run = matching_active_run(&slot, run_use.run_id, "trigger")?;
-        self.ensure_serial_context_unchanged(&slot).await?;
-        let expected_run_id = run_use.run_id;
-        if let Some(active) = &slot.active_trigger {
-            bail!(
-                "port already has Trigger {} in status {:?}; wait for it to finish or cancel it \
-                 from its owning client",
-                active.id,
-                active.status
-            );
-        }
-
-        let spec = trigger_spec(&args)?;
-        let operation_id = Uuid::new_v4();
-        let attached_after_seq = slot.head_seq;
-        let capture = Capture::attach(
-            self.api.endpoint(),
-            &self.actor_label,
-            run_use.port.clone(),
-            Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: attached_after_seq,
-            },
-            self.capture_limits,
-        )
-        .await?;
-
-        // Capture uses an independent subscribed socket. The control session
-        // only starts/statuses the daemon Job and stays available for its
-        // normal periodic Run lease renewal.
-        let capture_timeout = Duration::from_millis(spec.timeout_ms)
-            .saturating_add(TRIGGER_STATUS_MARGIN)
-            .saturating_add(TRIGGER_CANCEL_MARGIN);
-        let (capture_stop, capture_terminal) = oneshot::channel();
-        let capture_task =
-            tokio::spawn(capture.collect_until_seq(capture_terminal, capture_timeout));
-
-        let started = match self
-            .session
-            .trigger_start(
-                run_use.port.clone(),
-                slot.daemon_epoch,
-                slot.generation,
-                operation_id,
-                expected_run_id,
-                run_use.run_token,
-                serial_context_precondition(&slot),
-                spec,
-            )
-            .await
-        {
-            Ok(trigger) => trigger,
-            Err(error) if error.downcast_ref::<SequenceBoundaryRejected>().is_some() => {
-                let _ = capture_stop.send(None);
-                let _ = capture_task.await;
-                return Err(self.context_changed_after_boundary(&slot, &error).await);
-            }
-            Err(error) => {
-                let _ = capture_stop.send(None);
-                let _ = capture_task.await;
-                return Err(self
-                    .session_run_error(&slot, expected_run_id, active_run.start_seq, error, true)
-                    .await);
-            }
-        };
-        let started_id = started.id;
-        let terminal = match self
-            .wait_trigger_terminal(
-                &slot,
-                expected_run_id,
-                run_use.run_token,
-                operation_id,
-                started,
-            )
-            .await
-        {
-            Ok(trigger) => trigger,
-            Err(error) => {
-                let cancel = self
-                    .session
-                    .trigger_cancel(
-                        run_use.port.clone(),
-                        slot.daemon_epoch,
-                        slot.generation,
-                        started_id,
-                        expected_run_id,
-                        run_use.run_token,
-                    )
-                    .await;
-                let _ = capture_stop.send(None);
-                let _ = capture_task.await;
-                match cancel {
-                    Ok(trigger) => bail!(
-                        "{error}; best-effort cancellation returned status {:?}, but the \
-                         original status/identity failure prevents presenting this as a trusted \
-                         normal result. Inspect Trigger {} and the TX timeline before retrying.",
-                        trigger.status,
-                        trigger.id
-                    ),
-                    Err(cancel_error) => bail!(
-                        "{error}; best-effort cancellation also failed ({cancel_error}). Trigger \
-                         {started_id} has no authoritative terminal result at this client; its \
-                         outcome is uncertain. Inspect active_trigger/TX timeline before retrying."
-                    ),
-                }
-            }
-        };
-        let Some(terminal_end_seq) = terminal.end_seq else {
-            let _ = capture_stop.send(None);
-            let _ = capture_task.await;
-            bail!(
-                "seriald returned terminal Trigger {} without end_seq; its evidence boundary is \
-                 not authoritative",
-                terminal.id
-            );
-        };
-        if terminal_end_seq < terminal.start_seq {
-            let _ = capture_stop.send(None);
-            let _ = capture_task.await;
-            bail!(
-                "seriald returned Trigger {} with invalid evidence range {}..={terminal_end_seq}",
-                terminal.id,
-                terminal.start_seq
-            );
-        }
-        let _ = capture_stop.send(Some(terminal_end_seq));
-        let capture = capture_task
-            .await
-            .context("trigger capture task stopped unexpectedly")?;
-        let run_ownership_retained = self
-            .session
-            .run_ownership_retained(slot.config.port.clone(), expected_run_id, run_use.run_token)
-            .await
-            .unwrap_or(false);
-
-        let trigger_events: Vec<_> = capture
-            .events
-            .iter()
-            .filter(|event| {
-                trigger_evidence_contains(event.seq, terminal.start_seq, terminal_end_seq)
-            })
-            .cloned()
-            .collect();
-        let rendered = render_events(
-            &trigger_events,
-            RenderOptions {
-                max_chars: DEFAULT_TEXT_CHARS,
-                include_raw: false,
-                echo: None,
-                collapse_repeats: true,
-                include_events: false,
-                match_excerpt: None,
-            },
-        );
-        let observed_through_seq = capture.through_seq;
-        let last_seq = terminal_end_seq;
-        self.remember_live_cursor(
-            &slot.config.port,
-            Cursor {
-                epoch: slot.daemon_epoch,
-                after_seq: last_seq,
-            },
-        );
-        let matched_pattern = terminal
-            .matched_pattern
-            .as_deref()
-            .map(|pattern| String::from_utf8_lossy(pattern).into_owned());
-        let outcome = trigger_status_label(terminal.status);
-        let send_budget_exhausted = trigger_send_budget_exhausted(&terminal);
-        let capture_complete = !capture.truncated
-            && capture.gaps.is_empty()
-            && matches!(&capture.completion, Completion::Signal(_))
-            && observed_through_seq.is_some_and(|through| through >= terminal_end_seq);
-        let gap = !capture.gaps.is_empty();
-        let truncated = capture.truncated || rendered.text_truncated;
-        let confidence = if gap {
-            "unreliable"
-        } else if truncated || !capture_complete {
-            "partial"
-        } else {
-            "high"
-        };
-        let takeover_diagnosis = if matches!(
-            terminal.status,
-            TriggerStatus::ControlLost | TriggerStatus::RunLost
-        ) {
-            self.diagnose_run_abort(&slot, expected_run_id, active_run.start_seq)
-                .await
-        } else {
-            None
-        };
-        let mut output = json!({
-            "port": slot.config.port,
-            "run_handle": args.run_handle,
-            "run_open": run_ownership_retained,
-            "outcome": outcome,
-            "matched": terminal.status.is_matched(),
-            "fires": terminal.fires_confirmed,
-            "fire_budget": terminal.spec.max_fires,
-            "send_budget_exhausted": send_budget_exhausted,
-            "confidence": confidence,
-            "text": rendered.text,
-            "truncated": truncated,
-            "gap": gap,
-            "cursor": {"epoch": slot.daemon_epoch, "after_seq": last_seq}
-        });
-        if let Some(matched_pattern) = matched_pattern {
-            output["matched_pattern"] = json!(matched_pattern);
-        }
-        let confirmed_human_takeover = takeover_diagnosis.as_ref().is_some_and(|diagnosis| {
-            attach_trigger_takeover_diagnosis(&mut output, expected_run_id, diagnosis)
-        });
-        let mut warnings = Vec::new();
-        if gap {
-            warnings.push("RX gap; Trigger evidence is unreliable".to_string());
-        }
-        if capture.truncated {
-            warnings.push("Trigger capture hit its hard limit".to_string());
-        }
-        if !capture_complete {
-            warnings
-                .push("Trigger terminal sequence was not fully observed by capture".to_string());
-        }
-        if !run_ownership_retained {
-            warnings.push("MCP no longer owns the Run; start a new Run before writing".to_string());
-        }
-        if confirmed_human_takeover {
-            warnings.push(
-                "Human takeover aborted the Run after seriald accepted the Trigger Job; kickoff or action bytes may already have reached the physical DUT (no_bytes_written=false)"
-                    .to_string(),
-            );
-        }
-        if terminal.status.is_matched()
-            && send_budget_exhausted
-            && !terminal.spec.stop_contains.is_empty()
-        {
-            warnings.push(
-                "The stop matcher remained armed after the final permitted action write; no extra action writes were scheduled"
-                    .to_string(),
-            );
-        }
-        if !terminal.status.is_matched() {
-            warnings.push(trigger_guidance(&terminal).to_string());
-        }
-        if !warnings.is_empty() {
-            output["warnings"] = json!(warnings);
-        }
-        attach_omission(&mut output, &rendered);
-        Ok(output)
-    }
-
-    async fn wait_trigger_terminal(
-        &self,
-        slot: &SlotSnapshot,
-        expected_run_id: Uuid,
-        run_token: Uuid,
-        operation_id: Uuid,
-        mut trigger: TriggerInfo,
-    ) -> Result<TriggerInfo> {
-        let trigger_id = trigger.id;
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(trigger.spec.timeout_ms)
-            + TRIGGER_STATUS_MARGIN;
-        loop {
-            validate_trigger_identity(&trigger, slot, expected_run_id, operation_id, trigger_id)?;
-            if trigger.status.is_terminal() {
-                return Ok(trigger);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(TRIGGER_STATUS_POLL).await;
-            trigger = self
-                .session
-                .trigger_status(
-                    slot.config.port.clone(),
-                    slot.daemon_epoch,
-                    slot.generation,
-                    trigger_id,
-                )
-                .await?;
-        }
-
-        // seriald should terminate at its own timeout. If it has not, request
-        // cancellation rather than allowing a Job to outlive this tool call.
-        trigger = self
-            .session
-            .trigger_cancel(
-                slot.config.port.clone(),
-                slot.daemon_epoch,
-                slot.generation,
-                trigger_id,
-                expected_run_id,
-                run_token,
-            )
-            .await
-            .context("Trigger exceeded its status deadline and cancellation failed")?;
-        let cancel_deadline = tokio::time::Instant::now() + TRIGGER_CANCEL_MARGIN;
-        loop {
-            validate_trigger_identity(&trigger, slot, expected_run_id, operation_id, trigger_id)?;
-            if trigger.status.is_terminal() {
-                return Ok(trigger);
-            }
-            if tokio::time::Instant::now() >= cancel_deadline {
-                bail!(
-                    "Trigger {trigger_id} remained {:?} after cancellation; no authoritative \
-                     terminal outcome was received",
-                    trigger.status
-                );
-            }
-            tokio::time::sleep(TRIGGER_STATUS_POLL).await;
-            trigger = self
-                .session
-                .trigger_status(
-                    slot.config.port.clone(),
-                    slot.daemon_epoch,
-                    slot.generation,
-                    trigger_id,
-                )
-                .await?;
-        }
-    }
-
     async fn run_start(&self, args: RunStartArgs) -> Result<Value> {
         let _write_guard = self.write_guard(&args.port).await;
         let slot = self.slot_online(&args.port).await?;
@@ -2040,6 +1734,7 @@ impl AgentTools {
             "approval_id": started.approval_id,
             "run_id": run.id,
             "run_handle": started.run_handle,
+            "macro_catalog": self.macro_context().await,
             "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
             "cleanup_required": "Call run_end before the final reply unless deliberately handing this live Run to a continuing agent workflow."
         }))
@@ -2440,29 +2135,6 @@ fn format_run_abort_error(
     )
 }
 
-/// Add a machine-readable diagnosis to an already accepted Trigger Job.
-///
-/// Unlike a rejected write request, a Trigger can have emitted its kickoff or
-/// one or more actions before ownership loss became terminal. Consequently the
-/// stable diagnostic must never claim that zero physical bytes were written.
-fn attach_trigger_takeover_diagnosis(
-    output: &mut Value,
-    run_id: Uuid,
-    diagnosis: &RunAbortDiagnosis,
-) -> bool {
-    if diagnosis.reason != "human takeover" {
-        return false;
-    }
-    output["abort_diagnosis"] = json!({
-        "code": "human_takeover",
-        "reason": diagnosis.reason,
-        "taken_over_by": diagnosis.taken_over_by.as_ref(),
-        "run_id": run_id,
-        "no_bytes_written": false,
-    });
-    true
-}
-
 fn error_indicates_run_or_control_loss(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     [
@@ -2534,7 +2206,7 @@ fn remember_live_cursor(cursors: &mut BTreeMap<String, Cursor>, port: &str, curs
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
-    serde_json::from_value(value).context("invalid tool arguments")
+    serde_json::from_value(value).map_err(|error| anyhow!("invalid tool arguments: {error}"))
 }
 
 fn matching_active_run<'a>(
@@ -2994,7 +2666,19 @@ fn render_response(
     options: RenderOptions,
     scope: &str,
 ) -> Value {
-    let rendered = render_events(&response.events, options);
+    render_response_with_exclusions(slot, query_epoch, response, options, scope, &[])
+}
+
+fn render_response_with_exclusions(
+    slot: &SlotSnapshot,
+    query_epoch: Uuid,
+    response: serial_protocol::EventQueryResponse,
+    options: RenderOptions,
+    scope: &str,
+    exclusions: &[String],
+) -> Value {
+    let rendered =
+        crate::render::render_events_with_exclusions(&response.events, options, exclusions);
     let after_seq = response
         .next_cursor
         .as_ref()
@@ -3019,6 +2703,9 @@ fn render_response(
     });
     if let Some(ref excerpt) = rendered.match_excerpt {
         output["matches"] = json!(excerpt.matched_lines);
+    }
+    if rendered.excluded_lines > 0 {
+        output["excluded_lines"] = json!(rendered.excluded_lines);
     }
     let mut warnings = Vec::new();
     if gap {
@@ -3365,10 +3052,10 @@ fn requested_completion(
 }
 
 #[cfg(test)]
-mod completion_tests {
+pub(crate) mod completion_tests {
     use super::*;
 
-    fn slot(shell: Option<&str>, uboot: Option<&str>) -> SlotSnapshot {
+    pub(crate) fn slot(shell: Option<&str>, uboot: Option<&str>) -> SlotSnapshot {
         SlotSnapshot {
             config: serial_protocol::SlotConfig {
                 port: "/dev/cu.usbserial-210".into(),
@@ -3987,194 +3674,6 @@ fn compile_regex(value: &str, field: &str) -> Result<regex::Regex> {
     regex::Regex::new(value).with_context(|| format!("{field} is not a valid regex"))
 }
 
-fn trigger_spec(args: &TriggerArgs) -> Result<TriggerSpec> {
-    let initial_write = args
-        .initial_write
-        .as_ref()
-        .map(|write| trigger_write_bytes(write, "kickoff", MAX_TRIGGER_INITIAL_WRITE_BYTES))
-        .transpose()?;
-    let action = trigger_write_bytes(&args.action, "action", MAX_TRIGGER_ACTION_BYTES)?;
-    let start_contains = args
-        .start_contains
-        .as_ref()
-        .map(|pattern| trigger_pattern_bytes(pattern, "start_contains"))
-        .transpose()?;
-    if args.stop_contains.len() > MAX_TRIGGER_PATTERNS {
-        bail!(
-            "stop_contains has {} literals; at most {MAX_TRIGGER_PATTERNS} are allowed",
-            args.stop_contains.len()
-        );
-    }
-    let stop_contains = args
-        .stop_contains
-        .iter()
-        .enumerate()
-        .map(|(index, pattern)| trigger_pattern_bytes(pattern, &format!("stop_contains[{index}]")))
-        .collect::<Result<Vec<_>>>()?;
-
-    let interval_ms = args.interval_ms.unwrap_or(DEFAULT_TRIGGER_INTERVAL_MS);
-    if !(MIN_TRIGGER_INTERVAL_MS..=MAX_TRIGGER_INTERVAL_MS).contains(&interval_ms) {
-        bail!(
-            "interval_ms must be between {MIN_TRIGGER_INTERVAL_MS} and \
-             {MAX_TRIGGER_INTERVAL_MS}"
-        );
-    }
-    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TRIGGER_TIMEOUT_MS);
-    if !(MIN_TRIGGER_TIMEOUT_MS..=MAX_TRIGGER_TIMEOUT_MS).contains(&timeout_ms) {
-        bail!("timeout_ms must be between {MIN_TRIGGER_TIMEOUT_MS} and {MAX_TRIGGER_TIMEOUT_MS}");
-    }
-    let max_fires = args.max_fires.unwrap_or(DEFAULT_TRIGGER_MAX_FIRES);
-    if !(1..=MAX_TRIGGER_FIRES).contains(&max_fires) {
-        bail!("max_fires must be between 1 and {MAX_TRIGGER_FIRES}");
-    }
-    let planned_bytes = initial_write
-        .as_ref()
-        .map_or(0, Vec::len)
-        .saturating_add(action.len().saturating_mul(max_fires as usize));
-    if planned_bytes > MAX_TRIGGER_TOTAL_BYTES {
-        bail!(
-            "kickoff plus action * max_fires plans {planned_bytes} bytes; the Trigger limit \
-             is {MAX_TRIGGER_TOTAL_BYTES} bytes"
-        );
-    }
-
-    Ok(TriggerSpec {
-        initial_write,
-        start_contains,
-        action,
-        interval_ms,
-        stop_contains,
-        timeout_ms,
-        max_fires,
-        // Trigger writes use the port's configured physical write pacing.
-        pacing: None,
-    })
-}
-
-fn trigger_write_bytes(write: &TriggerWriteArgs, field: &str, max_bytes: usize) -> Result<Vec<u8>> {
-    let mut bytes = write.text.as_bytes().to_vec();
-    bytes.extend_from_slice(write.eol.as_deref().unwrap_or("").as_bytes());
-    if bytes.is_empty() {
-        bail!("{field} text and EOL are both empty; omit kickoff or provide bytes");
-    }
-    if bytes.len() > max_bytes {
-        bail!("{field} text plus EOL exceeds {max_bytes} UTF-8 bytes");
-    }
-    Ok(bytes)
-}
-
-fn trigger_pattern_bytes(pattern: &str, field: &str) -> Result<Vec<u8>> {
-    if pattern.is_empty() {
-        bail!("{field} must not be empty");
-    }
-    let bytes = pattern.as_bytes().to_vec();
-    if bytes.len() > MAX_TRIGGER_PATTERN_BYTES {
-        bail!("{field} exceeds {MAX_TRIGGER_PATTERN_BYTES} UTF-8 bytes");
-    }
-    Ok(bytes)
-}
-
-fn trigger_evidence_contains(seq: u64, start_seq: u64, end_seq: u64) -> bool {
-    (start_seq..=end_seq).contains(&seq)
-}
-
-fn validate_trigger_identity(
-    trigger: &TriggerInfo,
-    slot: &SlotSnapshot,
-    expected_run_id: Uuid,
-    operation_id: Uuid,
-    trigger_id: Uuid,
-) -> Result<()> {
-    if trigger.id != trigger_id {
-        bail!(
-            "seriald returned Trigger {} while waiting for {trigger_id}",
-            trigger.id
-        );
-    }
-    if trigger.daemon_epoch != slot.daemon_epoch {
-        bail!("Trigger daemon epoch changed; its terminal outcome cannot be trusted");
-    }
-    if trigger.generation != slot.generation {
-        bail!("Trigger serial generation changed; its terminal outcome cannot be trusted");
-    }
-    if trigger.expected_run_id != Some(expected_run_id) {
-        bail!("Trigger is no longer bound to the adapter-owned Run {expected_run_id}");
-    }
-    if trigger.operation_id != Some(operation_id) {
-        bail!("Trigger operation identity changed; refusing to merge unrelated evidence");
-    }
-    Ok(())
-}
-
-fn trigger_status_label(status: TriggerStatus) -> &'static str {
-    match status {
-        TriggerStatus::Armed => "armed",
-        TriggerStatus::WaitingForStart => "waiting_for_start",
-        TriggerStatus::Running => "running",
-        TriggerStatus::Stopping => "stopping",
-        TriggerStatus::Matched => "matched",
-        TriggerStatus::TimedOut => "timed_out",
-        TriggerStatus::MaxFiresReached => "max_fires_reached",
-        TriggerStatus::Cancelled => "cancelled",
-        TriggerStatus::ControlLost => "control_lost",
-        TriggerStatus::RunLost => "run_lost",
-        TriggerStatus::GenerationChanged => "generation_changed",
-        TriggerStatus::PortClosed => "port_closed",
-        TriggerStatus::WriteFailed => "write_failed",
-        TriggerStatus::RxGap => "rx_gap",
-    }
-}
-
-fn trigger_send_budget_exhausted(trigger: &TriggerInfo) -> bool {
-    trigger.fires_confirmed >= trigger.spec.max_fires
-}
-
-fn trigger_guidance(trigger: &TriggerInfo) -> &'static str {
-    match trigger.status {
-        TriggerStatus::Matched => {
-            "A caller-supplied stop literal was observed in live RX. This confirms only the \
-             Trigger boundary, not that a later flashing or debug workflow succeeded."
-        }
-        TriggerStatus::TimedOut => {
-            "The observation deadline elapsed without a stop match. Confirmed TX proves only \
-             that bytes were accepted by the serial driver, not that the target action failed. \
-             Inspect this capture/current Run before changing parameters or retrying."
-        }
-        TriggerStatus::MaxFiresReached if !trigger.spec.stop_contains.is_empty() => {
-            "The action send budget was exhausted, then seriald kept observing until the \
-             original deadline without a stop match. Confirmed TX is not proof that the target \
-             action failed; inspect TX/RX and current device state before any retry."
-        }
-        TriggerStatus::MaxFiresReached => {
-            "No stop literal was configured, so exhausting the action send budget completed \
-             this Trigger. That proves neither target success nor target failure; inspect the \
-             resulting state instead of blindly retrying."
-        }
-        TriggerStatus::Cancelled => {
-            "The Trigger was cancelled and reached an authoritative terminal state; no future \
-             fires will be scheduled."
-        }
-        TriggerStatus::ControlLost
-        | TriggerStatus::RunLost
-        | TriggerStatus::GenerationChanged
-        | TriggerStatus::PortClosed => {
-            "The serial ownership/session boundary changed. Start a new Run and initialize \
-             device state explicitly before any further write."
-        }
-        TriggerStatus::WriteFailed | TriggerStatus::RxGap => {
-            "Trigger evidence is uncertain because a physical write failed or live RX had a \
-             gap. Inspect the TX timeline and current device state before retrying."
-        }
-        TriggerStatus::Armed
-        | TriggerStatus::WaitingForStart
-        | TriggerStatus::Running
-        | TriggerStatus::Stopping => {
-            "The Trigger has not reached a terminal outcome; this response should not normally \
-             be returned by serial_trigger."
-        }
-    }
-}
-
 fn seconds(value: Option<u64>, default: u64, min: u64, max: u64) -> Duration {
     Duration::from_secs(value.unwrap_or(default).clamp(min, max))
 }
@@ -4212,7 +3711,7 @@ fn ensure_sequence_write_precondition_supported(status: &StatusResponse) -> Resu
 fn ensure_serial_context_precondition_supported(status: &StatusResponse) -> Result<()> {
     if !status.serial_context_precondition_supported {
         bail!(
-            "seriald does not advertise atomic serial-context boundaries for Write, BREAK, and Trigger; no bytes were written. Install seriald and serial-mcp from the same release"
+            "seriald does not advertise atomic serial-context boundaries for Write, BREAK, and Macro; no bytes were written. Install seriald and serial-mcp from the same release"
         );
     }
     Ok(())
@@ -4333,6 +3832,23 @@ struct ReadArgs {
     epoch: Option<Uuid>,
     after_seq: Option<u64>,
     through_seq: Option<u64>,
+    #[serde(default)]
+    exclude_patterns: Vec<String>,
+}
+
+fn validate_read_exclusions(lines: &[String]) -> Result<()> {
+    if lines.len() > 64 || lines.iter().map(String::len).sum::<usize>() > 8192 {
+        bail!("exclude_patterns permits at most 64 patterns and 8192 UTF-8 bytes total");
+    }
+    if lines
+        .iter()
+        .any(|line| line.is_empty() || line.contains(['\r', '\n']) || line.len() > 1024)
+    {
+        bail!(
+            "each exclude_patterns item must be one nonempty literal pattern (no CR/LF), at most 1024 UTF-8 bytes"
+        );
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4410,26 +3926,6 @@ struct SignalArgs {
     run_handle: String,
     signal: String,
     duration_ms: Option<u64>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TriggerWriteArgs {
-    text: String,
-    eol: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TriggerArgs {
-    run_handle: String,
-    #[serde(rename = "kickoff")]
-    initial_write: Option<TriggerWriteArgs>,
-    start_contains: Option<String>,
-    action: TriggerWriteArgs,
-    #[serde(default)]
-    stop_contains: Vec<String>,
-    interval_ms: Option<u64>,
-    timeout_ms: Option<u64>,
-    max_fires: Option<u32>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

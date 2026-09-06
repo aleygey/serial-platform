@@ -18,6 +18,12 @@ export function installQaBridge(): boolean {
     bootstrap: async () => snapshot,
     refresh: async () => snapshot,
     sendCommand: async () => ({ status: 'accepted' }),
+    sendSignal: async () => ({ status: 'accepted' }),
+    queryHumanHistory: async (query, contains) => ({ ...snapshot.humanHistory!, entries: snapshot.humanHistory!.entries.filter((entry) => contains ? entry.command.includes(query) : entry.command.startsWith(query)) }),
+    listMacros: async () => ({ catalog_revision: 0, macros: [], total: 0 }),
+    saveMacro: async (definition) => ({ catalog_revision: 1, definition: { ...definition, language_version: 1, revision: (definition.expected_revision ?? 0) + 1, shared: definition.shared ?? false, updated_at_ns: Date.now() * 1_000_000 } }),
+    runMacro: async () => { throw new Error('预览模式不会运行串口宏') },
+    cancelMacro: async () => { throw new Error('预览模式没有正在运行的宏') },
     decideRunStart: async () => undefined,
     setPortOpen: async (port, open) => {
       snapshot = {

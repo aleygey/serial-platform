@@ -30,7 +30,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const OUTBOUND_QUEUE: usize = 512;
-const MAX_WS_INCOMING_BYTES: usize = 64 * 1024;
+// 64 KiB source plus JSON string escaping and request metadata.
+const MAX_WS_INCOMING_BYTES: usize = 512 * 1024;
 const MAX_WS_CONNECTIONS: usize = 256;
 
 #[derive(Clone)]
@@ -45,6 +46,7 @@ struct AppStateInner {
     registry: SlotRegistry,
     journal: JournalHandle,
     monitors: MonitorManager,
+    macros: crate::macros::MacroCatalog,
     daemon_epoch: Uuid,
     started: Instant,
     ws_connections: Arc<Semaphore>,
@@ -86,6 +88,9 @@ impl AppState {
         )?;
         Ok(Self {
             inner: Arc::new(AppStateInner {
+                macros: crate::macros::MacroCatalog::new(
+                    config_store.paths().data_dir.join("macros.json"),
+                ),
                 config_store,
                 config: RwLock::new(config),
                 config_updates: Mutex::new(()),
@@ -280,6 +285,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/status", get(status))
         .route("/api/v1/ports", get(ports))
+        .route("/api/v1/history/commands", get(human_command_history))
+        .route("/api/v1/macros", get(list_macros).post(save_macro))
         .route("/api/v1/config/ports", put(configure_ports))
         .route(
             "/api/v1/config/transport-profiles",
@@ -315,6 +322,42 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/ws", get(websocket))
         .with_state(state)
+}
+
+async fn list_macros(
+    State(state): State<AppState>,
+    Query(query): Query<serial_protocol::MacroListQuery>,
+) -> Result<Json<serial_protocol::MacroListResponse>, ApiError> {
+    let catalog = state.inner.macros.clone();
+    let result = tokio::task::spawn_blocking(move || catalog.list(query))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
+    Ok(Json(result))
+}
+
+async fn save_macro(
+    State(state): State<AppState>,
+    Json(request): Json<serial_protocol::MacroSaveRequest>,
+) -> Result<Json<serial_protocol::MacroSaveResponse>, ApiError> {
+    let catalog = state.inner.macros.clone();
+    let result = tokio::task::spawn_blocking(move || catalog.save(request))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
+    Ok(Json(result))
+}
+
+async fn human_command_history(
+    State(state): State<AppState>,
+    Query(query): Query<serial_protocol::HumanCommandHistoryQuery>,
+) -> Result<Json<serial_protocol::HumanCommandHistoryResponse>, ApiError> {
+    let server_id = state.inner.config.read().await.server_id;
+    Ok(Json(
+        state
+            .inner
+            .journal
+            .human_command_history(server_id, query)
+            .await?,
+    ))
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
@@ -1142,7 +1185,8 @@ async fn dispatch_message(
                 .get(port)
                 .await
                 .ok_or_else(|| WsError::NotFound(port.into()))?;
-            let (request_id, result) = dispatch_slot_command(other, handle, actor.clone()).await?;
+            let (request_id, result) =
+                dispatch_slot_command(other, handle, actor.clone(), &state.inner.macros).await?;
             send_result(outbound, request_id, result).await
         }
     }
@@ -1152,9 +1196,53 @@ async fn dispatch_slot_command(
     message: ClientMessage,
     handle: SlotHandle,
     actor: Actor,
+    macros: &crate::macros::MacroCatalog,
 ) -> Result<(Uuid, CommandResult), WsError> {
     let request_id = message.request_id();
     let result = match message {
+        ClientMessage::MacroStart {
+            control_id,
+            fence,
+            daemon_epoch,
+            generation,
+            operation_id,
+            expected_run_id,
+            sequence_precondition,
+            spec,
+            ..
+        } => {
+            let catalog = macros.clone();
+            let prepared = tokio::task::spawn_blocking(move || catalog.prepare(spec))
+                .await
+                .map_err(|e| WsError::BadRequest(e.to_string()))?
+                .map_err(|e| WsError::BadRequest(e.to_string()))?;
+            handle
+                .start_macro(
+                    actor,
+                    control_id,
+                    fence,
+                    daemon_epoch,
+                    generation,
+                    operation_id,
+                    expected_run_id,
+                    sequence_precondition,
+                    prepared,
+                )
+                .await?
+        }
+        ClientMessage::MacroStatus { execution_id, .. } => {
+            handle.macro_status(actor, execution_id).await?
+        }
+        ClientMessage::MacroCancel {
+            control_id,
+            fence,
+            execution_id,
+            ..
+        } => {
+            handle
+                .cancel_macro(actor, control_id, fence, execution_id)
+                .await?
+        }
         ClientMessage::AcquireControl { mode, ttl_ms, .. } => {
             handle
                 .acquire_control(request_id, actor, mode, ttl_ms)
@@ -1209,16 +1297,18 @@ async fn dispatch_slot_command(
             data,
             operation_id,
             description,
+            input,
             ..
         } => {
             handle
-                .send_human_command(
+                .send_human_input(
                     request_id,
                     actor,
                     expected_generation,
                     data,
                     operation_id,
                     description,
+                    input,
                 )
                 .await?
         }
@@ -1498,6 +1588,9 @@ fn command_slot(message: &ClientMessage) -> Option<&str> {
         | ClientMessage::Write { port, .. }
         | ClientMessage::SendBreak { port, .. }
         | ClientMessage::TriggerStart { port, .. }
+        | ClientMessage::MacroStart { port, .. }
+        | ClientMessage::MacroStatus { port, .. }
+        | ClientMessage::MacroCancel { port, .. }
         | ClientMessage::TriggerStatus { port, .. }
         | ClientMessage::TriggerCancel { port, .. }
         | ClientMessage::StartRun { port, .. }
@@ -1567,6 +1660,11 @@ impl WsError {
             Self::NotFound(_) => (ErrorCode::NotFound, false),
             Self::Closed => (ErrorCode::Internal, true),
             Self::Slot(error) => match error {
+                SlotError::MacroActive => (ErrorCode::Conflict, false),
+                SlotError::MacroNotFound(_) => (ErrorCode::NotFound, false),
+                SlotError::MacroInvalid(_) | SlotError::InvalidHumanLineInput => {
+                    (ErrorCode::BadRequest, false)
+                }
                 SlotError::PortOffline | SlotError::Closed | SlotError::ReplyDropped => {
                     (ErrorCode::PortOffline, true)
                 }
@@ -1633,6 +1731,8 @@ impl WsError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    #[error(transparent)]
+    Macro(#[from] crate::macros::MacroError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -1708,6 +1808,15 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
         let (status, code) = match &self {
+            Self::Macro(crate::macros::MacroError::Conflict { .. }) => {
+                (StatusCode::CONFLICT, ErrorCode::Conflict)
+            }
+            Self::Macro(crate::macros::MacroError::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, ErrorCode::NotFound)
+            }
+            Self::Macro(
+                crate::macros::MacroError::Invalid(_) | crate::macros::MacroError::Script(_),
+            ) => (StatusCode::BAD_REQUEST, ErrorCode::BadRequest),
             Self::Config(ConfigError::Validation(_)) => {
                 (StatusCode::BAD_REQUEST, ErrorCode::BadRequest)
             }
@@ -1756,6 +1865,7 @@ impl IntoResponse for ApiError {
                 | SlotError::BreakFailed { .. },
             ) => (StatusCode::CONFLICT, ErrorCode::WriteOutcomeUncertain),
             Self::Config(_)
+            | Self::Macro(_)
             | Self::Registry(_)
             | Self::ConfigRollback { .. }
             | Self::ConfigCommitRestore { .. }
@@ -1790,6 +1900,112 @@ mod tests {
         routing::get,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn macro_http_catalog_validates_revisions_sharing_and_has_no_serial_side_effects() {
+        use crate::config::{ConfigPaths, ConfigStore};
+        use crate::control::ControlLimits;
+        use crate::journal::{JournalConfig, JournalManager};
+        use crate::registry::SlotRegistry;
+        use serial_protocol::{MacroListResponse, MacroSaveResponse};
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(directory.path()));
+        let config = store.load_or_create().unwrap().config;
+        let journal =
+            JournalManager::open(JournalConfig::new(store.paths().journal_dir.clone())).unwrap();
+        let epoch = uuid::Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let registry = SlotRegistry::new(
+            epoch,
+            started,
+            journal.handle(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ControlLimits::default(),
+        );
+        let state = super::AppState::new(store, config, registry, journal.handle(), epoch, started);
+        let app = super::router(state.clone());
+        let source = serde_json::json!({
+            "id":"reusable", "name":"Reusable macro", "description":"Test serial macro",
+            "script":"cmd(\"help\");", "parameters":{}
+        });
+        let post = |value: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/macros")
+                .header("content-type", "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        let response = app.clone().oneshot(post(source.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: MacroSaveResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), 100_000).await.unwrap())
+                .unwrap();
+        assert_eq!(saved.definition.revision, 1);
+        assert!(!saved.definition.shared);
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/macros")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list: MacroListResponse =
+            serde_json::from_slice(&to_bytes(list.into_body(), 100_000).await.unwrap()).unwrap();
+        assert!(list.macros.is_empty());
+        assert_eq!(
+            app.clone()
+                .oneshot(post(source.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut shared = source.clone();
+        shared["expected_revision"] = 1.into();
+        shared["shared"] = true.into();
+        let response = app.clone().oneshot(post(shared)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/macros")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list: MacroListResponse =
+            serde_json::from_slice(&to_bytes(list.into_body(), 100_000).await.unwrap()).unwrap();
+        assert_eq!(list.macros.len(), 1);
+        assert_eq!(list.macros[0].revision, 2);
+        let mut invalid = source;
+        invalid["id"] = "invalid".into();
+        invalid["script"] = "cmd(\"help\"); shell(\"host\");".into();
+        assert_eq!(
+            app.clone().oneshot(post(invalid)).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let history = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/history/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        assert!(state.inner.registry.snapshots().await.is_empty());
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
 
     #[test]
     fn ambiguous_physical_writes_have_a_distinct_non_retryable_wire_error() {

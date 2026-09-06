@@ -20,6 +20,7 @@ export function createQaSnapshot(preferences: DesktopPreferences = {
   return {
     connection: 'connected', connectionMessage: '实时连接已建立', serverId: 'qa-server',
     daemonEpoch: 'qa-epoch', configRevision: 8,
+    humanHistory: { server_id: 'qa-server', revision: 4, entries: ['cat /etc/version', 'cat /proc/meminfo', 'echo 中🙂', 'version'].map((command, index) => ({ id: `human-${index}`, command, port: index % 2 ? 'COM7' : 'COM6', wall_time_ns: now, revision: 4 - index, uses: 1 })) },
     preferences: { ...preferences, selectedPort: 'COM6' },
     service: { owned: true, status: 'running', pid: 4208, program: 'seriald' },
     availablePorts: [

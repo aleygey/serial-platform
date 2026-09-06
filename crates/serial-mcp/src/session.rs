@@ -12,8 +12,7 @@ use serial_protocol::{
     Actor, ActorKind, ClientMessage, CommandCaptureCompleted, CommandCaptureMatcher,
     CommandCaptureReport, CommandResult, CommandSequenceAuditContext, ControlLease, ErrorCode,
     PROTOCOL_VERSION, RunContextState, RunInfo, SequenceWritePrecondition, ServerMessage,
-    TriggerInfo, TriggerSpec, TriggerStatus, WireFrame, WritePacing, decode_wire_frame,
-    encode_client_control,
+    WireFrame, WritePacing, decode_wire_frame, encode_client_control,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -22,6 +21,11 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 use uuid::Uuid;
+
+mod macros;
+pub(crate) use macros::MacroAction;
+#[cfg(test)]
+mod macro_tests;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type RenewalPlan = (Vec<String>, Vec<(String, ControlLease)>);
@@ -53,7 +57,7 @@ fn validate_run_handle_shape(run_handle: &str) -> Result<()> {
     {
         bail!(
             "invalid run_handle format: expected exactly {RUN_HANDLE_CHARS} base64url \
-             characters returned by run_start"
+         characters returned by run_start"
         );
     }
     Ok(())
@@ -73,8 +77,8 @@ pub(crate) fn ensure_welcome_protocol(protocol_version: u16) -> Result<()> {
     if protocol_version != PROTOCOL_VERSION {
         bail!(
             "seriald WebSocket protocol version {protocol_version} is incompatible with \
-             serial-mcp protocol version {PROTOCOL_VERSION}; install seriald and serial-mcp \
-             from the same release"
+         serial-mcp protocol version {PROTOCOL_VERSION}; install seriald and serial-mcp \
+         from the same release"
         );
     }
     Ok(())
@@ -97,7 +101,7 @@ fn ensure_welcome_identity(
     if expected.server_id != server_id || expected.daemon_epoch != daemon_epoch {
         bail!(
             "seriald identity changed while serial-mcp was running: expected server {} epoch {}, \
-             but the WebSocket welcomed server {} epoch {}; restart serial-mcp",
+         but the WebSocket welcomed server {} epoch {}; restart serial-mcp",
             expected.server_id,
             expected.daemon_epoch,
             server_id,
@@ -160,6 +164,11 @@ enum RunLifecycle {
 }
 
 enum SessionRequest {
+    Macro {
+        port: String,
+        action: MacroAction,
+        reply: Reply,
+    },
     UpdateRunIdleTtl {
         run_idle_ttl: Option<Duration>,
         reply: oneshot::Sender<()>,
@@ -192,33 +201,6 @@ enum SessionRequest {
         expected_run_id: Uuid,
         run_token: Uuid,
         sequence_precondition: SequenceWritePrecondition,
-        reply: Reply,
-    },
-    TriggerStart {
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        operation_id: Uuid,
-        expected_run_id: Uuid,
-        run_token: Uuid,
-        sequence_precondition: SequenceWritePrecondition,
-        spec: TriggerSpec,
-        reply: Reply,
-    },
-    TriggerStatus {
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        trigger_id: Uuid,
-        reply: Reply,
-    },
-    TriggerCancel {
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        trigger_id: Uuid,
-        expected_run_id: Uuid,
-        run_token: Uuid,
         reply: Reply,
     },
     RunOwnership {
@@ -273,10 +255,10 @@ struct RunStartPolicy<'a> {
 // protocol values inline avoids an allocation on every session RPC.
 #[allow(clippy::large_enum_variant)]
 enum SessionResponse {
+    Macro(serial_protocol::MacroExecutionInfo),
     ActorIdentity(Option<String>),
     Write { event_seq: u64 },
     Break { event_seq: u64 },
-    Trigger(TriggerInfo),
     Run(RunInfo),
     RunStarted(StartedRun),
     RunAuthorized(AuthorizedRunUse),
@@ -287,6 +269,25 @@ enum SessionResponse {
 }
 
 impl SessionHandle {
+    pub(crate) async fn macro_request(
+        &self,
+        port: String,
+        action: MacroAction,
+    ) -> Result<serial_protocol::MacroExecutionInfo> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::Macro {
+                port,
+                action,
+                reply,
+            })
+            .await
+            .context("serial session task stopped")?;
+        match receive(response).await? {
+            SessionResponse::Macro(execution) => Ok(execution),
+            _ => bail!("serial session returned the wrong response type"),
+        }
+    }
     pub fn spawn(
         endpoint: String,
         actor_label: String,
@@ -484,91 +485,6 @@ impl SessionHandle {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn trigger_start(
-        &self,
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        operation_id: Uuid,
-        expected_run_id: Uuid,
-        run_token: Uuid,
-        sequence_precondition: SequenceWritePrecondition,
-        spec: TriggerSpec,
-    ) -> Result<TriggerInfo> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(SessionRequest::TriggerStart {
-                port,
-                daemon_epoch,
-                generation,
-                operation_id,
-                expected_run_id,
-                run_token,
-                sequence_precondition,
-                spec,
-                reply,
-            })
-            .await
-            .context("serial session task stopped")?;
-        match receive(response).await? {
-            SessionResponse::Trigger(trigger) => Ok(trigger),
-            _ => bail!("serial session returned the wrong response type"),
-        }
-    }
-
-    pub async fn trigger_status(
-        &self,
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        trigger_id: Uuid,
-    ) -> Result<TriggerInfo> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(SessionRequest::TriggerStatus {
-                port,
-                daemon_epoch,
-                generation,
-                trigger_id,
-                reply,
-            })
-            .await
-            .context("serial session task stopped")?;
-        match receive(response).await? {
-            SessionResponse::Trigger(trigger) => Ok(trigger),
-            _ => bail!("serial session returned the wrong response type"),
-        }
-    }
-
-    pub async fn trigger_cancel(
-        &self,
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        trigger_id: Uuid,
-        expected_run_id: Uuid,
-        run_token: Uuid,
-    ) -> Result<TriggerInfo> {
-        let (reply, response) = oneshot::channel();
-        self.tx
-            .send(SessionRequest::TriggerCancel {
-                port,
-                daemon_epoch,
-                generation,
-                trigger_id,
-                expected_run_id,
-                run_token,
-                reply,
-            })
-            .await
-            .context("serial session task stopped")?;
-        match receive(response).await? {
-            SessionResponse::Trigger(trigger) => Ok(trigger),
-            _ => bail!("serial session returned the wrong response type"),
-        }
-    }
-
     pub async fn run_ownership_retained(
         &self,
         port: String,
@@ -718,6 +634,17 @@ impl SessionState {
 
     async fn handle(&mut self, request: SessionRequest) {
         match request {
+            SessionRequest::Macro {
+                port,
+                action,
+                reply,
+            } => {
+                let result = self
+                    .macro_request(port, action)
+                    .await
+                    .map(SessionResponse::Macro);
+                send_reply(reply, result);
+            }
             SessionRequest::UpdateRunIdleTtl {
                 run_idle_ttl,
                 reply,
@@ -841,67 +768,6 @@ impl SessionState {
                     .map(|event_seq| SessionResponse::Break { event_seq });
                 send_reply(reply, result);
             }
-            SessionRequest::TriggerStart {
-                port,
-                daemon_epoch,
-                generation,
-                operation_id,
-                expected_run_id,
-                run_token,
-                sequence_precondition,
-                spec,
-                reply,
-            } => {
-                let result = self
-                    .trigger_start(
-                        port,
-                        daemon_epoch,
-                        generation,
-                        operation_id,
-                        expected_run_id,
-                        run_token,
-                        sequence_precondition,
-                        spec,
-                    )
-                    .await
-                    .map(SessionResponse::Trigger);
-                send_reply(reply, result);
-            }
-            SessionRequest::TriggerStatus {
-                port,
-                daemon_epoch,
-                generation,
-                trigger_id,
-                reply,
-            } => {
-                let result = self
-                    .trigger_status(port, daemon_epoch, generation, trigger_id)
-                    .await
-                    .map(SessionResponse::Trigger);
-                send_reply(reply, result);
-            }
-            SessionRequest::TriggerCancel {
-                port,
-                daemon_epoch,
-                generation,
-                trigger_id,
-                expected_run_id,
-                run_token,
-                reply,
-            } => {
-                let result = self
-                    .trigger_cancel(
-                        port,
-                        daemon_epoch,
-                        generation,
-                        trigger_id,
-                        expected_run_id,
-                        run_token,
-                    )
-                    .await
-                    .map(SessionResponse::Trigger);
-                send_reply(reply, result);
-            }
             SessionRequest::RunOwnership {
                 port,
                 run_id,
@@ -957,7 +823,7 @@ impl SessionState {
             self.best_effort_release(&capability.port).await;
             bail!(
                 "run_handle expired: Run {} on port {:?} exceeded the {}-second orphan timeout \
-                 and was released; call run_start for a new handle",
+             and was released; call run_start for a new handle",
                 capability.run_id,
                 capability.port,
                 self.run_idle_ttl
@@ -987,7 +853,7 @@ impl SessionState {
             })
             .with_context(|| {
                 "unknown run_handle: it expired, belongs to another serial-mcp process, or was \
-                 never issued here; call run_start and use its exact run_handle"
+             never issued here; call run_start and use its exact run_handle"
             })
     }
 
@@ -1015,13 +881,13 @@ impl SessionState {
         let Some(owned) = self.owned_runs.get(port) else {
             bail!(
                 "serial-mcp does not own an active Run on port {port:?}; call run_start and \
-                 use the returned run_handle; no bytes were written"
+             use the returned run_handle; no bytes were written"
             );
         };
         if owned.id != run_id || owned.token != run_token {
             bail!(
                 "internal Run capability mismatch for port {port:?}; the run_handle is no \
-                 longer valid, so call run_start; no bytes were written"
+             longer valid, so call run_start; no bytes were written"
             );
         }
         Ok(owned)
@@ -1079,14 +945,14 @@ impl SessionState {
             self.disconnect();
             bail!(
                 "the serial connection was lost and Run {expected_run_id} can no longer be \
-                 trusted; start a new Run before writing"
+             trusted; start a new Run before writing"
             );
         }
         let Some(lease) = self.leases.get(port).cloned() else {
             self.disconnect();
             bail!(
                 "serial-mcp lost the control lease for Run {expected_run_id}; start a new Run \
-                 before writing"
+             before writing"
             );
         };
         let request = ClientMessage::RenewControl {
@@ -1105,91 +971,26 @@ impl SessionState {
                 self.disconnect();
                 bail!(
                     "unexpected control renewal result for Run {expected_run_id}: {other:?}; \
-                     start a new Run before writing"
+                 start a new Run before writing"
                 )
             }
             Err(error) if is_control_loss_rejection(&error) => {
                 self.disconnect();
                 bail!(
                     "human_takeover_or_control_revoked: serial control for Run \
-                     {expected_run_id} was revoked before renewal completed; \
-                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true; \
-                     start a new Run only after the current owner releases control and the DUT \
-                     model/state is reconfirmed: {error}"
+                 {expected_run_id} was revoked before renewal completed; \
+                 taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true; \
+                 start a new Run only after the current owner releases control and the DUT \
+                 model/state is reconfirmed: {error}"
                 )
             }
             Err(error) => {
                 self.disconnect();
                 bail!(
                     "control renewal failed for Run {expected_run_id}; seriald may have aborted \
-                     this Run, so a new Run is required before writing: {error}"
+                 this Run, so a new Run is required before writing: {error}"
                 )
             }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn trigger_start(
-        &mut self,
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        operation_id: Uuid,
-        expected_run_id: Uuid,
-        run_token: Uuid,
-        sequence_precondition: SequenceWritePrecondition,
-        spec: TriggerSpec,
-    ) -> Result<TriggerInfo> {
-        let lease = self
-            .renew_owned_run_control(&port, expected_run_id, run_token)
-            .await?;
-        let request_id = Uuid::new_v4();
-        let request = ClientMessage::TriggerStart {
-            request_id,
-            port,
-            control_id: lease.id,
-            fence: lease.fence,
-            daemon_epoch,
-            generation,
-            operation_id: Some(operation_id),
-            expected_run_id: Some(expected_run_id),
-            sequence_precondition: Some(sequence_precondition),
-            spec,
-        };
-        match self.call(request).await {
-            Ok(CommandResult::TriggerStarted { trigger }) => Ok(*trigger),
-            Ok(other) => bail!("unexpected trigger-start result: {other:?}"),
-            Err(error) if is_user_read_required(&error) => {
-                Err(anyhow::Error::new(UserCommandUsed {
-                    message: error.to_string(),
-                }))
-            }
-            Err(error) if is_sequence_boundary_rejection(&error) => {
-                Err(anyhow::Error::new(SequenceBoundaryRejected {
-                    message: error.to_string(),
-                }))
-            }
-            Err(error) if daemon_reports_write_outcome_uncertain(&error) => Err(
-                physical_write_outcome_uncertain("Trigger start", request_id, operation_id, error),
-            ),
-            Err(error) if is_control_loss_rejection(&error) => {
-                self.disconnect();
-                bail!(
-                    "human_takeover_or_control_revoked: serial control for Run \
-                     {expected_run_id} was revoked before Trigger {request_id} was accepted; \
-                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true: \
-                     {error}"
-                )
-            }
-            Err(error) if error.downcast_ref::<DaemonRequestError>().is_some() => bail!(
-                "seriald rejected Trigger start request {request_id} (operation {operation_id}) \
-                 before accepting a Job: {error}"
-            ),
-            Err(error) => bail!(
-                "Trigger start outcome is uncertain after request {request_id} (operation \
-                 {operation_id}); inspect active_trigger/TX timeline before starting another \
-                 Trigger: {error}"
-            ),
         }
     }
 
@@ -1240,110 +1041,23 @@ impl SessionState {
                 self.disconnect();
                 bail!(
                     "seriald rejected Break request {request_id} (operation {operation_id}) \
-                     because the expected Run boundary is no longer valid. Start a new Run \
-                     before retrying: {error}"
+                 because the expected Run boundary is no longer valid. Start a new Run \
+                 before retrying: {error}"
                 )
             }
             Err(error) if is_control_loss_rejection(&error) => {
                 self.disconnect();
                 bail!(
                     "human_takeover_or_control_revoked: serial control for Run \
-                     {expected_run_id} was revoked before Break {request_id} reached the port; \
-                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true: \
-                     {error}"
+                 {expected_run_id} was revoked before Break {request_id} reached the port; \
+                 taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true: \
+                 {error}"
                 )
             }
             Err(error) => bail!(
                 "Break outcome is uncertain after request {request_id} (operation \
-                 {operation_id}); inspect the TX/control timeline before retrying: {error}"
+             {operation_id}); inspect the TX/control timeline before retrying: {error}"
             ),
-        }
-    }
-
-    async fn trigger_status(
-        &mut self,
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        trigger_id: Uuid,
-    ) -> Result<TriggerInfo> {
-        // Status is a read-only lookup against seriald's bounded terminal
-        // Trigger cache. It deliberately does not require this connection's
-        // old actor/Run/lease: takeover or disconnect can revoke those before
-        // the adapter observes the authoritative control_lost/run_lost state.
-        let result = match self
-            .call(trigger_status_request(
-                &port,
-                daemon_epoch,
-                generation,
-                trigger_id,
-            ))
-            .await
-        {
-            Ok(result) => result,
-            Err(error) if is_transport_error(&error) || is_timeout_error(&error) => self
-                .call(trigger_status_request(
-                    &port,
-                    daemon_epoch,
-                    generation,
-                    trigger_id,
-                ))
-                .await
-                .with_context(|| {
-                    format!(
-                        "Trigger {trigger_id} status remained unavailable after reconnect; its \
-                         terminal outcome is uncertain"
-                    )
-                })?,
-            Err(error) => return Err(error),
-        };
-        let trigger = match result {
-            CommandResult::TriggerStatus { trigger } => *trigger,
-            other => bail!("unexpected trigger-status result: {other:?}"),
-        };
-        self.observe_trigger_terminal(&port, trigger.status);
-        Ok(trigger)
-    }
-
-    async fn trigger_cancel(
-        &mut self,
-        port: String,
-        daemon_epoch: Uuid,
-        generation: u64,
-        trigger_id: Uuid,
-        expected_run_id: Uuid,
-        run_token: Uuid,
-    ) -> Result<TriggerInfo> {
-        let lease = self
-            .renew_owned_run_control(&port, expected_run_id, run_token)
-            .await?;
-        let request = ClientMessage::TriggerCancel {
-            request_id: Uuid::new_v4(),
-            port: port.clone(),
-            control_id: lease.id,
-            fence: lease.fence,
-            daemon_epoch,
-            generation,
-            trigger_id,
-        };
-        let trigger = match self.call(request).await? {
-            CommandResult::TriggerCancelled { trigger } => *trigger,
-            other => bail!("unexpected trigger-cancel result: {other:?}"),
-        };
-        self.observe_trigger_terminal(&port, trigger.status);
-        Ok(trigger)
-    }
-
-    fn observe_trigger_terminal(&mut self, port: &str, status: TriggerStatus) {
-        if matches!(
-            status,
-            TriggerStatus::ControlLost
-                | TriggerStatus::RunLost
-                | TriggerStatus::GenerationChanged
-                | TriggerStatus::PortClosed
-        ) {
-            self.leases.remove(port);
-            self.owned_runs.remove(port);
         }
     }
 
@@ -1414,24 +1128,24 @@ impl SessionState {
                 self.disconnect();
                 bail!(
                     "seriald rejected write request {request_id} (operation {operation_id}) \
-                     because the expected Run boundary is no longer valid; no bytes reached the \
-                     serial port. Start a new Run before retrying: {error}"
+                 because the expected Run boundary is no longer valid; no bytes reached the \
+                 serial port. Start a new Run before retrying: {error}"
                 )
             }
             Err(error) if is_control_loss_rejection(&error) => {
                 self.disconnect();
                 bail!(
                     "human_takeover_or_control_revoked: serial control for Run \
-                     {expected_run_id} was revoked before write {request_id} reached the port; \
-                     taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true; \
-                     start a new Run only after the current owner releases control and the DUT \
-                     model/state is reconfirmed: {error}"
+                 {expected_run_id} was revoked before write {request_id} reached the port; \
+                 taken_over_by=unknown; run_id={expected_run_id}; no_bytes_written=true; \
+                 start a new Run only after the current owner releases control and the DUT \
+                 model/state is reconfirmed: {error}"
                 )
             }
             Err(error) if is_definite_prewrite_rejection(&error) => bail!(
                 "seriald rejected write request {request_id} (operation {operation_id}) before \
-                 any bytes reached the serial port; it is safe to retry after correcting the \
-                 pacing or starting/restoring the expected Run and control lease: {error}"
+             any bytes reached the serial port; it is safe to retry after correcting the \
+             pacing or starting/restoring the expected Run and control lease: {error}"
             ),
             Err(error) => bail!(
                 "write outcome is uncertain after request {request_id} (operation {operation_id}); inspect the TX timeline before retrying: {error}"
@@ -1537,7 +1251,7 @@ impl SessionState {
                 }
                 bail!(
                     "run_start caller disconnected; the pending approval was cancelled, no Run \
-                     remains owned by this MCP, and no bytes were written"
+                 remains owned by this MCP, and no bytes were written"
                 );
             }
             if tokio::time::Instant::now() >= approval_deadline {
@@ -1546,12 +1260,12 @@ impl SessionState {
                     .map(|approval| approval.id)
                     .context(
                         "run_start exceeded its local approval deadline before seriald returned a \
-                     pending approval identity; no Run was created and no bytes were written",
+                 pending approval identity; no Run was created and no bytes were written",
                     )?;
                 self.cancel_run_start(&port, approval_id).await?;
                 bail!(
                     "run_start approval {approval_id} timed out locally and was cancelled; no \
-                     Run was created and no bytes were written"
+                 Run was created and no bytes were written"
                 );
             }
 
@@ -1572,7 +1286,7 @@ impl SessionState {
                         self.disconnect();
                         bail!(
                             "seriald returned a mismatched run_start grant; the connection was \
-                             closed so no Run remains owned by this MCP and no bytes were written"
+                         closed so no Run remains owned by this MCP and no bytes were written"
                         );
                     }
                     let run_token = Uuid::new_v4();
@@ -1590,8 +1304,8 @@ impl SessionState {
                         self.best_effort_release(&port).await;
                         bail!(
                             "run_start caller disconnected as approval was granted; the new Run \
-                             was immediately released, no Run remains owned by this MCP, and no \
-                             bytes were written"
+                         was immediately released, no Run remains owned by this MCP, and no \
+                         bytes were written"
                         );
                     }
                     return Ok(StartedRun {
@@ -1627,8 +1341,8 @@ impl SessionState {
                         self.disconnect();
                         bail!(
                             "seriald returned a mismatched run_start approval identity or request \
-                             body; the connection was closed so the pending request is cancelled; \
-                             no Run was created and no bytes were written"
+                         body; the connection was closed so the pending request is cancelled; \
+                         no Run was created and no bytes were written"
                         );
                     }
                     if pending_approval
@@ -1638,8 +1352,8 @@ impl SessionState {
                         self.disconnect();
                         bail!(
                             "seriald changed the run_start approval while polling; the \
-                             connection was closed so no pending request remains; no Run was \
-                             created and no bytes were written"
+                         connection was closed so no pending request remains; no Run was \
+                         created and no bytes were written"
                         );
                     }
                     let expires_wall_time_ns = approval.expires_wall_time_ns;
@@ -1652,21 +1366,21 @@ impl SessionState {
                 }
                 Ok(CommandResult::RunStartDenied { approval_id }) => bail!(
                     "Human denied run_start approval {approval_id}; no Run was created and no \
-                     bytes were written"
+                 bytes were written"
                 ),
                 Ok(CommandResult::RunStartTimedOut { approval_id }) => bail!(
                     "run_start approval {approval_id} expired without a Human decision; no Run \
-                     was created and no bytes were written"
+                 was created and no bytes were written"
                 ),
                 Ok(CommandResult::RunStartCancelled { approval_id }) => bail!(
                     "run_start approval {approval_id} was cancelled; no Run was created and no \
-                     bytes were written"
+                 bytes were written"
                 ),
                 Ok(other) => {
                     self.disconnect();
                     bail!(
                         "unexpected run_start result {other:?}; the connection was closed to \
-                         cancel any pending approval; no Run was accepted and no bytes were written"
+                     cancel any pending approval; no Run was accepted and no bytes were written"
                     )
                 }
                 Err(error) => {
@@ -1675,8 +1389,8 @@ impl SessionState {
                     self.disconnect();
                     return Err(error).context(
                         "run_start approval polling failed; the Agent connection was closed to \
-                         cancel the pending request; no Run remains owned by this MCP and no bytes \
-                         were written",
+                     cancel the pending request; no Run remains owned by this MCP and no bytes \
+                     were written",
                     );
                 }
             }
@@ -1688,8 +1402,8 @@ impl SessionState {
                 if self.socket.is_none() {
                     bail!(
                         "the Agent connection closed while run_start was waiting for Human \
-                         approval; pending state was cleared, no Run remains owned by this MCP, \
-                         and no bytes were written"
+                     approval; pending state was cleared, no Run remains owned by this MCP, \
+                     and no bytes were written"
                     );
                 }
                 next_renewal = tokio::time::Instant::now() + RENEW_INTERVAL;
@@ -1712,7 +1426,7 @@ impl SessionState {
                 self.disconnect();
                 bail!(
                     "seriald did not confirm cancellation of run_start approval {approval_id} \
-                     (returned {other:?}); the connection was closed to clear pending state"
+                 (returned {other:?}); the connection was closed to clear pending state"
                 )
             }
             Err(error) => {
@@ -1720,7 +1434,7 @@ impl SessionState {
                 Err(error).with_context(|| {
                     format!(
                         "failed to cancel run_start approval {approval_id}; the connection was \
-                         closed to clear pending state"
+                     closed to clear pending state"
                     )
                 })
             }
@@ -1794,8 +1508,8 @@ impl SessionState {
             self.owned_runs.remove(&port);
             bail!(
                 "aborted run_end cannot send ReleaseControl because local control was already \
-                 lost; local Run ownership was discarded. Inspect devices for remote \
-                 convergence, then use a fresh run_start before any further write"
+             lost; local Run ownership was discarded. Inspect devices for remote \
+             convergence, then use a fresh run_start before any further write"
             );
         };
         self.validate_run_capability(&port, run_id, run_token)?;
@@ -1831,7 +1545,7 @@ impl SessionState {
                 self.owned_runs.remove(&port);
                 Err(error).context(
                     "control release failed; local Run ownership was discarded and a fresh \
-                     run_start is required",
+                 run_start is required",
                 )
             }
         }
@@ -1855,11 +1569,11 @@ impl SessionState {
             Ok(CommandResult::ControlReleased) => {}
             Ok(other) => eprintln!(
                 "serial-mcp: best-effort control release returned an unexpected result for port \
-                 {port:?}: {other:?}; the lease will expire at its TTL"
+             {port:?}: {other:?}; the lease will expire at its TTL"
             ),
             Err(error) => eprintln!(
                 "serial-mcp: best-effort control release failed for port {port:?}: {error}; \
-                 the lease will expire at its TTL"
+             the lease will expire at its TTL"
             ),
         }
     }
@@ -1887,7 +1601,7 @@ impl SessionState {
                 .as_secs();
             eprintln!(
                 "serial-mcp: Run on port {port:?} was idle for {idle_seconds} seconds; \
-                 releasing control and aborting the abandoned Run"
+             releasing control and aborting the abandoned Run"
             );
             self.best_effort_release(&port).await;
             if self.socket.is_none() {
@@ -1937,7 +1651,7 @@ impl SessionState {
                     .with_context(|| {
                         format!(
                             "active Run on port {port:?} has no local control lease; its \
-                             ownership can no longer be trusted"
+                         ownership can no longer be trusted"
                         )
                     })
             })
@@ -2030,21 +1744,6 @@ fn write_request_timeout(data_len: usize, pacing: WritePacing) -> Duration {
         .min(WRITE_RPC_TIMEOUT)
 }
 
-fn trigger_status_request(
-    port: &str,
-    daemon_epoch: Uuid,
-    generation: u64,
-    trigger_id: Uuid,
-) -> ClientMessage {
-    ClientMessage::TriggerStatus {
-        request_id: Uuid::new_v4(),
-        port: port.to_string(),
-        daemon_epoch,
-        generation,
-        trigger_id,
-    }
-}
-
 fn send_reply(reply: Reply, result: Result<SessionResponse>) {
     let _ = reply.send(result);
 }
@@ -2132,7 +1831,7 @@ impl std::fmt::Display for UserCommandUsed {
         write!(
             formatter,
             "a Human command changed this Run's serial context; read the live timeline through \
-             that command before another physical action; no bytes were written: {}",
+         that command before another physical action; no bytes were written: {}",
             self.message
         )
     }
@@ -2167,9 +1866,9 @@ fn physical_write_outcome_uncertain(
     anyhow::Error::new(WriteOutcomeUncertain {
         message: format!(
             "seriald could not confirm the {action} outcome after request {request_id} \
-             (operation {operation_id}); bytes or another physical effect may have reached the \
-             device. Do not retry automatically; inspect the TX/control timeline and current \
-             device state first: {error}"
+         (operation {operation_id}); bytes or another physical effect may have reached the \
+         device. Do not retry automatically; inspect the TX/control timeline and current \
+         device state first: {error}"
         ),
     })
 }

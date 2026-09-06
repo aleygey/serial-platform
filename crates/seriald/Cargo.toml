@@ -21,6 +21,7 @@ regex-syntax = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }
+serial-macro = { path = "../serial-macro" }
 serialport.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -26,7 +26,7 @@ serialctl     foreground TUI
 
 `serial` 会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。App→`serial` 和 `serial`→App 都会复用这个后端。只有裸 `serial` 会保证 HTTP MCP 可用；App 的 Local Service 只管理 `seriald`。
 
-HTTP MCP listener 从所选后端的实际 `ActiveEndpoint` 继承精确 IP，并固定使用 3211 端口。默认后端因此仍是 `127.0.0.1:3211`；若活动后端是 `192.168.56.109:3210`，MCP 则是 `192.168.56.109:3211`。后端 wildcard bind 发布为 loopback `ActiveEndpoint`，不会让 MCP 跟随绑定到 wildcard。health、复用、启动等待和最终显示都使用同一目标地址；复用还会核对当前 Serial wire protocol v7、后端 endpoint、server ID 和 daemon epoch。
+HTTP MCP listener 从所选后端的实际 `ActiveEndpoint` 继承精确 IP，并固定使用 3211 端口。默认后端因此仍是 `127.0.0.1:3211`；若活动后端是 `192.168.56.109:3210`，MCP 则是 `192.168.56.109:3211`。后端 wildcard bind 发布为 loopback `ActiveEndpoint`，不会让 MCP 跟随绑定到 wildcard。health、复用、启动等待和最终显示都使用同一目标地址；复用还会核对当前 Serial wire protocol v8、后端 endpoint、server ID 和 daemon epoch。
 
 App 与 `serial` 只停止自己启动的进程。外部 owner 退出后，仍在运行的客户端不会自动 failover；重新启动后才重新发现或创建服务。
 
@@ -110,12 +110,13 @@ capture_max_bytes = 1048576
 
 ## 工具发现
 
-adapter 暴露固定 16 项：
+adapter 暴露固定 18 项：
 
 ```text
 devices              model_identity_set   read
 command              command_sequence     signal
-trigger              wait                 search
+macro_list           macro_save           macro_run
+wait                 search
 monitor_start        monitor_list         monitor_status
 monitor_incidents    monitor_stop         run_start
 run_end
@@ -206,7 +207,7 @@ adapter 在发送下一步之前等待当前 matcher。任一步失败，所有�
 
 ## 人工协作后的 Agent 上下文
 
-人工在活动 Agent Run 中直接按 Enter 发送命令时，该命令立即作为 Human TX 写入和审计，但不会借用 Agent fence 或转移 Agent Control。后端同时更新 Run context；Agent 下一次 `command`、`command_sequence`、`signal` 或 `trigger` 会在发送前收到结构化 `user_command_used` tool error，并返回 `no_bytes_written=true`。
+人工在活动 Agent Run 中直接按 Enter 发送命令时，该命令立即作为 Human TX 写入和审计，但不会借用 Agent fence 或转移 Agent Control。后端同时更新 Run context；Agent 下一次 `command`、`command_sequence`、`signal` 或 `macro_run` 会在发送前收到结构化 `user_command_used` tool error，并返回 `no_bytes_written=true`。
 
 Agent 必须调用实时 `read(scope=tail)` 或 `read(scope=continue)`，直到返回范围确实包含最新 Human TX，并看到 `user_command_acknowledged=true`。即使 `wait` 已让普通 cursor 越过该 TX，下一次 live read 也会临时从该 TX 前一序号恢复读取。有界 live ring 已淘汰这条证据时会返回 `user_command_acknowledged=false` 和明确 gap/warning，门禁继续保持关闭，不能用 archive 结果冒充确认。`wait`、`search`、Monitor 和 `read(scope=archive)` 都不会确认或清除该门禁。确认只证明 Agent 已看过人工干预；是否重试原操作仍需根据新的串口状态重新判断。
 

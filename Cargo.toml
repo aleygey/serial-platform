@@ -5,6 +5,7 @@ members = [
   "crates/seriald",
   "crates/serialctl",
   "crates/serial-mcp",
+  "crates/serial-macro",
 ]
 resolver = "2"
 
@@ -12,7 +13,7 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
-version = "0.8.5"
+version = "0.8.6"
 
 [workspace.dependencies]
 anyhow = "1.0"

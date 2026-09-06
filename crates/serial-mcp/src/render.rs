@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use serial_protocol::{Direction, TimelineEvent};
 
 pub struct RenderedEvents {
+    pub excluded_lines: usize,
     pub text: String,
     #[cfg_attr(not(test), allow(dead_code))]
     pub events: Vec<Value>,
@@ -56,6 +57,14 @@ pub struct RenderOptions<'a> {
 }
 
 pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> RenderedEvents {
+    render_events_with_exclusions(events, options, &[])
+}
+
+pub(crate) fn render_events_with_exclusions(
+    events: &[TimelineEvent],
+    options: RenderOptions,
+    exclude_patterns: &[String],
+) -> RenderedEvents {
     // Captures normally contain both the confirmed TX audit and device RX; in
     // that case present RX only. A TX-filtered read/search still needs useful
     // text, so fall back to TX when there is no RX event at all.
@@ -74,6 +83,11 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
     if let Some(echo) = options.echo {
         text = remove_leading_echo(text, echo);
     }
+    let (text, excluded_lines) = if display_direction == Direction::Rx {
+        exclude_complete_lines(&text, exclude_patterns)
+    } else {
+        (text, 0)
+    };
     let (text, match_excerpt) = match options.match_excerpt {
         Some(excerpt) => {
             let (text, summary) = match_excerpt(&text, excerpt.pattern, excerpt.context_lines);
@@ -96,6 +110,7 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
     };
 
     RenderedEvents {
+        excluded_lines,
         text,
         events,
         text_truncated,
@@ -103,6 +118,29 @@ pub fn render_events(events: &[TimelineEvent], options: RenderOptions) -> Render
         match_excerpt,
         summary,
     }
+}
+
+/// This is a display transform only. Retain the first and incomplete last
+/// line: a bounded page may begin/end in the middle of a physical RX line.
+/// Matching is case-sensitive literal substring; never trim spaces or use regex.
+fn exclude_complete_lines(text: &str, exclusions: &[String]) -> (String, usize) {
+    if exclusions.is_empty() {
+        return (text.to_owned(), 0);
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut count = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let omit = index > 0
+            && line
+                .strip_suffix('\n')
+                .is_some_and(|complete| exclusions.iter().any(|item| complete.contains(item)));
+        if omit {
+            count += 1;
+        } else {
+            output.push_str(line);
+        }
+    }
+    (output, count)
 }
 
 fn event_summaries(events: &[TimelineEvent], include_raw: bool) -> Vec<Value> {
@@ -556,6 +594,44 @@ fn take_last_chars(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use serial_protocol::EventKind;
+
+    #[test]
+    fn exclusions_use_literal_substrings_and_preserve_boundary_fragments() {
+        let excluded = vec!["noise".to_owned(), "[.*]".to_owned(), "日志".to_owned()];
+        let input = "noise\nnoise\n[12:45] noise\nNOISE\n[.*]\n日志\nnoise";
+        let (text, count) = exclude_complete_lines(input, &excluded);
+        assert_eq!(text, "noise\nNOISE\nnoise");
+        assert_eq!(count, 4);
+        assert_eq!(exclude_complete_lines(input, &[]), (input.to_owned(), 0));
+    }
+
+    #[test]
+    fn filtered_rx_keeps_event_evidence_exact_and_never_hides_tx() {
+        let options = || RenderOptions {
+            max_chars: 1000,
+            include_raw: true,
+            echo: None,
+            collapse_repeats: false,
+            include_events: true,
+            match_excerpt: None,
+        };
+        let events = vec![
+            rx_event(1, b"header\r\nnoi"),
+            rx_event(2, b"se\r\nkeep\r\n"),
+        ];
+        let full = render_events(&events, options());
+        let filtered = render_events_with_exclusions(&events, options(), &["noise".into()]);
+        assert_eq!(filtered.text, "header\nkeep\n");
+        assert_eq!(filtered.excluded_lines, 1);
+        assert_eq!(filtered.events, full.events);
+        let tx = render_events_with_exclusions(
+            &[tx_event(1, b"header\nnoise\n")],
+            options(),
+            &["noise".into()],
+        );
+        assert_eq!(tx.text, "header\nnoise\n");
+        assert_eq!(tx.excluded_lines, 0);
+    }
 
     fn rx_event(seq: u64, data: &[u8]) -> TimelineEvent {
         TimelineEvent {

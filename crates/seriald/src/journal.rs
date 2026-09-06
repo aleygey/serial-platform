@@ -215,11 +215,13 @@ impl JournalManager {
 
         let config = Arc::new(config);
         let state = WriterState::initialize(Arc::clone(&config))?;
+        let human_history = state.human_history.clone();
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
         let handle = JournalHandle {
             sender,
             config,
             query_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+            human_history,
         };
         let worker = thread::Builder::new()
             .name("seriald-journal".into())
@@ -265,9 +267,21 @@ pub struct JournalHandle {
     sender: mpsc::Sender<WriterCommand>,
     config: Arc<JournalConfig>,
     query_gate: Arc<Semaphore>,
+    human_history: crate::human_history::HumanHistory,
 }
 
 impl JournalHandle {
+    pub async fn human_command_history(
+        &self,
+        server_id: Uuid,
+        query: serial_protocol::HumanCommandHistoryQuery,
+    ) -> Result<serial_protocol::HumanCommandHistoryResponse, JournalError> {
+        let history = self.human_history.clone();
+        tokio::task::spawn_blocking(move || history.query(server_id, &query))
+            .await
+            .map_err(|_| JournalError::WriterPanicked)
+    }
+
     /// How long a Slot waits for one append acknowledgement before it
     /// continues live delivery with `durable=false` and marks logging
     /// degraded.
@@ -485,6 +499,7 @@ struct StreamKey {
 
 struct WriterState {
     config: Arc<JournalConfig>,
+    human_history: crate::human_history::HumanHistory,
     open_segments: HashMap<StreamKey, OpenSegment>,
     heads: HashMap<StreamKey, u64>,
     total_bytes: u64,
@@ -514,6 +529,9 @@ impl WriterState {
 
         let total_bytes = directory_size(&config.root_dir)?;
         let mut state = Self {
+            human_history: crate::human_history::HumanHistory::open(
+                config.root_dir.join("human-history.json"),
+            )?,
             config,
             open_segments: HashMap::new(),
             heads,
@@ -603,6 +621,7 @@ impl WriterState {
                 self.total_bytes = self.total_bytes.saturating_add(bytes_written);
                 self.open_segments.insert(key.clone(), segment);
                 self.heads.insert(key, event.seq);
+                self.human_history.record(&event)?;
                 Ok(event)
             }
             Err(SegmentAppendError::Recovered(error)) => {

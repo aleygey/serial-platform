@@ -7,7 +7,6 @@ use serial_protocol::{
     TimelineEvent, WireFrame, decode_wire_frame, encode_client_control,
 };
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, client::IntoClientRequest},
@@ -160,8 +159,12 @@ pub enum Completion {
     Prompt(String),
     Regex(String),
     Quiet,
+    #[cfg_attr(not(test), allow(dead_code))]
     Signal(String),
-    RunAborted { run_id: Uuid, reason: String },
+    RunAborted {
+        run_id: Uuid,
+        reason: String,
+    },
     Timeout,
     Disconnected(String),
 }
@@ -281,69 +284,6 @@ impl Capture {
         boundary: CommandBoundary,
     ) -> CaptureResult {
         self.collect_inner(options, Some(boundary)).await
-    }
-
-    /// Keep a pre-attached capture alive until an external operation reports
-    /// its authoritative terminal sequence. Trigger status polling runs on
-    /// the independent control session, so this socket can continue draining
-    /// RX/TX without blocking lease renewal. When a gap prevents observing the
-    /// requested sequence, return the bounded evidence with that gap instead
-    /// of pretending the capture is complete.
-    pub async fn collect_until_seq(
-        mut self,
-        mut terminal_seq: oneshot::Receiver<Option<u64>>,
-        timeout: Duration,
-    ) -> CaptureResult {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut signalled = false;
-        let mut target_seq = None;
-        let mut through_seq = self.events.back().map(|event| event.seq);
-
-        loop {
-            if signalled
-                && (target_seq
-                    .is_none_or(|target| through_seq.is_some_and(|through| through >= target))
-                    || !self.gaps.is_empty())
-            {
-                return self.finish(Completion::Signal("trigger_terminal".into()), None);
-            }
-
-            tokio::select! {
-                signal = &mut terminal_seq, if !signalled => {
-                    match signal {
-                        Ok(seq) => {
-                            signalled = true;
-                            target_seq = seq;
-                        }
-                        Err(_) => {
-                            return self.finish(
-                                Completion::Disconnected(
-                                    "trigger status waiter ended without a terminal result".into()
-                                ),
-                                None,
-                            );
-                        }
-                    }
-                }
-                frame = self.next() => {
-                    match frame {
-                        Ok(Frame::Event(event)) => {
-                            let event = *event;
-                            through_seq = Some(through_seq.map_or(event.seq, |through| through.max(event.seq)));
-                            self.push(event);
-                        }
-                        Ok(Frame::Gap(gap)) => self.gaps.push(gap),
-                        Ok(Frame::Ready | Frame::Other) => {}
-                        Err(error) => {
-                            return self.finish(Completion::Disconnected(error.to_string()), None);
-                        }
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.finish(Completion::Timeout, None);
-                }
-            }
-        }
     }
 
     async fn collect_inner(

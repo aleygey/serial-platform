@@ -33,37 +33,37 @@ afterEach(async () => {
 })
 
 describe('component protocol gate', () => {
-  it('accepts v7 and rejects an older backend before opening the live socket', () => {
-    expect(() => assertCompatibleProtocol(7)).not.toThrow()
-    expect(() => assertCompatibleProtocol(6)).toThrow(/App 需要 v7，后端提供 v6/)
+  it('accepts v8 and rejects an older backend before opening the live socket', () => {
+    expect(() => assertCompatibleProtocol(8)).not.toThrow()
+    expect(() => assertCompatibleProtocol(7)).toThrow(/App 需要 v8，后端提供 v7/)
   })
 
-  it('requires an ok v7 health response with stable UUID identities', () => {
+  it('requires an ok v8 health response with stable UUID identities', () => {
     const identity = parseSerialdHealth({
       status: 'ok',
       server_id: '11111111-1111-4111-8111-111111111111',
       daemon_epoch: '22222222-2222-4222-8222-222222222222',
-      protocol_version: 7,
+      protocol_version: 8,
       uptime_ms: 10
     })
     expect(identity).toEqual({
       serverId: '11111111-1111-4111-8111-111111111111',
       daemonEpoch: '22222222-2222-4222-8222-222222222222',
-      protocolVersion: 7
+      protocolVersion: 8
     })
     expect(serialdIdentityMatches(identity, identity)).toBe(true)
     expect(serialdIdentityMatches(identity, { ...identity, daemonEpoch: '33333333-3333-4333-8333-333333333333' }))
       .toBe(false)
-    expect(() => parseSerialdHealth({ ...identity, status: 'ok', protocol_version: 7 }))
+    expect(() => parseSerialdHealth({ ...identity, status: 'ok', protocol_version: 8 }))
       .toThrow('服务身份')
     expect(() => parseSerialdHealth({
       status: 'ok', server_id: identity.serverId, daemon_epoch: identity.daemonEpoch,
       protocol_version: 6
-    })).toThrow(/App 需要 v7/)
+    })).toThrow(/App 需要 v8/)
   })
 })
 
-describe('v7 Human control messages', () => {
+describe('v8 Human control messages', () => {
   it('sends Enter as one atomic Human command without queue or lease fields', () => {
     const message = buildHumanCommandMessage({
       requestId: 'request', operationId: 'operation', port: 'COM6', expectedGeneration: 4,
@@ -82,6 +82,22 @@ describe('v7 Human control messages', () => {
     expect(buildRunStartDecisionMessage('decision', 'COM6', 'approval', 'deny')).toEqual({
       type: 'decide_run_start', request_id: 'decision', port: 'COM6', approval_id: 'approval', decision: 'deny'
     })
+  })
+
+  it('sends Human Ctrl-D/C exactly without EOL or input-history metadata, and sends bare Enter', async () => {
+    const backend = await serialBackend({ serverId: FIRST_SERVER_ID, daemonEpoch: FIRST_DAEMON_EPOCH, headSeq: 0, events: [], humanCommandOutcome: 'accepted' })
+    const client = new SerialClient(backend.endpoint)
+    await client.start()
+    await client.sendSignal('COM6', 'ctrl_d')
+    await client.sendSignal('COM6', 'ctrl_c')
+    await client.sendCommand('COM6', '')
+    await client.sendCommand('COM6', 'version')
+    expect(backend.humanCommands.map((item) => [...Buffer.from(String(item.data), 'base64')])).toEqual([[4], [3], [13], [...Buffer.from('version\r')]])
+    expect(backend.humanCommands[0].input).toBeUndefined()
+    expect(backend.humanCommands[1].input).toBeUndefined()
+    expect(backend.humanCommands[2].input).toEqual({ command: '' })
+    expect(backend.humanCommands[3].input).toEqual({ command: 'version' })
+    await client.stop()
   })
 
   it('marks a TX-followed-by-disconnect result as uncertain and never resends it after reconnect', async () => {
@@ -530,7 +546,7 @@ function statusResponse(configRevision: number): Record<string, unknown> {
   return {
     server_id: '11111111-1111-4111-8111-111111111111',
     daemon_epoch: '22222222-2222-4222-8222-222222222222',
-    protocol_version: 7,
+    protocol_version: 8,
     config_revision: configRevision,
     ports: []
   }
@@ -614,7 +630,7 @@ async function serialBackend(initial: SerialDaemonState): Promise<SerialTestBack
           type: 'welcome',
           server_id: backend.state.serverId,
           daemon_epoch: backend.state.daemonEpoch,
-          protocol_version: 7,
+          protocol_version: 8,
           actor: HUMAN_ACTOR
         })
         sendControl(socket, {
@@ -699,6 +715,7 @@ async function serialBackend(initial: SerialDaemonState): Promise<SerialTestBack
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request): Promise<Response> => {
     const url = new URL(String(input))
     if (url.pathname === '/api/v1/ports') return jsonResponse([])
+    if (url.pathname === '/api/v1/history/commands') return jsonResponse({ server_id: backend.state.serverId, revision: 0, entries: [] })
     if (url.pathname === '/api/v1/status') return jsonResponse(statusFor(backend.state))
     if (url.pathname.endsWith('/events')) return jsonResponse({ events: backend.state.events })
     if (url.pathname === '/api/v1/config/model-families') {
@@ -716,7 +733,7 @@ function statusFor(state: SerialDaemonState): Record<string, unknown> {
   return {
     server_id: state.serverId,
     daemon_epoch: state.daemonEpoch,
-    protocol_version: 7,
+    protocol_version: 8,
     config_revision: 1,
     ports: [portSnapshot(state)]
   }
