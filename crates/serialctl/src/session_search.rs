@@ -73,10 +73,10 @@ impl Drop for Directory {
     fn drop(&mut self) {
         // This path was atomically created here and is owned only by this
         // archive. Never clean the shared temp root or a user-supplied path.
-        if !self.preserve.load(Ordering::Acquire) {
-            if let Err(error) = fs::remove_dir_all(&self.path) {
-                tracing::warn!(path = %self.path.display(), %error, "session search archive cleanup failed");
-            }
+        if !self.preserve.load(Ordering::Acquire)
+            && let Err(error) = fs::remove_dir_all(&self.path)
+        {
+            tracing::warn!(path = %self.path.display(), %error, "session search archive cleanup failed");
         }
     }
 }
@@ -646,8 +646,10 @@ impl HitRecord {
         let mut bytes = [0u8; MATCH_BYTES as usize];
         reader.read_exact(&mut bytes)?;
         let mut values = bytes
-            .chunks_exact(8)
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| u64::from_le_bytes(*bytes));
         Ok(Self {
             row_id: values.next().unwrap(),
             byte_start: values.next().unwrap(),
@@ -811,7 +813,7 @@ fn search_worker(state: Arc<QueryState>, regex: Regex, carry_bytes: usize) {
                 }
                 let line = reader.read(scanned)?;
                 matcher.scan(scanned, &line, &regex, carry_bytes, |record| {
-                    if count % 128 == 0 && state.cancelled.load(Ordering::Acquire) {
+                    if count.is_multiple_of(128) && state.cancelled.load(Ordering::Acquire) {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "search cancelled",
@@ -824,7 +826,7 @@ fn search_worker(state: Arc<QueryState>, regex: Regex, carry_bytes: usize) {
                     Ok(())
                 })?;
                 scanned += 1;
-                if scanned % 128 == 0 {
+                if scanned.is_multiple_of(128) {
                     matches.flush()?;
                     let mut data = state.data.lock().unwrap();
                     data.committed_matches = count;
@@ -857,10 +859,10 @@ fn search_worker(state: Arc<QueryState>, regex: Regex, carry_bytes: usize) {
     if state.cancelled.load(Ordering::Acquire) {
         data.progress.cancelled = true;
         data.progress.complete = false;
-        if let Err(error) = fs::remove_file(&state.matches_path) {
-            if error.kind() != io::ErrorKind::NotFound {
-                tracing::warn!(%error, "cancelled session search result cleanup failed");
-            }
+        if let Err(error) = fs::remove_file(&state.matches_path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "cancelled session search result cleanup failed");
         }
     } else if let Err(error) = outcome {
         data.progress.error = Some(format!("session search failed: {error}"));

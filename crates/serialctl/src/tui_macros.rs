@@ -243,15 +243,15 @@ impl Editor {
                         .rposition(|c| *c == '\n')
                         .map_or(0, |i| i + 1);
                     self.cursor = (previous + column).min(start - 1);
-                } else if key.code == KeyCode::Down {
-                    if let Some(end) = self.text[self.cursor..].iter().position(|c| *c == '\n') {
-                        let next = self.cursor + end + 1;
-                        let length = self.text[next..]
-                            .iter()
-                            .position(|c| *c == '\n')
-                            .unwrap_or(self.text.len() - next);
-                        self.cursor = next + column.min(length);
-                    }
+                } else if key.code == KeyCode::Down
+                    && let Some(end) = self.text[self.cursor..].iter().position(|c| *c == '\n')
+                {
+                    let next = self.cursor + end + 1;
+                    let length = self.text[next..]
+                        .iter()
+                        .position(|c| *c == '\n')
+                        .unwrap_or(self.text.len() - next);
+                    self.cursor = next + column.min(length);
                 }
             }
             KeyCode::Backspace if self.cursor > 0 => {

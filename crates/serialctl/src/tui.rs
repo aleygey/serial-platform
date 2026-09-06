@@ -4634,11 +4634,11 @@ impl App {
                 let mut macro_record_missing = false;
                 let mut macro_error_port = None;
                 if let Some(request_id) = request_id {
-                    if let Some(port) = self.macro_start_requests.remove(&request_id) {
-                        if code != serial_protocol::ErrorCode::WriteOutcomeUncertain {
-                            self.macro_operations.remove(&port);
-                            self.release_macro_temporary_control(&port, commands);
-                        }
+                    if let Some(port) = self.macro_start_requests.remove(&request_id)
+                        && code != serial_protocol::ErrorCode::WriteOutcomeUncertain
+                    {
+                        self.macro_operations.remove(&port);
+                        self.release_macro_temporary_control(&port, commands);
                     }
                     let macro_port = self.macro_requests.remove(&request_id);
                     if let Some(port) = &macro_port
@@ -4660,15 +4660,14 @@ impl App {
                     {
                         macro_error_port = Some(port);
                     }
-                    if let Some(port) = &macro_error_port {
-                        if let Some(panel) = self
+                    if let Some(port) = &macro_error_port
+                        && let Some(panel) = self
                             .macro_panel
                             .as_mut()
                             .filter(|panel| &panel.port == port)
-                        {
-                            panel.busy = false;
-                            panel.message = safe_inline(&message);
-                        }
+                    {
+                        panel.busy = false;
+                        panel.message = safe_inline(&message);
                     }
                     match self.pending_requests.remove(&request_id) {
                         Some(PendingRequest::Write { port, .. })

@@ -1331,7 +1331,7 @@ mod tests {
     }
     #[test]
     fn idle_unsupported_strings_are_consumed_or_fail_if_observation_starts_inside() {
-        for prefix in [b'P', b'X', b'^', b'_'] {
+        for prefix in *b"PX^_" {
             let mut p = Projection::default();
             p.feed_unobserved(&[0x1b, prefix]);
             p.feed_unobserved(b"payload Ready\x1b");

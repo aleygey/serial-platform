@@ -413,10 +413,10 @@ impl Compiler {
             let actual = self.expression(argument)?;
             self.require(actual, *expected, argument.span)?;
         }
-        if builtin == Builtin::Cmd {
-            if let Some(text) = constant_string(&args[0], self.limits.max_string_bytes)? {
-                validate_command(&text, self.limits.max_string_bytes, args[0].span)?;
-            }
+        if builtin == Builtin::Cmd
+            && let Some(text) = constant_string(&args[0], self.limits.max_string_bytes)?
+        {
+            validate_command(&text, self.limits.max_string_bytes, args[0].span)?;
         }
         if builtin == Builtin::Watch
             && constant_string(&args[0], self.limits.max_string_bytes)?
@@ -430,17 +430,17 @@ impl Compiler {
         }
         if matches!(builtin, Builtin::Wait | Builtin::Expect | Builtin::Delay) {
             let duration = args.last().unwrap();
-            if let ExprKind::Literal(Value::Integer(ms)) = duration.kind {
-                if ms < 0 || ms as u64 > self.limits.max_duration_ms {
-                    return Err(Error::new(
-                        "duration_limit",
-                        format!(
-                            "duration must be 0..={} milliseconds",
-                            self.limits.max_duration_ms
-                        ),
-                        duration.span,
-                    ));
-                }
+            if let ExprKind::Literal(Value::Integer(ms)) = duration.kind
+                && (ms < 0 || ms as u64 > self.limits.max_duration_ms)
+            {
+                return Err(Error::new(
+                    "duration_limit",
+                    format!(
+                        "duration must be 0..={} milliseconds",
+                        self.limits.max_duration_ms
+                    ),
+                    duration.span,
+                ));
             }
         }
         self.emit(Op::Call(builtin), span);
