@@ -18476,13 +18476,10 @@ mod tests {
             latest_page.last().map(|item| item.seq),
             Some(MAX_LINES_PER_SLOT as u64)
         );
-        // Structural assertions above prove occurrence memory is page-bounded;
-        // this generous guard catches accidental per-hit allocation/scanning
-        // regressions without depending on release-mode timings.
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "dense index took {elapsed:?}"
-        );
+        // Exact scan counts and page/line bounds are deterministic regression
+        // guards. Wall time in a shared, unoptimized CI runner is diagnostic,
+        // not a product latency benchmark (other tests compete for its CPU).
+        eprintln!("dense index: {expected} matches in {elapsed:?}");
     }
 
     #[test]
