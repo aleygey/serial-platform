@@ -16,7 +16,7 @@ pub use features::*;
 
 /// Shared protocol generation for HTTP DTOs, WebSocket control/timeline
 /// frames, and cross-component compatibility checks.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const CONTROL_FRAME_TAG: u8 = 0x01;
 pub const RX_FRAME_TAG: u8 = 0x02;
 pub const TX_FRAME_TAG: u8 = 0x03;
@@ -2534,7 +2534,7 @@ mod tests {
 
     #[test]
     fn protocol_v7_exposes_independent_model_identity_contracts() {
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
         let profile = serde_json::to_value(model_profile()).unwrap();
         assert!(profile.get("model_names").is_none());
         let family = serde_json::to_value(ModelFamily {

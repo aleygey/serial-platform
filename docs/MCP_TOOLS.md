@@ -28,7 +28,7 @@ http://127.0.0.1:3211/mcp
 
 MCP host 对该 URL 发送 JSON-RPC `POST`。notification 返回 HTTP 202；没有持久 HTTP session 或 SSE GET channel。
 
-统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 从实际 `ActiveEndpoint` 继承精确 IP，并在该 IP 的 3211 端口保证 HTTP MCP 可用。例如后端活动地址为 `192.168.56.109:3210` 时，MCP 地址是 `http://192.168.56.109:3211/mcp`，不会另外绑定 localhost。后端 wildcard bind 发布为可连接的 loopback `ActiveEndpoint`，因此 `0.0.0.0` / `::` 分别收敛为 `127.0.0.1:3211` / `[::1]:3211`。health 检查、进程复用、启动等待和最终输出都使用同一个目标地址；复用还会核对当前 Serial wire protocol v8、后端 endpoint、server ID 和 daemon epoch。Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
+统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 从实际 `ActiveEndpoint` 继承精确 IP，并在该 IP 的 3211 端口保证 HTTP MCP 可用。例如后端活动地址为 `192.168.56.109:3210` 时，MCP 地址是 `http://192.168.56.109:3211/mcp`，不会另外绑定 localhost。后端 wildcard bind 发布为可连接的 loopback `ActiveEndpoint`，因此 `0.0.0.0` / `::` 分别收敛为 `127.0.0.1:3211` / `[::1]:3211`。health 检查、进程复用、启动等待和最终输出都使用同一个目标地址；复用还会核对当前 Serial wire protocol v9、后端 endpoint、server ID 和 daemon epoch。Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
 
 HTTP MCP 没有认证。listener 只接受精确 loopback 或可信 host-only 网卡的 unicast 地址，拒绝 wildcard、broadcast 和 multicast。非 loopback 部署必须限制在可信 host-only 网络，并使用主机防火墙限制来源，不能把 3211 端口暴露到普通局域网或公网。
 
@@ -64,10 +64,10 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 | `wait` | `run_handle` | `expect`, `regex`, `timeout_seconds` | 从 live cursor 等待 RX 边界 |
 | `search` | `port`, `query` | `regex`, `scope`, `run_id`, `epoch`, `after_seq` | 搜索当前 Run、当前 cursor 或归档 |
 | `monitor_start` | `port`, `matchers` | `description`, `idempotency_key` | 用一组 OR 条件创建持久 Monitor 并立即返回 |
-| `monitor_list` | — | `port` | 列出 Monitor |
+| `monitor_list` | — | `port`, `include_stopped` | 默认仅列出运行中 Monitor |
 | `monitor_status` | `monitor_id` | — | 读取一个 Monitor 的权威状态 |
 | `monitor_incidents` | `monitor_id` | `after` | 读取 incident tail 或向前分页 |
-| `monitor_stop` | `monitor_id` | — | 停止未来匹配，保留 incident |
+| `monitor_stop` | `monitor_id` | `delete_history` | 默认停止并保留历史；显式删除时清理 Monitor 和 incident，保留原始串口日志 |
 | `run_start` | `port`, `label` | — | 空闲时原子开始 Run；Human 持有时等待 TUI/App 明确审批 |
 | `run_end` | `run_handle` | `outcome` | 正常完成 Run，或经权威确认后异常中止并释放 Control |
 
@@ -307,9 +307,11 @@ Break 默认 250 ms，可用 `duration_ms` 设置 1–5000 ms。其他 signal �
 
 ## Macro Script v1
 
-公开 `trigger` 已替换为 `macro_list`、`macro_save`、`macro_run`。`command_sequence` 保留，不需要把简单线性步骤写成宏。
+`macro_list` 查找宏，`macro_save` 保存或编辑宏，`macro_run` 执行保存的宏或一次性脚本。`command_sequence` 适合简单线性步骤，宏适合循环、条件和可重复流程。
 
 宏支持 let、if/else、for、while、break/continue，以及 cmd、watch、prompt、wait、expect、delay。cmd 自动追加 Profile EOL，不开放 input/raw/eol 参数。脚本执行器位于 seriald，不逐步回调 Agent，不运行宿主机 shell。
+
+`cmd(text)` 等待完整、精确的命令行回显（最长 2 秒，并受宏总时限约束），缺字、回显不符或不可确认时停止，不继续后续步骤、不自动重试。不检查返回值或命令业务结果，这由 Agent 判断。明确无回显的启动窗口可用 `cmd(text, "send_only")`，只确认主机发送；不算作输入已验证。返回的 `writes`、`input_verified_writes`、`send_only_writes` 分别报告三种计数。磁盘日志降级不会单独阻止宏，实时 RX 缺口/断连/人工介入仍会安全停止。
 
 保存默认为 shared:false；默认列表及 AI 上下文仅包含显式共享宏。一次性 script 直接 run、不入库；保存的宏使用固定 revision，编辑使用 expected_revision。macros 列表/保存是目录操作，不占串口；运行需要已授权 Run。
 
@@ -367,7 +369,7 @@ scope：
 
 ### `monitor_list` / `monitor_status`
 
-`monitor_list` 可用 `port` 过滤。`monitor_status` 输入：
+`monitor_list` 可用 `port` 过滤，默认仅返回运行中任务；加 `include_stopped:true` 查看保留的历史。`monitor_status` 输入：
 
 ```json
 {"monitor_id":"uuid"}
@@ -396,6 +398,8 @@ scope：
 ```
 
 停止未来匹配，已有 incident 继续可读。
+
+明确不再需要 Monitor 历史时可传 `{"monitor_id":"uuid","delete_history":true}`：先停止，再按 revision 删除 Monitor 及 incident；原始串口 journal 不删除。删除历史不可撤销，普通停止不会删除。
 
 ## `run_end`
 

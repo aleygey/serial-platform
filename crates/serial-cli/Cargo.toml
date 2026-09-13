@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+crossterm.workspace = true
 serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }
 seriald = { path = "../seriald" }

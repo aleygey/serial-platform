@@ -391,6 +391,7 @@ impl SlotHandle {
                 last_rx_wall_time_ns: None,
                 last_rx_instant: None,
                 logging: LoggingState::Healthy,
+                journal_health_seq: 0,
                 control: ControlState::new(daemon_epoch, 0, control_limits),
                 pending_run_start: None,
                 active_run: None,
@@ -1601,6 +1602,7 @@ struct SlotActor {
     last_rx_wall_time_ns: Option<i64>,
     last_rx_instant: Option<Instant>,
     logging: LoggingState,
+    journal_health_seq: u64,
     control: ControlState,
     pending_run_start: Option<PendingRunStartState>,
     active_run: Option<RunInfo>,
@@ -4237,9 +4239,12 @@ impl SlotActor {
             self.active_trigger.is_none() && self.active_macro.is_none() && !self.trigger_arming;
         let mut degradation = None;
         let event = match self.journal.try_append(event.clone()) {
-            Ok(pending) if self.logging == LoggingState::Healthy && wait_for_journal => {
-                match tokio::time::timeout(self.journal.ack_timeout(), pending.wait()).await {
-                    Ok(Ok(durable)) => durable,
+            Ok(mut pending) if self.logging == LoggingState::Healthy && wait_for_journal => {
+                match tokio::time::timeout(self.journal.ack_timeout(), pending.wait_mut()).await {
+                    Ok(Ok(durable)) => {
+                        self.journal_health_seq = event_seq;
+                        durable
+                    }
                     Ok(Err(error)) => {
                         if self.mark_logging_degraded(&error) {
                             degradation = Some(error.to_string());
@@ -4251,24 +4256,26 @@ impl SlotActor {
                         if self.mark_logging_degraded_message(error) {
                             degradation = Some(error.into());
                         }
+                        // Keep the original completion token: a late disk write
+                        // is not a lost RX event and must be able to recover.
+                        let _ = self.track_journal_ack(event_seq, pending, true);
                         event
                     }
                 }
             }
-            Ok(pending) if self.logging == LoggingState::Healthy => {
+            Ok(pending) => {
                 // Trigger matching and scheduling are real-time paths. Enqueue
                 // the record in sequence order, deliver the live event as
                 // durable=false, and observe the acknowledgement out of band.
                 // This prevents a healthy-but-slow disk flush from stretching a
                 // 20 ms Trigger interval toward the journal's 100 ms budget.
-                if let Err(error) = self.track_journal_ack(event_seq, pending)
+                if let Err(error) = self.track_journal_ack(event_seq, pending, false)
                     && self.mark_logging_degraded_message(error)
                 {
                     degradation = Some(error.into());
                 }
                 event
             }
-            Ok(_pending) => event,
             Err(error) => {
                 if self.mark_logging_degraded(&error) {
                     degradation = Some(error.to_string());
@@ -4285,7 +4292,12 @@ impl SlotActor {
         event_seq
     }
 
-    fn track_journal_ack(&self, seq: u64, pending: PendingAppend) -> Result<(), &'static str> {
+    fn track_journal_ack(
+        &self,
+        seq: u64,
+        mut pending: PendingAppend,
+        already_timed_out: bool,
+    ) -> Result<(), &'static str> {
         let permit = self
             .journal_ack_permits
             .clone()
@@ -4297,10 +4309,28 @@ impl SlotActor {
         let completed = self.journal_ack_results.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let outcome = match tokio::time::timeout(timeout, pending.wait()).await {
-                Ok(Ok(_durable)) => JournalAckOutcome::Durable,
-                Ok(Err(error)) => JournalAckOutcome::Failed(error.to_string()),
-                Err(_) => JournalAckOutcome::TimedOut,
+            let first = if already_timed_out {
+                None
+            } else {
+                Some(tokio::time::timeout(timeout, pending.wait_mut()).await)
+            };
+            let outcome = match first {
+                Some(Ok(Ok(_durable))) => JournalAckOutcome::Durable,
+                Some(Ok(Err(error))) => JournalAckOutcome::Failed(error.to_string()),
+                timed_out => {
+                    if timed_out.is_some() {
+                        let _ = completed
+                            .send(JournalAckResult {
+                                seq,
+                                outcome: JournalAckOutcome::TimedOut,
+                            })
+                            .await;
+                    }
+                    match pending.wait().await {
+                        Ok(_) => JournalAckOutcome::Durable,
+                        Err(error) => JournalAckOutcome::Failed(error.to_string()),
+                    }
+                }
             };
             let _ = completed.send(JournalAckResult { seq, outcome }).await;
         });
@@ -4311,9 +4341,22 @@ impl SlotActor {
         match result.outcome {
             JournalAckOutcome::Durable => {
                 self.ring.lock().await.mark_durable(result.seq);
+                if result.seq >= self.journal_health_seq {
+                    self.journal_health_seq = result.seq;
+                    self.logging = LoggingState::Healthy;
+                    if self
+                        .state_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with("journal degraded:"))
+                    {
+                        self.state_reason = None;
+                        self.state_code = None;
+                    }
+                    self.publish_snapshot().await;
+                }
             }
             JournalAckOutcome::Failed(error) => {
-                if self.mark_logging_degraded_message(&error) {
+                if self.mark_logging_degraded_at(&error, result.seq) {
                     self.publish_nondurable_logging_event(error).await;
                 }
             }
@@ -4322,7 +4365,7 @@ impl SlotActor {
                     "journal acknowledgement for event {} timed out; continuing live delivery",
                     result.seq
                 );
-                if self.mark_logging_degraded_message(&error) {
+                if self.mark_logging_degraded_at(&error, result.seq) {
                     self.publish_nondurable_logging_event(error).await;
                 }
             }
@@ -4334,6 +4377,14 @@ impl SlotActor {
     }
 
     fn mark_logging_degraded_message(&mut self, error: &str) -> bool {
+        self.mark_logging_degraded_at(error, self.seq)
+    }
+
+    fn mark_logging_degraded_at(&mut self, error: &str, seq: u64) -> bool {
+        if seq < self.journal_health_seq {
+            return false;
+        }
+        self.journal_health_seq = seq;
         let changed = self.logging != LoggingState::Degraded;
         self.logging = LoggingState::Degraded;
         self.state_reason = Some(format!("journal degraded: {error}"));

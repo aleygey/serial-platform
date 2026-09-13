@@ -293,6 +293,22 @@ impl ApiClient {
         .await
     }
 
+    pub async fn delete_monitor_history(
+        &self,
+        id: uuid::Uuid,
+        revision: u64,
+    ) -> Result<serial_protocol::MonitorResponse> {
+        decode_response(
+            self.client
+                .delete(self.url(&format!("/api/v1/monitors/{id}/history")))
+                .query(&[("expected_revision", revision)])
+                .send()
+                .await
+                .context("删除 Monitor 历史失败")?,
+        )
+        .await
+    }
+
     pub async fn monitor_incidents(
         &self,
         monitor_id: uuid::Uuid,

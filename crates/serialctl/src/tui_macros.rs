@@ -651,10 +651,12 @@ impl Panel {
             .as_ref()
             .map(|execution| {
                 format!(
-                    "{:?} · 行{} · {}次写入 · {}",
+                    "{:?} · 行{} · 发送{} · 输入核对{} · 只发送{} · {}",
                     execution.status,
                     execution.line,
                     execution.writes,
+                    execution.input_verified_writes,
+                    execution.send_only_writes,
                     execution.message.as_deref().unwrap_or("")
                 )
             })

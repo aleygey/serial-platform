@@ -154,6 +154,8 @@ pub struct Effect {
 pub enum EffectKind {
     Command {
         text: String,
+        /// False only for an explicit cmd(text, "send_only") call.
+        verify_echo: bool,
     },
     Watch {
         watcher: WatcherId,

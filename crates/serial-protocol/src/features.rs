@@ -214,6 +214,10 @@ pub struct MacroExecutionInfo {
     pub line: usize,
     pub column: usize,
     pub writes: u64,
+    #[serde(default)]
+    pub input_verified_writes: u64,
+    #[serde(default)]
+    pub send_only_writes: u64,
     pub bytes_written: u64,
     pub first_seq: u64,
     pub through_seq: u64,

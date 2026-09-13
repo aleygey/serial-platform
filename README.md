@@ -21,7 +21,11 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 serial setup
 ```
 
-交互说明保持简短并同时显示中英文：
+本地首次配置使用三步向导：扫描并选择串口 → 参数与机型 → 确认保存。扫描只枚举设备，不打开串口，也不发送探测命令。选择页支持方向键、空格多选、Enter 确认、R/F5 刷新、M 手动输入和 L 稍后配置；配置时可用 `q` 取消，保存前不会改动配置。已有端口与 Profile 保留。
+
+常用参数是波特率和 EOL，其余放在可选高级设置；提示符及机型可以稍后配置。保存后可直接打开 TUI，或仅保存。已运行本地后端时自动改用在线配置；`serial setup --endpoint http://HOST:3210` 配置远程后端，扫描的是该后端机器的串口。
+
+几个概念：
 
 - 后端地址 / Endpoint：`seriald` 的监听 IP 和端口。
 - 串口 Profile / Transport Profile：波特率、数据位、校验位、停止位、流控、DTR/RTS 和自动打开。
@@ -46,7 +50,9 @@ serial
 
 同一本地数据目录只运行一个 `seriald`。`serial` 和 App 会自动发现并验证该后端；无论使用默认还是自定义地址、先启动 App 还是先运行 `serial`，后启动的一方都会复用同一个服务。
 
-当前 Macro/人工历史使用 Serial wire protocol v8。更新时 seriald、TUI/CLI、App 和 MCP 应使用同一构建并重启，MCP 宿主需要刷新工具列表；不要混用 v7 后端和新客户端。现有配置文件无需删除。
+当前 Macro/人工历史使用 Serial wire protocol v9。更新时 seriald、TUI/CLI、App 和 MCP 应使用同一构建并重启，MCP 宿主需要刷新工具列表；不要混用 v8 后端和新客户端。现有配置文件无需删除。
+
+v0.8.7 的 `cmd(text)` 在发送后检查完整命令回显，不判断执行结果；无回显的启动窗口使用显式 `cmd(text, "send_only")`。升级前请审核相关旧宏，不会自动改写用户脚本。详见 [v0.8.7 更新说明](./docs/releases/v0.8.7.md)。
 
 App 和 `serial` 只停止自己启动的进程。拥有后端的一方退出后，另一方不会自动接管或启动替代后端；重新启动后才重新发现或创建服务。
 
@@ -223,7 +229,7 @@ physical UART
     ▼
 seriald ── durable journal
     ├── HTTP v1 configuration / diagnostics / history
-    ├── WebSocket protocol v8 realtime and control
+    ├── WebSocket protocol v9 realtime and control
     ├── serialctl TUI
     ├── Electron App
     └── serial-mcp ── stdio or Streamable HTTP ── Agent
@@ -238,7 +244,7 @@ seriald ── durable journal
 文档入口：
 
 - [架构与交互设计](./DOCUMENTATION.md)：产品边界、配置模型、Control/Run、历史投影和启动所有权；
-- [protocol v8](./docs/PROTOCOL.md)：HTTP v1、WebSocket v8、Timeline、Monitor 与 MCP transport 线协议；
+- [protocol v9](./docs/PROTOCOL.md)：HTTP v1、WebSocket v9、Timeline、Monitor 与 MCP transport 线协议；
 - [MCP 工具契约](./docs/MCP_TOOLS.md)：18 个工具的输入、结果和 Agent 工作流；
 - [Macro Script v1](./docs/MACRO_SCRIPT_V1.md)：宏语言、参数、共享和执行边界；
 - [输入与搜索操作](./docs/INPUT_AND_SEARCH.md)：补全、焦点、同页配置、全会话搜索与 TUI 宏页面；

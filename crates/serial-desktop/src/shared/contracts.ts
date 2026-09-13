@@ -215,6 +215,8 @@ export interface MacroExecution {
   line: number
   column: number
   writes: number
+  input_verified_writes?: number
+  send_only_writes?: number
   bytes_written: number
   first_seq: number
   through_seq: number

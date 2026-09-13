@@ -265,6 +265,23 @@ impl ApiClient {
         unreachable!("the bounded Monitor creation retry loop always returns")
     }
 
+    pub async fn delete_monitor_history(
+        &self,
+        monitor_id: uuid::Uuid,
+        revision: u64,
+    ) -> Result<MonitorResponse> {
+        let response = self
+            .request(
+                self.client
+                    .delete(self.url(&format!("/api/v1/monitors/{monitor_id}/history")))
+                    .query(&[("expected_revision", revision)]),
+            )
+            .send()
+            .await
+            .context("delete stopped Monitor history failed")?;
+        decode_response(response).await
+    }
+
     pub async fn monitors(&self, port: Option<&str>) -> Result<MonitorListResponse> {
         let query: Vec<(&str, &str)> = port.map(|id| vec![("port", id)]).unwrap_or_default();
         let response = self

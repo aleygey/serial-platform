@@ -34,8 +34,8 @@ afterEach(async () => {
 
 describe('component protocol gate', () => {
   it('accepts v8 and rejects an older backend before opening the live socket', () => {
-    expect(() => assertCompatibleProtocol(8)).not.toThrow()
-    expect(() => assertCompatibleProtocol(7)).toThrow(/App 需要 v8，后端提供 v7/)
+    expect(() => assertCompatibleProtocol(9)).not.toThrow()
+    expect(() => assertCompatibleProtocol(8)).toThrow(/App 需要 v9，后端提供 v8/)
   })
 
   it('requires an ok v8 health response with stable UUID identities', () => {
@@ -43,23 +43,23 @@ describe('component protocol gate', () => {
       status: 'ok',
       server_id: '11111111-1111-4111-8111-111111111111',
       daemon_epoch: '22222222-2222-4222-8222-222222222222',
-      protocol_version: 8,
+      protocol_version: 9,
       uptime_ms: 10
     })
     expect(identity).toEqual({
       serverId: '11111111-1111-4111-8111-111111111111',
       daemonEpoch: '22222222-2222-4222-8222-222222222222',
-      protocolVersion: 8
+      protocolVersion: 9
     })
     expect(serialdIdentityMatches(identity, identity)).toBe(true)
     expect(serialdIdentityMatches(identity, { ...identity, daemonEpoch: '33333333-3333-4333-8333-333333333333' }))
       .toBe(false)
-    expect(() => parseSerialdHealth({ ...identity, status: 'ok', protocol_version: 8 }))
+    expect(() => parseSerialdHealth({ ...identity, status: 'ok', protocol_version: 9 }))
       .toThrow('服务身份')
     expect(() => parseSerialdHealth({
       status: 'ok', server_id: identity.serverId, daemon_epoch: identity.daemonEpoch,
       protocol_version: 6
-    })).toThrow(/App 需要 v8/)
+    })).toThrow(/App 需要 v9/)
   })
 })
 
@@ -546,7 +546,7 @@ function statusResponse(configRevision: number): Record<string, unknown> {
   return {
     server_id: '11111111-1111-4111-8111-111111111111',
     daemon_epoch: '22222222-2222-4222-8222-222222222222',
-    protocol_version: 8,
+    protocol_version: 9,
     config_revision: configRevision,
     ports: []
   }
@@ -630,7 +630,7 @@ async function serialBackend(initial: SerialDaemonState): Promise<SerialTestBack
           type: 'welcome',
           server_id: backend.state.serverId,
           daemon_epoch: backend.state.daemonEpoch,
-          protocol_version: 8,
+          protocol_version: 9,
           actor: HUMAN_ACTOR
         })
         sendControl(socket, {
@@ -733,7 +733,7 @@ function statusFor(state: SerialDaemonState): Record<string, unknown> {
   return {
     server_id: state.serverId,
     daemon_epoch: state.daemonEpoch,
-    protocol_version: 8,
+    protocol_version: 9,
     config_revision: 1,
     ports: [portSnapshot(state)]
   }

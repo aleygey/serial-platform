@@ -18,6 +18,7 @@ impl From<ValueType> for Type {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Builtin {
     Cmd,
+    CmdSendOnly,
     Watch,
     Wait,
     Expect,
@@ -344,6 +345,23 @@ impl Compiler {
         })
     }
     fn call(&mut self, name: &str, args: &[Expr], span: Span) -> Result<Type, Error> {
+        if name == "cmd" && args.len() == 2 {
+            if !matches!(&args[1].kind, ExprKind::Literal(Value::String(mode)) if mode == "send_only")
+            {
+                return Err(Error::new(
+                    "invalid_command_mode",
+                    "cmd second argument must be the literal \"send_only\"; omit it to verify device echo",
+                    args[1].span,
+                ));
+            }
+            let actual = self.expression(&args[0])?;
+            self.require(actual, Type::Scalar(ValueType::String), args[0].span)?;
+            if let Some(text) = constant_string(&args[0], self.limits.max_string_bytes)? {
+                validate_command(&text, self.limits.max_string_bytes, args[0].span)?;
+            }
+            self.emit(Op::Call(Builtin::CmdSendOnly), span);
+            return Ok(Type::Void);
+        }
         if name == "prompt" {
             if args.len() != 1 {
                 return Err(Error::new(

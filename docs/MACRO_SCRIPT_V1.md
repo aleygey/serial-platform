@@ -1,6 +1,6 @@
 # Macro Script v1
 
-Macro 是在 seriald 内执行的有界串口脚本，不是宿主机 JavaScript、Shell 或 Python。人和 Agent 使用同一个目录、语言、参数规则与执行器。`command` 用于单条命令，`command_sequence` 保留用于 1–8 步线性依赖；需要循环、条件或重复使用的流程使用 Macro。公开 `trigger` 由 Macro 替代，旧 Trigger 时间线和底层 wire 类型仅用于兼容与审计。
+Macro 是在 seriald 内执行的有界串口脚本，不是宿主机 JavaScript、Shell 或 Python。人和 Agent 使用同一个目录、语言、参数规则与执行器。`command` 用于单条命令，`command_sequence` 保留用于 1–8 步线性依赖；需要循环、条件或重复使用的流程使用 Macro。
 
 ## AI 如何使用
 
@@ -20,7 +20,7 @@ Macro 是在 seriald 内执行的有界串口脚本，不是宿主机 JavaScript
 {
   "run_handle": "<run_start 返回的句柄>",
   "description": "重启后反复发送 slp，直到当前 Profile 的 U-Boot 提示符",
-  "script": "let boot = watch(prompt(\"uboot\"));\ncmd(\"reboot\");\nwhile (!boot.matched) {\n  cmd(\"slp\");\n  wait(boot, 50);\n}\nexpect(boot, 0);",
+  "script": "let boot = watch(prompt(\"uboot\"));\ncmd(\"reboot\", \"send_only\");\nwhile (!boot.matched) {\n  cmd(\"slp\", \"send_only\");\n  wait(boot, 50);\n}\nexpect(boot, 0);",
   "timeout_seconds": 15
 }
 ```
@@ -40,7 +40,7 @@ Macro 是在 seriald 内执行的有界串口脚本，不是宿主机 JavaScript
       "maximum": 1000
     }
   },
-  "script": "let boot = watch(prompt(\"uboot\"));\ncmd(\"reboot\");\nwhile (!boot.matched) {\n  cmd(\"slp\");\n  wait(boot, args.interval_ms);\n}\nexpect(boot, 0);",
+  "script": "let boot = watch(prompt(\"uboot\"));\ncmd(\"reboot\", \"send_only\");\nwhile (!boot.matched) {\n  cmd(\"slp\", \"send_only\");\n  wait(boot, args.interval_ms);\n}\nexpect(boot, 0);",
   "shared": false
 }
 ```
@@ -76,7 +76,7 @@ for (let i = 0; i < 3; i++) {
 
 | 内建函数 | 行为 |
 | --- | --- |
-| `cmd(text)` | 自动追加有效 Profile EOL，等待本次 TX 确认，**不等待提示符**。 |
+| `cmd(text)` | 自动追加有效 Profile EOL，等待 TX 确认后最多 2 秒核对完整设备回显，**不判断命令执行结果**。 |
 | `watch(literal)` | 安装字面值观察器；起点绑定下一次 cmd 的权威 TX，新 RX 才能命中。 |
 | `prompt("shell")` / `prompt("uboot")` | 引用当前 Profile 的提示符，未配置则整个宏在 TX 前拒绝。 |
 | `wait(w, ms)` | 命中返回 true；本次等待到时返回 false，观察器仍继续工作。 |
@@ -92,6 +92,14 @@ for (let i = 0; i < 3; i++) {
 不支持数组、对象、用户函数、import、eval、宿主文件、网络或系统命令。完整词法及编译器接口见 [核心语言说明](../crates/serial-macro/README.md)。
 
 ## 执行与失败边界
+
+### 0.8.7 输入确认
+
+`cmd(text)` 默认核对新 RX 中的一整行精确命令回显（可带配置中精确的提示符前缀），最多等待 2 秒并受宏总时限约束。分段和 ANSI SGR/OSC 装饰会正常处理。回显缺字、不一致、缺失或证据不明确时停止后续步骤，不补字、不重发；已经提交的本条命令不能撤回。执行器不解析成功/失败文本、不判断命令业务结果，结果由人或 Agent 使用 read 检查。
+
+无回显、空命令及重启时序发送必须显式使用 `cmd(text, "send_only")`；仍带 EOL，不是 raw/input 工具。执行结果分别提供 `writes`、`input_verified_writes`、`send_only_writes`。既有宏不会被静默修改：升级后检查重启、slp 等需要只发送的步骤。收到命令回显仅能核对可观察输入，并非设备端协议校验和或业务执行证明。
+
+宏依据本次连续的实时 RX，而不依赖过去磁盘日志的健康标记。落盘延迟会保留诊断，后续确认可恢复当前记录状态；既有历史缺口不会被抹除。当前实时流丢失、断线、控制权变化仍然停止宏。
 
 - 默认总时限 30 秒，允许 1–120 秒；源码最多 64 KiB，字符串最多 4096 字节，最多 256 个 watcher/变量、64 层嵌套、100000 条 VM 指令；每 256 条指令协作让出执行。
 - 单条物理命令含 EOL 最多 4096 字节；整个宏含 EOL 的 TX 最多 1 MiB。实际写入仍受 pacing、原有写入时限和剩余 lease 约束。

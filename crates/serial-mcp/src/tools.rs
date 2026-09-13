@@ -900,6 +900,7 @@ impl AgentTools {
             .and_then(Value::as_array)
             .context("seriald Monitor list omitted monitors")?
             .iter()
+            .filter(|monitor| args.include_stopped || monitor["status"] == "running")
             .map(compact_monitor)
             .collect::<Vec<_>>();
         let count = monitors.len();
@@ -977,13 +978,21 @@ impl AgentTools {
         }))
     }
 
-    async fn monitor_stop(&self, args: MonitorIdArgs) -> Result<Value> {
+    async fn monitor_stop(&self, args: MonitorStopArgs) -> Result<Value> {
         let existing = monitor_from_response(self.api.monitor(args.monitor_id).await?)?;
         let revision = existing
             .get("revision")
             .and_then(Value::as_u64)
             .context("seriald Monitor response omitted revision")?;
         let response = self.api.stop_monitor(args.monitor_id, revision).await?;
+        if args.delete_history {
+            self.api
+                .delete_monitor_history(args.monitor_id, response.monitor.revision)
+                .await?;
+            return Ok(
+                json!({"monitor_id":args.monitor_id,"stopped":true,"deleted":true,"incidents_retained":false,"serial_journal_retained":true}),
+            );
+        }
         let mut output = compact_monitor(&monitor_from_response(response)?);
         output["stopped"] = json!(true);
         output["incidents_retained"] = json!(true);
@@ -3874,6 +3883,15 @@ struct MonitorStartArgs {
 #[serde(deny_unknown_fields)]
 struct MonitorListArgs {
     port: Option<String>,
+    #[serde(default)]
+    include_stopped: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorStopArgs {
+    monitor_id: Uuid,
+    #[serde(default)]
+    delete_history: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

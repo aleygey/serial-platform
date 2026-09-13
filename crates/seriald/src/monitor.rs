@@ -398,6 +398,39 @@ impl MonitorManager {
         })
     }
 
+    /// Explicitly remove only a terminal job. The serial journal is untouched.
+    pub async fn delete_stopped(
+        &self,
+        monitor_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<MonitorResponse, MonitorError> {
+        let removed = self
+            .mutate_and_persist(|state| {
+                let monitor = state
+                    .monitors
+                    .get(&monitor_id)
+                    .ok_or(MonitorError::NotFound(monitor_id))?;
+                if monitor.revision != expected_revision {
+                    return Err(MonitorError::RevisionMismatch {
+                        expected: expected_revision,
+                        actual: monitor.revision,
+                    });
+                }
+                if monitor.status == MonitorStatus::Running {
+                    return Err(MonitorError::InvalidSpec(
+                        "stop the Monitor before deleting its history".into(),
+                    ));
+                }
+                let removed = monitor.clone();
+                state.monitors.remove(&monitor_id);
+                state.incidents.remove(&monitor_id);
+                state.checkpoints.remove(&monitor_id);
+                Ok(removed)
+            })
+            .await?;
+        Ok(MonitorResponse { monitor: removed })
+    }
+
     pub async fn get(&self, monitor_id: Uuid) -> Result<MonitorResponse, MonitorError> {
         Ok(MonitorResponse {
             monitor: self.get_view(monitor_id).await?,
@@ -529,21 +562,21 @@ impl MonitorManager {
             .ok_or(MonitorError::NotFound(monitor_id))
     }
 
-    async fn mutate_and_persist(
+    async fn mutate_and_persist<T>(
         &self,
-        mutate: impl FnOnce(&mut PersistedState) -> Result<(), MonitorError>,
-    ) -> Result<(), MonitorError> {
+        mutate: impl FnOnce(&mut PersistedState) -> Result<T, MonitorError>,
+    ) -> Result<T, MonitorError> {
         let _mutation = self.inner.mutation.lock().await;
         let previous = self.inner.state.read().await.clone();
-        {
+        let value = {
             let mut state = self.inner.state.write().await;
-            mutate(&mut state)?;
-        }
+            mutate(&mut state)?
+        };
         if let Err(error) = self.persist().await {
             *self.inner.state.write().await = previous;
             return Err(error);
         }
-        Ok(())
+        Ok(value)
     }
 
     async fn persist(&self) -> Result<(), MonitorError> {
@@ -2969,6 +3002,60 @@ mod tests {
         assert_eq!(stopped.status, MonitorStatus::Stopped);
         assert!(!manager.inner.workers.lock().await.contains_key(&monitor_id));
 
+        manager.shutdown().await;
+        registry.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_history_deletion_requires_stopped_revision_and_is_transactional() {
+        let temp = TempDir::new().unwrap();
+        let (manager, registry, journal, _) = fixture(&temp).await;
+        let created = manager
+            .create(CreateMonitorRequest {
+                request_id: Uuid::new_v4(),
+                spec: spec("slot-1"),
+            })
+            .await
+            .unwrap()
+            .monitor;
+        assert!(matches!(
+            manager.delete_stopped(created.id, created.revision).await,
+            Err(MonitorError::InvalidSpec(_))
+        ));
+        let stopped = manager
+            .stop(created.id, created.revision)
+            .await
+            .unwrap()
+            .monitor;
+        assert!(matches!(
+            manager.delete_stopped(created.id, created.revision).await,
+            Err(MonitorError::RevisionMismatch { .. })
+        ));
+        manager.set_persist_failure(true);
+        assert!(
+            manager
+                .delete_stopped(stopped.id, stopped.revision)
+                .await
+                .is_err()
+        );
+        assert!(manager.get(stopped.id).await.is_ok());
+        manager.set_persist_failure(false);
+        manager
+            .delete_stopped(stopped.id, stopped.revision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get(stopped.id).await,
+            Err(MonitorError::NotFound(_))
+        ));
+        assert!(
+            load_state(&temp.path().join("monitors.json"))
+                .unwrap()
+                .monitors
+                .is_empty()
+        );
+        assert!(temp.path().join("journal").exists());
         manager.shutdown().await;
         registry.shutdown().await;
         journal.shutdown().await.unwrap();

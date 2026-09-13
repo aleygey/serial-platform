@@ -360,7 +360,7 @@ impl Vm {
 
     fn call(&mut self, builtin: Builtin) -> Result<Effect, Error> {
         let kind = match builtin {
-            Builtin::Cmd => {
+            Builtin::Cmd | Builtin::CmdSendOnly => {
                 let text = self.pop_string()?;
                 validate_command(&text, self.program.limits.max_string_bytes, self.last_span)?;
                 let bytes = self
@@ -372,7 +372,10 @@ impl Vm {
                 }
                 self.command_bytes = bytes;
                 self.command_effects += 1;
-                EffectKind::Command { text }
+                EffectKind::Command {
+                    text,
+                    verify_echo: builtin == Builtin::Cmd,
+                }
             }
             Builtin::Watch => {
                 let pattern = self.pop_string()?;

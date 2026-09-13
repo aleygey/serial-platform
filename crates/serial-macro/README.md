@@ -13,9 +13,9 @@ Unicode double-quoted literals; the supported escapes are `\"`, `\\`, `\n`,
 
 ```text
 let boot = watch(prompt("uboot"));
-cmd("reboot");
+cmd("reboot", "send_only");
 while (!boot.matched) {
-    cmd("slp");
+    cmd("slp", "send_only");
     wait(boot, args.interval_ms);
 }
 
@@ -35,7 +35,7 @@ implicit conversions, objects, arrays, imports, functions, eval or host access.
 
 | Built-in | Result | Driver obligation |
 | --- | --- | --- |
-| `cmd(string)` | void | Append Profile EOL; confirm TX, without waiting for a prompt |
+| `cmd(string)` | void | Append Profile EOL; confirm TX and exact fresh device echo, not command results |
 | `watch(string)` | watcher | Register before the next TX; bind to that command's new RX |
 | `prompt("shell" / "uboot")` | string | Supply the required Profile prompt before execution |
 | `wait(watcher, ms)` | boolean | Return whether this deadline observed a trustworthy match |

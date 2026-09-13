@@ -647,61 +647,8 @@ async fn run_setup(
         );
     }
 
-    let discovered = api.ports().await?;
-    if discovered.is_empty() {
-        bail!(tr("i.no.ports"));
-    }
-    if !args.json {
-        println!("{}", tr("i.ports.header"));
-        for (index, port) in discovered.iter().enumerate() {
-            let detail = port
-                .product
-                .as_deref()
-                .or(port.manufacturer.as_deref())
-                .unwrap_or(&port.port_type);
-            println!(
-                "  {:>2}. {} {}",
-                index + 1,
-                pad_display(&safe_inline(&port.name), 10),
-                safe_inline(detail)
-            );
-        }
-    }
-
-    let existing_selection = discovered
-        .iter()
-        .enumerate()
-        .filter(|(_, port)| {
-            existing_ports
-                .iter()
-                .any(|configured| same_serial_port(&configured.port, &port.name))
-        })
-        .map(|(index, _)| (index + 1).to_string())
-        .collect::<Vec<_>>();
-    let default_selection = if existing_selection.is_empty() {
-        "1".to_string()
-    } else {
-        existing_selection.join(",")
-    };
-    let selected = if args.port.is_empty() {
-        if !interactive {
-            bail!("at least one --port is required in non-interactive setup");
-        }
-        let selection = prompt_with_default(tr("i.select.ports"), &default_selection)?;
-        parse_selection(&selection, discovered.len())?
-    } else {
-        args.port
-            .iter()
-            .map(|requested| {
-                discovered
-                    .iter()
-                    .position(|port| same_serial_port(&port.name, requested))
-                    .with_context(|| {
-                        format!("serial port {requested:?} was not discovered on the seriald host")
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
+    let (discovered, selected) =
+        setup_port_selection(&api, &existing_ports, &args, interactive).await?;
 
     let (transport_catalog, _) = profile::load_transport_catalog(&api).await?;
     let model_catalog = profile::load_model_catalog(&api).await?;
@@ -710,11 +657,47 @@ async fn run_setup(
         println!("串口 Profile：配置波特率、数据位、校验位、停止位和流控");
         println!("机型 Profile：配置 Shell/U-Boot 提示符和发送方式");
         println!("机型名：用一级系列和二级具体型号标记当前设备");
+        println!(
+            "可用串口参数：none（115200 8N1） / {}",
+            transport_catalog
+                .profiles
+                .iter()
+                .map(|p| format!("{}（{}）", safe_inline(&p.name), p.baud_rate))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        );
+        println!(
+            "可用交互配置：none / {}",
+            model_catalog
+                .profiles
+                .iter()
+                .map(|p| safe_inline(&p.name))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        );
+        for family in &family_catalog.families {
+            println!(
+                "  {} → {}",
+                safe_inline(&family.name),
+                family
+                    .model_names
+                    .iter()
+                    .map(|n| safe_inline(n))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            );
+        }
     }
 
     let mut configured_ports = Vec::with_capacity(selected.len());
     for port_index in selected {
         let discovered_port = &discovered[port_index];
+        if interactive {
+            println!(
+                "\n步骤 2/3 · 配置 {}（Enter 保留当前值；none 跳过；q 取消）",
+                safe_inline(&discovered_port.name)
+            );
+        }
         let existing = existing_ports
             .iter()
             .find(|configured| same_serial_port(&configured.port, &discovered_port.name));
@@ -816,6 +799,20 @@ async fn run_setup(
         }
     }
 
+    if interactive {
+        println!("步骤 3/3 · 将保存以下串口配置：");
+        for port in &configured_ports {
+            println!(
+                "  {} · {} · {}",
+                safe_inline(&port.port),
+                safe_inline(port.transport_profile.as_deref().unwrap_or("115200 8N1")),
+                safe_inline(port.model_name.as_deref().unwrap_or("机型未配置"))
+            );
+        }
+        if !prompt_yes_no_default_no("确认保存？")? {
+            bail!("已取消，未保存配置");
+        }
+    }
     let configured = api
         .configure_ports(configured_ports, current.config_revision)
         .await
@@ -863,14 +860,107 @@ async fn run_setup(
     }
     Ok(())
 }
+async fn setup_port_selection(
+    api: &ApiClient,
+    existing: &[SlotConfig],
+    args: &SetupArgs,
+    interactive: bool,
+) -> Result<(Vec<serial_protocol::PortDescriptor>, Vec<usize>)> {
+    loop {
+        let mut ports = api.ports().await?;
+        if !args.json {
+            println!("步骤 1/3 · 后端串口（扫描不打开设备、不发送探测命令）");
+            for (i, port) in ports.iter().enumerate() {
+                println!(
+                    "{}. {} · {}",
+                    i + 1,
+                    safe_inline(&port.name),
+                    safe_inline(
+                        port.product
+                            .as_deref()
+                            .or(port.manufacturer.as_deref())
+                            .unwrap_or(&port.port_type)
+                    )
+                );
+            }
+        }
+        if !args.port.is_empty() {
+            let selected = args
+                .port
+                .iter()
+                .map(|requested| {
+                    ports
+                        .iter()
+                        .position(|p| same_serial_port(&p.name, requested))
+                        .with_context(|| format!("串口 {requested:?} 未在后端发现"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok((ports, selected));
+        }
+        if !interactive {
+            bail!("at least one --port is required in non-interactive setup");
+        }
+        if ports.is_empty() {
+            println!("未发现串口，请检查连接及驱动；可以刷新、手动输入或取消。");
+        }
+        let prior = ports
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| existing.iter().any(|e| same_serial_port(&e.port, &p.name)))
+            .map(|(i, _)| (i + 1).to_string())
+            .collect::<Vec<_>>();
+        let default = if prior.is_empty() && ports.len() == 1 {
+            "1".into()
+        } else {
+            prior.join(",")
+        };
+        let choice = prompt_with_default(
+            "选择编号（逗号多选）；r 刷新 / m 手动输入 / q 取消",
+            &default,
+        )?;
+        if choice == "r" {
+            continue;
+        }
+        if choice == "m" {
+            let name = prompt_with_default("后端串口名称（例如 COM4 或 /dev/ttyUSB0）", "")?;
+            if name.is_empty() || name.chars().any(char::is_control) {
+                println!("串口名称无效");
+                continue;
+            }
+            if let Some(index) = ports.iter().position(|p| same_serial_port(&p.name, &name)) {
+                return Ok((ports, vec![index]));
+            }
+            let index = ports.len();
+            ports.push(serial_protocol::PortDescriptor {
+                name,
+                port_type: "manual".into(),
+                manufacturer: None,
+                product: None,
+                serial_number: None,
+            });
+            println!("手动端口尚未验证，保存配置后由后端报告实际连接状态。");
+            return Ok((ports, vec![index]));
+        }
+        match parse_selection(&choice, ports.len()) {
+            Ok(selected) => return Ok((ports, selected)),
+            Err(e) => println!("{e}；请重新选择。"),
+        }
+    }
+}
+
 fn prompt_with_default(label: &str, default: &str) -> Result<String> {
     use std::io::Write;
 
     print!("{label} [{default}]: ");
     std::io::stdout().flush()?;
     let mut value = String::new();
-    std::io::stdin().read_line(&mut value)?;
+    if std::io::stdin().read_line(&mut value)? == 0 {
+        bail!("已取消，未保存配置");
+    }
     let value = value.trim();
+    if value == "q" {
+        bail!("已取消，未保存配置");
+    }
     Ok(if value.is_empty() {
         default.to_string()
     } else {

@@ -74,6 +74,8 @@ pub struct JournalConfig {
     /// far larger value so a slow CI disk cannot inject a spurious
     /// `LoggingDegraded` event into exact-sequence assertions.
     pub ack_timeout: Duration,
+    #[cfg(test)]
+    pub append_delay: Duration,
 }
 
 impl JournalConfig {
@@ -86,6 +88,8 @@ impl JournalConfig {
             max_total_bytes: 10 * 1024 * 1024 * 1024,
             cleanup_low_watermark: 0.90,
             ack_timeout: default_ack_timeout(),
+            #[cfg(test)]
+            append_delay: Duration::ZERO,
         }
     }
 
@@ -452,6 +456,13 @@ impl PendingAppend {
     pub async fn wait(self) -> Result<TimelineEvent, JournalError> {
         self.result.await.map_err(|_| JournalError::WriterClosed)?
     }
+    /// Cancellation of a caller's latency budget must not discard the eventual
+    /// write outcome. The token can be moved to an acknowledgement tracker.
+    pub async fn wait_mut(&mut self) -> Result<TimelineEvent, JournalError> {
+        (&mut self.result)
+            .await
+            .map_err(|_| JournalError::WriterClosed)?
+    }
 }
 
 enum WriterCommand {
@@ -548,6 +559,8 @@ impl WriterState {
     }
 
     fn append(&mut self, mut event: TimelineEvent) -> Result<TimelineEvent, JournalError> {
+        #[cfg(test)]
+        std::thread::sleep(self.config.append_delay);
         validate_port(&event.port)?;
         if event.seq == 0 {
             return Err(JournalError::NonMonotonicSequence {

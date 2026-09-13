@@ -6,7 +6,6 @@ use std::{
     net::TcpStream,
     path::PathBuf,
     process::{self, Child, Command, ExitStatus, Stdio},
-    str::FromStr as _,
     thread,
     time::{Duration, Instant},
 };
@@ -24,7 +23,7 @@ Unified serial-platform command
 Usage:
   serial                         Start backend, MCP HTTP, and TUI
   serial console [serialctl options]
-  serial setup [--root DIR]      Configure offline; backend need not be running
+  serial setup [--root DIR]      Scan ports and configure; reuse a running backend
   serial [--root DIR] serve [seriald options]
   serial profile <transport|model|attach|detach> ...
   serial status|doctor|archives|logs ...
@@ -38,9 +37,15 @@ wildcard seriald binds fall back to loopback.
 ";
 
 const SETUP_HELP: &str = "\
-Offline setup; seriald does not need to be running.
+Setup wizard; seriald does not need to be running.
 
 Usage: serial setup [--root DIR]
+       serial setup --endpoint http://HOST:3210
+
+自动扫描串口（不打开设备、不发送探测命令），支持刷新、多选和手动输入。
+本地离线向导：↑↓ 选择、空格多选、Enter 确认、R 刷新、M 手动输入、L 稍后配置。
+按步骤配置并在保存前确认；q 取消且不保存。已有配置、机型和端口保留。
+已有后端时改用在线配置；--endpoint 指定后端时扫描的是后端机器的串口。
 
 后端地址：seriald 监听 IP 和端口
 串口 Profile：波特率、数据位、校验位
@@ -194,7 +199,42 @@ fn component_program(component: Component) -> &'static OsStr {
 
 fn run_setup(args: &[OsString]) -> Result<(), String> {
     let store = config_store(args)?;
-    configure_offline(&store, true)
+    let remote = args
+        .iter()
+        .position(|a| a == "--endpoint")
+        .map(|index| {
+            args.get(index + 1)
+                .and_then(|v| v.to_str())
+                .ok_or("--endpoint requires a URL")
+        })
+        .transpose()?;
+    let active = if store.paths().config_file.exists() {
+        let config = store.load().map_err(|e| e.to_string())?;
+        discover_active(store.paths(), config.server_id).map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    if let Some(endpoint) = remote.or_else(|| active.as_ref().map(|a| a.endpoint.as_str())) {
+        println!("配置已运行的后端 {endpoint}；扫描该后端所在电脑的串口。");
+        let status = Command::new(
+            required_sibling(component_program(Component::Console)).map_err(|e| e.to_string())?,
+        )
+        .args(["--endpoint", endpoint, "setup"])
+        .status()
+        .map_err(|e| e.to_string())?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err("在线配置未完成".into())
+        };
+    }
+    if setup::configure(&store, true)? {
+        let status = run_unified(args).map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("配置已保存，但启动未成功；请检查上方连接错误后重试 serial".into());
+        }
+    }
+    Ok(())
 }
 
 fn run_unified(args: &[OsString]) -> std::io::Result<ExitStatus> {
@@ -327,199 +367,14 @@ fn append_root_arg(command: &mut Command, root: Option<&std::path::Path>) {
     }
 }
 
-struct OfflineConfiguration {
-    bind: SocketAddr,
-    transport_profiles: Vec<TransportProfile>,
-    model_profiles: Vec<ModelProfile>,
-    model_families: Vec<ModelFamily>,
-    ports: Vec<SlotConfig>,
-}
+mod setup;
 
 fn configure_offline(store: &ConfigStore, interactive: bool) -> Result<(), String> {
     if !interactive {
-        store
-            .load_or_create()
-            .map(|_| ())
-            .map_err(|error| error.to_string())?;
+        store.load_or_create().map_err(|e| e.to_string())?;
         return Ok(());
     }
-    println!("后端地址 / Endpoint：seriald 监听 IP 和端口");
-    println!("串口 Profile / Transport Profile：波特率、数据位、校验位");
-    println!("机型 Profile / Model Profile：Shell/U-Boot 提示符和发送行为");
-    println!("一级机型名 / Model family：设备系列");
-    println!("二级机型名 / Model name：当前串口所连接设备的具体型号");
-
-    let defaults = if store.paths().config_file.exists() {
-        store.load().map_err(|error| error.to_string())?
-    } else {
-        DaemonConfig::generate()
-    };
-    let bind = prompt("后端 IP:端口", &defaults.bind.to_string())?;
-    let bind = SocketAddr::from_str(&bind).map_err(|_| "后端地址格式应为 IP:端口".to_owned())?;
-
-    let existing_ports = defaults
-        .ports
-        .iter()
-        .map(|slot| slot.port.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    let ports = prompt("串口名（多个用逗号分隔，可留空）", &existing_ports)?
-        .split(',')
-        .map(str::trim)
-        .filter(|port| !port.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-
-    let transport_name = defaults
-        .transport_profiles
-        .first()
-        .map(|profile| profile.name.as_str())
-        .unwrap_or("default-115200");
-    let transport_name = prompt("串口 Profile 名", transport_name)?;
-    let baud_default = defaults
-        .transport_profiles
-        .first()
-        .map(|profile| profile.baud_rate)
-        .unwrap_or(115_200);
-    let baud_rate = prompt("波特率", &baud_default.to_string())?
-        .parse::<u32>()
-        .map_err(|_| "波特率必须是整数".to_owned())?;
-    let transport_profiles = vec![TransportProfile {
-        name: transport_name.clone(),
-        baud_rate,
-        data_bits: DataBits::Eight,
-        parity: Parity::None,
-        stop_bits: StopBits::One,
-        flow_control: FlowControl::None,
-        dtr: false,
-        rts: false,
-        auto_open: true,
-    }];
-
-    let current_model = defaults.model_profiles.first();
-    let model_profile_name = prompt(
-        "机型 Profile 名（留空表示不绑定）",
-        current_model
-            .map(|profile| profile.name.as_str())
-            .unwrap_or(""),
-    )?;
-    let current_family = defaults.model_families.first();
-    let model_family_name = prompt(
-        "一级机型名（留空表示不标记机型）",
-        current_family
-            .map(|family| family.name.as_str())
-            .unwrap_or(""),
-    )?;
-    let current_concrete_model = defaults
-        .ports
-        .first()
-        .and_then(|port| port.model_name.as_deref())
-        .or_else(|| {
-            current_family.and_then(|family| family.model_names.first().map(String::as_str))
-        });
-    let concrete_model_name = if model_family_name.is_empty() {
-        String::new()
-    } else {
-        prompt("二级具体机型名", current_concrete_model.unwrap_or(""))?
-    };
-    if !model_family_name.is_empty() && concrete_model_name.is_empty() {
-        return Err("二级具体机型名不能为空".into());
-    }
-    let shell_prompt = prompt_optional(
-        "Shell 提示符（- 清空）",
-        current_model.and_then(|profile| profile.shell_prompt.as_deref()),
-    )?;
-    let uboot_prompt = prompt_optional(
-        "U-Boot 提示符（- 清空）",
-        current_model.and_then(|profile| profile.uboot_prompt.as_deref()),
-    )?;
-    let model_profiles = if model_profile_name.is_empty() {
-        Vec::new()
-    } else {
-        vec![ModelProfile {
-            name: model_profile_name.clone(),
-            shell_prompt,
-            uboot_prompt,
-            write_eol: Some("\r".into()),
-            echo: Some(EchoMode::Auto),
-            write_chunk_size: Some(1),
-            write_chunk_delay_ms: Some(1),
-        }]
-    };
-    let model_families = if model_family_name.is_empty() {
-        Vec::new()
-    } else {
-        vec![ModelFamily {
-            name: model_family_name.clone(),
-            model_names: vec![concrete_model_name.clone()],
-        }]
-    };
-    let ports = ports
-        .into_iter()
-        .map(|port| SlotConfig {
-            port,
-            transport_profile: Some(transport_name.clone()),
-            model_profile: (!model_profile_name.is_empty()).then(|| model_profile_name.clone()),
-            model_family: (!model_family_name.is_empty()).then(|| model_family_name.clone()),
-            model_name: (!concrete_model_name.is_empty()).then(|| concrete_model_name.clone()),
-            enabled: true,
-        })
-        .collect();
-    persist_offline_configuration(
-        store,
-        OfflineConfiguration {
-            bind,
-            transport_profiles,
-            model_profiles,
-            model_families,
-            ports,
-        },
-    )?;
-    println!("配置已保存：{}", store.paths().config_file.display());
-    Ok(())
-}
-
-fn persist_offline_configuration(
-    store: &ConfigStore,
-    draft: OfflineConfiguration,
-) -> Result<(), String> {
-    let mut current = store
-        .load_or_create()
-        .map_err(|error| error.to_string())?
-        .config;
-    current.bind = draft.bind;
-    current.transport_profiles = draft.transport_profiles;
-    current.model_profiles = draft.model_profiles;
-    current.model_families = draft.model_families;
-    current.ports = draft.ports;
-    current.config_revision = current.config_revision.saturating_add(1);
-    store.save(&current).map_err(|error| error.to_string())
-}
-
-fn prompt(label: &str, default: &str) -> Result<String, String> {
-    if default.is_empty() {
-        print!("{label}: ");
-    } else {
-        print!("{label} [{default}]: ");
-    }
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|error| error.to_string())?;
-    let input = input.trim_end_matches(['\r', '\n']);
-    Ok(if input.is_empty() {
-        default.to_owned()
-    } else {
-        input.to_owned()
-    })
-}
-
-fn prompt_optional(label: &str, default: Option<&str>) -> Result<Option<String>, String> {
-    let value = prompt(label, default.unwrap_or(""))?;
-    Ok((!value.is_empty() && value != "-").then_some(value))
+    setup::configure(store, false).map(|_| ())
 }
 
 fn required_sibling(program: &OsStr) -> std::io::Result<PathBuf> {
@@ -870,41 +725,6 @@ mod tests {
         assert!(!contents.contains("token"));
         assert!(!contents.contains("auth"));
         assert!(!contents.contains("slots"));
-    }
-
-    #[test]
-    fn interactive_setup_rebases_on_the_atomic_first_create_winner() {
-        let root = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(ConfigPaths::from_root(root.path()));
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let winner_store = store.clone();
-        let winner_barrier = barrier.clone();
-        let winner = std::thread::spawn(move || {
-            let loaded = winner_store.load_or_create().unwrap();
-            winner_barrier.wait();
-            (loaded.config.server_id, loaded.config.config_revision)
-        });
-
-        barrier.wait();
-        let stale = DaemonConfig::generate();
-        let requested_bind = "127.0.0.1:4321".parse().unwrap();
-        persist_offline_configuration(
-            &store,
-            OfflineConfiguration {
-                bind: requested_bind,
-                transport_profiles: stale.transport_profiles,
-                model_profiles: stale.model_profiles,
-                model_families: stale.model_families,
-                ports: stale.ports,
-            },
-        )
-        .unwrap();
-
-        let (winner_server_id, winner_revision) = winner.join().unwrap();
-        let saved = store.load().unwrap();
-        assert_eq!(saved.server_id, winner_server_id);
-        assert_eq!(saved.config_revision, winner_revision + 1);
-        assert_eq!(saved.bind, requested_bind);
     }
 
     #[test]

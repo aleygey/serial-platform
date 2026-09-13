@@ -760,6 +760,7 @@ struct SlotView {
     /// lifecycle and confirmed TX events for quick review.
     run_history: VecDeque<RunHistoryEntry>,
     monitor_history: VecDeque<MonitorHistoryEntry>,
+    show_stopped_monitors: bool,
     /// The bar is a bounded recent projection, not an assertion that the
     /// durable journal has been read from sequence one. Initial attach uses a
     /// tail, and any gap or local eviction keeps this conservative marker set.
@@ -1070,6 +1071,7 @@ impl SlotView {
             last_manual_activity: None,
             run_history: VecDeque::new(),
             monitor_history: VecDeque::new(),
+            show_stopped_monitors: false,
             run_history_limited: true,
             selected_run: None,
             expanded_run: None,
@@ -1334,18 +1336,25 @@ impl SlotView {
             .run_history_chronological()
             .into_iter()
             .map(|run| (run.start_seq, run.id, HistoryActionKey::Run(run.id)))
-            .chain(self.monitor_history.iter().map(|entry| {
-                (
-                    entry
-                        .monitor
-                        .spec
-                        .start_cursor
-                        .as_ref()
-                        .map_or(0, |cursor| cursor.after_seq),
-                    entry.monitor.id,
-                    HistoryActionKey::Monitor(entry.monitor.id),
-                )
-            }))
+            .chain(
+                self.monitor_history
+                    .iter()
+                    .filter(|entry| {
+                        self.show_stopped_monitors || entry.monitor.status == MonitorStatus::Running
+                    })
+                    .map(|entry| {
+                        (
+                            entry
+                                .monitor
+                                .spec
+                                .start_cursor
+                                .as_ref()
+                                .map_or(0, |cursor| cursor.after_seq),
+                            entry.monitor.id,
+                            HistoryActionKey::Monitor(entry.monitor.id),
+                        )
+                    }),
+            )
             .collect::<Vec<_>>();
         actions.sort_by_key(|(sequence, id, key)| {
             (
@@ -2980,6 +2989,10 @@ struct App {
     /// Confirmed local writes not yet represented by a sufficiently new snapshot.
     human_history_confirmed: Vec<(String, u64)>,
     macro_panel: Option<macro_ui::Panel>,
+    monitor_commands: Option<mpsc::Sender<(Uuid, u64)>>,
+    pending_monitor_delete: Option<(Uuid, u64, Instant)>,
+    port_mouse_tabs: Vec<(Rect, usize)>,
+    history_mouse_rows: Vec<(Rect, RunPanelRow)>,
     macro_saved_panel: Option<macro_ui::Panel>,
     macro_panel_id: Uuid,
     macro_io_contexts: VecDeque<Uuid>,
@@ -3075,6 +3088,10 @@ impl App {
             human_history_version: None,
             human_history_confirmed: Vec::new(),
             macro_panel: None,
+            monitor_commands: None,
+            pending_monitor_delete: None,
+            port_mouse_tabs: Vec::new(),
+            history_mouse_rows: Vec::new(),
             macro_saved_panel: None,
             macro_panel_id: Uuid::new_v4(),
             macro_io_contexts: VecDeque::new(),
@@ -5854,6 +5871,17 @@ impl App {
         self.normalize_queue_selection();
     }
 
+    fn leave_run_history(&mut self) {
+        self.focus = PaneFocus::Input;
+        self.pending_monitor_delete = None;
+        self.pending_exact_evidence = None;
+        if let Some(snapshot) = self.current_mut().scroll_snapshot.as_mut() {
+            for line in &mut snapshot.rows {
+                clear_command_highlight(line);
+            }
+        }
+    }
+
     fn toggle_run_history_panel(&mut self) {
         if !self.run_panel_visible {
             self.run_panel_visible = true;
@@ -5861,7 +5889,7 @@ impl App {
             self.status = tr("st.run.panel.focused").into();
         } else if self.focus == PaneFocus::RunHistory {
             self.run_panel_visible = false;
-            self.focus = PaneFocus::Input;
+            self.leave_run_history();
             self.status = tr("st.run.panel.hidden").into();
         } else {
             self.focus = PaneFocus::RunHistory;
@@ -5870,13 +5898,72 @@ impl App {
     }
 
     fn handle_run_history_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::F(6) {
+            let show = !self.current().show_stopped_monitors;
+            self.current_mut().show_stopped_monitors = show;
+            if !show {
+                let view = self.current_mut();
+                if view.selected_monitor.is_some_and(|id| {
+                    view.monitor(id)
+                        .is_none_or(|entry| entry.monitor.status != MonitorStatus::Running)
+                }) {
+                    view.selected_monitor = None;
+                    view.expanded_monitor = None;
+                    view.selected_monitor_matcher = None;
+                    view.selected_monitor_incident = None;
+                }
+            }
+            self.pending_monitor_delete = None;
+            self.status = if show {
+                "显示 Monitor 历史 · 选择已停止任务后按两次 Delete 删除；F6 隐藏"
+            } else {
+                "仅显示运行中 Monitor · F6 查看已停止历史"
+            }
+            .into();
+            return;
+        }
+        if key.code == KeyCode::Delete {
+            if let Some(monitor) = self
+                .current()
+                .selected_monitor
+                .and_then(|id| self.current().monitor(id))
+                .map(|entry| entry.monitor.clone())
+            {
+                if monitor.status == MonitorStatus::Running {
+                    self.status = "Monitor 正在运行，请先停止；未删除任何内容".into();
+                    return;
+                }
+                let confirmed = self
+                    .pending_monitor_delete
+                    .is_some_and(|(id, revision, at)| {
+                        id == monitor.id
+                            && revision == monitor.revision
+                            && at.elapsed() < Duration::from_secs(10)
+                    });
+                if confirmed {
+                    self.pending_monitor_delete = None;
+                    if self.monitor_commands.as_ref().is_some_and(|sender| {
+                        sender.try_send((monitor.id, monitor.revision)).is_ok()
+                    }) {
+                        self.status =
+                            "正在删除已停止 Monitor 及其命中记录；原始串口日志保留".into();
+                    }
+                } else {
+                    self.pending_monitor_delete =
+                        Some((monitor.id, monitor.revision, Instant::now()));
+                    self.status =
+                        "再按一次 Delete 删除选中的 Monitor 及命中记录；原始串口日志保留".into();
+                }
+            }
+            return;
+        }
+        self.pending_monitor_delete = None;
         // Serial paging and the mouse wheel are reserved for the serial
         // viewport. Keep long Agent details reachable with direction keys by
         // using Shift+Up/Down as an explicit detail-scroll gesture, while
         // unmodified arrows continue to navigate the history tree.
         if key.code == KeyCode::Esc {
-            self.focus = PaneFocus::Input;
-            self.current_mut().follow();
+            self.leave_run_history();
             self.status = tr("st.run.panel.left").into();
             return;
         }
@@ -6838,7 +6925,13 @@ impl App {
                 self.dirty = true;
                 return;
             }
-            KeyCode::Enter | KeyCode::Home | KeyCode::End | KeyCode::Tab | KeyCode::BackTab
+            KeyCode::Enter
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::F(6)
                 if self.focus == PaneFocus::RunHistory =>
             {
                 self.handle_run_history_key(key);
@@ -6846,7 +6939,7 @@ impl App {
                 return;
             }
             KeyCode::Esc if self.focus == PaneFocus::RunHistory => {
-                self.focus = PaneFocus::Input;
+                self.leave_run_history();
                 self.dirty = true;
                 return;
             }
@@ -6893,6 +6986,16 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        // Modals own interaction; no click or wheel may reach the underlying
+        // serial controls while a confirmation, editor, or search is open.
+        if self.help
+            || self.menu.is_some()
+            || self.macro_panel.is_some()
+            || self.output_search.is_some()
+            || self.pending_run_start_approval().is_some()
+        {
+            return;
+        }
         if matches!(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -6932,7 +7035,70 @@ impl App {
             return;
         };
         let position = Position::new(mouse.column, mouse.row);
+        if let Some(index) = self
+            .port_mouse_tabs
+            .iter()
+            .find(|(rect, _)| rect_contains(*rect, position))
+            .map(|(_, index)| *index)
+        {
+            self.leave_run_history();
+            self.clear_text_selection();
+            self.select(index);
+            self.last_output_click = None;
+            self.archived_view = None;
+            self.queue_selection = None;
+            return;
+        }
+        if let Some(row) = self
+            .history_mouse_rows
+            .iter()
+            .find(|(rect, _)| rect_contains(*rect, position))
+            .map(|(_, row)| {
+                (
+                    row.run,
+                    row.command,
+                    row.step,
+                    row.monitor,
+                    row.matcher,
+                    row.incident,
+                )
+            })
+        {
+            self.clear_text_selection();
+            self.focus = PaneFocus::RunHistory;
+            let view = self.current_mut();
+            view.run_detail_scroll = 0;
+            if let Some(id) = row.3 {
+                view.selected_run = None;
+                view.selected_run_command = None;
+                view.selected_monitor = Some(id);
+                view.selected_monitor_matcher = row.4;
+                view.selected_monitor_incident = row.5;
+                if row.4.is_none() {
+                    view.expanded_monitor = (view.expanded_monitor != Some(id)).then_some(id);
+                }
+                if row.5.is_some() {
+                    self.jump_output_to_monitor_incident();
+                }
+            } else if let Some(id) = row.0 {
+                view.selected_monitor = None;
+                view.selected_monitor_incident = None;
+                view.selected_run = Some(id);
+                view.selected_run_command = row.1;
+                view.selected_run_step = row.2;
+                if let Some(command) = row.1 {
+                    view.expanded_run = Some(id);
+                    view.expanded_run_command = Some(command);
+                    self.jump_output_to_run_command(command, row.2);
+                } else {
+                    view.expanded_run = (view.expanded_run != Some(id)).then_some(id);
+                    view.expanded_run_command = None;
+                }
+            }
+            return;
+        }
         if rect_contains(layout.input_area, position) {
+            self.leave_run_history();
             self.reset_software_cursor_blink(Instant::now());
             self.last_output_click = None;
             self.queue_selection = None;
@@ -6942,6 +7108,9 @@ impl App {
         if !rect_contains(layout.output_area, position) {
             self.last_output_click = None;
             return;
+        }
+        if self.focus == PaneFocus::RunHistory {
+            self.leave_run_history();
         }
         self.clear_text_selection();
         if !rect_contains(layout.output_inner, position) {
@@ -9862,6 +10031,14 @@ impl App {
 
     fn handle_monitor_io_event(&mut self, event: MonitorIoEvent) {
         match event {
+            MonitorIoEvent::Deleted => {
+                self.status = "已删除 Monitor 历史；原始串口日志仍保留".into();
+                self.dirty = true;
+            }
+            MonitorIoEvent::DeleteFailed(error) => {
+                self.status = format!("Monitor 历史未删除：{}", safe_inline(&error));
+                self.dirty = true;
+            }
             MonitorIoEvent::Snapshot(entries) => {
                 for view in &mut self.ports {
                     let mut matching = entries
@@ -9873,10 +10050,12 @@ impl App {
                         matching.pop_front();
                     }
                     view.monitor_history = matching;
-                    if view
-                        .selected_monitor
-                        .is_some_and(|id| view.monitor(id).is_none())
-                    {
+                    if view.selected_monitor.is_some_and(|id| {
+                        view.monitor(id).is_none_or(|entry| {
+                            !view.show_stopped_monitors
+                                && entry.monitor.status != MonitorStatus::Running
+                        })
+                    }) {
                         view.selected_monitor = None;
                         view.expanded_monitor = None;
                         view.selected_monitor_matcher = None;
@@ -10229,6 +10408,7 @@ struct MenuIo {
 }
 
 struct MonitorIo {
+    commands: mpsc::Sender<(Uuid, u64)>,
     events: mpsc::Receiver<MonitorIoEvent>,
 }
 
@@ -10286,6 +10466,8 @@ fn spawn_human_history_io(
 
 enum MonitorIoEvent {
     Snapshot(Vec<MonitorHistoryEntry>),
+    Deleted,
+    DeleteFailed(String),
     Failed(String),
 }
 
@@ -11450,13 +11632,24 @@ async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
 }
 
 fn spawn_monitor_io(api: ApiClient) -> MonitorIo {
+    let (commands, mut mutations) = mpsc::channel::<(Uuid, u64)>(2);
     let (event_tx, event_rx) = mpsc::channel(2);
     tokio::spawn(async move {
         let mut retained = HashMap::<Uuid, MonitorHistoryEntry>::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {},
+                command = mutations.recv() => {
+                    let Some((id, revision)) = command else { break; };
+                    let event = match api.delete_monitor_history(id, revision).await {
+                        Ok(_) => MonitorIoEvent::Deleted,
+                        Err(error) => MonitorIoEvent::DeleteFailed(format!("{error:#}")),
+                    };
+                    if event_tx.send(event).await.is_err() { break; }
+                }
+            }
             let result = refresh_monitor_history(&api, &mut retained).await;
             let event = match result {
                 Ok(entries) => MonitorIoEvent::Snapshot(entries),
@@ -11467,7 +11660,10 @@ fn spawn_monitor_io(api: ApiClient) -> MonitorIo {
             }
         }
     });
-    MonitorIo { events: event_rx }
+    MonitorIo {
+        commands,
+        events: event_rx,
+    }
 }
 
 async fn refresh_monitor_history(
@@ -11574,6 +11770,7 @@ pub async fn run(
     let mut exact_evidence_io = spawn_exact_evidence_io(api.clone());
     app.exact_evidence_commands = Some(exact_evidence_io.commands.clone());
     let mut monitor_io = spawn_monitor_io(api.clone());
+    app.monitor_commands = Some(monitor_io.commands.clone());
     let mut human_history_io =
         spawn_human_history_io(api.clone(), app.human_history_generation.clone());
     app.human_history_commands = Some(human_history_io.commands.clone());
@@ -11928,6 +12125,8 @@ fn wrap_queue_text(value: &str, width: u16) -> Vec<String> {
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.port_mouse_tabs.clear();
+    app.history_mouse_rows.clear();
     app.sync_status_notice(Instant::now());
     let area = frame.area();
     let history_growth = app
@@ -12380,7 +12579,7 @@ fn session_state_label(state: SessionState) -> &'static str {
     }
 }
 
-fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_tabs(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let titles = app
         .ports
         .iter()
@@ -12393,6 +12592,17 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ))
         })
         .collect::<Vec<_>>();
+    let inner = inset_border(area);
+    let mut x = inner.x;
+    for (index, title) in titles.iter().enumerate() {
+        let width =
+            (title.width().min(u16::MAX as usize) as u16).min(inner.right().saturating_sub(x));
+        if width > 0 {
+            app.port_mouse_tabs
+                .push((Rect::new(x, inner.y, width, inner.height), index));
+        }
+        x = x.saturating_add(width).saturating_add(1);
+    }
     let connection = if !app.transport_connected {
         tr("conn.reconnecting")
     } else if !app.hello_accepted {
@@ -12403,6 +12613,7 @@ fn draw_tabs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         tr("conn.attaching")
     };
     let tabs = Tabs::new(titles)
+        .padding("", "")
         .select(app.selected)
         .block(
             Block::default()
@@ -12473,7 +12684,13 @@ fn visible_output_lines(app: &App, inner: Rect) -> Vec<Line<'static>> {
         let scroll = view.scroll_from_bottom.min(max_scroll);
         let end = snapshot.rows.len().saturating_sub(scroll);
         let start = end.saturating_sub(visible_height);
-        return snapshot.rows[start..end].to_vec();
+        let mut rows = snapshot.rows[start..end].to_vec();
+        if app.focus != PaneFocus::RunHistory {
+            for line in &mut rows {
+                clear_command_highlight(line);
+            }
+        }
+        return rows;
     }
 
     let truncation_line = view.local_truncation_line();
@@ -12878,6 +13095,25 @@ const COMMAND_CAPTURE_BACKGROUND: Color = Color::Rgb(28, 53, 66);
 const COMMAND_FALLBACK_BACKGROUND: Color = Color::LightCyan;
 const OUTPUT_SEARCH_MATCH_BACKGROUND: Color = Color::Rgb(62, 54, 18);
 const OUTPUT_SEARCH_CURRENT_BACKGROUND: Color = Color::Rgb(120, 86, 8);
+
+fn clear_command_highlight(line: &mut Line<'static>) {
+    fn clear(style: &mut Style) {
+        if style.bg == Some(COMMAND_FALLBACK_BACKGROUND) {
+            style.fg = Some(Color::Reset);
+            *style = style.remove_modifier(Modifier::BOLD);
+        }
+        if matches!(
+            style.bg,
+            Some(COMMAND_CAPTURE_BACKGROUND | COMMAND_FALLBACK_BACKGROUND)
+        ) {
+            style.bg = Some(Color::Reset);
+        }
+    }
+    clear(&mut line.style);
+    for span in &mut line.spans {
+        clear(&mut span.style);
+    }
+}
 
 fn highlight_search_range(line: Line<'static>, start: usize, end: usize) -> Line<'static> {
     let mut spans = Vec::new();
@@ -13622,7 +13858,12 @@ fn draw_powerline_separator(frame: &mut Frame<'_>, app: &App, area: Rect, label_
     } else {
         Color::DarkGray
     };
-    let label = format!(" {} ", tr(label_key));
+    let hint = if label_key.starts_with("ui.separator.agent") && area.width >= 70 {
+        " · F6 Monitor history · Delete×2 cleanup"
+    } else {
+        ""
+    };
+    let label = format!(" {}{} ", tr(label_key), hint);
     let occupied = UnicodeWidthStr::width(label.as_str()).saturating_add(2);
     let fill = "─".repeat((area.width as usize).saturating_sub(occupied));
     frame.render_widget(
@@ -14075,14 +14316,17 @@ fn run_history_rows(app: &App, width: u16) -> Vec<RunPanelRow> {
     rows
 }
 
-fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect, framed: bool) {
+fn draw_run_history(frame: &mut Frame<'_>, app: &mut App, area: Rect, framed: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(if app.current().run_history_limited {
-            tr("ui.run.title.limited")
-        } else {
-            tr("ui.run.title")
-        })
+        .title(format!(
+            "{} · F6 Monitor 历史 · Delete 删除已停止任务",
+            if app.current().run_history_limited {
+                tr("ui.run.title.limited")
+            } else {
+                tr("ui.run.title")
+            }
+        ))
         .border_style(if app.focus == PaneFocus::RunHistory {
             Style::default().fg(Color::Cyan)
         } else {
@@ -14147,7 +14391,15 @@ fn draw_run_history(frame: &mut Frame<'_>, app: &App, area: Rect, framed: bool) 
         rows.into_iter()
             .skip(start)
             .take(height)
-            .map(|row| row.line)
+            .enumerate()
+            .map(|(index, row)| {
+                let line = row.line.clone();
+                app.history_mouse_rows.push((
+                    Rect::new(inner.x, inner.y + index as u16, inner.width, 1),
+                    row,
+                ));
+                line
+            })
             .collect::<Vec<_>>(),
     );
     if framed {
@@ -16208,6 +16460,8 @@ mod tests {
             line: 1,
             column: 1,
             writes: 1,
+            input_verified_writes: 1,
+            send_only_writes: 0,
             bytes_written: 5,
             first_seq: 1,
             through_seq: 2,
@@ -17644,6 +17898,89 @@ mod tests {
     }
 
     #[test]
+    fn leaving_history_clears_cached_highlight_without_losing_position_or_text() {
+        let mut app = App::new(vec![snapshot()], None);
+        let (commands, _) = mpsc::channel(1);
+        for close_by_toggle in [false, true] {
+            app.run_panel_visible = true;
+            app.focus = PaneFocus::RunHistory;
+            app.current_mut().scroll_snapshot = Some(ScrollSnapshot {
+                rows: vec![
+                    command_capture_line(Line::from(Span::styled(
+                        "context",
+                        Style::default().fg(Color::Yellow),
+                    ))),
+                    command_fallback_line("command"),
+                ],
+            });
+            app.current_mut().scroll_from_bottom = 1;
+            if close_by_toggle {
+                app.toggle_run_history_panel();
+            } else {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commands);
+            }
+            assert_eq!(app.focus, PaneFocus::Input);
+            assert_eq!(app.current().scroll_from_bottom, 1);
+            let rows = &app.current().scroll_snapshot.as_ref().unwrap().rows;
+            assert_eq!(line_plain_text(&rows[0]), "context");
+            assert_eq!(rows[0].spans[0].style.fg, Some(Color::Yellow));
+            for row in rows {
+                assert_ne!(row.style.bg, Some(COMMAND_CAPTURE_BACKGROUND));
+                for span in &row.spans {
+                    assert!(!matches!(
+                        span.style.bg,
+                        Some(COMMAND_CAPTURE_BACKGROUND | COMMAND_FALLBACK_BACKGROUND)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_targets_rendered_tabs_history_and_input_but_never_clicks_through_modals() {
+        let mut current = snapshot();
+        let run = agent_run("clickable history");
+        current.active_run = Some(run.clone());
+        let mut other = snapshot();
+        other.config.port = "COM9".into();
+        let mut app = App::new(vec![current, other], None);
+        let (commands, mut received) = mpsc::channel(8);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let click = |rect: Rect| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let tab = app.port_mouse_tabs[1].0;
+        app.help = true;
+        app.handle_mouse(click(tab), &commands);
+        assert_eq!(app.selected, 0);
+        app.help = false;
+        app.handle_mouse(click(tab), &commands);
+        assert_eq!(app.selected, 1);
+        let first = app.port_mouse_tabs[0].0;
+        app.handle_mouse(click(first), &commands);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let row = app
+            .history_mouse_rows
+            .iter()
+            .find(|(_, row)| row.run == Some(run.id))
+            .unwrap()
+            .0;
+        app.handle_mouse(click(row), &commands);
+        assert_eq!(app.focus, PaneFocus::RunHistory);
+        assert_eq!(app.current().expanded_run, Some(run.id));
+        app.handle_mouse(click(app.layout.unwrap().input_area), &commands);
+        assert_eq!(app.focus, PaneFocus::Input);
+        assert!(
+            received.try_recv().is_err(),
+            "clicking only selects, never transmits"
+        );
+    }
+
+    #[test]
     fn top_status_uses_only_port_name_and_session_state() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::En);
@@ -17656,7 +17993,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_tabs(frame, &app, area);
+                draw_tabs(frame, &mut app, area);
             })
             .unwrap();
         let rendered = terminal
@@ -19200,6 +19537,45 @@ mod tests {
             created_wall_time_ns: 200,
             acked_wall_time_ns: None,
         }
+    }
+
+    #[test]
+    fn stopped_monitor_filter_and_confirmed_cleanup_do_not_delete_running_jobs() {
+        let mut app = App::new(vec![snapshot()], None);
+        let incident = monitor_incident(app.current().snapshot.daemon_epoch, 2, 3);
+        let id = incident.monitor_id;
+        select_monitor_incident(&mut app, incident);
+        let (sender, mut receiver) = mpsc::channel(4);
+        app.monitor_commands = Some(sender);
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(receiver.try_recv().is_err());
+        assert!(app.pending_monitor_delete.is_none());
+        app.current_mut().monitor_history[0].monitor.status = MonitorStatus::Stopped;
+        assert!(app.current().history_action_keys().is_empty());
+        app.handle_run_history_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert_eq!(
+            app.current().history_action_keys(),
+            vec![HistoryActionKey::Monitor(id)]
+        );
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(receiver.try_recv().is_err());
+        app.leave_run_history();
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(
+            receiver.try_recv().is_err(),
+            "changing focus cancels confirmation"
+        );
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(receiver.try_recv().unwrap(), (id, 1));
+        app.handle_run_history_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert!(app.current().selected_monitor.is_none());
+        assert!(app.current().selected_monitor_incident.is_none());
+        assert_eq!(
+            app.current().monitor_history.len(),
+            1,
+            "hiding is not deletion"
+        );
     }
 
     fn select_monitor_incident(app: &mut App, incident: MonitorIncident) {

@@ -26,7 +26,7 @@ fn commands(source: &str) -> Vec<String> {
     let mut output = Vec::new();
     while let Some(effect) = next(&mut vm).unwrap() {
         match &effect.kind {
-            EffectKind::Command { text } => output.push(text.clone()),
+            EffectKind::Command { text, .. } => output.push(text.clone()),
             _ => panic!("unexpected effect {effect:?}"),
         }
         vm.resume(effect.id, EffectResult::Done).unwrap();
@@ -35,6 +35,28 @@ fn commands(source: &str) -> Vec<String> {
 }
 fn compile_error(source: &str) -> Error {
     compile(source, &BTreeMap::new(), Limits::default()).unwrap_err()
+}
+
+#[test]
+fn command_verifies_by_default_and_send_only_requires_an_explicit_static_mode() {
+    for (source, verify_echo) in [
+        (r#"cmd("help");"#, true),
+        (r#"cmd("slp", "send_only");"#, false),
+    ] {
+        let mut vm = vm(source);
+        assert!(
+            matches!(next(&mut vm).unwrap().unwrap().kind, EffectKind::Command { verify_echo: actual, .. } if actual == verify_echo)
+        );
+    }
+    assert_eq!(
+        compile_error(r#"cmd("help", false);"#).code,
+        "invalid_command_mode"
+    );
+    assert!(
+        compile_error(r#"cmd("bad\n", "send_only");"#)
+            .message
+            .contains("control")
+    );
 }
 
 #[test]
@@ -125,7 +147,13 @@ fn short_circuit_does_not_evaluate_division_or_issue_wait() {
     assert!(matches!(first.kind, EffectKind::Watch { .. }));
     vm.resume(first.id, EffectResult::Done).unwrap();
     let second = next(&mut vm).unwrap().unwrap();
-    assert_eq!(second.kind, EffectKind::Command { text: "ok".into() });
+    assert_eq!(
+        second.kind,
+        EffectKind::Command {
+            text: "ok".into(),
+            verify_echo: true
+        }
+    );
     vm.resume(second.id, EffectResult::Done).unwrap();
     assert!(next(&mut vm).unwrap().is_none());
 }
@@ -157,7 +185,7 @@ fn uboot_watch_command_repeat_and_match_sequence() {
                 registered = true;
                 EffectResult::Done
             }
-            EffectKind::Command { text } => {
+            EffectKind::Command { text, .. } => {
                 assert!(registered);
                 writes.push(text);
                 EffectResult::Done
@@ -204,7 +232,7 @@ fn wait_timeout_can_be_handled_by_if_but_expect_timeout_is_terminal() {
     loop {
         let effect = next(&mut vm).unwrap().unwrap();
         let result = match &effect.kind {
-            EffectKind::Command { text } => {
+            EffectKind::Command { text, .. } => {
                 writes.push(text.clone());
                 EffectResult::Done
             }
@@ -392,7 +420,8 @@ fn arguments_are_strictly_typed_and_unknown_fields_rejected_before_effects() {
     assert_eq!(
         next(&mut vm).unwrap().unwrap().kind,
         EffectKind::Command {
-            text: "机型".into()
+            text: "机型".into(),
+            verify_echo: true
         }
     );
 }

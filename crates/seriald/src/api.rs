@@ -313,6 +313,10 @@ pub fn router(state: AppState) -> Router {
             get(get_monitor).put(update_monitor).delete(stop_monitor),
         )
         .route(
+            "/api/v1/monitors/{monitor_id}/history",
+            axum::routing::delete(delete_monitor_history),
+        )
+        .route(
             "/api/v1/monitors/{monitor_id}/incidents",
             get(list_monitor_incidents),
         )
@@ -390,37 +394,11 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
 }
 
 async fn ports() -> Result<Json<Vec<PortDescriptor>>, ApiError> {
-    let ports = tokio::task::spawn_blocking(serialport::available_ports)
+    tokio::task::spawn_blocking(crate::enumerate_ports)
         .await
         .map_err(|_| ApiError::Internal("serial enumeration task failed".into()))?
-        .map_err(|error| ApiError::Internal(format!("serial enumeration failed: {error}")))?;
-    Ok(Json(
-        ports
-            .into_iter()
-            .map(|port| {
-                let (port_type, manufacturer, product, serial_number) = match port.port_type {
-                    serialport::SerialPortType::UsbPort(info) => (
-                        "usb".to_owned(),
-                        info.manufacturer,
-                        info.product,
-                        info.serial_number,
-                    ),
-                    serialport::SerialPortType::BluetoothPort => {
-                        ("bluetooth".to_owned(), None, None, None)
-                    }
-                    serialport::SerialPortType::PciPort => ("pci".to_owned(), None, None, None),
-                    serialport::SerialPortType::Unknown => ("unknown".to_owned(), None, None, None),
-                };
-                PortDescriptor {
-                    name: port.port_name,
-                    port_type,
-                    manufacturer,
-                    product,
-                    serial_number,
-                }
-            })
-            .collect(),
-    ))
+        .map(Json)
+        .map_err(|error| ApiError::Internal(format!("serial enumeration failed: {error}")))
 }
 
 async fn configure_ports(
@@ -850,6 +828,20 @@ async fn update_monitor(
 ) -> Result<Json<MonitorResponse>, ApiError> {
     Ok(Json(
         state.inner.monitors.update(monitor_id, request).await?,
+    ))
+}
+
+async fn delete_monitor_history(
+    State(state): State<AppState>,
+    Path(monitor_id): Path<Uuid>,
+    Query(query): Query<MonitorMutationQuery>,
+) -> Result<Json<MonitorResponse>, ApiError> {
+    Ok(Json(
+        state
+            .inner
+            .monitors
+            .delete_stopped(monitor_id, query.expected_revision)
+            .await?,
     ))
 }
 

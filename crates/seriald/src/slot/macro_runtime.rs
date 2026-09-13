@@ -407,9 +407,6 @@ impl SlotActor {
                 if self.port.is_none() {
                     return Err(SlotError::PortOffline);
                 }
-                if self.logging != LoggingState::Healthy {
-                    return Err(SlotError::MacroInvalid("serial journal is degraded; repair evidence capture before starting a macro".into()));
-                }
                 if let Some(precondition) = &precondition {
                     validate_sequence_write_precondition(
                         precondition,
@@ -471,6 +468,8 @@ impl SlotActor {
                     line: 1,
                     column: 1,
                     writes: 0,
+                    input_verified_writes: 0,
+                    send_only_writes: 0,
                     bytes_written: 0,
                     first_seq: self.seq + 1,
                     through_seq: self.seq,
@@ -533,6 +532,7 @@ impl SlotActor {
                     watchers: HashMap::new(),
                     prompt_values,
                     echo_filter: EchoFilter::default(),
+                    input_check: None,
                     projection: Projection::default(),
                     total_bytes: 0,
                 };
@@ -637,6 +637,7 @@ struct Driver {
     watchers: HashMap<u64, Watcher>,
     prompt_values: Vec<String>,
     echo_filter: EchoFilter,
+    input_check: Option<InputCheck>,
     projection: Projection,
     total_bytes: usize,
 }
@@ -708,10 +709,8 @@ impl Driver {
         }
         self.observed_seq = event.seq;
         match event.kind {
-            EventKind::Gap | EventKind::LoggingDegraded => {
-                return Err(failed(
-                    "serial evidence gap or degraded journal; macro stopped",
-                ));
+            EventKind::Gap => {
+                return Err(failed("live serial evidence gap; macro stopped"));
             }
             EventKind::SerialClosed | EventKind::PortRemoved => {
                 return Err(failed("serial port disconnected"));
@@ -734,10 +733,11 @@ impl Driver {
                 });
             }
             EventKind::Rx => {
-                if !self
-                    .watchers
-                    .values()
-                    .any(|watch| !watch.matched && watch.boundary.is_some())
+                if self.input_check.is_none()
+                    && !self
+                        .watchers
+                        .values()
+                        .any(|watch| !watch.matched && watch.boundary.is_some())
                 {
                     self.projection.feed_unobserved(&event.data);
                     self.info
@@ -747,7 +747,11 @@ impl Driver {
                     return Ok(());
                 }
                 let visible = self.projection.feed(&event.data)?;
-                let visible = self.echo_filter.feed(&visible)?;
+                let visible = if let Some(check) = self.input_check.as_mut() {
+                    check.feed(&visible)
+                } else {
+                    self.echo_filter.feed(&visible)?
+                };
                 for (id, watch) in &mut self.watchers {
                     if !watch.matched && watch.boundary.is_some_and(|seq| event.seq > seq) {
                         watch.matched = watch.matcher.feed(&visible, watch.prompt);
@@ -839,7 +843,12 @@ impl Driver {
                             );
                             EffectResult::Done
                         }
-                        EffectKind::Command { text } => {
+                        EffectKind::Command { text, verify_echo } => {
+                            if verify_echo && (self.echo == EchoMode::Off || text.is_empty()) {
+                                return Err(failed(
+                                    "input verification unavailable: device echo is disabled or command is empty; use cmd(text, \"send_only\") explicitly for unverified line input",
+                                ));
+                            }
                             let mut data = text.as_bytes().to_vec();
                             data.extend_from_slice(self.eol.as_bytes());
                             self.total_bytes = self.total_bytes.saturating_add(data.len());
@@ -924,6 +933,41 @@ impl Driver {
                             }
                             self.echo_filter =
                                 EchoFilter::new(&text, self.echo, &self.prompt_values);
+                            if verify_echo {
+                                self.input_check =
+                                    Some(InputCheck::new(&text, &self.prompt_values));
+                                let until = Instant::now() + Duration::from_secs(2);
+                                loop {
+                                    self.drain().await?;
+                                    if self.input_check.as_ref().is_some_and(|check| check.matched)
+                                    {
+                                        break;
+                                    }
+                                    if Instant::now() >= until || !self.receive_until(until).await?
+                                    {
+                                        let observed = self
+                                            .input_check
+                                            .as_ref()
+                                            .map(|check| check.observed.clone())
+                                            .unwrap_or_default();
+                                        return Err(failed(format!(
+                                            "command input not verified at {}:{}: expected {:?}; observed {:?}. Further commands stopped; command results were not evaluated. Do not replay automatically.",
+                                            effect.span.line, effect.span.column, text, observed
+                                        )));
+                                    }
+                                }
+                                self.input_check = None;
+                                self.echo_filter = EchoFilter::default();
+                                self.info
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .input_verified_writes += 1;
+                            } else {
+                                self.info
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .send_only_writes += 1;
+                            }
                             EffectResult::Done
                         }
                         EffectKind::Wait {
@@ -1153,6 +1197,72 @@ impl Projection {
             }
         }
         Ok(out)
+    }
+}
+
+#[derive(Default)]
+/// Only a complete fresh RX line can confirm command input. Arbitrary output,
+/// command prefixes, and old prompts are never treated as acknowledgement.
+/// Bounded diagnostics retain observed text without growing with noisy devices.
+struct InputCheck {
+    expected: Vec<u8>,
+    prompts: Vec<Vec<u8>>,
+    line: Vec<u8>,
+    overlong: bool,
+    observed: String,
+    matched: bool,
+}
+impl InputCheck {
+    fn new(command: &str, prompts: &[String]) -> Self {
+        Self {
+            expected: command.as_bytes().to_vec(),
+            prompts: prompts
+                .iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| p.as_bytes().to_vec())
+                .collect(),
+            line: Vec::new(),
+            overlong: false,
+            observed: String::new(),
+            matched: false,
+        }
+    }
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for &byte in bytes {
+            if self.matched {
+                output.push(byte);
+                continue;
+            }
+            if byte == b'\n' {
+                if !self.overlong {
+                    self.matched = self.line == self.expected
+                        || self.prompts.iter().any(|prompt| {
+                            self.line.strip_prefix(prompt.as_slice())
+                                == Some(self.expected.as_slice())
+                        });
+                }
+                if !self.line.is_empty() && self.observed.len() < 512 {
+                    let text = String::from_utf8_lossy(&self.line);
+                    for c in text.chars().take(128) {
+                        if self.observed.len() + c.len_utf8() > 512 {
+                            break;
+                        }
+                        self.observed.push(c);
+                    }
+                    if self.observed.len() < 512 {
+                        self.observed.push('\n');
+                    }
+                }
+                self.line.clear();
+                self.overlong = false;
+            } else if self.line.len() < MAX_WRITE_BYTES * 2 {
+                self.line.push(byte);
+            } else {
+                self.overlong = true;
+            }
+        }
+        output
     }
 }
 
@@ -1435,15 +1545,22 @@ mod tests {
         }
         impl Fixture {
             async fn new() -> Self {
+                Self::with_disk_delay(Duration::ZERO).await
+            }
+            async fn with_disk_delay(delay: Duration) -> Self {
                 let (master, mut slave) = SerialStream::pair().expect("PTY pair");
                 slave
                     .set_exclusive(false)
                     .expect("PTY shared open for daemon");
                 let port = slave.name().expect("PTY path");
                 let directory = tempfile::tempdir().unwrap();
-                let manager =
-                    JournalManager::open(JournalConfig::new(directory.path().join("journal")))
-                        .unwrap();
+                let mut config = JournalConfig::new(directory.path().join("journal"));
+                config.append_delay = delay;
+                if !delay.is_zero() {
+                    config.ack_timeout = Duration::from_millis(1);
+                    config.max_segment_bytes = 2048;
+                }
+                let manager = JournalManager::open(config).unwrap();
                 let slot = SlotHandle::spawn(
                     SlotConfig {
                         port,
@@ -1585,12 +1702,93 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn slow_rotating_journal_does_not_disable_macros_and_late_ack_recovers_without_restart()
+         {
+            let mut f = Fixture::with_disk_delay(Duration::from_millis(20)).await;
+            for _ in 0..8 {
+                f.master.write_all(&vec![b'x'; 2048]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let id = Uuid::new_v4();
+            f.start(id, r#"cmd("check");"#).await.unwrap();
+            assert_eq!(f.command().await, b"check\r");
+            f.master.write_all(b"check\r\n").await.unwrap();
+            let info = f.terminal(id).await;
+            assert_eq!(info.status, MacroStatus::Succeeded, "{info:?}");
+            assert_eq!(info.input_verified_writes, 1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while f.slot.snapshot().logging != LoggingState::Healthy {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("late acknowledgements must recover logging without restarting");
+            let second = Uuid::new_v4();
+            f.start(second, r#"cmd("again");"#).await.unwrap();
+            assert_eq!(f.command().await, b"again\r");
+            f.master.write_all(b"again\r\n").await.unwrap();
+            assert_eq!(f.terminal(second).await.status, MacroStatus::Succeeded);
+            f.close().await;
+        }
+
+        #[tokio::test]
+        async fn input_check_waits_for_complete_echo_but_does_not_judge_command_results() {
+            let mut f = Fixture::new().await;
+            let id = Uuid::new_v4();
+            f.start(id, r#"cmd("setenv bootdelay 3"); cmd("status");"#)
+                .await
+                .unwrap();
+            assert_eq!(f.command().await, b"setenv bootdelay 3\r");
+            f.master.write_all(b"setenv boot").await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), f.master.read_u8())
+                    .await
+                    .is_err()
+            );
+            f.master
+                .write_all(b"delay 3\r\nERROR: command failed\r\nU-Boot> ")
+                .await
+                .unwrap();
+            assert_eq!(f.command().await, b"status\r");
+            f.master.write_all(b"status\r\nERROR\r\n").await.unwrap();
+            let info = f.terminal(id).await;
+            assert_eq!(info.status, MacroStatus::Succeeded, "{info:?}");
+            assert_eq!(info.input_verified_writes, 2);
+            assert_eq!(info.send_only_writes, 0);
+            f.close().await;
+        }
+
+        #[tokio::test]
+        async fn missing_character_or_missing_echo_stops_later_commands_without_replay() {
+            for response in [b"setenv bootdely 3\r\nU-Boot> ".as_slice(), b"U-Boot> "] {
+                let mut f = Fixture::new().await;
+                let id = Uuid::new_v4();
+                f.start(id, r#"cmd("setenv bootdelay 3"); cmd("forbidden");"#)
+                    .await
+                    .unwrap();
+                assert_eq!(f.command().await, b"setenv bootdelay 3\r");
+                f.master.write_all(response).await.unwrap();
+                let info = f.terminal(id).await;
+                assert_eq!(info.status, MacroStatus::Failed, "{info:?}");
+                assert_eq!(info.writes, 1);
+                assert_eq!(info.input_verified_writes, 0);
+                assert!(info.message.unwrap().contains("input not verified"));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(80), f.master.read_u8())
+                        .await
+                        .is_err()
+                );
+                f.close().await;
+            }
+        }
+
+        #[tokio::test]
         async fn reboot_macro_ignores_old_prompt_matches_fresh_split_rx_and_never_replays() {
             let mut f = Fixture::new().await;
             f.master.write_all(b"U-Boot> ").await.unwrap();
             tokio::time::sleep(Duration::from_millis(30)).await;
-            let script = r#"let boot = watch(prompt("uboot")); cmd("reboot");
-                while (!boot.matched) { cmd("slp"); wait(boot, 80); }
+            let script = r#"let boot = watch(prompt("uboot")); cmd("reboot", "send_only");
+                while (!boot.matched) { cmd("slp", "send_only"); wait(boot, 80); }
                 expect(boot, 0);"#;
             let id = Uuid::new_v4();
             f.start(id, script).await.unwrap();
@@ -1696,6 +1894,7 @@ mod tests {
             let next = Uuid::new_v4();
             f.start(next, r#"cmd("next");"#).await.unwrap();
             assert_eq!(f.command().await, b"next\r");
+            f.master.write_all(b"next\r\n").await.unwrap();
             assert_eq!(f.terminal(next).await.status, MacroStatus::Succeeded);
             f.close().await;
         }
@@ -1704,7 +1903,7 @@ mod tests {
         async fn hidden_osc_started_before_watch_cannot_satisfy_new_completion() {
             let mut f = Fixture::new().await;
             let id = Uuid::new_v4();
-            f.start(id, r#"cmd("first"); delay(80); let w = watch("Ready"); cmd("next"); expect(w, 120); cmd("forbidden");"#).await.unwrap();
+            f.start(id, r#"cmd("first", "send_only"); delay(80); let w = watch("Ready"); cmd("next", "send_only"); expect(w, 120); cmd("forbidden");"#).await.unwrap();
             assert_eq!(f.command().await, b"first\r");
             f.master.write_all(b"\x1b]0;title-").await.unwrap();
             assert_eq!(f.command().await, b"next\r");
@@ -1732,7 +1931,7 @@ mod tests {
         async fn persistent_watch_keeps_escape_state_across_commands() {
             let mut f = Fixture::new().await;
             let id = Uuid::new_v4();
-            f.start(id, r#"let ready = watch("Ready"); cmd("first"); wait(ready, 80); cmd("second"); expect(ready, 120);"#).await.unwrap();
+            f.start(id, r#"let ready = watch("Ready"); cmd("first", "send_only"); wait(ready, 80); cmd("second", "send_only"); expect(ready, 120);"#).await.unwrap();
             assert_eq!(f.command().await, b"first\r");
             f.master.write_all(b"\x1b[3").await.unwrap();
             assert_eq!(f.command().await, b"second\r");

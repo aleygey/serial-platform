@@ -12,6 +12,33 @@ pub mod ring;
 pub mod runtime;
 pub mod slot;
 
+/// Enumerate without opening ports or transmitting probe bytes.
+pub fn enumerate_ports() -> Result<Vec<serial_protocol::PortDescriptor>, serialport::Error> {
+    let mut ports = serialport::available_ports()?
+        .into_iter()
+        .map(|port| {
+            let (port_type, manufacturer, product, serial_number) = match port.port_type {
+                serialport::SerialPortType::UsbPort(info) => {
+                    ("usb", info.manufacturer, info.product, info.serial_number)
+                }
+                serialport::SerialPortType::BluetoothPort => ("bluetooth", None, None, None),
+                serialport::SerialPortType::PciPort => ("pci", None, None, None),
+                serialport::SerialPortType::Unknown => ("unknown", None, None, None),
+            };
+            serial_protocol::PortDescriptor {
+                name: port.port_name,
+                port_type: port_type.into(),
+                manufacturer,
+                product,
+                serial_number,
+            }
+        })
+        .collect::<Vec<_>>();
+    ports.sort_by(|a, b| a.name.cmp(&b.name));
+    ports.dedup_by(|a, b| a.name == b.name);
+    Ok(ports)
+}
+
 use crate::api::AppState;
 use crate::config::{ConfigStore, LoadedConfig};
 use crate::journal::{JournalConfig, JournalManager};

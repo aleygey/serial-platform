@@ -1,6 +1,6 @@
 # Serial Platform Desktop
 
-Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v8，不直接打开物理串口。
+Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用相同的 `seriald` HTTP/WebSocket protocol v9，不直接打开物理串口。
 
 ## UI
 
@@ -45,7 +45,7 @@ Model Profile 和 Model Family 是两份独立 catalog。端口的 `model_profil
 
 ## Process architecture
 
-- `src/main`：本地服务生命周期、protocol v8 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
+- `src/main`：本地服务生命周期、protocol v9 HTTP/WebSocket client、snapshot/timeline 协调和 IPC handler；
 - `src/preload`：context-isolated、类型化 bridge；
 - `src/renderer`：React UI 与纯展示状态；
 - `src/shared`：DTO、preferences 和 QA fixture。

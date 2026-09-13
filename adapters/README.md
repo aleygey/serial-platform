@@ -26,7 +26,7 @@ serialctl     foreground TUI
 
 `serial` 会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。App→`serial` 和 `serial`→App 都会复用这个后端。只有裸 `serial` 会保证 HTTP MCP 可用；App 的 Local Service 只管理 `seriald`。
 
-HTTP MCP listener 从所选后端的实际 `ActiveEndpoint` 继承精确 IP，并固定使用 3211 端口。默认后端因此仍是 `127.0.0.1:3211`；若活动后端是 `192.168.56.109:3210`，MCP 则是 `192.168.56.109:3211`。后端 wildcard bind 发布为 loopback `ActiveEndpoint`，不会让 MCP 跟随绑定到 wildcard。health、复用、启动等待和最终显示都使用同一目标地址；复用还会核对当前 Serial wire protocol v8、后端 endpoint、server ID 和 daemon epoch。
+HTTP MCP listener 从所选后端的实际 `ActiveEndpoint` 继承精确 IP，并固定使用 3211 端口。默认后端因此仍是 `127.0.0.1:3211`；若活动后端是 `192.168.56.109:3210`，MCP 则是 `192.168.56.109:3211`。后端 wildcard bind 发布为 loopback `ActiveEndpoint`，不会让 MCP 跟随绑定到 wildcard。health、复用、启动等待和最终显示都使用同一目标地址；复用还会核对当前 Serial wire protocol v9、后端 endpoint、server ID 和 daemon epoch。
 
 App 与 `serial` 只停止自己启动的进程。外部 owner 退出后，仍在运行的客户端不会自动 failover；重新启动后才重新发现或创建服务。
 

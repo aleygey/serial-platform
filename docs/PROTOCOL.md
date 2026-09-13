@@ -1,4 +1,4 @@
-# Serial Platform Protocol v8
+# Serial Platform Protocol v9
 
 本文是 `seriald` HTTP/WebSocket 和 `serial-mcp` transport 的当前线协议说明。Rust DTO 与编码实现位于 `serial-protocol`；Agent 工具参数见 [MCP_TOOLS.md](./MCP_TOOLS.md)。
 
@@ -31,7 +31,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "address": "127.0.0.1:3210",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "pid": 12345
 }
 ```
@@ -40,7 +40,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 
 ## HTTP v1
 
-`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=8`；路由仍保持 `/api/v1/...`。
+`/api/v1` 是 HTTP 路由命名空间，不是跨组件兼容代际。当前 HTTP DTO、WebSocket 握手和客户端兼容检查统一使用 `protocol_version=9`；路由仍保持 `/api/v1/...`。
 
 ### 路由
 
@@ -62,9 +62,10 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `GET` | `/api/v1/ports/{port}/events` | 有界 journal 查询 |
 | `GET` / `POST` | `/api/v1/monitors` | 列表/创建 Monitor |
 | `GET` / `PUT` / `DELETE` | `/api/v1/monitors/{monitor_id}` | 读取/更新/停止 Monitor |
+| `DELETE` | `/api/v1/monitors/{monitor_id}/history?expected_revision=N` | 显式删除已停止 Monitor 及 incident，拒绝运行中或旧 revision，不删除原始串口 journal |
 | `GET` | `/api/v1/monitors/{monitor_id}/incidents` | 分页读取 incident |
 | `POST` | `/api/v1/monitors/{monitor_id}/incidents/{incident_id}/ack` | 确认 incident |
-| `GET` | `/api/v1/ws` | WebSocket protocol v8 |
+| `GET` | `/api/v1/ws` | WebSocket protocol v9 |
 
 ### Health
 
@@ -74,7 +75,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
   "server_id": "uuid",
   "daemon_epoch": "uuid",
   "uptime_ms": 1200,
-  "protocol_version": 8
+  "protocol_version": 9
 }
 ```
 
@@ -86,7 +87,7 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 {
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "config_revision": 12,
   "sequence_write_precondition_supported": true,
   "serial_context_precondition_supported": true,
@@ -449,7 +450,7 @@ Monitor spec：
 
 列表 query 可使用 `port` 和 `status`。incident query：`after_incident_seq`、`limit`、`include_acked`。incident 响应提供 `next_cursor`、`truncated`、`first_available_incident_seq` 和 `retention_gap`。
 
-## WebSocket protocol v8
+## WebSocket protocol v9
 
 连接地址：`GET /api/v1/ws`。
 
@@ -477,7 +478,7 @@ Monitor spec：
 {
   "type": "hello",
   "request_id": "uuid",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "client_name": "serialctl",
   "actor_kind": "human"
 }
@@ -490,7 +491,7 @@ Monitor spec：
   "type": "welcome",
   "server_id": "uuid",
   "daemon_epoch": "uuid",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "actor": {"id": "...", "label": "serialctl", "kind": "human"}
 }
 ```
@@ -739,7 +740,7 @@ unavailable internal
 
 `user_read_required` 是 daemon 的稳定线协议错误：最新 Human TX 尚未被 Agent Run owner 的 ACK 覆盖，检查发生在物理 action 前，保证本请求零字节。MCP 将它投影为 model-facing `user_command_used`，并要求先完成包含该 TX 的 live `read`。`retryable` 只说明错误类别可能在状态改变后恢复，不代表客户端应自动重放物理动作。连接丢失、timeout、partial write 或结果未确认时必须先观察时间线。
 
-## v8 人工历史与 Macro
+## 人工历史与 Macro（v8 引入，v9 增强）
 
 新增 HTTP 目录接口（与串口物理写入分离）：
 
@@ -778,6 +779,8 @@ Macro 控制消息：
 
 execution.id 等于 operation_id；状态为 running/stopping/succeeded/timed_out/cancelled/interrupted_by_user/failed。结果包含 epoch、generation、owner、Run、固定宏 revision、时间、源码行列、确认 TX 数量/字节数、first_seq/through_seq、message 和 outcome_uncertain。只有 Slot actor 提交完成并释放宏 guard 后，status 才对外暴露终态。取消先停止后续动作，再确认在途写；stopping 不是完成。
 
+v9 将 `writes`（主机确认发送次数）、`input_verified_writes`（完整设备命令回显确认次数）、`send_only_writes`（显式不检查回显的次数）分开。`cmd(text)` 默认在继续前检查完整回显，最长 2 秒；`cmd(text, "send_only")` 仅确认 TX。两者均追加 Profile EOL，不判断命令执行结果。历史磁盘日志降级不会单独阻止宏，但实时 RX 缺口/订阅溢出/断连仍停止；晚到落盘确认允许日志状态恢复，并不抹去历史缺口。
+
 宏编译、参数、版本、Profile、适用机型和审计记录大小在首次 TX 前校验；源码/参数/Profile 快照写入 started checkpoint，每个 TX 附 macro_execution_id/macro_id/macro_revision/macro_line/macro_column，结束写入 completed checkpoint。同一 daemon epoch 内复用 operation_id 不会重放物理动作；结果状态缓存有界，无法恢复时返回 NotFound/过期错误，不表示设备未执行。
 
 单口宏与其他 Agent 物理写互斥，不隐式排队；原有 Control、Run、generation、fence 和 Human read gate 继续有效。Human Enter/RAW/Ctrl-D 停止后续宏步骤，保留原 Agent Run 的人工干预门槛。完整语言/参数规则见 [Macro Script v1](./MACRO_SCRIPT_V1.md)。
@@ -807,7 +810,7 @@ POST /mcp
 {
   "status": "ok",
   "service": "serial-mcp",
-  "protocol_version": 8,
+  "protocol_version": 9,
   "pid": 12345,
   "seriald_endpoint": "http://127.0.0.1:3210",
   "seriald_server_id": "uuid",
@@ -815,7 +818,7 @@ POST /mcp
 }
 ```
 
-统一启动器只在 `service`、`protocol_version=8` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
+统一启动器只在 `service`、`protocol_version=9` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
 
 统一启动时，MCP listener 使用已验证 `active-endpoint.json.address` 的精确 IP，并固定使用 port 3211；只有 seriald 原本是 IPv4/IPv6 通配 bind 时，活动地址才先转换为 `127.0.0.1`/`::1`。因此 host-only 场景会得到例如 `192.168.56.109:3211`，不会悄悄改成 loopback，也不会绑定所有接口。
 

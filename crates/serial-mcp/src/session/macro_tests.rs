@@ -70,6 +70,8 @@ fn execution(
         line: 1,
         column: 1,
         writes: 0,
+        input_verified_writes: 0,
+        send_only_writes: 0,
         bytes_written: 0,
         first_seq: 10,
         through_seq: 10,

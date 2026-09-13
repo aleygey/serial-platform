@@ -26,7 +26,11 @@ App 和 `serial` 只停止自己启动的进程。外部 owner 退出后，仍�
 serial setup
 ```
 
-该流程直接读写本地后端配置，`seriald` 不需要先启动。交互只解释四项：
+本地离线向导无需先启动 `seriald`：先自动扫描串口（只枚举、不打开或发送），支持刷新、多选、手动输入和稍后配置；再设置波特率/EOL、可选高级参数与机型，最后确认并选择保存或直接打开。`q` 取消不保存，未选中的已有端口和 Profile 保留。
+
+若本地后端已在运行，会复用在线配置；`serial setup --endpoint http://HOST:3210` 或 `serialctl --endpoint http://HOST:3210 setup` 使用后端机器的扫描列表。在线向导支持 `r` 刷新、`m` 手动输入、`q` 取消，并在保存前确认。Profile 和机型列表直接显示供选择。
+
+概念说明：
 
 - 后端地址 / Endpoint：监听 IP 和端口；
 - 串口 Profile / Transport Profile：波特率、数据位、校验位等 UART 参数；
