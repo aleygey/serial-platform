@@ -733,12 +733,11 @@ impl Driver {
                 });
             }
             EventKind::Rx => {
-                if self.input_check.is_none()
-                    && !self
-                        .watchers
-                        .values()
-                        .any(|watch| !watch.matched && watch.boundary.is_some())
-                {
+                let watching = self
+                    .watchers
+                    .values()
+                    .any(|watch| !watch.matched && watch.boundary.is_some());
+                if self.input_check.is_none() && !watching {
                     self.projection.feed_unobserved(&event.data);
                     self.info
                         .lock()
@@ -746,10 +745,10 @@ impl Driver {
                         .through_seq = self.observed_seq;
                     return Ok(());
                 }
-                let visible = self.projection.feed(&event.data)?;
                 let visible = if let Some(check) = self.input_check.as_mut() {
-                    check.feed(&visible)
+                    check.observe(&mut self.projection, &event.data, watching)?
                 } else {
+                    let visible = self.projection.feed(&event.data)?;
                     self.echo_filter.feed(&visible)?
                 };
                 for (id, watch) in &mut self.watchers {
@@ -1227,6 +1226,34 @@ impl InputCheck {
             matched: false,
         }
     }
+
+    fn observe(
+        &mut self,
+        projection: &mut Projection,
+        bytes: &[u8],
+        watching: bool,
+    ) -> DriverResult<Vec<u8>> {
+        let mut at = 0;
+        let mut visible = Vec::new();
+        // Stop strict input projection exactly at the echoed line boundary.
+        // A result in the same RX batch may redraw the terminal; that is not
+        // an input failure. Only an explicit live watch observes result text.
+        // Work a line/chunk at a time, avoiding per-byte allocations.
+        while at < bytes.len() && !self.matched {
+            let end = bytes[at..]
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))
+                .map_or(bytes.len(), |index| at + index + 1);
+            visible.extend(self.feed(&projection.feed(&bytes[at..end])?));
+            at = end;
+        }
+        if watching {
+            visible.extend(projection.feed(&bytes[at..])?);
+        } else {
+            projection.feed_unobserved(&bytes[at..]);
+        }
+        Ok(visible)
+    }
     fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         for &byte in bytes {
@@ -1464,6 +1491,56 @@ mod tests {
         assert_eq!(filter.feed(b"ady\nReady\n").unwrap(), b"Ready\n");
         let mut off = EchoFilter::new("help", EchoMode::Off, &[]);
         assert_eq!(off.feed(b"help").unwrap(), b"help");
+    }
+
+    #[test]
+    fn input_boundary_is_independent_of_rx_chunking_and_result_redraws() {
+        let data = b"\x1b[32mdut# status\x1b[0m\r\nprogress abc\x08\x1b[2KERROR\r\n";
+        for split in 0..=data.len() {
+            let mut check = InputCheck::new("status", &["dut# ".into()]);
+            let mut projection = Projection::default();
+            assert!(
+                check
+                    .observe(&mut projection, &data[..split], false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                check
+                    .observe(&mut projection, &data[split..], false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(check.matched, "RX split at {split}");
+        }
+    }
+
+    #[test]
+    fn input_check_keeps_unsafe_echo_and_explicit_watch_evidence_strict() {
+        let mut check = InputCheck::new("status", &[]);
+        assert!(
+            check
+                .observe(&mut Projection::default(), b"sta\x08status\r\n", false)
+                .is_err()
+        );
+        assert!(!check.matched);
+        let mut check = InputCheck::new("status", &["dut# ".into()]);
+        assert_eq!(
+            check
+                .observe(
+                    &mut Projection::default(),
+                    b"dut# status\r\nReady\r\n",
+                    true
+                )
+                .unwrap(),
+            b"Ready\n"
+        );
+        let mut check = InputCheck::new("status", &[]);
+        assert!(
+            check
+                .observe(&mut Projection::default(), b"status\r\n\x1b[2KReady", true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1755,6 +1832,29 @@ mod tests {
             assert_eq!(info.status, MacroStatus::Succeeded, "{info:?}");
             assert_eq!(info.input_verified_writes, 2);
             assert_eq!(info.send_only_writes, 0);
+            f.close().await;
+        }
+
+        #[tokio::test]
+        async fn result_terminal_editing_after_verified_echo_is_not_input_failure() {
+            let mut f = Fixture::new().await;
+            let id = Uuid::new_v4();
+            f.start(id, r#"cmd("status"); cmd("next");"#).await.unwrap();
+            assert_eq!(f.command().await, b"status\r");
+            // One RX chunk contains both the complete echo and result display
+            // editing. The result is not part of command-input verification.
+            f.master
+                .write_all(b"status\r\nprogress abc\x08\x08\x1b[2Kdone\r\n")
+                .await
+                .unwrap();
+            assert_eq!(f.command().await, b"next\r");
+            f.master
+                .write_all(b"next\r\n\x1b[2KERROR\r\n")
+                .await
+                .unwrap();
+            let info = f.terminal(id).await;
+            assert_eq!(info.status, MacroStatus::Succeeded, "{info:?}");
+            assert_eq!(info.input_verified_writes, 2);
             f.close().await;
         }
 
