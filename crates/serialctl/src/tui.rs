@@ -3565,23 +3565,21 @@ impl App {
         }
         let query = search.query_text();
         let case_sensitive = search.case_sensitive;
-        let archives =
-            if search.scope == OutputSearchScope::Retained && search.retained_archive.is_some() {
-                vec![(
-                    search.port.clone(),
-                    search.retained_archive.as_ref().unwrap().0.clone(),
-                )]
-            } else {
-                self.ports
-                    .iter()
-                    .filter(|view| view.snapshot.config.port == search.port)
-                    .filter_map(|view| {
-                        view.session_archive
-                            .clone()
-                            .map(|archive| (view.snapshot.config.port.clone(), archive))
-                    })
-                    .collect::<Vec<_>>()
-            };
+        let archives = if search.scope == OutputSearchScope::Retained
+            && let Some((archive, _)) = search.retained_archive.as_ref()
+        {
+            vec![(search.port.clone(), archive.clone())]
+        } else {
+            self.ports
+                .iter()
+                .filter(|view| view.snapshot.config.port == search.port)
+                .filter_map(|view| {
+                    view.session_archive
+                        .clone()
+                        .map(|archive| (view.snapshot.config.port.clone(), archive))
+                })
+                .collect::<Vec<_>>()
+        };
         if archives.is_empty() {
             return false;
         }

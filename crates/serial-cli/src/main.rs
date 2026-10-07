@@ -695,10 +695,7 @@ impl ChildDiagnostics {
             done.store(false, std::sync::atomic::Ordering::Release);
             thread::spawn(move || {
                 let mut buffer = [0_u8; 4096];
-                loop {
-                    let Ok(count) = stderr.read(&mut buffer) else {
-                        break;
-                    };
+                while let Ok(count) = stderr.read(&mut buffer) {
                     if count == 0 {
                         break;
                     }

@@ -27,6 +27,15 @@ const MAX_PAGE: usize = 256;
 const MAX_CONTEXT: usize = 512;
 const MATCH_BYTES: u64 = 32;
 
+// Rust 1.88 is supported; the renamed AtomicUsize::try_update is not available
+// there. Keep the compatibility exception local to this one atomic operation.
+#[allow(deprecated)]
+fn reserve_budget(used: &AtomicUsize, amount: usize, limit: usize) -> Result<usize, usize> {
+    used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(amount).filter(|total| *total <= limit)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     pub query: String,
@@ -201,15 +210,7 @@ impl SessionArchive {
                         .saturating_add(256)
                 });
         if bytes > QUEUE_BYTES
-            || self
-                .shared
-                .queued_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    current
-                        .checked_add(bytes)
-                        .filter(|total| *total <= QUEUE_BYTES)
-                })
-                .is_err()
+            || reserve_budget(&self.shared.queued_bytes, bytes, QUEUE_BYTES).is_err()
         {
             self.shared.fault("session archive queue byte budget exceeded; some displayed history was not recorded");
             self.shared.revision.fetch_add(1, Ordering::AcqRel);
@@ -258,16 +259,7 @@ impl SessionArchive {
             if self.shared.directory.preserve.load(Ordering::Acquire) {
                 return Err(io::Error::other("历史存档写入失败，已停止加载"));
             }
-            if self
-                .shared
-                .queued_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    current
-                        .checked_add(bytes)
-                        .filter(|total| *total <= QUEUE_BYTES)
-                })
-                .is_ok()
-            {
+            if reserve_budget(&self.shared.queued_bytes, bytes, QUEUE_BYTES).is_ok() {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(2));
@@ -335,14 +327,9 @@ impl SessionArchive {
             .size_limit(1024 * 1024)
             .build()
             .map_err(io::Error::other)?;
-        self.shared
-            .queries
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                (value < 4).then_some(value + 1)
-            })
-            .map_err(|_| {
-                io::Error::other("too many active session searches; cancel the previous search")
-            })?;
+        reserve_budget(&self.shared.queries, 1, 4).map_err(|_| {
+            io::Error::other("too many active session searches; cancel the previous search")
+        })?;
         let state = Arc::new(QueryState {
             archive: self.shared.clone(),
             matches_path: self
