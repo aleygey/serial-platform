@@ -1,3 +1,4 @@
+mod agent_history_io;
 mod api;
 mod cli;
 mod clipboard;
@@ -7,6 +8,7 @@ mod doctor;
 mod history;
 mod i18n;
 mod profile;
+mod retained_history;
 mod session_search;
 mod tui;
 mod ws;

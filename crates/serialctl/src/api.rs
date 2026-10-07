@@ -137,6 +137,31 @@ impl ApiClient {
         self.get_json("/api/v1/status").await
     }
 
+    pub async fn agent_history(&self, port: &str) -> Result<serial_protocol::AgentHistoryResponse> {
+        self.get_json(&format!(
+            "/api/v1/ports/{}/agent-history",
+            encode_path_segment(port)
+        ))
+        .await
+    }
+
+    pub async fn clear_agent_history(
+        &self,
+        port: &str,
+        run_ids: Option<Vec<uuid::Uuid>>,
+    ) -> Result<serial_protocol::AgentHistoryVisibility> {
+        let response = self
+            .client
+            .post(self.url(&format!(
+                "/api/v1/ports/{}/agent-history",
+                encode_path_segment(port)
+            )))
+            .json(&serial_protocol::AgentHistoryClearRequest { run_ids })
+            .send()
+            .await?;
+        decode_response(response).await
+    }
+
     pub async fn human_command_history(
         &self,
     ) -> Result<serial_protocol::HumanCommandHistoryResponse> {
@@ -225,6 +250,29 @@ impl ApiClient {
             .await
             .context("seriald configuration request failed")?;
         decode_response(response).await
+    }
+
+    pub async fn configure_setup(
+        &self,
+        draft: serial_setup::Draft,
+        expected_revision: u64,
+    ) -> Result<ConfigurePortsDocumentResponse> {
+        decode_response(
+            self.client
+                .put(self.url("/api/v1/config/setup"))
+                .json(&serial_protocol::ConfigureSetupRequest {
+                    ports: draft.ports,
+                    transport_profiles: draft.transport_profiles,
+                    model_profiles: draft.model_profiles,
+                    model_families: draft.model_families,
+                    expected_revision,
+                    source: "human:serialctl-setup".into(),
+                })
+                .send()
+                .await
+                .context("保存初始化配置失败")?,
+        )
+        .await
     }
 
     pub async fn transport_profiles(&self) -> Result<ProfileCatalog<TransportProfile>> {

@@ -9,6 +9,7 @@ pub mod macros;
 pub mod monitor;
 pub mod registry;
 pub mod ring;
+pub mod run_history;
 pub mod runtime;
 pub mod slot;
 
@@ -59,6 +60,7 @@ pub async fn serve(
     let started = Instant::now();
     let bind = bind_override.unwrap_or(loaded.config.bind);
     let server_id = loaded.config.server_id;
+    instance.startup_stage("binding service address", started);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind seriald to {bind}"))?;
@@ -71,7 +73,12 @@ pub async fn serve(
         f64::from(loaded.config.logging.retention_target_percent) / 100.0;
     journal_config.max_segment_bytes = loaded.config.logging.segment_max_bytes;
     journal_config.max_segment_age = Duration::from_secs(60 * 60);
-    let journal = JournalManager::open(journal_config).context("open serial journal")?;
+    instance.startup_stage("recovering serial journals", started);
+    let journal = tokio::task::spawn_blocking(move || JournalManager::open(journal_config))
+        .await
+        .context("serial journal recovery worker stopped")?
+        .context("open serial journal")?;
+    instance.startup_stage("initializing port registry", started);
     let registry = SlotRegistry::new(
         loaded.daemon_epoch,
         started,
@@ -81,6 +88,7 @@ pub async fn serve(
         loaded.config.model_profiles.clone(),
         loaded.config.control.limits(),
     );
+    instance.startup_stage("loading automation state", started);
     let state = AppState::try_new(
         store,
         loaded.config,
@@ -99,6 +107,7 @@ pub async fn serve(
     instance
         .publish(&endpoint)
         .context("publish the active seriald endpoint")?;
+    instance.startup_stage("starting HTTP service", started);
     tracing::info!(requested_bind = %bind, actual_bind = %actual_bind, endpoint = %endpoint.endpoint, epoch = %loaded.daemon_epoch, "seriald listening");
     let server = axum::serve(listener, api::router(state.clone()))
         .with_graceful_shutdown(shutdown_signal(managed));

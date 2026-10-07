@@ -508,11 +508,13 @@ struct RunCommandStep {
 #[derive(Debug, Clone)]
 struct RunCommandRecord {
     daemon_epoch: Uuid,
+    macro_execution_id: Option<Uuid>,
     sequence_id: Option<Uuid>,
     first_seq: u64,
     last_seq: u64,
     description: Option<String>,
     steps: Vec<RunCommandStep>,
+    omitted_steps: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,6 +584,15 @@ impl RunCommandStep {
 }
 
 impl RunCommandRecord {
+    fn macro_execution_id(event: &TimelineEvent) -> Option<Uuid> {
+        event
+            .metadata
+            .get("macro_execution_id")?
+            .as_str()?
+            .parse()
+            .ok()
+    }
+
     fn sequence_id(event: &TimelineEvent) -> Option<Uuid> {
         event.metadata.get("command_sequence_id").and_then(|value| {
             value
@@ -592,6 +603,19 @@ impl RunCommandRecord {
     }
 
     fn description(event: &TimelineEvent) -> Option<String> {
+        if Self::macro_execution_id(event).is_some() {
+            return Some(format!(
+                "Macro · {}",
+                event
+                    .metadata
+                    .get("macro_description")
+                    .filter(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+                    .or_else(|| event.metadata.get("macro_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("inline")
+            ));
+        }
         event
             .metadata
             .get("command_sequence_description")
@@ -605,17 +629,24 @@ impl RunCommandRecord {
     fn from_event(event: &TimelineEvent) -> Self {
         Self {
             daemon_epoch: event.daemon_epoch,
+            macro_execution_id: Self::macro_execution_id(event),
             sequence_id: Self::sequence_id(event),
             first_seq: event.seq,
             last_seq: event.seq,
             description: Self::description(event),
             steps: vec![RunCommandStep::from_event(event)],
+            omitted_steps: 0,
         }
     }
 
     fn matches_event(&self, event: &TimelineEvent) -> bool {
         if self.daemon_epoch != event.daemon_epoch {
             return false;
+        }
+        match (self.macro_execution_id, Self::macro_execution_id(event)) {
+            (Some(existing), Some(incoming)) => return existing == incoming,
+            (None, None) => {}
+            _ => return false,
         }
         match (self.sequence_id, Self::sequence_id(event)) {
             (Some(existing), Some(incoming)) => existing == incoming,
@@ -644,6 +675,12 @@ impl RunCommandRecord {
         if let Some(step) = existing {
             step.append_event(event);
         } else {
+            // A long-running loop is one history item, not unbounded UI memory.
+            // Exact command events remain in the journal.
+            if self.steps.len() >= 512 {
+                self.steps.remove(0);
+                self.omitted_steps += 1;
+            }
             self.steps.push(RunCommandStep::from_event(event));
             self.steps
                 .sort_by_key(|step| (step.step_index.unwrap_or(usize::MAX), step.first_seq));
@@ -759,6 +796,9 @@ struct SlotView {
     /// rows remain the durable audit source; this projection only groups their
     /// lifecycle and confirmed TX events for quick review.
     run_history: VecDeque<RunHistoryEntry>,
+    archived_runs: HashMap<Uuid, serial_protocol::AgentRunRecord>,
+    hidden_runs: std::collections::HashSet<Uuid>,
+    loading_runs: std::collections::HashSet<Uuid>,
     monitor_history: VecDeque<MonitorHistoryEntry>,
     show_stopped_monitors: bool,
     /// The bar is a bounded recent projection, not an assertion that the
@@ -897,6 +937,7 @@ struct LocalOutputSearchIndex {
 
 #[derive(Debug)]
 struct OutputSearchState {
+    retained_archive: Option<(SessionArchive, crate::retained_history::RetainedHistory)>,
     disk: Option<DiskSearch>,
     session_mode: bool,
     clean_snapshot: Option<Vec<Line<'static>>>,
@@ -1070,6 +1111,9 @@ impl SlotView {
             completion: None,
             last_manual_activity: None,
             run_history: VecDeque::new(),
+            archived_runs: HashMap::new(),
+            hidden_runs: Default::default(),
+            loading_runs: Default::default(),
             monitor_history: VecDeque::new(),
             show_stopped_monitors: false,
             run_history_limited: true,
@@ -1138,9 +1182,17 @@ impl SlotView {
         // Stable ordering makes snapshot-seeded active Runs coexist with an
         // older replay irrespective of arrival order. The bounded projection
         // always drops the oldest start sequence, never the first insertion.
-        self.run_history
-            .make_contiguous()
-            .sort_by_key(|entry| entry.start_seq);
+        let archived = &self.archived_runs;
+        let epoch = self.snapshot.daemon_epoch;
+        self.run_history.make_contiguous().sort_by_key(|entry| {
+            match archived
+                .get(&entry.id)
+                .filter(|record| record.epoch != epoch)
+            {
+                Some(record) => (false, record.started_wall_time_ns, entry.start_seq),
+                None => (true, 0, entry.start_seq),
+            }
+        });
         while self.run_history.len() > MAX_RUN_HISTORY_PER_SLOT {
             let Some(removed) = self.run_history.pop_front().map(|entry| entry.id) else {
                 break;
@@ -1151,7 +1203,8 @@ impl SlotView {
     }
 
     fn upsert_run(&mut self, run: &RunInfo) {
-        if run.owner.kind != serial_protocol::ActorKind::Agent {
+        if run.owner.kind != serial_protocol::ActorKind::Agent || self.hidden_runs.contains(&run.id)
+        {
             return;
         }
         if let Some(index) = self.run_history.iter().position(|entry| entry.id == run.id) {
@@ -1168,6 +1221,9 @@ impl SlotView {
         event: &TimelineEvent,
         run_id: Uuid,
     ) -> Option<&mut RunHistoryEntry> {
+        if self.hidden_runs.contains(&run_id) {
+            return None;
+        }
         if let Some(index) = self.run_history.iter().position(|entry| entry.id == run_id) {
             return Some(&mut self.run_history[index]);
         }
@@ -1322,7 +1378,16 @@ impl SlotView {
 
     fn run_history_chronological(&self) -> Vec<&RunHistoryEntry> {
         let mut runs = self.run_history.iter().collect::<Vec<_>>();
-        runs.sort_by_key(|run| run.start_seq);
+        runs.sort_by_key(|run| {
+            match self
+                .archived_runs
+                .get(&run.id)
+                .filter(|record| record.epoch != self.snapshot.daemon_epoch)
+            {
+                Some(record) => (false, record.started_wall_time_ns, run.start_seq),
+                None => (true, 0, run.start_seq),
+            }
+        });
         runs
     }
 
@@ -1358,6 +1423,10 @@ impl SlotView {
             .collect::<Vec<_>>();
         actions.sort_by_key(|(sequence, id, key)| {
             (
+                self.archived_runs
+                    .get(id)
+                    .filter(|record| record.epoch != self.snapshot.daemon_epoch)
+                    .map_or((true, 0), |record| (false, record.started_wall_time_ns)),
                 *sequence,
                 match key {
                     HistoryActionKey::Run(_) => 0u8,
@@ -1462,11 +1531,16 @@ impl SlotView {
     }
 
     fn next_run_command_seq(&self, key: RunCommandKey) -> Option<u64> {
+        let epoch = self.run_command(key)?.daemon_epoch;
         self.run_command_keys()
             .into_iter()
             .filter_map(|candidate| {
-                (candidate != key && candidate.first_seq > key.first_seq)
-                    .then_some(candidate.first_seq)
+                (candidate != key
+                    && candidate.first_seq > key.first_seq
+                    && self
+                        .run_command(candidate)
+                        .is_some_and(|command| command.daemon_epoch == epoch))
+                .then_some(candidate.first_seq)
             })
             .min()
     }
@@ -2098,6 +2172,9 @@ fn shared_profile_impacts(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuPage {
     Root,
+    QuickProfiles,
+    TransportSettings,
+    InteractionSettings,
     Profiles,
     CreateProfiles,
     CreateTransportProfile,
@@ -2114,6 +2191,33 @@ enum MenuPage {
     Help,
 }
 
+impl MenuPage {
+    fn edits_current_profile(self) -> bool {
+        matches!(
+            self,
+            Self::Profiles
+                | Self::TransportSettings
+                | Self::InteractionSettings
+                | Self::QuickProfiles
+        )
+    }
+
+    fn profile_row_index(self, index: usize) -> usize {
+        match self {
+            Self::TransportSettings => index,
+            Self::InteractionSettings => {
+                if index == 0 {
+                    10
+                } else {
+                    11 + index
+                }
+            }
+            Self::QuickProfiles => 11,
+            _ => index,
+        }
+    }
+}
+
 struct MenuState {
     page: MenuPage,
     selected: usize,
@@ -2125,6 +2229,9 @@ struct MenuState {
     create_model: Option<ModelProfile>,
     choice: Option<MenuChoice>,
     model_family: Option<String>,
+    model_query: String,
+    recent_models: Vec<(String, String)>,
+    quick_model: bool,
     prompt: Option<MenuPrompt>,
     confirmation: Option<MenuConfirmation>,
     field_help: Option<String>,
@@ -2146,6 +2253,9 @@ impl MenuState {
             create_model: None,
             choice: None,
             model_family: None,
+            model_query: String::new(),
+            recent_models: Vec::new(),
+            quick_model: false,
             prompt: None,
             confirmation: None,
             field_help: None,
@@ -2384,7 +2494,7 @@ enum MenuIoEvent {
     Failed(String),
 }
 
-const CURRENT_PROFILE_ROW_COUNT: usize = 19;
+const CURRENT_PROFILE_ROW_COUNT: usize = 18;
 const CREATE_TRANSPORT_ROW_COUNT: usize = 10;
 const CREATE_MODEL_ROW_COUNT: usize = 8;
 
@@ -2586,12 +2696,46 @@ enum ModelTreeRow {
 
 fn model_tree_rows(menu: &MenuState) -> Vec<ModelTreeRow> {
     let configuring = menu.page == MenuPage::ConfigureModelFamilies;
+    if !configuring && !menu.model_query.is_empty() {
+        let query = menu.model_query.to_lowercase();
+        return menu
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .model_families
+                    .iter()
+                    .flat_map(|family| {
+                        family
+                            .model_names
+                            .iter()
+                            .map(move |name| (&family.name, name))
+                    })
+                    .filter(|(family, name)| {
+                        format!("{family}/{name}").to_lowercase().contains(&query)
+                    })
+                    .map(|(family, name)| ModelTreeRow::Model(family.clone(), name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     let mut rows = vec![if configuring {
         ModelTreeRow::AddFamily
     } else {
         ModelTreeRow::Unbound
     }];
     if let Some(catalog) = &menu.catalog {
+        if !configuring {
+            for (family, name) in &menu.recent_models {
+                if catalog
+                    .model_families
+                    .iter()
+                    .any(|entry| &entry.name == family && entry.model_names.contains(name))
+                {
+                    rows.push(ModelTreeRow::Model(family.clone(), name.clone()));
+                }
+            }
+        }
         for family in &catalog.model_families {
             rows.push(ModelTreeRow::Family(family.name.clone()));
             if menu.model_family.as_deref() == Some(family.name.as_str()) {
@@ -2643,7 +2787,13 @@ fn model_tree_lines(menu: &MenuState) -> Vec<Line<'static>> {
                     format!(
                         "  {} {}",
                         if selected { "✓" } else { " " },
-                        safe_inline(&name)
+                        if !menu.model_query.is_empty()
+                            || menu.recent_models.contains(&(family.clone(), name.clone()))
+                        {
+                            format!("{} / {}", safe_inline(&family), safe_inline(&name))
+                        } else {
+                            safe_inline(&name)
+                        }
                     )
                 }
             };
@@ -2655,6 +2805,9 @@ fn model_tree_lines(menu: &MenuState) -> Vec<Line<'static>> {
 fn menu_item_count(menu: &MenuState) -> usize {
     match menu.page {
         MenuPage::Root => 4,
+        MenuPage::QuickProfiles => 3,
+        MenuPage::TransportSettings => 10,
+        MenuPage::InteractionSettings => 7,
         MenuPage::Profiles => CURRENT_PROFILE_ROW_COUNT,
         MenuPage::CreateProfiles => 5,
         MenuPage::Settings => 2,
@@ -2980,6 +3133,9 @@ enum ExactEvidenceIoEvent {
 }
 
 struct App {
+    retained_api: Option<ApiClient>,
+    agent_history_commands: Option<mpsc::Sender<crate::agent_history_io::Command>>,
+    pending_run_delete: Option<(String, Option<Uuid>, Instant)>,
     ports: Vec<SlotView>,
     /// Oldest first, Human LINE submissions only; shared across all ports.
     human_history: Vec<String>,
@@ -3082,6 +3238,9 @@ impl App {
             .unwrap_or(0);
         Self {
             ports,
+            retained_api: None,
+            agent_history_commands: None,
+            pending_run_delete: None,
             human_history: Vec::new(),
             human_history_commands: None,
             human_history_generation: Default::default(),
@@ -3301,6 +3460,7 @@ impl App {
             through_seq: view.snapshot.head_seq,
         });
         self.output_search = Some(OutputSearchState {
+            retained_archive: None,
             disk: None,
             session_mode: self.session_archiving,
             clean_snapshot: None,
@@ -3314,7 +3474,11 @@ impl App {
             matcher: OutputSearchMatcher::Literal,
             case_sensitive: false,
             direction: OutputSearchDirection::Both,
-            scope: OutputSearchScope::CurrentEpoch,
+            scope: if self.retained_api.is_some() {
+                OutputSearchScope::Retained
+            } else {
+                OutputSearchScope::CurrentEpoch
+            },
             phase: OutputSearchPhase::Editing,
             matches: Vec::new(),
             local_index: None,
@@ -3351,6 +3515,40 @@ impl App {
     }
 
     fn start_session_search(&mut self, prefer_latest: bool) -> bool {
+        if let Some(search) = self.output_search.as_mut()
+            && search.scope == OutputSearchScope::Retained
+            && search.matcher == OutputSearchMatcher::Literal
+            && search.direction != OutputSearchDirection::Tx
+            && !search.query.is_empty()
+            && search.retained_archive.is_none()
+            && let Some(api) = self.retained_api.clone()
+        {
+            match SessionArchive::new() {
+                Ok(archive) => {
+                    let loader = crate::retained_history::RetainedHistory::start(
+                        api,
+                        search.port.clone(),
+                        archive.clone(),
+                    );
+                    search.retained_archive = Some((archive, loader));
+                }
+                Err(error) => {
+                    let message = format!("无法建立历史搜索索引：{error}");
+                    search.error = Some(message.clone());
+                    search.partial = true;
+                    search.disk = Some(DiskSearch {
+                        id: Uuid::new_v4(),
+                        sources: Vec::new(),
+                        total: 0,
+                        complete: true,
+                        selected: None,
+                        pending: None,
+                        coverage_errors: vec![message],
+                    });
+                    return true;
+                }
+            }
+        }
         let Some(search) = self.output_search.as_ref() else {
             return false;
         };
@@ -3367,28 +3565,34 @@ impl App {
         }
         let query = search.query_text();
         let case_sensitive = search.case_sensitive;
-        let archives = self
-            .ports
-            .iter()
-            .filter(|view| {
-                search.scope == OutputSearchScope::Retained
-                    || view.snapshot.config.port == search.port
-            })
-            .filter_map(|view| {
-                view.session_archive
-                    .clone()
-                    .map(|archive| (view.snapshot.config.port.clone(), archive))
-            })
-            .collect::<Vec<_>>();
+        let archives =
+            if search.scope == OutputSearchScope::Retained && search.retained_archive.is_some() {
+                vec![(
+                    search.port.clone(),
+                    search.retained_archive.as_ref().unwrap().0.clone(),
+                )]
+            } else {
+                self.ports
+                    .iter()
+                    .filter(|view| view.snapshot.config.port == search.port)
+                    .filter_map(|view| {
+                        view.session_archive
+                            .clone()
+                            .map(|archive| (view.snapshot.config.port.clone(), archive))
+                    })
+                    .collect::<Vec<_>>()
+            };
         if archives.is_empty() {
             return false;
         }
         let mut sources = Vec::new();
         let mut errors = Vec::new();
-        for view in self.ports.iter().filter(|view| {
-            search.scope == OutputSearchScope::Retained || view.snapshot.config.port == search.port
-        }) {
-            if view.session_archive.is_none() {
+        for view in self
+            .ports
+            .iter()
+            .filter(|view| view.snapshot.config.port == search.port)
+        {
+            if search.retained_archive.is_none() && view.session_archive.is_none() {
                 errors.push(format!("{} 的会话存档不可用", view.snapshot.config.port));
             }
         }
@@ -3470,6 +3674,15 @@ impl App {
                     Err(failure) if failure.kind() == io::ErrorKind::WouldBlock => complete = false,
                     Err(failure) => error = Some(failure.to_string()),
                 }
+            }
+        }
+        if search.scope == OutputSearchScope::Retained
+            && let Some((_, history)) = &search.retained_archive
+        {
+            let progress = history.progress();
+            complete &= !progress.loading;
+            if let Some(failure) = progress.error {
+                error = Some(format!("历史覆盖不完整：{failure}"));
             }
         }
         disk.total = total;
@@ -5494,7 +5707,7 @@ impl App {
                 operation_id,
                 description: None,
                 input: match &recovery {
-                    HumanCommandRecovery::LineDraft(command) => {
+                    HumanCommandRecovery::LineDraft(command) if !command.contains(['\n', '\r']) => {
                         Some(serial_protocol::HumanLineInput {
                             command: command.clone(),
                         })
@@ -5872,6 +6085,7 @@ impl App {
     }
 
     fn leave_run_history(&mut self) {
+        self.pending_run_delete = None;
         self.focus = PaneFocus::Input;
         self.pending_monitor_delete = None;
         self.pending_exact_evidence = None;
@@ -5880,6 +6094,199 @@ impl App {
                 clear_command_highlight(line);
             }
         }
+    }
+
+    fn clear_selected_run(&mut self, all: bool) {
+        let id = if all {
+            None
+        } else {
+            self.current().selected_run_id()
+        };
+        if !all && id.is_none() {
+            return;
+        }
+        if id.is_some_and(|id| {
+            self.current()
+                .run_history
+                .iter()
+                .any(|run| run.id == id && run.status == RunStatus::Active)
+        }) {
+            self.status = "Run 正在执行，不能清理；原始串口日志未改动".into();
+            self.pending_run_delete = None;
+            return;
+        }
+        let port = self.selected_port();
+        let confirmed =
+            self.pending_run_delete
+                .as_ref()
+                .is_some_and(|(pending_port, pending_id, at)| {
+                    pending_port == &port
+                        && pending_id == &id
+                        && at.elapsed() < Duration::from_secs(10)
+                });
+        if confirmed {
+            self.pending_run_delete = None;
+            if self.agent_history_commands.as_ref().is_some_and(|sender| {
+                sender
+                    .try_send(crate::agent_history_io::Command::Clear {
+                        port,
+                        ids: id.map(|id| vec![id]),
+                    })
+                    .is_ok()
+            }) {
+                self.status = "正在清理 Agent 历史；原始日志与人工历史保留".into();
+            } else {
+                self.status = "历史服务暂不可用，未清理任何记录".into();
+            }
+        } else {
+            let label = id
+                .and_then(|id| self.current().run_history.iter().find(|run| run.id == id))
+                .map(|run| safe_inline(&run.label))
+                .unwrap_or_else(|| "当前串口全部已结束 Run".into());
+            self.status = format!(
+                "再次按 {} 清理「{label}」的整轮历史；原始串口日志保留",
+                if all { "Ctrl+Delete" } else { "Delete" }
+            );
+            self.pending_run_delete = Some((port, id, Instant::now()));
+        }
+    }
+
+    fn load_expanded_run(&mut self) {
+        let Some(id) = self.current().expanded_run else {
+            return;
+        };
+        if self.current().loading_runs.contains(&id)
+            || self
+                .current()
+                .run_history
+                .iter()
+                .any(|run| run.id == id && !run.commands.is_empty())
+        {
+            return;
+        }
+        let Some(record) = self.current().archived_runs.get(&id).cloned() else {
+            return;
+        };
+        if self.agent_history_commands.as_ref().is_some_and(|sender| {
+            sender
+                .try_send(crate::agent_history_io::Command::Load(record))
+                .is_ok()
+        }) {
+            self.current_mut().loading_runs.insert(id);
+            self.status = "正在读取该 Run 的历史命令…".into();
+        }
+    }
+
+    fn apply_run_visibility(
+        &mut self,
+        port: &str,
+        visibility: serial_protocol::AgentHistoryVisibility,
+    ) {
+        let Some(index) = self.slot_index(port) else {
+            return;
+        };
+        let view = &mut self.ports[index];
+        view.hidden_runs = visibility.hidden.into_iter().collect();
+        let removed = view
+            .run_history
+            .iter()
+            .filter(|run| view.hidden_runs.contains(&run.id))
+            .map(|run| run.id)
+            .collect::<Vec<_>>();
+        view.run_history
+            .retain(|run| !view.hidden_runs.contains(&run.id));
+        for id in removed {
+            view.forget_run_selection(id);
+        }
+    }
+
+    fn handle_agent_history_event(&mut self, event: crate::agent_history_io::Event) {
+        use crate::agent_history_io::Event;
+        match event {
+            Event::Snapshot { port, history } => {
+                let index_incomplete = history.indexing || history.warning.is_some();
+                self.apply_run_visibility(&port, history.visibility);
+                if let Some(index) = self.slot_index(&port) {
+                    let view = &mut self.ports[index];
+                    view.run_history_limited |= index_incomplete
+                        || history.truncated
+                        || history.runs.len() > MAX_RUN_HISTORY_PER_SLOT;
+                    view.archived_runs = history
+                        .runs
+                        .iter()
+                        .map(|record| (record.run.id, record.clone()))
+                        .collect();
+                    for record in history.runs {
+                        // The live stream may be ahead of this polling snapshot.
+                        if !view.run_history.iter().any(|run| run.id == record.run.id)
+                            || (record.run.status != RunStatus::Active
+                                && view.run_history.iter().any(|run| {
+                                    run.id == record.run.id && run.status == RunStatus::Active
+                                }))
+                        {
+                            view.upsert_run(&record.run);
+                        }
+                    }
+                }
+            }
+            Event::Cleared { port, visibility } => {
+                self.apply_run_visibility(&port, visibility);
+                self.status = "Agent 历史已清理；原始日志、人工历史和补全均保留".into();
+            }
+            Event::Loaded {
+                port,
+                id,
+                events,
+                limited,
+            } => {
+                if let Some(index) = self.slot_index(&port) {
+                    let view = &mut self.ports[index];
+                    view.loading_runs.remove(&id);
+                    if !view.hidden_runs.contains(&id) {
+                        if let Some(run) = view.run_history.iter_mut().find(|run| run.id == id) {
+                            for event in &events {
+                                if event.kind == EventKind::Tx && is_described_agent_command(event)
+                                {
+                                    // Recovery can overlap the live tail; never append an event twice.
+                                    if !run
+                                        .commands
+                                        .iter()
+                                        .flat_map(|command| command.steps.iter())
+                                        .any(|step| {
+                                            step.daemon_epoch == event.daemon_epoch
+                                                && step.first_seq <= event.seq
+                                                && event.seq <= step.last_seq
+                                        })
+                                    {
+                                        run.append_command(event);
+                                    }
+                                }
+                            }
+                        }
+                        for event in events
+                            .iter()
+                            .filter(|event| event.kind == EventKind::CommandCaptureCompleted)
+                        {
+                            view.observe_run_history(event);
+                        }
+                        view.run_history_limited |= limited;
+                    }
+                    self.status = if limited {
+                        "已加载部分命令，历史存在缺口或达到读取上限；原始日志未修改"
+                    } else {
+                        "历史命令已加载"
+                    }
+                    .into();
+                }
+            }
+            Event::Failed(error) => {
+                for view in &mut self.ports {
+                    view.loading_runs.clear();
+                }
+                self.status = format!("Agent 历史操作失败：{}", safe_inline(&error));
+            }
+        }
+        self.dirty = true;
     }
 
     fn toggle_run_history_panel(&mut self) {
@@ -5898,6 +6305,17 @@ impl App {
     }
 
     fn handle_run_history_key(&mut self, key: KeyEvent) {
+        if key.code != KeyCode::Delete {
+            self.pending_run_delete = None;
+        }
+        if key.code == KeyCode::Delete
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || self.current().selected_monitor.is_none())
+        {
+            self.pending_monitor_delete = None;
+            self.clear_selected_run(key.modifiers.contains(KeyModifiers::CONTROL));
+            return;
+        }
         if key.code == KeyCode::F(6) {
             let show = !self.current().show_stopped_monitors;
             self.current_mut().show_stopped_monitors = show;
@@ -6370,7 +6788,18 @@ impl App {
             || {
                 next_command
                     .map(|sequence| sequence.saturating_sub(1))
-                    .unwrap_or(view.snapshot.head_seq.max(view.last_seq))
+                    .unwrap_or_else(|| {
+                        if daemon_epoch == view.snapshot.daemon_epoch {
+                            view.snapshot.head_seq.max(view.last_seq)
+                        } else {
+                            view.archived_runs
+                                .get(&key.run_id)
+                                .filter(|record| record.epoch == daemon_epoch)
+                                .map_or(write_end_seq, |record| {
+                                    record.run.end_seq.unwrap_or(record.through_seq)
+                                })
+                        }
+                    })
                     .max(write_end_seq)
             },
             |(_, through)| through.max(write_end_seq),
@@ -6791,6 +7220,7 @@ impl App {
                 self.dirty = true;
             }
             Event::FocusLost => {
+                self.pending_run_delete = None;
                 self.clear_text_selection();
                 self.dirty = true;
             }
@@ -6799,6 +7229,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent, commands: &mpsc::Sender<NetworkCommand>) {
+        if key.code != KeyCode::Delete || self.focus != PaneFocus::RunHistory {
+            self.pending_run_delete = None;
+        }
         self.clear_text_selection();
         // An Agent Run-start approval is a fail-closed modal. It preempts
         // search/menu/input so an Enter intended for another pane can never
@@ -6915,6 +7348,7 @@ impl App {
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                 if self.focus == PaneFocus::RunHistory {
                     self.handle_run_history_key(key);
+                    self.load_expanded_run();
                 } else {
                     self.focus = PaneFocus::Input;
                     match self.current_mode() {
@@ -6935,6 +7369,7 @@ impl App {
                 if self.focus == PaneFocus::RunHistory =>
             {
                 self.handle_run_history_key(key);
+                self.load_expanded_run();
                 self.dirty = true;
                 return;
             }
@@ -7031,10 +7466,22 @@ impl App {
     }
 
     fn begin_mouse_selection(&mut self, mouse: MouseEvent) {
+        self.pending_run_delete = None;
         let Some(layout) = self.layout else {
             return;
         };
         let position = Position::new(mouse.column, mouse.row);
+        if mouse.row == layout.output_area.y
+            && mouse.column > layout.output_area.x
+            && mouse.column
+                < layout.output_area.x.saturating_add(
+                    (UnicodeWidthStr::width(output_title(self).as_str()) as u16 + 1)
+                        .min(layout.output_area.width),
+                )
+        {
+            self.open_model_picker();
+            return;
+        }
         if let Some(index) = self
             .port_mouse_tabs
             .iter()
@@ -7064,6 +7511,11 @@ impl App {
                 )
             })
         {
+            if self.focus != PaneFocus::RunHistory {
+                self.clear_text_selection();
+                self.focus = PaneFocus::RunHistory;
+                return;
+            }
             self.clear_text_selection();
             self.focus = PaneFocus::RunHistory;
             let view = self.current_mut();
@@ -7095,6 +7547,7 @@ impl App {
                     view.expanded_run_command = None;
                 }
             }
+            self.load_expanded_run();
             return;
         }
         if rect_contains(layout.input_area, position) {
@@ -7299,6 +7752,7 @@ impl App {
                 self.handle_macro_action(action, commands);
             }
             KeyCode::Char('o' | 'O') => self.open_profiles_menu(),
+            KeyCode::Char('n' | 'N') => self.open_model_picker(),
             KeyCode::Char('h' | 'H') => self.toggle_run_history_panel(),
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
@@ -7612,10 +8066,14 @@ impl App {
             self.current_mut().history_browse = None;
         }
         match key.code {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let view = self.current_mut();
+                view.draft.insert(view.draft_cursor, '\n');
+                view.draft_cursor += 1;
+            }
             KeyCode::Enter => {
                 let value = self.current().draft.iter().collect::<String>();
-                let mut bytes = value.as_bytes().to_vec();
-                bytes.extend_from_slice(self.current().effective_write_eol().as_bytes());
+                let mut bytes = line_draft_bytes(&value, self.current().effective_write_eol());
                 // A Profile may intentionally omit a line ending for
                 // non-empty payloads. A bare terminal Enter must still put a
                 // real keypress on the wire, so use the conventional CR when
@@ -7649,6 +8107,14 @@ impl App {
                 self.start_history_search();
             }
             KeyCode::Tab => self.complete_draft(),
+            KeyCode::Up | KeyCode::Down if self.current().draft.contains(&'\n') => {
+                let view = self.current_mut();
+                view.draft_cursor = vertical_draft_cursor(
+                    &view.draft,
+                    view.draft_cursor,
+                    key.code == KeyCode::Down,
+                );
+            }
             KeyCode::Up => self.browse_human_history(false),
             KeyCode::Down => self.browse_human_history(true),
             KeyCode::Char(character)
@@ -7711,13 +8177,16 @@ impl App {
                     next_grapheme(&view.draft, view.draft_cursor)
                 };
             }
-            KeyCode::Home => self.current_mut().draft_cursor = 0,
+            KeyCode::Home => {
+                let view = self.current_mut();
+                view.draft_cursor = draft_line_bounds(&view.draft, view.draft_cursor).0;
+            }
             KeyCode::End => {
                 if self.accept_history_suggestion() {
                     return;
                 }
-                let length = self.current().draft.len();
-                self.current_mut().draft_cursor = length;
+                let view = self.current_mut();
+                view.draft_cursor = draft_line_bounds(&view.draft, view.draft_cursor).1;
             }
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
@@ -7757,7 +8226,8 @@ impl App {
             self.dirty = true;
             return;
         }
-        let dangerous = value.len() > 1024 || value.contains('\n') || value.contains('\r');
+        let dangerous = self.current_mode() == InputMode::Raw
+            && (value.len() > 1024 || value.contains('\n') || value.contains('\r'));
         if dangerous {
             self.pending_paste = Some(PendingPaste {
                 port: self.selected_port(),
@@ -7775,7 +8245,25 @@ impl App {
             // LINE mode is a visible command editor, so hidden terminal
             // controls belong in RAW mode and must not desynchronize display
             // width from the logical cursor.
-            let visible = safe_inline(&value);
+            let visible = value
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .split('\n')
+                .map(safe_inline)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if view.draft.iter().map(|ch| ch.len_utf8()).sum::<usize>() + visible.len()
+                > MAX_PASTE_BYTES
+            {
+                self.status = trf(
+                    "st.paste.rejected",
+                    &[&visible.len().to_string(), &MAX_PASTE_BYTES.to_string()],
+                );
+                self.dirty = true;
+                return;
+            }
+            view.history_browse = None;
+            view.completion = None;
             for character in visible.chars() {
                 view.draft.insert(view.draft_cursor, character);
                 view.draft_cursor += 1;
@@ -7907,19 +8395,32 @@ impl App {
     }
 
     fn open_profiles_menu(&mut self) {
-        self.open_menu_page(Some(MenuPage::Profiles));
+        self.open_menu_page(Some(MenuPage::QuickProfiles));
+    }
+
+    fn open_model_picker(&mut self) {
+        self.open_menu_page(Some(MenuPage::QuickProfiles));
+        if let Some(menu) = self.menu.as_mut() {
+            menu.push(MenuPage::ModelFamilies);
+            menu.quick_model = true;
+        }
     }
 
     fn open_menu_page(&mut self, page: Option<MenuPage>) {
         self.queue_selection = None;
         self.focus = PaneFocus::Input;
         let mut menu = MenuState::new();
+        menu.recent_models = self
+            .config
+            .as_ref()
+            .map(|config| config.config.recent_models.clone())
+            .unwrap_or_default();
         if let Some(page) = page {
             menu.push(page);
         }
         self.submit_menu_command(&mut menu, MenuIoCommand::Reload);
         self.menu = Some(menu);
-        self.status = if page == Some(MenuPage::Profiles) {
+        self.status = if page.is_some_and(MenuPage::edits_current_profile) {
             tr("st.menu.profile.open").into()
         } else {
             tr("st.menu.open").into()
@@ -7991,6 +8492,9 @@ impl App {
         let mut keep_open = true;
         let count = menu_item_count(&menu);
         match key.code {
+            KeyCode::Esc if menu.quick_model => {
+                keep_open = false;
+            }
             KeyCode::Esc | KeyCode::Left => {
                 if !menu.back() {
                     keep_open = false;
@@ -8003,10 +8507,10 @@ impl App {
             KeyCode::Down if count > 0 => {
                 menu.selected = (menu.selected + 1).min(count - 1);
             }
-            KeyCode::Tab if menu.page == MenuPage::Profiles => {
+            KeyCode::Tab if menu.page.edits_current_profile() => {
                 self.switch_current_profile_port(&mut menu, false);
             }
-            KeyCode::BackTab if menu.page == MenuPage::Profiles => {
+            KeyCode::BackTab if menu.page.edits_current_profile() => {
                 self.switch_current_profile_port(&mut menu, true);
             }
             KeyCode::PageUp if menu.page == MenuPage::Help => {
@@ -8061,6 +8565,35 @@ impl App {
     }
 
     fn handle_model_tree_key(&mut self, menu: &mut MenuState, key: KeyEvent) -> bool {
+        if menu.page == MenuPage::ModelFamilies {
+            match key.code {
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if menu.model_query.len() < 128 {
+                        menu.model_query.push(ch);
+                    }
+                    menu.selected = 0;
+                    menu.message = format!("搜索机型：{}", menu.model_query);
+                    return true;
+                }
+                KeyCode::Backspace => {
+                    menu.model_query.pop();
+                    menu.selected = 0;
+                    menu.message = format!("搜索机型：{}", menu.model_query);
+                    return true;
+                }
+                KeyCode::Esc if !menu.model_query.is_empty() => {
+                    menu.model_query.clear();
+                    menu.selected = 0;
+                    menu.message.clear();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if menu.busy
             && matches!(
                 key.code,
@@ -8072,7 +8605,7 @@ impl App {
         }
         let rows = model_tree_rows(menu);
         let Some(row) = rows.get(menu.selected).cloned() else {
-            return false;
+            return !matches!(key.code, KeyCode::Esc | KeyCode::Left);
         };
         let configuring = menu.page == MenuPage::ConfigureModelFamilies;
         match key.code {
@@ -8119,7 +8652,7 @@ impl App {
                     if let Some(editor) = menu.profile_editor.as_mut() {
                         editor.model_family = Some(family);
                         editor.model_name = Some(name);
-                        while menu.page != MenuPage::Profiles && menu.back() {}
+                        while !menu.page.edits_current_profile() && menu.back() {}
                         self.submit_current_profile_updates(menu);
                     }
                 }
@@ -8909,7 +9442,7 @@ impl App {
         };
         if changed {
             menu.message = tr("menu.current.modified").into();
-            if menu.page == MenuPage::Profiles {
+            if menu.page.edits_current_profile() {
                 self.submit_current_profile_updates(menu);
             }
         }
@@ -8949,7 +9482,8 @@ impl App {
     }
 
     fn activate_current_profile_row(&mut self, menu: &mut MenuState) {
-        let Some(row) = CurrentProfileRow::from_index(menu.selected) else {
+        let Some(row) = CurrentProfileRow::from_index(menu.page.profile_row_index(menu.selected))
+        else {
             return;
         };
         if menu.profile_editor.is_none() {
@@ -9142,6 +9676,7 @@ impl App {
                 );
             }
             CurrentProfileRow::ModelName => {
+                menu.model_query.clear();
                 let selection = menu.profile_editor.as_ref().and_then(|editor| {
                     Some(ModelTreeRow::Model(
                         editor.model_family.clone()?,
@@ -9667,7 +10202,14 @@ impl App {
             return;
         };
         let impacts = shared_profile_impacts(catalog, transport.as_ref(), device.as_ref());
-        let has_shared_profile_update = transport.is_some() || device.is_some();
+        let has_shared_profile_update = impacts
+            .transport
+            .as_ref()
+            .is_some_and(|impact| impact.ports.len() > 1)
+            || impacts
+                .device
+                .as_ref()
+                .is_some_and(|impact| impact.ports.len() > 1);
         let mutation = MenuMutation::UpdateCurrentProfiles(Box::new(CurrentProfileUpdate {
             current_port: self.selected_port(),
             new_port: port,
@@ -9714,7 +10256,7 @@ impl App {
         match menu.page {
             MenuPage::Root => match menu.selected {
                 0 => {
-                    menu.push(MenuPage::Profiles);
+                    menu.push(MenuPage::QuickProfiles);
                     self.refresh_current_profile_editor(menu);
                 }
                 1 => menu.push(MenuPage::CreateProfiles),
@@ -9722,7 +10264,15 @@ impl App {
                 3 => menu.push(MenuPage::Help),
                 _ => {}
             },
-            MenuPage::Profiles => self.activate_current_profile_row(menu),
+            MenuPage::QuickProfiles => match menu.selected {
+                0 => self.activate_current_profile_row(menu),
+                1 => menu.push(MenuPage::InteractionSettings),
+                2 => menu.push(MenuPage::TransportSettings),
+                _ => {}
+            },
+            MenuPage::Profiles | MenuPage::TransportSettings | MenuPage::InteractionSettings => {
+                self.activate_current_profile_row(menu)
+            }
             MenuPage::CreateProfiles => match menu.selected {
                 0 => {
                     menu.create_transport = Some(default_transport_profile(String::new()));
@@ -9808,7 +10358,7 @@ impl App {
                 {
                     editor.model_family = Some(family);
                     editor.model_name = Some(name);
-                    while menu.page != MenuPage::Profiles && menu.back() {}
+                    while !menu.page.edits_current_profile() && menu.back() {}
                     menu.message = tr("menu.current.modified").into();
                 }
             }
@@ -9855,7 +10405,7 @@ impl App {
         editor.model_family = None;
         editor.model_name = None;
         menu.model_family = None;
-        while menu.page != MenuPage::Profiles && menu.back() {}
+        while !menu.page.edits_current_profile() && menu.back() {}
         menu.message = tr("menu.current.modified").into();
     }
 
@@ -9881,13 +10431,11 @@ impl App {
                     .position(|view| view.snapshot.config.port == port)
                 {
                     let mut view = previous.swap_remove(index);
-                    let configuration_changed = view.snapshot.config != slot.config;
                     view.snapshot = slot;
                     view.sync_trigger_projection(false);
                     view.sync_active_run_history();
-                    if configuration_changed {
-                        view.follow();
-                    }
+                    // Editing identity/profile settings must not discard the
+                    // user's paused output position or unsent input.
                     view
                 } else {
                     SlotView::new(slot)
@@ -9952,6 +10500,23 @@ impl App {
                     }
                 }
                 let profile_editor = CurrentProfileEditor::new(self.current(), &catalog);
+                if matches!(success, MenuSuccess::ProfilesUpdated { .. })
+                    && let Some(identity) = profile_editor
+                        .model_family
+                        .clone()
+                        .zip(profile_editor.model_name.clone())
+                    && let Some(config) = self.config.as_mut()
+                {
+                    config
+                        .config
+                        .recent_models
+                        .retain(|value| value != &identity);
+                    config.config.recent_models.insert(0, identity);
+                    config.config.recent_models.truncate(8);
+                    if let Err(error) = config.save() {
+                        tracing::warn!(%error, "save recent models");
+                    }
+                }
                 let mut message = menu_success_message(&success);
                 if let Some(menu) = self.menu.as_mut() {
                     let current_draft_was_applied =
@@ -9970,6 +10535,26 @@ impl App {
                     }
                     menu.catalog = Some(*catalog);
                     menu.profile_editor = Some(profile_editor);
+                    if menu.quick_model && matches!(success, MenuSuccess::Loaded) {
+                        menu.model_family = menu
+                            .profile_editor
+                            .as_ref()
+                            .and_then(|editor| editor.model_family.clone());
+                        let selected = menu
+                            .profile_editor
+                            .as_ref()
+                            .and_then(|editor| {
+                                editor.model_family.clone().zip(editor.model_name.clone())
+                            })
+                            .map(|(family, name)| ModelTreeRow::Model(family, name));
+                        menu.selected = selected
+                            .and_then(|selected| {
+                                model_tree_rows(menu)
+                                    .iter()
+                                    .position(|row| row == &selected)
+                            })
+                            .unwrap_or(0);
+                    }
                     menu.profile_drafts.clear();
                     menu.busy = false;
                     menu.message = message.clone();
@@ -10016,6 +10601,11 @@ impl App {
                     menu.selected = menu.selected.min(count.saturating_sub(1));
                 }
                 self.status = message;
+                if self.menu.as_ref().is_some_and(|menu| menu.quick_model)
+                    && matches!(success, MenuSuccess::ProfilesUpdated { .. })
+                {
+                    self.menu = None;
+                }
             }
             MenuIoEvent::Failed(error) => {
                 let message = trf("menu.io.failed", &[&safe_inline(&error)]);
@@ -10094,6 +10684,9 @@ impl App {
     }
 
     fn complete_draft(&mut self) {
+        if self.current().draft.contains(&'\n') {
+            return;
+        }
         if self.current().completion.is_some() {
             self.cycle_completion(false);
             return;
@@ -10187,7 +10780,7 @@ impl App {
     }
 
     fn record_human_history(&mut self, command: String) {
-        if command.is_empty() {
+        if command.is_empty() || command.chars().any(char::is_control) {
             return;
         }
         self.human_history_generation
@@ -10292,6 +10885,7 @@ impl App {
         if self.focus != PaneFocus::Input
             || view.mode != InputMode::Line
             || view.draft.is_empty()
+            || view.draft.contains(&'\n')
             || view.draft_cursor != view.draft.len()
             || view.completion.is_some()
             || view.history_search.is_some()
@@ -11743,6 +12337,7 @@ pub async fn run(
         .map(StartupHistoryTarget::from)
         .collect::<Vec<_>>();
     let mut app = App::new(status.ports, initial_port.as_deref());
+    app.retained_api = Some(api.clone());
     app.enable_session_archives();
     app.human_idle_release = Duration::from_secs(
         loaded
@@ -11771,6 +12366,8 @@ pub async fn run(
     app.exact_evidence_commands = Some(exact_evidence_io.commands.clone());
     let mut monitor_io = spawn_monitor_io(api.clone());
     app.monitor_commands = Some(monitor_io.commands.clone());
+    let mut agent_history_io = crate::agent_history_io::spawn(api.clone());
+    app.agent_history_commands = Some(agent_history_io.commands.clone());
     let mut human_history_io =
         spawn_human_history_io(api.clone(), app.human_history_generation.clone());
     app.human_history_commands = Some(human_history_io.commands.clone());
@@ -11794,6 +12391,7 @@ pub async fn run(
             output_search: &mut output_search_io.events,
             exact_evidence: &mut exact_evidence_io.events,
             monitor: &mut monitor_io.events,
+            agent_history: &mut agent_history_io.events,
             human_history: &mut human_history_io.events,
             macros: &mut macro_io.events,
             session_search: &mut session_events,
@@ -11814,6 +12412,7 @@ pub async fn run(
 }
 
 struct RunLoopEvents<'a> {
+    agent_history: &'a mut mpsc::Receiver<crate::agent_history_io::Event>,
     network: &'a mut mpsc::Receiver<NetworkEvent>,
     menu: &'a mut mpsc::Receiver<MenuIoEvent>,
     output_search: &'a mut mpsc::Receiver<OutputSearchIoEvent>,
@@ -11832,6 +12431,7 @@ async fn run_loop(
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut network_events_open = true;
+    let mut agent_history_open = true;
     let mut output_search_events_open = true;
     let mut exact_evidence_events_open = true;
     let mut human_history_events_open = true;
@@ -11847,6 +12447,10 @@ async fn run_loop(
     terminal.draw(|frame| draw(frame, app))?;
     while !app.should_quit {
         tokio::select! {
+            event = io_events.agent_history.recv(), if agent_history_open => {
+                if let Some(event) = event { app.handle_agent_history_event(event); }
+                else { agent_history_open = false; }
+            },
             event = terminal_events.next() => match event {
                 Some(Ok(event)) => app.handle_terminal_event(event, commands),
                 Some(Err(error)) => return Err(error).context("terminal input failed"),
@@ -12156,6 +12760,22 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .saturating_add(2)
             .min(max_queue_height as usize) as u16
     };
+    let input_height = if app.current_mode() == InputMode::Line {
+        (3 + app
+            .current()
+            .draft
+            .iter()
+            .filter(|ch| **ch == '\n')
+            .count()
+            .min(5) as u16)
+            .min(
+                area.height
+                    .saturating_sub(10 + run_history_height + queue_height)
+                    .max(3),
+            )
+    } else {
+        3
+    };
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
@@ -12163,7 +12783,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Constraint::Length(run_history_height),
         Constraint::Length(separator_height),
         Constraint::Length(queue_height),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(area);
@@ -12339,7 +12959,7 @@ fn output_search_scope_label(scope: OutputSearchScope) -> &'static str {
 fn output_search_filters(search: &OutputSearchState) -> String {
     if search.session_mode {
         let scope = if search.scope == OutputSearchScope::Retained {
-            "本次会话 · 所有串口"
+            "当前串口 · 服务端保留的全部历史"
         } else {
             "本次会话 · 当前串口"
         };
@@ -12529,11 +13149,25 @@ fn draw_output_search(
             .add_modifier(Modifier::BOLD),
     ));
     let filters = output_search_filters(search);
+    let history_progress = search
+        .retained_archive
+        .as_ref()
+        .map(|(_, loader)| loader.progress());
     let status = if let Some(error) = search.error.as_deref() {
         Span::styled(safe_inline(error), Style::default().fg(Color::LightRed))
     } else if search.partial {
         Span::styled(
             tr("ui.output.search.quick.partial"),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if search.scope == OutputSearchScope::Retained
+        && let Some(progress) = history_progress.filter(|progress| progress.loading)
+    {
+        Span::styled(
+            format!(
+                "正在加载历史 {}/{} 批 · 已读 {} 条 · Esc 取消",
+                progress.archives_done, progress.archives_total, progress.events
+            ),
             Style::default().fg(Color::Yellow),
         )
     } else {
@@ -13956,14 +14590,6 @@ struct RunPanelRow {
     incident: Option<Uuid>,
 }
 
-fn run_status_text(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Active => tr("ui.run.status.active"),
-        RunStatus::Completed => tr("ui.run.status.completed"),
-        RunStatus::Aborted => tr("ui.run.status.aborted"),
-    }
-}
-
 fn monitor_status_text(status: MonitorStatus) -> &'static str {
     match status {
         MonitorStatus::Running => tr("ui.monitor.status.running"),
@@ -13998,10 +14624,10 @@ fn push_run_history_rows(
     } else {
         safe_inline(&run.label)
     };
-    let title = trf("ui.run.header", &[run_status_text(run.status), &label]);
+    let title = label;
     let mut style = Style::default()
         .fg(match run.status {
-            RunStatus::Active => Color::LightBlue,
+            RunStatus::Active => Color::Yellow,
             RunStatus::Completed => Color::LightGreen,
             RunStatus::Aborted => Color::LightRed,
         })
@@ -14062,11 +14688,9 @@ fn push_command_history_rows(
     let expanded = view.expanded_run_command == Some(key);
     let style = if is_selected && app.focus == PaneFocus::RunHistory {
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
+            .fg(Color::White)
+            .bg(Color::Rgb(36, 48, 58))
             .add_modifier(Modifier::BOLD)
-    } else if is_selected {
-        Style::default().fg(Color::LightCyan)
     } else {
         Style::default().fg(Color::White)
     };
@@ -14076,6 +14700,15 @@ fn push_command_history_rows(
         .as_deref()
         .map(safe_inline)
         .unwrap_or_else(|| tr("ui.run.description.missing").into());
+    let description = if command.omitted_steps > 0 {
+        format!(
+            "{description} [{} + {} archived]",
+            command.steps.len(),
+            command.omitted_steps
+        )
+    } else {
+        description
+    };
     let prefix = format!("    {disclosure} ");
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let available = width.saturating_sub(prefix_width as u16).max(1);
@@ -14440,6 +15073,43 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .current()
         .active_agent_run()
         .map(|run| trf("ui.input.agent", &[&safe_inline(&run.label)]));
+    if app.current_mode() == InputMode::Line && app.current().draft.contains(&'\n') {
+        let view = app.current();
+        let (current_start, _) = draft_line_bounds(&view.draft, view.draft_cursor);
+        let current_row = view.draft[..current_start]
+            .iter()
+            .filter(|ch| **ch == '\n')
+            .count();
+        let first_row = current_row.saturating_sub(inner.height.saturating_sub(1) as usize);
+        let mut offset = 0;
+        let mut rows = Vec::new();
+        for (index, line) in view.draft.split(|ch| *ch == '\n').enumerate() {
+            if index >= first_row && rows.len() < inner.height as usize {
+                let is_current = index == current_row;
+                let cursor = if is_current {
+                    view.draft_cursor - offset
+                } else {
+                    0
+                };
+                let (text, column) = line_input_projection(line, cursor, inner.width);
+                rows.push(if is_current && app.focus == PaneFocus::Input {
+                    line_with_software_cursor(text, column, app.software_cursor_visible)
+                } else {
+                    Line::from(text)
+                });
+            }
+            offset += line.len() + 1;
+        }
+        frame.render_widget(
+            Paragraph::new(rows).block(block.title(format!(
+                " LINE · {}/{} · Enter: send · Shift+Enter: newline ",
+                current_row + 1,
+                view.draft.iter().filter(|ch| **ch == '\n').count() + 1
+            ))),
+            area,
+        );
+        return;
+    }
     let (text, cursor_column, title) = match app.current_mode() {
         InputMode::Line => {
             if app.current().draft.is_empty()
@@ -14643,6 +15313,59 @@ fn next_word(draft: &[char], mut cursor: usize) -> usize {
     cursor
 }
 
+fn line_draft_bytes(value: &str, eol: &str) -> Vec<u8> {
+    if !value.contains('\n') {
+        return [value.as_bytes(), eol.as_bytes()].concat();
+    }
+    // A pasted final newline terminates the last command; it must not add
+    // another empty command. Interior blank lines and whitespace are retained.
+    value
+        .split_inclusive('\n')
+        .flat_map(|line| [line.trim_end_matches('\n').as_bytes(), eol.as_bytes()].concat())
+        .collect()
+}
+
+fn draft_line_bounds(draft: &[char], cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(draft.len());
+    let start = draft[..cursor]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |i| i + 1);
+    let end = draft[cursor..]
+        .iter()
+        .position(|ch| *ch == '\n')
+        .map_or(draft.len(), |i| cursor + i);
+    (start, end)
+}
+
+fn vertical_draft_cursor(draft: &[char], cursor: usize, down: bool) -> usize {
+    let (start, end) = draft_line_bounds(draft, cursor);
+    let column = draft[start..cursor]
+        .iter()
+        .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
+        .sum::<usize>();
+    let (target_start, target_end) = if down && end < draft.len() {
+        draft_line_bounds(draft, end + 1)
+    } else if !down && start > 0 {
+        draft_line_bounds(draft, start - 1)
+    } else {
+        return cursor;
+    };
+    let mut target = target_start;
+    let mut width = 0;
+    while target < target_end {
+        let next = next_grapheme(draft, target).min(target_end);
+        let grapheme = draft[target..next].iter().collect::<String>();
+        let next_width = UnicodeWidthStr::width(grapheme.as_str());
+        if width + next_width > column {
+            break;
+        }
+        width += next_width;
+        target = next;
+    }
+    target
+}
+
 fn line_input_projection(draft: &[char], cursor: usize, inner_width: u16) -> (String, u16) {
     use unicode_segmentation::UnicodeSegmentation;
     const PREFIX: &str = "> ";
@@ -14830,6 +15553,7 @@ fn help_lines(_app: &App) -> Vec<Line<'static>> {
         help_shortcut("help.key.follow", "help.desc.follow"),
         help_shortcut("help.key.menu", "help.desc.menu"),
         help_shortcut("help.key.profile", "help.desc.profile"),
+        help_shortcut("help.key.model", "help.desc.model"),
         help_shortcut("help.key.macros", "help.desc.macros"),
         help_shortcut("help.key.search.output", "help.desc.search.output"),
         Line::default(),
@@ -15005,6 +15729,9 @@ fn draw_menu_field_help(frame: &mut Frame<'_>, help: &str, parent: Rect) {
 fn menu_page_title(page: MenuPage) -> &'static str {
     match page {
         MenuPage::Root => tr("menu.title"),
+        MenuPage::QuickProfiles => "当前串口配置",
+        MenuPage::TransportSettings => "串口 Profile · 串口参数",
+        MenuPage::InteractionSettings => "机型 Profile · 交互配置",
         MenuPage::Profiles => tr("menu.profile.title"),
         MenuPage::CreateProfiles => tr("menu.create.title"),
         MenuPage::CreateTransportProfile => tr("menu.create.transport.title"),
@@ -15025,7 +15752,10 @@ fn menu_page_title(page: MenuPage) -> &'static str {
 fn menu_footer(page: MenuPage) -> &'static str {
     match page {
         MenuPage::Help => tr("menu.footer.help"),
-        MenuPage::Profiles => tr("menu.footer.profiles"),
+        MenuPage::Profiles
+        | MenuPage::QuickProfiles
+        | MenuPage::TransportSettings
+        | MenuPage::InteractionSettings => tr("menu.footer.profiles"),
         MenuPage::ConfigureModelFamilies | MenuPage::ConfigureModelNames => {
             tr("menu.footer.model.configure")
         }
@@ -15317,11 +16047,50 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
         .enumerate()
         .map(|(index, text)| selected_menu_line(index, menu.selected, text.into()))
         .collect(),
-        MenuPage::Profiles => {
+        MenuPage::QuickProfiles => {
+            let Some(editor) = &menu.profile_editor else {
+                return vec![Line::from(tr("menu.loading"))];
+            };
+            [
+                format!(
+                    "机型名             {}",
+                    editor
+                        .model_family
+                        .as_deref()
+                        .zip(editor.model_name.as_deref())
+                        .map(|(family, name)| format!(
+                            "{} / {}",
+                            safe_inline(family),
+                            safe_inline(name)
+                        ))
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())
+                ),
+                format!(
+                    "机型 Profile       {}",
+                    editor
+                        .model_profile_binding
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())
+                ),
+                format!(
+                    "串口 Profile       {}",
+                    editor
+                        .transport_binding
+                        .as_deref()
+                        .map(safe_inline)
+                        .unwrap_or_else(|| tr("menu.value.unbound").into())
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| selected_menu_line(i, menu.selected, value))
+            .collect()
+        }
+        MenuPage::Profiles | MenuPage::TransportSettings | MenuPage::InteractionSettings => {
             let Some(editor) = menu.profile_editor.as_ref() else {
                 return vec![Line::from(tr("menu.loading"))];
             };
-            let changed = editor.changed();
             let values = [
                 trf("menu.current.row.port", &[&safe_inline(&editor.port)]),
                 trf(
@@ -15405,12 +16174,18 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                     "menu.current.row.delay",
                     &[&optional_number(editor.device.write_chunk_delay_ms)],
                 ),
-                if changed {
-                    tr("menu.current.row.apply.changed").into()
-                } else {
-                    tr("menu.current.row.apply.clean").into()
-                },
             ];
+            if menu.page != MenuPage::Profiles {
+                return (0..menu_item_count(menu))
+                    .map(|index| {
+                        selected_menu_line(
+                            index,
+                            menu.selected,
+                            values[menu.page.profile_row_index(index)].clone(),
+                        )
+                    })
+                    .collect();
+            }
             let mut rows = Vec::with_capacity(values.len() + 4);
             rows.push(menu_section_heading("menu.current.section.serial"));
             rows.extend(
@@ -15431,9 +16206,6 @@ fn menu_rows(app: &App, menu: &MenuState) -> Vec<Line<'static>> {
                         indented_menu_line(index, menu.selected, text)
                     }),
             );
-            rows.push(Line::default());
-            rows.push(menu_section_heading("menu.current.section.actions"));
-            rows.push(indented_menu_line(18, menu.selected, values[18].clone()));
             rows
         }
         MenuPage::CreateProfiles => [
@@ -15680,19 +16452,21 @@ fn inline_menu_prompt_line(prompt: &MenuPrompt, cursor_visible: bool) -> Line<'s
 
 fn menu_field_help(_app: &App, menu: &MenuState) -> String {
     match menu.page {
-        MenuPage::Profiles => match CurrentProfileRow::from_index(menu.selected) {
-            Some(CurrentProfileRow::Port) => tr("menu.help.field.port"),
-            Some(CurrentProfileRow::TransportProfile) => tr("menu.help.field.transport"),
-            Some(CurrentProfileRow::ModelProfile) => tr("menu.help.field.model.profile"),
-            Some(CurrentProfileRow::ModelName) => tr("menu.help.field.model.name"),
-            Some(CurrentProfileRow::ShellPrompt) => tr("menu.help.field.shell"),
-            Some(CurrentProfileRow::UbootPrompt) => tr("menu.help.field.uboot"),
-            Some(CurrentProfileRow::ChunkSize | CurrentProfileRow::ChunkDelay) => {
-                tr("menu.help.field.pacing")
+        MenuPage::Profiles | MenuPage::TransportSettings | MenuPage::InteractionSettings => {
+            match CurrentProfileRow::from_index(menu.page.profile_row_index(menu.selected)) {
+                Some(CurrentProfileRow::Port) => tr("menu.help.field.port"),
+                Some(CurrentProfileRow::TransportProfile) => tr("menu.help.field.transport"),
+                Some(CurrentProfileRow::ModelProfile) => tr("menu.help.field.model.profile"),
+                Some(CurrentProfileRow::ModelName) => tr("menu.help.field.model.name"),
+                Some(CurrentProfileRow::ShellPrompt) => tr("menu.help.field.shell"),
+                Some(CurrentProfileRow::UbootPrompt) => tr("menu.help.field.uboot"),
+                Some(CurrentProfileRow::ChunkSize | CurrentProfileRow::ChunkDelay) => {
+                    tr("menu.help.field.pacing")
+                }
+                Some(CurrentProfileRow::Apply) => tr("menu.help.field.apply"),
+                _ => tr("menu.help.field.serial"),
             }
-            Some(CurrentProfileRow::Apply) => tr("menu.help.field.apply"),
-            _ => tr("menu.help.field.serial"),
-        },
+        }
         MenuPage::CreateProfiles
         | MenuPage::CreateTransportProfile
         | MenuPage::CreateModelProfile => tr("menu.help.field.create"),
@@ -17519,6 +18293,49 @@ mod tests {
     }
 
     #[test]
+    fn line_paste_is_visible_multiline_draft_until_enter_and_never_single_line_history() {
+        let mut app = ready_app_with_control();
+        let (commands, mut received) = mpsc::channel(8);
+        app.handle_paste("pwd\r\n  version  \r\n\r\n".into(), &commands);
+        assert_eq!(
+            app.current().draft.iter().collect::<String>(),
+            "pwd\n  version  \n\n"
+        );
+        assert!(received.try_recv().is_err());
+        assert!(app.pending_paste.is_none());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.layout.unwrap().input_area.height > 3);
+        app.handle_line_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &commands);
+        assert_eq!(app.current().draft_cursor, 16);
+        app.handle_line_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &commands);
+        let message = received.try_recv().unwrap();
+        let NetworkCommand::Send {
+            message: ClientMessage::SendHumanCommand { data, input, .. },
+            ..
+        } = message
+        else {
+            panic!("expected one human command");
+        };
+        assert_eq!(data, b"pwd\r  version  \r\r");
+        assert!(input.is_none());
+        assert!(app.current().draft.is_empty());
+        app.record_human_history("pwd\nversion".into());
+        assert!(app.human_history.is_empty());
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn multiline_editor_preserves_empty_lines_and_moves_over_graphemes() {
+        assert_eq!(line_draft_bytes("a\n\nb\n", "\r"), b"a\r\rb\r");
+        assert_eq!(line_draft_bytes("a\nb", "\r\n"), b"a\r\nb\r\n");
+        assert_eq!(line_draft_bytes("\n", "\r"), b"\r");
+        let draft = "中文\ne\u{301}x".chars().collect::<Vec<_>>();
+        assert_eq!(vertical_draft_cursor(&draft, 1, true), draft.len());
+        assert_eq!(draft_line_bounds(&draft, 1), (0, 2));
+    }
+
+    #[test]
     fn oversized_confirmed_line_paste_is_retained_without_partial_send() {
         let _guard = crate::i18n::lang_test_lock();
         let mut app = ready_app_with_control();
@@ -17971,6 +18788,12 @@ mod tests {
             .0;
         app.handle_mouse(click(row), &commands);
         assert_eq!(app.focus, PaneFocus::RunHistory);
+        assert_eq!(
+            app.current().expanded_run,
+            None,
+            "first click only focuses history"
+        );
+        app.handle_mouse(click(row), &commands);
         assert_eq!(app.current().expanded_run, Some(run.id));
         app.handle_mouse(click(app.layout.unwrap().input_area), &commands);
         assert_eq!(app.focus, PaneFocus::Input);
@@ -20085,6 +20908,104 @@ mod tests {
     }
 
     #[test]
+    fn agent_history_delete_confirms_whole_run_and_preserves_raw_and_human_history() {
+        let mut app = App::new(vec![snapshot()], None);
+        let mut run = agent_run("cleanup whole run");
+        run.status = RunStatus::Completed;
+        run.end_seq = Some(9);
+        app.current_mut().upsert_run(&run);
+        app.current_mut().selected_run = Some(run.id);
+        app.current_mut().selected_run_command = Some(RunCommandKey {
+            run_id: run.id,
+            first_seq: 2,
+        });
+        app.human_history.push("human command".into());
+        app.focus = PaneFocus::RunHistory;
+        let (sender, mut requests) = mpsc::channel(4);
+        app.agent_history_commands = Some(sender);
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+        app.leave_run_history();
+        app.focus = PaneFocus::RunHistory;
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(
+            requests.try_recv().is_err(),
+            "leaving the pane cancels confirmation"
+        );
+        app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        let crate::agent_history_io::Command::Clear { port, ids } = requests.try_recv().unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        assert_eq!(ids, Some(vec![run.id]));
+        assert_eq!(
+            app.current().run_history.len(),
+            1,
+            "no optimistic deletion before server acknowledgement"
+        );
+        app.apply_run_visibility(
+            &port,
+            serial_protocol::AgentHistoryVisibility {
+                revision: 1,
+                hidden: vec![run.id],
+            },
+        );
+        assert!(app.current().run_history.is_empty());
+        assert_eq!(app.human_history, vec!["human command"]);
+        app.current_mut().upsert_run(&run);
+        assert!(
+            app.current().run_history.is_empty(),
+            "replay cannot revive hidden history"
+        );
+    }
+
+    #[test]
+    fn agent_history_delete_protects_active_run() {
+        let mut app = App::new(vec![snapshot()], None);
+        let run = agent_run("active");
+        app.current_mut().upsert_run(&run);
+        app.current_mut().selected_run = Some(run.id);
+        let (sender, mut requests) = mpsc::channel(4);
+        app.agent_history_commands = Some(sender);
+        for _ in 0..2 {
+            app.handle_run_history_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        }
+        assert!(requests.try_recv().is_err());
+        assert!(app.pending_run_delete.is_none());
+    }
+
+    #[test]
+    fn macro_history_groups_by_execution_not_definition_and_bounds_loop_steps() {
+        let run = agent_run("macro run");
+        let epoch = snapshot().daemon_epoch;
+        let mut entry = RunHistoryEntry::from_run(&run);
+        let executions = [Uuid::new_v4(), Uuid::new_v4()];
+        for (index, execution) in executions.iter().enumerate() {
+            for step in 0..520 {
+                let mut tx = described_agent_tx(
+                    &run,
+                    epoch,
+                    (index * 1000 + step + 2) as u64,
+                    b"slp\r",
+                    "=> ",
+                );
+                tx.metadata
+                    .insert("macro_execution_id".into(), serde_json::json!(execution));
+                tx.metadata
+                    .insert("macro_id".into(), serde_json::json!("enter-uboot"));
+                entry.append_command(&tx);
+            }
+        }
+        assert_eq!(entry.commands.len(), 2);
+        for (command, execution) in entry.commands.iter().zip(executions) {
+            assert_eq!(command.macro_execution_id, Some(execution));
+            assert_eq!(command.steps.len(), 512);
+            assert_eq!(command.omitted_steps, 8);
+            assert_eq!(command.description.as_deref(), Some("Macro · enter-uboot"));
+        }
+    }
+
+    #[test]
     fn run_history_groups_command_sequence_steps_under_one_purpose() {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
@@ -20407,7 +21328,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             terminal.backend().buffer().content[selected_command_row * 100 + 4].bg,
-            Color::Cyan,
+            Color::Rgb(36, 48, 58),
             "selection belongs to the command description, not its Run title"
         );
 
@@ -20423,7 +21344,7 @@ mod tests {
         app.current_mut().expanded_run = None;
         app.current_mut().selected_run_command = None;
         for (status, color) in [
-            (RunStatus::Active, Color::LightBlue),
+            (RunStatus::Active, Color::Yellow),
             (RunStatus::Completed, Color::LightGreen),
             (RunStatus::Aborted, Color::LightRed),
         ] {
@@ -20433,7 +21354,8 @@ mod tests {
                 .iter()
                 .find(|row| row.run == Some(run.id) && row.command.is_none())
                 .unwrap();
-            assert!(line_plain_text(&status_row.line).contains(run_status_text(status)));
+            assert!(line_plain_text(&status_row.line).ends_with("Grouped run"));
+            assert!(!line_plain_text(&status_row.line).contains("Completed"));
             assert!(status_row.line.spans.iter().all(|span| {
                 span.style.fg == Some(color) && span.style.add_modifier.contains(Modifier::BOLD)
             }));
@@ -20898,6 +21820,24 @@ mod tests {
         let current_epoch = Uuid::new_v4();
         app.ports[0].snapshot.daemon_epoch = current_epoch;
         app.ports[0].last_epoch = Some(current_epoch);
+        // Archived bounds come from the persisted Run index, never the new
+        // daemon's coincidentally similar sequence numbers.
+        let port = app.ports[0].snapshot.config.port.clone();
+        app.ports[0].archived_runs.insert(
+            run.id,
+            serial_protocol::AgentRunRecord {
+                port,
+                epoch: archived_epoch,
+                run: RunInfo {
+                    status: RunStatus::Aborted,
+                    end_seq: Some(3),
+                    ..run.clone()
+                },
+                started_wall_time_ns: 1,
+                through_seq: 3,
+                hidden: false,
+            },
+        );
         let mut current_row = stream_row(3, Direction::Rx, "current epoch output");
         current_row.daemon_epoch = Some(current_epoch);
         app.ports[0].push_line(current_row, true);
@@ -21273,7 +22213,7 @@ mod tests {
             .into_iter()
             .map(|line| line_plain_text(&line))
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT + 4);
+        assert_eq!(rows.len(), CURRENT_PROFILE_ROW_COUNT + 2);
         assert_eq!(rows[0], tr("menu.current.section.serial"));
         assert_eq!(rows[11], tr("menu.current.section.model"));
         assert!(rows[1].starts_with("▶     "));
@@ -21783,6 +22723,50 @@ mod tests {
         assert_eq!(update.revisions.config, Some(41));
         assert_eq!(update.revisions.model_family, Some(41));
         assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn quick_model_filter_no_match_never_unbinds_and_recent_entries_must_exist() {
+        let (current, catalog) = editable_profile_fixture();
+        let mut app = App::new(vec![current], None);
+        let (commands, mut received) = mpsc::channel(4);
+        app.menu_commands = Some(commands);
+        let mut menu = MenuState::new();
+        menu.page = MenuPage::QuickProfiles;
+        menu.catalog = Some(catalog);
+        menu.recent_models = vec![
+            ("missing".into(), "deleted".into()),
+            ("DUT Console".into(), "DUT Console 1.0".into()),
+        ];
+        app.refresh_current_profile_editor(&mut menu);
+        menu.page = MenuPage::ModelFamilies;
+        menu.quick_model = true;
+        assert!(
+            !model_tree_rows(&menu)
+                .contains(&ModelTreeRow::Model("missing".into(), "deleted".into()))
+        );
+        let before = menu.profile_editor.as_ref().unwrap().model_name.clone();
+        app.menu = Some(menu);
+        for character in "no-such-model".chars() {
+            app.handle_menu_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert!(model_tree_rows(app.menu.as_ref().unwrap()).is_empty());
+        app.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.menu
+                .as_ref()
+                .unwrap()
+                .profile_editor
+                .as_ref()
+                .unwrap()
+                .model_name,
+            before
+        );
+        assert!(received.try_recv().is_err());
+        app.handle_menu_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.menu.as_ref().unwrap().model_query.is_empty());
+        app.handle_menu_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.menu.is_none());
     }
 
     #[test]
@@ -24206,7 +25190,7 @@ mod tests {
             Ok(MenuIoCommand::Reload)
         ));
         let menu = app.menu.as_ref().expect("profile menu");
-        assert_eq!(menu.page, MenuPage::Profiles);
+        assert_eq!(menu.page, MenuPage::QuickProfiles);
         assert_eq!(menu.stack, vec![(MenuPage::Root, 0)]);
         assert!(!menu_rows(&app, menu).is_empty());
         let help = help_lines(&app)

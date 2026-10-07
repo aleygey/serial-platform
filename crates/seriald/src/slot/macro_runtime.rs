@@ -48,6 +48,7 @@ impl ActiveMacro {
         let info = self.snapshot();
         metadata.insert("macro_execution_id".into(), json!(info.id));
         metadata.insert("macro_id".into(), json!(info.macro_id));
+        metadata.insert("macro_description".into(), json!(info.description));
         metadata.insert("macro_revision".into(), json!(info.revision));
         metadata.insert("macro_line".into(), json!(info.line));
         metadata.insert("macro_column".into(), json!(info.column));

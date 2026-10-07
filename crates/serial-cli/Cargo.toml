@@ -10,6 +10,7 @@ version.workspace = true
 crossterm.workspace = true
 serde_json.workspace = true
 serial-protocol = { path = "../serial-protocol" }
+serial-setup = { path = "../serial-setup" }
 seriald = { path = "../seriald" }
 uuid.workspace = true
 

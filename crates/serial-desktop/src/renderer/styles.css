@@ -232,10 +232,14 @@ kbd { font-family: inherit; font-size: 9px; font-weight: 500; }
 .pane-heading { justify-content: flex-start; gap: 9px; }
 .agent-scroll { min-height: 0; flex: 1; overflow: auto; padding: 10px 9px 24px; }
 .run-row { display: flex; align-items: center; gap: 10px; margin: 5px 8px 7px; padding: 8px 2px; border-bottom: 1px solid var(--border); }
+.run-row > .history-summary { flex: 1; min-width: 0; padding: 3px; }
+.run-row > button:not(.history-summary), .agent-pane .pane-heading > button { font-size: 10px; color: var(--text-3); white-space: nowrap; background: transparent; border: 0; cursor: pointer; }
+.run-row > button:disabled { opacity: .4; cursor: default; }
+.history-notice { padding: 5px 12px; color: var(--warning); font-size: 11px; }
 .run-row > div { min-width: 0; display: flex; flex: 1; flex-direction: column; }
 .run-row strong { overflow: hidden; color: var(--text-2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .run-row small { margin-top: 3px; color: var(--text-3); font-size: 10.5px; }
-.run-mark { width: 7px; height: 7px; border: 2px solid var(--blue); border-radius: 50%; }
+.run-mark { width: 7px; height: 7px; border: 2px solid var(--warning); border-radius: 50%; }
 .run-mark.is-completed { border-color: var(--success); background: var(--success); }
 .run-mark.is-aborted { border-color: var(--danger); background: var(--danger); }
 .history-card { margin-bottom: 6px; overflow: hidden; border: 1px solid transparent; border-radius: 10px; background: var(--surface-2); }

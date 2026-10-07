@@ -181,6 +181,11 @@ impl SessionArchive {
         self.shared.gaps.lock().unwrap().iter().cloned().collect()
     }
 
+    pub fn note_coverage_gap(&self, reason: impl Into<String>) {
+        self.shared.gap(reason);
+        self.shared.revision.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Never waits for disk or queue space on the TUI thread. Returns false and
     /// records an explicit coverage gap when backpressure prevents persistence.
     pub fn append(&self, batch: &StreamDisplayBatch) -> bool {
@@ -226,6 +231,74 @@ impl SessionArchive {
         }
         self.shared.revision.fetch_add(1, Ordering::AcqRel);
         true
+    }
+
+    /// Historical ingestion may wait for the bounded spool queue. Only call
+    /// this on a background blocking worker, never on the terminal/UI thread.
+    /// Unlike live append, pressure is retried without manufacturing a gap.
+    pub fn append_history(&self, batch: StreamDisplayBatch, cancel: &AtomicBool) -> io::Result<()> {
+        let bytes = batch
+            .completed
+            .iter()
+            .chain(batch.pending.iter())
+            .map(|line| {
+                line.text
+                    .len()
+                    .saturating_add(line.source.len())
+                    .saturating_add(256)
+            })
+            .sum::<usize>();
+        if bytes > QUEUE_BYTES {
+            return Err(io::Error::other("历史单批文本超过存档队列上限"));
+        }
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "历史加载已取消"));
+            }
+            if self.shared.directory.preserve.load(Ordering::Acquire) {
+                return Err(io::Error::other("历史存档写入失败，已停止加载"));
+            }
+            if self
+                .shared
+                .queued_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(bytes)
+                        .filter(|total| *total <= QUEUE_BYTES)
+                })
+                .is_ok()
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut message = Message::Append {
+            completed: batch.completed,
+            pending: batch.pending,
+            pending_committed: batch.pending_committed,
+            boundary: false,
+            bytes,
+        };
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "历史加载已取消"));
+            }
+            match self.sender.try_send(message) {
+                Ok(()) => {
+                    self.shared.revision.fetch_add(1, Ordering::AcqRel);
+                    return Ok(());
+                }
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    message = returned;
+                    thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    return Err(io::Error::other("历史存档写入服务已关闭"));
+                }
+            }
+        }
     }
 
     /// Call before parser reset or when capture reports a gap. The worker first

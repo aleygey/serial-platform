@@ -206,6 +206,8 @@ pub enum JournalError {
 pub struct JournalManager {
     handle: JournalHandle,
     worker: Option<JoinHandle<()>>,
+    index_worker: Option<JoinHandle<()>>,
+    stop_index: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl JournalManager {
@@ -220,20 +222,47 @@ impl JournalManager {
         let config = Arc::new(config);
         let state = WriterState::initialize(Arc::clone(&config))?;
         let human_history = state.human_history.clone();
+        let run_history = state.run_history.clone();
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
         let handle = JournalHandle {
             sender,
             config,
             query_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
             human_history,
+            run_history,
         };
         let worker = thread::Builder::new()
             .name("seriald-journal".into())
             .spawn(move || writer_loop(state, receiver))?;
 
+        // Build the small Run index from retained legacy journals off the
+        // startup/serial path. New lifecycle events maintain it incrementally.
+        let stop_index = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = stop_index.clone();
+        let index = handle.run_history.clone();
+        let root = handle.config.root_dir.clone();
+        index
+            .indexing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let index_worker = thread::Builder::new()
+            .name("seriald-history-index".into())
+            .spawn(move || {
+                let result = rebuild_run_index(&root, &index, &cancel);
+                if let Err(error) = result {
+                    *index.warning.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(error.to_string());
+                    tracing::warn!(%error, "Agent history index recovery incomplete");
+                }
+                index
+                    .indexing
+                    .store(false, std::sync::atomic::Ordering::Release);
+            })?;
+
         Ok(Self {
             handle,
             worker: Some(worker),
+            index_worker: Some(index_worker),
+            stop_index,
         })
     }
 
@@ -243,6 +272,14 @@ impl JournalManager {
 
     /// Flushes, seals all active segments, and joins the writer thread.
     pub async fn shutdown(mut self) -> Result<(), JournalError> {
+        self.stop_index
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.index_worker.take() {
+            tokio::task::spawn_blocking(move || worker.join())
+                .await
+                .map_err(|_| JournalError::WriterPanicked)?
+                .map_err(|_| JournalError::WriterPanicked)?;
+        }
         let result = self.handle.request_shutdown().await;
         if let Some(worker) = self.worker.take() {
             tokio::task::spawn_blocking(move || worker.join())
@@ -256,6 +293,8 @@ impl JournalManager {
 
 impl Drop for JournalManager {
     fn drop(&mut self) {
+        self.stop_index
+            .store(true, std::sync::atomic::Ordering::Release);
         if self.worker.is_some() {
             let _ = self
                 .handle
@@ -265,6 +304,60 @@ impl Drop for JournalManager {
     }
 }
 
+fn rebuild_run_index(
+    root: &Path,
+    history: &crate::run_history::RunHistory,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), JournalError> {
+    let checkpoint = root.join("agent-history-checkpoint.json");
+    let mut completed = match fs::read(&checkpoint) {
+        Ok(bytes) => serde_json::from_slice::<HashMap<Uuid, u64>>(&bytes).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    };
+    let mut segments = discover_segments(root, None)?;
+    segments.sort_by_key(|segment| (segment.header.daemon_epoch, segment.header.first_seq));
+    let retained = segments
+        .iter()
+        .map(|segment| segment.header.segment_id)
+        .collect::<std::collections::HashSet<_>>();
+    completed.retain(|id, _| retained.contains(id));
+    for segment in segments {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut file = match File::open(&segment.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue, // rotated/pruned concurrently
+            Err(error) => return Err(error.into()),
+        };
+        let size = file.metadata()?.len();
+        if segment.sealed && completed.get(&segment.header.segment_id) == Some(&size) {
+            continue;
+        }
+        let (_, offset) = read_segment_header(&mut file, &segment.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        while !cancel.load(std::sync::atomic::Ordering::Acquire) {
+            match read_record(&mut file)? {
+                RecordRead::Event(event) => history.record(&event)?,
+                RecordRead::Eof => break,
+                RecordRead::Invalid(message) if segment.sealed => {
+                    return Err(corrupt(&segment.path, message));
+                }
+                RecordRead::Invalid(_) => break, // active append tail: the writer indexes it
+            }
+        }
+        if segment.sealed && !cancel.load(std::sync::atomic::Ordering::Acquire) {
+            completed.insert(segment.header.segment_id, size);
+            crate::config::atomic_write(
+                &checkpoint,
+                &serde_json::to_vec(&completed)
+                    .map_err(|error| io::Error::other(error.to_string()))?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Cloneable client for appending, querying, and flushing journal events.
 #[derive(Clone)]
 pub struct JournalHandle {
@@ -272,6 +365,7 @@ pub struct JournalHandle {
     config: Arc<JournalConfig>,
     query_gate: Arc<Semaphore>,
     human_history: crate::human_history::HumanHistory,
+    pub(crate) run_history: crate::run_history::RunHistory,
 }
 
 impl JournalHandle {
@@ -436,6 +530,9 @@ fn journal_directory_usage(root: &Path) -> Result<u64, JournalError> {
         };
         for entry in entries {
             let entry = entry?;
+            if is_history_metadata(root, &entry.path()) {
+                continue;
+            }
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
                 pending.push(entry.path());
@@ -511,6 +608,7 @@ struct StreamKey {
 struct WriterState {
     config: Arc<JournalConfig>,
     human_history: crate::human_history::HumanHistory,
+    run_history: crate::run_history::RunHistory,
     open_segments: HashMap<StreamKey, OpenSegment>,
     heads: HashMap<StreamKey, u64>,
     total_bytes: u64,
@@ -540,6 +638,7 @@ impl WriterState {
 
         let total_bytes = directory_size(&config.root_dir)?;
         let mut state = Self {
+            run_history: crate::run_history::RunHistory::new(config.root_dir.join("agent-history")),
             human_history: crate::human_history::HumanHistory::open(
                 config.root_dir.join("human-history.json"),
             )?,
@@ -635,6 +734,14 @@ impl WriterState {
                 self.open_segments.insert(key.clone(), segment);
                 self.heads.insert(key, event.seq);
                 self.human_history.record(&event)?;
+                if let Err(error) = self.run_history.record(&event) {
+                    *self
+                        .run_history
+                        .warning
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                    tracing::error!(%error, "Agent history index unavailable; raw journal remains authoritative");
+                }
                 Ok(event)
             }
             Err(SegmentAppendError::Recovered(error)) => {
@@ -2778,6 +2885,9 @@ fn collect_files(root: &Path, extension: Option<&str>) -> Result<Vec<PathBuf>, J
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
+            if is_history_metadata(root, &entry.path()) {
+                continue;
+            }
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
                 directories.push(entry.path());
@@ -2791,6 +2901,16 @@ fn collect_files(root: &Path, extension: Option<&str>) -> Result<Vec<PathBuf>, J
         }
     }
     Ok(files)
+}
+
+// Panel metadata must not consume the raw-evidence retention budget. In
+// particular, retaining a large catalog of Runs must never evict serial logs.
+fn is_history_metadata(root: &Path, path: &Path) -> bool {
+    path.parent() == Some(root)
+        && matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("agent-history" | "agent-history-checkpoint.json")
+        )
 }
 
 fn directory_size(root: &Path) -> Result<u64, JournalError> {
@@ -2881,6 +3001,30 @@ mod tests {
         config.max_total_bytes = 1024 * 1024;
         config.cleanup_low_watermark = 0.75;
         config
+    }
+
+    #[test]
+    fn agent_index_does_not_consume_or_prune_the_raw_journal_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("agent-history/port")).unwrap();
+        fs::write(
+            temp.path().join("agent-history/port/run.json"),
+            vec![0; 8192],
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("agent-history-checkpoint.json"),
+            vec![0; 4096],
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join("slots/slot/epoch")).unwrap();
+        fs::write(
+            temp.path().join("slots/slot/epoch/evidence.slog"),
+            vec![1; 512],
+        )
+        .unwrap();
+        assert_eq!(directory_size(temp.path()).unwrap(), 512);
+        assert_eq!(journal_directory_usage(temp.path()).unwrap(), 512);
     }
 
     fn event(epoch: Uuid, seq: u64, direction: Direction, data: Vec<u8>) -> TimelineEvent {

@@ -74,12 +74,16 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
     setNavigationRevision((revision) => revision + 1)
   }
 
+  const commandAnchor = selectedCommand ? `${selectedCommand.daemonEpoch}:${selectedCommand.firstSeq}:${match?.fromSeq}:${match?.hasVisibleOutput}:${events[0]?.daemon_epoch}:${events[0]?.seq}` : ''
   useEffect(() => {
     if (match?.hasVisibleOutput) {
       scrollRef.current?.querySelector(`[data-event-key="${match.daemonEpoch}:${match.fromSeq}"]`)?.scrollIntoView({ block: 'center' })
       setFollow(false)
+    } else if (selectedCommand) {
+      scrollRef.current?.querySelector(`[data-event-key="${selectedCommand.daemonEpoch}:${selectedCommand.firstSeq}"]`)?.scrollIntoView({ block: 'center' })
+      setFollow(false)
     }
-  }, [match])
+  }, [commandAnchor])
 
   useEffect(() => {
     if (follow) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
@@ -152,14 +156,14 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
       )}
       {selectedCommand && !match && (
         <div className="command-overlay">
-          <span>设备回显中未匹配，已定位到命令</span>
+          <span>尚未匹配到完整命令回显；不会跳转到相似文本</span>
           <code>{displayCommand(selectedCommand.text)}</code>
           <button type="button" onClick={onClearCommand}><X size={14} /></button>
         </div>
       )}
       {selectedCommand && match && !match.hasVisibleOutput && (
         <div className="command-overlay">
-          <span>该命令的权威记录中没有可显示的设备输出</span>
+          <span>当前加载范围没有该命令的设备输出；请留意历史读取提示</span>
           <code>{displayCommand(selectedCommand.text)}</code>
           <button type="button" onClick={onClearCommand}><X size={14} /></button>
         </div>

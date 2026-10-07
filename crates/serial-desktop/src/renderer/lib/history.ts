@@ -1,4 +1,4 @@
-import type { TimelineEvent } from '../../shared/contracts'
+import type { TimelineEvent, AgentHistoryResponse } from '../../shared/contracts'
 
 export interface AgentCommand {
   id: string
@@ -65,7 +65,7 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
   const captures = new Map<string, CommandCaptureEvidence>()
   for (const event of events) {
     const capture = commandCapture(event)
-    if (capture) captures.set(capture.operationId, capture)
+    if (capture) captures.set(`${capture.daemonEpoch}:${capture.generation}:${capture.operationId}`, capture)
   }
   for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
     if (['run_started', 'run_ended', 'run_aborted'].includes(event.kind) && event.run_id) {
@@ -88,16 +88,22 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
       continue
     }
     if (event.kind !== 'tx' || event.direction !== 'tx' || event.actor?.kind !== 'agent') continue
-    const description = stringMetadata(event, 'command_sequence_description')
+    const macroExecutionId = stringMetadata(event, 'macro_execution_id')
+    const description = (macroExecutionId
+      ? `Macro · ${stringMetadata(event, 'macro_description') ?? stringMetadata(event, 'macro_id') ?? 'inline'}`
+      : undefined)
+      ?? stringMetadata(event, 'command_sequence_description')
       ?? stringMetadata(event, 'command_description')
     if (!description) continue
     const sequenceId = stringMetadata(event, 'command_sequence_id')
     const operationId = event.operation_id ?? undefined
-    const groupKey = sequenceId
-      ? `sequence:${sequenceId}`
+    const groupKey = macroExecutionId
+      ? `macro:${event.daemon_epoch}:${event.run_id ?? ''}:${macroExecutionId}`
+      : sequenceId
+      ? `sequence:${event.daemon_epoch}:${event.run_id ?? ''}:${sequenceId}`
       : operationId
-        ? `operation:${operationId}`
-        : `event:${event.seq}`
+        ? `operation:${event.daemon_epoch}:${event.run_id ?? ''}:${operationId}`
+        : `event:${event.daemon_epoch}:${event.seq}`
     let group = commandGroups.get(groupKey)
     if (!group) {
       group = {
@@ -112,7 +118,7 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
       items.push(group)
     }
     const stepIndex = numberMetadata(event, 'command_sequence_step_index')
-    const commandKey = stepIndex === undefined ? operationId ?? `event:${event.seq}` : `step:${stepIndex}`
+    const commandKey = macroExecutionId || stepIndex === undefined ? operationId ?? `event:${event.seq}` : `step:${stepIndex}`
     const existing = group.commands.find((command) => command.id === commandKey)
     if (existing) {
       existing.text += event.text
@@ -126,12 +132,36 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
         stepIndex,
         text: event.text,
         captureMatchers: captureMatchers(event),
-        capture: operationId ? captures.get(operationId) : undefined
+        capture: operationId ? captures.get(`${event.daemon_epoch}:${event.generation}:${operationId}`) : undefined
       })
     }
     group.commands.sort((a, b) => (a.stepIndex ?? Number.MAX_SAFE_INTEGER) - (b.stepIndex ?? Number.MAX_SAFE_INTEGER) || a.firstSeq - b.firstSeq)
   }
   return items.sort((a, b) => a.firstSeq - b.firstSeq)
+}
+
+export function mergeAgentHistory(events: TimelineEvent[], persisted?: AgentHistoryResponse): AgentHistoryItem[] {
+  const unique = new Map(events.map((event) => [`${event.daemon_epoch}:${event.seq}`, event]))
+  const hidden = new Set(persisted?.visibility.hidden ?? [])
+  const items = buildAgentHistory([...unique.values()].filter((event) => !event.run_id || !hidden.has(event.run_id)))
+  const runs = items.filter((item): item is Extract<AgentHistoryItem, { kind: 'run' }> => item.kind === 'run')
+  const known = new Set(runs.map((run) => run.id))
+  for (const record of persisted?.runs ?? []) {
+    const existing = runs.find((run) => run.id === `run:${record.run.id}`)
+    if (existing?.status === 'running' && record.run.status !== 'active') existing.status = record.run.status
+    if (!known.has(`run:${record.run.id}`) && !hidden.has(record.run.id)) runs.push({
+      kind: 'run', id: `run:${record.run.id}`, firstSeq: record.run.start_seq,
+      label: cleanInline(record.run.label), status: record.run.status === 'active' ? 'running' : record.run.status
+    })
+  }
+  const rank = new Map(persisted?.runs.map((run, index) => [`run:${run.run.id}`, index]))
+  runs.sort((a, b) => (rank.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.id) ?? Number.MAX_SAFE_INTEGER) || a.firstSeq - b.firstSeq)
+  const result: AgentHistoryItem[] = []
+  for (const run of runs) {
+    result.push(run, ...items.filter((item) => item.kind === 'command' && `run:${item.runId}` === run.id))
+  }
+  result.push(...items.filter((item) => item.kind === 'command' && !runs.some((run) => run.id === `run:${item.runId}`)))
+  return result
 }
 
 export function locateCommandOutput(

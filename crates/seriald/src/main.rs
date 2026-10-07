@@ -57,8 +57,10 @@ async fn main() -> anyhow::Result<()> {
         managed: false,
     }) {
         Command::Serve { bind, managed } => {
+            let started = std::time::Instant::now();
             let instance = seriald::runtime::ActiveInstance::acquire(store.paths())
                 .context("claim the seriald data root")?;
+            instance.startup_stage("loading configuration", started);
             let loaded = store
                 .load_or_create()
                 .context("load seriald configuration")?;

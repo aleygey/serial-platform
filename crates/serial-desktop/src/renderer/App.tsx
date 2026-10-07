@@ -4,6 +4,8 @@ import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import type {
   DesktopEvent,
   DesktopSnapshot,
+  AgentHistoryResponse,
+  TimelineEvent,
   HumanCommandSubmission,
   MacroExecution,
   RunStartDecision,
@@ -17,7 +19,7 @@ import { PortRail } from './components/PortRail'
 import { SettingsPage } from './components/SettingsPage'
 import { TerminalPane } from './components/TerminalPane'
 import { RunStartApprovalModal } from './components/RunStartApprovalModal'
-import { buildAgentHistory, locateCommandOutput, type AgentCommand } from './lib/history'
+import { mergeAgentHistory, locateCommandOutput, type AgentCommand } from './lib/history'
 import { resolveBackendControl } from './lib/backend-control'
 import iconUrl from './assets/icon.png'
 import type { CommandBuffer } from './lib/command-editor'
@@ -29,6 +31,12 @@ export function App(): React.JSX.Element {
   const [page, setPage] = useState<Page>('console')
   const [selectedPort, setSelectedPort] = useState<string>()
   const [selectedCommand, setSelectedCommand] = useState<AgentCommand>()
+  const [agentArchive, setAgentArchive] = useState<AgentHistoryResponse>()
+  const [agentArchiveEvents, setAgentArchiveEvents] = useState<TimelineEvent[]>([])
+  const [commandEvidence, setCommandEvidence] = useState<{ key: string; events: TimelineEvent[] }>()
+  const evidenceLoad = useRef(0)
+  const historyContext = useRef('')
+  const historyLoad = useRef(0)
   const [toast, setToast] = useState<{ kind: 'notice' | 'error'; message: string }>()
   const [expiredApprovals, setExpiredApprovals] = useState<Set<string>>(() => new Set())
   const [loadingMessage, setLoadingMessage] = useState('正在启动本地工作台…')
@@ -36,6 +44,28 @@ export function App(): React.JSX.Element {
   const macroDrafts = useRef<MacroDraftStore>({ drafts: new Map() })
   const commandDrafts = useRef(new Map<string, CommandBuffer>())
   const humanHistory = useMemo(() => snapshot?.humanHistory?.entries.map((item) => item.command) ?? [], [snapshot?.humanHistory])
+
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const context = `${snapshot?.serverId ?? ''}:${selectedPort ?? ''}`
+    historyContext.current = context
+    setAgentArchive(undefined)
+    setAgentArchiveEvents([])
+    setCommandEvidence(undefined)
+    evidenceLoad.current++
+    const refresh = async (): Promise<void> => {
+      if (!selectedPort) return
+      try {
+        const history = await window.serial.agentHistory(selectedPort)
+        if (!cancelled && history.server_id === snapshot?.serverId) setAgentArchive((current) =>
+          current && current.visibility.revision > history.visibility.revision ? current : history)
+      } catch { /* Live console remains usable when an older daemon has no panel index. */ }
+      if (!cancelled) timer = setTimeout(() => void refresh(), 5000)
+    }
+    void refresh()
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [selectedPort, snapshot?.serverId])
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
     if (event.type === 'macro') setMacroExecution(event.execution)
@@ -221,7 +251,7 @@ export function App(): React.JSX.Element {
 
   const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
   const events = selectedPort ? snapshot.events[selectedPort] ?? [] : []
-  const history = buildAgentHistory(events)
+  const history = mergeAgentHistory([...agentArchiveEvents, ...events], agentArchive)
   const currentSelectedCommand = selectedCommand
     ? history.flatMap((item) => item.kind === 'command' ? item.commands : []).find((command) => (
         command.id === selectedCommand.id
@@ -230,9 +260,40 @@ export function App(): React.JSX.Element {
         && command.generation === selectedCommand.generation
       ))
     : undefined
+  const displayedEvents = currentSelectedCommand && commandEvidence?.key === commandIdentity(currentSelectedCommand)
+    ? commandEvidence.events : events
   const match = currentSelectedCommand
-    ? locateCommandOutput(events, currentSelectedCommand)
+    ? locateCommandOutput(displayedEvents, currentSelectedCommand)
     : undefined
+  const selectCommand = async (command: AgentCommand): Promise<void> => {
+    setSelectedCommand(command)
+    setCommandEvidence(undefined)
+    const load = ++evidenceLoad.current
+    const context = historyContext.current
+    if (!selectedPort) return
+    const parent = history.find((item) => item.kind === 'command' && item.commands.includes(command))
+    const record = parent?.kind === 'command' ? agentArchive?.runs.find((record) => record.run.id === parent.runId) : undefined
+    const next = history.flatMap((item) => item.kind === 'command' ? item.commands : [])
+      .filter((candidate) => candidate.daemonEpoch === command.daemonEpoch && candidate.firstSeq > command.firstSeq)
+      .sort((a, b) => a.firstSeq - b.firstSeq)[0]
+    const firstSeq = command.capture?.evidenceFromSeq ?? command.firstSeq
+    const throughSeq = command.capture?.evidenceThroughSeq ?? (next ? next.firstSeq - 1
+      : record?.run.end_seq ?? (configuredPort?.daemon_epoch === command.daemonEpoch ? configuredPort.head_seq : record?.through_seq))
+    if (throughSeq === undefined || throughSeq < firstSeq) {
+      setToast({ kind: 'notice', message: '缺少该历史命令的准确日志边界，无法执行跳转。' }); return
+    }
+    const local = events.filter((event) => event.daemon_epoch === command.daemonEpoch && event.seq >= firstSeq && event.seq <= throughSeq)
+    if (local.length === throughSeq - firstSeq + 1 && local.every((event, index) => event.seq === firstSeq + index && event.kind !== 'gap')) return
+    setToast({ kind: 'notice', message: '正在读取该命令的原始串口上下文…' })
+    try {
+      const evidence = await window.serial.commandEvidence({ port: selectedPort, epoch: command.daemonEpoch, firstSeq, throughSeq })
+      if (context !== historyContext.current || load !== evidenceLoad.current) return
+      setCommandEvidence({ key: commandIdentity(command), events: evidence })
+      setToast(undefined)
+    } catch (error) {
+      if (context === historyContext.current && load === evidenceLoad.current) setToast({ kind: 'error', message: message(error) })
+    }
+  }
   return (
     <div className="app-frame">
       <WindowBar snapshot={snapshot} page={page} onPage={setPage} onStartBackend={startBackend} onStopBackend={stopBackend} onSavePreferences={savePreferences} />
@@ -248,10 +309,10 @@ export function App(): React.JSX.Element {
         <div className="console-stack">
           <TerminalPane
             configuredPort={configuredPort}
-            events={events}
+            events={displayedEvents}
             selectedCommand={currentSelectedCommand}
             match={match}
-            onClearCommand={() => setSelectedCommand(undefined)}
+            onClearCommand={() => { evidenceLoad.current++; setCommandEvidence(undefined); setSelectedCommand(undefined) }}
           />
           <CommandBar
             key={snapshot.serverId ?? snapshot.preferences.endpoint}
@@ -267,7 +328,33 @@ export function App(): React.JSX.Element {
             onSignal={(signal) => submitHumanCommand(() => window.serial.sendSignal(selectedPort!, signal), setToast)}
           />
         </div>
-        <AgentHistory items={history} selectedCommand={currentSelectedCommand} onSelect={setSelectedCommand} />
+        <AgentHistory key={`${snapshot.serverId}:${selectedPort}`} items={history} selectedCommand={currentSelectedCommand} onSelect={(command) => void selectCommand(command)}
+          onExpandRun={async (id) => {
+            const record = agentArchive?.runs.find((record) => record.run.id === id)
+            if (!record) return
+            const context = historyContext.current
+            const load = ++historyLoad.current
+            try {
+              const result = await window.serial.agentRunEvents(record)
+              if (context !== historyContext.current || load !== historyLoad.current) return
+              // Keep the last expanded archive, not every Run ever opened.
+              setAgentArchiveEvents(result.events)
+              if (result.limited) setToast({ kind: 'notice', message: '已加载部分历史命令；日志存在缺口或达到读取上限。' })
+            } catch (error) { if (context === historyContext.current) setToast({ kind: 'error', message: message(error) }) }
+          }}
+          onClear={async (ids) => {
+            if (!selectedPort) return
+            const context = historyContext.current
+            const visibility = await window.serial.clearAgentHistory(selectedPort, ids)
+            if (context !== historyContext.current) return
+            setAgentArchive((current) => current ? { ...current, visibility } : {
+              server_id: snapshot.serverId ?? '', runs: [], visibility, truncated: false, indexing: false
+            })
+            setSelectedCommand(undefined)
+            evidenceLoad.current++
+            setCommandEvidence(undefined)
+            setToast({ kind: 'notice', message: 'Agent 历史已清理；原始串口日志和人工历史保留。' })
+          }} />
       </div>
       <Toast value={toast} onClose={() => setToast(undefined)} />
       {pendingApproval && (
@@ -280,6 +367,10 @@ export function App(): React.JSX.Element {
       )}
     </div>
   )
+}
+
+function commandIdentity(command: AgentCommand): string {
+  return `${command.daemonEpoch}:${command.generation}:${command.firstSeq}:${command.id}`
 }
 
 export function mergeDesktopSnapshotEvent(

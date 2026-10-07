@@ -27,6 +27,40 @@ import {
 
 const serialBackends: SerialTestBackend[] = []
 
+describe('archived command evidence', () => {
+  const target = { port: 'COM6', epoch: 'old-epoch', firstSeq: 2, throughSeq: 4 }
+  const raw = (seq: number) => ({ port: 'COM6', daemon_epoch: 'old-epoch', generation: 1, seq, direction: 'rx', kind: 'rx', data: [65, 10] })
+  it('reads every page and preserves the original epoch and sequence', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const query = new URL(String(input)).searchParams
+      expect(query.get('epoch')).toBe('old-epoch')
+      expect(query.get('through_seq')).toBe('4')
+      const first = query.get('after_seq') === '1'
+      return jsonResponse({ events: first ? [raw(2), raw(3)] : [raw(4)], truncated: first, gaps: [] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const events = await new SerialClient('http://127.0.0.1:3210').commandEvidence(target)
+    expect(events.map((event) => event.seq)).toEqual([2, 3, 4])
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+  it('rejects a gap or a same-numbered record from a different epoch instead of returning partial evidence', async () => {
+    for (const page of [
+      { events: [raw(2), raw(4)], truncated: false, gaps: [] },
+      { events: [{ ...raw(2), daemon_epoch: 'new-epoch' }], truncated: false, gaps: [] },
+      { events: [raw(2)], truncated: true, gaps: [{ first_seq: 3, last_seq: 3 }] },
+      { events: [raw(2)], truncated: false, gaps: [] }
+    ]) {
+      vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(page)))
+      await expect(new SerialClient('http://127.0.0.1:3210').commandEvidence(target)).rejects.toThrow()
+    }
+  })
+  it('rejects an unbounded range before making any request', async () => {
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock)
+    await expect(new SerialClient('http://127.0.0.1:3210').commandEvidence({ ...target, throughSeq: 20000 })).rejects.toThrow('范围')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
 afterEach(async () => {
   vi.unstubAllGlobals()
   await Promise.all(serialBackends.splice(0).map((backend) => backend.close()))

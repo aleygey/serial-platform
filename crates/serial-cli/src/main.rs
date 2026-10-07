@@ -10,10 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serial_protocol::{
-    DataBits, EchoMode, FlowControl, McpHealthResponse, ModelFamily, ModelProfile,
-    PROTOCOL_VERSION, Parity, SlotConfig, StopBits, TransportProfile,
-};
+use serial_protocol::{McpHealthResponse, PROTOCOL_VERSION};
 use seriald::config::{ConfigPaths, ConfigStore, DaemonConfig};
 use seriald::runtime::{ActiveEndpoint, connect_address, discover_active};
 
@@ -467,11 +464,11 @@ fn wait_for_mcp_child(
     address: SocketAddr,
     seriald: &ActiveEndpoint,
 ) -> std::io::Result<Option<Child>> {
+    let diagnostics = ChildDiagnostics::start(&mut child);
     let deadline = Instant::now() + MCP_STARTUP_TIMEOUT;
     loop {
         if let Some(health) = matching_mcp_health(address, seriald) {
             if health.pid == child.id() {
-                drain_child_stderr(&mut child);
                 return Ok(Some(child));
             }
             let mut loser = Some(child);
@@ -479,7 +476,8 @@ fn wait_for_mcp_child(
             return Ok(None);
         }
         if let Some(status) = child.try_wait()? {
-            let detail = read_child_stderr(&mut child);
+            diagnostics.finish();
+            let detail = diagnostics.text();
             if wait_for_competing_mcp_after_exit(
                 address,
                 seriald,
@@ -503,7 +501,8 @@ fn wait_for_mcp_child(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            let detail = read_child_stderr(&mut child);
+            diagnostics.finish();
+            let detail = diagnostics.text();
             let suffix = if detail.is_empty() {
                 String::new()
             } else {
@@ -559,15 +558,30 @@ fn wait_for_child_endpoint(
     expected_address: SocketAddr,
     name: &str,
 ) -> std::io::Result<(Option<Child>, ActiveEndpoint)> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let started = Instant::now();
+    let mut deadline = started + Duration::from_secs(15);
+    // Drain concurrently, including during recovery. Waiting to read stderr
+    // until the child exits can itself deadlock a verbose failing startup.
+    let diagnostics = ChildDiagnostics::start(&mut child);
+    let mut stage = String::from("waiting for startup diagnostics");
     loop {
+        if let Some(progress) = seriald::runtime::read_startup_progress(paths, child.id()) {
+            if progress.stage != stage {
+                stage = progress.stage;
+                eprintln!("{name}: {stage} · {} s", started.elapsed().as_secs());
+            }
+            if recovery_stage(&stage) {
+                deadline = started + Duration::from_secs(90);
+            }
+        }
         if let Some(status) = child.try_wait()? {
+            diagnostics.finish();
             if let Some(active) = discover_active(paths, server_id)
                 .map_err(|error| Error::other(error.to_string()))?
             {
                 return Ok((None, active));
             }
-            let detail = read_child_stderr(&mut child);
+            let detail = diagnostics.persist(paths);
             if detail.contains("already owned by another process") {
                 while Instant::now() < deadline {
                     if let Some(active) = discover_active(paths, server_id)
@@ -584,7 +598,8 @@ fn wait_for_child_endpoint(
                 format!(": {detail}")
             };
             return Err(Error::other(format!(
-                "{name} exited during startup ({status}){suffix}"
+                "{name} exited during startup ({status}); stage: {stage}; diagnostics: {}{suffix}",
+                paths.data_dir.join("startup-stderr.log").display()
             )));
         }
         let active =
@@ -592,16 +607,16 @@ fn wait_for_child_endpoint(
         if let Some(active) = active.as_ref()
             && active.address == expected_address
         {
-            drain_child_stderr(&mut child);
             return Ok((Some(child), active.clone()));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            diagnostics.finish();
             if let Some(active) = active {
                 return Ok((None, active));
             }
-            let detail = read_child_stderr(&mut child);
+            let detail = diagnostics.persist(paths);
             let suffix = if detail.is_empty() {
                 String::new()
             } else {
@@ -610,7 +625,9 @@ fn wait_for_child_endpoint(
             return Err(Error::new(
                 ErrorKind::TimedOut,
                 format!(
-                    "{name} did not publish a verified endpoint at http://{expected_address}{suffix}"
+                    "{name} did not publish a verified endpoint at http://{expected_address}; stage: {stage}; elapsed: {} s; diagnostics: {}{suffix}",
+                    started.elapsed().as_secs(),
+                    paths.data_dir.join("startup-stderr.log").display()
                 ),
             ));
         }
@@ -618,22 +635,112 @@ fn wait_for_child_endpoint(
     }
 }
 
-fn read_child_stderr(child: &mut Child) -> String {
-    let Some(mut stderr) = child.stderr.take() else {
-        return String::new();
-    };
-    let mut bytes = Vec::new();
-    let _ = stderr.read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).trim().to_owned()
+fn recovery_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "recovering serial journals" | "loading automation state"
+    )
 }
 
-fn drain_child_stderr(child: &mut Child) {
-    let Some(mut stderr) = child.stderr.take() else {
-        return;
-    };
-    thread::spawn(move || {
-        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-    });
+#[cfg(test)]
+mod startup_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn only_known_disk_recovery_stages_extend_startup_wait() {
+        assert!(recovery_stage("recovering serial journals"));
+        assert!(recovery_stage("loading automation state"));
+        assert!(!recovery_stage("binding service address"));
+        assert!(!recovery_stage("starting HTTP service"));
+        assert!(!recovery_stage("unknown"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verbose_child_cannot_block_on_an_unread_stderr_pipe() {
+        let mut child = Command::new("sh")
+            .args(["-c", "i=0; while [ $i -lt 20000 ]; do printf 'diagnostic-line\\n' >&2; i=$((i+1)); done; printf 'finished!' >&2"])
+            .stderr(Stdio::piped()).spawn().unwrap();
+        let diagnostics = ChildDiagnostics::start(&mut child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child stalled while emitting startup diagnostics");
+        }
+        while !diagnostics.text().ends_with("finished!") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let text = diagnostics.text();
+        assert!(text.ends_with("finished!"));
+        assert!(text.len() <= 16 * 1024);
+    }
+}
+
+struct ChildDiagnostics {
+    bytes: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ChildDiagnostics {
+    fn start(child: &mut Child) -> Self {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        if let Some(mut stderr) = child.stderr.take() {
+            let output = bytes.clone();
+            let finished = done.clone();
+            done.store(false, std::sync::atomic::Ordering::Release);
+            thread::spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let Ok(count) = stderr.read(&mut buffer) else {
+                        break;
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    let mut tail = output.lock().unwrap_or_else(|e| e.into_inner());
+                    tail.extend(&buffer[..count]);
+                    let excess = tail.len().saturating_sub(16 * 1024);
+                    tail.drain(..excess);
+                }
+                finished.store(true, std::sync::atomic::Ordering::Release);
+            });
+        }
+        Self { bytes, done }
+    }
+
+    // Call after the child exits. A descendant may inherit the pipe, so never
+    // join the reader indefinitely, even when the direct child has terminated.
+    fn finish(&self) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while !self.done.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn text(&self) -> String {
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        String::from_utf8_lossy(&bytes).trim().to_owned()
+    }
+
+    fn persist(&self, paths: &ConfigPaths) -> String {
+        let text = self.text();
+        let _ = seriald::config::atomic_write(
+            &paths.data_dir.join("startup-stderr.log"),
+            text.as_bytes(),
+        );
+        text
+    }
 }
 
 fn stop_child(child: &mut Option<Child>) {

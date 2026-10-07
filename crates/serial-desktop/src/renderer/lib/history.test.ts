@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TimelineEvent } from '../../shared/contracts'
-import { buildAgentHistory, locateCommandOutput } from './history'
+import { buildAgentHistory, mergeAgentHistory, locateCommandOutput } from './history'
 
 function event(seq: number, direction: 'rx' | 'tx', text: string): TimelineEvent {
   return {
@@ -10,6 +10,38 @@ function event(seq: number, direction: 'rx' | 'tx', text: string): TimelineEvent
 }
 
 describe('Agent history', () => {
+  it('hides whole Runs without changing source events or another Run, and deduplicates restored TX', () => {
+    const tx = { ...event(2, 'tx', 'status\r'), run_id: 'old', operation_id: 'op', actor: { id: 'agent', label: 'Agent', kind: 'agent' as const }, metadata: { command_description: 'Status' } }
+    const records = [{ port: 'COM6', epoch: 'epoch', run: { id: 'old', label: 'Old', status: 'completed' as const, start_seq: 1, end_seq: 3 }, started_wall_time_ns: 1, through_seq: 3 }]
+    const persisted = { server_id: 'server', runs: records, visibility: { revision: 0, hidden: [] as string[] }, truncated: false, indexing: false }
+    const history = mergeAgentHistory([tx, tx], persisted)
+    expect(history).toHaveLength(2)
+    expect(history[1].kind === 'command' && history[1].commands[0].text).toBe('status\r')
+    persisted.visibility.hidden = ['old']
+    expect(mergeAgentHistory([tx], persisted)).toEqual([])
+    expect(tx.text).toBe('status\r')
+  })
+  it('groups each macro execution, never merging repeated executions of one definition', () => {
+    const events = [1, 2, 3, 4].map((seq) => ({
+      ...event(seq, 'tx', `command-${seq}\r`),
+      actor: { id: 'agent', label: 'Agent', kind: 'agent' as const },
+      operation_id: `operation-${seq}`, run_id: 'run',
+      metadata: {
+        command_description: `step-${seq}`, macro_id: 'enter-uboot',
+        macro_execution_id: seq < 3 ? 'first' : 'second'
+      }
+    }))
+    const history = buildAgentHistory(events)
+    expect(history).toHaveLength(2)
+    for (const item of history) {
+      expect(item.kind).toBe('command')
+      if (item.kind === 'command') {
+        expect(item.description).toBe('Macro · enter-uboot')
+        expect(item.commands).toHaveLength(2)
+      }
+    }
+  })
+
   it('keeps old-to-new order and groups command sequence steps', () => {
     const second = event(12, 'tx', 'password\r')
     second.actor = { id: 'agent', label: 'Agent', kind: 'agent' }

@@ -156,6 +156,46 @@ impl AppState {
         }
     }
 
+    async fn configure_setup_transaction(
+        &self,
+        request: serial_protocol::ConfigureSetupRequest,
+    ) -> Result<(Vec<serial_protocol::SlotSnapshot>, u64), ApiError> {
+        let _update = self.inner.config_updates.lock().await;
+        let current = self.inner.config.read().await.clone();
+        ensure_expected_revision(Some(request.expected_revision), current.config_revision)?;
+        let mut draft = current.clone();
+        draft.transport_profiles = request.transport_profiles;
+        draft.model_profiles = request.model_profiles;
+        draft.model_families = request.model_families;
+        let staged = draft
+            .staged_with_ports(request.ports)
+            .map_err(ConfigError::from)?;
+        let applied = self
+            .inner
+            .registry
+            .apply_replacement_with_source(
+                staged.ports.clone(),
+                staged.transport_profiles.clone(),
+                staged.model_profiles.clone(),
+                request.source,
+            )
+            .await?;
+        match self.inner.config_store.save(&staged) {
+            Ok(()) => {
+                let snapshots = applied.commit().await.map_err(|commit| {
+                    compensate_commit_failure(&self.inner.config_store, &current, commit)
+                })?;
+                let revision = staged.config_revision;
+                *self.inner.config.write().await = staged;
+                Ok((snapshots, revision))
+            }
+            Err(save) => match applied.rollback().await {
+                Ok(()) => Err(ApiError::Config(save)),
+                Err(rollback) => Err(ApiError::ConfigRollback { save, rollback }),
+            },
+        }
+    }
+
     /// Validates and stages every affected actor before persistence. Staging
     /// is inert, so an unavailable actor or save failure can roll back without
     /// publishing a mixed runtime catalog or changing the in-memory config.
@@ -288,6 +328,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/history/commands", get(human_command_history))
         .route("/api/v1/macros", get(list_macros).post(save_macro))
         .route("/api/v1/config/ports", put(configure_ports))
+        .route("/api/v1/config/setup", put(configure_setup))
         .route(
             "/api/v1/config/transport-profiles",
             get(list_transport_profiles).put(configure_transport_profiles),
@@ -307,6 +348,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ports/{port}/tail", get(live_tail))
         .route("/api/v1/ports/{port}/recent-activity", get(recent_activity))
         .route("/api/v1/ports/{port}/events", get(events))
+        .route(
+            "/api/v1/ports/{port}/agent-history",
+            get(agent_history).post(clear_agent_history),
+        )
         .route("/api/v1/monitors", get(list_monitors).post(create_monitor))
         .route(
             "/api/v1/monitors/{monitor_id}",
@@ -362,6 +407,80 @@ async fn human_command_history(
             .human_command_history(server_id, query)
             .await?,
     ))
+}
+
+async fn agent_history(
+    State(state): State<AppState>,
+    Path(port): Path<String>,
+) -> Result<Json<serial_protocol::AgentHistoryResponse>, ApiError> {
+    let store = state.inner.journal.run_history.clone();
+    let epoch = state.inner.daemon_epoch;
+    let server_id = state.inner.config.read().await.server_id;
+    tokio::task::spawn_blocking(move || {
+        let visibility = store.visibility(&port)?;
+        let mut runs = store.list(&port, epoch)?;
+        runs.retain(|record| visibility.hidden.binary_search(&record.run.id).is_err());
+        let truncated = runs.len() > 200;
+        if truncated {
+            runs.drain(..runs.len() - 200);
+        }
+        Ok::<_, std::io::Error>(serial_protocol::AgentHistoryResponse {
+            server_id,
+            runs,
+            visibility,
+            truncated,
+            indexing: store.indexing.load(std::sync::atomic::Ordering::Acquire),
+            warning: store
+                .warning
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
+    .map(Json)
+    .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+async fn clear_agent_history(
+    State(state): State<AppState>,
+    Path(port): Path<String>,
+    Json(request): Json<serial_protocol::AgentHistoryClearRequest>,
+) -> Result<Json<serial_protocol::AgentHistoryVisibility>, ApiError> {
+    if request
+        .run_ids
+        .as_ref()
+        .is_some_and(|ids| ids.is_empty() || ids.len() > 1000)
+    {
+        return Err(ApiError::BadRequest(
+            "choose 1..=1000 whole Runs, or all ended Runs".into(),
+        ));
+    }
+    let active = state
+        .inner
+        .registry
+        .snapshots()
+        .await
+        .into_iter()
+        .find(|slot| slot.config.port == port)
+        .and_then(|slot| slot.active_run)
+        .map(|run| run.id);
+    let store = state.inner.journal.run_history.clone();
+    let epoch = state.inner.daemon_epoch;
+    tokio::task::spawn_blocking(move || {
+        store.hide(&port, request.run_ids.as_deref(), epoch, active)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
+    .map(Json)
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock => {
+            ApiError::BadRequest(error.to_string())
+        }
+        std::io::ErrorKind::NotFound => ApiError::NotFound(error.to_string()),
+        _ => ApiError::Internal(error.to_string()),
+    })
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
@@ -434,6 +553,21 @@ fn validate_source(source: &str) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+async fn configure_setup(
+    State(state): State<AppState>,
+    Json(request): Json<serial_protocol::ConfigureSetupRequest>,
+) -> Result<Json<ConfigurePortsResponse>, ApiError> {
+    validate_source(&request.source)?;
+    let (ports, config_revision) =
+        tokio::spawn(async move { state.configure_setup_transaction(request).await })
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))??;
+    Ok(Json(ConfigurePortsResponse {
+        ports,
+        config_revision,
+    }))
 }
 
 async fn list_transport_profiles(
@@ -1892,6 +2026,86 @@ mod tests {
         routing::get,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn setup_commits_catalogs_and_bindings_together_and_rejects_stale_or_invalid_drafts() {
+        use crate::{
+            config::{ConfigPaths, ConfigStore},
+            control::ControlLimits,
+            journal::{JournalConfig, JournalManager},
+            registry::SlotRegistry,
+        };
+        use serial_protocol::{ConfigureSetupRequest, ModelFamily, ModelProfile, SlotConfig};
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(ConfigPaths::from_root(directory.path()));
+        let config = store.load_or_create().unwrap().config;
+        let revision = config.config_revision;
+        let journal =
+            JournalManager::open(JournalConfig::new(store.paths().journal_dir.clone())).unwrap();
+        let epoch = uuid::Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let registry = SlotRegistry::new(
+            epoch,
+            started,
+            journal.handle(),
+            vec![],
+            vec![],
+            vec![],
+            ControlLimits::default(),
+        );
+        let state = super::AppState::new(store, config, registry, journal.handle(), epoch, started);
+        let draft = ConfigureSetupRequest {
+            ports: vec![SlotConfig {
+                port: "COM-WIZARD-TEST".into(),
+                transport_profile: None,
+                model_profile: Some("new-behavior".into()),
+                model_family: Some("family".into()),
+                model_name: Some("board".into()),
+                enabled: false,
+            }],
+            transport_profiles: vec![],
+            model_profiles: vec![ModelProfile {
+                name: "new-behavior".into(),
+                shell_prompt: Some("dut# ".into()),
+                uboot_prompt: Some("=> ".into()),
+                write_eol: Some("\r".into()),
+                echo: None,
+                write_chunk_size: Some(1),
+                write_chunk_delay_ms: Some(1),
+            }],
+            model_families: vec![ModelFamily {
+                name: "family".into(),
+                model_names: vec!["board".into()],
+            }],
+            expected_revision: revision,
+            source: "human:test".into(),
+        };
+        let mut invalid = draft.clone();
+        invalid.ports[0].model_profile = Some("missing".into());
+        assert!(state.configure_setup_transaction(invalid).await.is_err());
+        assert_eq!(
+            state.inner.config_store.load().unwrap().config_revision,
+            revision
+        );
+        assert!(state.inner.registry.snapshots().await.is_empty());
+        let (ports, committed) = state
+            .configure_setup_transaction(draft.clone())
+            .await
+            .unwrap();
+        assert_eq!(committed, revision + 1);
+        assert_eq!(ports[0].config, draft.ports[0]);
+        let persisted = state.inner.config_store.load().unwrap();
+        assert_eq!(persisted.ports, draft.ports);
+        assert_eq!(persisted.model_profiles, draft.model_profiles);
+        assert_eq!(persisted.model_families, draft.model_families);
+        assert!(state.configure_setup_transaction(draft).await.is_err());
+        assert_eq!(
+            state.inner.config_store.load().unwrap().config_revision,
+            committed
+        );
+        state.shutdown().await;
+        journal.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn macro_http_catalog_validates_revisions_sharing_and_has_no_serial_side_effects() {

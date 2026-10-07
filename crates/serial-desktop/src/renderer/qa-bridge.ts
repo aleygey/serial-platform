@@ -15,6 +15,10 @@ export function installQaBridge(): boolean {
   const listeners = new Set<(event: DesktopEvent) => void>()
   const publish = (): void => listeners.forEach((listener) => listener({ type: 'snapshot', snapshot }))
   const bridge: DesktopBridge = {
+    agentHistory: async () => ({ server_id: 'qa-server', runs: [], visibility: { revision: 0, hidden: [] }, truncated: false, indexing: false }),
+    clearAgentHistory: async () => ({ revision: 1, hidden: [] }),
+    agentRunEvents: async () => ({ events: [], limited: false }),
+    commandEvidence: async () => [],
     bootstrap: async () => snapshot,
     refresh: async () => snapshot,
     sendCommand: async () => ({ status: 'accepted' }),

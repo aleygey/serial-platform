@@ -329,6 +329,58 @@ export class SerialClient extends EventEmitter {
     return this.get<HumanCommandHistory>(`/api/v1/history/commands?${parameters}`)
   }
 
+  async agentHistory(port: string): Promise<import('../shared/contracts').AgentHistoryResponse> {
+    return this.get(`/api/v1/ports/${encodeURIComponent(port)}/agent-history`)
+  }
+
+  async commandEvidence(target: Parameters<import('../shared/contracts').DesktopBridge['commandEvidence']>[0]): Promise<TimelineEvent[]> {
+    if (!Number.isSafeInteger(target.firstSeq) || !Number.isSafeInteger(target.throughSeq)
+      || target.firstSeq < 1 || target.throughSeq < target.firstSeq || target.throughSeq - target.firstSeq >= 10000) {
+      throw new Error('命令证据范围过大或无效，请使用 TUI 历史搜索查看；未显示不完整证据。')
+    }
+    const events: TimelineEvent[] = []
+    let after = target.firstSeq - 1
+    let bytes = 0
+    while (after < target.throughSeq) {
+      const query = new URLSearchParams({ epoch: target.epoch, after_seq: String(after), through_seq: String(target.throughSeq), limit_events: '1000', limit_bytes: String(1024 * 1024) })
+      const page = await this.get<{ events: unknown[]; truncated: boolean; gaps: unknown[] }>(`/api/v1/ports/${encodeURIComponent(target.port)}/events?${query}`)
+      if (page.gaps.length || !page.events.length) throw new Error('原始串口日志存在缺口，不能准确跳转到该命令。')
+      for (const raw of page.events) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('命令证据格式无效')
+        const event = normalizeTimelineEvent(raw as Record<string, unknown>)
+        if (event.port !== target.port || event.daemon_epoch !== target.epoch || event.seq !== after + 1 || event.seq > target.throughSeq || event.kind === 'gap') {
+          throw new Error('命令证据位置不连续，已停止跳转，未使用相似文本代替。')
+        }
+        bytes += Buffer.byteLength(JSON.stringify(raw), 'utf8')
+        if (bytes > 16 * 1024 * 1024) throw new Error('该命令上下文超过读取上限，请使用 TUI 历史搜索；未显示部分证据。')
+        events.push(event)
+        after = event.seq
+      }
+      if (!page.truncated && after !== target.throughSeq) throw new Error('命令上下文尚未完整读取，未执行跳转。')
+    }
+    return events
+  }
+
+  async clearAgentHistory(port: string, ids?: string[]): Promise<import('../shared/contracts').AgentHistoryVisibility> {
+    return await this.request(`/api/v1/ports/${encodeURIComponent(port)}/agent-history`, {
+      method: 'POST', body: { run_ids: ids ?? null }
+    }) as import('../shared/contracts').AgentHistoryVisibility
+  }
+
+  async agentRunEvents(record: import('../shared/contracts').AgentRunRecord): Promise<{ events: TimelineEvent[]; limited: boolean }> {
+    const events: TimelineEvent[] = []
+    let limited = false
+    for (const kind of ['tx', 'command_capture_completed']) {
+      const query = new URLSearchParams({ epoch: record.epoch, run_id: record.run.id, after_seq: String(Math.max(0, record.run.start_seq - 1)),
+        kind, limit_events: '1024', limit_bytes: String(2 * 1024 * 1024) })
+      if (record.run.end_seq != null) query.set('through_seq', String(record.run.end_seq))
+      const result = await this.get<{ events: Record<string, unknown>[]; truncated: boolean; gaps: unknown[] }>(`/api/v1/ports/${encodeURIComponent(record.port)}/events?${query}`)
+      limited ||= result.truncated || result.gaps.length > 0
+      events.push(...result.events.map(normalizeTimelineEvent))
+    }
+    return { events: events.sort((a, b) => a.seq - b.seq), limited }
+  }
+
   private async refreshHumanHistory(): Promise<void> {
     try {
       const history = await this.queryHumanHistory()

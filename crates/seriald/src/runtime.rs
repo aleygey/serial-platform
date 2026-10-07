@@ -18,6 +18,24 @@ const ACTIVE_ENDPOINT_FILE: &str = "active-endpoint.json";
 const INSTANCE_LOCK_FILE: &str = "seriald.lock";
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
 
+/// Diagnostic only: never substitutes for the identity-verified health check.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StartupProgress {
+    pub pid: u32,
+    pub stage: String,
+    pub elapsed_ms: u64,
+}
+
+pub fn read_startup_progress(paths: &ConfigPaths, pid: u32) -> Option<StartupProgress> {
+    let path = paths.data_dir.join("startup.json");
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_MARKER_BYTES {
+        return None;
+    }
+    let value: StartupProgress = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (value.pid == pid).then_some(value)
+}
+
 /// The verified local endpoint published by the process that owns this data root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +100,18 @@ pub struct ActiveInstance {
 }
 
 impl ActiveInstance {
+    /// Written while holding the instance lock; retained on failure for doctor.
+    pub fn startup_stage(&self, stage: &str, started: std::time::Instant) {
+        let progress = StartupProgress {
+            pid: std::process::id(),
+            stage: stage.to_owned(),
+            elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&progress) {
+            let _ = atomic_write(&self.marker_path.with_file_name("startup.json"), &bytes);
+        }
+        eprintln!("seriald startup: {stage} ({} ms)", progress.elapsed_ms);
+    }
     pub fn acquire(paths: &ConfigPaths) -> Result<Self, RuntimeError> {
         fs::create_dir_all(&paths.data_dir).map_err(|source| RuntimeError::Io {
             path: paths.data_dir.clone(),
@@ -316,6 +346,24 @@ mod tests {
 
     fn paths(root: &Path) -> ConfigPaths {
         ConfigPaths::from_root(root)
+    }
+
+    #[test]
+    fn startup_progress_is_diagnostic_and_scoped_to_the_child_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(root.path());
+        let instance = ActiveInstance::acquire(&paths).unwrap();
+        instance.startup_stage("recovering serial journals", std::time::Instant::now());
+        let progress = read_startup_progress(&paths, std::process::id()).unwrap();
+        assert_eq!(progress.stage, "recovering serial journals");
+        assert!(read_startup_progress(&paths, std::process::id().wrapping_add(1)).is_none());
+        assert!(
+            discover_active_with(&paths, Uuid::new_v4(), |_| true)
+                .unwrap()
+                .is_none()
+        );
+        atomic_write(&paths.data_dir.join("startup.json"), b"invalid").unwrap();
+        assert!(read_startup_progress(&paths, std::process::id()).is_none());
     }
 
     #[test]

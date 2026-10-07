@@ -30,6 +30,9 @@ pub struct ClientConfig {
     /// 3..=20; the default of 5 preserves the existing seven-row footprint
     /// once the two visual separators are included.
     pub agent_history_rows: Option<u16>,
+    /// Recent identity selections, newest first. These are UI hints only;
+    /// names absent from the current server catalog are ignored.
+    pub recent_models: Vec<(String, String)>,
     /// Seconds an unpinned Agent Run may remain idle before a newly started
     /// serial-mcp process treats it as orphaned and aborts it. Zero disables
     /// idle cleanup; in that mode only explicit `run_end`, adapter exit, or a

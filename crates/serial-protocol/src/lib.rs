@@ -666,6 +666,42 @@ pub struct RunInfo {
     pub metadata: BTreeMap<String, Value>,
 }
 
+/// Durable Agent panel metadata, separate from raw serial evidence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRunRecord {
+    pub port: String,
+    pub epoch: Uuid,
+    pub run: RunInfo,
+    pub started_wall_time_ns: i64,
+    pub through_seq: u64,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentHistoryVisibility {
+    pub revision: u64,
+    pub hidden: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentHistoryResponse {
+    pub server_id: Uuid,
+    pub runs: Vec<AgentRunRecord>,
+    pub visibility: AgentHistoryVisibility,
+    pub truncated: bool,
+    #[serde(default)]
+    pub indexing: bool,
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentHistoryClearRequest {
+    /// None clears all ended Runs; a list hides only those whole Runs.
+    pub run_ids: Option<Vec<Uuid>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerStatus {
@@ -1399,6 +1435,18 @@ pub struct ConfigurePortsRequest {
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+}
+
+/// One atomic human setup draft. Catalogs and bindings are validated and
+/// committed together; an interrupted wizard cannot leave orphaned profiles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigureSetupRequest {
+    pub ports: Vec<SlotConfig>,
+    pub transport_profiles: Vec<TransportProfile>,
+    pub model_profiles: Vec<ModelProfile>,
+    pub model_families: Vec<ModelFamily>,
+    pub expected_revision: u64,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

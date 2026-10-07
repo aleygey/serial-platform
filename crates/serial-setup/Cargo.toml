@@ -1,0 +1,12 @@
+[package]
+name = "serial-setup"
+description = "Shared human-facing serial configuration wizard"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+serial-protocol = { path = "../serial-protocol" }
+unicode-width = "0.2"

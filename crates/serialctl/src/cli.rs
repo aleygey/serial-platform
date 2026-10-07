@@ -653,7 +653,24 @@ async fn run_setup(
     let (transport_catalog, _) = profile::load_transport_catalog(&api).await?;
     let model_catalog = profile::load_model_catalog(&api).await?;
     let family_catalog = profile::load_model_family_catalog(&api).await?;
-    if !args.json {
+    if interactive
+        && [
+            transport_catalog.config_revision,
+            model_catalog.config_revision,
+            family_catalog.config_revision,
+        ]
+        .iter()
+        .any(|revision| *revision != current.config_revision)
+    {
+        bail!("读取期间配置已变化，请重新打开 setup；没有保存任何更改");
+    }
+    let mut setup_draft = serial_setup::Draft {
+        ports: existing_ports.clone(),
+        transport_profiles: transport_catalog.profiles.clone(),
+        model_profiles: model_catalog.profiles.clone(),
+        model_families: family_catalog.families.clone(),
+    };
+    if !args.json && !interactive {
         println!("串口 Profile：配置波特率、数据位、校验位、停止位和流控");
         println!("机型 Profile：配置 Shell/U-Boot 提示符和发送方式");
         println!("机型名：用一级系列和二级具体型号标记当前设备");
@@ -701,6 +718,69 @@ async fn run_setup(
         let existing = existing_ports
             .iter()
             .find(|configured| same_serial_port(&configured.port, &discovered_port.name));
+
+        if interactive {
+            let mut slot = existing.cloned().unwrap_or(SlotConfig {
+                port: discovered_port.name.clone(),
+                transport_profile: None,
+                model_profile: None,
+                model_family: None,
+                model_name: None,
+                enabled: true,
+            });
+            slot.port = discovered_port.name.clone();
+            if args.transport.as_ref().is_some_and(|name| {
+                !transport_catalog
+                    .profiles
+                    .iter()
+                    .any(|profile| &profile.name == name)
+            }) {
+                bail!("未知串口配置；未保存任何更改");
+            }
+            if args.model.as_ref().is_some_and(|name| {
+                !model_catalog
+                    .profiles
+                    .iter()
+                    .any(|profile| &profile.name == name)
+            }) {
+                bail!("未知交互配置；未保存任何更改");
+            }
+            if let Some(name) = &args.transport {
+                slot.transport_profile = Some(name.clone());
+            }
+            if let Some(name) = &args.model {
+                slot.model_profile = Some(name.clone());
+            }
+            if let Some(name) = &args.model_family {
+                slot.model_family = Some(name.clone());
+                slot.model_name = args.model_name.clone();
+            }
+            if let Some(current) = setup_draft
+                .ports
+                .iter_mut()
+                .find(|current| same_serial_port(&current.port, &slot.port))
+            {
+                *current = slot;
+            } else {
+                setup_draft.ports.push(slot);
+            }
+            // Candidates are read-only observations, not probes sent to the DUT.
+            let observed = observed_setup_prompts(&api, &discovered_port.name)
+                .await
+                .unwrap_or_default();
+            setup_draft
+                .configure_port(&discovered_port.name, &observed)
+                .map_err(anyhow::Error::msg)?;
+            configured_ports.push(
+                setup_draft
+                    .ports
+                    .iter()
+                    .find(|slot| slot.port == discovered_port.name)
+                    .unwrap()
+                    .clone(),
+            );
+            continue;
+        }
 
         let default_transport = existing.and_then(|port| port.transport_profile.clone());
         let transport_profile = match args.transport.as_deref() {
@@ -813,9 +893,12 @@ async fn run_setup(
             bail!("已取消，未保存配置");
         }
     }
-    let configured = api
-        .configure_ports(configured_ports, current.config_revision)
-        .await
+    let configured = if interactive {
+        setup_draft.ports = configured_ports;
+        api.configure_setup(setup_draft, current.config_revision.context("服务端未提供配置版本，不能安全保存")?).await
+    } else {
+        api.configure_ports(configured_ports, current.config_revision).await
+    }
         .map_err(|error| {
             if crate::api::is_conflict(&error) {
                 anyhow::anyhow!(
@@ -860,12 +943,68 @@ async fn run_setup(
     }
     Ok(())
 }
+async fn observed_setup_prompts(api: &ApiClient, port: &str) -> Result<Vec<String>> {
+    let status = api.status().await?;
+    let Some(slot) = status.ports.iter().find(|slot| slot.config.port == port) else {
+        return Ok(Vec::new());
+    };
+    if slot.head_seq == 0 {
+        return Ok(Vec::new());
+    }
+    let response = api
+        .events(
+            port,
+            &EventQuery {
+                epoch: Some(slot.daemon_epoch),
+                after_seq: Some(slot.head_seq.saturating_sub(256)),
+                through_seq: Some(slot.head_seq),
+                before_wall_time_ns: None,
+                after_wall_time_ns: None,
+                direction: None,
+                kind: None,
+                actor_id: None,
+                run_id: None,
+                operation_id: None,
+                contains: None,
+                regex: None,
+                limit_events: Some(256),
+                limit_bytes: Some(128 * 1024),
+            },
+        )
+        .await?;
+    let mut parser = crate::display::TerminalStreamParser::new();
+    let mut rows = Vec::new();
+    for event in response.events {
+        rows.extend(parser.push_event(&event).completed);
+    }
+    rows.extend(parser.flush());
+    let mut candidates = Vec::new();
+    for row in rows.into_iter().rev() {
+        if row.event_kind != EventKind::Rx {
+            continue;
+        }
+        let value = row.text;
+        if value.len() <= 128
+            && value.trim_end().ends_with(['#', '$', '>'])
+            && !candidates.contains(&value)
+        {
+            candidates.push(value);
+            if candidates.len() == 8 {
+                break;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
 async fn setup_port_selection(
     api: &ApiClient,
     existing: &[SlotConfig],
     args: &SetupArgs,
     interactive: bool,
 ) -> Result<(Vec<serial_protocol::PortDescriptor>, Vec<usize>)> {
+    let mut selection = std::collections::BTreeSet::new();
+    let mut first_scan = true;
     loop {
         let mut ports = api.ports().await?;
         if !args.json {
@@ -900,24 +1039,38 @@ async fn setup_port_selection(
         if !interactive {
             bail!("at least one --port is required in non-interactive setup");
         }
-        if ports.is_empty() {
-            println!("未发现串口，请检查连接及驱动；可以刷新、手动输入或取消。");
+        if first_scan {
+            selection.extend(
+                ports
+                    .iter()
+                    .filter(|port| {
+                        existing
+                            .iter()
+                            .any(|slot| same_serial_port(&slot.port, &port.name))
+                    })
+                    .map(|port| port.name.clone()),
+            );
+            if selection.is_empty() && ports.len() == 1 {
+                selection.insert(ports[0].name.clone());
+            }
+            first_scan = false;
         }
-        let prior = ports
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| existing.iter().any(|e| same_serial_port(&e.port, &p.name)))
-            .map(|(i, _)| (i + 1).to_string())
-            .collect::<Vec<_>>();
-        let default = if prior.is_empty() && ports.len() == 1 {
-            "1".into()
-        } else {
-            prior.join(",")
+        selection.retain(|name| ports.iter().any(|port| &port.name == name));
+        let choice = match serial_setup::port_picker(&ports, existing, &mut selection)
+            .map_err(anyhow::Error::msg)?
+        {
+            serial_setup::PortChoice::Selected(names) => {
+                let selected = names
+                    .iter()
+                    .filter_map(|name| ports.iter().position(|port| &port.name == name))
+                    .collect();
+                return Ok((ports, selected));
+            }
+            serial_setup::PortChoice::Refresh => "r",
+            serial_setup::PortChoice::Manual => "m",
+            serial_setup::PortChoice::Later => return Ok((ports, Vec::new())),
+            serial_setup::PortChoice::Cancel => bail!("已取消，未保存配置"),
         };
-        let choice = prompt_with_default(
-            "选择编号（逗号多选）；r 刷新 / m 手动输入 / q 取消",
-            &default,
-        )?;
         if choice == "r" {
             continue;
         }
@@ -940,10 +1093,6 @@ async fn setup_port_selection(
             });
             println!("手动端口尚未验证，保存配置后由后端报告实际连接状态。");
             return Ok((ports, vec![index]));
-        }
-        match parse_selection(&choice, ports.len()) {
-            Ok(selected) => return Ok((ports, selected)),
-            Err(e) => println!("{e}；请重新选择。"),
         }
     }
 }
@@ -1040,6 +1189,7 @@ fn unselected_existing_ports(existing: &[SlotConfig], selected: &[SlotConfig]) -
         .collect()
 }
 
+#[cfg(test)]
 fn parse_selection(value: &str, port_count: usize) -> Result<Vec<usize>> {
     let mut selected = Vec::new();
     for item in value

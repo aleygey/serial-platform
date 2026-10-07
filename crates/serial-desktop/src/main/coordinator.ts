@@ -107,6 +107,23 @@ export class DesktopCoordinator {
     return this.requireClient().queryHumanHistory(query, contains)
   }
 
+  async agentHistory(port: string) {
+    if (this.qaMode) return { server_id: 'qa-server', runs: [], visibility: { revision: 0, hidden: [] }, truncated: false, indexing: false }
+    return this.requireClient().agentHistory(port)
+  }
+
+  async clearAgentHistory(port: string, ids?: string[]) {
+    return this.requireClient().clearAgentHistory(port, ids)
+  }
+
+  async agentRunEvents(record: import('../shared/contracts').AgentRunRecord) {
+    return this.requireClient().agentRunEvents(record)
+  }
+
+  async commandEvidence(target: Parameters<import('../shared/contracts').DesktopBridge['commandEvidence']>[0]) {
+    return this.requireClient().commandEvidence(target)
+  }
+
   async listMacros(query: MacroListQuery) {
     return this.requireClient().listMacros(query)
   }

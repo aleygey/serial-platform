@@ -44,8 +44,8 @@ pub struct RenderOptions<'a> {
     pub max_chars: usize,
     pub include_raw: bool,
     pub echo: Option<&'a str>,
-    /// Collapse byte-identical adjacent lines. Disable when the exact line
-    /// stream matters more than a compact rendering.
+    /// Collapse adjacent complete lines that are identical apart from a
+    /// recognized date/time prefix. Raw events are always untouched.
     pub collapse_repeats: bool,
     /// Populate the per-event summary array. Omitted by default because the
     /// array dominates token usage; cursor fields are always reported by the
@@ -95,11 +95,12 @@ pub(crate) fn render_events_with_exclusions(
         }
         None => (text, None),
     };
-    let (text, repeated_lines_collapsed) = if options.collapse_repeats {
-        collapse_exact_repeats(&text)
-    } else {
-        (text, 0)
-    };
+    let (text, repeated_lines_collapsed) =
+        if options.collapse_repeats && excluded_lines == 0 && is_contiguous_stream(events) {
+            collapse_exact_repeats(&text)
+        } else {
+            (text, 0)
+        };
     let (text, summary) = smart_limit(text, options.max_chars);
     let text_truncated = summary.omitted_chars > 0;
 
@@ -380,38 +381,95 @@ fn match_excerpt(
     )
 }
 
+fn is_contiguous_stream(events: &[TimelineEvent]) -> bool {
+    use serial_protocol::EventKind;
+    !events.iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::Gap
+                | EventKind::SerialClosed
+                | EventKind::SerialOpening
+                | EventKind::SerialOpenFailed
+                | EventKind::PortRemoved
+                | EventKind::PortReconfigured
+        )
+    }) && events.windows(2).all(|pair| {
+        pair[0].port == pair[1].port
+            && pair[0].daemon_epoch == pair[1].daemon_epoch
+            && pair[0].generation == pair[1].generation
+            && pair[0].seq.checked_add(1) == Some(pair[1].seq)
+    })
+}
+
+/// Deliberately recognizes only date + time at the beginning of a line, not
+/// bracketed counters, uptime ticks, arbitrary digits or numbers in the body.
+fn timestamped_line(line: &str) -> Option<(&str, &str)> {
+    static PREFIX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+        r"^(?:\[(?:[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])[ T](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:[.,][0-9]{1,9})?(?:Z|[+-][0-2][0-9]:[0-5][0-9])?)\]|[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])[ T](?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:[.,][0-9]{1,9})?(?:Z|[+-][0-2][0-9]:[0-5][0-9])?)\s+"
+    ).expect("constant timestamp regex")
+    });
+    let prefix = PREFIX.find(line)?;
+    Some((&line[..prefix.end()], &line[prefix.end()..]))
+}
+
 fn collapse_exact_repeats(text: &str) -> (String, usize) {
     let mut output = String::new();
     let mut previous: Option<&str> = None;
+    let mut last: Option<&str> = None;
     let mut count = 0usize;
     let mut collapsed = 0usize;
 
-    let flush =
-        |output: &mut String, previous: Option<&str>, count: usize, collapsed: &mut usize| {
-            if let Some(line) = previous {
-                output.push_str(line);
-                output.push('\n');
-                if count > 1 {
-                    use std::fmt::Write as _;
+    let flush = |output: &mut String,
+                 previous: Option<&str>,
+                 last: Option<&str>,
+                 count: usize,
+                 collapsed: &mut usize| {
+        if let Some(line) = previous {
+            output.push_str(line);
+            output.push('\n');
+            if count > 1 {
+                use std::fmt::Write as _;
+                if let (Some((start, _)), Some((end, _))) =
+                    (timestamped_line(line), last.and_then(timestamped_line))
+                    && start != end
+                {
+                    let _ = writeln!(
+                        output,
+                        "[previous line repeated {} more times; {} → {}]",
+                        count - 1,
+                        start.trim(),
+                        end.trim()
+                    );
+                } else {
                     let _ = writeln!(output, "[previous line repeated {} more times]", count - 1);
-                    *collapsed += count - 1;
                 }
+                *collapsed += count - 1;
             }
-        };
+        }
+    };
 
-    for line in text.lines() {
-        if previous == Some(line) {
+    for part in text.split_inclusive('\n') {
+        let Some(line) = part.strip_suffix('\n') else {
+            flush(&mut output, previous.take(), last, count, &mut collapsed);
+            output.push_str(part);
+            break;
+        };
+        let same = previous.is_some_and(|previous| {
+            previous == line
+                || matches!((timestamped_line(previous), timestamped_line(line)),
+                (Some((_, a)), Some((_, b))) if a == b)
+        });
+        if same {
             count += 1;
         } else {
-            flush(&mut output, previous, count, &mut collapsed);
+            flush(&mut output, previous, last, count, &mut collapsed);
             previous = Some(line);
             count = 1;
         }
+        last = Some(line);
     }
-    flush(&mut output, previous, count, &mut collapsed);
-    if !text.ends_with('\n') {
-        output.pop();
-    }
+    flush(&mut output, previous, last, count, &mut collapsed);
     (output, collapsed)
 }
 
@@ -777,6 +835,52 @@ mod tests {
         assert_eq!(count, 2);
         assert!(text.contains("repeated 2 more times"));
         assert!(text.contains("[1] x\n[2] x"));
+    }
+
+    #[test]
+    fn timestamp_collapse_keeps_time_range_and_never_erases_changed_values_or_partial_lines() {
+        let source = "[2026-08-27 11:17:34] error=7\n[2026-08-27 11:17:35] error=7\n[2026-08-27 11:17:36] error=8\n[2026-08-27 11:17:37] error=8";
+        let (text, count) = collapse_exact_repeats(source);
+        assert_eq!(count, 1);
+        assert!(text.contains("11:17:34] → [2026-08-27 11:17:35]"));
+        assert!(text.contains("11:17:36] error=8\n[2026-08-27 11:17:37] error=8"));
+        assert!(!text.ends_with('\n'));
+        for untouched in [
+            "[1] x\n[2] x\n",
+            "192.168.1.1 x\n192.168.1.2 x\n",
+            "[2026-99-27 11:17:34] x\n[2026-99-27 11:17:35] x\n",
+        ] {
+            assert_eq!(collapse_exact_repeats(untouched), (untouched.to_owned(), 0));
+        }
+    }
+
+    #[test]
+    fn collapse_is_disabled_across_missing_events_epochs_or_disconnects() {
+        let first = rx_event(1, b"[2026-08-27 11:17:34] same\n");
+        let second = rx_event(2, b"[2026-08-27 11:17:35] same\n");
+        assert!(is_contiguous_stream(&[first.clone(), second.clone()]));
+        for variant in 0..4 {
+            let mut second = second.clone();
+            match variant {
+                0 => second.seq = 3,
+                1 => second.daemon_epoch = uuid::Uuid::new_v4(),
+                2 => second.generation += 1,
+                _ => second.kind = EventKind::SerialClosed,
+            }
+            let rendered = render_events(
+                &[first.clone(), second],
+                RenderOptions {
+                    max_chars: 1024,
+                    include_raw: true,
+                    echo: None,
+                    collapse_repeats: true,
+                    include_events: false,
+                    match_excerpt: None,
+                },
+            );
+            assert_eq!(rendered.repeated_lines_collapsed, 0);
+            assert_eq!(rendered.events.len(), 2);
+        }
     }
 
     #[test]

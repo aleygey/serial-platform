@@ -979,8 +979,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "menu.footer.profiles",
-        "Tab/Shift+Tab switch port · Enter edit/apply · ← back · ? help",
-        "Tab/Shift+Tab 切换串口 · Enter 编辑/应用 · ← 返回 · ? 说明",
+        "Tab/Shift+Tab switch port · Enter edit and apply · Esc back · ? help",
+        "Tab/Shift+Tab 切换串口 · Enter 确认即生效 · Esc 返回 · ? 说明",
     ),
     (
         "menu.footer.model.configure",
@@ -1418,6 +1418,12 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.menu", "Ctrl-] m", "Ctrl-] m"),
     ("help.desc.menu", "Open configuration", "打开配置"),
     ("help.key.profile", "Ctrl-] o", "Ctrl-] o"),
+    ("help.key.model", "Ctrl-] n", "Ctrl-] n"),
+    (
+        "help.desc.model",
+        "Search and switch model name",
+        "搜索并快速切换机型名",
+    ),
     ("help.key.macros", "Ctrl-] a", "Ctrl-] a"),
     (
         "help.desc.macros",
@@ -1456,8 +1462,8 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("help.key.paste", "Ctrl-Shift-V", "Ctrl-Shift-V"),
     (
         "help.desc.paste",
-        "Paste into the command input",
-        "粘贴到命令输入栏",
+        "Paste editable lines; Enter sends the whole draft",
+        "粘贴多行并编辑；Enter 提交整块草稿",
     ),
     ("help.key.takeover", "Ctrl-] t", "Ctrl-] t"),
     (

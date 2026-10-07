@@ -120,6 +120,23 @@ export interface HumanCommandHistory {
   warning?: string | null
 }
 
+export interface AgentRunRecord {
+  port: string
+  epoch: string
+  run: { id: string; label: string; status: 'active' | 'completed' | 'aborted'; start_seq: number; end_seq?: number | null }
+  started_wall_time_ns: number
+  through_seq: number
+}
+export interface AgentHistoryVisibility { revision: number; hidden: string[] }
+export interface AgentHistoryResponse {
+  server_id: string
+  runs: AgentRunRecord[]
+  visibility: AgentHistoryVisibility
+  truncated: boolean
+  indexing: boolean
+  warning?: string | null
+}
+
 export interface TimelineEvent {
   port: string
   daemon_epoch: string
@@ -271,6 +288,10 @@ export interface DesktopBridge {
   sendCommand(port: string, command: string): Promise<HumanCommandSubmission>
   sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<HumanCommandSubmission>
   queryHumanHistory(query: string, contains?: boolean): Promise<HumanCommandHistory>
+  agentHistory(port: string): Promise<AgentHistoryResponse>
+  clearAgentHistory(port: string, ids?: string[]): Promise<AgentHistoryVisibility>
+  agentRunEvents(record: AgentRunRecord): Promise<{ events: TimelineEvent[]; limited: boolean }>
+  commandEvidence(target: { port: string; epoch: string; firstSeq: number; throughSeq: number }): Promise<TimelineEvent[]>
   listMacros(query: MacroListQuery): Promise<MacroListResponse>
   saveMacro(definition: MacroSaveRequest): Promise<{ catalog_revision: number; definition: MacroDefinition }>
   runMacro(port: string, spec: MacroRunRequest): Promise<MacroExecution>

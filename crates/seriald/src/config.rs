@@ -1285,7 +1285,7 @@ fn io_error(path: &Path, source: io::Error) -> ConfigError {
     }
 }
 
-pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> io::Result<()> {
+pub fn atomic_write(target: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "configuration has no parent")
     })?;
