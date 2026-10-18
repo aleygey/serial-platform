@@ -271,7 +271,7 @@ npm ci --no-audit --no-fund
 npm run build
 ```
 
-Jenkins 是发布构建与 GitHub Release 发布入口。Prepare 阶段只在 Rust 节点向 GitHub checkout 一次，固定并校验完整 commit 后生成带 SHA-256 的源码 bundle；Linux、macOS、归档和发布阶段均恢复并复验这一份源码，macOS 节点不再独立向 GitHub 拉取仓库。workspace 版本 tag 尚不存在时构建 Debug 包；当当前提交存在与 `Cargo.toml` 版本一致的 annotated `vX.Y.Z` tag 时，Jenkins 自动切换 Release、构建四个平台、生成校验和并发布 GitHub Release，不需要填写发布参数。若同名 tag 不是 annotated tag 或没有指向本次 commit，本次仅按 Debug 构建且不发布。
+GitHub Actions 是构建与 GitHub Release 的唯一发布入口，使用 GitHub 标准托管 runner，不需要本地 Jenkins 节点。合并版本更新到 `main` 后，流水线固定源码提交，完成测试与四个平台打包，再由独立发布任务生成 annotated 版本 tag、校验资产与 SHA-256，并发布 Release。构建失败不会发布；已经发布的版本不会被新提交覆盖。只有发布任务持有短期 `GITHUB_TOKEN` 的 `contents: write`，不需要新增长期 token。仓库内 Jenkins 入口已改为只提示迁移，不再构建或发布，也不会停止现有 Jenkins 服务。使用与故障恢复见 [GitHub Actions 发布说明](./docs/GITHUB_ACTIONS_RELEASE.md)。
 
 发布矩阵：
 

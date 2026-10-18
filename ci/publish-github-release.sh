@@ -312,6 +312,12 @@ publish_release_by_id() {
     fi
 }
 
+release_draft_state() {
+    # jq -e considers JSON false a failing status. Convert a validated boolean
+    # to a string so already-published releases remain safely replayable.
+    jq -er '.draft | select(type == "boolean") | tostring' "$1"
+}
+
 assert_release_snapshot() {
     local release_json="$1"
     local expected_database_id="$2"
@@ -375,7 +381,7 @@ main() {
     require_command basename
 
     [[ -n "${GH_TOKEN:-}" ]] \
-        || fail "GH_TOKEN is required; bind Jenkins credential github-release-token"
+        || fail "GH_TOKEN is required; use the job-scoped GitHub Actions token"
 
     cd "${PROJECT_ROOT}"
 
@@ -399,7 +405,7 @@ main() {
         || fail "${tag} must be an annotated local tag"
     tag_commit="$(git rev-parse "${tag}^{}")"
     [[ "${tag_commit}" == "${head_commit}" ]] \
-        || fail "${tag} points to ${tag_commit}, but Jenkins checked out ${head_commit}"
+        || fail "${tag} points to ${tag_commit}, but the release job checked out ${head_commit}"
 
     local remote_ref_json
     local remote_tag_json
@@ -480,12 +486,16 @@ main() {
 
     if [[ "${release_exists}" == "false" ]]; then
         log "Creating draft GitHub Release ${tag}"
+        local -a notes_arguments=(--generate-notes)
+        if [[ -s "${PROJECT_ROOT}/docs/releases/${tag}.md" ]]; then
+            notes_arguments=(--notes-file "${PROJECT_ROOT}/docs/releases/${tag}.md")
+        fi
         gh release create "${tag}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --draft \
             --title "Serial Platform ${tag}" \
-            --generate-notes
+            "${notes_arguments[@]}"
         if discover_release_by_tag "${tag}" "${release_json}"; then
             :
         else
@@ -499,7 +509,7 @@ main() {
     local release_database_id
     release_database_id="$(jq -er '.id | select(type == "number" and . > 0 and floor == .)' "${release_json}")"
     local is_draft
-    is_draft="$(jq -er '.draft | select(type == "boolean")' "${release_json}")"
+    is_draft="$(release_draft_state "${release_json}")"
     local release_by_id_json="${TEMP_DIR}/release-by-id.json"
     fetch_release_snapshot_by_id \
         "${release_database_id}" \

@@ -51,7 +51,7 @@ configure_profile() {
             BUILD_PROFILE="debug"
             PROFILE_DIR="debug"
             # Keep the array non-empty for Bash 3.2 + `set -u` (the default
-            # shell on macOS Jenkins helpers). Cargo's built-in `dev` profile
+            # shell on macOS helpers). Cargo's built-in `dev` profile
             # writes to the conventional target/debug directory.
             CARGO_PROFILE_ARGS=(--profile dev)
             ;;
@@ -157,6 +157,8 @@ run_test() {
     cargo test --workspace --locked
     "${ELECTRON_SCRIPT}" test
     bash "${SCRIPT_DIR}/test-publish-github-release.sh"
+    bash "${SCRIPT_DIR}/test-release-actions.sh"
+    python3 "${SCRIPT_DIR}/test-verify-release-artifacts.py"
 }
 
 run_build() {
@@ -315,7 +317,7 @@ write_build_info() {
                 runtime: $desktop_runtime,
                 local_service: "serial and seriald are embedded in the desktop application"
             },
-            build_system: "Jenkins"
+            build_system: "GitHub Actions"
         }' >"${destination}"
 }
 

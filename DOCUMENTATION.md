@@ -351,14 +351,11 @@ serial mcp --endpoint http://127.0.0.1:3210
 
 ## 发布结构
 
-Jenkins 从一个确定 commit 构建。Prepare 阶段只在 Rust 节点向 GitHub checkout 一次，将本次 SCM commit 固定为完整 commit，完成 tag 判定后生成带 SHA-256 的 Git bundle。Linux、macOS、归档和发布阶段都从 Jenkins stash 恢复同一 bundle，并校验 bundle 校验和、HEAD commit 以及 Release tag 归属。macOS 节点不再单独向 GitHub 拉取仓库源码。
+GitHub Actions 使用 GitHub 标准托管 runner 构建同一个固定 commit。版本变更合入 `main` 后自动评估是否需要发布；只有当前版本尚未发布且版本/源码校验通过，才构建 Linux x86_64、Windows x86_64、macOS arm64 与 macOS x86_64 四个平台包。
 
-构建模式仍只由固定源码的版本 tag 决定：
+所有验证与打包任务成功后，独立发布任务才获得短期 `GITHUB_TOKEN` 的 `contents: write` 权限，创建并验证 annotated `vX.Y.Z` tag，汇总校验和，并通过现有幂等发布脚本先上传草稿、校验完整资产集合，再转为正式 Release。已有同名 tag 或 Release 必须与固定源码一致，不能覆盖其他提交。
 
-- workspace 版本 tag 不存在：Debug 包，不发布 GitHub Release；
-- 当前 commit 存在与 workspace 版本一致的 annotated `vX.Y.Z` tag：Release 包并自动发布。
-
-没有人工发布参数。tag 是唯一发布信号，tag 必须 peel 到本次构建 commit；同名 lightweight tag 或指向其他 commit 时仅构建 Debug，不发布。
+临时 Actions 构建产物短期保留；正式安装包与 `SHA256SUMS` 存在 GitHub Release。原 Jenkinsfile 仅输出迁移提示，不再请求节点、凭证或发布；无需新增长期密钥，也不会更改 Jenkins 服务本身。详情见 [GitHub Actions 发布说明](./docs/GITHUB_ACTIONS_RELEASE.md)。
 
 四个平台包均包含：
 

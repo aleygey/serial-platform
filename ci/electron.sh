@@ -102,7 +102,13 @@ ensure_node_runtime() {
 }
 
 desktop_version() {
-    node -p "require('${DESKTOP_DIR}/package.json').version"
+    # Git Bash paths such as /d/a/... are not Windows Node module paths when
+    # embedded inside JavaScript. Resolve from the package working directory;
+    # this also avoids interpolating quotes from a checkout path into JS.
+    (
+        cd "${DESKTOP_DIR}"
+        node -p "require('./package.json').version"
+    )
 }
 
 assert_versions() {

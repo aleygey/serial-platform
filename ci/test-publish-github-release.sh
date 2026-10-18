@@ -7,7 +7,7 @@ readonly TEST_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=publish-github-release.sh
 source "${TEST_SCRIPT_DIR}/publish-github-release.sh"
 
-# The publisher runs on Jenkins Linux where sha256sum is required. Keep this
+# The publisher runs on GitHub Actions Linux where sha256sum is required. Keep this
 # helper test portable to macOS without relaxing the production requirement.
 if ! command -v sha256sum >/dev/null 2>&1; then
     asset_sha256() {
@@ -116,6 +116,11 @@ expect_failure "mismatched API digest" verify_release_api_digests \
 
 published_release="${TEST_TEMP_DIR}/published-release.json"
 write_release_fixture "${published_release}" false "${TEST_ASSET_NAMES[@]}"
+[[ "$(release_draft_state "${valid_release}")" == true ]]
+[[ "$(release_draft_state "${published_release}")" == false ]]
+invalid_draft_release="${TEST_TEMP_DIR}/invalid-draft.json"
+jq '.draft = "false"' "${valid_release}" >"${invalid_draft_release}"
+expect_failure "draft state must be boolean" release_draft_state "${invalid_draft_release}"
 expect_failure "draft changed before publish" assert_release_snapshot \
     "${published_release}" 4242 v0.8.0 true
 assert_verified_release_snapshot \

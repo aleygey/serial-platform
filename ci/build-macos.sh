@@ -430,7 +430,7 @@ write_build_info() {
                 minimum_macos: "12.0",
                 local_service: "serial and seriald are embedded in the App resources"
             },
-            build_system: "Jenkins-compatible native macOS builder",
+            build_system: "GitHub Actions native macOS builder",
             distribution: {
                 signing_status: "unsigned (Mach-O ad-hoc signatures may be present)",
                 developer_id_signed: false,
