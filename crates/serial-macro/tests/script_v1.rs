@@ -111,6 +111,165 @@ fn for_continue_runs_update_and_empty_for_can_break() {
 }
 
 #[test]
+fn increment_and_decrement_build_numbered_commands_with_explicit_conversion() {
+    assert_eq!(
+        commands(
+            r#"
+        for (let i = 1; i <= 3; i++) { cmd("status " + str(i)); }
+        let n = 3;
+        n--;
+        cmd(str(n));
+        n += 2;
+        cmd(str(n));
+        n -= 5;
+        cmd(str(n));
+        n = n + 1;
+        cmd(str(n));
+        n++;
+        cmd(str(n));
+        for (let i = 2; i >= 0; i--) {
+            if (i == 1) { continue; }
+            cmd("down " + str(i));
+        }
+    "#
+        ),
+        [
+            "status 1", "status 2", "status 3", "2", "4", "-1", "0", "1", "down 2", "down 0"
+        ]
+    );
+}
+
+#[test]
+fn integer_conversion_is_pure_and_supports_full_signed_range_and_parameters() {
+    let p = compile(
+        r#"
+        str(99);
+        let text = str(args.minimum) + ":" + str(args.maximum);
+        cmd(text);
+        cmd(str((2 + 3) * 4));
+        cmd(str(0));
+    "#,
+        &BTreeMap::from([
+            ("minimum".into(), ValueType::Integer),
+            ("maximum".into(), ValueType::Integer),
+        ]),
+        Limits::default(),
+    )
+    .unwrap();
+    let mut vm = p
+        .start(
+            BTreeMap::from([
+                ("minimum".into(), Value::Integer(i64::MIN)),
+                ("maximum".into(), Value::Integer(i64::MAX)),
+            ]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+    for (id, expected) in [
+        (1, "-9223372036854775808:9223372036854775807"),
+        (2, "20"),
+        (3, "0"),
+    ] {
+        let effect = next(&mut vm).unwrap().unwrap();
+        assert_eq!(effect.id, id);
+        assert_eq!(
+            effect.kind,
+            EffectKind::Command {
+                text: expected.into(),
+                verify_echo: true,
+            }
+        );
+        assert_eq!(next(&mut vm).unwrap(), Some(effect.clone()));
+        vm.resume(effect.id, EffectResult::Done).unwrap();
+    }
+    assert!(next(&mut vm).unwrap().is_none());
+    assert_eq!(vm.commands_issued(), 3);
+}
+
+#[test]
+fn integer_conversion_and_increment_reject_unsupported_types_and_expression_forms() {
+    for source in [
+        "str(true);",
+        "str(\"1\");",
+        "let w=watch(\"ready\");str(w);",
+        "str(cmd(\"status\"));",
+        "if(false){str(false);}",
+        "let n=1;cmd(\"status \"+n);",
+        "let n=\"1\";n++;",
+        "let n=true;n--;",
+    ] {
+        assert_eq!(compile_error(source).code, "type_error", "{source}");
+    }
+    for source in ["str();", "str(1,2);"] {
+        assert_eq!(compile_error(source).code, "argument_count", "{source}");
+    }
+    assert_eq!(compile_error("let str=1;").code, "duplicate_variable");
+    for source in [
+        "let n=1;++n;",
+        "let n=1;let old=n++;",
+        "let n=1;cmd(str(n++));",
+    ] {
+        assert_eq!(compile_error(source).code, "syntax_error", "{source}");
+    }
+}
+
+#[test]
+fn increment_and_decrement_overflow_stop_before_later_commands() {
+    for source in [
+        "let n=9223372036854775807;n++;cmd(\"never\");",
+        "let n=-9223372036854775807-1;n--;cmd(\"never\");",
+        "let n=9223372036854775807;n+=1;cmd(\"never\");",
+        "let n=-9223372036854775807-1;n-=1;cmd(\"never\");",
+    ] {
+        let mut vm = vm(source);
+        let error = next(&mut vm).unwrap_err();
+        assert_eq!(error.code, "integer_overflow", "{source}");
+        assert_eq!(vm.commands_issued(), 0);
+        assert_eq!(next(&mut vm).unwrap_err(), error);
+    }
+}
+
+#[test]
+fn integer_conversion_enforces_string_limit_before_any_effect() {
+    for source in [
+        "str(1000);cmd(\"no\");",
+        "str(-100);cmd(\"no\");",
+        "cmd(\"x\"+str(100));",
+    ] {
+        let mut vm = compile(
+            source,
+            &BTreeMap::new(),
+            Limits {
+                max_string_bytes: 3,
+                ..Limits::default()
+            },
+        )
+        .unwrap()
+        .start(BTreeMap::new(), BTreeMap::new())
+        .unwrap();
+        let error = next(&mut vm).unwrap_err();
+        assert_eq!(error.code, "string_limit", "{source}");
+        assert_eq!(vm.commands_issued(), 0);
+        assert_eq!(next(&mut vm).unwrap_err(), error);
+    }
+    let mut vm = compile(
+        "cmd(str(-99));",
+        &BTreeMap::new(),
+        Limits {
+            max_string_bytes: 3,
+            ..Limits::default()
+        },
+    )
+    .unwrap()
+    .start(BTreeMap::new(), BTreeMap::new())
+    .unwrap();
+    assert!(matches!(
+        next(&mut vm).unwrap().unwrap().kind,
+        EffectKind::Command { text, .. } if text == "-99"
+    ));
+}
+
+#[test]
 fn while_continue_returns_to_condition() {
     assert_eq!(
         commands(r#"let n = 0; while (n < 3) { n++; continue; cmd("bad"); } cmd("ok");"#),

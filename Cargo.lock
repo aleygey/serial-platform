@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "serial-cli"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "crossterm",
  "serde_json",
@@ -1972,11 +1972,11 @@ dependencies = [
 
 [[package]]
 name = "serial-macro"
-version = "0.8.8"
+version = "0.8.9"
 
 [[package]]
 name = "serial-mcp"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "serial-protocol"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "base64",
  "serde",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "serial-setup"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "crossterm",
  "serial-protocol",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "serialctl"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "seriald"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "anyhow",
  "axum",

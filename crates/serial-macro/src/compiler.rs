@@ -39,6 +39,7 @@ pub(crate) enum Op {
     Store(usize),
     Pop,
     Matched,
+    IntegerToString,
     Unary(Unary),
     Binary(Binary),
     Jump(usize),
@@ -345,6 +346,19 @@ impl Compiler {
         })
     }
     fn call(&mut self, name: &str, args: &[Expr], span: Span) -> Result<Type, Error> {
+        if name == "str" {
+            if args.len() != 1 {
+                return Err(Error::new(
+                    "argument_count",
+                    "str requires one integer argument",
+                    span,
+                ));
+            }
+            let actual = self.expression(&args[0])?;
+            self.require(actual, ValueType::Integer.into(), args[0].span)?;
+            self.emit(Op::IntegerToString, span);
+            return Ok(ValueType::String.into());
+        }
         if name == "cmd" && args.len() == 2 {
             if !matches!(&args[1].kind, ExprKind::Literal(Value::String(mode)) if mode == "send_only")
             {
@@ -414,7 +428,7 @@ impl Compiler {
                 return Err(Error::new(
                     "unknown_function",
                     format!(
-                        "unknown function {name}; only cmd/watch/prompt/wait/expect/delay are available"
+                        "unknown function {name}; only cmd/watch/prompt/wait/expect/delay/str are available"
                     ),
                     span,
                 ));
@@ -469,7 +483,7 @@ impl Compiler {
 fn builtin_name(name: &str) -> bool {
     matches!(
         name,
-        "cmd" | "watch" | "prompt" | "wait" | "expect" | "delay"
+        "cmd" | "watch" | "prompt" | "wait" | "expect" | "delay" | "str"
     )
 }
 

@@ -200,6 +200,14 @@ impl Vm {
                     let matched = self.watcher_matched(watcher)?;
                     self.push_bool(matched);
                 }
+                Op::IntegerToString => {
+                    let text = self.pop_integer()?.to_string();
+                    if text.len() > self.program.limits.max_string_bytes {
+                        return Err(self
+                            .error("string_limit", "formatted integer exceeds UTF-8 byte limit"));
+                    }
+                    self.stack.push(RuntimeValue::Scalar(Value::String(text)));
+                }
                 Op::Unary(operator) => self.unary(operator)?,
                 Op::Binary(operator) => self.binary(operator)?,
                 Op::Jump(target) => self.pc = target,

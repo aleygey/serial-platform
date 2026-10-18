@@ -50,7 +50,11 @@ export function AgentHistory({ items, selectedCommand, onSelect, onExpandRun, on
 
   return (
     <aside className="agent-pane" onBlur={(event) => {
-      if (!event.currentTarget.contains(event.relatedTarget)) { setPendingDelete(undefined); setNotice('') }
+      if (!event.currentTarget.contains(event.relatedTarget)) {
+        setExpanded(new Set())
+        setPendingDelete(undefined)
+        setNotice('')
+      }
     }} onKeyDown={(event) => {
       if (event.key === 'Delete' && (selectedRun || event.ctrlKey)) {
         event.preventDefault(); void clear(event.ctrlKey ? '*' : selectedRun!)
