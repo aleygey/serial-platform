@@ -77,3 +77,19 @@ jobs:
       - name: Type-check, test, and build desktop
         working-directory: crates/serial-desktop
         run: npm run build
+
+  release-tools:
+    name: Release workflow guards
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check release shell syntax and offline publication guards
+        run: |
+          for script in ci/*.sh; do bash -n "$script"; done
+          bash ci/test-publish-github-release.sh
+          bash ci/test-release-actions.sh
+          python3 ci/test-verify-release-artifacts.py
+      - name: Validate workflow syntax and expressions
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -shellcheck=""

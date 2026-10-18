@@ -1,5 +1,5 @@
-# Jenkins is the only release builder and publisher. This workflow is a
-# non-publishing native portability check for development branches.
+# Native portability checks remain independent of the publishing workflow.
+# Canonical release builds and publication are in publish-release.yml.
 name: Release validation (non-publishing)
 
 on:
@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-15]
 
     steps:
       - name: Check out source

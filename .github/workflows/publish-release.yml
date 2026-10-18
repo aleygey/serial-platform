@@ -1,0 +1,293 @@
+# Canonical release pipeline. A new workspace version on main is sufficient;
+# only the final, all-success job can create a tag or publish a GitHub Release.
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - ci/**
+      - Cargo.toml
+      - Cargo.lock
+      - crates/serial-desktop/package*.json
+      - docs/releases/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 5
+  CARGO_HTTP_TIMEOUT: 120
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUST_BACKTRACE: 1
+  # Hosted runners can use the original upstream release downloads.
+  ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+
+jobs:
+  prepare:
+    name: Check unpublished workspace version
+    if: github.repository == 'aleygey/serial-platform' && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Check release eligibility without changing tags or releases
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            bash ci/release-actions.sh validate-pr
+          else
+            bash ci/release-actions.sh prepare
+          fi
+
+  linux-windows:
+    name: Build Linux and Windows archives
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/serial-desktop/package-lock.json
+      - name: Install cross-compilation and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential binutils file jq zip unzip gcc-mingw-w64-x86-64 \
+            libfuse2 wine64
+          python3 -m pip install --user 'ziglang==0.13.0'
+          python3 -c 'import pathlib, ziglang; print(pathlib.Path(ziglang.__file__).parent)' >> "$GITHUB_PATH"
+          cargo install --locked --version 0.20.1 cargo-zigbuild
+      - name: Validate, test, build, and smoke-test Linux host
+        run: bash ci/build.sh all
+      - name: Build glibc 2.31 Linux and Windows GNU release archives
+        run: bash ci/build.sh package x86_64-unknown-linux-gnu,x86_64-pc-windows-gnu release
+      - name: Run packaged Linux programs on Ubuntu 20.04
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          package="serial-platform-v${RELEASE_VERSION}-linux-x86_64-ubuntu20.04"
+          mkdir -p target/ubuntu20-smoke
+          tar -xzf "target/artifacts/${package}.tar.gz" -C target/ubuntu20-smoke
+          docker run --rm -v "$PWD/target/ubuntu20-smoke/$package:/package:ro" \
+            -e RELEASE_VERSION ubuntu:20.04 bash -euc '
+              cd /package
+              sha256sum --check --strict MANIFEST.sha256 >/dev/null
+              for binary in serial seriald serialctl serial-mcp; do
+                "./$binary" --version | grep -F "$RELEASE_VERSION"
+              done
+              ./serial --help >/dev/null
+              ./serial-mcp --dump-tools > /tmp/tools.json
+              test -s /tmp/tools.json
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-windows
+          path: target/artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  macos:
+    name: Build and test both macOS architectures
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    # Standard Apple Silicon runner, not a paid larger-runner label.
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/serial-desktop/package-lock.json
+      - name: Require Apple Silicon, Xcode tools, and Rosetta
+        run: |
+          test "$(uname -m)" = arm64
+          arch -x86_64 /usr/bin/true
+          bash ci/build-macos.sh env
+      - name: Fetch locked dependencies
+        run: bash ci/build-macos.sh fetch
+      - name: Test native arm64 and x86_64 under Rosetta
+        run: bash ci/build-macos.sh test debug
+      - name: Package and smoke-test both macOS release archives
+        run: bash ci/build-macos.sh package release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: target/macos-artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  windows-smoke:
+    name: Validate final Windows archive on Windows
+    needs: [prepare, linux-windows]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy, rustfmt
+      - name: Run native Windows workspace tests and Clippy
+        run: |
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-windows
+          path: target/artifacts
+      - name: Verify checksums and run the actual packaged Windows programs
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          (cd target/artifacts && sha256sum --check --strict SHA256SUMS)
+          package="serial-platform-v${RELEASE_VERSION}-windows-x86_64"
+          unzip -q "target/artifacts/${package}.zip" -d target/windows-smoke
+          cd "target/windows-smoke/${package}"
+          sha256sum --check --strict MANIFEST.sha256 >/dev/null
+          for binary in serial seriald serialctl serial-mcp; do
+            "./${binary}.exe" --version | grep -F "$RELEASE_VERSION"
+          done
+          ./serial.exe --help >/dev/null
+          ./serial-mcp.exe --dump-tools | jq -e 'type == "array" and length == 18' >/dev/null
+          test -s 'Serial Platform.exe'
+
+  verify:
+    name: Verify all four release archives
+    needs: [prepare, linux-windows, macos, windows-smoke]
+    if: >-
+      needs.prepare.outputs.release == 'true' &&
+      needs.linux-windows.result == 'success' &&
+      needs.macos.result == 'success' &&
+      needs.windows-smoke.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-windows
+          path: target/artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-macos
+          path: target/macos-artifacts
+      - name: Verify transferred checksums, provenance, and inner manifests
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          (cd target/artifacts && sha256sum --check --strict SHA256SUMS)
+          (cd target/macos-artifacts && sha256sum --check --strict SHA256SUMS)
+          cp target/macos-artifacts/*.zip target/artifacts/
+          bash ci/build.sh checksums
+          python3 ci/verify-release-artifacts.py target/artifacts "$RELEASE_VERSION" "$GITHUB_SHA"
+
+  publish:
+    name: Create annotated tag and publish verified release
+    needs: [prepare, verify]
+    if: >-
+      github.repository == 'aleygey/serial-platform' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      needs.prepare.outputs.release == 'true' && needs.verify.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-windows
+          path: target/artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-macos
+          path: target/macos-artifacts
+      - name: Recheck the exact assets in the publishing job
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          (cd target/artifacts && sha256sum --check --strict SHA256SUMS)
+          (cd target/macos-artifacts && sha256sum --check --strict SHA256SUMS)
+          cp target/macos-artifacts/*.zip target/artifacts/
+          bash ci/build.sh checksums
+          python3 ci/verify-release-artifacts.py target/artifacts "$RELEASE_VERSION" "$GITHUB_SHA"
+      - name: Create or verify the immutable annotated release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/release-actions.sh tag
+      - name: Publish only the exact verified four-platform asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci/publish-github-release.sh release

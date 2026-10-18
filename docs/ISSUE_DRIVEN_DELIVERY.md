@@ -1,5 +1,7 @@
 # Issue 驱动的评估、修复与发布流水线
 
+> 历史设计文档：下文 Jenkins 发布链描述自 v0.8.9 起不再是当前发布入口。现行流程见 [GitHub Actions 发布说明](./GITHUB_ACTIONS_RELEASE.md)；不要按此旧方案启用第二个发布者。
+
 本文描述一条适合本仓库的 GitHub Issue -> 本地 Codex -> Pull Request ->
 GitHub Actions/Jenkins -> GitHub Release 流程。它是实施设计，不会因为合入本文而自动启用。
 

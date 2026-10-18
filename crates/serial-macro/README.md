@@ -41,12 +41,33 @@ implicit conversions, objects, arrays, imports, functions, eval or host access.
 | `wait(watcher, ms)` | boolean | Return whether this deadline observed a trustworthy match |
 | `expect(watcher, ms)` | void | Require a match and reliable evidence, or terminate the run |
 | `delay(ms)` | void | Await a cancellable timer |
+| `str(integer)` | string | None; convert a signed integer to decimal text inside the VM |
 
 Only `watcher.matched` and declared `args.name` field access exists. Matchers are
 literal strings in v1; terminal projection and prompt-specific interpretation
 belong to the driver. Each independent command-response stage creates a fresh
 watcher. Ordinary `cmd` text rejects every Unicode control character, including
 embedded EOL; Ctrl-C/Ctrl-D remain on the existing signal path.
+
+### Incrementing command arguments
+
+Postfix `i++` and `i--` work as statements and in a `for` update. `i += 1` and
+`i = i + 1` are equivalent ways to increment. They do not return a value:
+`++i`, `let n = i++`, and `cmd(str(i++))` are unsupported. Convert the counter
+explicitly with `str(i)` when building command text; `"status " + i` is a type
+error because string/integer conversion is never implicit.
+
+```text
+for (let i = 1; i <= 3; i++) {
+    cmd("status " + str(i));
+}
+```
+
+This issues `status 1`, `status 2`, and `status 3` in order. `str` accepts one
+integer, including integer parameters and arithmetic expressions, and formats it
+in signed decimal without padding. It has no driver effect and respects the
+string byte limit. Arithmetic uses signed 64-bit integers; increment/decrement
+overflow stops execution before any later command rather than wrapping around.
 
 ## API and execution boundary
 

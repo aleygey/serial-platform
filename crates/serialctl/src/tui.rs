@@ -4703,6 +4703,9 @@ impl App {
 
     fn select(&mut self, index: usize) {
         if index < self.ports.len() {
+            if index != self.selected {
+                self.leave_run_history();
+            }
             self.clear_text_selection();
             self.queue_selection = None;
             self.selected = index;
@@ -5967,7 +5970,7 @@ impl App {
             view.history_search = None;
             view.completion = None;
             self.queue_selection = None;
-            self.focus = PaneFocus::Input;
+            self.leave_run_history();
             self.status = tr("st.queue.restored").into();
         } else {
             self.status = tr("st.queue.deleted").into();
@@ -5994,7 +5997,7 @@ impl App {
         if count == 0 {
             self.status = tr("st.queue.none").into();
             self.queue_selection = None;
-            self.focus = PaneFocus::Input;
+            self.leave_run_history();
             return;
         }
         self.queue_selection = Some(QueueSelection {
@@ -6002,6 +6005,7 @@ impl App {
             selected: 0,
             detail_scroll: 0,
         });
+        self.leave_run_history();
         self.focus = PaneFocus::Queue;
         self.status = tr("st.queue.select").into();
     }
@@ -6016,7 +6020,7 @@ impl App {
             .map_or(0, |queue| queued_line_operations(queue).len());
         if count == 0 {
             self.queue_selection = None;
-            self.focus = PaneFocus::Input;
+            self.leave_run_history();
         } else if let Some(selection) = self.queue_selection.as_mut() {
             selection.selected = selection.selected.min(count - 1);
         }
@@ -6074,7 +6078,7 @@ impl App {
             KeyCode::Char('e' | 'E') => self.remove_queued_line_operation(selected, true, commands),
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('u' | 'U') => {
                 self.queue_selection = None;
-                self.focus = PaneFocus::Input;
+                self.leave_run_history();
                 self.status = tr("st.queue.select.closed").into();
             }
             _ => {}
@@ -6087,7 +6091,18 @@ impl App {
         self.focus = PaneFocus::Input;
         self.pending_monitor_delete = None;
         self.pending_exact_evidence = None;
-        if let Some(snapshot) = self.current_mut().scroll_snapshot.as_mut() {
+        let view = self.current_mut();
+        // Keep the selected top-level Run/Monitor, but never leave expanded
+        // command details or child selections behind when focus moves away.
+        view.expanded_run = None;
+        view.selected_run_command = None;
+        view.expanded_run_command = None;
+        view.selected_run_step = None;
+        view.expanded_monitor = None;
+        view.selected_monitor_matcher = None;
+        view.selected_monitor_incident = None;
+        view.run_detail_scroll = 0;
+        if let Some(snapshot) = view.scroll_snapshot.as_mut() {
             for line in &mut snapshot.rows {
                 clear_command_highlight(line);
             }
@@ -7214,7 +7229,7 @@ impl App {
                     }
                 }
                 self.queue_selection = None;
-                self.focus = PaneFocus::Input;
+                self.leave_run_history();
                 self.dirty = true;
             }
             Event::FocusLost => {
@@ -7389,10 +7404,11 @@ impl App {
                     self.dirty = true;
                     return;
                 }
-                let leaving_history = self.focus == PaneFocus::RunHistory;
-                self.focus = PaneFocus::Input;
-                if leaving_history {
+                if self.focus == PaneFocus::RunHistory {
+                    self.leave_run_history();
                     self.current_mut().follow();
+                } else {
+                    self.focus = PaneFocus::Input;
                 }
                 match self.current_mode() {
                     InputMode::Line => self.handle_line_key(key, commands),
@@ -8406,7 +8422,7 @@ impl App {
 
     fn open_menu_page(&mut self, page: Option<MenuPage>) {
         self.queue_selection = None;
-        self.focus = PaneFocus::Input;
+        self.leave_run_history();
         let mut menu = MenuState::new();
         menu.recent_models = self
             .config
@@ -18752,6 +18768,136 @@ mod tests {
     }
 
     #[test]
+    fn history_focus_exits_collapse_commands_and_reenter_at_the_selected_root() {
+        for exit in [
+            "escape",
+            "hide",
+            "typing",
+            "resize",
+            "menu",
+            "queue",
+            "keyboard_port",
+            "input_click",
+            "output_click",
+            "port_click",
+        ] {
+            let run = agent_run("focus regression");
+            let mut current = snapshot();
+            current.active_run = Some(run.clone());
+            let epoch = current.daemon_epoch;
+            let mut other = snapshot();
+            other.config.port = "COM9".into();
+            let mut app = App::new(vec![current, other], None);
+            let mut tx = event(EventKind::Tx, Direction::Tx, 2, b"show version\r");
+            tx.daemon_epoch = epoch;
+            tx.actor = Some(run.owner.clone());
+            tx.run_id = Some(run.id);
+            tx.operation_id = Some(Uuid::new_v4());
+            tx.metadata.insert(
+                "command_description".into(),
+                serde_json::json!("read system version"),
+            );
+            app.current_mut().push_event(tx, true);
+            let (commands, mut received) = mpsc::channel(1);
+            app.toggle_run_history_panel();
+            for _ in 0..2 {
+                app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
+            }
+            assert!(app.current().expanded_run_command.is_some());
+            app.current_mut().run_detail_scroll = 5;
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let click = |rect: Rect| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y + 1,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            match exit {
+                "escape" => {
+                    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &commands);
+                }
+                "hide" => app.toggle_run_history_panel(),
+                "typing" => app.handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                    &commands,
+                ),
+                "resize" => app.handle_terminal_event(Event::Resize(100, 24), &commands),
+                "menu" => app.open_menu(),
+                "queue" => app.open_queue_selection(),
+                "keyboard_port" => app.handle_key(
+                    KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+                    &commands,
+                ),
+                "input_click" => {
+                    app.handle_mouse(click(app.layout.unwrap().input_area), &commands);
+                }
+                "output_click" => {
+                    app.handle_mouse(click(app.layout.unwrap().output_area), &commands);
+                }
+                "port_click" => {
+                    let tab = app.port_mouse_tabs[1].0;
+                    app.handle_mouse(
+                        MouseEvent {
+                            row: tab.y,
+                            column: tab.x,
+                            ..click(tab)
+                        },
+                        &commands,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(app.focus, PaneFocus::Input, "exit: {exit}");
+            let view = &app.ports[0];
+            assert_eq!(view.selected_run, Some(run.id), "exit: {exit}");
+            assert!(view.expanded_run.is_none(), "exit: {exit}");
+            assert!(view.selected_run_command.is_none(), "exit: {exit}");
+            assert!(view.expanded_run_command.is_none(), "exit: {exit}");
+            assert!(view.selected_run_step.is_none(), "exit: {exit}");
+            assert_eq!(view.run_detail_scroll, 0, "exit: {exit}");
+            assert_eq!(view.run_history.len(), 1, "exit: {exit}");
+            assert_eq!(view.run_history[0].commands.len(), 1, "exit: {exit}");
+            assert!(received.try_recv().is_err(), "exit: {exit}");
+
+            app.menu = None;
+            app.select(0);
+            app.toggle_run_history_panel();
+            assert_eq!(app.focus, PaneFocus::RunHistory, "exit: {exit}");
+            let rows = run_history_rows(&app, 80)
+                .into_iter()
+                .map(|row| line_plain_text(&row.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rows.contains("focus regression"), "exit: {exit}");
+            assert!(!rows.contains("read system version"), "exit: {exit}");
+            assert!(!rows.contains("show version"), "exit: {exit}");
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &commands);
+            assert!(app.current().selected_run_command.is_some(), "exit: {exit}");
+        }
+    }
+
+    #[test]
+    fn leaving_monitor_history_collapses_children_but_preserves_the_selected_root() {
+        let mut app = App::new(vec![snapshot()], None);
+        let incident = monitor_incident(app.current().snapshot.daemon_epoch, 2, 3);
+        let id = incident.monitor_id;
+        select_monitor_incident(&mut app, incident);
+        app.current_mut().run_detail_scroll = 5;
+
+        app.leave_run_history();
+
+        assert_eq!(app.current().selected_monitor, Some(id));
+        assert!(app.current().expanded_monitor.is_none());
+        assert!(app.current().selected_monitor_matcher.is_none());
+        assert!(app.current().selected_monitor_incident.is_none());
+        assert_eq!(app.current().run_detail_scroll, 0);
+        assert_eq!(app.current().monitor_history.len(), 1);
+        assert_eq!(app.current().monitor_history[0].incidents.len(), 1);
+    }
+
+    #[test]
     fn mouse_targets_rendered_tabs_history_and_input_but_never_clicks_through_modals() {
         let mut current = snapshot();
         let run = agent_run("clickable history");
@@ -22929,7 +23075,7 @@ mod tests {
         let _guard = crate::i18n::lang_test_lock();
         i18n::set_lang(i18n::Lang::Zh);
         let mut current = snapshot();
-        let run = agent_run("版本巡检");
+        let run = agent_run("version inspection");
         current.active_run = Some(run.clone());
         let epoch = current.daemon_epoch;
         let mut app = App::new(vec![current], None);
@@ -22992,8 +23138,7 @@ mod tests {
         assert!(!row_text.contains('\u{274c}'));
         assert!(!row_text.contains("已确认发送"));
 
-        app.focus = PaneFocus::Input;
-        app.current_mut().expanded_run_command = None;
+        app.leave_run_history();
         let backend = TestBackend::new(90, 24);
         let mut narrow = Terminal::new(backend).expect("narrow test terminal");
         narrow.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -23004,7 +23149,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(horizontal.contains("read system version"));
+        assert!(horizontal.contains("version inspection"));
+        assert!(!horizontal.contains("read system version"));
         let layout = app.layout.expect("horizontal history layout");
         let history_area = layout.run_history_area.expect("visible history bar");
         assert_eq!(history_area.x, layout.output_area.x);
@@ -23037,7 +23183,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(popup.contains("read system version"));
+        assert!(popup.contains("version inspection"));
+        assert!(!popup.contains("read system version"));
         assert!(
             app.layout
                 .and_then(|layout| layout.run_history_area)

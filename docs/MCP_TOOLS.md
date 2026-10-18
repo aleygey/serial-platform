@@ -309,7 +309,7 @@ Break 默认 250 ms，可用 `duration_ms` 设置 1–5000 ms。其他 signal �
 
 `macro_list` 查找宏，`macro_save` 保存或编辑宏，`macro_run` 执行保存的宏或一次性脚本。`command_sequence` 适合简单线性步骤，宏适合循环、条件和可重复流程。
 
-宏支持 let、if/else、for、while、break/continue，以及 cmd、watch、prompt、wait、expect、delay。cmd 自动追加 Profile EOL，不开放 input/raw/eol 参数。脚本执行器位于 seriald，不逐步回调 Agent，不运行宿主机 shell。
+宏支持 let、if/else、for、while、break/continue，以及 cmd、watch、prompt、wait、expect、delay、str。整数计数器可用语句形式 `i++` / `i--` 或 `+=` / `-=` 更新；动态命令使用 `cmd("status " + str(i))` 显式转成十进制文本，整数溢出时停止。cmd 自动追加 Profile EOL，不开放 input/raw/eol 参数。脚本执行器位于 seriald，不逐步回调 Agent，不运行宿主机 shell。
 
 `cmd(text)` 等待完整、精确的命令行回显（最长 2 秒，并受宏总时限约束），缺字、回显不符或不可确认时停止，不继续后续步骤、不自动重试。不检查返回值或命令业务结果，这由 Agent 判断。明确无回显的启动窗口可用 `cmd(text, "send_only")`，只确认主机发送；不算作输入已验证。返回的 `writes`、`input_verified_writes`、`send_only_writes` 分别报告三种计数。磁盘日志降级不会单独阻止宏，实时 RX 缺口/断连/人工介入仍会安全停止。
 
