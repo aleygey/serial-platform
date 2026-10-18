@@ -1370,7 +1370,8 @@ fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
-    #[link(name = "Kernel32")]
+    // Keep the import library lowercase for case-sensitive MinGW cross builds.
+    #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(
             existing_file_name: *const u16,
