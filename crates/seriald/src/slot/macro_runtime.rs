@@ -1200,14 +1200,23 @@ impl Projection {
     }
 }
 
+/// A target TTY inserts a visual line break when echoed input reaches its
+/// display width. Accept that wrap only after a plausible column so a short
+/// truncated echo followed by ordinary output cannot be joined into a match.
+const MIN_ECHO_HARD_WRAP_COLUMN: usize = 32;
+
 #[derive(Default)]
-/// Only a complete fresh RX line can confirm command input. Arbitrary output,
-/// command prefixes, and old prompts are never treated as acknowledgement.
-/// Bounded diagnostics retain observed text without growing with noisy devices.
+/// Only a complete fresh RX logical line can confirm command input. Arbitrary
+/// output, command prefixes, and old prompts are never treated as
+/// acknowledgement. Visual hard wraps inserted by the target TTY are ignored
+/// while reconstructing that logical line. Bounded diagnostics retain observed
+/// text without growing with noisy devices.
 struct InputCheck {
     expected: Vec<u8>,
     prompts: Vec<Vec<u8>>,
     line: Vec<u8>,
+    column: usize,
+    in_wrap: bool,
     overlong: bool,
     observed: String,
     matched: bool,
@@ -1222,6 +1231,8 @@ impl InputCheck {
                 .map(|p| p.as_bytes().to_vec())
                 .collect(),
             line: Vec::new(),
+            column: 0,
+            in_wrap: false,
             overlong: false,
             observed: String::new(),
             matched: false,
@@ -1263,12 +1274,22 @@ impl InputCheck {
                 continue;
             }
             if byte == b'\n' {
-                if !self.overlong {
-                    self.matched = self.line == self.expected
-                        || self.prompts.iter().any(|prompt| {
-                            self.line.strip_prefix(prompt.as_slice())
-                                == Some(self.expected.as_slice())
-                        });
+                if !self.overlong && self.line_matches() {
+                    self.matched = true;
+                    self.line.clear();
+                    self.column = 0;
+                    self.in_wrap = false;
+                    self.overlong = false;
+                    continue;
+                }
+                if self.is_hard_wrap() {
+                    // A target TTY can emit a run of newlines for one visual
+                    // wrap (CR CR LF projects as two newlines). Keep the
+                    // logical line intact and suppress the presentation-only
+                    // break; real output newlines still reset it below.
+                    self.column = 0;
+                    self.in_wrap = true;
+                    continue;
                 }
                 if !self.line.is_empty() && self.observed.len() < 512 {
                     let text = String::from_utf8_lossy(&self.line);
@@ -1283,14 +1304,42 @@ impl InputCheck {
                     }
                 }
                 self.line.clear();
+                self.column = 0;
+                self.in_wrap = false;
                 self.overlong = false;
-            } else if self.line.len() < MAX_WRITE_BYTES * 2 {
-                self.line.push(byte);
             } else {
-                self.overlong = true;
+                self.in_wrap = false;
+                self.column = self.column.saturating_add(1);
+                if self.line.len() < MAX_WRITE_BYTES * 2 {
+                    self.line.push(byte);
+                } else {
+                    self.overlong = true;
+                }
             }
         }
         output
+    }
+    fn line_matches(&self) -> bool {
+        self.line == self.expected
+            || self.prompts.iter().any(|prompt| {
+                self.line.strip_prefix(prompt.as_slice()) == Some(self.expected.as_slice())
+            })
+    }
+    fn line_is_prefix(&self) -> bool {
+        self.expected.starts_with(&self.line)
+            || self
+                .prompts
+                .iter()
+                .any(|prompt| match self.line.strip_prefix(prompt.as_slice()) {
+                    Some(rest) => self.expected.starts_with(rest),
+                    None => prompt.starts_with(&self.line),
+                })
+    }
+    fn is_hard_wrap(&self) -> bool {
+        !self.overlong
+            && !self.line.is_empty()
+            && self.line_is_prefix()
+            && (self.in_wrap || self.column >= MIN_ECHO_HARD_WRAP_COLUMN)
     }
 }
 
@@ -1298,6 +1347,12 @@ impl InputCheck {
 struct EchoFilter {
     expected: Vec<u8>,
     pending: Vec<u8>,
+    /// Raw candidate bytes, including visual hard-wrap newlines. They are
+    /// withheld with the echo and replayed intact if this turns out to be
+    /// ordinary device output.
+    delayed: Vec<u8>,
+    column: usize,
+    in_wrap: bool,
     active: bool,
 }
 impl EchoFilter {
@@ -1305,6 +1360,9 @@ impl EchoFilter {
         Self {
             expected: command.as_bytes().to_vec(),
             pending: Vec::new(),
+            delayed: Vec::new(),
+            column: 0,
+            in_wrap: false,
             active: mode != EchoMode::Off && !command.is_empty(),
         }
     }
@@ -1324,12 +1382,24 @@ impl EchoFilter {
                 // Only the complete, exact command at the fresh TX boundary
                 // is an echo. Arbitrary leading text or a suffix equality is
                 // not evidence: `failed command slp` must remain visible.
-                if self.pending != self.expected {
-                    out.append(&mut self.pending);
-                    out.push(byte);
-                } else {
+                if self.pending == self.expected {
                     self.pending.clear();
+                    self.delayed.clear();
+                    self.active = false;
+                    continue;
                 }
+                let hard_wrap = !self.pending.is_empty()
+                    && self.expected.starts_with(&self.pending)
+                    && (self.in_wrap || self.column >= MIN_ECHO_HARD_WRAP_COLUMN);
+                if hard_wrap {
+                    self.delayed.push(byte);
+                    self.column = 0;
+                    self.in_wrap = true;
+                    continue;
+                }
+                out.append(&mut self.delayed);
+                out.push(byte);
+                self.pending.clear();
                 self.active = false;
             } else if self.pending.len() < self.expected.len()
                 && byte == self.expected[self.pending.len()]
@@ -1337,13 +1407,17 @@ impl EchoFilter {
                 // In particular, an echoed command containing a configured
                 // prompt remains withheld until its real line terminator.
                 self.pending.push(byte);
+                self.delayed.push(byte);
+                self.column = self.column.saturating_add(1);
+                self.in_wrap = false;
             } else {
                 // The first mismatch proves this is device output. Release
                 // immediately, including a normal prompt with no newline.
                 // Do not speculate that a leading prompt precedes an echo:
                 // that is indistinguishable from a standalone live prompt.
-                out.append(&mut self.pending);
+                out.append(&mut self.delayed);
                 out.push(byte);
+                self.pending.clear();
                 self.active = false;
             }
         }
@@ -1514,6 +1588,65 @@ mod tests {
             );
             assert!(check.matched, "RX split at {split}");
         }
+    }
+
+    #[test]
+    fn input_check_accepts_target_hard_wrapped_echo_across_every_rx_split() {
+        let command = format!("printf {}", "0123456789".repeat(4));
+        let (first, rest) = command.split_at(40);
+        for wrap in ["\r\r\n", "\r\n"] {
+            let data = format!("dut# {first}{wrap}{rest}\r\n");
+            for split in 0..=data.len() {
+                let mut check = InputCheck::new(&command, &["dut# ".into()]);
+                let mut projection = Projection::default();
+                check
+                    .observe(&mut projection, &data.as_bytes()[..split], false)
+                    .unwrap();
+                check
+                    .observe(&mut projection, &data.as_bytes()[split..], false)
+                    .unwrap();
+                assert!(check.matched, "wrap {wrap:?} split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn input_check_does_not_join_a_short_truncated_echo_to_later_output() {
+        let command = format!("printf {}", "0123456789".repeat(4));
+        let (first, rest) = command.split_at(10);
+        let mut check = InputCheck::new(&command, &[]);
+        check
+            .observe(
+                &mut Projection::default(),
+                format!("{first}\r\n{rest}\r\n").as_bytes(),
+                false,
+            )
+            .unwrap();
+        assert!(!check.matched);
+    }
+
+    #[test]
+    fn echo_filter_hides_wrapped_echo_and_replays_it_on_mismatch() {
+        let command = format!("printf {}", "0123456789".repeat(4));
+        let (first, rest) = command.split_at(40);
+
+        let mut filter = EchoFilter::new(&command, EchoMode::On, &[]);
+        assert!(
+            filter
+                .feed(format!("{first}\n\n{rest}\n").as_bytes())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!filter.active);
+
+        let mut mismatch = EchoFilter::new(&command, EchoMode::On, &[]);
+        assert_eq!(
+            mismatch
+                .feed(format!("{first}\n\nXYZ\n").as_bytes())
+                .unwrap(),
+            format!("{first}\n\nXYZ\n").as_bytes()
+        );
+        assert!(!mismatch.active);
     }
 
     #[test]
@@ -1833,6 +1966,27 @@ mod tests {
             assert_eq!(info.status, MacroStatus::Succeeded, "{info:?}");
             assert_eq!(info.input_verified_writes, 2);
             assert_eq!(info.send_only_writes, 0);
+            f.close().await;
+        }
+
+        #[tokio::test]
+        async fn long_command_echo_wrapped_by_the_target_tty_still_verifies() {
+            let mut f = Fixture::new().await;
+            let command = format!("setenv {}", "value-".repeat(10));
+            let (first, rest) = command.split_at(40);
+            let script = format!("cmd({command:?}); cmd(\"next\");");
+            let id = Uuid::new_v4();
+            f.start(id, &script).await.unwrap();
+            assert_eq!(f.command().await, format!("{command}\r").into_bytes());
+            f.master
+                .write_all(format!("{first}\r\r\n{rest}\r\nU-Boot> ").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(f.command().await, b"next\r");
+            f.master.write_all(b"next\r\n").await.unwrap();
+            let info = f.terminal(id).await;
+            assert_eq!(info.status, MacroStatus::Succeeded, "{info:?}");
+            assert_eq!(info.input_verified_writes, 2);
             f.close().await;
         }
 
