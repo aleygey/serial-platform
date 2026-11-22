@@ -1,3 +1,5 @@
+import type { PaletteId } from './appearance'
+import type { SetupBrief, SetupRequest } from './first-setup'
 export type ThemePreference = 'system' | 'dark' | 'light'
 export type ConnectionState = 'starting' | 'connected' | 'reconnecting' | 'offline'
 export type SessionState = 'disabled' | 'waiting_for_port' | 'opening' | 'online' | 'backoff' | 'stopping'
@@ -47,6 +49,7 @@ export interface PortSnapshot {
   session_state: SessionState
   state_reason?: string | null
   control?: ControlLease | null
+  active_run?: (AgentRunRecord['run'] & { owner: Actor }) | null
   pending_run_start?: PendingRunStartApproval | null
   run_context?: RunContextState | null
   effective_shell_prompt?: string | null
@@ -245,7 +248,10 @@ export interface DesktopPreferences {
   endpoint: string
   autoStartLocal: boolean
   theme: ThemePreference
+  palette?: PaletteId
   selectedPort?: string
+  firstUse?: 'new' | 'dismissed' | 'complete'
+  setupTask?: { id: string; server: string; port: string }
 }
 
 export interface ServiceState {
@@ -283,6 +289,11 @@ export interface SerialConfigurationDraft {
 }
 
 export interface DesktopBridge {
+  replaySampleRun?: () => void
+  openRunExample?: () => Promise<void>
+  createSetup(brief: SetupBrief): Promise<SetupRequest>
+  readSetup(id: string): Promise<SetupRequest>
+  applySetup(id: string, revision: number): Promise<MacroDefinition>
   bootstrap(): Promise<DesktopSnapshot>
   refresh(): Promise<DesktopSnapshot>
   sendCommand(port: string, command: string): Promise<HumanCommandSubmission>
@@ -298,10 +309,11 @@ export interface DesktopBridge {
   cancelMacro(port: string, executionId: string): Promise<MacroExecution>
   decideRunStart(port: string, approvalId: string, decision: RunStartDecision): Promise<void>
   setPortOpen(port: string, open: boolean): Promise<void>
+  setPortModel(port: string, family: string | null, name: string | null, expectedRevision: number): Promise<void>
   saveSerialConfiguration(draft: SerialConfigurationDraft, expectedRevision: number): Promise<void>
   saveModelProfiles(profiles: ModelProfile[], expectedRevision: number): Promise<void>
   saveModelFamilies(families: ModelFamily[], expectedRevision: number): Promise<void>
-  savePreferences(preferences: DesktopPreferences): Promise<void>
+  savePreferences(preferences: Partial<DesktopPreferences>): Promise<void>
   startLocalService(): Promise<void>
   stopLocalService(): Promise<void>
   onEvent(listener: (event: DesktopEvent) => void): () => void

@@ -1,6 +1,17 @@
-import { FileCode2, Play, Plus, RefreshCw, Save, Square } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import type { MacroDefinition, MacroExecution, MacroListResponse, MacroParameter, MacroSaveRequest, ModelFamily, PortSnapshot } from '../../shared/contracts'
+import { ChevronDown, Play, Plus, RefreshCw, Save, Search, Square } from 'lucide-react'
+import { useEffect, useId, useRef, useState } from 'react'
+import { Accordion, AccordionItem, AccordionContent, AccordionTrigger } from './ui/accordion'
+import { GooeyNav } from './ui/gooey-nav'
+import { Disclosure, DisclosureContent } from './ui/disclosure'
+import { WorkspaceSidebar } from './WorkspaceSidebar'
+import { BounceSidebar } from './ui/bounce-sidebar'
+import { ModelPicker } from './ui/model-picker'
+import { MoreFields, OptionField } from './SerialFields'
+import { useReducedMotion } from '../lib/use-reduced-motion'
+import { StepPlayer, type StepMark } from './ui/step-player'
+import { macroExecutionLabel } from './AgentHistory'
+import { displayCommand } from '../lib/history'
+import type { TimelineEvent, MacroDefinition, MacroExecution, MacroListResponse, MacroParameter, MacroSaveRequest, ModelFamily, PortSnapshot } from '../../shared/contracts'
 
 interface Editor {
   id: string
@@ -17,6 +28,7 @@ interface Editor {
 export interface MacroDraftStore { current?: Editor; drafts: Map<string, Editor> }
 
 interface Props {
+  events?: Record<string, TimelineEvent[]>
   ports: PortSnapshot[]
   modelFamilies: ModelFamily[]
   selectedPort?: string
@@ -75,7 +87,12 @@ function requestFor(editor: Editor): MacroSaveRequest {
   }
 }
 
-export function MacroPage({ ports, modelFamilies, selectedPort, connected, drafts, execution, onExecution }: Props): React.JSX.Element {
+export function MacroPage({ events, ports, modelFamilies, selectedPort, connected, drafts, execution, onExecution }: Props): React.JSX.Element {
+  const [section, setSection] = useState<'编辑' | '指南'>('编辑')
+  const [filterOpen, setFilterOpen] = useState(false)
+  const filterId = useId()
+  const scriptId = useId()
+  const reduced = useReducedMotion()
   const [catalog, setCatalog] = useState<MacroListResponse>()
   const [query, setQuery] = useState('')
   const [includeDrafts, setIncludeDrafts] = useState(false)
@@ -115,6 +132,7 @@ export function MacroPage({ ports, modelFamilies, selectedPort, connected, draft
   }, [connected, query, includeDrafts, offset, refresh])
 
   const load = async (id: string): Promise<void> => {
+    setSection('编辑')
     const request = ++selectionRequest.current
     const local = drafts.drafts.get(id)
     if (local) { updateEditor(local); setArgs({}); return }
@@ -160,6 +178,7 @@ export function MacroPage({ ports, modelFamilies, selectedPort, connected, draft
   }
 
   const newMacro = (template = false): void => {
+    setSection('编辑')
     selectionRequest.current += 1
     updateEditor(template ? {
       ...EMPTY, id: 'enter_uboot', name: '进入 U-Boot', description: '发送 reboot，再重复 slp，直到匹配当前机型 U-Boot 提示符', script: UBOOT_SCRIPT,
@@ -168,35 +187,107 @@ export function MacroPage({ ports, modelFamilies, selectedPort, connected, draft
     setArgs({}); setError('')
   }
 
-  return <main className="macro-page">
-    <aside className="macro-catalog">
-      <div className="macro-heading"><strong><FileCode2 size={17} /> 命令宏</strong><button type="button" title="刷新宏目录" onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={15} /></button></div>
-      <input aria-label="查找宏" placeholder="名称、用途、机型…" value={query} onChange={(event) => { setQuery(event.target.value); setOffset(0) }} />
-      <label className="macro-drafts-toggle"><input type="checkbox" checked={includeDrafts} onChange={(event) => { setIncludeDrafts(event.target.checked); setOffset(0) }} /> 显示未共享草稿</label>
-      <button className="macro-new" type="button" onClick={() => newMacro()}><Plus size={15} /> 新建宏</button>
-      <div className="macro-list" aria-label="已有宏">{catalog?.macros.map((macro) => <button className={editor.saved?.id === macro.id ? 'is-selected' : ''} key={macro.id} type="button" onClick={() => void load(macro.id)}><strong>{macro.name}<small>v{macro.revision} · {macro.shared ? '共享' : '草稿'}</small></strong><span>{macro.description}</span><code>{macro.id}</code></button>)}</div>
-      {loading && <p role="status">正在读取目录…</p>}
-      {!loading && !catalog?.macros.length && <p>没有匹配的宏</p>}
-      <div className="macro-pagination"><button type="button" disabled={!offset} onClick={() => setOffset(Math.max(0, offset - 50))}>上一页</button><span>{catalog?.total ?? 0} 项</span><button type="button" disabled={catalog?.next_offset == null} onClick={() => setOffset(catalog?.next_offset ?? 0)}>下一页</button></div>
-    </aside>
+  const macros = catalog?.macros ?? []
+  return <main className="workspace-shell macro-page">
+    <WorkspaceSidebar title="宏目录" className="macro-catalog" actions={<>
+      <button type="button" aria-label="筛选宏" title="筛选宏" aria-expanded={filterOpen} aria-controls={filterId} onClick={() => setFilterOpen(!filterOpen)}><Search size={15} /></button>
+      <button type="button" className="macro-new" aria-label="新建宏" title="新建宏" onClick={() => newMacro()}><Plus size={16} /></button>
+    </>}>
+      <Disclosure className="catalog-filter" open={filterOpen} transition={{duration:reduced ? 0 : 0.18}}>
+        <DisclosureContent id={filterId}><div className="catalog-filter-fields">
+          <input className="macro-search" aria-label="查找宏" placeholder="搜索宏…" value={query} onChange={event => { setQuery(event.target.value); setOffset(0) }} />
+          <label className="macro-drafts-toggle"><input type="checkbox" checked={includeDrafts} onChange={event => { setIncludeDrafts(event.target.checked); setOffset(0) }} /> 显示未共享草稿</label>
+          <button type="button" aria-label="刷新宏目录" title="刷新宏目录" onClick={() => setRefresh(value => value + 1)}><RefreshCw size={14} /></button>
+        </div></DisclosureContent>
+      </Disclosure>
+      <div className="macro-list" aria-label="已有宏">
+        {macros.length > 0 && <BounceSidebar items={macros.map(macro => macro.name)} value={macros.findIndex(macro => macro.id === editor.saved?.id)}
+          onChange={index => void load(macros[index].id)} itemProps={index => ({title: macros[index].description, 'aria-pressed': editor.saved?.id === macros[index].id})} />}
+        {loading && !macros.length && <p role="status">正在读取目录…</p>}
+        {!loading && !macros.length && <p>没有匹配的宏</p>}
+      </div>
+      <div className="macro-compact-picker"><ModelPicker label="选择宏" value={editor.saved?.id ?? ''}
+        models={[{id: '', name: '选择宏'}, ...macros.map(macro => ({id: macro.id, name: macro.name}))]} searchable onSearchChange={value => { setQuery(value); setOffset(0) }} onChange={id => { if (id) void load(id) }} /></div>
+      {(offset > 0 || catalog?.next_offset != null) && <div className="macro-pagination"><button type="button" disabled={!offset} onClick={() => setOffset(Math.max(0, offset - 50))}>上一页</button><span>{catalog?.total} 项</span><button type="button" disabled={catalog?.next_offset == null} onClick={() => setOffset(catalog?.next_offset ?? 0)}>下一页</button></div>}
+    </WorkspaceSidebar>
     <section className="macro-editor-panel">
-      <div className="macro-heading"><div><h2>{editor.saved ? editor.saved.name : '新建命令宏'}</h2><small>{editor.saved ? `v${editor.saved.revision}${dirty ? ' · 有未保存修改' : ''}` : '保存为草稿，通过试运行后可共享'} · 人和 Agent 使用同一份定义</small></div><button type="button" onClick={() => newMacro(true)}>U-Boot 模板</button></div>
-      <form onSubmit={(event) => { event.preventDefault(); void save() }}>
-        <div className="macro-fields"><label>ID<input aria-label="宏 ID" required readOnly={!!editor.saved} pattern="[A-Za-z0-9_-]+" value={editor.id} onChange={(event) => updateEditor({ ...editor, id: event.target.value })} /></label><label>名称<input required value={editor.name} onChange={(event) => updateEditor({ ...editor, name: event.target.value })} /></label></div>
-        <label>用途说明<input required value={editor.description} onChange={(event) => updateEditor({ ...editor, description: event.target.value })} /></label>
-        <div className="macro-fields"><label>适用一级机型<select value={editor.modelFamily} onChange={(event) => updateEditor({ ...editor, modelFamily: event.target.value, modelNames: '' })}><option value="">通用</option>{modelFamilies.map((family) => <option key={family.name}>{family.name}</option>)}</select></label><label>二级机型（可选，逗号分隔）<input disabled={!editor.modelFamily} value={editor.modelNames} onChange={(event) => updateEditor({ ...editor, modelNames: event.target.value })} placeholder="留空适用于该一级机型" /></label></div>
-        <div className="macro-source-fields"><label>脚本<textarea className="macro-script" spellCheck={false} value={editor.script} onChange={(event) => updateEditor({ ...editor, script: event.target.value })} /></label><label>参数定义（JSON）<textarea spellCheck={false} value={editor.parameters} onChange={(event) => updateEditor({ ...editor, parameters: event.target.value })} /><small>脚本通过 args.name 读取参数。支持 string、integer、boolean。</small></label></div>
-        <p className="macro-help"><code>cmd("命令")</code> 自动加换行并核对完整回显；cmd("…", "send_only") 显式跳过回显核对；<code>watch / wait / delay</code> 等待设备；支持 <code>if / else / for / while</code>。保存仅校验语法，试运行会实际操作串口。</p>
-        <div className="macro-save-row"><label><input type="checkbox" checked={editor.shared} onChange={(event) => updateEditor({ ...editor, shared: event.target.checked })} /> 共享到默认宏列表，供其他 Agent 查找复用</label><button type="submit" disabled={!connected || saving}><Save size={15} /> {saving ? '校验保存中…' : '校验并保存'}</button></div>
+      <header className="macro-workbar"><div className="macro-workbar-inner">
+        <div className="macro-title"><h1 title={section === '指南' ? '宏指南' : editor.saved?.name || '新建命令宏'}>{section === '指南' ? '宏指南' : editor.saved?.name || '新建命令宏'}</h1>
+          {section === '编辑' && editor.saved && <small title={dirty ? '有未保存修改' : undefined}>v{editor.saved.revision}{dirty ? ' •' : ''}</small>}</div>
+        <GooeyNav className="macro-tabs" aria-label="宏工作区" items={['编辑','指南']} value={section === '编辑' ? 0 : 1}
+          onChange={index => setSection(index ? '指南' : '编辑')} size="xs" separation={5} radius={6} activeColor="var(--run-bg)" activeLabelColor="var(--run-text)" />
+      </div></header>
+      <div className="macro-scroll" key={section}><div className="macro-work">
+      {section === '编辑' && <><form onSubmit={event => { event.preventDefault(); void save() }}>
+        <div className="macro-fields"><label>名称<input required value={editor.name} onChange={event => updateEditor({ ...editor, name: event.target.value })} /></label>
+          <label>宏 ID<input aria-label="宏 ID" required readOnly={!!editor.saved} pattern="[A-Za-z0-9_\-]+" value={editor.id} onChange={event => updateEditor({ ...editor, id: event.target.value })} /></label></div>
+        <label>用途说明<input required value={editor.description} onChange={event => updateEditor({ ...editor, description: event.target.value })} /></label>
+        <div className="macro-code-field"><div><label htmlFor={scriptId}>脚本</label>
+          <button className="macro-template" type="button" onClick={() => newMacro(true)}>U-Boot 模板</button></div>
+          <textarea id={scriptId} className="macro-script" spellCheck={false} value={editor.script} onChange={event => updateEditor({ ...editor, script: event.target.value })} /></div>
+        <MoreFields title="参数与适用机型"><div className="macro-fields">
+          <OptionField label="机型系列" value={editor.modelFamily} options={[{id: '', name: '通用'}, ...modelFamilies.map(({name}) => ({id: name, name}))]} onChange={modelFamily => updateEditor({...editor, modelFamily, modelNames: ''})} />
+          <label>适用型号<input disabled={!editor.modelFamily} value={editor.modelNames} onChange={event => updateEditor({ ...editor, modelNames: event.target.value })} placeholder="多个型号用逗号分隔" /></label></div>
+          <label>参数定义（JSON）<textarea spellCheck={false} value={editor.parameters} onChange={event => updateEditor({ ...editor, parameters: event.target.value })} /></label>
+        </MoreFields>
+        <div className="macro-save-row"><label><input type="checkbox" checked={editor.shared} onChange={event => updateEditor({ ...editor, shared: event.target.checked })} /> 共享到默认宏列表</label>
+          <button className="primary-button" type="submit" disabled={!connected || saving}><Save size={15} /> {saving ? '校验保存中…' : '校验并保存'}</button></div>
       </form>
+      <section className="macro-run-panel"><MoreFields title="试运行">
+        <div className="macro-run-fields">
+          <OptionField label="目标串口" value={target} options={ports.map(({config}) => ({id: config.port, name: [config.port, config.model_name].filter(Boolean).join(' · ')}))} onChange={setTarget} />
+          <label>超时（秒）<input type="number" min={1} max={120} value={timeout} onChange={event => setTimeoutSeconds(Number(event.target.value))} /></label>
+          {Object.entries(editor.saved?.parameters ?? {}).map(([name, parameter]) => parameter.type === 'boolean'
+            ? <OptionField key={name} label={name} value={args[name] ?? String(parameter.default ?? '')} options={[{id:'',name:'请选择'},{id:'true',name:'true'},{id:'false',name:'false'}]} onChange={value => setArgs({...args, [name]: value})} />
+            : <label key={name} title={parameter.description}>{name}<input type={parameter.type === 'integer' ? 'number' : 'text'} min={parameter.minimum} max={parameter.maximum}
+              value={args[name] ?? String(parameter.default ?? '')} onChange={event => setArgs({...args, [name]: event.target.value})} /></label>)}
+        </div>
+        <div className="macro-run-actions"><button type="button" disabled={!connected || !editor.saved || dirty || busy || !target || !Number.isInteger(timeout) || timeout < 1 || timeout > 120} onClick={() => void run()}><Play size={15} /> {starting ? '启动中…' : '运行已保存版本'}</button>
+          {execution && ['running', 'stopping'].includes(execution.status) && <button type="button" disabled={!connected || execution.status === 'stopping'} onClick={() => { void window.serial.cancelMacro(execution.port, execution.id).then(onExecution).catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }}><Square size={14} /> 停止</button>}
+          {dirty && <small>修改保存后才能试运行</small>}</div>
+        {execution && <MacroProgress execution={execution} events={events?.[execution.port] ?? []} />}
+      </MoreFields></section></>}
+      {section === '指南' && <MacroGuide />}
       {notice && <p role="status" className="macro-notice">{notice}</p>}
       {error && <pre role="alert" className="macro-error">{error}</pre>}
-      <section className="macro-run-panel"><h3>试运行{editor.saved ? ` · ${editor.saved.id} v${editor.saved.revision}` : ''}</h3><div className="macro-run-fields"><label>串口<select value={target} onChange={(event) => setTarget(event.target.value)}>{ports.map((port) => <option key={port.config.port} value={port.config.port}>{port.config.port}{port.config.model_name ? ` · ${port.config.model_name}` : ''}</option>)}</select></label><label>超时（秒）<input type="number" min={1} max={120} value={timeout} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} /></label>{Object.entries(editor.saved?.parameters ?? {}).map(([name, parameter]) => <label key={name} title={parameter.description}>{name}{parameter.type === 'boolean' ? <select value={args[name] ?? String(parameter.default ?? '')} onChange={(event) => setArgs({ ...args, [name]: event.target.value })}><option value="">请选择</option><option>true</option><option>false</option></select> : <input type={parameter.type === 'integer' ? 'number' : 'text'} value={args[name] ?? String(parameter.default ?? '')} min={parameter.minimum} max={parameter.maximum} onChange={(event) => setArgs({ ...args, [name]: event.target.value })} />}</label>)}</div><div className="macro-run-actions"><button type="button" disabled={!connected || !editor.saved || dirty || busy || !target || !Number.isInteger(timeout) || timeout < 1 || timeout > 120} onClick={() => void run()}><Play size={15} /> {starting ? '启动中…' : '运行已保存版本'}</button>{execution && ['running', 'stopping'].includes(execution.status) && <button type="button" disabled={!connected || execution.status === 'stopping'} onClick={() => { void window.serial.cancelMacro(execution.port, execution.id).then(onExecution).catch((reason) => setError(String(reason instanceof Error ? reason.message : reason))) }}><Square size={14} /> 停止</button>}{dirty && <small>修改保存后才能试运行</small>}</div>
-      {execution && <div className={`macro-execution ${execution.outcome_uncertain ? 'is-uncertain' : ''}`} role="status"><strong>{execution.port} · {execution.description}</strong><span>{statusLabel(execution.status)} · 第 {execution.line} 行 · 已发送 {execution.writes} 条 · 输入已核对 {execution.input_verified_writes ?? 0} 条 · 只发送 {execution.send_only_writes ?? 0} 条</span>{execution.message && <p>{execution.message}</p>}{execution.outcome_uncertain && <p>执行结果不确定，请先查看串口时间线，勿直接重跑。</p>}</div>}</section>
-    </section>
+    </div></div></section>
   </main>
 }
 
-function statusLabel(status: MacroExecution['status']): string {
-  return { running: '运行中', stopping: '正在停止', succeeded: '已完成', timed_out: '已超时', cancelled: '已停止', interrupted_by_user: '用户已介入', failed: '执行失败' }[status]
+function MacroGuide() {
+  const reduced = useReducedMotion()
+  return <Accordion className="macro-guide" transition={{ duration: reduced ? 0 : 0.22 }}>
+    {[
+      ['宏的用途', <>把反复输入的一组命令保存为宏。人工执行和外部 Agent 调用可以复用同一个已保存版本。</>],
+      ['适用场景与前提', <>读取设备版本、等待启动提示符或按条件重复发送命令，都可以写成宏。试运行前选择可用串口，并确认目标机型与宏的适用范围一致。</>],
+      ['命令与参数规则', <><code>cmd("version")</code> 会加上换行并核对回显。<code>cmd("…", "send_only")</code> 只发送。用 <code>watch</code>、<code>wait</code>、<code>delay</code> 等待设备，用 <code>args.name</code> 读取字符串、整数或布尔参数。</>],
+      ['从第一个宏开始', <>新建宏或选用 U-Boot 模板，填写名称和用途，编辑脚本后校验并保存。在编辑器下方展开「试运行」选择串口和参数。运行会实际向所选设备写入命令。</>],
+    ].map(([title, body]) => <AccordionItem value={String(title)} key={String(title)}>
+      <AccordionTrigger className="guide-trigger">{title}<ChevronDown size={16} aria-hidden /></AccordionTrigger>
+      <AccordionContent className="guide-content"><p>{body}</p></AccordionContent>
+    </AccordionItem>)}
+  </Accordion>
+}
+
+function MacroProgress({ execution, events }: { execution: MacroExecution; events: TimelineEvent[] }) {
+  const state = macroExecutionLabel(execution)
+  const finished = !['running', 'stopping'].includes(execution.status)
+  const marks: StepMark[] = [{ index: 0, tone: 'done', label: '已开始' }]
+  if (execution.writes > 0) marks.push({ index: 1, tone: 'done', label: '已写入串口' })
+  if (finished || execution.outcome_uncertain) marks.push({ index: 2, ...state })
+  const commands = new Map<string | number, string>()
+  for (const event of events) {
+    if (event.kind !== 'tx' || event.daemon_epoch !== execution.daemon_epoch || event.generation !== execution.generation
+      || event.metadata.macro_execution_id !== execution.id) continue
+    const key = event.operation_id ?? event.seq
+    commands.set(key, (commands.get(key) ?? '') + event.text)
+  }
+  return <div className={`macro-execution ${execution.outcome_uncertain ? 'is-uncertain' : ''}`}>
+    <strong className="command-ink" data-tone={state.tone} title={state.label}>{execution.port} · {execution.description}</strong>
+    <div className="macro-progress" role="status"><StepPlayer steps={marks} total={3} label={'宏执行阶段 · ' + state.label} /></div>
+    <span>第 {execution.line} 行 · 已发送 {execution.writes} 条 · 输入已核对 {execution.input_verified_writes ?? 0} 条 · 只发送 {execution.send_only_writes ?? 0} 条</span>
+    {!!commands.size && <ol className="macro-command-list">{[...commands].map(([key, text]) => <li key={key}><code className="command-ink" data-tone="idle" title="已发送">{displayCommand(text) || 'Enter'}</code></li>)}</ol>}
+    {execution.message && <p>{execution.message}</p>}
+    {execution.outcome_uncertain && <p>执行结果待核对，请查看串口时间线。</p>}
+  </div>
 }

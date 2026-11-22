@@ -1780,6 +1780,41 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn setup_checks_require_new_device_output_after_a_single_write() {
+            let mut f = Fixture::new().await;
+            let heartbeat =
+                r#"let ready = watch(prompt("shell")); cmd("", "send_only"); expect(ready, 300);"#;
+            let first = Uuid::new_v4();
+            f.start(first, heartbeat).await.unwrap();
+            assert_eq!(f.command().await, b"\r");
+            f.master.write_all(b"\r\n# ").await.unwrap();
+            let result = f.terminal(first).await;
+            assert_eq!(result.status, MacroStatus::Succeeded);
+            assert_eq!(result.send_only_writes, 1);
+
+            let second = Uuid::new_v4();
+            f.start(second, heartbeat).await.unwrap();
+            assert_eq!(f.command().await, b"\r");
+            assert_eq!(f.terminal(second).await.status, MacroStatus::Failed);
+
+            let status = r#"let ready = watch(prompt("shell")); let reply = watch("firmware"); cmd("version", "send_only"); expect(reply, 500); expect(ready, 500);"#;
+            let third = Uuid::new_v4();
+            f.start(third, status).await.unwrap();
+            assert_eq!(f.command().await, b"version\r");
+            f.master
+                .write_all(b"version\r\nfirmware 2.4.1\r\n# ")
+                .await
+                .unwrap();
+            assert_eq!(f.terminal(third).await.status, MacroStatus::Succeeded);
+            let fourth = Uuid::new_v4();
+            f.start(fourth, status).await.unwrap();
+            assert_eq!(f.command().await, b"version\r");
+            f.master.write_all(b"version\r\n# ").await.unwrap();
+            assert_eq!(f.terminal(fourth).await.status, MacroStatus::Failed);
+            f.close().await;
+        }
+
+        #[tokio::test]
         async fn slow_rotating_journal_does_not_disable_macros_and_late_ack_recovers_without_restart()
          {
             let mut f = Fixture::with_disk_delay(Duration::from_millis(20)).await;

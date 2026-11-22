@@ -4,19 +4,29 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 
 ## UI
 
-控制台是三栏工作台：
+左侧设备列表显示串口名、机型和连接状态。选择设备会切换当前栏，从设备列表把串口拖入工作区，现有栏会让出插入位置。松手时按指针所在的一侧插入；拖到工作区外取消。聚焦设备后也可以按空格拾取、左右键定位、回车放置。点击某一栏后，命令输入、查找和快捷键都作用于该栏。每栏右上角的 × 关闭视图，串口继续连接。
 
-- 左栏：OS 串口名、机型名、连接状态、打开/关闭串口和配置入口；
-- 中栏：只显示设备 RX 的持久/实时终端，底部是人工命令输入；
-- 右栏：从旧到新的 Agent Run、普通命令和 `command_sequence` 历史。
+每个串口保留独立的草稿、发送回执和终端。输入命令按 Enter 或点击 Run 发送。输入栏上方展示外部 Agent 的接管、Run 启动和命令进度。展开历史可以查看每个 Run 的启动节点。串口归属栏显示外部接管申请、当前 Run 和控制权持有者。Agent 运行期间可以发送人工协作命令，按后端回执显示发送、回显匹配、超时、中止等状态。点击状态球可暂停该栏动效，系统减少动态效果偏好也会生效。
 
-标题栏可启动 App 管理的本地后端，也只允许停止 App 自己启动的进程；连接外部后端时会明确显示为不可停止。配置页可以持久化“自动启动本地后端”开关，默认开启。App 和 `serial` 会在同一本地数据目录中自动发现并验证唯一后端；无论谁先启动、使用默认还是自定义 endpoint，后启动的一方都会复用同一个服务。
+外部 Agent 通过 Serial MCP 取得串口控制权时，Matrix Orb 亮起。每栏输入框上方显示当前命令的描述，例如「Agent 正在读取固件版本」。任务结束时显示本轮任务名和结果，例如「读取传感器状态已完成」。首次收到 Run 时自动展开可滚动的历史，箭头沿动作和命令依次推进。已执行的步骤保持展开，手动收起的历史或动作会在切换页面后保留。选中历史命令可定位到原始串口输出。[Agent 接入说明](../../adapters/README.md)
+
+运行 `npm run preview:browser` 可生成 `qa/browser-preview/index.html`。直接用浏览器打开即可操作模拟串口、观察示例 Run 的进度，并切换外观。Electron 应用使用相同的 React 页面和桌面通信接口。
+
+浏览器示例的 COM7 输入框上方有「回放示例」，可重复观看接管、Run 启动、命令等待回显及归还控制权。桌面端从「配置 → 应用 → 观看 Agent 运行示例」或空的 Agent 历史打开独立模拟窗口。
+
+首次使用桌面客户端时，向导会询问串口、Shell 提示符和健康检查需求。提示符示意使用 Animata 的 Typing Text。把向导生成的任务交给已接入 Serial MCP 的外部 Agent，查看返回的方案并确认保存，即可运行一次心跳或状态检查。已有工作区可在「配置 → 应用 → 打开首次配置向导」进入。[配置邀请契约](../../docs/MCP_TOOLS.md#首次配置邀请)
+
+拖动分隔线可调整栏宽。拖动标题中的串口名可交换分栏位置，聚焦串口名后也可用左右方向键移动。点击标题中的机型可直接切换当前串口的型号。
+
+Rare UI 的 Gooey Nav 和 Bounce Sidebar 用于导航，Prompt Box 负责单行发送，Matrix Orb 表示外部 Agent 占用。Rail TOC 和 Step Player 跟随串口事件，Model Picker 和 Animated Counter 用于通信参数，Theme Selector 用于切换外观。Motion-Primitives 的 Disclosure、Accordion、Scroll Progress、Transition Panel、Animated Background 和 Text Effect 分别用于展开详情、宏指南、滚动进度、切换、选中态和命令出现。组件通过各自的官方安装器加入本项目。[Rare UI](https://github.com/swamimalode07/rare-ui) · [Motion-Primitives](https://github.com/ibelick/motion-primitives)
+
+配置页提供本地后端的启动和停止操作，也会标明当前连接的外部后端。配置页可以持久化“自动启动本地后端”开关，默认开启。App 和 `serial` 会在同一本地数据目录中自动发现并验证唯一后端；无论谁先启动、使用默认还是自定义 endpoint，后启动的一方都会复用同一个服务。
 
 选择具体 Agent 命令时，终端优先按持久化的 `command_capture_completed.metadata.capture` 关联 `operation_id`，使用 daemon 校验过的 `evidence_from_seq`、`evidence_through_seq` 和 RX stream offsets 定位对应输出。这样 quiet completion、重复 prompt 和重连后的历史都不需要 UI 重新猜测结束位置。旧版记录没有权威 capture 时才在同一 daemon epoch、generation 和下一条 TX/硬边界之前重跑 `command_capture_matchers`，并明确标记为“旧记录：输出范围由匹配规则推断”。没有可用范围时只显示临时命令提示，不把本机 TX 插入 RX 历史。
 
 终端支持 VS Code 风格的右上角 Find Widget、双击选词、错误/警告/成功词边界着色以及 IP/MAC 着色。Find Widget 默认隐藏，只能通过标题栏查找按钮、`Ctrl/Cmd+F` 或 `F3` 显式打开，普通字符不会自动抢占命令输入焦点。`Enter`/`F3` 和 `Shift+Enter`/`Shift+F3` 循环移动当前匹配，Widget 显示 `n/total`，并区分当前匹配和其他匹配；`Esc` 关闭后恢复原焦点，命令草稿与搜索草稿都保留。
 
-搜索文档由终端实际显示的 RX 文本连续组成，因此匹配可以跨越多个 RX event。匹配锚点使用 daemon epoch、event seq 和 event-local offset；实时 append、滚动窗口 truncate 或 snapshot rebuild 后，仍存在的当前匹配不会因数组下标变化而跳走。首次查询扫描完整显示文档，之后 append 只扫描 `query.length - 1` 的尾部重叠区和新增文本；终端 chunk 使用稳定对象与 memoized rendering，避免每个 event 重编译搜索正则或全量重绘 DOM。Agent 历史在 follow 状态下自动滚动到最新。
+搜索文档由终端实际显示的 RX 文本连续组成，因此匹配可以跨越多个 RX event。匹配锚点使用 daemon epoch、event seq 和 event-local offset；实时 append、滚动窗口 truncate 或 snapshot rebuild 后，仍存在的当前匹配不会因数组下标变化而跳走。首次查询扫描完整显示文档，之后 append 只扫描 `query.length - 1` 的尾部重叠区和新增文本；终端 chunk 使用稳定对象与 memoized rendering，避免每个 event 重编译搜索正则或全量重绘 DOM。
 
 当 Agent 请求在 Human 已持有的串口上启动 Run 时，App 会从 snapshot 或实时 timeline 恢复 `pending_run_start`。只有当前 Desktop WebSocket actor 确实等于 `required_approver`，并且仍持有匹配 control id、fence、daemon epoch 和 generation 的 Human lease 时，才显示 RunStart 审批对话框。对话框展示串口、Agent label、Run label 和剩余时间；批准或拒绝通过 `DecideRunStart` 发送。approved、denied、timed out、cancelled、过期或断连都会清理对话框，提交锁和主进程的最新状态复验会阻止重复点击及旧请求误决策。
 
@@ -28,7 +38,7 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 
 Model Profile 和 Model Family 是两份独立 catalog。端口的 `model_profile` 只决定串口交互行为；`model_family` 和 `model_name` 成对标记当前设备，具体机型必须来自所选系列的二级列表。
 
-主题支持 system、light 和 dark。
+在「配置 → 应用」可选择海湾蓝、磷光绿、琥珀金、赤陶红或石墨灰。每种配色都有浅色和深色两套，也可以跟随系统。磷光绿的深色终端使用近黑底色和绿色输出。
 
 快捷键：
 
@@ -99,7 +109,7 @@ renderer-only QA 必须显式使用 `?qa=1&theme=dark` 或 `light`；正常启�
 
 ## Packaging
 
-CI 先把同架构 `serial` 与 `seriald` 放入 `resources/bin`，再运行 electron-builder：
+CI 先把同架构的 `serial`、`seriald` 和 `serial-mcp` 放入 `resources/bin`，再运行 electron-builder：
 
 ```sh
 npm run package:mac

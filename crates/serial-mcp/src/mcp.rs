@@ -636,6 +636,19 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
+            "setup_proposal",
+            "Read a Desktop setup invitation. Submit a plan for user review, preserving the literal Shell prompt. For heartbeat leave both check fields empty. For status use a read-only check.",
+            object(
+                json!({"request_id":{"type":"string","format":"uuid"},"plan":object(json!({
+                "shell_prompt":{"type":"string","minLength":1,"maxLength":512},
+                "command":{"type":"string","maxLength":512},
+                "expected_reply":{"type":"string","maxLength":512}
+            }), &["shell_prompt","command","expected_reply"])}),
+                &["request_id"],
+            ),
+            false,
+        ),
+        tool(
             "devices",
             "List serial ports with concrete model identity, command prompts, readiness, cursor, and current ownership.",
             object(json!({"port":{"type":"string"}}), &[]),
@@ -1167,6 +1180,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "setup_proposal",
                 "devices",
                 "model_identity_set",
                 "read",

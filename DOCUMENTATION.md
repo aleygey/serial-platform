@@ -304,10 +304,10 @@ renderer 是 React 视图，不直接访问后端。控制台为三栏布局：�
 
 Streamable HTTP 没有认证和 TLS。listener 必须是一个精确单播地址，拒绝 IPv4/IPv6 unspecified、multicast 和 IPv4 broadcast；非 loopback 只允许用于受信 host-only VM interface，进程会打印安全警告，并要求用主机防火墙限制访问。`Origin` 可以省略；存在时必须是同端口、无 credentials/path/query/fragment 的 `http://` origin，host 是 listener 的精确 numeric IP。仅当 listener 本身为 loopback 时额外允许 `localhost`。这项检查是浏览器跨站缓解，不是认证，不能据此把 endpoint 暴露到 LAN 或公共网络。
 
-两种 transport 共享以下固定 18 个工具和相同结构化结果：
+两种 transport 共享以下固定 19 个工具和相同结构化结果：
 
 ```text
-devices model_identity_set read command command_sequence signal macro_list macro_save macro_run wait
+setup_proposal devices model_identity_set read command command_sequence signal macro_list macro_save macro_run wait
 search monitor_start monitor_list monitor_status monitor_incidents monitor_stop
 run_start run_end
 ```
@@ -368,6 +368,6 @@ Electron application
 BUILD-INFO.json
 ```
 
-Electron 形态为 Linux AppImage、Windows portable EXE、macOS `.app`。最终 artifacts 生成统一 `SHA256SUMS`。
+Electron 形态为 Linux AppImage、Windows portable EXE、macOS `.app`。Windows 的便携 EXE 也单独列在 Release 下载项中，与 ZIP 内的桌面程序相同。四个压缩包和单独的 EXE 均纳入 `SHA256SUMS`。
 
 macOS Rust CLI 的 deployment target 是 11.0；Electron 43 App 的最低系统版本是 12.0。当前 macOS `.app` 没有 Developer ID 签名，也没有 Apple notarization。

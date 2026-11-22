@@ -1,5 +1,14 @@
-import { ArrowLeft, Cable, Check, Cpu, Moon, Plus, Save, Sun, Trash2 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Plus, Save, Trash2 } from 'lucide-react'
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type KeyboardEvent } from 'react'
+import { BaudRateField, SerialNumberField } from './BaudRateField'
+import { BounceSidebar } from './ui/bounce-sidebar'
+import { ModelIdentityPicker, MoreFields, OptionField } from './SerialFields'
+import { ModelPicker } from './ui/model-picker'
+import { TransitionPanel } from './ui/transition-panel'
+import { WorkspaceSidebar } from './WorkspaceSidebar'
+import { DEFAULT_THEMES, ThemeSelector } from './ui/theme-selector'
+import { palettes, paletteId } from '../../shared/appearance'
+import { useAppearanceMode } from '../lib/appearance'
 import type {
   DesktopPreferences,
   ModelFamily,
@@ -18,66 +27,97 @@ interface Props {
   modelProfiles: ModelProfile[]
   modelFamilies: ModelFamily[]
   preferences: DesktopPreferences
+  serviceControls?: ReactNode
   initialPort?: string
-  onBack: () => void
   onSaveSerial: (draft: SerialConfigurationDraft) => Promise<boolean>
   onSaveModels: (profiles: ModelProfile[]) => Promise<boolean>
   onSaveModelFamilies: (families: ModelFamily[]) => Promise<boolean>
   onSavePreferences: (preferences: DesktopPreferences) => Promise<void>
+  onOpenSetup?: () => void
+  onOpenRunExample?: () => void
 }
 
-type SettingsSection = 'serial' | 'model' | 'identity'
+const sections = [
+  { id: 'serial', label: '串口配置' },
+  { id: 'model', label: '机型 Profile' },
+  { id: 'identity', label: '机型名称' },
+  { id: 'application', label: '应用' }
+] as const
+
+const themes = [
+  { value: 'system', label: '跟随系统', colors: { ...DEFAULT_THEMES[1].colors, sidebar: '#29414c', strong: '#94acb6', muted: '#687e87' } },
+  { ...DEFAULT_THEMES[1], label: '浅色' },
+  { ...DEFAULT_THEMES[0], label: '深色' }
+]
+
+// A live status refresh sends new objects even when the saved configuration is identical.
+function useConfigurationChange<T>(value: T, onChange: (next: T) => void): void {
+  const previous = useRef(value)
+  useEffect(() => {
+    const last = previous.current
+    previous.current = value
+    if (last !== value && JSON.stringify(last) !== JSON.stringify(value)) onChange(value)
+  }, [value, onChange])
+}
 
 export function SettingsPage(props: Props): React.JSX.Element {
-  const [section, setSection] = useState<SettingsSection>('serial')
-  const [saved, setSaved] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const [savedSection, setSavedSection] = useState<number>()
+  const content = useRef<HTMLElement>(null)
+  const groupId = useId()
+  const tabIds = sections.map(({ id }) => `${groupId}-${id}`)
+
+  function selectSection(index: number): void {
+    if (activeIndex === index) return
+    setActiveIndex(index)
+    content.current?.scrollTo({ top: 0 })
+  }
+
+  function moveTab(event: KeyboardEvent<HTMLButtonElement>, index: number): void {
+    let next: number
+    switch (event.key) {
+      case 'ArrowUp': next = (index + sections.length - 1) % sections.length; break
+      case 'ArrowDown': next = (index + 1) % sections.length; break
+      case 'Home': next = 0; break
+      case 'End': next = sections.length - 1; break
+      default: return
+    }
+    event.preventDefault()
+    document.getElementById(tabIds[next])?.focus()
+    selectSection(next)
+  }
 
   const saveNotice = (): void => {
-    setSaved(true)
-    setTimeout(() => setSaved(false), 1_600)
+    setSavedSection(activeIndex)
+    setTimeout(() => setSavedSection(undefined), 1_600)
   }
 
   return (
-    <main className="settings-page">
-      <header className="settings-topbar">
-        <button className="icon-button" type="button" onClick={props.onBack}><ArrowLeft size={18} /></button>
-        <div>
-          <strong>设备配置</strong>
-          <small>串口连接、交互行为与机型名称分别管理</small>
-        </div>
-        {saved && <span className="saved-badge"><Check size={14} /> 已保存</span>}
-      </header>
-      <div className="settings-layout">
-        <nav className="settings-nav">
-          <button className={section === 'serial' ? 'is-active' : ''} onClick={() => setSection('serial')} type="button">
-            <span className="settings-nav-icon"><Cable size={18} /></span>
-            <span><strong>串口配置</strong><small>端口与通信参数</small></span>
-          </button>
-          <button className={section === 'model' ? 'is-active' : ''} onClick={() => setSection('model')} type="button">
-            <span className="settings-nav-icon"><Cpu size={18} /></span>
-            <span><strong>机型 Profile</strong><small>提示符与交互行为</small></span>
-          </button>
-          <button className={section === 'identity' ? 'is-active' : ''} onClick={() => setSection('identity')} type="button">
-            <span className="settings-nav-icon"><Cpu size={18} /></span>
-            <span><strong>机型名称</strong><small>系列与具体型号</small></span>
-          </button>
-          <ApplicationSettings preferences={props.preferences} onSave={async (preferences) => {
-            await props.onSavePreferences(preferences)
-            saveNotice()
-          }} />
-        </nav>
-        <section className="settings-content">
-          {section === 'serial' ? (
+    <main className="settings-page" data-saved={savedSection === activeIndex || undefined}>
+      <span className="sr-only" role="status">{savedSection === activeIndex ? '已保存' : ''}</span>
+      <div className="workspace-shell settings-layout">
+        <WorkspaceSidebar className="settings-nav" title="配置">
+          <BounceSidebar className="settings-sections" items={sections.map(section => section.label)} value={activeIndex}
+            role="tablist" aria-label="设备配置分类" aria-orientation="vertical" onChange={selectSection}
+            itemProps={index => ({ role: 'tab', id: tabIds[index], 'data-id': sections[index].id,
+              'aria-selected': activeIndex === index, 'aria-controls': tabIds[index] + '-panel', tabIndex: activeIndex === index ? 0 : -1,
+              onKeyDown: event => moveTab(event, index) })} />
+          <div className="compact-section-picker"><ModelPicker label="配置分类" models={sections.map(({ id, label }) => ({id, name: label}))}
+            value={sections[activeIndex].id} onChange={id => selectSection(sections.findIndex(section => section.id === id))} /></div>
+        </WorkspaceSidebar>
+        <section className="settings-content" ref={content}>
+          <TransitionPanel activeIndex={activeIndex} tabIds={tabIds}>
             <SerialEditor {...props} onSaved={saveNotice} />
-          ) : section === 'model' ? (
             <ModelEditor profiles={props.modelProfiles} configuredPorts={props.configuredPorts} onSave={async (profiles) => {
               if (await props.onSaveModels(profiles)) saveNotice()
             }} />
-          ) : (
             <ModelFamilyEditor families={props.modelFamilies} configuredPorts={props.configuredPorts} onSave={async (families) => {
               if (await props.onSaveModelFamilies(families)) saveNotice()
             }} />
-          )}
+            <div className="editor-shell"><div className="editor-heading"><h1>应用</h1></div>
+              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} onOpenSetup={props.onOpenSetup} onOpenRunExample={props.onOpenRunExample} />
+            </div>
+          </TransitionPanel>
         </section>
       </div>
     </main>
@@ -101,85 +141,55 @@ function SerialEditor({
     [selectedPort, configuredPorts, transportProfiles]
   )
   const [value, setValue] = useState(draft)
-  useEffect(() => setValue(draft), [draft])
+  useConfigurationChange(draft, setValue)
   const updateProfile = <K extends keyof TransportProfile>(key: K, next: TransportProfile[K]): void => {
     setValue((current) => ({ ...current, transportProfile: { ...current.transportProfile, [key]: next } }))
   }
-  const selectedModelFamily = modelFamilies.find((family) => family.name === value.modelFamily)
 
   return (
     <div className="editor-shell">
       <div className="editor-heading">
-        <div><span className="eyebrow">SERIAL CONNECTION</span><h1>串口配置</h1><p>选择物理端口，并配置 UART 通信参数与关联机型。</p></div>
-        <button className="primary-button" type="button" disabled={!value.port || Boolean(value.modelFamily) !== Boolean(value.modelName)} onClick={async () => {
+        <div><h1>串口配置</h1></div>
+        <button className="primary-button" type="button" disabled={!value.port || !value.transportProfile.baud_rate || Boolean(value.modelFamily) !== Boolean(value.modelName)} onClick={async () => {
           if (await onSaveSerial(value)) onSaved()
         }}><Save size={16} /> 保存串口配置</button>
       </div>
-      <div className="serial-editor-grid">
-        <div className="device-picker">
-          {allPorts.map((port) => {
-            const configured = configuredPorts.find((item) => item.config.port === port)
-            const descriptor = availablePorts.find((item) => item.name === port)
-            return (
-              <button className={selectedPort === port ? 'is-active' : ''} key={port} onClick={() => setSelectedPort(port)} type="button">
-                <span className={`status-dot ${configured?.session_state === 'online' ? 'is-open' : 'is-idle'}`} />
-                <span><strong>{port}</strong><small>{configured?.config.model_name || descriptor?.product || '可用串口'}</small></span>
-              </button>
-            )
-          })}
-          {!allPorts.length && <div className="empty-picker">没有检测到串口</div>}
-        </div>
-        <div className="form-card">
-          <div className="form-section-title"><span>01</span><div><strong>端口绑定</strong><small>物理端口就是唯一设备位</small></div></div>
-          <div className="field-grid three">
-            <Field label="串口">
-              <select value={value.port} onChange={(event) => { setSelectedPort(event.target.value); setValue((current) => ({ ...current, port: event.target.value })) }}>
-                {allPorts.map((port) => <option key={port}>{port}</option>)}
-              </select>
-            </Field>
-            <Field label="机型 Profile">
-              <select value={value.modelProfile ?? ''} onChange={(event) => setValue((current) => selectModelProfile(current, event.target.value || null, modelProfiles))}>
-                <option value="">通用交互参数</option>
-                {modelProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.name}</option>)}
-              </select>
-            </Field>
-            <Field label="一级机型">
-              <select value={value.modelFamily ?? ''} onChange={(event) => setValue((current) => selectModelFamily(current, event.target.value || null, modelFamilies))}>
-                <option value="">未标记机型</option>
-                {modelFamilies.map((family) => <option key={family.name} value={family.name}>{family.name}</option>)}
-              </select>
-            </Field>
-            <Field label="具体型号">
-              <select
-                disabled={!selectedModelFamily || selectedModelFamily.model_names.length === 0}
-                value={value.modelName ?? ''}
-                onChange={(event) => setValue((current) => ({ ...current, modelName: event.target.value || null }))}
-              >
-                <option value="">{selectedModelFamily && selectedModelFamily.model_names.length === 0 ? '该系列暂无具体型号' : '选择具体型号'}</option>
-                {selectedModelFamily?.model_names.map((name) => <option key={name} value={name}>{name}</option>)}
-              </select>
-            </Field>
+      <div className="config-form">
+        <section className="config-section">
+          <h2>设备</h2>
+          <div className="field-grid two">
+            <OptionField label="串口" value={selectedPort} options={allPorts.map(port => ({id:port, name:port}))} onChange={setSelectedPort} />
+            <div className="form-field"><span>机型</span><ModelIdentityPicker families={modelFamilies} family={value.modelFamily} name={value.modelName}
+              onChange={(modelFamily, modelName) => setValue(current => ({...current, modelFamily, modelName}))} /></div>
           </div>
+        </section>
+        <section className="config-section">
+          <h2>通信参数</h2>
+          <div className="field-grid three">
+            <BaudRateField value={value.transportProfile.baud_rate} onChange={rate => updateProfile('baud_rate', rate)} />
+            <SerialNumberField label="数据位" value={DATA_BITS.indexOf(value.transportProfile.data_bits) + 5} choices={[5,6,7,8]}
+              onChange={n => updateProfile('data_bits', DATA_BITS[n - 5])} />
+            <SerialNumberField label="停止位" value={value.transportProfile.stop_bits === 'one' ? 1 : 2} choices={[1,2]}
+              onChange={n => updateProfile('stop_bits', n === 1 ? 'one' : 'two')} />
+          </div>
+          <MoreFields title="高级通信设置">
+            <div className="field-grid two">
+              <OptionField label="校验位" value={value.transportProfile.parity} options={[{id:'none',name:'无'},{id:'odd',name:'奇校验'},{id:'even',name:'偶校验'}]} onChange={id => updateProfile('parity', id)} />
+              <OptionField label="流控" value={value.transportProfile.flow_control} options={[{id:'none',name:'无'},{id:'software',name:'软件'},{id:'hardware',name:'硬件'}]} onChange={id => updateProfile('flow_control', id)} />
+              <OptionField label="交互 Profile" value={value.modelProfile ?? ''} options={[{id:'',name:'通用'}, ...modelProfiles.map(profile => ({id:profile.name,name:profile.name}))]}
+                onChange={id => setValue(current => selectModelProfile(current, id || null, modelProfiles))} />
+            </div>
+            <div className="inline-switches">
+              {(['dtr','rts','auto_open'] as const).map(key => <label key={key}><input type="checkbox" checked={value.transportProfile[key]} onChange={event => updateProfile(key,event.target.checked)} />{key === 'auto_open' ? '自动打开' : key.toUpperCase()}</label>)}
+            </div>
+          </MoreFields>
+        </section>
           <label className="switch-row">
-            <span><strong>保存后打开串口</strong><small>后端启动时也会自动恢复连接</small></span>
+            <span><strong>保存后打开串口</strong></span>
             <input type="checkbox" checked={value.enabled} onChange={(event) => setValue((current) => ({ ...current, enabled: event.target.checked }))} />
             <span className="switch-control" />
           </label>
-          <div className="form-divider" />
-          <div className="form-section-title"><span>02</span><div><strong>UART 参数</strong><small>按端口和参数内容自动管理配置</small></div></div>
-          <div className="field-grid three">
-            <Field label="波特率"><input inputMode="numeric" value={value.transportProfile.baud_rate} onChange={(event) => updateProfile('baud_rate', Number(event.target.value))} /></Field>
-            <Field label="数据位"><select value={value.transportProfile.data_bits} onChange={(event) => updateProfile('data_bits', event.target.value as TransportProfile['data_bits'])}>{['five', 'six', 'seven', 'eight'].map((option) => <option key={option} value={option}>{optionLabel(option)}</option>)}</select></Field>
-            <Field label="校验位"><select value={value.transportProfile.parity} onChange={(event) => updateProfile('parity', event.target.value as TransportProfile['parity'])}>{['none', 'odd', 'even'].map((option) => <option key={option}>{option}</option>)}</select></Field>
-            <Field label="停止位"><select value={value.transportProfile.stop_bits} onChange={(event) => updateProfile('stop_bits', event.target.value as TransportProfile['stop_bits'])}><option value="one">1</option><option value="two">2</option></select></Field>
-            <Field label="流控"><select value={value.transportProfile.flow_control} onChange={(event) => updateProfile('flow_control', event.target.value as TransportProfile['flow_control'])}>{['none', 'software', 'hardware'].map((option) => <option key={option}>{option}</option>)}</select></Field>
-          </div>
-          <div className="inline-switches">
-            {(['dtr', 'rts', 'auto_open'] as const).map((key) => (
-              <label key={key}><input type="checkbox" checked={value.transportProfile[key]} onChange={(event) => updateProfile(key, event.target.checked)} /><span>{key === 'auto_open' ? '自动打开' : key.toUpperCase()}</span></label>
-            ))}
-          </div>
-        </div>
+
       </div>
     </div>
   )
@@ -207,7 +217,10 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
   const [items, setItems] = useState<ModelDraft[]>(() => persistedModelDrafts(profiles))
   const [selected, setSelected] = useState(0)
   const nextDraftId = useRef(1)
-  useEffect(() => { setItems(persistedModelDrafts(profiles)); setSelected((current) => Math.min(current, Math.max(0, profiles.length - 1))) }, [profiles])
+  useConfigurationChange(profiles, (next) => {
+    setItems(persistedModelDrafts(next))
+    setSelected((current) => Math.min(current, Math.max(0, next.length - 1)))
+  })
   const draft = items[selected]
   const profile = draft?.profile
   const affectedPorts = profile
@@ -225,12 +238,13 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
   return (
     <div className="editor-shell">
       <div className="editor-heading">
-        <div><span className="eyebrow">DEVICE BEHAVIOR</span><h1>机型 Profile</h1><p>复用提示符、换行与发送节奏，不承载机型名称。</p></div>
+        <div><h1>机型 Profile</h1></div>
         <button className="primary-button" title={validationIssue} type="button" disabled={Boolean(validationIssue)} onClick={() => onSave(catalog)}><Save size={16} /> 保存机型配置</button>
       </div>
-      <div className="serial-editor-grid">
-        <div className="device-picker profile-picker">
-          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.profile.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.profile.name || '未命名 Profile'}</strong><small>串口交互参数</small></span></button>)}
+      <div className="config-form">
+        <div className="catalog-pick">
+          <OptionField label="编辑 Profile" value={draft?.key ?? ''} options={items.map(item => ({id:item.key,name:item.profile.name || '未命名'}))}
+            onChange={key => setSelected(items.findIndex(item => item.key === key))} />
           <button className="add-profile" type="button" onClick={() => {
             const index = items.length
             const id = nextDraftId.current++
@@ -240,8 +254,8 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
           }}><Plus size={16} /> 新建机型 Profile</button>
         </div>
         {profile ? (
-          <div className="form-card">
-            <div className="profile-form-header"><div className="form-section-title"><span>01</span><div><strong>Profile 标识</strong><small>名称原样保存</small></div></div><button
+          <div className="config-section">
+            <div className="profile-form-header"><div className="form-section-title"><div><strong>Profile 标识</strong></div></div><button
               aria-label={`删除机型 Profile ${profile.name}`}
               className="danger-icon"
               disabled={policy.deleteDisabled}
@@ -250,29 +264,24 @@ export function ModelEditor({ profiles, configuredPorts, onSave }: { profiles: M
               onClick={() => { setItems((current) => current.filter((_, index) => index !== selected)); setSelected((current) => Math.max(0, current - 1)) }}
             ><Trash2 size={16} /></button></div>
             <Field label="Profile 名称"><input readOnly={policy.nameReadOnly} title={policy.nameReadOnly ? '已有 Profile 名称是稳定标识' : undefined} value={profile.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 OpenWrt Shell" /></Field>
-            {policy.nameReadOnly && <div className="field-note">已有 Profile 名称是稳定标识；如需使用新名称，请新建 Profile。</div>}
-            {affectedPorts.length > 0 && (
-              <div className="impact-notice">
-                已关联端口：<strong>{affectedPorts.join('、')}</strong>。如需删除，请先在“串口配置”改绑或解绑。
-              </div>
-            )}
             {validationIssue && <div className="validation-notice" role="alert">{validationIssue}</div>}
             <div className="form-divider" />
-            <div className="form-section-title"><span>02</span><div><strong>命令提示符</strong><small>用于识别命令输出的完整边界</small></div></div>
+            <div className="form-section-title"><div><strong>命令提示符</strong></div></div>
             <div className="field-grid two">
               <Field label="Shell 提示符"><input value={profile.shell_prompt ?? ''} onChange={(event) => update('shell_prompt', event.target.value || null)} placeholder="root@router:~# " /></Field>
               <Field label="U-Boot 提示符"><input value={profile.uboot_prompt ?? ''} onChange={(event) => update('uboot_prompt', event.target.value || null)} placeholder="=> " /></Field>
             </div>
             <div className="form-divider" />
-            <div className="form-section-title"><span>03</span><div><strong>交互行为</strong><small>换行、设备回显与慢速写入</small></div></div>
+            <MoreFields title="写入与回显">
             <div className="field-grid three">
-              <Field label="发送换行"><select value={profile.write_eol ?? '\r'} onChange={(event) => update('write_eol', event.target.value)}><option value="\r">CR</option><option value="\n">LF</option><option value="\r\n">CRLF</option></select></Field>
-              <Field label="设备回显策略（用于 Agent 捕获解析）"><select value={profile.echo ?? 'auto'} onChange={(event) => update('echo', event.target.value as ModelProfile['echo'])}><option value="auto">自动识别</option><option value="on">设备回显开启</option><option value="off">设备回显关闭</option></select></Field>
+              <OptionField label="发送换行" value={profile.write_eol ?? '\r'} options={[{id:'\r',name:'CR'},{id:'\n',name:'LF'},{id:'\r\n',name:'CRLF'}]} onChange={value => update('write_eol',value)} />
+              <OptionField label="设备回显" value={profile.echo ?? 'auto'} options={[{id:'auto',name:'自动识别'},{id:'on',name:'开启'},{id:'off',name:'关闭'}]} onChange={value => update('echo',value)} />
               <Field label="每次写入字节"><input inputMode="numeric" value={profile.write_chunk_size ?? 1} onChange={(event) => update('write_chunk_size', Number(event.target.value))} /></Field>
               <Field label="写入间隔 (ms)"><input inputMode="numeric" value={profile.write_chunk_delay_ms ?? 0} onChange={(event) => update('write_chunk_delay_ms', Number(event.target.value))} /></Field>
             </div>
+            </MoreFields>
           </div>
-        ) : <div className="empty-profile"><Cpu size={30} /><strong>创建第一个机型 Profile</strong><span>配置提示符和发送行为后即可关联串口</span></div>}
+        ) : <div className="empty-profile"><strong>创建第一个机型 Profile</strong><span>编辑提示符和回显设置</span></div>}
       </div>
     </div>
   )
@@ -288,7 +297,10 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
   const [items, setItems] = useState<ModelFamilyDraft[]>(() => persistedFamilyDrafts(families))
   const [selected, setSelected] = useState(0)
   const nextDraftId = useRef(1)
-  useEffect(() => { setItems(persistedFamilyDrafts(families)); setSelected((current) => Math.min(current, Math.max(0, families.length - 1))) }, [families])
+  useConfigurationChange(families, (next) => {
+    setItems(persistedFamilyDrafts(next))
+    setSelected((current) => Math.min(current, Math.max(0, next.length - 1)))
+  })
   const draft = items[selected]
   const family = draft?.family
   const affectedPorts = family
@@ -306,23 +318,24 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
   return (
     <div className="editor-shell">
       <div className="editor-heading">
-        <div><span className="eyebrow">MODEL IDENTITY</span><h1>机型名称</h1><p>一级是机型系列，二级是串口实际连接的具体型号。</p></div>
+        <div><h1>机型名称</h1></div>
         <button className="primary-button" title={validationIssue} type="button" disabled={Boolean(validationIssue)} onClick={() => onSave(catalog)}><Save size={16} /> 保存机型名称</button>
       </div>
-      <div className="serial-editor-grid">
-        <div className="device-picker profile-picker">
-          {items.map((item, index) => <button className={selected === index ? 'is-active' : ''} key={item.key} onClick={() => setSelected(index)} type="button"><span className="profile-monogram">{item.family.name.slice(0, 2).toUpperCase()}</span><span><strong>{item.family.name || '未命名系列'}</strong><small>{item.family.model_names.length} 个具体型号</small></span></button>)}
+      <div className="config-form">
+        <div className="catalog-pick">
+          <OptionField label="机型系列" value={draft?.key ?? ''} options={items.map(item => ({id:item.key,name:item.family.name || '未命名'}))}
+            onChange={key => setSelected(items.findIndex(item => item.key === key))} />
           <button className="add-profile" type="button" onClick={() => {
             const index = items.length
             const id = nextDraftId.current++
             const name = nextFamilyName(items)
             setItems((current) => [...current, { key: `new:${id}`, family: { name, model_names: [] }, persisted: false }])
             setSelected(index)
-          }}><Plus size={16} /> 新建一级机型</button>
+          }}><Plus size={16} /> 新建系列</button>
         </div>
         {family ? (
-          <div className="form-card">
-            <div className="profile-form-header"><div className="form-section-title"><span>01</span><div><strong>一级机型</strong><small>机型系列名称</small></div></div><button
+          <div className="config-section">
+            <div className="profile-form-header"><div className="form-section-title"><strong>系列</strong></div><button
               aria-label={`删除一级机型 ${family.name}`}
               className="danger-icon"
               disabled={policy.deleteDisabled}
@@ -330,11 +343,10 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
               title={policy.deleteDisabled ? '请先在串口配置中改绑机型' : '删除一级机型'}
               onClick={() => { setItems((current) => current.filter((_, index) => index !== selected)); setSelected((current) => Math.max(0, current - 1)) }}
             ><Trash2 size={16} /></button></div>
-            <Field label="一级机型名称"><input readOnly={policy.nameReadOnly} value={family.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230" /></Field>
-            {affectedPorts.length > 0 && <div className="impact-notice">已关联端口：<strong>{affectedPorts.join('、')}</strong></div>}
+            <Field label="系列名称"><input readOnly={policy.nameReadOnly} value={family.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230" /></Field>
             <div className="model-name-editor">
               <div className="model-name-heading">
-                <div><strong>二级具体型号</strong><small>选择具体型号后才会写入串口配置</small></div>
+                <div><strong>系列中的型号</strong></div>
                 <button type="button" onClick={() => update('model_names', [...family.model_names, nextConcreteModelName(family.model_names)])}><Plus size={14} /> 添加具体型号</button>
               </div>
               {family.model_names.map((name, index) => {
@@ -343,28 +355,46 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
                 return (
                   <div className="model-name-row" key={index}>
                     <input aria-label={`二级具体型号 ${index + 1}`} readOnly={bound} value={name} onChange={(event) => update('model_names', family.model_names.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} />
-                    {bound && <span title={boundPorts.join('、')}>已绑定 {boundPorts.join('、')}</span>}
                     <button aria-label={`删除具体型号 ${name}`} disabled={bound} type="button" onClick={() => update('model_names', family.model_names.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={14} /></button>
                   </div>
                 )
               })}
-              {family.model_names.length === 0 && <div className="empty-model-names">请添加至少一个二级具体型号后再用于串口配置。</div>}
+              {family.model_names.length === 0 && <div className="empty-model-names">尚无具体型号</div>}
             </div>
             {validationIssue && <div className="validation-notice" role="alert">{validationIssue}</div>}
           </div>
-        ) : <div className="empty-profile"><Cpu size={30} /><strong>创建第一个一级机型</strong><span>然后添加对应的二级具体型号</span></div>}
+        ) : <div className="empty-profile"><strong>创建第一个系列</strong><span>添加系列中的具体型号</span></div>}
       </div>
     </div>
   )
 }
 
-function ApplicationSettings({ preferences, onSave }: { preferences: DesktopPreferences; onSave: (preferences: DesktopPreferences) => Promise<void> }): React.JSX.Element {
+function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup, onOpenRunExample }: Pick<Props, 'preferences' | 'serviceControls' | 'onOpenSetup' | 'onOpenRunExample'> & { onSave: (preferences: DesktopPreferences) => Promise<void> }): React.JSX.Element {
   const [value, setValue] = useState(preferences)
-  useEffect(() => setValue(preferences), [preferences])
+  useConfigurationChange(preferences, setValue)
+  const mode = useAppearanceMode(value.theme)
+  const colors = Object.entries(palettes).map(([id, palette]) => {
+    const swatch = palette[mode]
+    return { value: id, label: palette.name, colors: { sidebar:swatch.rail, panel:swatch.terminal, border:swatch.accent,
+      strong:swatch.accent, muted:`color-mix(in srgb, ${swatch.accent} 32%, ${swatch.panel})`, tile:swatch.panel } }
+  })
   return (
     <div className="app-settings">
-      <span className="app-settings-label">应用</span>
-      <label><span>后端地址</span><input value={value.endpoint} onChange={(event) => setValue((current) => ({ ...current, endpoint: event.target.value }))} onBlur={() => void onSave(value)} /></label>
+      <div className="appearance-setting"><h2>外观</h2>
+        <ThemeSelector compact aria-label="明暗模式" themes={themes} value={value.theme} onChange={(theme) => {
+          const next = { ...value, theme: theme as ThemePreference }
+          setValue(next)
+          void onSave(next)
+        }} />
+        <ThemeSelector aria-label="主题配色" themes={colors} value={paletteId(value.palette)} onChange={id => {
+          const next = { ...value, palette:paletteId(id) }
+          setValue(next)
+          void onSave(next)
+        }} />
+      </div>
+      <h2>后端连接</h2>
+      {serviceControls}
+      <label><span>后端地址</span><input value={value.endpoint} onChange={(event) => setValue((current) => ({ ...current, endpoint: event.target.value }))} onBlur={() => { if (value.endpoint !== preferences.endpoint) void onSave(value) }} /></label>
       <label className="auto-start-setting">
         <span><strong>自动启动本地后端</strong><small>连接不到配置地址时由 App 启动</small></span>
         <input
@@ -379,7 +409,8 @@ function ApplicationSettings({ preferences, onSave }: { preferences: DesktopPref
         />
         <span className="switch-control" />
       </label>
-      <label className="theme-label"><span>外观</span><div className="theme-switch">{(['system', 'light', 'dark'] as ThemePreference[]).map((theme) => <button className={value.theme === theme ? 'is-active' : ''} key={theme} type="button" title={theme} onClick={() => { const next = { ...value, theme }; setValue(next); void onSave(next) }}>{theme === 'dark' ? <Moon size={13} /> : theme === 'light' ? <Sun size={13} /> : 'A'}</button>)}</div></label>
+      {onOpenSetup && <button className="setup-reopen" type="button" onClick={onOpenSetup}>打开首次配置向导</button>}
+      {onOpenRunExample && <button className="setup-reopen" type="button" onClick={onOpenRunExample}>观看 Agent 运行示例</button>}
     </div>
   )
 }
@@ -507,6 +538,4 @@ function nextConcreteModelName(names: string[]): string {
   return `新型号 ${suffix}`
 }
 
-function optionLabel(value: string): string {
-  return value === 'five' ? '5' : value === 'six' ? '6' : value === 'seven' ? '7' : '8'
-}
+const DATA_BITS = ['five','six','seven','eight'] as const

@@ -15,7 +15,7 @@ sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("release_artifacts", Path(__file__).with_name("verify-release-artifacts.py"))
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
-VERSION = "0.8.9"
+VERSION = "0.9.0"
 COMMIT = "1" * 40
 
 
@@ -35,9 +35,9 @@ class ReleaseArtifactsTest(unittest.TestCase):
             files["docs/MCP_TOOLS.md"] = b"tools documentation"
             if platform.startswith("macos"):
                 files["Serial Platform.app/Contents/Info.plist"] = b"plist fixture"
-                for binary in ("serial", "seriald"):
+                for binary in ("serial", "seriald", "serial-mcp"):
                     files[f"Serial Platform.app/Contents/Resources/bin/{binary}"] = b"sidecar fixture"
-            metadata = {"version": VERSION, "git_commit": COMMIT, "cargo_profile": "release", "rust_target": target, "mcp_tool_count": 18}
+            metadata = {"version": VERSION, "git_commit": COMMIT, "cargo_profile": "release", "rust_target": target, "mcp_tool_count": 19}
             files["BUILD-INFO.json"] = json.dumps(metadata).encode()
             if edit:
                 edit(platform, files)
@@ -54,6 +54,10 @@ class ReleaseArtifactsTest(unittest.TestCase):
                     for name, data in files.items():
                         archive.writestr(root + "/" + name, data)
             outer.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n")
+            if platform == "windows-x86_64":
+                portable = self.directory / (root + ".exe")
+                portable.write_bytes(b"desktop fixture")
+                outer.append(f"{hashlib.sha256(portable.read_bytes()).hexdigest()}  {portable.name}\n")
         (self.directory / "SHA256SUMS").write_text("".join(outer))
 
     def verify(self):
@@ -89,7 +93,7 @@ class ReleaseArtifactsTest(unittest.TestCase):
     def test_escaping_symlink(self):
         self.fixture()
         def edit(entries):
-            info = zipfile.ZipInfo("serial-platform-v0.8.9-windows-x86_64/unsafe-link")
+            info = zipfile.ZipInfo(f"serial-platform-v{VERSION}-windows-x86_64/unsafe-link")
             info.create_system = 3
             info.external_attr = 0o120777 << 16
             return entries + [(info, b"../../outside")]
@@ -163,6 +167,11 @@ class ReleaseArtifactsTest(unittest.TestCase):
         self.fixture()
         next(self.directory.glob("*.zip")).unlink()
         with self.assertRaisesRegex(ValueError, "exactly four"):
+            self.verify()
+
+    def test_standalone_app_must_match_the_archived_app(self):
+        self.fixture(lambda platform, files: files.update({"Serial Platform.exe": b"another build"}) if platform == "windows-x86_64" else None)
+        with self.assertRaisesRegex(ValueError, "portable EXE differs"):
             self.verify()
 
     def test_malformed_checksum(self):

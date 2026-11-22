@@ -1,4 +1,4 @@
-import type { TimelineEvent, AgentHistoryResponse } from '../../shared/contracts'
+import type { TimelineEvent, AgentHistoryResponse, MacroExecution } from '../../shared/contracts'
 
 export interface AgentCommand {
   id: string
@@ -8,11 +8,14 @@ export interface AgentCommand {
   operationId?: string
   stepIndex?: number
   text: string
+  description?: string
   captureMatchers?: Array<{
     kind: 'contains' | 'regex' | 'shell_prompt' | 'uboot_prompt'
     value: string
   }>
   capture?: CommandCaptureEvidence
+  expectsCapture?: boolean
+  partial?: boolean
 }
 
 export interface CommandCaptureEvidence {
@@ -35,12 +38,18 @@ export type AgentHistoryItem =
       firstSeq: number
       label: string
       status: 'running' | 'completed' | 'aborted'
+      startedAt?: number
+      startSeq?: number
     }
   | {
       kind: 'command'
       id: string
       firstSeq: number
       description: string
+      actionKind?: 'single' | 'sequence' | 'macro' | 'signal' | 'trigger'
+      triggerStatus?: string
+      stepCount?: number
+      macro?: MacroExecution
       runId?: string
       commands: AgentCommand[]
     }
@@ -69,22 +78,70 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
   }
   for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
     if (['run_started', 'run_ended', 'run_aborted'].includes(event.kind) && event.run_id) {
-      const metadata = event.metadata.run as { label?: unknown } | undefined
+      const metadata = event.metadata.run as { label?: unknown; start_seq?: number } | undefined
       const existing = runs.get(event.run_id)
       const status = event.kind === 'run_started' ? 'running' : event.kind === 'run_ended' ? 'completed' : 'aborted'
       if (existing) {
         existing.status = status
+        if (typeof metadata?.label === 'string' && metadata.label.trim()) existing.label = cleanInline(metadata.label)
       } else {
         const run: Extract<AgentHistoryItem, { kind: 'run' }> = {
           kind: 'run',
           id: `run:${event.run_id}`,
           firstSeq: event.seq,
+          startSeq: event.kind === 'run_started' ? event.seq : metadata?.start_seq,
+          startedAt: event.kind === 'run_started' ? event.wall_time_ns : undefined,
           label: cleanInline(typeof metadata?.label === 'string' ? metadata.label : 'Agent 任务'),
           status
         }
         runs.set(event.run_id, run)
         items.push(run)
       }
+      continue
+    }
+    const macro = event.metadata.macro_execution as MacroExecution | undefined
+    if (event.kind === 'checkpoint' && macro?.owner?.kind === 'agent' && macro.daemon_epoch === event.daemon_epoch && macro.generation === event.generation && macro.id) {
+      const runId = event.run_id ?? macro.run_id ?? undefined
+      const id = `macro:${event.daemon_epoch}:${runId ?? ''}:${macro.id}`
+      const group = commandGroups.get(id)
+      if (group) group.macro = macro
+      else {
+        const item: Extract<AgentHistoryItem, { kind: 'command' }> = {
+          kind: 'command', id, firstSeq: event.seq, runId, actionKind: 'macro',
+          description: cleanInline(macro.description || macro.macro_id || 'Macro'), macro, commands: [],
+        }
+        commandGroups.set(id, item)
+        items.push(item)
+      }
+      continue
+    }
+    const commandDescription = cleanInline(stringMetadata(event, 'command_description') ?? '') || undefined
+    const triggerId = stringMetadata(event, 'trigger_id')
+    if (triggerId && event.actor?.kind === 'agent') {
+      const id = `trigger:${event.daemon_epoch}:${event.run_id ?? ''}:${triggerId}`
+      let action = commandGroups.get(id)
+      if (!action) {
+        action = { kind: 'command', id, firstSeq: event.seq, actionKind: 'trigger', runId: event.run_id ?? undefined, description: '串口触发器', commands: [] }
+        commandGroups.set(id, action)
+        items.push(action)
+      }
+      if (event.kind === 'tx') {
+        // A trigger reuses its operation ID across fires. Each confirmed physical write is a separate step.
+        action.commands.push({ id: 'fire:' + event.seq, daemonEpoch: event.daemon_epoch, generation: event.generation,
+          firstSeq: event.seq, text: event.text, description: commandDescription, expectsCapture: false, partial: event.metadata.partial === true })
+      } else {
+        const info = event.metadata.trigger as { status?: unknown } | undefined
+        if (typeof info?.status === 'string') action.triggerStatus = info.status
+      }
+      continue
+    }
+    if (event.kind === 'break' && event.actor?.kind === 'agent') {
+      const duration = numberMetadata(event, 'duration_ms')
+      const operation = event.operation_id ?? 'event:' + event.seq
+      items.push({ kind: 'command', id: `break:${event.daemon_epoch}:${operation}`, firstSeq: event.seq, actionKind: 'signal',
+        description: '发送 BREAK', runId: event.run_id ?? undefined, commands: [{ id: operation, daemonEpoch: event.daemon_epoch,
+          generation: event.generation, firstSeq: event.seq, operationId: event.operation_id ?? undefined, expectsCapture: false,
+          description: commandDescription, text: duration === undefined ? 'BREAK' : `BREAK ${duration} ms` }] })
       continue
     }
     if (event.kind !== 'tx' || event.direction !== 'tx' || event.actor?.kind !== 'agent') continue
@@ -94,6 +151,7 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
       : undefined)
       ?? stringMetadata(event, 'command_sequence_description')
       ?? stringMetadata(event, 'command_description')
+      ?? (event.run_id ? controlSignal(event.text) ?? '串口写入' : undefined)
     if (!description) continue
     const sequenceId = stringMetadata(event, 'command_sequence_id')
     const operationId = event.operation_id ?? undefined
@@ -111,6 +169,8 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
         id: groupKey,
         firstSeq: event.seq,
         description: cleanInline(description),
+        actionKind: macroExecutionId ? 'macro' : sequenceId ? 'sequence' : controlSignal(event.text) ? 'signal' : 'single',
+        stepCount: sequenceId ? integerValue(event.metadata.command_sequence_step_count) : undefined,
         runId: event.run_id ?? undefined,
         commands: []
       }
@@ -121,7 +181,9 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
     const commandKey = macroExecutionId || stepIndex === undefined ? operationId ?? `event:${event.seq}` : `step:${stepIndex}`
     const existing = group.commands.find((command) => command.id === commandKey)
     if (existing) {
+      existing.partial ||= event.metadata.partial === true
       existing.text += event.text
+      existing.description ??= commandDescription
     } else {
       group.commands.push({
         id: commandKey,
@@ -129,8 +191,11 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
         generation: event.generation,
         firstSeq: event.seq,
         operationId,
+        expectsCapture: !macroExecutionId && (!!sequenceId || !!stringMetadata(event, 'command_description') || !!captureMatchers(event)?.length),
         stepIndex,
+        partial: event.metadata.partial === true,
         text: event.text,
+        description: commandDescription,
         captureMatchers: captureMatchers(event),
         capture: operationId ? captures.get(`${event.daemon_epoch}:${event.generation}:${operationId}`) : undefined
       })
@@ -140,17 +205,25 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
   return items.sort((a, b) => a.firstSeq - b.firstSeq)
 }
 
-export function mergeAgentHistory(events: TimelineEvent[], persisted?: AgentHistoryResponse): AgentHistoryItem[] {
+export function mergeAgentHistory(events: TimelineEvent[], persisted?: AgentHistoryResponse, activeRun?: AgentHistoryResponse['runs'][number]['run']): AgentHistoryItem[] {
   const unique = new Map(events.map((event) => [`${event.daemon_epoch}:${event.seq}`, event]))
   const hidden = new Set(persisted?.visibility.hidden ?? [])
   const items = buildAgentHistory([...unique.values()].filter((event) => !event.run_id || !hidden.has(event.run_id)))
   const runs = items.filter((item): item is Extract<AgentHistoryItem, { kind: 'run' }> => item.kind === 'run')
+  if (activeRun && activeRun.status === 'active' && !runs.some(row => row.id === 'run:' + activeRun.id)) {
+    runs.push({ kind: 'run', id: 'run:' + activeRun.id, firstSeq: activeRun.start_seq, startSeq: activeRun.start_seq, label: cleanInline(activeRun.label), status: 'running' })
+  }
   const known = new Set(runs.map((run) => run.id))
   for (const record of persisted?.runs ?? []) {
     const existing = runs.find((run) => run.id === `run:${record.run.id}`)
+    if (existing) {
+      existing.startSeq ??= record.run.start_seq
+      existing.startedAt ??= record.started_wall_time_ns
+    }
+    if (existing && record.run.label) existing.label = cleanInline(record.run.label)
     if (existing?.status === 'running' && record.run.status !== 'active') existing.status = record.run.status
     if (!known.has(`run:${record.run.id}`) && !hidden.has(record.run.id)) runs.push({
-      kind: 'run', id: `run:${record.run.id}`, firstSeq: record.run.start_seq,
+      kind: 'run', id: `run:${record.run.id}`, firstSeq: record.run.start_seq, startSeq: record.run.start_seq, startedAt: record.started_wall_time_ns,
       label: cleanInline(record.run.label), status: record.run.status === 'active' ? 'running' : record.run.status
     })
   }
@@ -329,8 +402,16 @@ function sequenceAtOffset(events: TimelineEvent[], target: number): number {
   return events.at(-1)?.seq ?? 0
 }
 
+function controlSignal(text: string): string | undefined {
+  switch (text) {
+    case '\x03': return 'Ctrl+C'
+    case '\x04': return 'Ctrl+D'
+    case '\x1a': return 'Ctrl+Z'
+  }
+}
+
 export function displayCommand(text: string): string {
-  return text.replace(/\r/g, '').replace(/\n+$/g, '')
+  return controlSignal(text) ?? text.replace(/\r/g, '').replace(/\n+$/g, '')
 }
 
 function cleanInline(value: string): string {

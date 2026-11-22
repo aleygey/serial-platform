@@ -43,6 +43,25 @@ describe('archived command evidence', () => {
     expect(events.map((event) => event.seq)).toEqual([2, 3, 4])
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
+  it('pages archived Run actions and lifecycle records to their fixed boundary', async () => {
+    const requested: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const q = new URL(String(input)).searchParams
+      expect(q.get('through_seq')).toBe('8')
+      expect(q.get('run_id')).toBe('r')
+      requested.push(q.get('direction') + ':' + q.get('after_seq'))
+      const more = q.get('direction') === 'tx' && q.get('after_seq') === '1'
+      const seq = q.get('direction') === 'none' ? 7 : more ? 3 : 6
+      return jsonResponse({ events: [{ ...raw(seq), direction: q.get('direction'), kind: seq === 7 ? 'checkpoint' : 'tx' }],
+        truncated: more, next_cursor: more ? { epoch: 'old-epoch', after_seq: 3 } : null, gaps: [] })
+    }))
+    const result = await new SerialClient('http://127.0.0.1:3210').agentRunEvents({ port: 'COM6', epoch: 'old-epoch',
+      run: { id: 'r', label: 'test', status: 'completed', start_seq: 2, end_seq: 8 }, through_seq: 9, started_wall_time_ns: 0 })
+    expect(result.limited).toBe(false)
+    expect(result.events.map(e => e.seq)).toEqual([3, 6, 7])
+    expect(requested).toEqual(['tx:1', 'tx:3', 'none:1'])
+  })
+
   it('rejects a gap or a same-numbered record from a different epoch instead of returning partial evidence', async () => {
     for (const page of [
       { events: [raw(2), raw(4)], truncated: false, gaps: [] },
@@ -227,6 +246,27 @@ describe('v8 Human control messages', () => {
 })
 
 describe('authoritative WebSocket reconnect', () => {
+  it('updates live ownership and sees a Human-read acknowledgement without another timeline event', async () => {
+    const backend = await serialBackend({ serverId: FIRST_SERVER_ID, daemonEpoch: FIRST_DAEMON_EPOCH, headSeq: 0, events: [] })
+    const client = new SerialClient(backend.endpoint)
+    const owner = { kind: 'agent' as const, id: 'test-agent', label: 'Agent' }
+    try {
+      await client.start()
+      backend.state.activity = {
+        control: { id: 'lease', owner, epoch: FIRST_DAEMON_EPOCH, generation: 1, fence: 2, issued_wall_time_ns: 0, expires_wall_time_ns: 1e19 },
+        active_run: { id: 'test-run', owner, label: 'Read version', status: 'active', start_seq: 1 },
+        run_context: { run_id: 'test-run', revision: 1, acknowledged_revision: 0 }
+      }
+      backend.publish(timelineEvent(FIRST_DAEMON_EPOCH, 1, 'run_started'))
+      await vi.waitFor(() => expect(client.data().status.ports[0].control?.owner.id).toBe(owner.id))
+      backend.state.activity.run_context!.acknowledged_revision = 1
+      await vi.waitFor(() => expect(client.data().status.ports[0].run_context?.acknowledged_revision).toBe(1), { timeout: 2500 })
+      backend.state.activity = { control: null, active_run: null, run_context: null }
+      backend.publish(timelineEvent(FIRST_DAEMON_EPOCH, 2, 'run_ended'))
+      await vi.waitFor(() => expect(client.data().status.ports[0].active_run).toBeNull())
+    } finally { await client.stop() }
+  })
+
   it('clears old-epoch history and attaches from zero when the restarted daemon head is zero', async () => {
     const backend = await serialBackend({
       serverId: FIRST_SERVER_ID,
@@ -441,6 +481,33 @@ describe('configuration revision safety', () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/api/v1/status'))).toHaveLength(3)
   })
 
+  it('changes the model identity of one port without restaging serial settings or writing through a stale selection', async () => {
+    let revision = 7
+    const original = [
+      { port: 'COM6', enabled: true, transport_profile: 'board-speed', model_profile: 'shell', model_family: 'F', model_name: 'old' },
+      { port: 'COM7', enabled: false, transport_profile: 'other-speed', model_profile: null, model_family: null, model_name: null }
+    ]
+    const writes: { path: string; body: unknown }[] = []
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const path = new URL(String(input)).pathname
+      if (init?.method === 'PUT') {
+        writes.push({ path, body: JSON.parse(String(init.body)) })
+        revision++
+        return jsonResponse({})
+      }
+      if (path === '/api/v1/status') return jsonResponse({ ...statusResponse(revision), ports: original.map(config => ({ config, daemon_epoch: statusResponse(revision).daemon_epoch, head_seq: 0, generation: 1 })) })
+      if (path === '/api/v1/ports') return jsonResponse([])
+      return jsonResponse({ profiles: [], families: [], config_revision: revision })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new SerialClient('http://127.0.0.1:3210')
+    await client.setPortModel('COM6', 'F', 'new', revision)
+    await expect(client.setPortModel('COM7', null, null, 7)).rejects.toBeInstanceOf(ConfigurationConflictError)
+    expect(writes).toEqual([{ path: '/api/v1/config/ports', body: {
+      ports: [{ ...original[0], model_name: 'new' }, original[1]], source: 'human:desktop', expected_revision: 7
+    } }])
+  })
+
   it('makes no write when the UI revision is older than the consistent backend snapshot', async () => {
     const fetchMock = vi.fn(async (
       input: string | URL | Request,
@@ -600,6 +667,7 @@ const SECOND_DAEMON_EPOCH = '33333333-3333-4333-8333-333333333333'
 const HUMAN_ACTOR = { id: 'desktop-human', label: 'desktop', kind: 'human' as const }
 
 interface SerialDaemonState {
+  activity?: Pick<PortSnapshot, 'active_run' | 'run_context' | 'control'>
   serverId: string
   daemonEpoch: string
   headSeq: number
@@ -618,6 +686,7 @@ interface AttachRequest {
 }
 
 interface SerialTestBackend {
+  publish(event: TimelineEvent): void
   endpoint: string
   state: SerialDaemonState
   attachRequests: AttachRequest[]
@@ -635,6 +704,11 @@ async function serialBackend(initial: SerialDaemonState): Promise<SerialTestBack
     state: initial,
     attachRequests: [],
     humanCommands: [],
+    publish(event) {
+      this.state.headSeq = event.seq
+      this.state.events.push(event)
+      for (const socket of server.clients) sendControl(socket, { type: 'timeline', event, replay: false })
+    },
     disconnect(): void {
       for (const socket of server.clients) socket.terminate()
     },
@@ -806,7 +880,8 @@ function portSnapshot(state: SerialDaemonState): PortSnapshot {
     effective_shell_prompt: null,
     effective_uboot_prompt: null,
     effective_write_eol: '\r',
-    effective_transport: null
+    effective_transport: null,
+    ...state.activity
   }
 }
 

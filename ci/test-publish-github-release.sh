@@ -29,6 +29,7 @@ readonly -a TEST_ASSET_NAMES=(
     serial-platform-v0.8.0-macos-aarch64.zip
     serial-platform-v0.8.0-macos-x86_64.zip
     serial-platform-v0.8.0-windows-x86_64.zip
+    serial-platform-v0.8.0-windows-x86_64.exe
 )
 printf '%s\n' "${TEST_ASSET_NAMES[@]}" | LC_ALL=C sort >"${TEST_EXPECTED_ASSETS}"
 

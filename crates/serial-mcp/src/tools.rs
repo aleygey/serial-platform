@@ -23,6 +23,13 @@ use uuid::Uuid;
 
 mod macros;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupProposalArgs {
+    request_id: Uuid,
+    plan: Option<serial_protocol::SetupPlan>,
+}
+
 use crate::{
     api::ApiClient,
     capture::{Capture, CaptureOptions, CommandBoundary, Completion, CompletionPattern},
@@ -195,6 +202,12 @@ impl AgentTools {
         }
         let mut output = match name {
             "devices" => self.devices(parse(arguments)?).await,
+            "setup_proposal" => {
+                let args: SetupProposalArgs = parse(arguments)?;
+                self.api
+                    .setup_proposal(args.request_id, args.plan, &self.actor_label)
+                    .await
+            }
             "model_identity_set" => self.model_identity_set(parse(arguments)?).await,
             "read" => self.read(parse(arguments)?).await,
             "command" => self.command(parse(arguments)?).await,

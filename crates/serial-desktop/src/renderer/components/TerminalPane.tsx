@@ -1,7 +1,10 @@
-import { ArrowDown, ChevronDown, ChevronUp, Search, TerminalSquare, X } from 'lucide-react'
-import { Fragment, memo, useCallback, useEffect, useRef, useState } from 'react'
+import { ArrowDown, ChevronDown, ChevronUp, Search, X } from 'lucide-react'
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PortSnapshot, TimelineEvent } from '../../shared/contracts'
 import type { AgentCommand, MatchRange } from '../lib/history'
+import { commandEchoStyles, type EchoStyle } from '../lib/command-echo'
+import { InlineTextEffect } from './ui/text-effect'
+import { useReducedMotion } from '../lib/use-reduced-motion'
 import { displayCommand } from '../lib/history'
 import {
   TerminalDocumentIndex,
@@ -10,6 +13,12 @@ import {
 } from '../lib/terminal-find'
 
 interface Props {
+  commands?: AgentCommand[]
+  currentCommand?: AgentCommand
+  heading?: React.ReactNode
+  actions?: React.ReactNode
+  paused?: boolean
+  active?: boolean
   configuredPort?: PortSnapshot
   events: TimelineEvent[]
   selectedCommand?: AgentCommand
@@ -17,9 +26,11 @@ interface Props {
   onClearCommand: () => void
 }
 
+const NO_COMMANDS: AgentCommand[] = []
 const NO_FIND_HITS: readonly TerminalFindHit[] = Object.freeze([])
 
-export function TerminalPane({ configuredPort, events, selectedCommand, match, onClearCommand }: Props): React.JSX.Element {
+export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS, currentCommand, heading, actions, paused, active = true, configuredPort, events, selectedCommand, match, onClearCommand }: Props): React.JSX.Element {
+  const reduced = useReducedMotion()
   const scrollRef = useRef<HTMLDivElement>(null)
   const findInputRef = useRef<HTMLInputElement>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
@@ -32,12 +43,14 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
   const [findOpen, setFindOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [, setNavigationRevision] = useState(0)
+  const initialStream = useRef({ epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 })
+  if (initialStream.current.epoch !== configuredPort?.daemon_epoch) initialStream.current = { epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 }
   const chunks = terminalDocument.chunks
+  const echoes = useMemo(() => commandEchoStyles(events, chunks, commands, currentCommand), [events, chunks, commands, currentCommand])
   const total = terminalDocument.matchCount
   const highlighted = terminalDocument.highlightedMatchCount
   const current = terminalDocument.activeIndex < 0 ? 0 : terminalDocument.activeIndex + 1
   const activeId = terminalDocument.activeId
-  const findShortcut = isMacPlatform() ? '⌘F' : 'Ctrl F'
 
   const openFind = useCallback((): void => {
     if (!findOpen) {
@@ -96,6 +109,7 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
   }, [activeId, findOpen, search])
 
   useEffect(() => {
+    if (!active) return
     const handler = (event: KeyboardEvent): void => {
       if (event.defaultPrevented) return
       if (document.querySelector('[aria-modal="true"]')) {
@@ -122,24 +136,16 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [closeFind, findOpen, navigate, openFind, search])
+  }, [active, closeFind, findOpen, navigate, openFind, search])
 
-  const modelName = configuredPort?.config.model_name || '未配置机型'
   return (
     <section className="terminal-pane">
-      <header className="terminal-header">
-        <div className="terminal-title">
-          <span className="heading-icon"><TerminalSquare size={15} /></span>
-          <div>
-            <strong className={configuredPort?.config.model_name ? 'model-identity' : undefined}>{modelName}</strong>
-            <small>{sessionLabel(configuredPort?.session_state)}</small>
-          </div>
+      <header className="channel-heading terminal-header">
+        {heading ?? <strong>{configuredPort?.config.model_name || '未配置机型'}</strong>}
+        <div className="channel-tools">
+          <button className="terminal-find-trigger" type="button" aria-label="在串口输出中查找" aria-keyshortcuts="Control+f Meta+f" title="查找 (⌘/Ctrl+F)" onClick={openFind}><Search size={15} /></button>
+          {actions}
         </div>
-        <button className="terminal-find-trigger" type="button" aria-label="在串口输出中查找" title="查找 (⌘/Ctrl+F)" onClick={openFind}>
-          <Search size={14} />
-          <span>查找</span>
-          <kbd>{findShortcut}</kbd>
-        </button>
       </header>
       {findOpen && (
         <TerminalFindWidget
@@ -156,23 +162,23 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
       )}
       {selectedCommand && !match && (
         <div className="command-overlay">
-          <span>尚未匹配到完整命令回显；不会跳转到相似文本</span>
+          <span>尚未找到这条命令的完整回显</span>
           <code>{displayCommand(selectedCommand.text)}</code>
-          <button type="button" onClick={onClearCommand}><X size={14} /></button>
+          <button type="button" aria-label="关闭命令定位" onClick={onClearCommand}><X size={14} /></button>
         </div>
       )}
       {selectedCommand && match && !match.hasVisibleOutput && (
         <div className="command-overlay">
-          <span>当前加载范围没有该命令的设备输出；请留意历史读取提示</span>
+          <span>这段记录中没有设备输出</span>
           <code>{displayCommand(selectedCommand.text)}</code>
-          <button type="button" onClick={onClearCommand}><X size={14} /></button>
+          <button type="button" aria-label="关闭命令定位" onClick={onClearCommand}><X size={14} /></button>
         </div>
       )}
       {selectedCommand && match?.inferred && (
         <div className="command-overlay is-inferred">
-          <span>旧记录：输出范围由匹配规则推断</span>
+          <span>旧记录的输出范围为推断值</span>
           <code>{displayCommand(selectedCommand.text)}</code>
-          <button type="button" onClick={onClearCommand}><X size={14} /></button>
+          <button type="button" aria-label="关闭命令定位" onClick={onClearCommand}><X size={14} /></button>
         </div>
       )}
       <div
@@ -186,15 +192,15 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
       >
         {chunks.length === 0 ? (
           <div className="empty-state terminal-empty">
-            <TerminalSquare size={26} />
-            <strong>等待设备输出</strong>
-            <span>打开串口后，持久记录和实时数据会出现在这里</span>
+            <strong>{configuredPort?.session_state === 'online' ? '等待设备输出' : configuredPort?.session_state === 'opening' ? '正在打开串口' : configuredPort?.session_state === 'waiting_for_port' ? '等待设备接入' : '串口未打开'}</strong>
           </div>
         ) : (
           <pre className="terminal-output" aria-label="串口输出" onDoubleClick={selectTerminalWord}>
             {chunks.map((chunk) => (
               <TerminalChunkText
+                reveal={!paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
                 commandMatched={commandRangeIncludes(match, chunk)}
+                echoLength={echoes.get(chunk.key)?.length ?? 0} echoTone={echoes.get(chunk.key)?.tone}
                 chunk={chunk}
                 hits={findOpen ? terminalDocument.hitsFor(chunk) : NO_FIND_HITS}
                 key={chunk.key}
@@ -203,14 +209,14 @@ export function TerminalPane({ configuredPort, events, selectedCommand, match, o
           </pre>
         )}
       </div>
-      {!follow && (
+      {(!follow || selectedCommand) && (
         <button className="return-live" type="button" onClick={() => { setFollow(true); onClearCommand() }}>
           <ArrowDown size={14} /> 返回最新
         </button>
       )}
     </section>
   )
-}
+})
 
 interface FindWidgetProps {
   query: string
@@ -280,13 +286,19 @@ export function TerminalFindWidget({
 const TerminalChunkText = memo(function TerminalChunkText({
   chunk,
   hits,
-  commandMatched
+  commandMatched,
+  echoLength, echoTone,
+  reveal
 }: {
+  reveal: boolean
+  echoLength: number
+  echoTone?: EchoStyle['tone']
   chunk: TerminalDocumentChunk
   hits: readonly TerminalFindHit[]
   commandMatched: boolean
 }): React.JSX.Element {
-  const boundaries = new Set([0, chunk.text.length])
+  const [animateArrival] = useState(reveal)
+  const boundaries = new Set([0, echoLength, chunk.text.length])
   for (const hit of hits) {
     boundaries.add(hit.start)
     boundaries.add(hit.end)
@@ -318,6 +330,10 @@ const TerminalChunkText = memo(function TerminalChunkText({
       )
       continue
     }
+    if (echoTone && end <= echoLength) {
+      parts.push(<span className="command-ink echo-command" data-tone={echoTone} key={start + ':echo'}>{value}</span>)
+      continue
+    }
     while (chunk.decorations[decorationIndex] && chunk.decorations[decorationIndex].end <= start) decorationIndex += 1
     const candidateDecoration = chunk.decorations[decorationIndex]
     const decoration = candidateDecoration?.start <= start && candidateDecoration.end >= end
@@ -327,11 +343,8 @@ const TerminalChunkText = memo(function TerminalChunkText({
       ? <mark className={decoration.className} key={`${start}:${end}:semantic`}>{value}</mark>
       : <Fragment key={`${start}:${end}:text`}>{value}</Fragment>)
   }
-  return (
-    <span className={commandMatched ? 'matched-output' : undefined} data-event-key={chunk.key} data-seq={chunk.seq}>
-      {parts}
-    </span>
-  )
+  const attributes = { className: commandMatched ? 'matched-output' : undefined, 'data-event-key': chunk.key, 'data-seq': chunk.seq }
+  return animateArrival ? <InlineTextEffect {...attributes}>{parts}</InlineTextEffect> : <span {...attributes}>{parts}</span>
 })
 
 function commandRangeIncludes(match: MatchRange | undefined, chunk: TerminalDocumentChunk): boolean {
@@ -355,18 +368,6 @@ function commandRangeIncludes(match: MatchRange | undefined, chunk: TerminalDocu
   return true
 }
 
-function isMacPlatform(): boolean {
-  return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
-}
-
-function sessionLabel(state: PortSnapshot['session_state'] | undefined): string {
-  if (state === 'online') return '设备在线'
-  if (state === 'opening') return '正在打开串口'
-  if (state === 'waiting_for_port') return '等待设备接入'
-  if (state === 'backoff') return '等待重新连接'
-  if (state === 'stopping') return '正在关闭串口'
-  return '串口未打开'
-}
 
 function selectTerminalWord(event: React.MouseEvent<HTMLElement>): void {
   const selection = window.getSelection()

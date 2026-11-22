@@ -123,6 +123,27 @@ impl ApiClient {
         &self.endpoint
     }
 
+    pub async fn setup_proposal(
+        &self,
+        id: uuid::Uuid,
+        plan: Option<serial_protocol::SetupPlan>,
+        agent: &str,
+    ) -> Result<Value> {
+        let path = format!("/api/v1/setup/requests/{id}");
+        if let Some(plan) = plan {
+            let response = self
+                .request(
+                    self.client
+                        .put(self.url(&path))
+                        .json(&json!({"agent":agent,"plan":plan})),
+                )
+                .send()
+                .await?;
+            return decode_response(response).await;
+        }
+        self.get_json(&path).await
+    }
+
     pub async fn health(&self) -> Result<HealthResponse> {
         self.get_json("/api/v1/health").await
     }
