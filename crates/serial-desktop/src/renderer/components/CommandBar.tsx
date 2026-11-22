@@ -1,9 +1,10 @@
-import { AlertTriangle, CornerDownLeft, SendHorizontal } from 'lucide-react'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import {
-  HUMAN_COMMAND_UNCERTAIN_MESSAGE,
-  type HumanCommandSubmission
-} from '../../shared/contracts'
+import { History, LoaderCircle, Play, X } from 'lucide-react'
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import type { HumanCommandSubmission } from '../../shared/contracts'
+import { PromptBox, DIRECT_SEND } from './ui/prompt-box'
+import { ScrollProgress } from './ui/scroll-progress'
+import { PortInput, type CommandReceipt } from '../lib/port-input'
+export { resolveCommandSubmission } from '../lib/port-input'
 import {
   acceptsSuggestion, commandBuffer, humanHistoryCandidates, stepHistory, suggestedSuffix,
   type CommandBuffer, type HistoryCursor
@@ -15,7 +16,10 @@ interface Props {
   onSend: (command: string) => Promise<HumanCommandSubmission>
   onSignal?: (signal: 'ctrl_c' | 'ctrl_d') => Promise<HumanCommandSubmission>
   humanHistory?: readonly string[]
-  drafts?: Map<string, CommandBuffer>
+  session: PortInput
+  active: boolean
+  paused?: boolean
+  placeholder: string
   onQueryHistory?: (query: string, contains: boolean) => Promise<readonly string[]>
 }
 
@@ -27,46 +31,23 @@ interface CandidateMenu {
   index: number
 }
 
-export interface CommandSubmissionResolution {
-  draft: string
-  commitToHistory: boolean
-  uncertainty?: string
-}
-
-export function resolveCommandSubmission(
-  command: string,
-  submission: HumanCommandSubmission
-): CommandSubmissionResolution {
-  if (submission.status === 'accepted') return { draft: '', commitToHistory: true }
-  if (submission.status === 'rejected') return { draft: command, commitToHistory: false }
-  return { draft: '', commitToHistory: false, uncertainty: submission.message }
-}
-
 export function CommandStatusHint({
   sending,
-  uncertainty
+  uncertainty,
+  receipt
 }: {
   sending: boolean
   uncertainty?: string
+  receipt?: CommandReceipt
 }): React.JSX.Element {
-  if (uncertainty) {
-    return (
-      <span aria-label={uncertainty} className="command-hint is-uncertain" role="alert" title={uncertainty}>
-        <AlertTriangle size={13} />
-        <span>结果不确定：先查看串口时间线，勿直接重发</span>
-      </span>
-    )
-  }
-  return <span className="command-hint"><CornerDownLeft size={13} /> {sending ? '发送中…' : 'Enter'}</span>
+  if (uncertainty) return <span className="sr-only" role="alert">{uncertainty}</span>
+  const label = sending ? '发送中' : receipt?.status === 'accepted' ? '已发送' : receipt?.status === 'rejected' ? '被拒绝' : ''
+  return <span className="sr-only" role="status">{label}</span>
 }
 
-export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = [], drafts, onQueryHistory }: Props): React.JSX.Element {
-  const localDrafts = useRef(new Map<string, CommandBuffer>())
-  const draftStore = drafts ?? localDrafts.current
-  const portKey = port ?? ''
-  const [buffer, setBuffer] = useState<CommandBuffer>(() => draftStore.get(portKey) ?? commandBuffer())
-  const bufferRef = useRef(buffer)
-  const activePort = useRef(portKey)
+export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = [], session, active, paused, placeholder, onQueryHistory }: Props): React.JSX.Element {
+  const menuId = useId()
+  const { buffer, pending: sending, receipts } = useSyncExternalStore(session.subscribe, session.snapshot, session.snapshot)
   const [historyCursor, setHistoryCursor] = useState<HistoryCursor>()
   const [menu, setMenu] = useState<CandidateMenu>()
   const [focused, setFocused] = useState(false)
@@ -76,13 +57,23 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
   const [historyWarning, setHistoryWarning] = useState('')
   const queryHistoryRef = useRef(onQueryHistory)
   queryHistoryRef.current = onQueryHistory
-  const [sending, setSending] = useState(false)
-  const [uncertainties, setUncertainties] = useState<Record<string, string>>({})
   const inputRef = useRef<HTMLInputElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
-  const sendingPorts = useRef(new Set<string>())
-  const signalPending = useRef(false)
-  const selectionPending = useRef(false)
+  const listRef = useRef<HTMLDivElement>(null)
+  const formRef = useRef<HTMLFormElement>(null)
+  const menuOpen = !!menu
+  useEffect(() => {
+    if (!menuOpen) return
+    const outside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !formRef.current?.contains(event.target)) setMenu(undefined)
+    }
+    document.addEventListener('pointerdown', outside)
+    return () => document.removeEventListener('pointerdown', outside)
+  }, [menuOpen])
+  useEffect(() => {
+    if (disabled || !active) setMenu(undefined)
+  }, [disabled, active])
+  const selectionPending = useRef(true)
   const suffix = useMemo(() => focused && !composing && !menu && !sending && !disabled
     ? suggestedSuffix(buffer, remoteSuggestion?.query === buffer.value ? remoteSuggestion.entries : humanHistory) : '', [buffer, humanHistory, remoteSuggestion, focused, composing, menu, sending, disabled])
 
@@ -104,30 +95,17 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
       })
     }, 80)
     return () => { active = false; clearTimeout(timer) }
-  }, [historyQuery, historyContains, queryEnabled, portKey])
+  }, [historyQuery, historyContains, queryEnabled, port])
 
   useEffect(() => {
-    if (menu?.entries.length) document.getElementById(`human-command-option-${menu.index}`)?.scrollIntoView({ block: 'nearest' })
-  }, [menu?.index])
+    if (menu?.entries.length) document.getElementById(`${menuId}-${menu.index}`)?.scrollIntoView({ block: 'nearest' })
+  }, [menu?.index, menuId])
 
   const edit = (next: CommandBuffer, keepNavigation = false): void => {
-    bufferRef.current = next
-    draftStore.set(activePort.current, next)
     selectionPending.current = true
-    setBuffer(next)
+    session.edit(next)
     if (!keepNavigation) setHistoryCursor(undefined)
   }
-
-  useLayoutEffect(() => {
-    activePort.current = portKey
-    const next = draftStore.get(portKey) ?? commandBuffer()
-    bufferRef.current = next
-    setBuffer(next)
-    setHistoryCursor(undefined)
-    setMenu(undefined)
-    setSending(sendingPorts.current.has(portKey))
-    selectionPending.current = true
-  }, [portKey, draftStore])
 
   useLayoutEffect(() => {
     if (!selectionPending.current || !inputRef.current) return
@@ -141,6 +119,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
   }, [menu?.kind])
 
   useEffect(() => {
+    if (!active) return
     const handler = (event: KeyboardEvent): void => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
@@ -150,50 +129,21 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [])
+  }, [active])
+
+  const receipt = !buffer.value || receipts[0]?.command === buffer.value ? receipts[0] : undefined
+  const sendTone = sending ? 'working' : receipt?.status === 'rejected' ? 'failed' : receipt?.status === 'uncertain' ? 'waiting' : receipt?.status === 'accepted' ? 'done' : undefined
 
   const submit = async (): Promise<void> => {
-    const target = activePort.current
-    const submitted = bufferRef.current
-    const command = submitted.value.replace(/[\r\n]+$/, '')
-    if (disabled || sendingPorts.current.has(target)) return
-    sendingPorts.current.add(target)
-    setSending(true)
-    let submission: HumanCommandSubmission
-    try {
-      submission = await onSend(command)
-    } catch {
-      submission = { status: 'uncertain', message: HUMAN_COMMAND_UNCERTAIN_MESSAGE }
-    } finally {
-      sendingPorts.current.delete(target)
-      if (activePort.current === target) setSending(false)
-    }
-    const resolution = resolveCommandSubmission(command, submission)
-    if (resolution.uncertainty) {
-      setUncertainties((current) => ({ ...current, [target]: resolution.uncertainty! }))
-    }
-    if (submission.status === 'rejected') return
-    // A late result from another port must not erase its newer draft or the current editor.
-    if (draftStore.get(target) === submitted || (target === activePort.current && bufferRef.current === submitted)) {
-      const next = commandBuffer(resolution.draft)
-      draftStore.set(target, next)
-      if (activePort.current === target) {
-        edit(next)
-        setMenu(undefined)
-      }
-    }
+    if (disabled || session.snapshot().pending) return
+    const command = session.snapshot().buffer.value.replace(/[\r\n]+$/, '')
+    setMenu(undefined)
+    await session.submit(command, () => onSend(command), true)
   }
 
   const sendSignal = async (signal: 'ctrl_c' | 'ctrl_d'): Promise<void> => {
-    if (disabled || !onSignal || signalPending.current) return
-    const target = activePort.current
-    signalPending.current = true
-    try {
-      const result = await onSignal(signal)
-      if (result.status === 'uncertain') setUncertainties((current) => ({ ...current, [target]: result.message }))
-    } finally {
-      signalPending.current = false
-    }
+    if (disabled || !onSignal) return
+    await session.submit(signal === 'ctrl_c' ? 'Ctrl+C' : 'Ctrl+D', () => onSignal(signal), false)
   }
 
   const closeMenu = (accept: boolean): void => {
@@ -201,6 +151,10 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
     edit(accept && menu.entries[menu.index] ? commandBuffer(menu.entries[menu.index]) : menu.saved)
     setMenu(undefined)
     inputRef.current?.focus()
+  }
+
+  const openHistory = (current: CommandBuffer): void => {
+    setMenu({ kind: 'search', saved: current, query: '', entries: humanHistoryCandidates(humanHistory, '', true), index: 0 })
   }
 
   const menuKey = (event: React.KeyboardEvent): boolean => {
@@ -220,20 +174,17 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
     return false
   }
 
-  return (
-    <footer className={`command-bar ${focused ? 'is-focused' : ''}`}>
-      <div className="command-target">
-        <span className="target-dot" />
-        <span>{port || '未选择串口'}</span>
-      </div>
-      <div className="command-editor">
+  const editor = (
+    <div className="command-field" data-slot="prompt-box-field"><span aria-hidden className="serial-prompt-sign">›</span><div className="command-editor">
       <div aria-hidden="true" className="command-ghost"><span style={{ transform: `translateX(${-scrollLeft}px)` }}><span className="command-ghost-prefix">{buffer.value}</span><span>{suffix}</span></span></div>
       <input
+        data-slot="serial-command-input"
         aria-label="输入串口命令"
+        role="combobox"
         aria-autocomplete="both"
-        aria-controls={menu ? 'human-command-candidates' : undefined}
+        aria-controls={menu ? menuId : undefined}
         aria-expanded={!!menu}
-        aria-activedescendant={menu?.entries.length ? `human-command-option-${menu.index}` : undefined}
+        aria-activedescendant={menu?.entries.length ? `${menuId}-${menu.index}` : undefined}
         aria-busy={sending}
         autoComplete="off"
         disabled={disabled}
@@ -245,9 +196,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
         onSelect={(event) => {
           const target = event.currentTarget
           const next = { value: target.value, start: target.selectionStart ?? target.value.length, end: target.selectionEnd ?? target.value.length }
-          bufferRef.current = next
-          draftStore.set(activePort.current, next)
-          setBuffer(next)
+          session.edit(next)
         }}
         onScroll={(event) => setScrollLeft(event.currentTarget.scrollLeft)}
         onFocus={() => setFocused(true)}
@@ -264,7 +213,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
           }
           if (menuKey(event)) return
           if (menu) setMenu(undefined)
-          if (sendingPorts.current.has(activePort.current)) {
+          if (session.snapshot().pending) {
             if (['Enter', 'ArrowUp', 'ArrowDown'].includes(event.key)) event.preventDefault()
             return
           }
@@ -274,11 +223,11 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
             edit(commandBuffer(current.value + suffix))
           } else if (event.key === 'Enter') {
             event.preventDefault()
-            void submit()
+            if (!event.repeat) void submit()
           } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
             event.preventDefault()
-            setMenu({ kind: 'search', saved: current, query: '', entries: humanHistoryCandidates(humanHistory, '', true), index: 0 })
-          } else if (event.key === 'Tab' && !event.ctrlKey && !event.metaKey) {
+            openHistory(current)
+          } else if (event.key === 'Tab' && !event.ctrlKey && !event.metaKey && !event.shiftKey && !!current.value) {
             event.preventDefault()
             setMenu({ kind: 'completion', saved: current, query: current.value, entries: humanHistoryCandidates(humanHistory, current.value), index: 0 })
           } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
@@ -288,25 +237,36 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
             setHistoryCursor(next.cursor)
           }
         }}
-        placeholder={disabled ? '打开串口后可发送命令' : '输入命令…'}
+        placeholder={placeholder}
         readOnly={sending}
         ref={inputRef}
         value={buffer.value}
       />
       {menu && <div className="command-candidates">
-        <div className="command-candidates-heading">人工命令历史 <span>↑↓ 选择 · Enter 回填 · Esc 返回</span></div>
+        <div className="command-candidates-heading">人工命令历史<button type="button" aria-label="收起人工命令候选" title="收起 (Esc)" onClick={() => closeMenu(false)}><X size={12} /></button></div>
         {menu.kind === 'search' && <input aria-label="搜索人工命令历史" ref={searchRef} value={menu.query} onKeyDown={(event) => { menuKey(event) }} onChange={(event) => setMenu({ ...menu, query: event.target.value, entries: humanHistoryCandidates(humanHistory, event.target.value, true), index: 0 })} />}
-        <div id="human-command-candidates" role="listbox" aria-label="人工历史候选">
-          {menu.entries.map((entry, index) => <button id={`human-command-option-${index}`} aria-selected={index === menu.index} role="option" tabIndex={-1} type="button" key={entry} className={index === menu.index ? 'is-selected' : ''} onMouseDown={(event) => event.preventDefault()} onClick={() => { edit(commandBuffer(entry)); setMenu(undefined); inputRef.current?.focus() }}>{entry}</button>)}
+        <ScrollProgress containerRef={listRef} className="candidate-progress" />
+        <div id={menuId} ref={listRef} role="listbox" aria-label="人工历史候选">
+          {menu.entries.map((entry, index) => <button id={`${menuId}-${index}`} aria-selected={index === menu.index} role="option" tabIndex={-1} type="button" key={entry} className={index === menu.index ? 'is-selected' : ''} onMouseDown={(event) => event.preventDefault()} onClick={() => { edit(commandBuffer(entry)); setMenu(undefined); inputRef.current?.focus() }}>{entry}</button>)}
           {!menu.entries.length && <p>没有匹配的人工命令</p>}
         </div>
         {historyWarning && <p role="status">{historyWarning}</p>}
       </div>}
-      </div>
-      <CommandStatusHint sending={sending} uncertainty={uncertainties[portKey]} />
-      <button className="send-button" disabled={disabled || sending} onClick={() => void submit()} type="button" title="发送命令或 Enter">
-        <SendHorizontal size={17} />
-      </button>
-    </footer>
+      </div></div>
+  )
+
+  return (
+    <form ref={formRef} onBlur={event => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setMenu(undefined) }} className={`command-bar ${focused ? 'is-focused' : ''}`} aria-label={`${port ?? ''} 串口命令栏`}
+      onSubmit={event => { event.preventDefault(); void submit() }}>
+      <PromptBox className="serial-prompt" data-tone={sendTone} value={buffer.value} editor={editor}
+        actions={<button className="input-history" type="button" aria-label="查找人工命令历史" title="查找人工命令历史 (Ctrl+R)" disabled={disabled || sending}
+          aria-expanded={menu?.kind === 'search'} onClick={() => menu?.kind === 'search' ? closeMenu(false) : openHistory(buffer)}><History size={15} aria-hidden /></button>}
+        efforts={DIRECT_SEND} status={sending ? 'sending' : 'idle'} disabled={disabled} paused={paused}
+        hint={null} placeholder={placeholder} clearOnSubmit={false} sendLabel="Run" buttonClassName="send-button"
+        buttonTitle={receipt?.message || '向当前串口发送命令 (Enter)'}
+        submitIcon={sending ? <LoaderCircle className="is-spinning" size={12} /> : <Play size={12} />}
+        onSubmit={() => void submit()} feedback={<CommandStatusHint sending={sending} receipt={receipt}
+          uncertainty={receipts[0]?.status === 'uncertain' ? receipts[0].message : undefined} />} />
+    </form>
   )
 }

@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const OUTBOUND_QUEUE: usize = 512;
+mod setup_requests;
 // 64 KiB source plus JSON string escaping and request metadata.
 const MAX_WS_INCOMING_BYTES: usize = 512 * 1024;
 const MAX_WS_CONNECTIONS: usize = 256;
@@ -47,6 +48,7 @@ struct AppStateInner {
     journal: JournalHandle,
     monitors: MonitorManager,
     macros: crate::macros::MacroCatalog,
+    setup_requests: Mutex<HashMap<Uuid, (Instant, serial_protocol::SetupRequest)>>,
     daemon_epoch: Uuid,
     started: Instant,
     ws_connections: Arc<Semaphore>,
@@ -88,6 +90,7 @@ impl AppState {
         )?;
         Ok(Self {
             inner: Arc::new(AppStateInner {
+                setup_requests: Mutex::new(HashMap::new()),
                 macros: crate::macros::MacroCatalog::new(
                     config_store.paths().data_dir.join("macros.json"),
                 ),
@@ -329,6 +332,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/macros", get(list_macros).post(save_macro))
         .route("/api/v1/config/ports", put(configure_ports))
         .route("/api/v1/config/setup", put(configure_setup))
+        .route("/api/v1/setup/requests", post(setup_requests::create))
+        .route(
+            "/api/v1/setup/requests/{id}",
+            get(setup_requests::read).put(setup_requests::propose),
+        )
         .route(
             "/api/v1/config/transport-profiles",
             get(list_transport_profiles).put(configure_transport_profiles),

@@ -10,7 +10,7 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 - **一个物理写入者**：`seriald` 独占串口句柄，通过带 fencing 的 Control 串行化人和 Agent 的写入。
 - **同一份事实记录**：RX、确认后的 TX、Control、Run、Macro、断连和重配事件进入同一条带序号时间线。
 - **历史跨客户端重开保留**：日志由后端持久化；关闭再打开 TUI 或 App 不会清空已有串口记录。
-- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 18 个 MCP 工具；三者共享同一个后端状态。
+- **人和 Agent 各自适合的界面**：人使用 TUI 或 Electron App，Agent 使用 19 个 MCP 工具；三者共享同一个后端状态。
 - **配置分层清楚**：Transport Profile 管物理 UART 参数；Model Profile 只管提示符、换行、设备回显解析和写入节奏；Model Family 目录独立管理“一级机型系列 → 二级具体机型”，与行为 Profile 可以独立切换。
 
 ## 快速开始
@@ -185,9 +185,10 @@ App 默认连接配置的本地后端；后端不存在且启用了自动启动�
 
 ## Agent 与 MCP
 
-`serial-mcp` 暴露 18 个工具：
+`serial-mcp` 暴露 19 个工具：
 
 ```text
+setup_proposal
 devices              model_identity_set   read
 command              command_sequence     signal
 macro_list           macro_save           macro_run
@@ -251,7 +252,7 @@ seriald ── durable journal
 
 - [架构与交互设计](./DOCUMENTATION.md)：产品边界、配置模型、Control/Run、历史投影和启动所有权；
 - [protocol v9](./docs/PROTOCOL.md)：HTTP v1、WebSocket v9、Timeline、Monitor 与 MCP transport 线协议；
-- [MCP 工具契约](./docs/MCP_TOOLS.md)：18 个工具的输入、结果和 Agent 工作流；
+- [MCP 工具契约](./docs/MCP_TOOLS.md)：19 个工具的输入、结果和 Agent 工作流；
 - [Macro Script v1](./docs/MACRO_SCRIPT_V1.md)：宏语言、参数、共享和执行边界；
 - [输入与搜索操作](./docs/INPUT_AND_SEARCH.md)：补全、焦点、同页配置、全会话搜索与 TUI 宏页面；
 - [Adapter 配置](./adapters/README.md)：stdio/Streamable HTTP host 接入；

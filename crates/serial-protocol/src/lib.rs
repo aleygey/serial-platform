@@ -1450,6 +1450,39 @@ pub struct ConfigureSetupRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupCheckKind {
+    Heartbeat,
+    Status,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupBrief {
+    pub port: String,
+    pub prompt_hint: String,
+    pub check: SetupCheckKind,
+    pub intent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupPlan {
+    pub shell_prompt: String,
+    pub command: String,
+    #[serde(default)]
+    pub expected_reply: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupRequest {
+    pub id: Uuid,
+    pub brief: SetupBrief,
+    pub plan: Option<SetupPlan>,
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigurePortsResponse {
     pub ports: Vec<SlotSnapshot>,
     #[serde(default)]

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createOfflineSnapshot } from '../../shared/offline-snapshot'
 import { createQaSnapshot } from '../../shared/qa-fixture'
 import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../../shared/contracts'
-import { mergeDesktopSnapshotEvent, submitHumanCommand, WindowBar } from '../App'
+import { mergeDesktopSnapshotEvent, submitHumanCommand, BackendControls } from '../App'
 import { resolveBackendControl } from '../lib/backend-control'
 import {
   ModelEditor,
@@ -78,14 +78,14 @@ describe('desktop backend controls', () => {
   it('exposes a reachable stop action only for an App-owned backend', () => {
     const owned = createQaSnapshot()
     const ownedMarkup = renderToStaticMarkup(
-      <WindowBar snapshot={owned} page="console" onPage={vi.fn()} onStartBackend={action} onStopBackend={action} onSavePreferences={action} />
+      <BackendControls snapshot={owned} onStartBackend={action} onStopBackend={action} />
     )
     expect(ownedMarkup).toContain('aria-label="停止后端"')
     expect(ownedMarkup).not.toContain('aria-label="停止后端" disabled=""')
 
     const external = { ...owned, service: { owned: false, status: 'stopped' as const } }
     const externalMarkup = renderToStaticMarkup(
-      <WindowBar snapshot={external} page="console" onPage={vi.fn()} onStartBackend={action} onStopBackend={action} onSavePreferences={action} />
+      <BackendControls snapshot={external} onStartBackend={action} onStopBackend={action} />
     )
     expect(externalMarkup).toContain('aria-label="外部后端"')
     expect(externalMarkup).toContain('disabled=""')
@@ -102,7 +102,6 @@ describe('desktop backend controls', () => {
         modelFamilies={snapshot.modelFamilies}
         preferences={snapshot.preferences}
         initialPort="COM6"
-        onBack={vi.fn()}
         onSaveSerial={saveAction}
         onSaveModels={saveAction}
         onSaveModelFamilies={saveAction}
@@ -123,7 +122,7 @@ describe('desktop backend controls', () => {
     expect(resolveBackendControl(snapshot.service, snapshot.connection).kind).toBe('start')
 
     const windowMarkup = renderToStaticMarkup(
-      <WindowBar snapshot={snapshot} page="settings" onPage={vi.fn()} onStartBackend={action} onStopBackend={action} onSavePreferences={action} />
+      <BackendControls snapshot={snapshot} onStartBackend={action} onStopBackend={action} />
     )
     const settingsMarkup = renderToStaticMarkup(
       <SettingsPage
@@ -133,7 +132,6 @@ describe('desktop backend controls', () => {
         modelProfiles={snapshot.modelProfiles}
         modelFamilies={snapshot.modelFamilies}
         preferences={snapshot.preferences}
-        onBack={vi.fn()}
         onSaveSerial={saveAction}
         onSaveModels={saveAction}
         onSaveModelFamilies={saveAction}
@@ -157,7 +155,7 @@ describe('desktop backend controls', () => {
     expect(profileMarkup).toContain('title="已有 Profile 名称是稳定标识"')
     expect(profileMarkup).toContain('readOnly=""')
     expect(profileMarkup).toMatch(/aria-label="删除机型 Profile TL-AS7230 Shell"[^>]*disabled=""/)
-    expect(profileMarkup).toContain('如需删除，请先在“串口配置”改绑或解绑。')
+    expect(profileMarkup).toContain('title="请先在串口配置中改绑或解绑"')
 
     const familyMarkup = renderToStaticMarkup(
       <ModelFamilyEditor families={snapshot.modelFamilies} configuredPorts={snapshot.configuredPorts} onSave={action} />
@@ -165,7 +163,7 @@ describe('desktop backend controls', () => {
     expect(familyMarkup).toMatch(/aria-label="删除一级机型 TL-AS7230"[^>]*disabled=""/)
     expect(familyMarkup).toMatch(/aria-label="二级具体型号 1"[^>]*readOnly=""/)
     expect(familyMarkup).toMatch(/aria-label="删除具体型号 TL-AS7230-W 1.0"[^>]*disabled=""/)
-    expect(familyMarkup).toContain('已绑定 COM6')
+    expect(familyMarkup).not.toContain('已绑定 COM6')
   })
 
   it('rejects silently removing a concrete model that is still bound to a port', () => {
@@ -198,7 +196,6 @@ describe('desktop backend controls', () => {
         selectedPort="COM6"
         onSelect={vi.fn()}
         onToggle={vi.fn()}
-        onSettings={vi.fn()}
       />
     )
     const terminal = renderToStaticMarkup(

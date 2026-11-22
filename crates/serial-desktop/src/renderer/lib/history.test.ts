@@ -10,12 +10,25 @@ function event(seq: number, direction: 'rx' | 'tx', text: string): TimelineEvent
 }
 
 describe('Agent history', () => {
+  it('shows a Run before its first command and retains its start after completion', () => {
+    const run = { id: 'live', label: 'Read sensors', status: 'active' as const, start_seq: 12 }
+    expect(mergeAgentHistory([], undefined, run)).toEqual([
+      { kind: 'run', id: 'run:live', label: run.label, status: 'running', firstSeq: 12, startSeq: 12 }
+    ])
+    const start = { ...event(12, 'rx', ''), run_id: run.id, kind: 'run_started', wall_time_ns: 100, metadata: { run } }
+    const end = { ...start, kind: 'run_ended', seq: 15, wall_time_ns: 200 }
+    expect(mergeAgentHistory([end, start], undefined, run)).toMatchObject([
+      { status: 'completed', startSeq: 12, startedAt: 100 }
+    ])
+  })
+
   it('hides whole Runs without changing source events or another Run, and deduplicates restored TX', () => {
     const tx = { ...event(2, 'tx', 'status\r'), run_id: 'old', operation_id: 'op', actor: { id: 'agent', label: 'Agent', kind: 'agent' as const }, metadata: { command_description: 'Status' } }
     const records = [{ port: 'COM6', epoch: 'epoch', run: { id: 'old', label: 'Old', status: 'completed' as const, start_seq: 1, end_seq: 3 }, started_wall_time_ns: 1, through_seq: 3 }]
     const persisted = { server_id: 'server', runs: records, visibility: { revision: 0, hidden: [] as string[] }, truncated: false, indexing: false }
     const history = mergeAgentHistory([tx, tx], persisted)
     expect(history).toHaveLength(2)
+    expect(history[0]).toMatchObject({ startSeq: 1, startedAt: 1, status: 'completed' })
     expect(history[1].kind === 'command' && history[1].commands[0].text).toBe('status\r')
     persisted.visibility.hidden = ['old']
     expect(mergeAgentHistory([tx], persisted)).toEqual([])
@@ -63,6 +76,9 @@ describe('Agent history', () => {
     expect(history[0].kind === 'command' && history[0].commands.map((item) => item.text)).toEqual([
       'admin\r', 'password\r'
     ])
+    expect(history[0]).toMatchObject({ description: '登录设备', commands: [
+      { description: '输入账号' }, { description: '输入密码' }
+    ] })
   })
 
   it('uses the persisted prompt matcher and otherwise returns no synthetic range', () => {

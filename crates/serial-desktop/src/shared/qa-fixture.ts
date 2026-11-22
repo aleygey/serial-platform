@@ -17,11 +17,29 @@ export function createQaSnapshot(preferences: DesktopPreferences = {
     tx(118, now - 6_000_000_000, 'cat /etc/version\r', agent, '确认固件版本', undefined, undefined, 'root@router:~# '),
     rx(119, now - 5_800_000_000, 'Serial Platform Firmware 0.8.0-debug\nBuild: 2026-08-22\nStatus: ready\nroot@router:~# ')
   ]
+  const run = { id: 'qa-sensor-run', label: '读取传感器状态', owner: agent, start_seq: 2, status: 'active' as const }
+  const sensorEvent = (seq: number, text: string, direction: TimelineEvent['direction']): TimelineEvent => ({
+    port: 'COM7', daemon_epoch: 'qa-epoch', generation: 1, seq, wall_time_ns: now - (8 - seq) * 1_000_000_000,
+    kind: direction, direction, text, metadata: {}, durable: true
+  })
+  const sensorEvents: TimelineEvent[] = [
+    sensorEvent(1, 'Sensor Board / UART0\nFirmware 2.4.1\nI2C bus ready\n\nsensor> ', 'rx'),
+    { ...sensorEvent(2, '', 'none'), kind: 'run_started', actor: agent, run_id: run.id, metadata: { run } },
+    { ...sensorEvent(3, 'version\r', 'tx'), actor: agent, run_id: run.id, operation_id: 'qa-version',
+      metadata: { command_description: '读取固件版本', command_capture_matchers: [{ kind: 'contains', value: 'sensor> ' }] } },
+    sensorEvent(4, 'version\nboard     SHT31\nrevision  B2\nfirmware  2.4.1\nsensor> ', 'rx'),
+    { ...sensorEvent(5, '', 'none'), kind: 'command_capture_completed', run_id: run.id, operation_id: 'qa-version',
+      metadata: { capture: { daemon_epoch: 'qa-epoch', generation: 1, operation_id: 'qa-version', tx_event_seq: 3,
+        evidence_from_seq: 3, evidence_through_seq: 4, completion: 'prompt', confidence: 'high' } } },
+    { ...sensorEvent(6, 'sensor read\r', 'tx'), actor: agent, run_id: run.id, operation_id: 'qa-sample',
+      metadata: { command_description: '读取实时采样', command_capture_matchers: [{ kind: 'contains', value: 'sensor> ' }] } },
+    sensorEvent(7, 'sensor read\nSampling channel 0…\n', 'rx')
+  ]
   return {
     connection: 'connected', connectionMessage: '实时连接已建立', serverId: 'qa-server',
     daemonEpoch: 'qa-epoch', configRevision: 8,
     humanHistory: { server_id: 'qa-server', revision: 4, entries: ['cat /etc/version', 'cat /proc/meminfo', 'echo 中🙂', 'version'].map((command, index) => ({ id: `human-${index}`, command, port: index % 2 ? 'COM7' : 'COM6', wall_time_ns: now, revision: 4 - index, uses: 1 })) },
-    preferences: { ...preferences, selectedPort: 'COM6' },
+    preferences: { ...preferences, selectedPort: preferences.selectedPort ?? 'COM6' },
     service: { owned: true, status: 'running', pid: 4208, program: 'seriald' },
     availablePorts: [
       { name: 'COM6', port_type: 'usb', manufacturer: 'FTDI', product: 'USB Serial Port' },
@@ -37,9 +55,10 @@ export function createQaSnapshot(preferences: DesktopPreferences = {
       shell_prompt: 'root@router:~# ', uboot_prompt: '=> ',
       write_eol: '\r', echo: 'auto', write_chunk_size: 1, write_chunk_delay_ms: 2
     }],
-    modelFamilies: [{
-      name: 'TL-AS7230', model_names: ['TL-AS7230-W 1.0', 'TL-AS7230-F4GE 2.0']
-    }],
+    modelFamilies: [
+      { name: 'TL-AS7230', model_names: ['TL-AS7230-W 1.0', 'TL-AS7230-F4GE 2.0'] },
+      { name: 'SHT3x', model_names: ['SHT31 Sensor Board'] }
+    ],
     configuredPorts: [
       {
         config: {
@@ -52,12 +71,13 @@ export function createQaSnapshot(preferences: DesktopPreferences = {
         effective_uboot_prompt: '=> ', effective_write_eol: '\r'
       },
       {
-        config: { port: 'COM7', transport_profile: '115200-8N1', model_profile: null, enabled: false },
-        daemon_epoch: 'qa-epoch', head_seq: 0, generation: 0, endpoint_present: true,
-        session_state: 'disabled'
+        config: { port: 'COM7', transport_profile: '115200-8N1', model_family: 'SHT3x', model_name: 'SHT31 Sensor Board', enabled: true },
+        daemon_epoch: 'qa-epoch', head_seq: 7, generation: 1, endpoint_present: true, session_state: 'online',
+        active_run: run, control: { id: 'qa-agent-lease', owner: agent, epoch: 'qa-epoch', generation: 1, fence: 1,
+          issued_wall_time_ns: now, expires_wall_time_ns: now + 60_000_000_000 }
       }
     ],
-    events: { COM6: events, COM7: [] }
+    events: { COM6: events, COM7: sensorEvents }
   }
 }
 
@@ -83,7 +103,7 @@ function tx(
     kind: 'tx', direction: 'tx', actor, operation_id: `op-${seq}`, text,
     metadata: {
       command_description: description,
-      ...(sequenceId ? { command_sequence_id: sequenceId, command_sequence_description: description } : {}),
+      ...(sequenceId ? { command_sequence_id: sequenceId, command_sequence_description: description, command_sequence_step_count: 2 } : {}),
       ...(stepIndex === undefined ? {} : { command_sequence_step_index: stepIndex }),
       ...(matcher ? { command_capture_matchers: [{ kind: 'contains', value: matcher }] } : {})
     },

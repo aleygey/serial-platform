@@ -110,9 +110,10 @@ capture_max_bytes = 1048576
 
 ## 工具发现
 
-adapter 暴露固定 18 项：
+adapter 暴露固定 19 项：
 
 ```text
+setup_proposal
 devices              model_identity_set   read
 command              command_sequence     signal
 macro_list           macro_save           macro_run

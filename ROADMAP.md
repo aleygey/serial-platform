@@ -12,7 +12,7 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 4. 端口和机型配置足够直观，首次使用可以快速完成；
 5. 通用平台只提供串口原语，不把厂商流程和 Shell 假设写进核心。
 
-当前产品结构围绕这五点收敛。公开设备位只有 OS 串口名 `port`；Transport Profile 描述主机 UART，Model Profile 只描述可复用的串口交互行为，独立 Model Family 目录描述“一级机型系列 → 二级具体机型”身份；TUI、Electron 与 18 个 MCP 工具共享 `seriald` 时间线。
+当前产品结构围绕这五点收敛。公开设备位只有 OS 串口名 `port`；Transport Profile 描述主机 UART，Model Profile 只描述可复用的串口交互行为，独立 Model Family 目录描述“一级机型系列 → 二级具体机型”身份；TUI、Electron 与 19 个 MCP 工具共享 `seriald` 时间线。
 
 ## 当前能力
 
@@ -66,7 +66,7 @@ Serial Platform 是一个基于人/Agent 协同交互的通用串口平台。
 ### serial-mcp
 
 - stdio 与 sessionless Streamable HTTP 两种 transport；HTTP 继承活动 `seriald` 的精确 loopback 或单播 IP，并拒绝通配、广播和组播监听。
-- 18 个工具覆盖设备发现、已配置机型身份绑定、Run、命令、信号、Macro、查询和 Monitor；不再公开容易误操作且可由 `command` 覆盖的 `input`。
+- 19 个工具覆盖设备发现、已配置机型身份绑定、Run、命令、信号、Macro、查询和 Monitor；不再公开容易误操作且可由 `command` 覆盖的 `input`。
 - `devices` 是唯一发现工具，只提供串口、两级机型身份、Agent 所需状态和有效 Shell/U-Boot 提示符；不向 Agent 暴露 Profile 名、UART、EOL/echo 或写入节奏。
 - 机型身份工具只绑定/解绑人工预先配置的 family/name；Profile 和两级机型目录继续由 TUI、Electron 或 HTTP 管理。
 - `run_handle` 收敛 Run-scoped 参数；Agent 用 `run_end(outcome=completed|aborted)` 统一表达正常完成或经权威确认的异常终止，并收口 Control。

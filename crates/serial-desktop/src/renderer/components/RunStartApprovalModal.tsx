@@ -1,4 +1,6 @@
-import { Bot, Clock3, ShieldCheck } from 'lucide-react'
+import { Clock3 } from 'lucide-react'
+import { motion } from 'motion/react'
+import { useReducedMotion } from '../lib/use-reduced-motion'
 import { useEffect, useRef, useState } from 'react'
 import type { PendingRunStartApproval, RunStartDecision } from '../../shared/contracts'
 
@@ -9,6 +11,7 @@ interface Props {
 }
 
 export function RunStartApprovalModal({ approval, onDecide, onExpired }: Props): React.JSX.Element {
+  const reduced = useReducedMotion()
   const dialogRef = useRef<HTMLDivElement>(null)
   const expiredRef = useRef(false)
   const submittingRef = useRef(false)
@@ -63,16 +66,17 @@ export function RunStartApprovalModal({ approval, onDecide, onExpired }: Props):
     submittingRef.current = true
     setDecisionError(false)
     setSubmitting(decision)
-    if (!(await onDecide(decision))) {
-      submittingRef.current = false
-      setSubmitting(undefined)
-      setDecisionError(true)
-    }
+    try {
+      if (await onDecide(decision)) return
+    } catch { /* The dialog remains actionable if the backend rejects a request. */ }
+    submittingRef.current = false
+    setSubmitting(undefined)
+    setDecisionError(true)
   }
 
   return (
     <div className="approval-backdrop">
-      <div
+      <motion.div initial={reduced ? false : { opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.16 }}
         aria-describedby="run-start-approval-description"
         aria-labelledby="run-start-approval-title"
         aria-modal="true"
@@ -82,18 +86,16 @@ export function RunStartApprovalModal({ approval, onDecide, onExpired }: Props):
         role="dialog"
         tabIndex={-1}
       >
-        <span className="approval-icon"><ShieldCheck size={21} /></span>
         <div className="approval-heading">
-          <span>Agent Run Control</span>
-          <h2 id="run-start-approval-title">允许 Agent 启动任务？</h2>
-          <p id="run-start-approval-description">当前串口由你持有，Agent 必须获得明确批准后才能接管并启动 Run。</p>
+          <h2 id="run-start-approval-title">允许外部 Agent 接管串口？</h2>
+          <p id="run-start-approval-description">当前串口由你持有。批准后，请求方将通过 MCP 获得控制权并执行这轮 Run。</p>
         </div>
         <dl className="approval-details">
           <div><dt>串口</dt><dd><code>{approval.port}</code></dd></div>
-          <div><dt>Agent</dt><dd><Bot size={14} /> {approval.requester.label}</dd></div>
+          <div><dt>Agent</dt><dd>{approval.requester.label}</dd></div>
           <div><dt>Run</dt><dd>{approval.label}</dd></div>
         </dl>
-        <div aria-live="polite" className={`approval-expiry ${remainingMs <= 5_000 ? 'is-urgent' : ''}`}>
+        <div role="timer" className={`approval-expiry ${remainingMs <= 5_000 ? 'is-urgent' : ''}`}>
           <Clock3 size={14} />
           {remainingMs > 0 ? `请求将在 ${formatRemaining(remainingMs)} 后自动失效` : '请求已失效'}
         </div>
@@ -106,7 +108,7 @@ export function RunStartApprovalModal({ approval, onDecide, onExpired }: Props):
             {submitting === 'approve' ? '正在批准…' : '批准并交给 Agent'}
           </button>
         </div>
-      </div>
+      </motion.div>
     </div>
   )
 }

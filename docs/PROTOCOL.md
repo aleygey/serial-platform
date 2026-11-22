@@ -50,6 +50,8 @@ JSON field、WebSocket message、timeline event 与 MCP 参数都保留原始端
 | `GET` | `/api/v1/status` | 全局状态、config revision、所有配置端口 snapshot |
 | `GET` | `/api/v1/ports` | 枚举主机可见的 OS 串口 |
 | `PUT` | `/api/v1/config/ports` | 原子替换端口配置 |
+| `POST` | `/api/v1/setup/requests` | 根据首次配置向导的回答创建邀请 |
+| `GET` / `PUT` | `/api/v1/setup/requests/{id}` | 读取邀请及回答，或提交供用户确认的配置方案 |
 | `GET` / `PUT` | `/api/v1/config/transport-profiles` | 读取/原子替换 Transport Profile catalog |
 | `GET` / `PUT` | `/api/v1/config/model-profiles` | 读取/原子替换 Model Profile catalog |
 | `GET` / `PUT` | `/api/v1/config/model-families` | 读取/原子替换两级 Model Family catalog |
@@ -836,10 +838,10 @@ HTTP MCP 没有认证和 TLS。`--listen` 必须是一个精确的单播接口�
 
 `Origin` 检查只降低浏览器跨站请求风险，不替代认证；非浏览器客户端可以不发送该 header。
 
-initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回固定 18 项：
+initialize 响应声明 `tools.listChanged=false`。`tools/list` 返回固定 19 项：
 
 ```text
-devices model_identity_set read command command_sequence signal macro_list macro_save macro_run wait
+setup_proposal devices model_identity_set read command command_sequence signal macro_list macro_save macro_run wait
 search monitor_start monitor_list monitor_status monitor_incidents monitor_stop
 run_start run_end
 ```

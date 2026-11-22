@@ -37,6 +37,7 @@ export class DesktopCoordinator {
   private readonly settings = new SettingsStore()
   private readonly service: LocalService
   private preferences?: DesktopPreferences
+  private initialSnapshot?: Promise<DesktopSnapshot>
   private client?: SerialClient
   private connection: DesktopSnapshot['connection'] = 'offline'
   private connectionMessage = '尚未连接'
@@ -50,9 +51,16 @@ export class DesktopCoordinator {
     this.service = new LocalService((service) => this.emit({ type: 'service', service }))
   }
 
-  async bootstrap(): Promise<DesktopSnapshot> {
+  bootstrap(): Promise<DesktopSnapshot> {
+    if (this.initialSnapshot) return this.initialSnapshot
+    if (this.client && this.connection === 'connected') return Promise.resolve(this.toSnapshot(this.client.data()))
+    this.initialSnapshot = this.initialize().finally(() => { this.initialSnapshot = undefined })
+    return this.initialSnapshot
+  }
+
+  private async initialize(): Promise<DesktopSnapshot> {
     this.preferences = await this.settings.load()
-    if (this.qaTheme) this.preferences = { ...this.preferences, theme: this.qaTheme }
+    if (this.qaMode && this.qaTheme) this.preferences = { ...this.preferences, theme: this.qaTheme }
     if (this.qaMode) return createQaSnapshot(this.preferences)
     return this.connectOrOffline(this.preferences.autoStartLocal)
   }
@@ -128,6 +136,13 @@ export class DesktopCoordinator {
     return this.requireClient().listMacros(query)
   }
 
+  createSetup(brief: import('../shared/first-setup').SetupBrief) { return this.requireClient().createSetup(brief) }
+  readSetup(id: string) { return this.requireClient().readSetup(id) }
+  async applySetup(id: string, revision: number) {
+    try { return await this.requireClient().applySetup(id, revision) }
+    finally { await this.publishSnapshot() }
+  }
+
   async saveMacro(definition: MacroSaveRequest) {
     return this.requireClient().saveMacro(definition)
   }
@@ -139,6 +154,11 @@ export class DesktopCoordinator {
     if (this.qaMode) return
     await this.requireClient().setPortOpen(port, open)
     await this.publishSnapshot()
+  }
+
+  async setPortModel(port: string, family: string | null, name: string | null, expectedRevision: number): Promise<void> {
+    if (this.qaMode) return
+    await this.saveConfiguration(() => this.requireClient().setPortModel(port, family, name, expectedRevision))
   }
 
   async saveSerialConfiguration(draft: SerialConfigurationDraft, expectedRevision: number): Promise<void> {
@@ -158,8 +178,10 @@ export class DesktopCoordinator {
     await this.saveConfiguration(() => this.requireClient().saveModelFamilies(families, expectedRevision))
   }
 
-  async savePreferences(preferences: DesktopPreferences): Promise<void> {
-    const endpointChanged = this.preferences?.endpoint !== preferences.endpoint
+  async savePreferences(patch: Partial<DesktopPreferences>): Promise<void> {
+    const previous = this.preferences ?? (await this.settings.load())
+    const preferences = { ...previous, ...patch }
+    const endpointChanged = previous.endpoint !== preferences.endpoint
     this.preferences = preferences
     await this.settings.save(preferences)
     if (this.qaMode) return
@@ -278,7 +300,9 @@ export class DesktopCoordinator {
       ? await selectLocalEndpoint(preferred, reachable, () => this.service.discoverEndpoint())
       : (await reachable(preferred) ? { endpoint: preferred, discovered: false } : undefined)
     if (!selection) {
-      if (preferredError) throw preferredError
+      if (preferredError && !(discoverActive && isUnusedLocalEndpoint(preferred, preferredError))) {
+        throw preferredError
+      }
       return undefined
     }
     if (selection.discovered) {
@@ -390,6 +414,13 @@ export class DesktopCoordinator {
     if (!this.client) throw new Error('尚未连接 Serial Platform 后端')
     return this.client
   }
+}
+
+function isUnusedLocalEndpoint(endpoint: string, error: unknown): boolean {
+  const cause = error instanceof TypeError ? error.cause as NodeJS.ErrnoException | undefined : undefined
+  if (cause?.code !== 'ECONNREFUSED') return false
+  const { hostname, protocol } = new URL(endpoint)
+  return protocol === 'http:' && (hostname === 'localhost' || hostname === '[::1]' || /^127(?:\.\d+){3}$/.test(hostname))
 }
 
 function errorMessage(error: unknown): string {

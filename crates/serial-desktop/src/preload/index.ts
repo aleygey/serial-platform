@@ -9,6 +9,10 @@ import type {
 } from '../shared/contracts'
 
 const bridge: DesktopBridge = {
+  openRunExample: () => ipcRenderer.invoke('serial:open-run-example'),
+  createSetup: brief => ipcRenderer.invoke('serial:setup-create', brief),
+  readSetup: id => ipcRenderer.invoke('serial:setup-read', id),
+  applySetup: (id, revision) => ipcRenderer.invoke('serial:setup-apply', id, revision),
   bootstrap: () => ipcRenderer.invoke('serial:bootstrap'),
   refresh: () => ipcRenderer.invoke('serial:refresh'),
   sendCommand: (port, command) => ipcRenderer.invoke('serial:send-command', port, command),
@@ -25,13 +29,15 @@ const bridge: DesktopBridge = {
   decideRunStart: (port, approvalId, decision) =>
     ipcRenderer.invoke('serial:decide-run-start', port, approvalId, decision),
   setPortOpen: (port, open) => ipcRenderer.invoke('serial:set-port-open', port, open),
+  setPortModel: (port, family, name, expectedRevision) =>
+    ipcRenderer.invoke('serial:set-port-model', port, family, name, expectedRevision),
   saveSerialConfiguration: (draft: SerialConfigurationDraft, expectedRevision: number) =>
     ipcRenderer.invoke('serial:save-serial-configuration', draft, expectedRevision),
   saveModelProfiles: (profiles: ModelProfile[], expectedRevision: number) =>
     ipcRenderer.invoke('serial:save-model-profiles', profiles, expectedRevision),
   saveModelFamilies: (families: ModelFamily[], expectedRevision: number) =>
     ipcRenderer.invoke('serial:save-model-families', families, expectedRevision),
-  savePreferences: (preferences: DesktopPreferences) =>
+  savePreferences: (preferences: Partial<DesktopPreferences>) =>
     ipcRenderer.invoke('serial:save-preferences', preferences),
   startLocalService: () => ipcRenderer.invoke('serial:start-local-service'),
   stopLocalService: () => ipcRenderer.invoke('serial:stop-local-service'),

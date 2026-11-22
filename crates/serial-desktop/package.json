@@ -13,6 +13,7 @@
     "test": "vitest",
     "test:run": "vitest run",
     "preview": "electron-vite preview",
+    "preview:browser": "electron-vite build && node scripts/build-browser-preview.mjs",
     "package": "npm run build && electron-builder --dir --publish never",
     "package:mac": "electron-builder --mac dir --publish never",
     "package:linux": "electron-builder --linux AppImage --publish never",
@@ -24,13 +25,18 @@
   "dependencies": {
     "@fontsource-variable/inter": "5.3.0",
     "@fontsource/jetbrains-mono": "5.3.0",
+    "cn": "^0.5.2",
     "lucide-react": "1.33.0",
+    "motion": "^14.14.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "react-resizable-panels": "^4.24.1",
+    "react-use-measure": "^2.1.7",
     "ws": "8.21.3"
   },
   "devDependencies": {
     "@electron-toolkit/preload": "3.0.2",
+    "@tailwindcss/vite": "4.3.5",
     "@types/node": "26.2.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
@@ -40,6 +46,7 @@
     "electron-builder": "26.15.3",
     "electron-vite": "5.0.0",
     "plist": "3.1.0",
+    "tailwindcss": "4.3.5",
     "typescript": "7.0.2",
     "vite": "7.3.6",
     "vitest": "4.1.11"
@@ -58,28 +65,44 @@
     },
     "files": [
       "out/**/*",
+      "RARE-UI-LICENSE.txt",
+      "MOTION-PRIMITIVES-LICENSE.txt",
+      "ANIMATA-LICENSE.txt",
       "package.json"
     ],
     "extraResources": [
       {
         "from": "resources/bin",
         "to": "bin",
-        "filter": ["serial", "seriald", "serial.exe", "seriald.exe"]
+        "filter": [
+          "serial",
+          "seriald",
+          "serial-mcp",
+          "serial-mcp.exe",
+          "serial.exe",
+          "seriald.exe"
+        ]
       }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": ["dir"],
+      "target": [
+        "dir"
+      ],
       "icon": "resources/icon.png"
     },
     "win": {
-      "target": ["portable"],
+      "target": [
+        "portable"
+      ],
       "icon": "resources/icon.png",
       "signAndEditExecutable": false,
       "artifactName": "serial-platform-desktop-${version}-windows-${arch}.${ext}"
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "category": "Development",
       "icon": "resources/icon.png",
       "artifactName": "serial-platform-desktop-${version}-linux-${arch}.${ext}"

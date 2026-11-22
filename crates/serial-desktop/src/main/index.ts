@@ -12,6 +12,7 @@ const qaThemeArgument = process.argv.find((argument) => argument.startsWith('--q
 const qaTheme = qaThemeArgument === 'light' ? 'light' : 'dark'
 const startup = startupAction(process.argv.slice(1))
 let window: BrowserWindow | undefined
+let exampleWindow: BrowserWindow | undefined
 let coordinator: DesktopCoordinator | undefined
 const quitGate = new GracefulQuitGate()
 
@@ -59,7 +60,40 @@ function createWindow(): void {
   }
 }
 
+async function openRunExample(): Promise<void> {
+  if (exampleWindow && !exampleWindow.isDestroyed()) {
+    if (exampleWindow.isMinimized()) exampleWindow.restore()
+    exampleWindow.focus()
+    return
+  }
+  const example = new BrowserWindow({
+    title: 'Agent 运行示例 · 模拟串口', width: 1000, height: 720, minWidth: 360, minHeight: 480,
+    parent: window, show: false, autoHideMenuBar: true,
+    webPreferences: { partition: 'serial-run-example', contextIsolation: true, nodeIntegration: false, sandbox: true },
+  })
+  exampleWindow = example
+  example.once('closed', () => { exampleWindow = undefined })
+  example.on('page-title-updated', event => event.preventDefault())
+  example.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  const query = { preview: '1', focus: 'agent' }
+  try {
+    if (process.env.ELECTRON_RENDERER_URL) {
+      const url = new URL(process.env.ELECTRON_RENDERER_URL)
+      url.search = new URLSearchParams(query).toString()
+      await example.loadURL(url.href)
+    } else await example.loadFile(join(__dirname, '../renderer/index.html'), { query })
+    if (!example.isDestroyed()) example.show()
+  } catch (error) {
+    if (!example.isDestroyed()) example.close()
+    throw error
+  }
+}
+
 function installIpc(): void {
+  ipcMain.handle('serial:open-run-example', openRunExample)
+  ipcMain.handle('serial:setup-create', (_, brief: import('../shared/first-setup').SetupBrief) => coordinator!.createSetup(brief))
+  ipcMain.handle('serial:setup-read', (_, id: string) => coordinator!.readSetup(id))
+  ipcMain.handle('serial:setup-apply', (_, id: string, revision: number) => coordinator!.applySetup(id, revision))
   ipcMain.handle('serial:bootstrap', () => coordinator!.bootstrap())
   ipcMain.handle('serial:refresh', () => coordinator!.refresh())
   ipcMain.handle('serial:send-command', (_event, port: string, command: string) =>
@@ -82,6 +116,8 @@ function installIpc(): void {
   ) => coordinator!.decideRunStart(port, approvalId, decision))
   ipcMain.handle('serial:set-port-open', (_event, port: string, open: boolean) =>
     coordinator!.setPortOpen(port, open))
+  ipcMain.handle('serial:set-port-model', (_event, port: string, family: string | null, name: string | null, expectedRevision: number) =>
+    coordinator!.setPortModel(port, family, name, expectedRevision))
   ipcMain.handle('serial:save-serial-configuration', (
     _event,
     draft: SerialConfigurationDraft,
@@ -91,7 +127,7 @@ function installIpc(): void {
     coordinator!.saveModelProfiles(profiles, expectedRevision))
   ipcMain.handle('serial:save-model-families', (_event, families: ModelFamily[], expectedRevision: number) =>
     coordinator!.saveModelFamilies(families, expectedRevision))
-  ipcMain.handle('serial:save-preferences', (_event, preferences: DesktopPreferences) =>
+  ipcMain.handle('serial:save-preferences', (_event, preferences: Partial<DesktopPreferences>) =>
     coordinator!.savePreferences(preferences))
   ipcMain.handle('serial:start-local-service', () => coordinator!.startLocalService())
   ipcMain.handle('serial:stop-local-service', () => coordinator!.stopLocalService())

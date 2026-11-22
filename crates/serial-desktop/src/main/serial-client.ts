@@ -1,7 +1,9 @@
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import WebSocket from 'ws'
 import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
+import { setupChanges, type SetupBrief, type SetupRequest } from '../shared/first-setup'
 import type {
   Actor,
   HumanCommandHistory,
@@ -149,6 +151,9 @@ export class SerialClient extends EventEmitter {
   private actor?: Actor
   private humanHistory?: HumanCommandHistory
   private historyRefreshTimer?: ReturnType<typeof setTimeout>
+  private activityTimer?: ReturnType<typeof setTimeout>
+  private activityRequest?: WebSocket
+  private activityRevision = 0
   private readonly macroSessions = new Map<string, { operationId: string; lease: ControlLease; execution: MacroExecution; release: boolean; timer?: ReturnType<typeof setTimeout>; renewedAt: number }>()
   private readonly macroStartingPorts = new Set<string>()
   private readonly pending = new Map<string, PendingRequest>()
@@ -237,6 +242,20 @@ export class SerialClient extends EventEmitter {
     })
     await this.refresh()
     await this.reconnectSocket()
+  }
+
+  async setPortModel(port: string, family: string | null, name: string | null, expectedRevision: number): Promise<void> {
+    const status = await this.get<StatusResponse>('/api/v1/status')
+    if (status.config_revision !== expectedRevision) await this.raiseConfigurationConflict()
+    if (!status.ports.some(item => item.config.port === port)) throw new Error('该串口尚未配置')
+    const ports = status.ports.map(({ config }) => config.port === port
+      ? { ...config, model_family: family, model_name: name } : config)
+    try {
+      await this.put('/api/v1/config/ports', { ports, source: 'human:desktop', expected_revision: expectedRevision })
+    } catch (error) {
+      return this.recoverConfigurationConflict(error)
+    }
+    await this.refresh()
   }
 
   async saveSerialConfiguration(
@@ -370,13 +389,23 @@ export class SerialClient extends EventEmitter {
   async agentRunEvents(record: import('../shared/contracts').AgentRunRecord): Promise<{ events: TimelineEvent[]; limited: boolean }> {
     const events: TimelineEvent[] = []
     let limited = false
-    for (const kind of ['tx', 'command_capture_completed']) {
-      const query = new URLSearchParams({ epoch: record.epoch, run_id: record.run.id, after_seq: String(Math.max(0, record.run.start_seq - 1)),
-        kind, limit_events: '1024', limit_bytes: String(2 * 1024 * 1024) })
-      if (record.run.end_seq != null) query.set('through_seq', String(record.run.end_seq))
-      const result = await this.get<{ events: Record<string, unknown>[]; truncated: boolean; gaps: unknown[] }>(`/api/v1/ports/${encodeURIComponent(record.port)}/events?${query}`)
-      limited ||= result.truncated || result.gaps.length > 0
-      events.push(...result.events.map(normalizeTimelineEvent))
+    // Read non-RX events through a fixed snapshot boundary. This includes macro checkpoints,
+    // capture receipts, BREAK and trigger lifecycle events without loading the whole terminal.
+    const through = record.run.end_seq ?? record.through_seq
+    for (const direction of ['tx', 'none']) {
+      let after = Math.max(0, record.run.start_seq - 1)
+      while (after < through) {
+        const query = new URLSearchParams({ epoch: record.epoch, run_id: record.run.id, after_seq: String(after),
+          through_seq: String(through), direction, limit_events: '1024', limit_bytes: String(2 * 1024 * 1024) })
+        const page = await this.get<{ events: Record<string, unknown>[]; truncated: boolean; gaps: unknown[]; next_cursor?: { epoch: string; after_seq: number } }>(
+          `/api/v1/ports/${encodeURIComponent(record.port)}/events?${query}`)
+        limited ||= page.gaps.length > 0
+        events.push(...page.events.map(normalizeTimelineEvent))
+        if (!page.truncated) break
+        const cursor = page.next_cursor
+        if (!cursor || cursor.epoch !== record.epoch || !Number.isSafeInteger(cursor.after_seq) || cursor.after_seq <= after) { limited = true; break }
+        after = cursor.after_seq
+      }
     }
     return { events: events.sort((a, b) => a.seq - b.seq), limited }
   }
@@ -396,6 +425,35 @@ export class SerialClient extends EventEmitter {
     const parameters = new URLSearchParams()
     for (const [key, value] of Object.entries(query)) if (value !== undefined) parameters.set(key, String(value))
     return this.get<MacroListResponse>(`/api/v1/macros?${parameters}`)
+  }
+
+  async createSetup(brief: SetupBrief): Promise<SetupRequest> {
+    return await this.request('/api/v1/setup/requests', { method: 'POST', body: brief }) as SetupRequest
+  }
+
+  readSetup(id: string): Promise<SetupRequest> {
+    return this.get('/api/v1/setup/requests/' + encodeURIComponent(id))
+  }
+
+  async applySetup(id: string, revision: number): Promise<MacroDefinition> {
+    const [task, { status, transport, profiles, families }] = await Promise.all([this.readSetup(id), this.loadConsistentConfiguration()])
+    const changes = setupChanges(task, status.ports.map(p => p.config), profiles.profiles)
+    if (!changes.alreadyBound && status.config_revision !== revision) return this.raiseConfigurationConflict()
+    let existing: MacroDefinition | null | undefined
+    try { existing = (await this.listMacros({ id: changes.macro.id, include_drafts: true })).definition }
+    catch (error) { if (!(error instanceof SerialHttpError && error.status === 404)) throw error }
+    if (existing && (existing.script !== changes.macro.script || existing.name !== changes.macro.name)) throw new Error('这个宏已经被编辑，请重新生成配置任务。')
+    // A retry can resume an existing draft after a configuration revision conflict.
+    const draft = existing ?? (await this.saveMacro({ ...changes.macro, shared: false })).definition
+    if (!changes.alreadyBound) {
+      try {
+        await this.put('/api/v1/config/setup', { ports: changes.ports, transport_profiles: transport.profiles,
+          model_profiles: changes.profiles, model_families: families.families, expected_revision: revision, source: 'human:desktop-setup' })
+      } catch (error) { return this.recoverConfigurationConflict(error) }
+    }
+    const definition = draft.shared ? draft : (await this.saveMacro({ ...changes.macro, expected_revision: draft.revision })).definition
+    await this.refresh()
+    return definition
   }
 
   async saveMacro(definition: MacroSaveRequest): Promise<{ catalog_revision: number; definition: MacroDefinition }> {
@@ -552,6 +610,7 @@ export class SerialClient extends EventEmitter {
     this.macroStartingPorts.clear()
     if (this.historyRefreshTimer) clearTimeout(this.historyRefreshTimer)
     this.historyRefreshTimer = undefined
+    clearTimeout(this.activityTimer)
     this.stopped = true
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
@@ -678,6 +737,7 @@ export class SerialClient extends EventEmitter {
       }
       this.actor = actor
       this.readySocket = socket
+      this.scheduleActivityRefresh(50)
       this.emit('snapshot')
       this.emit('connected')
     } catch (error) {
@@ -748,7 +808,6 @@ export class SerialClient extends EventEmitter {
         replay: message.replay
       })
       this.assertTimelineIdentity(event)
-      this.observeTimelineState(event)
       this.appendEvent(event)
       return
     }
@@ -804,12 +863,59 @@ export class SerialClient extends EventEmitter {
     items.push(event)
     if (items.length > 12_000) items.splice(0, items.length - 12_000)
     this.events.set(event.port, items)
+    if (!event.replay) this.observeTimelineState(event)
     this.emit('timeline', event)
+  }
+
+  // Attach supplies a snapshot, then the live stream carries timeline events.
+  // Read the authoritative lease/Run after a transition. A Human-read
+  // acknowledgement can change the gate without adding another timeline event.
+  private scheduleActivityRefresh(delay: number): void {
+    const socket = this.readySocket
+    if (!socket || this.activityRequest === socket || this.stopped) return
+    clearTimeout(this.activityTimer)
+    this.activityTimer = setTimeout(() => void this.refreshActivity(socket), delay)
+  }
+
+  private async refreshActivity(socket: WebSocket): Promise<void> {
+    const status = this.status
+    if (!status || this.readySocket !== socket || this.stopped) return
+    this.activityRequest = socket
+    const revision = this.activityRevision
+    let retry = false
+    try {
+      const next = await this.get<StatusResponse>('/api/v1/status')
+      if (this.readySocket !== socket || this.status !== status || revision !== this.activityRevision
+        || next.server_id !== status.server_id || next.daemon_epoch !== status.daemon_epoch) return
+      let changed = false
+      for (const port of next.ports) {
+        const index = status.ports.findIndex((item) => item.config.port === port.config.port)
+        const previous = status.ports[index]
+        if (!previous || port.daemon_epoch !== previous.daemon_epoch || port.head_seq < previous.head_seq) continue
+        const waiting = port.run_context && port.run_context.revision > port.run_context.acknowledged_revision
+        retry ||= Boolean(waiting)
+        if (isDeepStrictEqual(previous, port)) continue
+        status.ports[index] = port
+        changed = true
+      }
+      if (changed) this.emit('snapshot')
+    } catch { retry = true }
+    finally {
+      if (this.activityRequest === socket) this.activityRequest = undefined
+      if (this.readySocket === socket) {
+        if (revision !== this.activityRevision) this.scheduleActivityRefresh(0)
+        else if (retry) this.scheduleActivityRefresh(1000)
+      }
+    }
   }
 
   private observeTimelineState(event: TimelineEvent): void {
     const configured = this.status?.ports.find((item) => item.config.port === event.port)
     if (!configured) return
+    if (/^(control_|run_|serial_|port_)/.test(event.kind) || event.metadata.cooperative === true) {
+      this.activityRevision++
+      this.scheduleActivityRefresh(40)
+    }
     if (event.kind === 'run_start_requested') {
       const approval = pendingRunStartApproval(event.metadata.approval)
       if (approval) {

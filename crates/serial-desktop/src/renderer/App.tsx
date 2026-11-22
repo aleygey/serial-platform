@@ -1,71 +1,94 @@
-import { Command, FileCode2, LoaderCircle, Moon, Power, RefreshCw, Server, Settings2, Square, Sun, Wifi, WifiOff, X } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
+import { Braces, SlidersHorizontal, Cable, LoaderCircle, Power, RefreshCw, Server, Settings2, Square, SquareTerminal, Wifi, WifiOff, X } from 'lucide-react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { message, withToast, type ToastValue } from './lib/feedback'
+export { submitHumanCommand } from './lib/feedback'
 import type {
   DesktopEvent,
   DesktopSnapshot,
-  AgentHistoryResponse,
-  TimelineEvent,
-  HumanCommandSubmission,
   MacroExecution,
-  RunStartDecision,
-  ThemePreference
+  RunStartDecision
 } from '../shared/contracts'
 import { isApprovalActionable } from '../shared/run-start'
-import { AgentHistory } from './components/AgentHistory'
-import { CommandBar } from './components/CommandBar'
+import { paletteId, palettes } from '../shared/appearance'
+import { Group, Panel, Separator, type GroupImperativeHandle, type Layout } from 'react-resizable-panels'
+import { motion } from 'motion/react'
+import { DockPreview, InsertionGap, usePortDrag } from './components/PortDrag'
+import { PortConsole } from './components/PortConsole'
+import type { AgentHistoryView } from './components/AgentHistory'
+import { PortInput } from './lib/port-input'
+import { closePane, dockedWidths, insertPane, reorderPane, selectPane, type PaneLayout } from './lib/console-workspace'
 import { MacroPage, type MacroDraftStore } from './components/MacroPage'
 import { PortRail } from './components/PortRail'
+import { GooeyNav } from './components/ui/gooey-nav'
 import { SettingsPage } from './components/SettingsPage'
-import { TerminalPane } from './components/TerminalPane'
+import { FirstUseSetup } from './components/FirstUseSetup'
 import { RunStartApprovalModal } from './components/RunStartApprovalModal'
-import { mergeAgentHistory, locateCommandOutput, type AgentCommand } from './lib/history'
 import { resolveBackendControl } from './lib/backend-control'
-import iconUrl from './assets/icon.png'
-import type { CommandBuffer } from './lib/command-editor'
+import { applyAppearance, useAppearanceMode } from './lib/appearance'
 
 type Page = 'console' | 'settings' | 'macros'
 
 export function App(): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>()
+  const mode = useAppearanceMode(snapshot?.preferences.theme ?? 'system')
+  const colors = palettes[paletteId(snapshot?.preferences.palette)][mode]
   const [page, setPage] = useState<Page>('console')
-  const [selectedPort, setSelectedPort] = useState<string>()
-  const [selectedCommand, setSelectedCommand] = useState<AgentCommand>()
-  const [agentArchive, setAgentArchive] = useState<AgentHistoryResponse>()
-  const [agentArchiveEvents, setAgentArchiveEvents] = useState<TimelineEvent[]>([])
-  const [commandEvidence, setCommandEvidence] = useState<{ key: string; events: TimelineEvent[] }>()
-  const evidenceLoad = useRef(0)
-  const historyContext = useRef('')
-  const historyLoad = useRef(0)
-  const [toast, setToast] = useState<{ kind: 'notice' | 'error'; message: string }>()
+  const [setupOpen, setSetupOpen] = useState<boolean>()
+  const [layout, setLayout] = useState<PaneLayout>({ ports: [] })
+  const deckRef = useRef<HTMLDivElement>(null)
+  const groupRef = useRef<GroupImperativeHandle>(null)
+  const pendingWidths = useRef<Layout>(undefined)
+  const keepEmpty = useRef(false)
+  const selectedPort = layout.active
+  const [toast, setToast] = useState<ToastValue>()
   const [expiredApprovals, setExpiredApprovals] = useState<Set<string>>(() => new Set())
   const [loadingMessage, setLoadingMessage] = useState('正在启动本地工作台…')
   const [macroExecution, setMacroExecution] = useState<MacroExecution>()
   const macroDrafts = useRef<MacroDraftStore>({ drafts: new Map() })
-  const commandDrafts = useRef(new Map<string, CommandBuffer>())
+  const endpoint = snapshot?.preferences.endpoint
+  const lastServer = useRef(new Map<string, string>())
+  if (endpoint && snapshot?.serverId) lastServer.current.set(endpoint, snapshot.serverId)
+  const scope = JSON.stringify([endpoint, endpoint ? lastServer.current.get(endpoint) : undefined])
+  const layoutScope = useRef(scope)
+  const sessions = useMemo(() => new Map<string, { input: PortInput; history: AgentHistoryView }>(), [scope])
+  const knownPorts = useMemo(() => [...new Set([...(snapshot?.configuredPorts ?? []).map((port) => port.config.port), ...(snapshot?.availablePorts ?? []).map((port) => port.name)])], [snapshot?.configuredPorts, snapshot?.availablePorts])
   const humanHistory = useMemo(() => snapshot?.humanHistory?.entries.map((item) => item.command) ?? [], [snapshot?.humanHistory])
+  const drag = usePortDrag(deckRef, (port, slot) => {
+    if (!knownPorts.includes(port)) return
+    keepEmpty.current = false
+    const next = insertPane(layout, port, slot)
+    pendingWidths.current = dockedWidths(next.ports, groupRef.current?.getLayout() ?? {})
+    setLayout(next)
+  })
+  useEffect(() => { drag.cancel() }, [page, scope, drag.cancel])
 
-  useEffect(() => {
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const context = `${snapshot?.serverId ?? ''}:${selectedPort ?? ''}`
-    historyContext.current = context
-    setAgentArchive(undefined)
-    setAgentArchiveEvents([])
-    setCommandEvidence(undefined)
-    evidenceLoad.current++
-    const refresh = async (): Promise<void> => {
-      if (!selectedPort) return
-      try {
-        const history = await window.serial.agentHistory(selectedPort)
-        if (!cancelled && history.server_id === snapshot?.serverId) setAgentArchive((current) =>
-          current && current.visibility.revision > history.visibility.revision ? current : history)
-      } catch { /* Live console remains usable when an older daemon has no panel index. */ }
-      if (!cancelled) timer = setTimeout(() => void refresh(), 5000)
-    }
-    void refresh()
-    return () => { cancelled = true; if (timer) clearTimeout(timer) }
-  }, [selectedPort, snapshot?.serverId])
+  useLayoutEffect(() => {
+    const widths = pendingWidths.current
+    if (!widths) return
+    // A previously opened panel combination can have its own cached sizes.
+    // Apply the drop geometry after the group has registered the new children.
+    const frame = requestAnimationFrame(() => {
+      const group = groupRef.current
+      const actual = group?.getLayout()
+      if (group && actual && Object.keys(actual).length === Object.keys(widths).length &&
+          Object.keys(widths).every(port => Object.hasOwn(actual, port))) {
+        group.setLayout(widths)
+      }
+      pendingWidths.current = undefined
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [layout.ports, page])
+
+  useLayoutEffect(() => {
+    const deck = deckRef.current
+    if (!deck || !selectedPort || deck.clientWidth >= deck.scrollWidth) return
+    const panel = document.getElementById(selectedPort)
+    if (!panel || !deck.contains(panel)) return
+    const bounds = deck.getBoundingClientRect()
+    const view = panel.getBoundingClientRect()
+    if (view.left < bounds.left) deck.scrollLeft += view.left - bounds.left
+    else if (view.right > bounds.right) deck.scrollLeft += view.right - bounds.right
+  }, [layout.ports, selectedPort, page])
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
     if (event.type === 'macro') setMacroExecution(event.execution)
@@ -99,7 +122,6 @@ export function App(): React.JSX.Element {
       )
       buffering = false
       setSnapshot(merged)
-      setSelectedPort(merged.preferences.selectedPort ?? merged.configuredPorts[0]?.config.port ?? merged.availablePorts[0]?.name)
       for (const event of buffered) {
         if (event.type === 'connection') setLoadingMessage(event.message)
         else if (event.type === 'notice' || event.type === 'error') {
@@ -120,15 +142,37 @@ export function App(): React.JSX.Element {
   }, [applyEvent])
 
   useEffect(() => {
-    if (snapshot && !selectedPort) {
-      setSelectedPort(snapshot.preferences.selectedPort ?? snapshot.configuredPorts[0]?.config.port ?? snapshot.availablePorts[0]?.name)
-    }
-  }, [snapshot, selectedPort])
+    if (!snapshot) return
+    const changedServer = layoutScope.current !== scope
+    layoutScope.current = scope
+    setLayout((current) => {
+      if (!changedServer && snapshot.connection !== 'connected') return current
+      const ports = changedServer ? [] : current.ports.filter((port) => knownPorts.includes(port))
+      if (ports.length) {
+        if (ports.length === current.ports.length) return current
+        return { ports, active: current.active && ports.includes(current.active) ? current.active : ports[0] }
+      }
+      if (!knownPorts.length) return current.ports.length ? { ports: [] } : current
+      const preferred = snapshot.preferences.selectedPort
+      const active = preferred && knownPorts.includes(preferred) ? preferred : knownPorts[0]
+      if (keepEmpty.current && !changedServer) return current.ports.length ? { ports: [] } : current
+      keepEmpty.current = false
+      return { ports: [active], active }
+    })
+  }, [scope, knownPorts, snapshot?.connection])
 
   useEffect(() => {
-    if (!snapshot) return
-    return applyTheme(snapshot.preferences.theme)
-  }, [snapshot?.preferences.theme])
+    const preferences = snapshot?.preferences
+    if (!preferences || (setupOpen ?? preferences.firstUse === 'new') || !selectedPort || preferences.selectedPort === selectedPort || !knownPorts.includes(selectedPort)) return
+    const timer = setTimeout(() => {
+      void withToast(() => window.serial.savePreferences({ selectedPort }), setToast, false)
+    }, 180)
+    return () => clearTimeout(timer)
+  }, [scope, selectedPort, setupOpen, snapshot?.preferences.selectedPort, snapshot?.preferences.firstUse])
+
+  useLayoutEffect(() => {
+    applyAppearance(mode, snapshot?.preferences.palette)
+  }, [mode, snapshot?.preferences.palette])
 
   useEffect(() => {
     if (!toast) return
@@ -143,10 +187,11 @@ export function App(): React.JSX.Element {
       const retained = new Set([...current].filter((id) => pending.has(id)))
       return retained.size === current.size ? current : retained
     })
-  }, [snapshot])
+  }, [snapshot?.configuredPorts])
 
   useEffect(() => {
     const handler = (event: KeyboardEvent): void => {
+      if (event.isComposing || event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return
       if ((event.metaKey || event.ctrlKey) && event.key === ',') {
         event.preventDefault()
         setPage('settings')
@@ -155,27 +200,27 @@ export function App(): React.JSX.Element {
         event.preventDefault()
         setPage('console')
       }
-      if (event.key === 'Escape' && page === 'settings') setPage('console')
+      if (event.key === 'Escape' && page === 'settings' && !(event.target as Element)?.closest('[data-slot="model-picker-panel"]') && !event.defaultPrevented) setPage('console')
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [page])
 
   const selectPort = (port: string): void => {
-    setSelectedPort(port)
-    setSelectedCommand(undefined)
-    if (snapshot) {
-      const preferences = { ...snapshot.preferences, selectedPort: port }
-      setSnapshot({ ...snapshot, preferences })
-      void window.serial.savePreferences(preferences)
-    }
+    if (selectedPort === port) return
+    keepEmpty.current = false
+    setLayout((current) => selectPane(current, port))
   }
 
   const startBackend = async (): Promise<void> => { await withToast(() => window.serial.startLocalService(), setToast, false) }
   const stopBackend = async (): Promise<void> => { await withToast(() => window.serial.stopLocalService(), setToast, false) }
   const savePreferences = async (preferences: DesktopSnapshot['preferences']): Promise<void> => {
+    const previous = snapshot?.preferences
     setSnapshot((current) => current ? { ...current, preferences } : current)
-    await withToast(() => window.serial.savePreferences(preferences), setToast)
+    const saved = await withToast(() => window.serial.savePreferences(preferences), setToast, false)
+    if (!saved && previous) {
+      setSnapshot((current) => current?.preferences === preferences ? { ...current, preferences: previous } : current)
+    }
   }
 
   const pendingApproval = snapshot?.connection === 'connected'
@@ -199,7 +244,6 @@ export function App(): React.JSX.Element {
   if (!snapshot) {
     return (
       <div className="startup-screen">
-        <BrandMark />
         <div className="startup-pulse"><span /><span /><span /></div>
         <strong>{loadingMessage}</strong>
         <small>后端、持久记录与实时通道正在就绪</small>
@@ -208,11 +252,45 @@ export function App(): React.JSX.Element {
     )
   }
 
-  if (page === 'settings') {
-    return (
-      <div className="app-frame">
-        <WindowBar snapshot={snapshot} page={page} onPage={setPage} onStartBackend={startBackend} onStopBackend={stopBackend} onSavePreferences={savePreferences} />
+  const slot = drag.drag?.index
+  const from = drag.drag ? layout.ports.indexOf(drag.drag.port) : -1
+  const inserting = slot != null && (from < 0 || (slot !== from && slot !== from + 1))
+  const draggedPort = drag.drag?.port
+  const dockPreview = draggedPort ? {
+    port: draggedPort,
+    model: snapshot.configuredPorts.find(p => p.config.port === draggedPort)?.config.model_name
+      ?? snapshot.availablePorts.find(p => p.name === draggedPort)?.product ?? undefined,
+    lines: (snapshot.events[draggedPort] ?? []).slice(-12).filter(e => e.direction === 'rx' || e.direction === 'tx')
+      .flatMap(e => e.text.slice(-240).split(/[\r\n]+/)).filter(Boolean).slice(-3),
+  } : undefined
+  const gap = (index: number) => <InsertionGap active={inserting && slot === index} preview={dockPreview} weight={drag.drag?.weight ?? 1} />
+  const closePortView = (port: string) => {
+    if (layout.ports.length === 1) keepEmpty.current = true
+    setLayout(current => closePane(current, port))
+  }
+  const split = layout.ports.length > 1
+  const connected = snapshot.connection === 'connected'
+  const preferences = snapshot.preferences
+  const showSetup = setupOpen ?? preferences.firstUse === 'new'
+  async function leaveSetup(complete: boolean, nextPage: Page = 'console') {
+    await window.serial.savePreferences({ firstUse:complete || preferences.firstUse==='complete' ? 'complete' : 'dismissed',
+      ...(complete && { setupTask:undefined }) })
+    setSetupOpen(false); setPage(nextPage)
+    if (complete && preferences.setupTask?.port && knownPorts.includes(preferences.setupTask.port)) {
+      selectPort(preferences.setupTask.port)
+    } else if (nextPage === 'console' && window.serial.replaySampleRun && !complete) {
+      selectPort('COM7')
+      window.serial.replaySampleRun()
+    }
+  }
+  return (
+    <div className="app-frame">
+      <WindowBar page={page} onPage={next=>{ if(showSetup) void withToast(()=>leaveSetup(false,next),setToast,false); else setPage(next) }} />
+      {showSetup ? <FirstUseSetup key={scope} snapshot={snapshot} execution={macroExecution} onExecution={setMacroExecution} onLeave={leaveSetup} /> : page === 'settings' ? (
         <SettingsPage
+          onOpenSetup={()=>setSetupOpen(true)}
+          onOpenRunExample={window.serial.openRunExample && (()=>void withToast(()=>window.serial.openRunExample!(),setToast,false))}
+          serviceControls={<BackendControls snapshot={snapshot} onStartBackend={startBackend} onStopBackend={stopBackend} />}
           configuredPorts={snapshot.configuredPorts}
           availablePorts={snapshot.availablePorts}
           transportProfiles={snapshot.transportProfiles}
@@ -220,142 +298,62 @@ export function App(): React.JSX.Element {
           modelFamilies={snapshot.modelFamilies}
           preferences={snapshot.preferences}
           initialPort={selectedPort}
-          onBack={() => setPage('console')}
           onSaveSerial={async (draft) => withToast(
             () => window.serial.saveSerialConfiguration(draft, snapshot.configRevision),
-            setToast
+            setToast, false
           )}
-          onSaveModels={async (profiles) => withToast(() => window.serial.saveModelProfiles(profiles, snapshot.configRevision), setToast)}
-          onSaveModelFamilies={async (families) => withToast(() => window.serial.saveModelFamilies(families, snapshot.configRevision), setToast)}
+          onSaveModels={async (profiles) => withToast(() => window.serial.saveModelProfiles(profiles, snapshot.configRevision), setToast, false)}
+          onSaveModelFamilies={async (families) => withToast(() => window.serial.saveModelFamilies(families, snapshot.configRevision), setToast, false)}
           onSavePreferences={savePreferences}
         />
-        <Toast value={toast} onClose={() => setToast(undefined)} />
-        {pendingApproval && (
-          <RunStartApprovalModal
-            approval={pendingApproval}
-            key={pendingApproval.id}
-            onDecide={decideRunStart}
-            onExpired={() => setExpiredApprovals((current) => new Set(current).add(pendingApproval.id))}
-          />
-        )}
-      </div>
-    )
-  }
-
-  if (page === 'macros') return <div className="app-frame">
-    <WindowBar snapshot={snapshot} page={page} onPage={setPage} onStartBackend={startBackend} onStopBackend={stopBackend} onSavePreferences={savePreferences} />
-    <MacroPage ports={snapshot.configuredPorts} modelFamilies={snapshot.modelFamilies} connected={snapshot.connection === 'connected'} selectedPort={selectedPort} drafts={macroDrafts.current} execution={macroExecution} onExecution={setMacroExecution} />
-    <Toast value={toast} onClose={() => setToast(undefined)} />
-    {pendingApproval && <RunStartApprovalModal approval={pendingApproval} key={pendingApproval.id} onDecide={decideRunStart} onExpired={() => setExpiredApprovals((current) => new Set(current).add(pendingApproval.id))} />}
-  </div>
-
-  const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
-  const events = selectedPort ? snapshot.events[selectedPort] ?? [] : []
-  const history = mergeAgentHistory([...agentArchiveEvents, ...events], agentArchive)
-  const currentSelectedCommand = selectedCommand
-    ? history.flatMap((item) => item.kind === 'command' ? item.commands : []).find((command) => (
-        command.id === selectedCommand.id
-        && command.firstSeq === selectedCommand.firstSeq
-        && command.daemonEpoch === selectedCommand.daemonEpoch
-        && command.generation === selectedCommand.generation
-      ))
-    : undefined
-  const displayedEvents = currentSelectedCommand && commandEvidence?.key === commandIdentity(currentSelectedCommand)
-    ? commandEvidence.events : events
-  const match = currentSelectedCommand
-    ? locateCommandOutput(displayedEvents, currentSelectedCommand)
-    : undefined
-  const selectCommand = async (command: AgentCommand): Promise<void> => {
-    setSelectedCommand(command)
-    setCommandEvidence(undefined)
-    const load = ++evidenceLoad.current
-    const context = historyContext.current
-    if (!selectedPort) return
-    const parent = history.find((item) => item.kind === 'command' && item.commands.includes(command))
-    const record = parent?.kind === 'command' ? agentArchive?.runs.find((record) => record.run.id === parent.runId) : undefined
-    const next = history.flatMap((item) => item.kind === 'command' ? item.commands : [])
-      .filter((candidate) => candidate.daemonEpoch === command.daemonEpoch && candidate.firstSeq > command.firstSeq)
-      .sort((a, b) => a.firstSeq - b.firstSeq)[0]
-    const firstSeq = command.capture?.evidenceFromSeq ?? command.firstSeq
-    const throughSeq = command.capture?.evidenceThroughSeq ?? (next ? next.firstSeq - 1
-      : record?.run.end_seq ?? (configuredPort?.daemon_epoch === command.daemonEpoch ? configuredPort.head_seq : record?.through_seq))
-    if (throughSeq === undefined || throughSeq < firstSeq) {
-      setToast({ kind: 'notice', message: '缺少该历史命令的准确日志边界，无法执行跳转。' }); return
-    }
-    const local = events.filter((event) => event.daemon_epoch === command.daemonEpoch && event.seq >= firstSeq && event.seq <= throughSeq)
-    if (local.length === throughSeq - firstSeq + 1 && local.every((event, index) => event.seq === firstSeq + index && event.kind !== 'gap')) return
-    setToast({ kind: 'notice', message: '正在读取该命令的原始串口上下文…' })
-    try {
-      const evidence = await window.serial.commandEvidence({ port: selectedPort, epoch: command.daemonEpoch, firstSeq, throughSeq })
-      if (context !== historyContext.current || load !== evidenceLoad.current) return
-      setCommandEvidence({ key: commandIdentity(command), events: evidence })
-      setToast(undefined)
-    } catch (error) {
-      if (context === historyContext.current && load === evidenceLoad.current) setToast({ kind: 'error', message: message(error) })
-    }
-  }
-  return (
-    <div className="app-frame">
-      <WindowBar snapshot={snapshot} page={page} onPage={setPage} onStartBackend={startBackend} onStopBackend={stopBackend} onSavePreferences={savePreferences} />
-      <div className="workspace-grid">
-        <PortRail
-          configuredPorts={snapshot.configuredPorts}
-          availablePorts={snapshot.availablePorts}
-          selectedPort={selectedPort}
-          onSelect={selectPort}
-          onToggle={(port, open) => void withToast(() => window.serial.setPortOpen(port, open), setToast)}
-          onSettings={() => setPage('settings')}
-        />
-        <div className="console-stack">
-          <TerminalPane
-            configuredPort={configuredPort}
-            events={displayedEvents}
-            selectedCommand={currentSelectedCommand}
-            match={match}
-            onClearCommand={() => { evidenceLoad.current++; setCommandEvidence(undefined); setSelectedCommand(undefined) }}
-          />
-          <CommandBar
-            key={snapshot.serverId ?? snapshot.preferences.endpoint}
-            port={selectedPort}
-            drafts={commandDrafts.current}
-            humanHistory={humanHistory}
-            onQueryHistory={async (query, contains) => (await window.serial.queryHumanHistory(query, contains)).entries.map((entry) => entry.command)}
-            disabled={!configuredPort || configuredPort.session_state !== 'online' || snapshot.connection !== 'connected'}
-            onSend={(command) => submitHumanCommand(
-              () => window.serial.sendCommand(selectedPort!, command),
-              setToast
-            )}
-            onSignal={(signal) => submitHumanCommand(() => window.serial.sendSignal(selectedPort!, signal), setToast)}
-          />
+      ) : page === 'macros' ? (
+        <MacroPage events={snapshot.events} ports={snapshot.configuredPorts} modelFamilies={snapshot.modelFamilies} connected={snapshot.connection === 'connected'} selectedPort={selectedPort} drafts={macroDrafts.current} execution={macroExecution} onExecution={setMacroExecution} />
+      ) : (
+        <div className="workspace-shell workspace-grid">
+          <PortRail configuredPorts={snapshot.configuredPorts} availablePorts={snapshot.availablePorts} connected={connected}
+            selectedPort={selectedPort} onSelect={selectPort} drag={drag}
+            onToggle={(port, open) => void withToast(() => window.serial.setPortOpen(port, open), setToast, false)}
+            onRefresh={() => void withToast(async () => { await window.serial.refresh() }, setToast, false)}
+            endpoint={snapshot.preferences.endpoint} />
+          <main className="console-workspace">
+            <div ref={deckRef} className={`pane-deck ${split ? 'is-split' : ''}`}
+              data-dragging={!!drag.drag || undefined} data-settling={drag.settling || undefined}
+              onScroll={({ currentTarget: deck }) => {
+                // On a phone, a swipe selects the terminal that snaps into view.
+                const width = deck.clientWidth
+                if (drag.drag || !split || !width || Math.abs((deck.querySelector('[data-panel]')?.getBoundingClientRect().width ?? 0) - width) > 1) return
+                const index = Math.round(deck.scrollLeft / width)
+                const port = layout.ports[index]
+                if (port && Math.abs(deck.scrollLeft - index * width) < 1) selectPort(port)
+              }}>
+              {layout.ports.length > 0 ? <Group className="workspace-panels" orientation="horizontal" aria-label="串口分栏"
+                groupRef={groupRef} defaultLayout={pendingWidths.current} style={{ '--pane-count': layout.ports.length } as React.CSSProperties}>
+              {layout.ports.map((port, index) => {
+                let session = sessions.get(port)
+                if (!session) { session = { input: new PortInput(), history: { rows: {} } }; sessions.set(port, session) }
+                return <Fragment key={JSON.stringify([scope, port])}>
+                  {gap(index)}
+                  {index > 0 && <Separator className="pane-divider" aria-label={`调整 ${layout.ports[index - 1]} 与 ${port} 的宽度`}><span /></Separator>}
+                  <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors}
+                  active={selectedPort === port} split={split} dragController={drag} lifted={inserting && drag.drag?.port === port}
+                  animateEntry={!!pendingWidths.current && selectedPort === port} session={session.input} historyView={session.history} humanHistory={humanHistory}
+                  onReorder={target => setLayout(current => reorderPane(current, port, target))}
+                  setToast={setToast} onFocus={() => selectPort(port)} onClose={() => closePortView(port)} /></Panel>
+                </Fragment>
+              })}
+              {gap(layout.ports.length)}
+              </Group> : <div className="workspace-empty" data-drop-preview={inserting || undefined}>
+                {inserting && dockPreview ? <DockPreview preview={dockPreview} /> : knownPorts.length ? <p>选择串口，或将串口拖到此处</p>
+                  : <><Cable size={28} /><h2>{connected ? '等待串口设备' : '等待后端连接'}</h2>
+                    <button type="button" onClick={() => setPage('settings')}><Settings2 size={15} /> 打开配置</button></>}
+              </div>}
+            </div>
+            {drag.drag && !drag.drag.keyboard && !inserting && dockPreview && <motion.div className="drag-port-label" aria-hidden style={{x:drag.x, y:drag.y}}><DockPreview preview={dockPreview} floating /></motion.div>}
+            {drag.drag?.keyboard && <span className="sr-only" role="status">{`${drag.drag.port} · 插入位置 ${(slot ?? 0) + 1}，左右键调整，回车放置，Esc 取消`}</span>}
+          </main>
         </div>
-        <AgentHistory key={`${snapshot.serverId}:${selectedPort}`} items={history} selectedCommand={currentSelectedCommand} onSelect={(command) => void selectCommand(command)}
-          onExpandRun={async (id) => {
-            const record = agentArchive?.runs.find((record) => record.run.id === id)
-            if (!record) return
-            const context = historyContext.current
-            const load = ++historyLoad.current
-            try {
-              const result = await window.serial.agentRunEvents(record)
-              if (context !== historyContext.current || load !== historyLoad.current) return
-              // Keep the last expanded archive, not every Run ever opened.
-              setAgentArchiveEvents(result.events)
-              if (result.limited) setToast({ kind: 'notice', message: '已加载部分历史命令；日志存在缺口或达到读取上限。' })
-            } catch (error) { if (context === historyContext.current) setToast({ kind: 'error', message: message(error) }) }
-          }}
-          onClear={async (ids) => {
-            if (!selectedPort) return
-            const context = historyContext.current
-            const visibility = await window.serial.clearAgentHistory(selectedPort, ids)
-            if (context !== historyContext.current) return
-            setAgentArchive((current) => current ? { ...current, visibility } : {
-              server_id: snapshot.serverId ?? '', runs: [], visibility, truncated: false, indexing: false
-            })
-            setSelectedCommand(undefined)
-            evidenceLoad.current++
-            setCommandEvidence(undefined)
-            setToast({ kind: 'notice', message: 'Agent 历史已清理；原始串口日志和人工历史保留。' })
-          }} />
-      </div>
+      )}
+      <div className="picker-layer" />
       <Toast value={toast} onClose={() => setToast(undefined)} />
       {pendingApproval && (
         <RunStartApprovalModal
@@ -367,10 +365,6 @@ export function App(): React.JSX.Element {
       )}
     </div>
   )
-}
-
-function commandIdentity(command: AgentCommand): string {
-  return `${command.daemonEpoch}:${command.generation}:${command.firstSeq}:${command.id}`
 }
 
 export function mergeDesktopSnapshotEvent(
@@ -400,18 +394,28 @@ export function mergeDesktopSnapshotEvent(
   }
 }
 
-interface WindowBarProps {
-  snapshot: DesktopSnapshot
-  page: Page
-  onPage: (page: Page) => void
-  onStartBackend: () => Promise<void>
-  onStopBackend: () => Promise<void>
-  onSavePreferences: (preferences: DesktopSnapshot['preferences']) => Promise<void>
+const pages = ['console', 'macros', 'settings'] as const
+const pageItems = [
+  { label: '控制台', icon: <SquareTerminal size={14} aria-hidden /> },
+  { label: '宏', icon: <Braces size={14} aria-hidden /> },
+  { label: '配置', icon: <SlidersHorizontal size={14} aria-hidden /> },
+]
+
+export function WindowBar({ page, onPage }: { page: Page; onPage: (page: Page) => void }): React.JSX.Element {
+  return <header className="window-bar">
+    <GooeyNav aria-label="工作区" items={pageItems} value={pages.indexOf(page)} onChange={index => onPage(pages[index])}
+      size="sm" activeColor="var(--run-bg)" activeLabelColor="var(--run-text)" separation={7} radius={8} />
+  </header>
 }
 
-export function WindowBar({ snapshot, page, onPage, onStartBackend, onStopBackend, onSavePreferences }: WindowBarProps): React.JSX.Element {
+interface BackendControlsProps {
+  snapshot: DesktopSnapshot
+  onStartBackend: () => Promise<void>
+  onStopBackend: () => Promise<void>
+}
+
+export function BackendControls({ snapshot, onStartBackend, onStopBackend }: BackendControlsProps): React.JSX.Element {
   const connected = snapshot.connection === 'connected'
-  const nextTheme: ThemePreference = snapshot.preferences.theme === 'dark' ? 'light' : 'dark'
   const backend = resolveBackendControl(snapshot.service, snapshot.connection)
   const BackendIcon = backend.kind === 'start'
     ? Power
@@ -421,15 +425,8 @@ export function WindowBar({ snapshot, page, onPage, onStartBackend, onStopBacken
         ? Server
         : LoaderCircle
   return (
-    <header className="window-bar">
-      <div className="brand-lockup"><BrandMark /><div><strong>Serial Platform</strong><small>Human × Agent Workspace</small></div></div>
-      <nav className="view-tabs">
-        <button className={page === 'console' ? 'is-active' : ''} onClick={() => onPage('console')} type="button"><Command size={14} /> 控制台</button>
-        <button className={page === 'macros' ? 'is-active' : ''} onClick={() => onPage('macros')} type="button"><FileCode2 size={14} /> 宏</button>
-        <button className={page === 'settings' ? 'is-active' : ''} onClick={() => onPage('settings')} type="button"><Settings2 size={14} /> 配置</button>
-      </nav>
-      <div className="window-actions">
-        <button className="connection-pill" type="button" title={snapshot.connectionMessage} onClick={() => void window.serial.refresh()}>
+      <div className="backend-settings" aria-label="后端服务">
+        <button className={`connection-pill ${connected ? 'is-connected' : ''}`} type="button" title={snapshot.connectionMessage} onClick={() => void window.serial.refresh()}>
           {connected ? <Wifi size={14} /> : <WifiOff size={14} />}
           <span>{connected ? '已连接' : snapshot.connection === 'reconnecting' ? '重连中' : '离线'}</span>
           {snapshot.service.owned && <small>PID {snapshot.service.pid}</small>}
@@ -446,76 +443,11 @@ export function WindowBar({ snapshot, page, onPage, onStartBackend, onStopBacken
           <span>{backend.label}</span>
         </button>
         <button className="icon-button" type="button" title="刷新" onClick={() => void window.serial.refresh()}><RefreshCw size={16} /></button>
-        <button className="icon-button" type="button" title="切换主题" onClick={() => {
-          const preferences = { ...snapshot.preferences, theme: nextTheme }
-          void onSavePreferences(preferences)
-        }}>{snapshot.preferences.theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button>
       </div>
-    </header>
   )
-}
-
-function BrandMark(): React.JSX.Element {
-  return <span className="brand-mark"><img src={iconUrl} alt="" /></span>
 }
 
 function Toast({ value, onClose }: { value?: { kind: 'notice' | 'error'; message: string }; onClose: () => void }): React.JSX.Element | null {
   if (!value) return null
-  return <div className={`toast is-${value.kind}`}><span>{value.message}</span><button type="button" onClick={onClose}><X size={14} /></button></div>
-}
-
-export async function submitHumanCommand(
-  action: () => Promise<HumanCommandSubmission>,
-  setToast: (toast: { kind: 'notice' | 'error'; message: string } | undefined) => void
-): Promise<HumanCommandSubmission> {
-  try {
-    const submission = await action()
-    if (
-      !submission
-      || !['accepted', 'rejected', 'uncertain'].includes(submission.status)
-      || (submission.status !== 'accepted' && typeof submission.message !== 'string')
-    ) {
-      throw new Error('App 未收到可识别的人工命令结果')
-    }
-    if (submission.status !== 'accepted') {
-      setToast({ kind: 'error', message: submission.message })
-    }
-    return submission
-  } catch {
-    const submission: HumanCommandSubmission = {
-      status: 'uncertain',
-      message: HUMAN_COMMAND_UNCERTAIN_MESSAGE
-    }
-    setToast({ kind: 'error', message: submission.message })
-    return submission
-  }
-}
-
-async function withToast(
-  action: () => Promise<void>,
-  setToast: (toast: { kind: 'notice' | 'error'; message: string } | undefined) => void,
-  announce = true
-): Promise<boolean> {
-  try {
-    await action()
-    if (announce) setToast({ kind: 'notice', message: '配置已保存并生效' })
-    return true
-  } catch (error) {
-    setToast({ kind: 'error', message: message(error) })
-    return false
-  }
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-function applyTheme(theme: ThemePreference): () => void {
-  const media = window.matchMedia('(prefers-color-scheme: dark)')
-  const update = (): void => {
-    document.documentElement.dataset.theme = theme === 'system' ? (media.matches ? 'dark' : 'light') : theme
-  }
-  update()
-  media.addEventListener('change', update)
-  return () => media.removeEventListener('change', update)
+  return <div className={`toast is-${value.kind}`}><span>{value.message}</span><button type="button" aria-label="关闭提示" onClick={onClose}><X size={14} /></button></div>
 }

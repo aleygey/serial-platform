@@ -3,12 +3,15 @@ import { describe, expect, it, vi } from 'vitest'
 import { MacroPage, macroRunArguments, parseMacroParameters } from './MacroPage'
 
 describe('human Macro editor', () => {
-  it('requires explicit sharing and a saved revision before actual execution', () => {
+  it('keeps sharing opt-in and presents editing, trial runs and the guide separately', () => {
     const markup = renderToStaticMarkup(<MacroPage connected ports={[]} modelFamilies={[]} drafts={{ drafts: new Map() }} onExecution={vi.fn()} />)
     expect(markup).toContain('共享到默认宏列表')
     expect(markup).not.toContain('checked=""')
-    expect(markup).toContain('修改保存后才能试运行')
-    expect(markup).toContain('保存仅校验语法，试运行会实际操作串口')
+    expect(markup).toContain('试运行')
+    expect(markup).toContain('指南')
+    expect(markup).not.toContain('运行已保存版本')
+    expect(markup).toContain('参数与适用机型')
+    expect(markup).not.toContain('命令与参数规则')
   })
 
   it('passes typed parameter values rather than interpolating them into source', () => {

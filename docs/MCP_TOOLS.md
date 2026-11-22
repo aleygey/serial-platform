@@ -1,6 +1,6 @@
 # Serial MCP Tools
 
-`serial-mcp` 把 Serial Platform 收敛为 18 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
+`serial-mcp` 把 Serial Platform 收敛为 19 个 MCP 工具。完整机器可读 schema 由可执行文件直接生成：
 
 ```sh
 serial mcp --dump-tools
@@ -48,10 +48,11 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 
 支持 MCP protocol：`2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25`。
 
-## 18 个工具
+## 19 个工具
 
 | Tool | Required | Optional | 作用 |
 |---|---|---|---|
+| `setup_proposal` | `request_id` | `plan` | 读取桌面首次配置向导的回答，回传 Shell 提示符和检查方案供用户确认 |
 | `devices` | — | `port` | 唯一设备发现入口；读取串口、两级机型身份、Agent 状态和有效 Shell/U-Boot 提示符 |
 | `model_identity_set` | `port`, `model_family`, `model_name` | — | 成对绑定已有系列/具体机型，或以两个 null 清空身份 |
 | `read` | `port` | `scope`, `epoch`, `after_seq`, `through_seq`, `exclude_patterns` | 读取有界文本；按区分大小写的字面子串隐藏完整噪音行，只影响显示，人工 read-gate 确认时强制关闭 |
@@ -70,6 +71,12 @@ stdio 每行一个 JSON-RPC frame；stdout 只包含 MCP，运行信息输出到
 | `monitor_stop` | `monitor_id` | `delete_history` | 默认停止并保留历史；显式删除时清理 Monitor 和 incident，保留原始串口日志 |
 | `run_start` | `port`, `label` | — | 空闲时原子开始 Run；Human 持有时等待 TUI/App 明确审批 |
 | `run_end` | `run_handle` | `outcome` | 正常完成 Run，或经权威确认后异常中止并释放 Control |
+
+## 首次配置邀请
+
+用户在桌面向导里选择串口和检查方式，再把任务 ID 交给外部 Agent。调用 `setup_proposal({request_id})` 读取问题和回答。可以用 `read` 查看目标串口已有的回显。需要更多信息时询问用户，再用同一工具提交 `plan`。
+
+`shell_prompt` 保留实际提示符的末尾空格。心跳方案的 `command` 和 `expected_reply` 均为空字符串。设备状态检查使用一个只读命令，并选择能区别于命令回显的应答文本。只有用户在桌面确认后才写入本地配置，点击运行才会发送检查。任务存于当前后端内存，重启后或 24 小时后需重新生成。
 
 ## 标准工作流
 

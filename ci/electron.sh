@@ -172,18 +172,19 @@ stage_sidecars() {
     local executable_suffix="$2"
     local resources_bin="${DESKTOP_DIR}/resources/bin"
 
-    [[ -f "${binary_dir}/serial${executable_suffix}" ]] \
-        || fail "desktop sidecar is missing: ${binary_dir}/serial${executable_suffix}"
-    [[ -f "${binary_dir}/seriald${executable_suffix}" ]] \
-        || fail "desktop sidecar is missing: ${binary_dir}/seriald${executable_suffix}"
+    local sidecar
+    for sidecar in serial seriald serial-mcp; do
+        [[ -f "${binary_dir}/${sidecar}${executable_suffix}" ]] \
+            || fail "desktop sidecar is missing: ${binary_dir}/${sidecar}${executable_suffix}"
+    done
 
     rm -rf "${resources_bin}"
     mkdir -p "${resources_bin}"
     STAGED_RESOURCES_BIN="${resources_bin}"
-    install -m 0755 "${binary_dir}/serial${executable_suffix}" \
-        "${resources_bin}/serial${executable_suffix}"
-    install -m 0755 "${binary_dir}/seriald${executable_suffix}" \
-        "${resources_bin}/seriald${executable_suffix}"
+    for sidecar in serial seriald serial-mcp; do
+        install -m 0755 "${binary_dir}/${sidecar}${executable_suffix}" \
+            "${resources_bin}/${sidecar}${executable_suffix}"
+    done
 }
 
 single_match() {
@@ -236,7 +237,7 @@ package_macos() {
     [[ -x "${destination}/Serial Platform.app/Contents/Resources/bin/seriald" ]] \
         || fail "macOS App does not contain the seriald sidecar"
     local sidecar
-    for sidecar in serial seriald; do
+    for sidecar in serial seriald serial-mcp; do
         local sidecar_description
         sidecar_description="$(
             file -b "${destination}/Serial Platform.app/Contents/Resources/bin/${sidecar}"
@@ -301,7 +302,7 @@ package_linux() {
     [[ "${newest_glibc}" == "GLIBC_2.31" ]] \
         || fail "Linux Electron executable requires ${highest_glibc}, newer than GLIBC_2.31"
     local sidecar
-    for sidecar in serial seriald; do
+    for sidecar in serial seriald serial-mcp; do
         [[ -x "${unpacked_resources}/${sidecar}" ]] \
             || fail "Linux Electron package does not contain ${sidecar}"
         cmp -s "${DESKTOP_DIR}/resources/bin/${sidecar}" "${unpacked_resources}/${sidecar}" \
@@ -331,7 +332,7 @@ package_windows() {
     file "${unpacked_app}" | grep -Eq 'PE32\+ executable.*x86-64' \
         || fail "Electron Windows application is not an x86_64 PE32+ executable"
     local sidecar
-    for sidecar in serial.exe seriald.exe; do
+    for sidecar in serial.exe seriald.exe serial-mcp.exe; do
         [[ -f "${unpacked_resources}/${sidecar}" ]] \
             || fail "Windows Electron package does not contain ${sidecar}"
         cmp -s "${DESKTOP_DIR}/resources/bin/${sidecar}" "${unpacked_resources}/${sidecar}" \
