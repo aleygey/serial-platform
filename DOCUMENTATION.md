@@ -368,6 +368,6 @@ Electron application
 BUILD-INFO.json
 ```
 
-Electron 形态为 Linux AppImage、Windows portable EXE、macOS `.app`。最终 artifacts 生成统一 `SHA256SUMS`。
+Electron 形态为 Linux AppImage、Windows portable EXE、macOS `.app`。Windows 的便携 EXE 也单独列在 Release 下载项中，与 ZIP 内的桌面程序相同。四个压缩包和单独的 EXE 均纳入 `SHA256SUMS`。
 
 macOS Rust CLI 的 deployment target 是 11.0；Electron 43 App 的最低系统版本是 12.0。当前 macOS `.app` 没有 Developer ID 签名，也没有 Apple notarization。

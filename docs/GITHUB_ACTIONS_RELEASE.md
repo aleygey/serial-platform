@@ -8,13 +8,13 @@
 2. Pull Request 的 CI 与原生验证通过后合入 `main`。涉及发布工作流、打包脚本、版本清单或更新说明的 PR 还会只读运行同一四平台打包与完整资产验证，绝不创建 tag 或 Release。
 3. `Publish release`（`.github/workflows/publish-release.yml`）由 main push 自动启动，固定这次推送的完整 commit SHA。版本已正式发布时直接跳过，不重复打包或覆盖旧版本。
 4. 未发布版本由标准 GitHub 托管 runner 构建 Linux x86_64、Windows x86_64、macOS arm64、macOS x86_64。复用原有打包脚本的版本、架构、兼容性、MCP 工具数、应用 sidecar 和包内清单检查。
-5. 所有测试、打包与验收任务成功后，发布任务创建或验证 annotated `vX.Y.Z` tag，使其精确指向该源码 commit；汇总 `SHA256SUMS`，先上传草稿并验证四个包及其校验和，最后才公开正式 Release。
+5. 所有测试、打包与验收任务成功后，发布任务创建或验证指向该源码 commit 的 annotated `vX.Y.Z` tag。在草稿中验证四个平台压缩包、Windows 便携 EXE 及其校验和后，公开正式 Release。
 
 也可在 GitHub Actions 页面选中 `Publish release`，从 `main` 手动运行，用于未完成版本的重试。手动运行不是绕过检查的快速发布入口。
 
 ## 资产与权限
 
-- Release 包含四个平台安装压缩包和一个 `SHA256SUMS`；压缩包继续包含四个 Rust 程序、Electron App、`BUILD-INFO.json` 和清单。
+- Release 提供四个平台压缩包、可单独下载的 Windows x64 便携 EXE 和覆盖全部五项下载的 `SHA256SUMS`。Windows runner 会从独立目录启动该 EXE，检查主窗口和内置后端，并校验它与 ZIP 内的桌面程序逐字节一致。
 - 构建任务默认只有读取代码的权限。只有依赖全部验收任务成功的发布任务使用短期 `GITHUB_TOKEN` 的 `contents: write`；不需要 Personal Access Token、SSH key 或自托管 runner。
 - 不接受外部 PR 触发写权限发布，不使用 `pull_request_target`。所有阶段使用同一固定源码 SHA。
 - 中间 Actions artifacts 保留 3 天，正式下载从 GitHub Release 获取。中间产物不是正式发布结果。
@@ -26,7 +26,7 @@
 - 已有 tag 指向其他提交、不是 annotated tag，或已有正式 Release 资产与当前文件不一致：停止，不强推 tag、不覆盖资产。
 - 草稿上传中断：现有发布脚本按 Release/asset ID 校验已上传内容，相同资产可保留并补齐；不同内容拒绝覆盖。
 - 首次运行若提示 Actions 被仓库或组织策略禁用，由仓库管理员在 GitHub 设置中处理；本流水线不会自动更改这些安全设置。
-- 发布成功必须同时核对 Release 可见、tag commit、四个平台资产和 `SHA256SUMS`，不能只凭某个 job 显示绿色。
+- 发布后检查 Release 的公开状态、tag 指向的 commit，以及四个平台压缩包、Windows 便携 EXE 和 `SHA256SUMS` 的下载。
 
 ## Jenkins 迁移边界
 

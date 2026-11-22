@@ -58,7 +58,7 @@ def checksums(text: str) -> dict[str, str]:
     return result
 
 
-def verify_archive(path: Path, root: str, target: str, desktop: str, version: str, commit: str) -> None:
+def verify_archive(path: Path, root: str, target: str, desktop: str, version: str, commit: str) -> str:
     archive = tarfile.open(path, "r:gz") if path.name.endswith(".tar.gz") else zipfile.ZipFile(path)
     with archive:
         members = archive.getmembers() if isinstance(archive, tarfile.TarFile) else archive.infolist()
@@ -93,12 +93,12 @@ def verify_archive(path: Path, root: str, target: str, desktop: str, version: st
         required = {f"{binary}{suffix}" for binary in ("serial", "seriald", "serialctl", "serial-mcp")}
         required.update({desktop, "BUILD-INFO.json", "MANIFEST.sha256", "docs/MCP_TOOLS.md"})
         if "apple-darwin" in target:
-            required.update({f"Serial Platform.app/Contents/Resources/bin/{binary}" for binary in ("serial", "seriald")})
+            required.update({f"Serial Platform.app/Contents/Resources/bin/{binary}" for binary in ("serial", "seriald", "serial-mcp")})
             required.add("Serial Platform.app/Contents/Info.plist")
         require(required <= files.keys(), f"missing required payloads in {path.name}: {sorted(required - files.keys())}")
         with open_member("BUILD-INFO.json") as stream:
             metadata = json.load(stream)
-        for field, expected in {"version": version, "git_commit": commit, "cargo_profile": "release", "rust_target": target, "mcp_tool_count": 18}.items():
+        for field, expected in {"version": version, "git_commit": commit, "cargo_profile": "release", "rust_target": target, "mcp_tool_count": 19}.items():
             require(metadata.get(field) == expected, f"{path.name}: unexpected {field}: {metadata.get(field)!r}")
         with open_member("MANIFEST.sha256") as stream:
             manifest = checksums(stream.read().decode("utf-8"))
@@ -107,21 +107,28 @@ def verify_archive(path: Path, root: str, target: str, desktop: str, version: st
             with open_member(name) as stream:
                 require(digest(stream) == expected, f"{path.name}: inner checksum mismatch for {name}")
     print(f"Verified source, payloads, and manifest: {path.name}")
+    return manifest[desktop]
 
 
 def verify_release(directory: Path, version: str, commit: str) -> None:
     require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None, "source commit must be a full lowercase SHA")
     require(re.fullmatch(r"(0|[1-9][0-9]*)\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?", version) is not None, "invalid release version")
     expected = {f"serial-platform-v{version}-{platform}{extension}" for platform, (extension, _, _) in PLATFORMS.items()}
-    require({path.name for path in directory.iterdir()} == expected | {"SHA256SUMS"}, "release directory must contain exactly four archives and SHA256SUMS")
+    portable = f"serial-platform-v{version}-windows-x86_64.exe"
+    expected.add(portable)
+    require({path.name for path in directory.iterdir()} == expected | {"SHA256SUMS"}, "release directory must contain exactly four archives, the portable Windows EXE and SHA256SUMS")
     manifest = checksums((directory / "SHA256SUMS").read_text())
-    require(set(manifest) == expected, "SHA256SUMS must cover exactly the four release archives")
+    require(set(manifest) == expected, "SHA256SUMS must cover all five downloads")
+    with (directory / portable).open("rb") as stream:
+        require(digest(stream) == manifest[portable], "portable Windows EXE checksum mismatch")
     for platform, (extension, target, desktop) in PLATFORMS.items():
         root = f"serial-platform-v{version}-{platform}"
         path = directory / (root + extension)
         with path.open("rb") as stream:
             require(digest(stream) == manifest[path.name], f"archive checksum mismatch: {path.name}")
-        verify_archive(path, root, target, desktop, version, commit)
+        desktop_digest = verify_archive(path, root, target, desktop, version, commit)
+        if platform == "windows-x86_64":
+            require(desktop_digest == manifest[portable], "portable EXE differs from Serial Platform.exe inside the Windows ZIP")
 
 
 def main() -> None:

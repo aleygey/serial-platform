@@ -428,13 +428,14 @@ main() {
     [[ -d "${ARTIFACT_DIR}" ]] \
         || fail "artifact directory is missing: ${ARTIFACT_DIR}"
 
-    local -a archive_names=(
+    local -a download_names=(
         "serial-platform-v${package_version}-linux-x86_64-ubuntu20.04.tar.gz"
         "serial-platform-v${package_version}-windows-x86_64.zip"
+        "serial-platform-v${package_version}-windows-x86_64.exe"
         "serial-platform-v${package_version}-macos-aarch64.zip"
         "serial-platform-v${package_version}-macos-x86_64.zip"
     )
-    local -a asset_names=("${archive_names[@]}" "SHA256SUMS")
+    local -a asset_names=("${download_names[@]}" "SHA256SUMS")
 
     local name
     for name in "${asset_names[@]}"; do
@@ -463,11 +464,11 @@ main() {
         fail "artifact directory does not contain the exact Release asset set"
     fi
 
-    printf '%s\n' "${archive_names[@]}" | LC_ALL=C sort >"${expected_checksums_file}"
+    printf '%s\n' "${download_names[@]}" | LC_ALL=C sort >"${expected_checksums_file}"
     awk '{print $2}' "${ARTIFACT_DIR}/SHA256SUMS" | sed 's/^\*//' \
         | LC_ALL=C sort >"${actual_checksums_file}"
     cmp -s "${expected_checksums_file}" "${actual_checksums_file}" \
-        || fail "SHA256SUMS must contain each of the four archives exactly once"
+        || fail "SHA256SUMS must cover each archive and the portable Windows application exactly once"
     (
         cd "${ARTIFACT_DIR}"
         sha256sum --check --strict SHA256SUMS
@@ -566,7 +567,7 @@ main() {
 
     # Close the upload-to-publish race with a fresh REST snapshot. The draft
     # may only be published if it is still a draft and its complete asset set
-    # is exactly the four platform packages plus SHA256SUMS. Rechecking here
+    # is exactly the four archives, portable Windows app and SHA256SUMS. Rechecking here
     # prevents an asset added, removed, or duplicated after discovery from
     # being made public accidentally.
     CURRENT_PHASE="pre-publish-guard"

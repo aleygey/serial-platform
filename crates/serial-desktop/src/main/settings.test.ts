@@ -18,8 +18,14 @@ describe('desktop preferences', () => {
 
       await store.save({ ...defaults, autoStartLocal: false, firstUse: 'complete' })
       expect(await store.load()).toMatchObject({ autoStartLocal: false, firstUse: 'complete' })
-      await writeFile(store.path, JSON.stringify({ theme: 'dark' }))
-      expect(await store.load()).toMatchObject({ theme: 'dark', firstUse: 'dismissed' })
+      const previousPreferences = {
+        endpoint: 'http://127.0.0.1:4321',
+        autoStartLocal: false,
+        selectedPort: 'COM9',
+        theme: 'dark'
+      }
+      await writeFile(store.path, JSON.stringify(previousPreferences))
+      expect(await store.load()).toEqual({ ...previousPreferences, palette: 'harbor', firstUse: 'dismissed' })
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

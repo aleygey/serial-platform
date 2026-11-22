@@ -519,26 +519,27 @@ run_package_target() {
             ;;
         x86_64-pc-windows-gnu)
             create_zip_archive "${package_name}"
+            install -m 0755 "${package_dir}/${desktop_artifact}" "${ARTIFACT_DIR}/${package_name}.exe"
             ;;
     esac
     rm -rf "${package_dir}"
     printf 'packaged %s\n' "${package_name}"
 }
 
-write_archive_checksums() {
-    local -a archives=()
+write_release_checksums() {
+    local -a artifacts=()
     local path
     shopt -s nullglob
-    for path in "${ARTIFACT_DIR}"/*.tar.gz "${ARTIFACT_DIR}"/*.zip; do
-        archives+=("${path}")
+    for path in "${ARTIFACT_DIR}"/*.tar.gz "${ARTIFACT_DIR}"/*.zip "${ARTIFACT_DIR}"/*.exe; do
+        artifacts+=("${path}")
     done
     shopt -u nullglob
-    ((${#archives[@]} > 0)) || fail "no release archives were created"
+    ((${#artifacts[@]} > 0)) || fail "no release artifacts were created"
 
     (
         cd "${ARTIFACT_DIR}"
         : >SHA256SUMS
-        for path in "${archives[@]}"; do
+        for path in "${artifacts[@]}"; do
             sha256sum "$(basename "${path}")" >>SHA256SUMS
         done
         sha256sum --check SHA256SUMS
@@ -583,14 +584,14 @@ run_package() {
     for target in "${targets[@]}"; do
         run_package_target "${target}"
     done
-    write_archive_checksums
+    write_release_checksums
 }
 
 run_checksums() {
     CURRENT_PHASE="checksums"
     [[ -d "${ARTIFACT_DIR}" ]] \
         || fail "artifact directory is missing: ${ARTIFACT_DIR}"
-    write_archive_checksums
+    write_release_checksums
 }
 
 run_all() {

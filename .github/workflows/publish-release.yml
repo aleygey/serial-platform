@@ -205,8 +205,38 @@ jobs:
             "./${binary}.exe" --version | grep -F "$RELEASE_VERSION"
           done
           ./serial.exe --help >/dev/null
-          ./serial-mcp.exe --dump-tools | jq -e 'type == "array" and length == 18' >/dev/null
-          test -s 'Serial Platform.exe'
+          ./serial-mcp.exe --dump-tools | jq -e 'length == 19 and any(.[]; .name == "setup_proposal")' >/dev/null
+          cmp 'Serial Platform.exe' "../../artifacts/${package}.exe"
+      - name: Launch the standalone desktop and its bundled daemon on Windows
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $name = "serial-platform-v$env:RELEASE_VERSION-windows-x86_64.exe"
+          $folder = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'Serial desktop smoke')
+          $exe = Join-Path $folder.FullName $name
+          Copy-Item "target/artifacts/$name" $exe
+          $launcher = Start-Process -FilePath $exe -WorkingDirectory $folder.FullName -PassThru
+          $window = $null
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
+            do {
+              Start-Sleep -Milliseconds 500
+              if ($launcher.HasExited) { throw "Portable launcher exited before opening the console ($($launcher.ExitCode))" }
+              $window = Get-Process -Name 'Serial Platform' -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+              $daemon = Get-Process -Name 'seriald' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -like '*\resources\bin\seriald.exe' } | Select-Object -First 1
+              try { $health = Invoke-RestMethod 'http://127.0.0.1:3210/api/v1/health' -TimeoutSec 2 }
+              catch { $health = $null }
+              $ready = $window -and $daemon -and $health.status -eq 'ok' -and $health.protocol_version -eq 9
+            } until ($ready -or [DateTime]::UtcNow -ge $deadline)
+            if (-not $ready) { throw 'The standalone app did not open its main window and connect to the packaged seriald.' }
+            Write-Host "Windows desktop window and protocol $($health.protocol_version) daemon are running."
+          } finally {
+            if ($window) { $null = $window.CloseMainWindow() }
+            if (-not $launcher.WaitForExit(15000)) { taskkill.exe /PID $launcher.Id /T /F }
+          }
 
   verify:
     name: Verify all four release archives

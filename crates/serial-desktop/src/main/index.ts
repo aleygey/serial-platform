@@ -30,6 +30,7 @@ function createWindow(): void {
     show: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0a0d12' : '#f4f6f8',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    titleBarOverlay: process.platform === 'win32',
     trafficLightPosition: { x: 18, y: 18 },
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
