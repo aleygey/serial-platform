@@ -1739,13 +1739,9 @@ impl AgentTools {
             },
         );
         Ok(json!({
-            "port": args.port,
-            "approval_id": started.approval_id,
-            "run_id": run.id,
             "run_handle": started.run_handle,
-            "macro_catalog": self.macro_context().await,
-            "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq},
-            "cleanup_required": "Call run_end before the final reply unless deliberately handing this live Run to a continuing agent workflow."
+            "run_id": run.id,
+            "cursor": {"epoch": slot.daemon_epoch, "after_seq": run.start_seq}
         }))
     }
 

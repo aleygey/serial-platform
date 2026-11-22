@@ -87,12 +87,9 @@ Run 只界定证据，不复位设备，也不证明当前状态干净。Agent �
 
 ```json
 {
-  "port": "COM4",
-  "approval_id": "uuid",
-  "run_id": "uuid",
   "run_handle": "22-character-handle",
-  "cursor": {"epoch": "uuid", "after_seq": 120},
-  "cleanup_required": "Call run_end ..."
+  "run_id": "uuid",
+  "cursor": {"epoch": "uuid", "after_seq": 120}
 }
 ```
 
@@ -103,9 +100,9 @@ Run 只界定证据，不复位设备，也不证明当前状态干净。Agent �
 - Human 拒绝、审批超时、后端取消、adapter 清理取消、调用方或 WebSocket 断连、端口 generation 变化等终态都不创建 Run，也不写入任何串口 bytes；
 - adapter 的审批等待有界，接近本地上限时会先取消 pending 请求；如果不能确认取消，则关闭 Agent 连接，让后端清理 pending 状态。
 
-因此不要在 MCP host 超时后自行假设批准成功，也不要盲目重试写操作。HTTP/stdio host 的 tool timeout 建议至少 130 秒，以覆盖最长 120 秒本地等待及响应收敛。`approval_id` 是这次原子授权的审计身份，不代替 `run_handle`。
+因此不要在 MCP host 超时后自行假设批准成功，也不要盲目重试写操作。HTTP/stdio host 的 tool timeout 建议至少 130 秒，以覆盖最长 120 秒本地等待及响应收敛。审批 ID 仍用于后端授权校验和审计，不返回给 Agent，也不代替 `run_handle`。
 
-`run_handle` 固定 22 个 URL-safe 字符，仅由当前 `serial-mcp` 进程解析。所有 Run-scoped 工具只需要这一个值，因此小模型不必在每次调用中同时复制端口、Run ID 和其他底层状态。
+`run_handle` 固定 22 个 URL-safe 字符，仅由当前 `serial-mcp` 进程解析。所有 Run-scoped 工具只需要这一个值，因此小模型不必在每次调用中同时复制端口、Run ID 和其他底层状态。成功响应的文本 JSON 和 `structuredContent` 都只含上述三个字段，文本中 `run_handle` 排第一。按本轮起点搜索时，沿用输入的 `port`，并用返回的 `run_id` 和 `cursor` 填入 `search`；翻页用搜索响应的 `continuation`。需要复用已有宏时，可先用 `macro_list(query=...)` 查找、再用 `macro_list(id=...)` 查看源码和准确 revision；不必占用串口就能查询。普通命令不需要查宏。
 
 默认 `orphan_run_timeout_seconds=1800`。`0` 表示不限时，其他值至少 300 秒。该设置只处理最后一个 Run-scoped 调用后无人继续的情况；正常工作流仍调用 `run_end`。
 

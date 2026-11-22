@@ -120,7 +120,6 @@ pub struct SessionHandle {
 /// Public Run identity plus the one opaque MCP capability issued to its caller.
 #[derive(Debug)]
 pub struct StartedRun {
-    pub approval_id: Uuid,
     pub run: RunInfo,
     pub run_handle: String,
 }
@@ -1308,11 +1307,7 @@ impl SessionState {
                          bytes were written"
                         );
                     }
-                    return Ok(StartedRun {
-                        approval_id,
-                        run,
-                        run_handle,
-                    });
+                    return Ok(StartedRun { run, run_handle });
                 }
                 Ok(CommandResult::RunStartPending { approval }) => {
                     let request_content_matches = match &request {
@@ -2117,7 +2112,6 @@ mod tests {
             }
         );
         let started = started.unwrap();
-        assert_eq!(started.approval_id, request.request_id());
         assert_eq!(started.run.id, run.id);
         assert!(matches!(
             request,
@@ -2243,7 +2237,6 @@ mod tests {
         );
         let started = started.unwrap();
         assert_eq!(started.run.id, run.id);
-        assert_eq!(started.approval_id, requests.0.request_id());
         assert_eq!(requests.0, requests.1);
         assert!(matches!(requests.0, ClientMessage::RequestRunStart { .. }));
     }

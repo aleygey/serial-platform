@@ -19,6 +19,7 @@ struct DaemonData {
     uncertain_start: bool,
     evidence_after: u64,
     evidence_truncated: bool,
+    macro_requests: usize,
 }
 
 async fn fixture(uncertain_start: bool) -> (AgentTools, TestDaemon, tokio::task::JoinHandle<()>) {
@@ -59,13 +60,14 @@ async fn fixture(uncertain_start: bool) -> (AgentTools, TestDaemon, tokio::task:
         uncertain_start,
         evidence_after: 17,
         evidence_truncated: false,
+        macro_requests: 0,
     })));
     let router = Router::new()
-        .route("/api/v1/ws",get(ws_upgrade))
-        .route("/api/v1/status",get(status))
-        .route("/api/v1/macros",get(|| async { Json(json!({"catalog_revision":1,"macros":[],"definition":null,"total":0,"next_offset":null})) }))
-        .route("/api/v1/ports/COM6/events",get(evidence))
-        .route("/api/v1/ports/COM6/recent-activity",get(evidence))
+        .route("/api/v1/ws", get(ws_upgrade))
+        .route("/api/v1/status", get(status))
+        .route("/api/v1/macros", get(macro_catalog))
+        .route("/api/v1/ports/COM6/events", get(evidence))
+        .route("/api/v1/ports/COM6/recent-activity", get(evidence))
         .with_state(data.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -84,6 +86,26 @@ async fn fixture(uncertain_start: bool) -> (AgentTools, TestDaemon, tokio::task:
         crate::config::CaptureLimits::default(),
     );
     (tools, data, server)
+}
+
+async fn macro_catalog(State(data): State<TestDaemon>) -> Json<MacroListResponse> {
+    data.0.lock().unwrap().macro_requests += 1;
+    Json(MacroListResponse {
+        catalog_revision: 1,
+        macros: vec![MacroSummary {
+            id: "shared-test".into(),
+            name: "Shared fixture".into(),
+            description: "x".repeat(1024),
+            language_version: 1,
+            revision: 1,
+            parameters: Default::default(),
+            shared: true,
+            applies_to: None,
+        }],
+        definition: None,
+        total: 1,
+        next_offset: None,
+    })
 }
 
 async fn status(State(data): State<TestDaemon>) -> Json<StatusResponse> {
@@ -151,6 +173,22 @@ async fn serve_socket(mut socket: WebSocket, data: TestDaemon) {
                         lease: data.lease.clone(),
                     },
                 }),
+                ClientMessage::EndRun { run_id, .. } => {
+                    assert_eq!(*run_id, data.run.id);
+                    let mut ended = data.slot.active_run.take().unwrap();
+                    ended.status = RunStatus::Completed;
+                    Some(ServerMessage::Result {
+                        request_id: request.request_id(),
+                        result: CommandResult::RunEnded { run: ended },
+                    })
+                }
+                ClientMessage::ReleaseControl { .. } => {
+                    data.slot.control = None;
+                    Some(ServerMessage::Result {
+                        request_id: request.request_id(),
+                        result: CommandResult::ControlReleased,
+                    })
+                }
                 ClientMessage::MacroStart {
                     operation_id,
                     expected_run_id,
@@ -239,6 +277,83 @@ async fn serve_socket(mut socket: WebSocket, data: TestDaemon) {
             break;
         }
     }
+}
+
+async fn call_tool(tools: &AgentTools, name: &str, arguments: Value) -> Value {
+    let request = RpcRequest {
+        jsonrpc: Some("2.0".into()),
+        id: Some(json!(1)),
+        method: "tools/call".into(),
+        params: json!({"name": name, "arguments": arguments}),
+    };
+    let response = dispatch_cancellable(tools, request, json!(1), None).await;
+    response["result"].clone()
+}
+
+#[tokio::test]
+async fn mcp_run_start_keeps_exact_compact_result_and_supports_followup_calls() {
+    let (tools, data, server) = fixture(false).await;
+    let result = call_tool(
+        &tools,
+        "run_start",
+        json!({"port": "COM6", "label": "compact Run"}),
+    )
+    .await;
+    assert_eq!(result["isError"], false);
+    assert_eq!(data.0.lock().unwrap().macro_requests, 0);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with(r#"{"run_handle":"#));
+    assert!(text.len() <= 700);
+    let output: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(output, result["structuredContent"]);
+    assert_eq!(output.as_object().unwrap().len(), 3);
+    let handle = output["run_handle"].as_str().unwrap();
+    assert_eq!(handle.len(), 22);
+    {
+        let state = data.0.lock().unwrap();
+        assert_eq!(output["run_id"], json!(state.run.id));
+        assert_eq!(
+            output["cursor"],
+            json!({"epoch": state.slot.daemon_epoch, "after_seq": state.run.start_seq})
+        );
+    }
+
+    {
+        let mut state = data.0.lock().unwrap();
+        state.evidence_after = 18;
+        state.evidence_truncated = true;
+    }
+    let search = call_tool(
+        &tools,
+        "search",
+        json!({
+            "port": "COM6",
+            "query": "boot",
+            "run_id": output["run_id"],
+            "epoch": output["cursor"]["epoch"],
+            "after_seq": output["cursor"]["after_seq"]
+        }),
+    )
+    .await;
+    assert_eq!(search["isError"], false, "{search}");
+    assert_eq!(
+        search["structuredContent"]["continuation"]["run_id"],
+        output["run_id"]
+    );
+    assert_eq!(search["structuredContent"]["continuation"]["after_seq"], 18);
+    let macros = call_tool(&tools, "macro_list", json!({"query": "Shared"})).await;
+    assert_eq!(macros["isError"], false);
+    assert_eq!(
+        macros["structuredContent"]["macros"][0]["id"],
+        "shared-test"
+    );
+    assert!(macros["content"][0]["text"].as_str().unwrap().len() > 700);
+    assert_eq!(data.0.lock().unwrap().macro_requests, 1);
+    let ended = call_tool(&tools, "run_end", json!({"run_handle": handle})).await;
+    assert_eq!(ended["isError"], false, "{ended}");
+    assert_eq!(ended["structuredContent"]["run_id"], output["run_id"]);
+    assert!(data.0.lock().unwrap().slot.active_run.is_none());
+    server.abort();
 }
 
 async fn run_and_cancel(uncertain_start: bool, timeout: bool) {
