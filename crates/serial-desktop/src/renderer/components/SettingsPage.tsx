@@ -7,7 +7,7 @@ import { ModelPicker } from './ui/model-picker'
 import { TransitionPanel } from './ui/transition-panel'
 import { WorkspaceSidebar } from './WorkspaceSidebar'
 import { DEFAULT_THEMES, ThemeSelector } from './ui/theme-selector'
-import { palettes, paletteId, terminalFontSize, terminalFontSizes } from '../../shared/appearance'
+import { palettes, paletteId, interfaceFontSize, interfaceFontSizes, terminalFontSize, terminalFontSizes } from '../../shared/appearance'
 import { useAppearanceMode } from '../lib/appearance'
 import type {
   DesktopPreferences,
@@ -387,6 +387,11 @@ function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup
         }} />
         <ThemeSelector aria-label="主题配色" themes={colors} value={paletteId(value.palette)} onChange={id => {
           const next = { ...value, palette:paletteId(id) }
+          setValue(next)
+          void onSave(next)
+        }} />
+        <SerialNumberField label="界面字号（px）" choices={interfaceFontSizes} value={interfaceFontSize(value.interfaceFontSize)} onChange={size => {
+          const next = { ...value, interfaceFontSize: size }
           setValue(next)
           void onSave(next)
         }} />

@@ -111,8 +111,11 @@ export type RunStartDecision = 'approve' | 'deny'
 
 export const HUMAN_COMMAND_UNCERTAIN_MESSAGE = '人工命令的物理写入结果不确定。请先查看串口时间线，勿直接重发。'
 
+export interface InputSendTiming { sentAt: number; acceptedAt: number }
+export interface InputObservation { ids: string[]; receivedAt: number }
+
 export type HumanCommandSubmission =
-  | { status: 'accepted' }
+  | { status: 'accepted'; timing?: InputSendTiming }
   | { status: 'rejected'; message: string }
   | { status: 'uncertain'; message: string }
 
@@ -155,6 +158,10 @@ export interface TimelineEvent {
   stream_offset_start?: number | null
   stream_offset_end?: number | null
   text: string
+  /** Original bytes when decoding this RX frame alone would be lossy. */
+  rxBytes?: Uint8Array
+  /** Desktop-local timing attached only to a traced live RX. */
+  inputObservation?: InputObservation
   metadata: Record<string, unknown>
   durable: boolean
   replay?: boolean
@@ -250,6 +257,7 @@ export interface DesktopPreferences {
   autoStartLocal: boolean
   theme: ThemePreference
   terminalFontSize?: number
+  interfaceFontSize?: number
   palette?: PaletteId
   selectedPort?: string
   firstUse?: 'new' | 'dismissed' | 'complete'
@@ -296,7 +304,7 @@ export interface DesktopBridge {
   applySetup(id: string, revision: number): Promise<MacroDefinition>
   bootstrap(): Promise<DesktopSnapshot>
   refresh(): Promise<DesktopSnapshot>
-  sendCommand(port: string, command: string): Promise<HumanCommandSubmission>
+  sendCommand(port: string, command: string, traceId?: string): Promise<HumanCommandSubmission>
   sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<HumanCommandSubmission>
   queryHumanHistory(query: string, contains?: boolean): Promise<HumanCommandHistory>
   agentHistory(port: string): Promise<AgentHistoryResponse>

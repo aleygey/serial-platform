@@ -49,6 +49,7 @@ export class DesktopCoordinator {
     let pending: TimelineEvent[] = []
     let timer: ReturnType<typeof setTimeout> | undefined
     let lastBatch = -Infinity
+    const awaitingInput = new Set<string>()
     const flush = () => {
       clearTimeout(timer)
       timer = undefined
@@ -59,13 +60,20 @@ export class DesktopCoordinator {
     }
     this.emit = event => {
       if (event.type === 'timeline') {
-        pending.push(event.event)
-        // Deliver an idle port's first output immediately. Coalesce a running
-        // stream for at most half a 60 Hz frame, measured from the last delivery.
+        const entry = event.event
+        const humanWrite = !entry.replay && entry.direction === 'tx' && entry.actor?.kind === 'human'
+        pending.push(entry)
+        if (humanWrite) awaitingInput.add(entry.port)
+        // The terminal displays RX. Give a short reply a chance to share its
+        // input's batch, then deliver it immediately, even during a busy stream.
+        const firstReply = !entry.replay && entry.direction === 'rx' && awaitingInput.delete(entry.port)
         const remaining = 8 - (performance.now() - lastBatch)
-        if (remaining <= 0 || pending.length >= 256) flush()
+        if (firstReply || pending.length >= 256) flush()
+        else if (humanWrite && pending.length === 1 && remaining <= 0) timer ??= setTimeout(flush, 8)
+        else if (remaining <= 0) flush()
         else timer ??= setTimeout(flush, Math.ceil(remaining))
       } else {
+        if (event.type === 'connection' || event.type === 'snapshot') awaitingInput.clear()
         flush()
         emit(event)
       }
@@ -105,12 +113,12 @@ export class DesktopCoordinator {
     return snapshot
   }
 
-  async sendCommand(port: string, command: string): Promise<HumanCommandSubmission> {
+  async sendCommand(port: string, command: string, traceId?: string): Promise<HumanCommandSubmission> {
     if (this.qaMode) return { status: 'accepted' }
     const value = command.replace(/[\r\n]+$/, '')
     try {
-      await this.requireClient().sendCommand(port, value)
-      return { status: 'accepted' }
+      const timing = await this.requireClient().sendCommand(port, value, traceId)
+      return timing ? { status: 'accepted', timing } : { status: 'accepted' }
     } catch (error) {
       const message = errorMessage(error)
       return error instanceof HumanCommandOutcomeUncertainError

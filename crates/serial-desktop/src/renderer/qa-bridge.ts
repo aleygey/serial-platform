@@ -11,14 +11,14 @@ export function installQaBridge(): boolean {
   const demo = document.documentElement.hasAttribute('data-serial-preview') || params.get('preview') === '1'
   if (!demo && params.get('qa') !== '1') return false
   const theme = params.get('theme')
-  let saved: Pick<Partial<DesktopPreferences>, 'palette' | 'theme' | 'firstUse' | 'terminalFontSize'> = {}
+  let saved: Pick<Partial<DesktopPreferences>, 'palette' | 'theme' | 'firstUse' | 'terminalFontSize' | 'interfaceFontSize'> = {}
   if (demo) {
     try { saved = JSON.parse(window.localStorage.getItem('serial-preview-appearance') ?? '{}') ?? {} } catch { /* Storage may be disabled in an embedded preview. */ }
   }
   const preferences: DesktopPreferences = {
     endpoint: 'http://127.0.0.1:3210', autoStartLocal: true,
     theme: theme === 'light' || theme === 'dark' ? theme : saved.theme === 'dark' || saved.theme === 'system' ? saved.theme : demo ? 'light' : 'system',
-    palette: paletteId(saved.palette), terminalFontSize: saved.terminalFontSize, selectedPort: demo ? 'COM7' : 'COM6',
+    palette: paletteId(saved.palette), terminalFontSize: saved.terminalFontSize, interfaceFontSize: saved.interfaceFontSize, selectedPort: demo ? 'COM7' : 'COM6',
     firstUse: saved.firstUse ?? (document.documentElement.hasAttribute('data-serial-preview') ? 'new' : 'dismissed')
   }
   let snapshot = createQaSnapshot(preferences)
@@ -194,7 +194,7 @@ export function installQaBridge(): boolean {
       const next = { ...snapshot.preferences, ...patch }
       snapshot = { ...snapshot, preferences: next }
       if (demo) {
-        try { window.localStorage.setItem('serial-preview-appearance', JSON.stringify({theme:next.theme, palette:next.palette, terminalFontSize:next.terminalFontSize, firstUse:next.firstUse})) } catch { /* Optional preview storage. */ }
+        try { window.localStorage.setItem('serial-preview-appearance', JSON.stringify({theme:next.theme, palette:next.palette, terminalFontSize:next.terminalFontSize, interfaceFontSize:next.interfaceFontSize, firstUse:next.firstUse})) } catch { /* Optional preview storage. */ }
       }
       publish()
     },

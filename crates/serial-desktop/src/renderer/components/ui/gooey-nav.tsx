@@ -29,7 +29,7 @@ const BAR_TEXT = "text-[#F4F4F9] dark:text-[#262626]";
 
 const SIZES = {
   xs: {
-    label: "gap-1 px-2 py-1.5 text-[11px] leading-4 [&_svg]:size-[11px]",
+    label: "gap-1 px-2 py-1.5 text-[0.6875rem] leading-4 [&_svg]:size-[11px]",
     radius: 8,
     separation: 14,
   },

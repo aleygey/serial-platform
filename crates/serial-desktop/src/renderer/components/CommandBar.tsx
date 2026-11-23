@@ -13,7 +13,7 @@ import {
 interface Props {
   port?: string
   disabled: boolean
-  onSend: (command: string) => Promise<HumanCommandSubmission>
+  onSend: (command: string, keyTime?: number) => Promise<HumanCommandSubmission>
   onSignal?: (signal: 'ctrl_c' | 'ctrl_d') => Promise<HumanCommandSubmission>
   humanHistory?: readonly string[]
   session: PortInput
@@ -136,11 +136,11 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
   const receipt = !buffer.value || receipts[0]?.command === buffer.value ? receipts[0] : undefined
   const sendTone = sending ? 'working' : receipt?.status === 'rejected' ? 'failed' : receipt?.status === 'uncertain' ? 'waiting' : receipt?.status === 'accepted' ? 'done' : undefined
 
-  const submit = async (): Promise<void> => {
+  const submit = async (keyTime?: number): Promise<void> => {
     if (disabled) return
     const command = session.snapshot().buffer.value.replace(/[\r\n]+$/, '')
     setMenu(undefined)
-    await session.submit(command, () => onSend(command), true)
+    await session.submit(command, () => onSend(command, keyTime), true)
   }
 
   const sendSignal = async (signal: 'ctrl_c' | 'ctrl_d'): Promise<void> => {
@@ -222,7 +222,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
             edit(commandBuffer(current.value + suffix))
           } else if (event.key === 'Enter') {
             event.preventDefault()
-            void submit()
+            void submit(event.timeStamp)
           } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
             event.preventDefault()
             openHistory(current)

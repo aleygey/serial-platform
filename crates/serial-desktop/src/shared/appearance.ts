@@ -30,6 +30,13 @@ export type PaletteId = keyof typeof palettes
 export const paletteId = (value: unknown): PaletteId =>
   typeof value === 'string' && Object.hasOwn(palettes, value) ? value as PaletteId : 'harbor'
 
+export const interfaceFontSizes = Array.from({ length: 13 }, (_, index) => 12 + index)
+
+export function interfaceFontSize(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(12, Math.min(24, Math.round(value))) : 16
+}
+
 export const terminalFontSizes = Array.from({ length: 19 }, (_, index) => 10 + index)
 
 export function terminalFontSize(value: unknown): number {

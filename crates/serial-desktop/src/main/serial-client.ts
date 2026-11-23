@@ -7,6 +7,7 @@ import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import { setupChanges, type SetupBrief, type SetupRequest } from '../shared/first-setup'
 import type {
   Actor,
+  InputSendTiming,
   HumanCommandHistory,
   MacroListQuery,
   MacroListResponse,
@@ -32,6 +33,7 @@ import {
   SERIAL_PROTOCOL_VERSION,
   type WireControl
 } from './protocol'
+import { InputTraceTracker } from './input-traces'
 import { ReconnectLoop } from './reconnect-loop'
 import { isApprovalActionable } from '../shared/run-start'
 
@@ -141,6 +143,7 @@ export class HumanCommandOutcomeUncertainError extends Error {
 }
 
 export class SerialClient extends EventEmitter {
+  private readonly inputTraces = new InputTraceTracker()
   readonly endpoint: string
   private status?: StatusResponse
   private availablePorts: PortDescriptor[] = []
@@ -343,11 +346,11 @@ export class SerialClient extends EventEmitter {
     await this.refresh()
   }
 
-  async sendCommand(port: string, command: string): Promise<void> {
+  async sendCommand(port: string, command: string, traceId?: string): Promise<InputSendTiming | undefined> {
     const configured = this.status?.ports.find((item) => item.config.port === port)
     const eol = configured?.effective_write_eol ?? '\r'
     const data = command + eol || '\r'
-    await this.sendHumanBytes(port, Buffer.from(data), { command })
+    return this.sendHumanBytes(port, Buffer.from(data), { command }, traceId)
   }
 
   async sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<void> {
@@ -577,16 +580,18 @@ export class SerialClient extends EventEmitter {
     }
   }
 
-  private async sendHumanBytes(port: string, data: Buffer, input?: { command: string }): Promise<void> {
+  private async sendHumanBytes(port: string, data: Buffer, input?: { command: string }, traceId?: string): Promise<InputSendTiming | undefined> {
     const socket = this.readySocket
     if (!socket || this.socket !== socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('实时连接尚未建立')
     }
     const configured = this.status?.ports.find((item) => item.config.port === port)
     if (!configured) throw new Error(`未找到串口 ${port}`)
+    const sentAt = traceId ? performance.timeOrigin + performance.now() : 0
+    if (traceId) this.inputTraces.start(traceId, configured, sentAt)
     const result = await this.control(buildHumanCommandMessage({
       requestId: randomUUID(),
-      operationId: randomUUID(),
+      operationId: traceId || randomUUID(),
       port,
       expectedGeneration: configured.generation,
       data: data.toString('base64'),
@@ -594,13 +599,19 @@ export class SerialClient extends EventEmitter {
     }), socket, {
       outcomeUncertainOnTransportLoss: true,
       outcomeUncertainErrorCodes: ['write_outcome_uncertain']
+    }).catch(error => {
+      if (traceId) this.inputTraces.cancel(traceId)
+      throw error
     }) as HumanCommandAccepted
+    const timing = traceId ? { sentAt, acceptedAt: performance.timeOrigin + performance.now() } : undefined
     if (result?.type !== 'human_command_accepted') {
+      if (traceId) this.inputTraces.cancel(traceId)
       throw new HumanCommandOutcomeUncertainError('后端返回了未知的人工命令结果')
     }
     if (result.mode === 'cooperative') {
       this.emit('notice', '人工命令已介入 Agent Run；Agent 必须先读取最新串口输出后才能继续。')
     }
+    return timing
   }
 
   async decideRunStart(port: string, approvalId: string, decision: RunStartDecision): Promise<void> {
@@ -647,6 +658,7 @@ export class SerialClient extends EventEmitter {
     const error = new Error('实时连接已关闭')
     if (socket) this.rejectSocketHandshake(socket, error)
     this.rejectPending(error)
+    this.inputTraces.clear()
     this.actor = undefined
   }
 
@@ -884,6 +896,7 @@ export class SerialClient extends EventEmitter {
       return
     }
     if (message.type === 'gap' || message.type === 'lagged') {
+      this.inputTraces.clear(typeof message.port === 'string' ? message.port : undefined)
       this.emit('notice', `${String(message.port)} 的实时记录存在缺口`)
     }
   }
@@ -896,6 +909,8 @@ export class SerialClient extends EventEmitter {
     }
     const last = items.at(-1)
     if (last && last.seq >= event.seq) return
+    if (last && last.seq + 1 < event.seq && !event.replay) this.inputTraces.clear(event.port)
+    const observation = this.inputTraces.observe(event)
     // Only a complete, nonempty human line can change seriald's command history.
     const command = event.metadata.human_line_input
     if (!event.replay && event.kind === 'tx' && event.actor?.kind === 'human' && event.metadata.partial !== true
@@ -909,7 +924,7 @@ export class SerialClient extends EventEmitter {
     if (items.length > 12_000) items.splice(0, items.length - 12_000)
     this.events.set(event.port, items)
     if (!event.replay) this.observeTimelineState(event)
-    this.emit('timeline', event)
+    this.emit('timeline', observation ? { ...event, inputObservation: observation } : event)
   }
 
   // Attach supplies a snapshot, then the live stream carries timeline events.
@@ -1098,6 +1113,7 @@ export class SerialClient extends EventEmitter {
     const error = new Error('配置已更新，正在重建实时连接')
     if (socket) this.rejectSocketHandshake(socket, error)
     this.rejectPending(error)
+    this.inputTraces.clear()
     this.actor = undefined
     try {
       await this.openSocket(this.connectionVersion)
@@ -1115,6 +1131,7 @@ export class SerialClient extends EventEmitter {
     const error = new Error('实时连接中断')
     this.rejectSocketHandshake(socket, error)
     this.rejectPending(error)
+    this.inputTraces.clear()
     this.actor = undefined
     if (wasReady) {
       this.emit('disconnected')

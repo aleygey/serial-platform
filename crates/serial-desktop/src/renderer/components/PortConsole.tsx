@@ -1,4 +1,4 @@
-import { X } from 'lucide-react'
+import { Activity, X } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { PortDragHandle, usePortPointerDrag, type PortDragController } from './PortDrag'
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type SyntheticEvent } from 'react'
@@ -10,7 +10,9 @@ import { ModelIdentityPicker } from './SerialFields'
 import { CommandBar } from './CommandBar'
 import { AgentDock } from './AgentDock'
 import { AgentHistory, macroExecutionLabel, type AgentHistoryView } from './AgentHistory'
-import { TerminalPane } from './TerminalPane'
+import { InputDiagnostics } from '../lib/input-diagnostics'
+import { InputDiagnosticPanel } from './InputDiagnosticPanel'
+import { TerminalPane, type TerminalPaneHandle } from './TerminalPane'
 import { message, withToast, submitHumanCommand, type SetToast } from '../lib/feedback'
 
 const EMPTY_EVENTS: TimelineEvent[] = []
@@ -44,6 +46,15 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
   }, [historyView])
   const [paused, setPaused] = useState(false)
   const frame = useRef<HTMLElement>(null)
+  const terminal = useRef<TerminalPaneHandle>(null)
+  const historyToggle = useRef<HTMLButtonElement>(null)
+  const [diagnostics, setDiagnostics] = useState<InputDiagnostics>()
+  useEffect(() => () => diagnostics?.dispose(), [diagnostics])
+  const collapseHistory = useCallback(() => {
+    setAnimateDrawer(true)
+    historyToggle.current?.focus({ preventScroll: true })
+    setHistoryOpen(false)
+  }, [setHistoryOpen])
   const reduced = useReducedMotion()
   const [savingModel, setSavingModel] = useState(false)
   const panelElements = () => Array.from(frame.current?.closest('.workspace-panels')?.querySelectorAll<HTMLElement>('[data-panel]') ?? [])
@@ -139,7 +150,8 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
   const match = currentSelectedCommand
     ? locateCommandOutput(displayedEvents, currentSelectedCommand)
     : undefined
-  const selectCommand = async (command: AgentCommand): Promise<void> => {
+  const selectCommand = useCallback(async (command: AgentCommand): Promise<void> => {
+    const events = liveEvents.current
     setSelectedCommand(command)
     setCommandEvidence(undefined)
     const load = ++evidenceLoad.current
@@ -167,7 +179,7 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
     } catch (error) {
       if (context === historyContext.current && load === evidenceLoad.current) setToast({ kind: 'error', message: message(error) })
     }
-  }
+  }, [history, commands, agentArchive, selectedPort, configuredPort?.daemon_epoch, configuredPort?.head_seq, setToast])
   const connected = snapshot.connection === 'connected'
   const online = connected && configuredPort?.session_state === 'online'
   const lastOutcome = useMemo(() => lastRunOutcome(historyEvents, configuredPort, history), [historyEvents, history, selectedPort, configuredPort?.daemon_epoch, configuredPort?.generation])
@@ -176,9 +188,6 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
   const outcome = !runId && (endedCurrentRun || ['idle', 'local', 'agent'].includes(activity.phase)) ? lastOutcome : undefined
   const showHistory = !!(runId || history.some(item => item.kind === 'run'))
   const historyOpen = drawerPreference ?? showHistory
-  useEffect(() => {
-    if (drawerPreference === undefined && showHistory) setHistoryOpen(true)
-  }, [drawerPreference, showHistory, setHistoryOpen])
   const currentStep = useMemo(() => {
     if (!runId || !configuredPort) return
     let latest: { actionId: string; description: string; command?: AgentCommand; macro?: MacroExecution; seq: number } | undefined
@@ -194,6 +203,21 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
   }, [history, runId, configuredPort?.daemon_epoch, configuredPort?.generation])
   const currentCommand = currentStep?.command
   const macroState = currentStep?.macro && currentStep.macro.status !== 'running' ? macroExecutionLabel(currentStep.macro) : undefined
+  const clearHistory = useCallback(async (ids?: string[]) => {
+    if (!selectedPort) return
+    const context = historyContext.current
+    const visibility = await window.serial.clearAgentHistory(selectedPort, ids)
+    if (context !== historyContext.current) return
+    for (const id of visibility.hidden) historyLoad.current.delete(id)
+    setAgentArchive((current) => current ? { ...current, visibility } : {
+      server_id: snapshot.serverId ?? '', runs: [], visibility, truncated: false, indexing: false
+    })
+    setAgentArchiveEvents(current => Object.fromEntries(Object.entries(current).filter(([id]) => !visibility.hidden.includes(id))))
+    setSelectedCommand(undefined)
+    evidenceLoad.current++
+    setCommandEvidence(undefined)
+    setToast({ kind: 'notice', message: 'Agent 历史已清理；原始串口日志和人工历史保留。' })
+  }, [selectedPort, snapshot.serverId, setToast])
   const focusPort = (event: SyntheticEvent) => {
     if (!(event.target instanceof Element) || !event.target.closest('.channel-close')) onFocus()
   }
@@ -204,7 +228,9 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
     initial={!reduced && animateEntry ? { scale:0.96, opacity:0.76 } : false} animate={{ scale:1, opacity:1 }}
     transition={reduced ? {duration:0} : {type:'spring', stiffness:420, damping:32, layout: { type: 'spring', stiffness: 490, damping: 39 } }}>
     <div className="console-stack channel-body">
-      <TerminalPane paused={paused} active={active} configuredPort={configuredPort} events={displayedEvents} commands={commands} currentCommand={currentCommand}
+      <TerminalPane ref={terminal} diagnostics={diagnostics}
+        diagnosticPanel={diagnostics && <InputDiagnosticPanel recorder={diagnostics} port={selectedPort} historyCount={events.length} />}
+        paused={paused} active={active} configuredPort={configuredPort} events={displayedEvents} commands={commands} currentCommand={currentCommand}
         heading={<div className="channel-name" {...headingDrag}>
           <ModelIdentityPicker label={`切换 ${selectedPort} 机型`} families={snapshot.modelFamilies} family={configuredPort?.config.model_family}
             name={configuredPort?.config.model_name} disabled={!connected || !configuredPort || savingModel}
@@ -223,44 +249,39 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
               moveTo(panels[index + direction])
             }}>{selectedPort}</PortDragHandle> : selectedPort}</h2>
         </div>}
-        actions={<button className="channel-close" type="button" aria-label={`关闭 ${selectedPort} 分栏`} title="关闭分栏" onClick={onClose}><X size={15} /></button>}
+        actions={<><button className="terminal-find-trigger diagnostic-trigger" type="button" aria-label="输入诊断" aria-expanded={!!diagnostics}
+          title="输入诊断" onClick={() => setDiagnostics(current => current ? undefined : new InputDiagnostics())}><Activity size={15} aria-hidden /></button>
+          <button className="channel-close" type="button" aria-label={`关闭 ${selectedPort} 分栏`} title="关闭分栏" onClick={onClose}><X size={15} /></button></>}
         selectedCommand={currentSelectedCommand} match={match} onClearCommand={clearCommand} />
     </div>
     <section className="command-history-dock" aria-label={selectedPort + ' 执行历史'}>
       <div id={historyId} className="history-drawer" data-animate={animateDrawer || undefined} data-open={!!historyOpen} inert={!historyOpen} aria-hidden={!historyOpen}>
         <div className="history-drawer-clip">
           {(historyOpen || drawerPreference !== undefined) && <AgentHistory view={historyView} visible={historyOpen} items={history} paused={paused} activeRunId={runId} currentActionId={currentStep?.actionId} currentCommand={currentCommand}
-          selectedCommand={currentSelectedCommand} onSelect={(command) => void selectCommand(command)}
+          selectedCommand={currentSelectedCommand} onSelect={selectCommand} onCollapse={collapseHistory}
           onExpandRun={loadRun}
-          onClear={async (ids) => {
-            if (!selectedPort) return
-            const context = historyContext.current
-            const visibility = await window.serial.clearAgentHistory(selectedPort, ids)
-            if (context !== historyContext.current) return
-            for (const id of visibility.hidden) historyLoad.current.delete(id)
-            setAgentArchive((current) => current ? { ...current, visibility } : {
-              server_id: snapshot.serverId ?? '', runs: [], visibility, truncated: false, indexing: false
-            })
-            setAgentArchiveEvents(current => Object.fromEntries(Object.entries(current).filter(([id]) => !visibility.hidden.includes(id))))
-            setSelectedCommand(undefined)
-            evidenceLoad.current++
-            setCommandEvidence(undefined)
-            setToast({ kind: 'notice', message: 'Agent 历史已清理；原始串口日志和人工历史保留。' })
-          }} />}
+          onClear={clearHistory} />}
         </div>
       </div>
       <AgentDock port={selectedPort} activity={activity} orbColor={activity.agentOwned ? colors.accent : colors.output} command={currentCommand}
         outcome={outcome ?? (macroState && { ...macroState, label: currentStep!.description + macroState.label })}
 
         action={currentStep?.description}
-        expanded={historyOpen} historyId={historyId} onToggleHistory={() => { setAnimateDrawer(true); setHistoryOpen(!historyOpen) }}
+        toggleRef={historyToggle} expanded={historyOpen} historyId={historyId} onToggleHistory={() => { setAnimateDrawer(true); setHistoryOpen(!historyOpen) }}
         paused={paused} onToggleMotion={() => setPaused(!paused)} />
     </section>
     <CommandBar port={selectedPort} paused={paused} session={session} active={active} humanHistory={humanHistory}
       disabled={!activity.canWrite}
       placeholder={!online ? '打开串口后可发送命令' : !activity.canWrite ? '等待串口控制权释放' : '输入命令…'}
       onQueryHistory={async (query, contains) => (await window.serial.queryHumanHistory(query, contains)).entries.map((entry) => entry.command)}
-      onSend={(command) => submitHumanCommand(() => window.serial.sendCommand(selectedPort, command), setToast)}
+      onSend={async (command, keyTime) => {
+        const id = diagnostics?.begin(command, keyTime)
+        const pending = submitHumanCommand(() => window.serial.sendCommand(selectedPort, command, id), setToast)
+        terminal.current?.returnToLive()
+        const result = await pending
+        if (id) diagnostics?.finish(id, result)
+        return result
+      }}
       onSignal={(signal) => submitHumanCommand(() => window.serial.sendSignal(selectedPort, signal), setToast)} />
   </motion.article>
 }
