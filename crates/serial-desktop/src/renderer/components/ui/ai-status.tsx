@@ -150,7 +150,7 @@ function AiStatus({
             data-state={state}
             data-active={active || undefined}
             role="status"
-            className={cn('flex h-8 w-fit items-center gap-2 font-runde text-[14px] text-black dark:text-white', className)}
+            className={cn('flex h-8 w-fit items-center gap-2 font-runde text-[0.875rem] text-black dark:text-white', className)}
             {...props}
         >
             {icon !== false && <span data-slot="ai-status-icon" className="relative flex size-5 shrink-0 items-center justify-center">

@@ -6942,13 +6942,13 @@ fn run_windows_port_reader(
             }
         };
         if available == 0 {
-            let sleep = flush_deadline
-                .map(|deadline: Instant| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(WINDOWS_PORT_POLL_INTERVAL)
-                .min(WINDOWS_PORT_POLL_INTERVAL);
-            if !sleep.is_zero() {
-                std::thread::sleep(sleep);
+            // The driver queue is drained. Deliver a short reply before
+            // sleeping: waiting for a second Windows timer tick here delays
+            // interactive prompts even when all of their bytes are available.
+            if flush_deadline.take().is_some() {
+                enqueue_rx(&events, &mut pending, &mut dropped_bytes);
             }
+            std::thread::sleep(WINDOWS_PORT_POLL_INTERVAL);
             continue;
         }
 

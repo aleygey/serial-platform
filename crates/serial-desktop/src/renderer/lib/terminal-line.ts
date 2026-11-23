@@ -3,12 +3,14 @@
 export class TerminalLine {
   private line = ''
   private cursor = 0
-  private escape = ''
+  private control: 'text' | 'escape' | 'intermediate' | 'csi' | 'string' | 'stringEscape' = 'text'
+  private parameters = ''
 
   reset(): void {
     this.line = ''
     this.cursor = 0
-    this.escape = ''
+    this.control = 'text'
+    this.parameters = ''
   }
 
   retain(length: number): void {
@@ -20,7 +22,7 @@ export class TerminalLine {
   }
 
   write(raw: string): { remove: number; text: string } {
-    if (!this.escape && this.cursor === this.line.length && !/[\x00-\x08\x0a-\x1f\x7f]/.test(raw)) {
+    if (this.control === 'text' && this.cursor === this.line.length && !/[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(raw)) {
       this.line += raw
       this.cursor += raw.length
       return { remove: 0, text: raw }
@@ -35,10 +37,53 @@ export class TerminalLine {
       this.line = this.line.slice(0, this.cursor) + ' '.repeat(gap) + text + this.line.slice(this.cursor + text.length)
       this.cursor += text.length
     }
-    const input = this.escape + raw
-    this.escape = ''
+    const input = raw
     for (let i = 0; i < input.length;) {
       const char = input[i++]
+      if (this.control === 'string' || this.control === 'stringEscape') {
+        if (char === '\x07' || char === '\x9c' || char === '\x18' || char === '\x1a' ||
+            (this.control === 'stringEscape' && char === '\\')) this.control = 'text'
+        else this.control = char === '\x1b' ? 'stringEscape' : 'string'
+        continue
+      }
+      if (char === '\x1b') { this.control = 'escape'; continue }
+      if (char === '\x18' || char === '\x1a') { this.control = 'text'; continue }
+      if (char === '\x9b' || (this.control === 'escape' && char === '[')) {
+        this.control = 'csi'
+        this.parameters = ''
+        continue
+      }
+      // OSC, DCS, SOS, PM and APC are not printable text. Consume their
+      // payload up to BEL or ST, including when the terminator spans packets.
+      if ('\x90\x98\x9d\x9e\x9f'.includes(char) || (this.control === 'escape' && 'P]X^_'.includes(char))) {
+        this.control = 'string'
+        continue
+      }
+      if (this.control === 'escape' || this.control === 'intermediate') {
+        this.control = char >= ' ' && char <= '/' ? 'intermediate' : 'text'
+        continue
+      }
+      if (this.control === 'csi') {
+        if (char >= ' ' && char <= '?') {
+          if (this.parameters.length < 64) this.parameters += char
+          continue
+        }
+        if (char < '@' || char > '~') continue
+        this.control = 'text'
+        const amount = Math.min(16384, parseInt(this.parameters, 10) || 0)
+        if (char === 'G') this.cursor = Math.max(0, amount - 1)
+        else if (char === 'C') this.cursor = Math.min(this.line.length + 16384, this.cursor + (amount || 1))
+        else if (char === 'D') this.cursor = Math.max(0, this.cursor - (amount || 1))
+        else if (char === 'K' && amount <= 2) {
+          if (amount === 0) { markEdit(this.cursor); this.line = this.line.slice(0, this.cursor) }
+          else if (amount === 1) {
+            markEdit(0)
+            const end = Math.min(this.line.length, this.cursor + 1)
+            this.line = ' '.repeat(end) + this.line.slice(end)
+          } else { markEdit(0); this.line = '' }
+        }
+        continue
+      }
       if (char === '\r') { this.cursor = 0; continue }
       if (char === '\n') {
         finished += this.line + '\n'
@@ -53,34 +98,9 @@ export class TerminalLine {
         }
         continue
       }
-      if (char === '\x1b') {
-        const begin = i - 1
-        if (i === input.length) { this.escape = char; break }
-        if (input[i++] !== '[') continue
-        const params = i
-        while (i < input.length && input.charCodeAt(i) >= 0x20 && input.charCodeAt(i) <= 0x3f) i++
-        if (i === input.length) {
-          if (i - begin <= 64) this.escape = input.slice(begin)
-          break
-        }
-        const amount = Math.min(16384, parseInt(input.slice(params, i), 10) || 0)
-        const op = input[i++]
-        if (op === 'G') this.cursor = Math.max(0, amount - 1)
-        else if (op === 'C') this.cursor = Math.min(this.line.length + 16384, this.cursor + (amount || 1))
-        else if (op === 'D') this.cursor = Math.max(0, this.cursor - (amount || 1))
-        else if (op === 'K' && amount <= 2) {
-          if (amount === 0) { markEdit(this.cursor); this.line = this.line.slice(0, this.cursor) }
-          else if (amount === 1) {
-            markEdit(0)
-            const end = Math.min(this.line.length, this.cursor + 1)
-            this.line = ' '.repeat(end) + this.line.slice(end)
-          } else { markEdit(0); this.line = '' }
-        }
-        continue
-      }
-      if (char < ' ' && char !== '\t') { writeText('�'); continue }
+      if ((char < ' ' && char !== '\t') || (char >= '\x80' && char <= '\x9f')) continue
       const begin = i - 1
-      while (i < input.length && (input[i] >= ' ' && input[i] !== '\x7f' || input[i] === '\t')) i++
+      while (i < input.length && ((input[i] >= ' ' && input[i] < '\x7f') || input[i] > '\x9f' || input[i] === '\t')) i++
       writeText(input.slice(begin, i))
     }
     return { remove: originalLength - unchanged, text: (finished + this.line).slice(unchanged) }

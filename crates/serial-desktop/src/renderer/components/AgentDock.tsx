@@ -1,3 +1,4 @@
+import { ChevronUp } from 'lucide-react'
 import { commandState, type ExecutionState, type portActivity } from '../lib/console-workspace'
 import { displayCommand, type AgentCommand } from '../lib/history'
 import { useReducedMotion } from '../lib/use-reduced-motion'
@@ -11,6 +12,7 @@ interface Props {
   command?: AgentCommand
   action?: string
   outcome?: ExecutionState
+  toggleRef?: React.Ref<HTMLButtonElement>
   expanded: boolean
   historyId: string
   onToggleHistory: () => void
@@ -18,7 +20,7 @@ interface Props {
   onToggleMotion: () => void
 }
 
-export function AgentDock({ port, orbColor, activity, command, action, outcome, expanded, historyId, onToggleHistory, paused, onToggleMotion }: Props) {
+export function AgentDock({ port, orbColor, activity, command, action, outcome, toggleRef, expanded, historyId, onToggleHistory, paused, onToggleMotion }: Props) {
   const reduced = useReducedMotion()
   const current = command && (displayCommand(command.text) || 'Enter')
   const state = command && commandState(command, true)
@@ -35,11 +37,12 @@ export function AgentDock({ port, orbColor, activity, command, action, outcome, 
       <MatrixOrb aria-hidden size={30} dots={7} state={activity.agentOwned ? 'thinking' : 'idle'}
         paused={paused || reduced || !activity.agentOwned} color={orbColor} />
     </button>
-    <button className="history-toggle" type="button" aria-expanded={expanded} aria-controls={historyId}
+    <button ref={toggleRef} className="history-toggle" type="button" aria-expanded={expanded} aria-controls={historyId}
       aria-label={toggleLabel} title={toggleLabel} onClick={onToggleHistory}>
       <span className={command && !outcome ? 'live-command command-ink' : 'live-phase command-ink'} data-tone={status.tone} title={detail}>
         {reduced || paused ? status.label : <TextEffect key={status.label} as="span" per="line" preset="fade" speedSegment={1.5}>{status.label}</TextEffect>}
       </span>
+      <ChevronUp className="drawer-chevron" size={14} aria-hidden />
     </button>
 
     <span className="sr-only" role="status">{status.label}</span>

@@ -37,14 +37,14 @@ export function decodeFrame(data: Buffer): DecodedFrame {
     kind: 'timeline',
     event: normalizeTimelineEvent({
       ...header,
-      text: data.subarray(payloadStart).toString('utf8'),
       direction: tag === RX ? 'rx' : 'tx'
-    })
+    }, data.subarray(payloadStart))
   }
 }
 
-export function normalizeTimelineEvent(raw: Record<string, unknown>): TimelineEvent {
-  const encoded = typeof raw.data === 'string' ? raw.data : undefined
+export function normalizeTimelineEvent(raw: Record<string, unknown>, payload?: Buffer): TimelineEvent {
+  const bytes = payload ?? (typeof raw.data === 'string' ? Buffer.from(raw.data, 'base64') : undefined)
+  const text = bytes ? bytes.toString('utf8') : typeof raw.text === 'string' ? raw.text : ''
   return {
     port: String(raw.port ?? ''),
     daemon_epoch: String(raw.daemon_epoch ?? ''),
@@ -58,12 +58,8 @@ export function normalizeTimelineEvent(raw: Record<string, unknown>): TimelineEv
     operation_id: raw.operation_id ? String(raw.operation_id) : null,
     stream_offset_start: optionalNumber(raw.stream_offset_start),
     stream_offset_end: optionalNumber(raw.stream_offset_end),
-    text:
-      typeof raw.text === 'string'
-        ? raw.text
-        : encoded
-          ? Buffer.from(encoded, 'base64').toString('utf8')
-          : '',
+    text,
+    ...(raw.direction === 'rx' && bytes && text.includes('\uFFFD') ? { rxBytes: Uint8Array.from(bytes) } : {}),
     metadata: (raw.metadata as Record<string, unknown>) ?? {},
     durable: Boolean(raw.durable),
     replay: Boolean(raw.replay)

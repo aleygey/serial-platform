@@ -288,3 +288,30 @@ it('preserves CRLF, backspace and split ANSI erase-to-end while keeping prior li
   index.search('xy\nready')
   expect(index.matchCount).toBe(1)
 })
+
+it('consumes control strings split between RX frames without printing diamonds or prompt metadata', () => {
+  const index = new TerminalDocumentIndex()
+  const parts = ['root# \x00\x07\x11\x13\x1b]0;title', '\x1b', '\\', '\x1bPprivate sequence', '\x1b\\', '\x1b(Br', '\r\nnext# �']
+  index.sync(parts.map((part, i) => rx(i + 1, part)))
+  expect(index.chunks.map(chunk => chunk.text).join('')).toBe('root# r\nnext# �')
+})
+
+it('streams split UTF-8 for live and archived events and never joins bytes across a port gap', async () => {
+  const { normalizeTimelineEvent } = await import('../../main/protocol')
+  const base = rx(1, '')
+  const frame = (seq: number, bytes: number[], start: number) => normalizeTimelineEvent({
+    ...base, seq, data: Buffer.from(bytes).toString('base64'), stream_offset_start: start, stream_offset_end: start + bytes.length
+  })
+  const events = [frame(1, [0xe4], 0), frame(2, [0xb8, 0xad, 0xf0], 1), frame(3, [0x9f, 0x99, 0x82], 4),
+    frame(4, [0x20, 0xe4], 7), frame(5, [0xb8, 0xad], 10), frame(6, [0xff, 0x21], 12)]
+  for (const replay of [false, true]) {
+    const index = new TerminalDocumentIndex()
+    const rows = events.map(event => ({ ...event, replay }))
+    if (replay) index.sync(rows)
+    else for (let i = 1; i <= rows.length; i++) index.sync(rows.slice(0, i))
+    const rendered = index.chunks.map(chunk => chunk.text).join('')
+    expect(rendered).toBe('中🙂 ���!')
+    index.search('中🙂')
+    expect(index.matchCount).toBe(1)
+  }
+})

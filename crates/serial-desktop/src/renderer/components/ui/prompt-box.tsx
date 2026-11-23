@@ -399,7 +399,7 @@ function PromptBox({
                                 animate={{ opacity: 1 }}
                                 exit={{ opacity: 0, transition: INSTANT }}
                                 transition={reduced ? INSTANT : { duration: 0.2, delay: ghost ? 0.25 : 0 }}
-                                className="pointer-events-none absolute inset-x-0 top-0 grid text-[15px] leading-6 text-[#868593]"
+                                className="pointer-events-none absolute inset-x-0 top-0 grid text-[0.9375rem] leading-6 text-[#868593]"
                             >
                                 <AnimatePresence initial={false} mode="popLayout">
                                     <motion.span
@@ -441,7 +441,7 @@ function PromptBox({
                         }}
                         style={{ ...inputProps?.style, height: LINE }}
                         className={cn(
-                            'relative block w-full resize-none break-words bg-transparent text-[15px] leading-6 outline-none [scrollbar-width:thin] disabled:cursor-not-allowed',
+                            'relative block w-full resize-none break-words bg-transparent text-[0.9375rem] leading-6 outline-none [scrollbar-width:thin] disabled:cursor-not-allowed',
                             inputProps?.className,
                         )}
                     />
@@ -461,7 +461,7 @@ function PromptBox({
                         }}
                     >
                         <div
-                            className="whitespace-pre-wrap break-words text-[15px] leading-6"
+                            className="whitespace-pre-wrap break-words text-[0.9375rem] leading-6"
                             style={{ marginTop: -ghost.scroll, width: ghost.width || undefined }}
                         >
                             {flyWords
@@ -489,7 +489,7 @@ function PromptBox({
                 <span aria-live="polite" className="sr-only">
                     {charging ? effort.label : ''}
                 </span>
-                <span aria-hidden className="relative grid text-[13px] font-medium whitespace-nowrap">
+                <span aria-hidden className="relative grid text-[0.8125rem] font-medium whitespace-nowrap">
                     {/* the span collapses once its only child pops out, so a left anchor would fling the exit over the button */}
                     <AnimatePresence initial={false} mode="popLayout" anchorX="right">
                         {charging ? (

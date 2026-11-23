@@ -1,5 +1,5 @@
-import { Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { ChevronDown, Trash2 } from 'lucide-react'
+import { memo, useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { useReducedMotion } from 'motion/react'
 import { Disclosure, DisclosureContent } from './ui/disclosure'
 import { RailToc } from './ui/rail-toc'
@@ -25,10 +25,11 @@ interface Props {
   selectedCommand?: AgentCommand
   onSelect: (command: AgentCommand) => void
   onExpandRun: (runId: string) => Promise<void>
+  onCollapse: () => void
   onClear: (runIds?: string[]) => Promise<void>
 }
 
-export function AgentHistory({ view, visible, items, paused, activeRunId, currentActionId, currentCommand, selectedCommand, onSelect, onExpandRun, onClear }: Props): React.JSX.Element {
+export const AgentHistory = memo(function AgentHistory({ view, visible, items, paused, activeRunId, currentActionId, currentCommand, selectedCommand, onSelect, onExpandRun, onClear, onCollapse }: Props): React.JSX.Element {
   const scope = useId()
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
@@ -168,7 +169,8 @@ export function AgentHistory({ view, visible, items, paused, activeRunId, curren
         event.preventDefault(); void clear(event.ctrlKey ? '*' : selectedRun!)
       } else if (event.key !== 'Delete') setPendingDelete(undefined)
     }}>
-      <div className="history-heading"><strong>Agent 执行历史</strong>
+      <div className="history-heading"><button className="history-collapse" type="button" onClick={onCollapse}
+        aria-label="收起 Agent 执行历史"><strong>Agent 执行历史</strong><ChevronDown size={14} aria-hidden /></button>
         <button className="history-clear" type="button" disabled={busy || !runs.some(run => run.status !== 'running')}
           onClick={() => void clear('*')} aria-label="清空已结束的 Agent Run" title="清理已结束的 Run"><Trash2 size={13} /></button>
       </div>
@@ -211,7 +213,7 @@ export function AgentHistory({ view, visible, items, paused, activeRunId, curren
       </div>
     </aside>
   )
-}
+})
 
 function OutlineBranch({ id, open, reduced, children }: { id: string; open: boolean; reduced: boolean; children: ReactNode }) {
   return <div id={id} inert={!open} className="outline-disclosure">

@@ -183,8 +183,8 @@ export function App(): React.JSX.Element {
   }, [scope, selectedPort, setupOpen, snapshot?.preferences.selectedPort, snapshot?.preferences.firstUse])
 
   useLayoutEffect(() => {
-    applyAppearance(mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize)
-  }, [mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize])
+    applyAppearance(mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize, snapshot?.preferences.interfaceFontSize)
+  }, [mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize, snapshot?.preferences.interfaceFontSize])
 
   useEffect(() => {
     if (!toast) return

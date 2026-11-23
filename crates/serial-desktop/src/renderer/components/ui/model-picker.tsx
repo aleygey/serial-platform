@@ -461,7 +461,7 @@ function ModelPicker({
                 onClick={() => (open ? close(selectedId, 'pointer') : show())}
                 onKeyDown={onTriggerKey}
                 className={cn(
-                    'flex h-8 cursor-pointer items-center gap-2 rounded-full pr-2 pl-2.5 text-[13px] font-medium text-black/90 outline-none transition-colors hover:bg-black/[0.05] focus-visible:ring-2 focus-visible:ring-black/15 dark:text-white/90 dark:hover:bg-white/[0.07] dark:focus-visible:ring-white/25',
+                    'flex h-8 cursor-pointer items-center gap-2 rounded-full pr-2 pl-2.5 text-[0.8125rem] font-medium text-black/90 outline-none transition-colors hover:bg-black/[0.05] focus-visible:ring-2 focus-visible:ring-black/15 dark:text-white/90 dark:hover:bg-white/[0.07] dark:focus-visible:ring-white/25',
                 )}
             >
                 <span ref={triggerIconRef} className="picker-value">{compact ? null : renderValue ? renderValue(selected) : <RollingText text={selected.name} roll={roll} />}</span>
@@ -508,7 +508,7 @@ function ModelPicker({
                                     aria-controls={listId}
                                     aria-activedescendant={current ? `${id}-option-${active}` : undefined}
                                     aria-label={'搜索' + label}
-                                    className="h-full min-w-0 flex-1 bg-transparent text-[13px] text-black outline-none placeholder:text-black/35 dark:text-white dark:placeholder:text-white/35"
+                                    className="h-full min-w-0 flex-1 bg-transparent text-[0.8125rem] text-black outline-none placeholder:text-black/35 dark:text-white dark:placeholder:text-white/35"
                                 />
                             </div>
                         )}
@@ -538,7 +538,7 @@ function ModelPicker({
                             {groups.map((group, g) => (
                                 <div key={`${group.provider ?? ''}-${g}`} role="group" aria-label={group.provider} data-model-results={browseFamilies && !!group.provider || undefined}>
                                     {group.provider && (!browseFamilies || !!query.trim()) && (
-                                        <div className="px-2.5 pt-2 pb-1 text-[11px] font-medium text-black/35 dark:text-white/35">
+                                        <div className="px-2.5 pt-2 pb-1 text-[0.6875rem] font-medium text-black/35 dark:text-white/35">
                                             {browseFamilies && <small>系列</small>}{group.provider}
                                         </div>
                                     )}
@@ -557,7 +557,7 @@ function ModelPicker({
                                                 onMouseDown={(event) => event.preventDefault()}
                                                 onClick={() => choose(model, 'pointer')}
                                                 className={cn(
-                                                    'relative flex h-9 cursor-pointer items-center gap-2.5 rounded-[10px] px-2.5 text-[13px] font-medium transition-colors',
+                                                    'relative flex h-9 cursor-pointer items-center gap-2.5 rounded-[10px] px-2.5 text-[0.8125rem] font-medium transition-colors',
                                                     i === active || model.id === foldTo
                                                         ? 'text-black/90 dark:text-white/90'
                                                         : 'text-black/65 dark:text-white/65',
@@ -579,7 +579,7 @@ function ModelPicker({
                                 </div>
                             ))}
                             {!filtered.length && (
-                                <div className="px-2.5 py-6 text-center text-[13px] text-black/40 dark:text-white/40">
+                                <div className="px-2.5 py-6 text-center text-[0.8125rem] text-black/40 dark:text-white/40">
                                     没有匹配项
                                 </div>
                             )}

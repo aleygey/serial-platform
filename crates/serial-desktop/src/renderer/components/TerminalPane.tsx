@@ -1,6 +1,7 @@
 import { ArrowDown, ChevronDown, ChevronUp, Search, X } from 'lucide-react'
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { PortSnapshot, TimelineEvent } from '../../shared/contracts'
+import type { InputDiagnostics } from '../lib/input-diagnostics'
 import type { AgentCommand, MatchRange } from '../lib/history'
 import { commandEchoStyles, type EchoStyle } from '../lib/command-echo'
 import { InlineTextEffect } from './ui/text-effect'
@@ -13,7 +14,12 @@ import {
   type TerminalFindHit
 } from '../lib/terminal-find'
 
+export interface TerminalPaneHandle { returnToLive(): void }
+
 interface Props {
+  ref?: React.Ref<TerminalPaneHandle>
+  diagnostics?: InputDiagnostics
+  diagnosticPanel?: React.ReactNode
   commands?: AgentCommand[]
   currentCommand?: AgentCommand
   heading?: React.ReactNode
@@ -29,11 +35,12 @@ interface Props {
 
 const WINDOW_CHUNKS = 320
 const TEXT_BLOCK = 128
+const DETAIL_BLOCK = 16
 
 const NO_COMMANDS: AgentCommand[] = []
 const NO_FIND_HITS: readonly TerminalFindHit[] = Object.freeze([])
 
-export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS, currentCommand, heading, actions, paused, active = true, configuredPort, events, selectedCommand, match, onClearCommand }: Props): React.JSX.Element {
+export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagnosticPanel, commands = NO_COMMANDS, currentCommand, heading, actions, paused, active = true, configuredPort, events, selectedCommand, match, onClearCommand }: Props): React.JSX.Element {
   const reduced = useReducedMotion()
   const scrollRef = useRef<HTMLDivElement>(null)
   const findInputRef = useRef<HTMLInputElement>(null)
@@ -52,6 +59,8 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   if (initialStream.current.epoch !== configuredPort?.daemon_epoch) initialStream.current = { epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 }
   const chunks = terminalDocument.chunks
   const echoes = useMemo(() => commandEchoStyles(events, key => terminalDocument.textFor(key), commands, currentCommand), [events, terminalDocument, commands, currentCommand])
+  const echoBlocks = useMemo(() => new Set([...echoes.keys()].map(key => Math.floor(Number(key.slice(key.lastIndexOf(':') + 1)) / DETAIL_BLOCK))), [echoes])
+  const renderedBlocks = useRef(new WeakMap<TerminalDocumentChunk, { last: TerminalDocumentChunk; className?: string; element: React.ReactElement }>())
   const total = terminalDocument.matchCount
   const highlighted = terminalDocument.highlightedMatchCount
   const current = terminalDocument.activeIndex < 0 ? 0 : terminalDocument.activeIndex + 1
@@ -60,6 +69,22 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   const target = findOpen && activeId ? activeId : selectedCommand ? selectedCommand.daemonEpoch + ':' + selectedCommand.firstSeq : ''
   const [anchor, setAnchor] = useState<{ seq?: number; target: string }>()
   const scrollAnchor = useRef<{ seq: number; offset: number; top: number } | null>(null)
+  const returnToLive = useCallback(() => {
+    if (follow && !manualScroll.current && !selectedCommand && !findOpen) return
+    manualScroll.current = false
+    scrollAnchor.current = null
+    setAnchor(undefined)
+    setFindOpen(false)
+    if (selectedCommand) onClearCommand()
+    if (follow) {
+      const view = scrollRef.current
+      if (view) view.scrollTop = view.scrollHeight
+    } else setFollow(true)
+  }, [follow, selectedCommand, findOpen, onClearCommand])
+  useImperativeHandle(ref, () => ({ returnToLive }), [returnToLive])
+  useLayoutEffect(() => {
+    diagnostics?.committed(events, [configuredPort?.effective_shell_prompt, configuredPort?.effective_uboot_prompt], key => terminalDocument.textFor(key))
+  }, [events, diagnostics, terminalDocument, configuredPort?.effective_shell_prompt, configuredPort?.effective_uboot_prompt])
   const textCache = useRef(new WeakMap<TerminalDocumentChunk, { last: TerminalDocumentChunk; text: string }>())
   const pinned = anchor?.target === target
   const range = pinned ? undefined : findOpen && activeId ? terminalDocument.activeChunkRange : selectedCommand
@@ -72,7 +97,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   // the whole retained document. Only the viewport needs per-event markup.
   function renderText(from: number, until: number, detailed = false) {
     const blocks: React.ReactNode[] = []
-    const width = detailed ? 16 : TEXT_BLOCK
+    const width = detailed ? DETAIL_BLOCK : TEXT_BLOCK
     for (let i = from; i < until;) {
       const first = chunks[i]
       const nextBucket = (Math.floor(first.seq / width) + 1) * width
@@ -83,7 +108,14 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
       const completeLines = (i === 0 || chunks[i - 1].text.endsWith('\n')) && last.text.endsWith('\n')
       const className = completeLines ? 'terminal-lines' : undefined
       if (detailed) {
-        blocks.push(<span key={'detail:' + first.key} className={className}>{chunks.slice(i, stop).map(chunk => (
+        const reusable = !findOpen && !selectedCommand && !echoBlocks.has(Math.floor(first.seq / width))
+        const cached = reusable ? renderedBlocks.current.get(first) : undefined
+        if (cached && cached.last === last && cached.className === className) {
+          blocks.push(cached.element)
+          i = stop
+          continue
+        }
+        const element = <span key={'detail:' + first.key} className={className}>{chunks.slice(i, stop).map(chunk => (
           <TerminalChunkText
             reveal={echoes.has(chunk.key) && !paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
             commandMatched={commandRangeIncludes(match, chunk)}
@@ -92,7 +124,9 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
             hits={findOpen ? terminalDocument.hitsFor(chunk) : NO_FIND_HITS}
             key={chunk.key}
           />
-        ))}</span>)
+        ))}</span>
+        if (reusable) renderedBlocks.current.set(first, { last, className, element })
+        blocks.push(element)
       } else {
         let block = textCache.current.get(first)
         if (block?.last !== last) {
@@ -261,6 +295,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
           {actions}
         </div>
       </header>
+      {diagnosticPanel}
       {findOpen && (
         <TerminalFindWidget
           current={current}
@@ -334,7 +369,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
         )}
       </div>
       {(!follow || selectedCommand) && (
-        <button className="return-live" type="button" onClick={() => { manualScroll.current = false; scrollAnchor.current = null; setAnchor({ target: findOpen && activeId ? activeId : '' }); setFollow(true); onClearCommand() }}>
+        <button className="return-live" type="button" onClick={returnToLive}>
           <ArrowDown size={14} /> 返回最新
         </button>
       )}

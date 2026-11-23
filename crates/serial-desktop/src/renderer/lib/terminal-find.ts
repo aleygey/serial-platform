@@ -86,6 +86,8 @@ export class TerminalDocumentIndex {
   private readonly chunksByKey = new Map<string, TerminalDocumentChunk>()
   private nextAbsolute = 0
   private readonly line = new TerminalLine()
+  private decoder?: TextDecoder
+  private rxEnd?: number
   private lineEpoch?: string
   private lineGeneration?: number
   private queryValue = ''
@@ -239,6 +241,8 @@ export class TerminalDocumentIndex {
     this.chunksByKey.clear()
     this.nextAbsolute = 0
     this.line.reset()
+    this.decoder = undefined
+    this.rxEnd = undefined
     this.lineEpoch = undefined
     this.source = events
     this.statsValue.rebuilds += 1
@@ -284,13 +288,26 @@ export class TerminalDocumentIndex {
   }
 
   private appendChunk(event: TimelineEvent): number {
-    if (event.kind === 'gap' || this.lineEpoch !== event.daemon_epoch || this.lineGeneration !== event.generation) {
+    if (event.kind === 'gap' || event.kind === 'serial_closed' || this.lineEpoch !== event.daemon_epoch ||
+        this.lineGeneration !== event.generation || (event.direction === 'rx' && this.rxEnd !== undefined &&
+        event.stream_offset_start != null && event.stream_offset_start !== this.rxEnd)) {
       this.line.reset()
+      this.decoder = undefined
+      this.rxEnd = undefined
       this.lineEpoch = event.daemon_epoch
       this.lineGeneration = event.generation
     }
     if (event.direction !== 'rx') return this.nextAbsolute
-    const { remove, text } = this.line.write(event.text)
+    this.rxEnd = event.stream_offset_end ?? undefined
+    let decoded = event.text
+    if (event.rxBytes) {
+      this.decoder ??= new TextDecoder('utf-8', { ignoreBOM: true })
+      decoded = this.decoder.decode(event.rxBytes, { stream: true })
+    } else if (this.decoder && decoded) {
+      decoded = this.decoder.decode() + decoded
+      this.decoder = undefined
+    }
+    const { remove, text } = this.line.write(decoded)
     this.nextAbsolute -= remove
     if (remove) {
       let tail = this.chunksValue.at(-1)
