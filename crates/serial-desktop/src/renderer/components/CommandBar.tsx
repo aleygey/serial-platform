@@ -110,7 +110,9 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
   useLayoutEffect(() => {
     if (!selectionPending.current || !inputRef.current) return
     selectionPending.current = false
-    inputRef.current.setSelectionRange(buffer.start, buffer.end)
+    if (inputRef.current.selectionStart !== buffer.start || inputRef.current.selectionEnd !== buffer.end) {
+      inputRef.current.setSelectionRange(buffer.start, buffer.end)
+    }
     setScrollLeft(inputRef.current.scrollLeft)
   }, [buffer])
 
@@ -190,7 +192,8 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
         disabled={disabled}
         onChange={(event) => {
           const target = event.target
-          edit({ value: target.value, start: target.selectionStart ?? target.value.length, end: target.selectionEnd ?? target.value.length })
+          session.edit({ value: target.value, start: target.selectionStart ?? target.value.length, end: target.selectionEnd ?? target.value.length })
+          setHistoryCursor(undefined)
           setMenu(undefined)
         }}
         onSelect={(event) => {
@@ -238,7 +241,6 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
           }
         }}
         placeholder={placeholder}
-        readOnly={sending}
         ref={inputRef}
         value={buffer.value}
       />

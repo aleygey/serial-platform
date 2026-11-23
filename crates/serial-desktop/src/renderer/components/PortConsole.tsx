@@ -1,6 +1,6 @@
 import { X } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
-import { PortDragHandle, type PortDragController } from './PortDrag'
+import { PortDragHandle, usePortPointerDrag, type PortDragController } from './PortDrag'
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 import type { AgentHistoryResponse, DesktopSnapshot, TimelineEvent } from '../../shared/contracts'
 import { locateCommandOutput, mergeAgentHistory, type AgentCommand } from '../lib/history'
@@ -26,21 +26,21 @@ interface Props {
   humanHistory: string[]
   onFocus: () => void
   dragController: PortDragController
-  lifted: boolean
+  swapTarget: boolean
   animateEntry: boolean
   onReorder: (target: string) => void
   onClose: () => void
   setToast: SetToast
 }
 
-export function PortConsole({ snapshot, colors, selectedPort, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, lifted, animateEntry, setToast }: Props): React.JSX.Element {
-  const replay = typeof window !== 'undefined' && selectedPort === 'COM7' ? window.serial?.replaySampleRun : undefined
+export function PortConsole({ snapshot, colors, selectedPort, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
+  const headingDrag = usePortPointerDrag(selectedPort, split ? dragController : undefined)
+  const [animateDrawer, setAnimateDrawer] = useState(false)
   const [drawerPreference, setDrawerPreference] = useState(historyView.expanded)
   const setHistoryOpen = useCallback((open: boolean) => {
     historyView.expanded = open
     setDrawerPreference(open)
   }, [historyView])
-  const [replayTake, setReplayTake] = useState(0)
   const [paused, setPaused] = useState(false)
   const frame = useRef<HTMLElement>(null)
   const reduced = useReducedMotion()
@@ -83,7 +83,7 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
     }
     void refresh()
     return () => { cancelled = true; historyContext.current = ''; evidenceLoad.current++; historyLoad.current.clear(); if (timer) clearTimeout(timer) }
-  }, [selectedPort, snapshot?.serverId, replayTake])
+  }, [selectedPort, snapshot?.serverId])
 
   const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
   const events = snapshot.events[selectedPort] ?? EMPTY_EVENTS
@@ -168,7 +168,7 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
   const endedCurrentRun = !!activity.run && lastOutcome?.runId === activity.run.id
   const runId = endedCurrentRun ? undefined : activity.run?.id
   const outcome = !runId && (endedCurrentRun || ['idle', 'local', 'agent'].includes(activity.phase)) ? lastOutcome : undefined
-  const showHistory = !!(runId || history.some(item => item.kind === 'run') || (replay && document.documentElement.dataset.serialFocus === 'agent'))
+  const showHistory = !!(runId || history.some(item => item.kind === 'run'))
   const historyOpen = drawerPreference ?? showHistory
   useEffect(() => {
     if (drawerPreference === undefined && showHistory) setHistoryOpen(true)
@@ -192,13 +192,13 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
   }
 
   return <motion.article className={`port-console ${active ? 'is-active' : ''}`} aria-label={`${selectedPort} 控制台`} data-port={selectedPort}
-    data-motion={paused ? 'paused' : undefined} data-lifted={lifted || undefined} ref={frame}
+    data-motion={paused ? 'paused' : undefined} data-swap-target={swapTarget || undefined} ref={frame}
     onPointerDownCapture={focusPort} onFocusCapture={focusPort} layout={reduced ? false : 'position'}
     initial={!reduced && animateEntry ? { scale:0.96, opacity:0.76 } : false} animate={{ scale:1, opacity:1 }}
     transition={reduced ? {duration:0} : {type:'spring', stiffness:420, damping:32, layout: { type: 'spring', stiffness: 490, damping: 39 } }}>
     <div className="console-stack channel-body">
       <TerminalPane paused={paused} active={active} configuredPort={configuredPort} events={displayedEvents} commands={commands} currentCommand={currentCommand}
-        heading={<div className="channel-name">
+        heading={<div className="channel-name" {...headingDrag}>
           <ModelIdentityPicker label={`切换 ${selectedPort} 机型`} families={snapshot.modelFamilies} family={configuredPort?.config.model_family}
             name={configuredPort?.config.model_name} disabled={!connected || !configuredPort || savingModel}
             onChange={async (family, name) => {
@@ -206,7 +206,7 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
               try { await withToast(() => window.serial.setPortModel(selectedPort, family, name, snapshot.configRevision), setToast, false) }
               finally { setSavingModel(false) }
             }} />
-          <h2>{split ? <PortDragHandle className="pane-grip" port={selectedPort} controller={dragController} aria-label={`移动 ${selectedPort} 分栏`} title="拖动交换分栏，或按左右方向键"
+          <h2>{split ? <PortDragHandle keyboardOnly className="pane-grip" port={selectedPort} controller={dragController} aria-label={`移动 ${selectedPort} 分栏`} title="拖动交换分栏，或按左右方向键"
             onKeyDown={event => {
               const direction = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0
               if (!direction) return
@@ -220,9 +220,9 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
         selectedCommand={currentSelectedCommand} match={match} onClearCommand={clearCommand} />
     </div>
     <section className="command-history-dock" aria-label={selectedPort + ' 执行历史'}>
-      <div id={historyId} className="history-drawer" data-open={!!historyOpen} inert={!historyOpen} aria-hidden={!historyOpen}>
+      <div id={historyId} className="history-drawer" data-animate={animateDrawer || undefined} data-open={!!historyOpen} inert={!historyOpen} aria-hidden={!historyOpen}>
         <div className="history-drawer-clip">
-          {(historyOpen || drawerPreference !== undefined) && <AgentHistory key={replayTake} view={historyView} visible={historyOpen} items={history} paused={paused} activeRunId={runId} currentActionId={currentStep?.actionId} currentCommand={currentCommand}
+          {(historyOpen || drawerPreference !== undefined) && <AgentHistory view={historyView} visible={historyOpen} items={history} paused={paused} activeRunId={runId} currentActionId={currentStep?.actionId} currentCommand={currentCommand}
           selectedCommand={currentSelectedCommand} onSelect={(command) => void selectCommand(command)}
           onExpandRun={loadRun}
           onClear={async (ids) => {
@@ -243,9 +243,9 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
         </div>
       </div>
       <AgentDock port={selectedPort} activity={activity} orbColor={activity.agentOwned ? colors.accent : colors.output} command={currentCommand} outcome={outcome}
-        onReplay={replay && (() => { historyView.rows = {}; setHistoryOpen(true); setPaused(false); clearCommand(); setReplayTake(take => take + 1); replay() })}
+
         action={currentStep?.description}
-        expanded={historyOpen} historyId={historyId} onToggleHistory={() => setHistoryOpen(!historyOpen)}
+        expanded={historyOpen} historyId={historyId} onToggleHistory={() => { setAnimateDrawer(true); setHistoryOpen(!historyOpen) }}
         paused={paused} onToggleMotion={() => setPaused(!paused)} />
     </section>
     <CommandBar port={selectedPort} paused={paused} session={session} active={active} humanHistory={humanHistory}

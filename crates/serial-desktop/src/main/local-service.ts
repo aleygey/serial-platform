@@ -12,6 +12,15 @@ import {
 } from './service-command'
 import { stopManagedChild } from './managed-child'
 
+const startupMessages: Record<string, string> = {
+  'loading configuration': '正在读取串口配置…',
+  'binding service address': '正在打开本地服务地址…',
+  'recovering serial journals': '正在恢复串口日志…',
+  'initializing port registry': '正在初始化串口…',
+  'loading automation state': '正在读取自动化任务记录…',
+  'starting HTTP service': '正在连接本地服务…'
+}
+
 interface Program {
   path: string
   args: string[]
@@ -21,10 +30,11 @@ export class LocalService {
   private child?: ChildProcess
   private current: ServiceState = { owned: false, status: 'stopped' }
   private stderrTail = ''
+  private stage?: string
   private startupFailureValue?: Error
   private readonly onState: (state: ServiceState) => void
 
-  constructor(onState: (state: ServiceState) => void) {
+  constructor(onState: (state: ServiceState) => void, private readonly onProgress?: (message: string) => void) {
     this.onState = onState
   }
 
@@ -36,6 +46,7 @@ export class LocalService {
     if (this.child) return
     const program = await this.resolveProgram()
     this.stderrTail = ''
+    this.stage = undefined
     this.startupFailureValue = undefined
     this.update({ owned: true, status: 'starting', program: program.path })
     const child = spawn(program.path, buildSpawnArgs(program.args, endpoint), {
@@ -46,7 +57,14 @@ export class LocalService {
     this.child = child
     child.stderr?.setEncoding('utf8')
     child.stderr?.on('data', (chunk: string) => {
+      if (this.child !== child) return
       this.stderrTail = `${this.stderrTail}${chunk}`.slice(-16 * 1024)
+      if (this.current.status !== 'starting') return
+      const stage = Array.from(this.stderrTail.matchAll(/seriald startup: ([^\r\n(]+) \(\d+ ms\)/g)).at(-1)?.[1]
+      if (stage && stage !== this.stage) {
+        this.stage = stage
+        if (startupMessages[stage]) this.onProgress?.(startupMessages[stage])
+      }
     })
     child.once('exit', (code, signal) => {
       if (this.child !== child) return
@@ -77,6 +95,7 @@ export class LocalService {
             resolve(stdout)
             return
           }
+          if (error.killed && this.current.status === 'starting') { resolve(''); return }
           const detail = stderr.trim() || error.message
           reject(new Error(`无法发现当前 seriald：${detail}`))
         }
@@ -87,6 +106,10 @@ export class LocalService {
 
   startupFailure(): Error | undefined {
     return this.startupFailureValue
+  }
+
+  startupStage(): string | undefined {
+    return this.stage
   }
 
   startingPid(): number | undefined {

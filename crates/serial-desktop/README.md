@@ -10,9 +10,9 @@ Serial Platform Desktop 是 Electron + React 桌面客户端。它与 TUI 使用
 
 外部 Agent 通过 Serial MCP 取得串口控制权时，Matrix Orb 亮起。每栏输入框上方显示当前命令的描述，例如「Agent 正在读取固件版本」。任务结束时显示本轮任务名和结果，例如「读取传感器状态已完成」。首次收到 Run 时自动展开可滚动的历史，箭头沿动作和命令依次推进。已执行的步骤保持展开，手动收起的历史或动作会在切换页面后保留。选中历史命令可定位到原始串口输出。[Agent 接入说明](../../adapters/README.md)
 
-运行 `npm run preview:browser` 可生成 `qa/browser-preview/index.html`。直接用浏览器打开即可操作模拟串口、观察示例 Run 的进度，并切换外观。Electron 应用使用相同的 React 页面和桌面通信接口。
+运行 `npm run preview:browser` 可生成 `qa/browser-preview/index.html`。直接用浏览器打开即可操作模拟串口、调整分栏和外观。Electron 应用使用相同的 React 页面和桌面通信接口。
 
-浏览器示例的 COM7 输入框上方有「回放示例」，可重复观看接管、Run 启动、命令等待回显及归还控制权。桌面端从「配置 → 应用 → 观看 Agent 运行示例」或空的 Agent 历史打开独立模拟窗口。
+桌面端在对应串口输入栏上方显示外部 Agent 通过 MCP 发起的任务和命令历史。拖动分栏标题可交换位置，拖动左侧设备可调整顺序或添加分栏。在「配置 → 应用 → 外观」设置终端字号。
 
 首次使用桌面客户端时，向导会询问串口、Shell 提示符和健康检查需求。提示符示意使用 Animata 的 Typing Text。把向导生成的任务交给已接入 Serial MCP 的外部 Agent，查看返回的方案并确认保存，即可运行一次心跳或状态检查。已有工作区可在「配置 → 应用 → 打开首次配置向导」进入。[配置邀请契约](../../docs/MCP_TOOLS.md#首次配置邀请)
 

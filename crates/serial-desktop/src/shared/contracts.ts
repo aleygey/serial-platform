@@ -248,6 +248,7 @@ export interface DesktopPreferences {
   endpoint: string
   autoStartLocal: boolean
   theme: ThemePreference
+  terminalFontSize?: number
   palette?: PaletteId
   selectedPort?: string
   firstUse?: 'new' | 'dismissed' | 'complete'
@@ -289,8 +290,6 @@ export interface SerialConfigurationDraft {
 }
 
 export interface DesktopBridge {
-  replaySampleRun?: () => void
-  openRunExample?: () => Promise<void>
   createSetup(brief: SetupBrief): Promise<SetupRequest>
   readSetup(id: string): Promise<SetupRequest>
   applySetup(id: string, revision: number): Promise<MacroDefinition>
@@ -322,6 +321,7 @@ export interface DesktopBridge {
 export type DesktopEvent =
   | { type: 'snapshot'; snapshot: DesktopSnapshot }
   | { type: 'timeline'; event: TimelineEvent }
+  | { type: 'timeline-batch'; events: TimelineEvent[] }
   | { type: 'macro'; execution: MacroExecution }
   | { type: 'connection'; state: ConnectionState; message: string }
   | { type: 'service'; service: ServiceState }

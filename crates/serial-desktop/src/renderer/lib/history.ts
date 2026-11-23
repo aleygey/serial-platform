@@ -206,7 +206,11 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
 }
 
 export function mergeAgentHistory(events: TimelineEvent[], persisted?: AgentHistoryResponse, activeRun?: AgentHistoryResponse['runs'][number]['run']): AgentHistoryItem[] {
-  const unique = new Map(events.map((event) => [`${event.daemon_epoch}:${event.seq}`, event]))
+  const unique = new Map<string, TimelineEvent>()
+  for (const event of events) {
+    if (event.kind === 'rx' && event.direction === 'rx' && !(event.actor?.kind === 'agent' && event.metadata.trigger_id)) continue
+    unique.set(`${event.daemon_epoch}:${event.seq}`, event)
+  }
   const hidden = new Set(persisted?.visibility.hidden ?? [])
   const items = buildAgentHistory([...unique.values()].filter((event) => !event.run_id || !hidden.has(event.run_id)))
   const runs = items.filter((item): item is Extract<AgentHistoryItem, { kind: 'run' }> => item.kind === 'run')

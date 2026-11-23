@@ -9,7 +9,6 @@ import type {
 } from '../shared/contracts'
 
 const bridge: DesktopBridge = {
-  openRunExample: () => ipcRenderer.invoke('serial:open-run-example'),
   createSetup: brief => ipcRenderer.invoke('serial:setup-create', brief),
   readSetup: id => ipcRenderer.invoke('serial:setup-read', id),
   applySetup: (id, revision) => ipcRenderer.invoke('serial:setup-apply', id, revision),

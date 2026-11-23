@@ -5,6 +5,8 @@ import { BounceSidebar } from './ui/bounce-sidebar'
 import type { PortDescriptor, PortSnapshot } from '../../shared/contracts'
 
 interface Props {
+  ports?: string[]
+  onSwap?: (port: string, target: string) => void
   configuredPorts: PortSnapshot[]
   availablePorts: PortDescriptor[]
   selectedPort?: string
@@ -17,8 +19,8 @@ interface Props {
 }
 
 export function PortRail({ configuredPorts, availablePorts, selectedPort, connected = true, endpoint,
-  onSelect, drag, onRefresh, onToggle }: Props): React.JSX.Element {
-  const ports = [...new Set([...configuredPorts.map((item) => item.config.port), ...availablePorts.map((port) => port.name)])]
+  onSelect, drag, onRefresh, onToggle, ports: orderedPorts, onSwap }: Props): React.JSX.Element {
+  const ports = orderedPorts ?? [...new Set([...configuredPorts.map((item) => item.config.port), ...availablePorts.map((port) => port.name)])]
   return <WorkspaceSidebar className="device-rail" title="串口设备" count={ports.length} actions={
       <button type="button" title="刷新设备列表" aria-label="刷新设备列表" onClick={onRefresh}><RefreshCw size={15} /></button>}>
     <div className="devices-list">
@@ -31,8 +33,12 @@ export function PortRail({ configuredPorts, availablePorts, selectedPort, connec
         const present = connected && (configured?.endpoint_present ?? !!descriptor)
         const selected = selectedPort === port
         const label = online ? '在线' : !present ? '离线' : configured?.session_state === 'opening' ? '连接中' : '待连接'
-        return <div className={`device-row ${selected ? 'is-selected' : ''}`} key={port}>
-          <PortDragHandle {...button} className={button.className + ' device-choice'} port={port} controller={drag} aria-pressed={selected} title={port + ' · ' + label + ' · 拖入分栏（键盘用空格拾取）'}>
+        return <div data-device-port={port} data-swap-target={drag?.drag?.railTarget === port && drag.drag.port !== port || undefined} className={`device-row ${selected ? 'is-selected' : ''}`} key={port}>
+          <PortDragHandle {...button} className={button.className + ' device-choice'} port={port} controller={drag} aria-pressed={selected} onKeyDown={event => {
+              if (!event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return
+              const target = ports[index + (event.key === 'ArrowUp' ? -1 : 1)]
+              if (target) { event.preventDefault(); onSwap?.(port, target) }
+            }} title={port + ' · ' + label + ' · 拖入分栏（键盘用空格拾取）'}>
             <span className="device-copy"><strong>{port}</strong><small>{configured?.config.model_name || descriptor?.product || '未配置机型'}</small>
               </span>
           </PortDragHandle>

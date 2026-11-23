@@ -1,5 +1,5 @@
 import { ArrowDown, ChevronDown, ChevronUp, Search, X } from 'lucide-react'
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { PortSnapshot, TimelineEvent } from '../../shared/contracts'
 import type { AgentCommand, MatchRange } from '../lib/history'
 import { commandEchoStyles, type EchoStyle } from '../lib/command-echo'
@@ -26,6 +26,17 @@ interface Props {
   onClearCommand: () => void
 }
 
+const WINDOW_CHUNKS = 320
+function chunkIndex(chunks: readonly TerminalDocumentChunk[], seq: number): number {
+  let lo = 0, hi = chunks.length
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2)
+    if (chunks[mid].seq < seq) lo = mid + 1
+    else hi = mid
+  }
+  return lo
+}
+
 const NO_COMMANDS: AgentCommand[] = []
 const NO_FIND_HITS: readonly TerminalFindHit[] = Object.freeze([])
 
@@ -40,6 +51,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   terminalDocument.sync(events)
 
   const [follow, setFollow] = useState(true)
+  const manualScroll = useRef(false)
   const [findOpen, setFindOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [, setNavigationRevision] = useState(0)
@@ -51,6 +63,36 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   const highlighted = terminalDocument.highlightedMatchCount
   const current = terminalDocument.activeIndex < 0 ? 0 : terminalDocument.activeIndex + 1
   const activeId = terminalDocument.activeId
+
+  const target = findOpen && activeId ? activeId : selectedCommand ? selectedCommand.daemonEpoch + ':' + selectedCommand.firstSeq : ''
+  const [anchor, setAnchor] = useState<{ seq?: number; target: string }>()
+  const scrollAnchor = useRef<{ seq: number; top: number } | null>(null)
+  const pinned = anchor?.target === target
+  const range = pinned ? undefined : findOpen && activeId ? terminalDocument.activeChunkRange : selectedCommand
+    ? { first: match?.fromSeq ?? selectedCommand.firstSeq, last: match?.fromSeq ?? selectedCommand.firstSeq } : undefined
+  const tailStart = Math.max(0, chunks.length - WINDOW_CHUNKS)
+  const start = pinned && anchor.seq !== undefined ? Math.min(tailStart, chunkIndex(chunks, anchor.seq)) :
+    range ? Math.max(0, Math.min(tailStart, chunkIndex(chunks, range.first) - Math.floor(WINDOW_CHUNKS / 2))) : tailStart
+  const end = Math.min(chunks.length, Math.max(start + WINDOW_CHUNKS, range ? chunkIndex(chunks, range.last) + 1 : 0))
+  const visible = chunks.slice(start, end)
+
+  const page = (direction: number) => {
+    const next = Math.min(tailStart, Math.max(0, start + direction * (WINDOW_CHUNKS / 2)))
+    if (next === start) return
+    const retained = chunks[Math.max(next, start)]
+    const node = scrollRef.current?.querySelector<HTMLElement>(`[data-seq="${retained.seq}"]`)
+    if (node) scrollAnchor.current = { seq: retained.seq, top: node.getBoundingClientRect().top }
+    setFollow(false)
+    setAnchor({ seq: chunks[next].seq, target })
+  }
+  useLayoutEffect(() => {
+    const saved = scrollAnchor.current
+    if (!saved) return
+    scrollAnchor.current = null
+    const view = scrollRef.current
+    const row = view?.querySelector<HTMLElement>(`[data-seq="${saved.seq}"]`)
+    if (view && row) view.scrollTop += row.getBoundingClientRect().top - saved.top
+  }, [start, anchor])
 
   const openFind = useCallback((): void => {
     if (!findOpen) {
@@ -98,9 +140,22 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
     }
   }, [commandAnchor])
 
-  useEffect(() => {
-    if (follow) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+  useLayoutEffect(() => {
+    if (follow) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'instant' })
   }, [chunks.at(-1)?.key, follow])
+
+  const hasOutput = chunks.length > 0
+  useEffect(() => {
+    const view = scrollRef.current
+    const output = view?.querySelector('pre')
+    if (!follow || !view || !output) return
+    const observer = new ResizeObserver(() => {
+      if (!manualScroll.current) view.scrollTop = view.scrollHeight
+    })
+    observer.observe(view)
+    observer.observe(output)
+    return () => observer.disconnect()
+  }, [follow, hasOutput])
 
   useEffect(() => {
     if (findOpen && activeId) {
@@ -185,20 +240,38 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
         className="terminal-scroll"
         ref={scrollRef}
         tabIndex={-1}
+        onPointerDown={() => { manualScroll.current = true }}
+        onKeyDown={event => {
+          if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key)) manualScroll.current = true
+        }}
+        onWheel={event => {
+          manualScroll.current = true
+          const view = event.currentTarget
+          if (event.deltaY < 0 && view.scrollTop < 48) page(-1)
+          else if (event.deltaY > 0 && view.scrollHeight - view.scrollTop - view.clientHeight < 48) page(1)
+        }}
         onScroll={(event) => {
           const element = event.currentTarget
-          setFollow(element.scrollHeight - element.scrollTop - element.clientHeight < 36)
+          const atEnd = end === chunks.length && element.scrollHeight - element.scrollTop - element.clientHeight < 36
+          if (follow && !manualScroll.current) return
+          if (atEnd) manualScroll.current = false
+          setFollow(atEnd)
+          if (!target && chunks[start]) {
+            if (atEnd && anchor?.seq !== undefined) setAnchor(undefined)
+            else if (!atEnd && anchor?.seq === undefined) setAnchor({ seq: chunks[start].seq, target })
+          }
         }}
       >
+        {start > 0 && <button type="button" className="terminal-page" onClick={() => page(-1)}>较早的输出</button>}
         {chunks.length === 0 ? (
           <div className="empty-state terminal-empty">
             <strong>{configuredPort?.session_state === 'online' ? '等待设备输出' : configuredPort?.session_state === 'opening' ? '正在打开串口' : configuredPort?.session_state === 'waiting_for_port' ? '等待设备接入' : '串口未打开'}</strong>
           </div>
         ) : (
           <pre className="terminal-output" aria-label="串口输出" onDoubleClick={selectTerminalWord}>
-            {chunks.map((chunk) => (
+            {visible.map((chunk) => (
               <TerminalChunkText
-                reveal={!paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
+                reveal={echoes.has(chunk.key) && !paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
                 commandMatched={commandRangeIncludes(match, chunk)}
                 echoLength={echoes.get(chunk.key)?.length ?? 0} echoTone={echoes.get(chunk.key)?.tone}
                 chunk={chunk}
@@ -208,9 +281,10 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
             ))}
           </pre>
         )}
+        {end < chunks.length && <button type="button" className="terminal-page" onClick={() => page(1)}>较新的输出</button>}
       </div>
       {(!follow || selectedCommand) && (
-        <button className="return-live" type="button" onClick={() => { setFollow(true); onClearCommand() }}>
+        <button className="return-live" type="button" onClick={() => { manualScroll.current = false; setAnchor({ target: findOpen && activeId ? activeId : '' }); setFollow(true); onClearCommand() }}>
           <ArrowDown size={14} /> 返回最新
         </button>
       )}

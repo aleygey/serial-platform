@@ -169,8 +169,6 @@ export function AgentHistory({ view, visible, items, paused, activeRunId, curren
       <div className="agent-scroll" ref={scroll} onWheel={() => { follow.current = false }} onTouchStart={() => { follow.current = false }}
         onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) follow.current = false }} tabIndex={0} role="region" aria-label="命令历史">
         {!items.length && <div className="empty-state compact">暂无 Agent 执行记录
-          {typeof window !== 'undefined' && window.serial?.openRunExample && <button className="setup-reopen" type="button"
-            onClick={() => void window.serial.openRunExample!().catch(error => setNotice(String(error)))}>观看 Agent 运行示例</button>}
         </div>}
         {runs.map(run => {
           const id = run.id.slice(4)

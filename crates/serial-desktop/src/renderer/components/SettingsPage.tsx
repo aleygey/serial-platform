@@ -7,7 +7,7 @@ import { ModelPicker } from './ui/model-picker'
 import { TransitionPanel } from './ui/transition-panel'
 import { WorkspaceSidebar } from './WorkspaceSidebar'
 import { DEFAULT_THEMES, ThemeSelector } from './ui/theme-selector'
-import { palettes, paletteId } from '../../shared/appearance'
+import { palettes, paletteId, terminalFontSize, terminalFontSizes } from '../../shared/appearance'
 import { useAppearanceMode } from '../lib/appearance'
 import type {
   DesktopPreferences,
@@ -34,7 +34,6 @@ interface Props {
   onSaveModelFamilies: (families: ModelFamily[]) => Promise<boolean>
   onSavePreferences: (preferences: DesktopPreferences) => Promise<void>
   onOpenSetup?: () => void
-  onOpenRunExample?: () => void
 }
 
 const sections = [
@@ -115,7 +114,7 @@ export function SettingsPage(props: Props): React.JSX.Element {
               if (await props.onSaveModelFamilies(families)) saveNotice()
             }} />
             <div className="editor-shell"><div className="editor-heading"><h1>应用</h1></div>
-              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} onOpenSetup={props.onOpenSetup} onOpenRunExample={props.onOpenRunExample} />
+              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} onOpenSetup={props.onOpenSetup} />
             </div>
           </TransitionPanel>
         </section>
@@ -336,17 +335,17 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
         {family ? (
           <div className="config-section">
             <div className="profile-form-header"><div className="form-section-title"><strong>系列</strong></div><button
-              aria-label={`删除一级机型 ${family.name}`}
+              aria-label={`删除机型系列 ${family.name}`}
               className="danger-icon"
               disabled={policy.deleteDisabled}
               type="button"
-              title={policy.deleteDisabled ? '请先在串口配置中改绑机型' : '删除一级机型'}
+              title={policy.deleteDisabled ? '请先在串口配置中改绑机型' : '删除机型系列'}
               onClick={() => { setItems((current) => current.filter((_, index) => index !== selected)); setSelected((current) => Math.max(0, current - 1)) }}
             ><Trash2 size={16} /></button></div>
             <Field label="系列名称"><input readOnly={policy.nameReadOnly} value={family.name} onChange={(event) => update('name', event.target.value)} placeholder="例如 TL-AS7230" /></Field>
             <div className="model-name-editor">
               <div className="model-name-heading">
-                <div><strong>系列中的型号</strong></div>
+                <div><strong>{family.name ? family.name + ' 的具体型号' : '具体型号'}</strong></div>
                 <button type="button" onClick={() => update('model_names', [...family.model_names, nextConcreteModelName(family.model_names)])}><Plus size={14} /> 添加具体型号</button>
               </div>
               {family.model_names.map((name, index) => {
@@ -354,7 +353,7 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
                 const bound = boundPorts.length > 0
                 return (
                   <div className="model-name-row" key={index}>
-                    <input aria-label={`二级具体型号 ${index + 1}`} readOnly={bound} value={name} onChange={(event) => update('model_names', family.model_names.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} />
+                    <input aria-label={`具体型号 ${index + 1}`} readOnly={bound} value={name} onChange={(event) => update('model_names', family.model_names.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} />
                     <button aria-label={`删除具体型号 ${name}`} disabled={bound} type="button" onClick={() => update('model_names', family.model_names.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={14} /></button>
                   </div>
                 )
@@ -369,7 +368,7 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
   )
 }
 
-function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup, onOpenRunExample }: Pick<Props, 'preferences' | 'serviceControls' | 'onOpenSetup' | 'onOpenRunExample'> & { onSave: (preferences: DesktopPreferences) => Promise<void> }): React.JSX.Element {
+function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup }: Pick<Props, 'preferences' | 'serviceControls' | 'onOpenSetup'> & { onSave: (preferences: DesktopPreferences) => Promise<void> }): React.JSX.Element {
   const [value, setValue] = useState(preferences)
   useConfigurationChange(preferences, setValue)
   const mode = useAppearanceMode(value.theme)
@@ -388,6 +387,11 @@ function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup
         }} />
         <ThemeSelector aria-label="主题配色" themes={colors} value={paletteId(value.palette)} onChange={id => {
           const next = { ...value, palette:paletteId(id) }
+          setValue(next)
+          void onSave(next)
+        }} />
+        <SerialNumberField label="终端字号（px）" choices={terminalFontSizes} value={terminalFontSize(value.terminalFontSize)} onChange={size => {
+          const next = { ...value, terminalFontSize: size }
           setValue(next)
           void onSave(next)
         }} />
@@ -410,7 +414,7 @@ function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup
         <span className="switch-control" />
       </label>
       {onOpenSetup && <button className="setup-reopen" type="button" onClick={onOpenSetup}>打开首次配置向导</button>}
-      {onOpenRunExample && <button className="setup-reopen" type="button" onClick={onOpenRunExample}>观看 Agent 运行示例</button>}
+
     </div>
   )
 }
@@ -494,15 +498,15 @@ export function validateModelProfileCatalog(profiles: ModelProfile[], configured
 export function validateModelFamilyCatalog(families: ModelFamily[], configuredPorts: PortSnapshot[]): string | undefined {
   const familyNames = new Set<string>()
   for (const family of families) {
-    if (!family.name.trim()) return '一级机型名称不能为空。'
-    if (family.name !== family.name.trim()) return `一级机型“${family.name}”首尾不能有空格。`
-    if (familyNames.has(family.name)) return `一级机型名称“${family.name}”重复。`
+    if (!family.name.trim()) return '机型系列名称不能为空。'
+    if (family.name !== family.name.trim()) return `机型系列“${family.name}”首尾不能有空格。`
+    if (familyNames.has(family.name)) return `机型系列名称“${family.name}”重复。`
     familyNames.add(family.name)
     const modelNames = new Set<string>()
     for (const name of family.model_names) {
-      if (!name.trim()) return `一级机型“${family.name}”包含空的具体型号。`
+      if (!name.trim()) return `机型系列“${family.name}”包含空的具体型号。`
       if (name !== name.trim()) return `具体型号“${name}”首尾不能有空格。`
-      if (modelNames.has(name)) return `一级机型“${family.name}”中的具体型号“${name}”重复。`
+      if (modelNames.has(name)) return `机型系列“${family.name}”中的具体型号“${name}”重复。`
       modelNames.add(name)
     }
   }

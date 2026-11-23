@@ -53,13 +53,22 @@ export function App(): React.JSX.Element {
   const sessions = useMemo(() => new Map<string, { input: PortInput; history: AgentHistoryView }>(), [scope])
   const knownPorts = useMemo(() => [...new Set([...(snapshot?.configuredPorts ?? []).map((port) => port.config.port), ...(snapshot?.availablePorts ?? []).map((port) => port.name)])], [snapshot?.configuredPorts, snapshot?.availablePorts])
   const humanHistory = useMemo(() => snapshot?.humanHistory?.entries.map((item) => item.command) ?? [], [snapshot?.humanHistory])
+  const [railOrder, setRailOrder] = useState<{ scope: string; ports: string[] }>()
+  const railPorts = railOrder?.scope === scope
+    ? [...railOrder.ports.filter(port => knownPorts.includes(port)), ...knownPorts.filter(port => !railOrder.ports.includes(port))] : knownPorts
+  const swapRailPorts = (port: string, target: string) => {
+    const next = reorderPane({ ports: railPorts }, port, target)
+    if (next.ports !== railPorts) setRailOrder({ scope, ports: next.ports })
+  }
   const drag = usePortDrag(deckRef, (port, slot) => {
     if (!knownPorts.includes(port)) return
     keepEmpty.current = false
-    const next = insertPane(layout, port, slot)
+    const from = layout.ports.indexOf(port)
+    const target = layout.ports[from < slot ? slot - 1 : slot]
+    const next = from < 0 ? insertPane(layout, port, slot) : { ...reorderPane(layout, port, target), active: port }
     pendingWidths.current = dockedWidths(next.ports, groupRef.current?.getLayout() ?? {})
     setLayout(next)
-  })
+  }, swapRailPorts)
   useEffect(() => { drag.cancel() }, [page, scope, drag.cancel])
 
   useLayoutEffect(() => {
@@ -92,7 +101,7 @@ export function App(): React.JSX.Element {
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
     if (event.type === 'macro') setMacroExecution(event.execution)
-    if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'connection' || event.type === 'service') {
+    if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'timeline-batch' || event.type === 'connection' || event.type === 'service') {
       setSnapshot((current) => mergeDesktopSnapshotEvent(current, event))
     }
     if (event.type === 'connection') {
@@ -111,7 +120,10 @@ export function App(): React.JSX.Element {
     let cancelled = false
     const buffered: DesktopEvent[] = []
     const unsubscribe = window.serial.onEvent((event) => {
-      if (buffering) buffered.push(event)
+      if (buffering) {
+        if (event.type === 'connection') setLoadingMessage(event.message)
+        buffered.push(event)
+      }
       else applyEvent(event)
     })
     window.serial.bootstrap().then((value) => {
@@ -171,8 +183,8 @@ export function App(): React.JSX.Element {
   }, [scope, selectedPort, setupOpen, snapshot?.preferences.selectedPort, snapshot?.preferences.firstUse])
 
   useLayoutEffect(() => {
-    applyAppearance(mode, snapshot?.preferences.palette)
-  }, [mode, snapshot?.preferences.palette])
+    applyAppearance(mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize)
+  }, [mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize])
 
   useEffect(() => {
     if (!toast) return
@@ -254,7 +266,8 @@ export function App(): React.JSX.Element {
 
   const slot = drag.drag?.index
   const from = drag.drag ? layout.ports.indexOf(drag.drag.port) : -1
-  const inserting = slot != null && (from < 0 || (slot !== from && slot !== from + 1))
+  const inserting = slot != null && from < 0
+  const swapTarget = slot != null && from >= 0 ? layout.ports[from < slot ? slot - 1 : slot] : undefined
   const draggedPort = drag.drag?.port
   const dockPreview = draggedPort ? {
     port: draggedPort,
@@ -278,9 +291,6 @@ export function App(): React.JSX.Element {
     setSetupOpen(false); setPage(nextPage)
     if (complete && preferences.setupTask?.port && knownPorts.includes(preferences.setupTask.port)) {
       selectPort(preferences.setupTask.port)
-    } else if (nextPage === 'console' && window.serial.replaySampleRun && !complete) {
-      selectPort('COM7')
-      window.serial.replaySampleRun()
     }
   }
   return (
@@ -289,7 +299,7 @@ export function App(): React.JSX.Element {
       {showSetup ? <FirstUseSetup key={scope} snapshot={snapshot} execution={macroExecution} onExecution={setMacroExecution} onLeave={leaveSetup} /> : page === 'settings' ? (
         <SettingsPage
           onOpenSetup={()=>setSetupOpen(true)}
-          onOpenRunExample={window.serial.openRunExample && (()=>void withToast(()=>window.serial.openRunExample!(),setToast,false))}
+
           serviceControls={<BackendControls snapshot={snapshot} onStartBackend={startBackend} onStopBackend={stopBackend} />}
           configuredPorts={snapshot.configuredPorts}
           availablePorts={snapshot.availablePorts}
@@ -310,7 +320,7 @@ export function App(): React.JSX.Element {
         <MacroPage events={snapshot.events} ports={snapshot.configuredPorts} modelFamilies={snapshot.modelFamilies} connected={snapshot.connection === 'connected'} selectedPort={selectedPort} drafts={macroDrafts.current} execution={macroExecution} onExecution={setMacroExecution} />
       ) : (
         <div className="workspace-shell workspace-grid">
-          <PortRail configuredPorts={snapshot.configuredPorts} availablePorts={snapshot.availablePorts} connected={connected}
+          <PortRail ports={railPorts} onSwap={swapRailPorts} configuredPorts={snapshot.configuredPorts} availablePorts={snapshot.availablePorts} connected={connected}
             selectedPort={selectedPort} onSelect={selectPort} drag={drag}
             onToggle={(port, open) => void withToast(() => window.serial.setPortOpen(port, open), setToast, false)}
             onRefresh={() => void withToast(async () => { await window.serial.refresh() }, setToast, false)}
@@ -335,7 +345,7 @@ export function App(): React.JSX.Element {
                   {gap(index)}
                   {index > 0 && <Separator className="pane-divider" aria-label={`调整 ${layout.ports[index - 1]} 与 ${port} 的宽度`}><span /></Separator>}
                   <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors}
-                  active={selectedPort === port} split={split} dragController={drag} lifted={inserting && drag.drag?.port === port}
+                  active={selectedPort === port} split={split} dragController={drag} swapTarget={swapTarget === port && draggedPort !== port}
                   animateEntry={!!pendingWidths.current && selectedPort === port} session={session.input} historyView={session.history} humanHistory={humanHistory}
                   onReorder={target => setLayout(current => reorderPane(current, port, target))}
                   setToast={setToast} onFocus={() => selectPort(port)} onClose={() => closePortView(port)} /></Panel>
@@ -377,21 +387,27 @@ export function mergeDesktopSnapshotEvent(
     return { ...current, connection: event.state, connectionMessage: event.message }
   }
   if (event.type === 'service') return { ...current, service: event.service }
-  if (event.type !== 'timeline') return current
+  if (event.type !== 'timeline' && event.type !== 'timeline-batch') return current
 
-  const configured = current.configuredPorts.find((port) => port.config.port === event.event.port)
-  if (!configured || configured.daemon_epoch !== event.event.daemon_epoch) return current
-  const prior = current.events[event.event.port] ?? []
-  const events = prior.some((item) => item.daemon_epoch !== event.event.daemon_epoch) ? [] : prior
-  const last = events.at(-1)
-  if (last && last.seq >= event.event.seq) return current
-  return {
-    ...current,
-    events: {
-      ...current.events,
-      [event.event.port]: [...events, event.event].slice(-12_000)
-    }
+  const incoming = event.type === 'timeline' ? [event.event] : event.events
+  const epochs = new Map(current.configuredPorts.map(port => [port.config.port, port.daemon_epoch]))
+  const batches = new Map<string, typeof incoming>()
+  for (const entry of incoming) {
+    if (epochs.get(entry.port) !== entry.daemon_epoch) continue
+    const pending = batches.get(entry.port)
+    const last = pending?.at(-1) ?? current.events[entry.port]?.at(-1)
+    if (last?.daemon_epoch === entry.daemon_epoch && last.seq >= entry.seq) continue
+    if (pending) pending.push(entry)
+    else batches.set(entry.port, [entry])
   }
+  if (!batches.size) return current
+  const events = { ...current.events }
+  for (const [port, entries] of batches) {
+    const prior = events[port] ?? []
+    const retained = prior[0]?.daemon_epoch === entries[0].daemon_epoch ? prior : []
+    events[port] = retained.slice(Math.max(0, retained.length + entries.length - 12_000)).concat(entries.slice(-12_000))
+  }
+  return { ...current, events }
 }
 
 const pages = ['console', 'macros', 'settings'] as const

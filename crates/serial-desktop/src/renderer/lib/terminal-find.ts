@@ -113,21 +113,20 @@ export class TerminalDocumentIndex {
         this.restoreActive(wasFollowingLatest ? undefined : preferred, wasFollowingLatest ? undefined : fallback)
         return 'append'
       }
-      if (
-        events.length === previous.length
-        && previous.length > 1
-        && eventKey(events[0]) === eventKey(previous[1])
-        && eventKey(events.at(-2)!) === eventKey(previous.at(-1)!)
-      ) {
+      const dropped = events.length && events[0].daemon_epoch === previous[0].daemon_epoch
+        ? previous.findIndex(event => event.seq === events[0].seq) : -1
+      const retainedCount = previous.length - dropped
+      if (dropped > 0 && events.length >= retainedCount
+          && eventKey(events[retainedCount - 1]) === eventKey(previous[previous.length - 1])) {
         const wasFollowingLatest = this.activeIndexValue === this.matchLength - 1
         const preferred = this.activeAnchor()
         const oldIndex = this.activeIndexValue
-        const removedMatches = this.removeEvent(previous[0])
+        const removedMatches = this.removePrefix(previous, dropped)
         // A one-code-unit literal cannot overlap itself. Longer literals can:
         // removing the first selected occurrence may change `/g` alignment for
         // the retained prefix (`aaa` / `aa`), so rescan that bounded document.
         const requiresRealignment = removedMatches > 0 && this.queryValue.length > 1
-        this.appendEvents([events.at(-1)!], !requiresRealignment)
+        this.appendEvents(events.slice(retainedCount), !requiresRealignment)
         this.source = events
         const fallback = oldIndex >= 0 ? Math.max(0, oldIndex - removedMatches) : undefined
         const retained = wasFollowingLatest ? undefined : preferred
@@ -191,6 +190,14 @@ export class TerminalDocumentIndex {
     return this.matchAt(this.activeIndexValue)?.id
   }
 
+  get activeChunkRange(): { first: number; last: number } | undefined {
+    const position = this.positionAt(this.activeIndexValue)
+    if (!position) return
+    const first = this.chunkAt(position[0])
+    const last = this.chunkAt(position[1] - 1)
+    if (first && last) return { first: first.seq, last: last.seq }
+  }
+
   get activeIndex(): number {
     return this.activeIndexValue
   }
@@ -238,13 +245,12 @@ export class TerminalDocumentIndex {
     this.scanText(text, scanStart, oldEnd)
   }
 
-  private removeEvent(event: TimelineEvent): number {
-    if (event.direction !== 'rx') return 0
-    const key = eventKey(event)
-    const index = this.chunksValue.findIndex((chunk) => chunk.key === key)
-    if (index < 0) return 0
-    this.chunksValue.splice(index, 1)
-    this.chunksByKey.delete(key)
+  private removePrefix(events: TimelineEvent[], count: number): number {
+    let chunks = 0
+    for (let i = 0; i < count; i++) {
+      if (this.chunksByKey.delete(eventKey(events[i]))) chunks++
+    }
+    this.chunksValue.splice(0, chunks)
     const base = this.chunksValue[0]?.absoluteStart ?? this.nextAbsolute
     const removed = this.lowerBoundStart(base)
     this.matchHead += removed

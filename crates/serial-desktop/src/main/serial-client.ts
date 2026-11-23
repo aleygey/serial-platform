@@ -150,6 +150,7 @@ export class SerialClient extends EventEmitter {
   private connectionVersion = 0
   private actor?: Actor
   private humanHistory?: HumanCommandHistory
+  private historyRead = new AbortController()
   private historyRefreshTimer?: ReturnType<typeof setTimeout>
   private activityTimer?: ReturnType<typeof setTimeout>
   private activityRequest?: WebSocket
@@ -160,7 +161,7 @@ export class SerialClient extends EventEmitter {
   private pendingWelcome?: PendingWelcome
   private readonly reconnectLoop: ReconnectLoop
 
-  constructor(endpoint: string) {
+  constructor(endpoint: string, private readonly managedStartup = false) {
     super()
     const parsed = new URL(endpoint)
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('后端地址必须使用 http 或 https')
@@ -188,6 +189,8 @@ export class SerialClient extends EventEmitter {
 
   async start(): Promise<ServerData> {
     this.stopped = false
+    this.historyRead.abort()
+    this.historyRead = new AbortController()
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
     await this.refresh(true)
@@ -612,6 +615,7 @@ export class SerialClient extends EventEmitter {
     this.historyRefreshTimer = undefined
     clearTimeout(this.activityTimer)
     this.stopped = true
+    this.historyRead.abort()
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
     const socket = this.socket
@@ -637,9 +641,10 @@ export class SerialClient extends EventEmitter {
       limit_events: '4000',
       limit_bytes: String(2 * 1024 * 1024)
     })
-    const response = await this.get<EventQueryResponse>(
-      `/api/v1/ports/${encodeURIComponent(configured.config.port)}/events?${query}`
-    )
+    const response = await this.request(
+      `/api/v1/ports/${encodeURIComponent(configured.config.port)}/events?${query}`,
+      { signal: this.managedStartup ? this.historyRead.signal : AbortSignal.any([this.historyRead.signal, AbortSignal.timeout(8_000)]) }
+    ) as EventQueryResponse
     const history = response.events.map(normalizeTimelineEvent).sort((a, b) => a.seq - b.seq)
     if (history.some((event) => (
       event.port !== configured.config.port
@@ -855,7 +860,7 @@ export class SerialClient extends EventEmitter {
     }
     this.assertTimelineIdentity(event)
     let items = this.events.get(event.port) ?? []
-    if (items.some((item) => item.daemon_epoch !== event.daemon_epoch)) {
+    if (items.length && items[0].daemon_epoch !== event.daemon_epoch) {
       items = []
     }
     const last = items.at(-1)
@@ -1141,13 +1146,13 @@ export class SerialClient extends EventEmitter {
 
   private async request(
     path: string,
-    options: { method?: string; body?: unknown; timeout?: number } = {}
+    options: { method?: string; body?: unknown; timeout?: number; signal?: AbortSignal } = {}
   ): Promise<unknown> {
     const response = await fetch(`${this.endpoint}${path}`, {
       method: options.method ?? 'GET',
       headers: options.body ? { 'content-type': 'application/json' } : undefined,
       body: options.body ? JSON.stringify(options.body) : undefined,
-      signal: AbortSignal.timeout(options.timeout ?? 8_000)
+      signal: options.signal ?? AbortSignal.timeout(options.timeout ?? 8_000)
     })
     if (!response.ok) {
       const detail = (await response.text()).trim()

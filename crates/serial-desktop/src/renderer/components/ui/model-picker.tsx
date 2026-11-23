@@ -1,7 +1,7 @@
 // Rare UI. Copyright (c) 2026 Swami Malode. See RARE-UI-LICENSE.txt.
 'use client'
 
-import { Check, ChevronDown, Search } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Check, ChevronDown, Search } from 'lucide-react'
 import {
     AnimatePresence,
     animate,
@@ -20,6 +20,7 @@ export type PickerModel = {
     id: string
     name: string
     provider?: string
+    series?: boolean
 }
 
 type Phase = 'closed' | 'open' | 'closing'
@@ -72,6 +73,7 @@ export type ModelPickerProps = Omit<React.ComponentProps<'div'>, 'onChange' | 'd
     defaultValue?: string
     onChange?: (id: string) => void
     label: string
+    browseFamilies?: boolean
     searchable?: boolean
     searchPlaceholder?: string
     onSearchChange?: (query: string) => void
@@ -85,7 +87,7 @@ function ModelPicker({
     value,
     defaultValue,
     onChange,
-    label, disabled, compact, renderValue,
+    label, disabled, compact, renderValue, browseFamilies = false,
     searchable = false, searchPlaceholder = '搜索…', onSearchChange,
     className,
     ...props
@@ -101,6 +103,7 @@ function ModelPicker({
     const [foldTo, setFoldTo] = useState<string | undefined>(undefined)
     const [picked, setPicked] = useState<string | undefined>(undefined)
     const [query, setQuery] = useState('')
+    const [family, setFamily] = useState<string>()
     const [active, setActive] = useState(0)
 
     const rootRef = useRef<HTMLDivElement>(null)
@@ -119,8 +122,12 @@ function ModelPicker({
     const open = phase === 'open'
     const filtered = useMemo(() => {
         const q = query.trim().toLowerCase()
-        return q ? models.filter((model) => `${model.name} ${model.provider ?? ''}`.toLowerCase().includes(q)) : models
-    }, [models, query])
+        if (q) return models.filter(model => `${model.name} ${model.provider ?? ''}`.toLowerCase().includes(q))
+        if (!browseFamilies) return models
+        if (family) return models.filter(model => model.provider === family)
+        const names = [...new Set(models.map(model => model.provider).filter((name): name is string => !!name))]
+        return [...names.map(name => ({ id: 'series:' + name, name, series: true })), ...models.filter(model => !model.provider)] as PickerModel[]
+    }, [models, query, browseFamilies, family])
     const anchor = useRef({ left: 0, top: 0 })
     const [scrolls, setScrolls] = useState(false)
     const current = filtered[active]
@@ -134,7 +141,9 @@ function ModelPicker({
         anchor.current = { left: rect.left, top: rect.top }
         setQuery('')
         onSearchChange?.('')
-        setActive(Math.max(0, models.indexOf(selected)))
+        setFamily(browseFamilies ? selected?.provider : undefined)
+        const choices = browseFamilies ? models.filter(model => model.provider === selected?.provider) : models
+        setActive(browseFamilies && !selected?.provider ? 0 : Math.max(0, choices.indexOf(selected)))
         setPhase('open')
     }
 
@@ -151,6 +160,13 @@ function ModelPicker({
     }
 
     const choose = (model: PickerModel, via: 'keyboard' | 'pointer') => {
+        if (model.series) {
+            setFamily(model.name)
+            setActive(0)
+            if (listRef.current) listRef.current.scrollTop = 0
+            inputRef.current?.focus({ preventScroll: true })
+            return
+        }
         if (value === undefined) {
             setInner(model.id)
         }
@@ -176,13 +192,13 @@ function ModelPicker({
         const pillWidth = trigger.offsetWidth
         const pillHeight = trigger.offsetHeight
         const field = compact ? root.closest<HTMLElement>('[data-serial-number]') : null
-        const panelWidth = Math.min(window.innerWidth - EDGE * 2, 390, Math.max(field?.offsetWidth ?? pillWidth, searchable ? 258 : 112))
+        const panelWidth = Math.min(window.innerWidth - EDGE * 2, 390, Math.max(field?.offsetWidth ?? pillWidth, browseFamilies ? 300 : searchable ? 258 : 112))
         content.style.width = panelWidth + 'px'
         const rect = trigger.getBoundingClientRect()
         const below = window.innerHeight - rect.bottom - EDGE - 4
         const above = rect.top - EDGE - 4
         const space = Math.max(below, above)
-        list.style.maxHeight = Math.min(LIST_MAX_HEIGHT, Math.max(36, space - (searchable ? 44 : 6))) + "px"
+        list.style.maxHeight = Math.min(LIST_MAX_HEIGHT, Math.max(36, space - (searchable ? 44 : 6) - (browseFamilies ? 38 : 0))) + "px"
         const height = content.offsetHeight
         const rootRect = root.getBoundingClientRect()
         // screen rects include any zoom or scale above the picker, while offsets and styles are in local pixels
@@ -371,6 +387,12 @@ function ModelPicker({
         }
     }, [active, open])
 
+    const showFamilies = () => {
+        setFamily(undefined)
+        setActive(0)
+        if (listRef.current) listRef.current.scrollTop = 0
+        inputRef.current?.focus({ preventScroll: true })
+    }
     const onPanelKey = (event: React.KeyboardEvent) => {
         if (event.nativeEvent.isComposing) return
         const count = filtered.length
@@ -382,7 +404,10 @@ function ModelPicker({
         } else if (event.key === 'Home' || event.key === 'End') {
             event.preventDefault()
             setActive(event.key === 'Home' ? 0 : Math.max(0, count - 1))
-        } else if (event.key === 'Enter') {
+        } else if (event.key === 'ArrowLeft' && browseFamilies && family && !query) {
+            event.preventDefault()
+            showFamilies()
+        } else if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement)) {
             event.preventDefault()
             if (current) {
                 choose(current, 'keyboard')
@@ -488,6 +513,12 @@ function ModelPicker({
                             </div>
                         )}
 
+                        {browseFamilies && <div className="picker-level">
+                            {query.trim() ? <span>匹配的具体型号</span> : family ? <>
+                                <button type="button" title="全部机型系列" aria-label="全部机型系列" onClick={showFamilies}><ChevronLeft size={15} />系列</button>
+                                <strong>{family}</strong><span>具体型号</span>
+                            </> : <strong>机型系列</strong>}
+                        </div>}
                         {scrolls && <ScrollProgress className="picker-progress" containerRef={listRef} />}
                         <div
                             ref={listRef}
@@ -505,10 +536,10 @@ function ModelPicker({
                                 className="pointer-events-none absolute top-0 right-1.5 left-1.5 rounded-[10px] bg-black/[0.05] opacity-0 dark:bg-white/[0.07]"
                             />
                             {groups.map((group, g) => (
-                                <div key={`${group.provider ?? ''}-${g}`} role="group" aria-label={group.provider}>
-                                    {group.provider && (
+                                <div key={`${group.provider ?? ''}-${g}`} role="group" aria-label={group.provider} data-model-results={browseFamilies && !!group.provider || undefined}>
+                                    {group.provider && (!browseFamilies || !!query.trim()) && (
                                         <div className="px-2.5 pt-2 pb-1 text-[11px] font-medium text-black/35 dark:text-white/35">
-                                            {group.provider}
+                                            {browseFamilies && <small>系列</small>}{group.provider}
                                         </div>
                                     )}
                                     {group.items.map(({ model, index: i }) => {
@@ -519,6 +550,7 @@ function ModelPicker({
                                                 id={`${id}-option-${i}`}
                                                 role="option"
                                                 aria-selected={isSelected}
+                                                data-series={model.series || undefined}
                                                 data-id={model.id}
                                                 data-index={i}
                                                 onPointerMove={() => setActive(i)}
@@ -532,6 +564,7 @@ function ModelPicker({
                                                 )}
                                             >
                                                 <span data-slot="model-picker-icon" className="relative min-w-0 flex-1 truncate">{model.name}</span>
+                                                {model.series && <ChevronRight size={14} aria-hidden />}
                                                 {isSelected && (
                                                     <Check
                                                         className={cn(

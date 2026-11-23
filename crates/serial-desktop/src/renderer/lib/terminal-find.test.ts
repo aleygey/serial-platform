@@ -8,6 +8,17 @@ import {
 } from './terminal-find'
 
 describe('terminal find document', () => {
+  it('evicts batched prefixes once while retaining search alignment across RX chunks', () => {
+    const index = new TerminalDocumentIndex()
+    const entries = [rx(1, 'ab'), rx(2, 'c'), rx(3, 'a'), rx(4, 'bc'), rx(5, 'a'), rx(6, 'bc')]
+    index.sync(entries.slice(0, 4))
+    index.search('abc')
+    expect(index.sync(entries.slice(2))).toBe('truncate-append')
+    expect(index.matchCount).toBe(2)
+    expect(index.chunks.map(chunk => chunk.seq)).toEqual([3, 4, 5, 6])
+    expect(index.stats().sanitizedChunks).toBe(6)
+  })
+
   it('searches the exact displayed text across RX event boundaries', () => {
     const index = new TerminalDocumentIndex()
     index.sync([

@@ -114,7 +114,7 @@ kbd { font-family: inherit; font-size: 9px; font-weight: 500; }
 .terminal-find-widget button:hover:not(:disabled), .terminal-find-widget button:focus-visible { color: var(--text); background: var(--surface-hover); }
 .terminal-find-widget button:focus-visible { outline: 1px solid var(--accent); }
 .terminal-find-widget button:disabled { color: var(--text-3); cursor: default; opacity: .45; }
-.terminal-scroll { min-height: 0; flex: 1; overflow: auto; scroll-behavior: smooth; }
+.terminal-scroll { min-height: 0; flex: 1; overflow: auto; scroll-behavior: auto; }
 .terminal-output { min-height: 100%; margin: 0; padding: 20px 22px 70px; color: color-mix(in srgb, var(--text) 89%, var(--accent)); font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace; font-size: 13px; line-height: 1.68; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; cursor: text; }
 .terminal-output > span { border-radius: 3px; transition: background .18s; }
 .terminal-output > span.matched-output { background: rgba(73, 145, 255, .15); box-shadow: 0 0 0 3px rgba(73, 145, 255, .08); }

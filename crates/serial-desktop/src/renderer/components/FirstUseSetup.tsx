@@ -38,7 +38,6 @@ export function FirstUseSetup({ snapshot, execution, onExecution, onLeave }: {
   const titleId = useId()
   const status = configuredPorts.find(p => p.config.port === port)
   const online = snapshot.connection === 'connected'
-  const simulation = !!window.serial.replaySampleRun
   const proposal = task?.plan
   const shownCheck = task?.brief.check ?? check
   const examplePrompt = proposal?.shell_prompt || (supplyPrompt && hint) || status?.effective_shell_prompt || 'board> '
@@ -125,9 +124,9 @@ export function FirstUseSetup({ snapshot, execution, onExecution, onLeave }: {
             </fieldset>
             {check==='status' && <label className="setup-input">想确认什么？<textarea rows={2} maxLength={480} value={intent} placeholder="例如，读取固件版本并确认设备有响应" onChange={e=>setIntent(e.target.value)}/></label>}
           </>}
-          {step === 3 && !proposal && <><p>{simulation ? '示例 Agent 正在根据你的回答准备方案。' : '把任务交给已接入 Serial MCP 的外部 Agent。方案提交后会自动出现在这里。'}</p>
-            <div className="setup-await" role="status"><i />{online ? simulation ? '等待示例方案' : '等待外部 Agent 返回方案' : '等待后端重新连接'}</div>
-            {!simulation && id && <><button type="button" className="setup-secondary" onClick={()=>void copy()}><Copy size={14}/>{copied ? '已复制任务' : '复制给 Agent'}</button>
+          {step === 3 && !proposal && <><p>把任务交给已接入 Serial MCP 的外部 Agent。方案提交后会自动出现在这里。</p>
+            <div className="setup-await" role="status"><i />{online ? '等待外部 Agent 返回方案' : '等待后端重新连接'}</div>
+            {id && <><button type="button" className="setup-secondary" onClick={()=>void copy()}><Copy size={14}/>{copied ? '已复制任务' : '复制给 Agent'}</button>
               <MoreFields title="查看交接内容"><textarea aria-label="给外部 Agent 的任务" readOnly value={handoff} />
                 <p>首次接入时，在外部 Agent 的 MCP 设置中添加以下 stdio 命令。</p>
                 <code>serial mcp --endpoint {snapshot.preferences.endpoint}</code>

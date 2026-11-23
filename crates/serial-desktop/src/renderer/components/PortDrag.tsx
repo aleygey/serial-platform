@@ -1,20 +1,23 @@
 import { motion, useMotionValue, useReducedMotion, type HTMLMotionProps } from 'motion/react'
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useRef, useState, type RefObject, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
 
 type Point = { x: number; y: number }
 interface Drag {
   port: string
   index: number | null
+  railTarget?: string
   weight: number
   keyboard: boolean
 }
 
-export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (port: string, index: number) => void) {
+export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (port: string, index: number) => void, onRailDrop: (port: string, target: string) => void) {
   const [drag, setDrag] = useState<Drag | null>(null)
   const [settling, setSettling] = useState(false)
   const settleTimer = useRef<number>(undefined)
   const live = useRef<Drag | null>(null)
   const centers = useRef<number[]>([])
+  const geometry = useRef<{ right: number; port: string }[]>([])
+  const sourceIndex = useRef(-1)
   const pointer = useRef<Point | null>(null)
   const x = useMotionValue(0)
   const y = useMotionValue(0)
@@ -35,12 +38,17 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
     const area = deck.current
     if (!area) return null
     const rect = area.getBoundingClientRect()
-    const clientX = point.x - window.scrollX
-    const clientY = point.y - window.scrollY
+    const clientX = point.x
+    const clientY = point.y
     x.set(clientX + 206 < window.innerWidth ? clientX + 12 : Math.max(6, clientX - 190))
     y.set(Math.max(5, Math.min(window.innerHeight - 100, clientY + 13)))
     if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null
     const offset = clientX - rect.left + area.scrollLeft
+    if (sourceIndex.current >= 0) {
+      const hit = geometry.current.findIndex(item => offset <= item.right)
+      const target = hit < 0 ? geometry.current.length - 1 : hit
+      return target > sourceIndex.current ? target + 1 : target
+    }
     const index = centers.current.findIndex(center => offset < center)
     return index === -1 ? centers.current.length : index
   }, [deck, x, y])
@@ -53,6 +61,8 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
     const left = area.getBoundingClientRect().left - area.scrollLeft
     const panels = Array.from(area.querySelectorAll<HTMLElement>('[data-panel]'))
     // Keep the hit regions stable while the actual panels animate out of the way.
+    geometry.current = panels.map(panel => ({ port: panel.id, right: panel.getBoundingClientRect().right - left }))
+    sourceIndex.current = panels.findIndex(panel => panel.id === port)
     centers.current = panels.map(panel => {
       const box = panel.getBoundingClientRect()
       return box.left - left + box.width / 2
@@ -62,18 +72,24 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
     const share = existing ? weight(existing) : panels.reduce((sum, node) => sum + weight(node), 0) / (panels.length || 1)
     update({port, weight: share || 1, keyboard: !point, index: point ? pointIndex(point) : panels.length})
   }
+  const railTargetAt = (point: Point) => document.elementFromPoint(point.x, point.y)?.closest<HTMLElement>('[data-device-port]')?.dataset.devicePort
   const move = (point: Point) => {
     const current = live.current
     if (!current) return
     pointer.current = point
     const index = pointIndex(point)
-    if (current.index !== index) update({ ...current, index })
+    const railTarget = index === null ? railTargetAt(point) : undefined
+    if (current.index !== index || current.railTarget !== railTarget) update({ ...current, index, railTarget })
   }
   const finish = (point?: Point) => {
     const current = live.current
     if (!current) return
     const index = point ? pointIndex(point) : current.index
-    if (index === null) return cancel()
+    if (index === null) {
+      const target = point && railTargetAt(point)
+      if (target && target !== current.port) onRailDrop(current.port, target)
+      return cancel()
+    }
     pointer.current = null
     update(null)
     onDrop(current.port, index)
@@ -97,7 +113,7 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
       previous = now
       if (current.index !== null) {
         const rect = area.getBoundingClientRect()
-        const offset = point.x - window.scrollX - rect.left
+        const offset = point.x - rect.left
         const edge = 32
         const speed = offset < edge ? (offset - edge) / edge : Math.max(0, (offset - rect.width + edge) / edge)
         if (speed) {
@@ -129,20 +145,57 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
 
 export type PortDragController = ReturnType<typeof usePortDrag>
 type HandleProps = Omit<HTMLMotionProps<'button'>, 'port' | 'onPan' | 'onPanStart' | 'onPanEnd'> & {
-  port: string; controller?: PortDragController
+  port: string; controller?: PortDragController; keyboardOnly?: boolean
 }
 
-export function PortDragHandle({ port, controller, onClick, onKeyDown, children, ...props }: HandleProps) {
+export function usePortPointerDrag(port: string, controller?: PortDragController) {
+  const pointer = useRef<{ id: number; origin: Point } | null>(null)
   const panned = useRef(false)
+  const point = (event: ReactPointerEvent) => ({ x: event.clientX, y: event.clientY })
+  return {
+    onPointerDown(event: ReactPointerEvent<HTMLElement>) {
+      if (!controller || event.button !== 0 || !event.isPrimary || pointer.current) return
+      pointer.current = { id: event.pointerId, origin: point(event) }
+      panned.current = false
+      // Keep normal clicks on the model picker and capture a drag beyond its bounds.
+      const handle = (event.target as Element).closest('button') ?? event.currentTarget
+      handle.setPointerCapture(event.pointerId)
+    },
+    onPointerMove(event: ReactPointerEvent<HTMLElement>) {
+      const start = pointer.current
+      if (!controller || start?.id !== event.pointerId) return
+      const here = point(event)
+      if (!panned.current) {
+        if (Math.hypot(here.x - start.origin.x, here.y - start.origin.y) < 5) return
+        panned.current = true
+        controller.begin(port, start.origin)
+      }
+      controller.move(here)
+    },
+    onPointerUp(event: ReactPointerEvent<HTMLElement>) {
+      if (pointer.current?.id !== event.pointerId) return
+      pointer.current = null
+      if (panned.current) controller?.finish(point(event))
+    },
+    onLostPointerCapture(event: ReactPointerEvent<HTMLElement>) {
+      if (pointer.current?.id !== event.pointerId) return
+      pointer.current = null
+      if (panned.current) controller?.cancel()
+    },
+    onClickCapture(event: ReactMouseEvent<HTMLElement>) {
+      if (event.detail && panned.current) {
+        panned.current = false
+        event.preventDefault()
+        event.stopPropagation()
+      }
+    },
+  }
+}
+
+export function PortDragHandle({ port, controller, keyboardOnly, onKeyDown, children, ...props }: HandleProps) {
+  const pointer = usePortPointerDrag(port, keyboardOnly ? undefined : controller)
   const keyboard = controller?.drag?.keyboard && controller.drag.port === port
-  return <motion.button {...props} type="button" onPointerDown={() => { panned.current = false }}
-    onPanStart={(_event, info) => { panned.current = true; controller?.begin(port, info.point) }}
-    onPan={(_event, info) => controller?.move(info.point)}
-    onPanEnd={(event, info) => { if (event.type === 'pointercancel') controller?.cancel(); else controller?.finish(info.point) }}
-    onClick={event => {
-      if (event.detail && panned.current) { panned.current = false; return }
-      onClick?.(event)
-    }}
+  return <motion.button {...props} {...(keyboardOnly ? {} : pointer)} type="button"
     onKeyDown={event => {
       if (controller && event.key === ' ' && !event.repeat) {
         event.preventDefault()
