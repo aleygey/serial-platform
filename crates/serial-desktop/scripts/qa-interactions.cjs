@@ -470,8 +470,18 @@ app.whenReady().then(async () => {
   await js(`{ const v=document.querySelector('.terminal-scroll'); v.scrollTop=v.scrollHeight/2 }`)
   await until(`!!document.querySelector('.return-live')`)
   assert.ok(await js(`Math.abs(document.querySelector('.terminal-scroll').scrollTop/document.querySelector('.terminal-scroll').scrollHeight-.5)<.01`))
+  await js(`window.visibleFlashRow=()=>{const view=document.querySelector('.terminal-scroll'), box=view.getBoundingClientRect();return document.caretRangeFromPoint(box.left+view.clientWidth/2,box.top+4)?.startContainer.parentElement.closest('[data-seq]')?.dataset.seq}; true`)
+  await until(`!!window.visibleFlashRow()`)
+  const pausedRow = await js('window.visibleFlashRow()')
+  await js(`(async () => {
+    const state=await window.serial.bootstrap(), rows=state.events.COM6, last=rows.at(-1)
+    state.events.COM6=[...rows.slice(64),...Array.from({length:64},(_,i)=>({...last,seq:last.seq+i+1,text:'#'}))]
+    await window.serial.savePreferences({})
+  })()`)
+  await until(`document.querySelector('.terminal-output').textContent.startsWith('boot 64\\n')`)
+  assert.equal(await js('window.visibleFlashRow()'), pausedRow)
   await js(`document.querySelector('.terminal-scroll').scrollTop=0`)
-  await until(`document.querySelector('.terminal-output [data-seq="1"]')?.textContent === 'boot 0\\n'`)
+  await until(`document.querySelector('.terminal-output [data-seq="65"]')?.textContent === 'boot 64\\n'`)
   await js(`document.querySelector('.return-live').click()`)
   await until(`(() => {const v=document.querySelector('.terminal-scroll');return v.scrollHeight-v.clientHeight-v.scrollTop<3})()`)
   await js(`(async () => {

@@ -67,7 +67,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
 
   const target = findOpen && activeId ? activeId : selectedCommand ? selectedCommand.daemonEpoch + ':' + selectedCommand.firstSeq : ''
   const [anchor, setAnchor] = useState<{ seq?: number; target: string }>()
-  const scrollAnchor = useRef<{ seq: number; top: number } | null>(null)
+  const scrollAnchor = useRef<{ seq: number; offset: number; top: number } | null>(null)
   const textCache = useRef(new WeakMap<TerminalDocumentChunk, { last: TerminalDocumentChunk; text: string }>())
   const pinned = anchor?.target === target
   const range = pinned ? undefined : findOpen && activeId ? terminalDocument.activeChunkRange : selectedCommand
@@ -107,15 +107,16 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
     if (!range || !span || !view.contains(span)) return
     const first = Number(span.dataset.seq ?? span.dataset.firstSeq)
     let index = chunkIndex(chunks, first)
-    if (span.dataset.firstSeq && node?.nodeType === Node.TEXT_NODE) {
-      let offset = range.startOffset
-      while (index + 1 < chunks.length && offset >= chunks[index].text.length) offset -= chunks[index++].text.length
-    }
+    const prefix = range.cloneRange()
+    prefix.selectNodeContents(span)
+    prefix.setEnd(range.startContainer, range.startOffset)
+    let offset = prefix.toString().length
+    while (index + 1 < chunks.length && offset >= chunks[index].text.length) offset -= chunks[index++].text.length
     const seq = chunks[index]?.seq
     if (seq === undefined) return
     // The detailed window is grown around the new position after a thumb drag.
     if (!pinned || index < start + TEXT_BLOCK / 2 || index >= end - TEXT_BLOCK / 2) setAnchor({ seq, target })
-    if (span.dataset.seq) scrollAnchor.current = { seq, top: span.getBoundingClientRect().top - box.top }
+    scrollAnchor.current = { seq, offset, top: range.getBoundingClientRect().top - box.top }
   }
   const firstKey = chunks[0]?.key
   useLayoutEffect(() => {
@@ -123,7 +124,23 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
     const view = scrollRef.current
     if (!view || !saved || follow || !manualScroll.current) return
     const row = view.querySelector<HTMLElement>(`[data-seq="${saved.seq}"]`)
-    if (row) view.scrollTop += row.getBoundingClientRect().top - view.getBoundingClientRect().top - saved.top
+    if (!row) {
+      if (chunks[0] && saved.seq < chunks[0].seq) view.scrollTop = 0
+      return
+    }
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT)
+    let remaining = saved.offset
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const length = node.textContent?.length ?? 0
+      if (remaining <= length) {
+        const range = document.createRange()
+        range.setStart(node, remaining)
+        range.collapse(true)
+        view.scrollTop += range.getBoundingClientRect().top - view.getBoundingClientRect().top - saved.top
+        break
+      }
+      remaining -= length
+    }
   }, [firstKey])
 
   const openFind = useCallback((): void => {
