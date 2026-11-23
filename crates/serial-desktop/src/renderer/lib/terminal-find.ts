@@ -1,6 +1,16 @@
 import type { TimelineEvent } from '../../shared/contracts'
 import { TerminalLine } from './terminal-line'
 
+export function indexAtOrAfterSeq(entries: readonly { seq: number }[], seq: number): number {
+  let lo = 0, hi = entries.length
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2)
+    if (entries[mid].seq < seq) lo = mid + 1
+    else hi = mid
+  }
+  return lo
+}
+
 export interface TerminalDecoration {
   start: number
   end: number
@@ -172,6 +182,10 @@ export class TerminalDocumentIndex {
 
   get chunks(): readonly TerminalDocumentChunk[] {
     return this.chunksValue
+  }
+
+  textFor(key: string): string | undefined {
+    return this.chunksByKey.get(key)?.text
   }
 
   matchAt(index: number): TerminalFindMatch | undefined {

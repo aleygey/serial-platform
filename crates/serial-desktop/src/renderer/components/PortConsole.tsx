@@ -19,6 +19,7 @@ interface Props {
   snapshot: DesktopSnapshot
   colors: { accent: string; output: string }
   selectedPort: string
+  paneOrder: string[]
   active: boolean
   split: boolean
   session: PortInput
@@ -33,7 +34,7 @@ interface Props {
   setToast: SetToast
 }
 
-export function PortConsole({ snapshot, colors, selectedPort, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
+export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
   const headingDrag = usePortPointerDrag(selectedPort, split ? dragController : undefined)
   const [animateDrawer, setAnimateDrawer] = useState(false)
   const [drawerPreference, setDrawerPreference] = useState(historyView.expanded)
@@ -199,7 +200,7 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
 
   return <motion.article className={`port-console ${active ? 'is-active' : ''}`} aria-label={`${selectedPort} 控制台`} data-port={selectedPort}
     data-motion={paused ? 'paused' : undefined} data-swap-target={swapTarget || undefined} ref={frame}
-    onPointerDownCapture={focusPort} onFocusCapture={focusPort} layout={reduced ? false : 'position'}
+    onPointerDownCapture={focusPort} onFocusCapture={focusPort} layout={reduced ? false : 'position'} layoutDependency={dragController.drag ? undefined : paneOrder}
     initial={!reduced && animateEntry ? { scale:0.96, opacity:0.76 } : false} animate={{ scale:1, opacity:1 }}
     transition={reduced ? {duration:0} : {type:'spring', stiffness:420, damping:32, layout: { type: 'spring', stiffness: 490, damping: 39 } }}>
     <div className="console-stack channel-body">

@@ -65,7 +65,7 @@ describe('Agent history', () => {
       run_id: 'run', operation_id: String(i), metadata: { macro_execution_id: 'exec', macro_id: 'probe', macro_name: '设备心跳' } }))
     const end = { ...start, seq: 2002, metadata: { macro_execution: { ...macro, status: 'timed_out' } } }
     const select = createHistorySelector()
-    const first = select([start, writes[0]])
+    const first = select([event(0, 'rx', 'previous output'), start, writes[0]])
     expect(select([start, ...writes])).toBe(first)
     const complete = select([start, ...writes, end])
     expect(complete).toHaveLength(3)

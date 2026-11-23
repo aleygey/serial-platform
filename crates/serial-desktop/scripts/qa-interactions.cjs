@@ -441,14 +441,14 @@ app.whenReady().then(async () => {
     await window.serial.savePreferences({})
     document.querySelector('[data-device-port="COM6"] .device-choice').click()
   })()`)
-  await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12000'`)
-  assert.ok(await js(`document.querySelectorAll('.terminal-output > span').length < 420`))
+  await until(`Array.from(document.querySelectorAll('.terminal-output [data-seq]')).at(-1)?.dataset.seq === '12000'`)
+  assert.ok(await js(`document.querySelectorAll('.terminal-output [data-seq], .terminal-output [data-first-seq]').length < 420`))
   await js(`(async () => {
     const s=await window.serial.bootstrap(), lines=s.events.COM6
     s.events.COM6=[...lines.slice(32),...lines.slice(-32).map(e=>({...e,seq:e.seq+32}))]
     await window.serial.savePreferences({})
   })()`)
-  await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12032'`)
+  await until(`Array.from(document.querySelectorAll('.terminal-output [data-seq]')).at(-1)?.dataset.seq === '12032'`)
   await js(`{ const view=document.querySelector('.terminal-scroll'); view.focus(); view.scrollTop = view.scrollHeight / 2 }`)
   await until(`!!document.querySelector('.return-live')`)
   await js(`document.querySelector('.terminal-find-trigger').click()`)
@@ -459,13 +459,22 @@ app.whenReady().then(async () => {
   })()`)
   await until(`document.querySelector('.term-search-hit.is-current')?.closest('[data-seq]')?.dataset.seq === '43'`)
   await js(`document.querySelector('[aria-label="关闭查找 (Escape)"]').click(); document.querySelector('.return-live').click()`)
-  await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12032'`)
+  await until(`Array.from(document.querySelectorAll('.terminal-output [data-seq]')).at(-1)?.dataset.seq === '12032'`)
   await js(`(async () => {
     const s = await window.serial.bootstrap(), base = s.events.COM6[0]
     s.events.COM6 = Array.from({length:12000}, (_,i) => ({...base,seq:i+1,text:i<4000 ? 'boot '+i+'\\n' : (i%80===79 ? '#\\n' : '#')}))
     await window.serial.savePreferences({})
   })()`)
   await until(`document.querySelector('.terminal-output')?.textContent.startsWith('boot 0')`)
+  assert.ok(await js(`(() => {
+    const pre=document.querySelector('.terminal-output'), view=pre.parentElement, plain=pre.cloneNode(false)
+    plain.textContent=pre.textContent
+    Object.assign(plain.style,{position:'absolute',visibility:'hidden',width:pre.offsetWidth+'px'})
+    view.append(plain)
+    const sameHeight=Math.abs(plain.getBoundingClientRect().height-pre.getBoundingClientRect().height)<1
+    plain.remove()
+    return sameHeight
+  })()`), 'Archived text must wrap to the exact height of the unsegmented terminal')
   assert.ok(await js(`document.querySelector('.terminal-scroll').scrollHeight / document.querySelector('.terminal-scroll').clientHeight > 100`))
   await js(`{ const v=document.querySelector('.terminal-scroll'); v.scrollTop=v.scrollHeight/2 }`)
   await until(`!!document.querySelector('.return-live')`)

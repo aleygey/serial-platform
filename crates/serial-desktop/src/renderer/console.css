@@ -785,7 +785,8 @@ button.outline-trigger:hover, .command-step:hover { background: var(--surface-ho
 .picker-anchor [data-model-results] > div:first-child:not([role]) { display:flex; gap:7px; align-items:baseline; color:var(--text-2); font-weight:650; }
 .picker-anchor [data-model-results] small { font-size:10px; font-weight:450; }
 .picker-level button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
-.terminal-scroll { overflow-anchor:none; }
+.terminal-scroll { overflow-anchor:none; contain:strict; }
+.terminal-lines { display:block; contain:layout; }
 .appearance-setting > .form-field { max-width:220px; }
 .is-split .channel-name { flex:1; align-self:stretch; cursor:grab; touch-action:none; user-select:none; }
 .is-split .channel-name h2 { display:flex; flex:1; min-width:4ch; }

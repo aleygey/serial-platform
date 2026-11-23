@@ -76,11 +76,14 @@ export function createHistorySelector() {
   const macroWrites = new Set<string>()
   return (events: TimelineEvent[]) => {
     if (source === events) return rows
-    const append = source.length > 0 && source.length <= events.length &&
-      source[0] === events[0] && source.at(-1) === events[source.length - 1]
+    // Keep the existing projection when the ring only discarded ordinary RX.
+    // Rebuild if its representative write fell out, so a later macro write can replace it.
+    const keptFrom = events[0] && (!rows[0] || rows[0].seq >= events[0].seq) ? source.indexOf(events[0]) : -1
+    const overlap = source.length - keptFrom
+    const append = keptFrom >= 0 && events.length >= overlap && source.at(-1) === events[overlap - 1]
     if (!append) macroWrites.clear()
     const added: TimelineEvent[] = []
-    for (let i = append ? source.length : 0; i < events.length; i++) {
+    for (let i = append ? overlap : 0; i < events.length; i++) {
       const event = events[i]
       if (event.actor?.kind !== 'agent' && !event.kind.startsWith('run_') &&
           event.kind !== 'command_capture_completed' && !event.metadata.macro_execution) continue

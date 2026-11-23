@@ -344,7 +344,7 @@ export function App(): React.JSX.Element {
                 return <Fragment key={JSON.stringify([scope, port])}>
                   {gap(index)}
                   {index > 0 && <Separator className="pane-divider" aria-label={`调整 ${layout.ports[index - 1]} 与 ${port} 的宽度`}><span /></Separator>}
-                  <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors}
+                  <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors} paneOrder={layout.ports}
                   active={selectedPort === port} split={split} dragController={drag} swapTarget={swapTarget === port && draggedPort !== port}
                   animateEntry={!!pendingWidths.current && selectedPort === port} session={session.input} historyView={session.history} humanHistory={humanHistory}
                   onReorder={target => setLayout(current => reorderPane(current, port, target))}

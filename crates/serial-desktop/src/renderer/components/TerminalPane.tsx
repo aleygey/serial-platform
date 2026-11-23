@@ -7,6 +7,7 @@ import { InlineTextEffect } from './ui/text-effect'
 import { useReducedMotion } from '../lib/use-reduced-motion'
 import { displayCommand } from '../lib/history'
 import {
+  indexAtOrAfterSeq,
   TerminalDocumentIndex,
   type TerminalDocumentChunk,
   type TerminalFindHit
@@ -28,15 +29,6 @@ interface Props {
 
 const WINDOW_CHUNKS = 320
 const TEXT_BLOCK = 128
-function chunkIndex(chunks: readonly TerminalDocumentChunk[], seq: number): number {
-  let lo = 0, hi = chunks.length
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2)
-    if (chunks[mid].seq < seq) lo = mid + 1
-    else hi = mid
-  }
-  return lo
-}
 
 const NO_COMMANDS: AgentCommand[] = []
 const NO_FIND_HITS: readonly TerminalFindHit[] = Object.freeze([])
@@ -59,7 +51,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   const initialStream = useRef({ epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 })
   if (initialStream.current.epoch !== configuredPort?.daemon_epoch) initialStream.current = { epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 }
   const chunks = terminalDocument.chunks
-  const echoes = useMemo(() => commandEchoStyles(events, chunks, commands, currentCommand), [events, chunks, commands, currentCommand])
+  const echoes = useMemo(() => commandEchoStyles(events, key => terminalDocument.textFor(key), commands, currentCommand), [events, terminalDocument, commands, currentCommand])
   const total = terminalDocument.matchCount
   const highlighted = terminalDocument.highlightedMatchCount
   const current = terminalDocument.activeIndex < 0 ? 0 : terminalDocument.activeIndex + 1
@@ -73,26 +65,42 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   const range = pinned ? undefined : findOpen && activeId ? terminalDocument.activeChunkRange : selectedCommand
     ? { first: match?.fromSeq ?? selectedCommand.firstSeq, last: match?.fromSeq ?? selectedCommand.firstSeq } : undefined
   const tailStart = Math.max(0, chunks.length - WINDOW_CHUNKS)
-  const start = pinned && anchor.seq !== undefined ? Math.max(0, Math.min(tailStart, chunkIndex(chunks, anchor.seq) - Math.floor(WINDOW_CHUNKS / 2))) :
-    range ? Math.max(0, Math.min(tailStart, chunkIndex(chunks, range.first) - Math.floor(WINDOW_CHUNKS / 2))) : tailStart
-  const end = Math.min(chunks.length, Math.max(start + WINDOW_CHUNKS, range ? chunkIndex(chunks, range.last) + 1 : 0))
-  const visible = chunks.slice(start, end)
-
+  const start = pinned && anchor.seq !== undefined ? Math.max(0, Math.min(tailStart, indexAtOrAfterSeq(chunks, anchor.seq) - Math.floor(WINDOW_CHUNKS / 2))) :
+    range ? Math.max(0, Math.min(tailStart, indexAtOrAfterSeq(chunks, range.first) - Math.floor(WINDOW_CHUNKS / 2))) : tailStart
+  const end = Math.min(chunks.length, Math.max(start + WINDOW_CHUNKS, range ? indexAtOrAfterSeq(chunks, range.last) + 1 : 0))
   // Preserve the browser's exact wrapping, selection and native scrollbar over
   // the whole retained document. Only the viewport needs per-event markup.
-  function compactText(from: number, until: number) {
+  function renderText(from: number, until: number, detailed = false) {
     const blocks: React.ReactNode[] = []
+    const width = detailed ? 16 : TEXT_BLOCK
     for (let i = from; i < until;) {
       const first = chunks[i]
-      const nextBucket = (Math.floor(first.seq / TEXT_BLOCK) + 1) * TEXT_BLOCK
-      const stop = Math.min(until, chunkIndex(chunks, nextBucket))
+      const nextBucket = (Math.floor(first.seq / width) + 1) * width
+      const stop = Math.min(until, indexAtOrAfterSeq(chunks, nextBucket))
       const last = chunks[stop - 1]
-      let block = textCache.current.get(first)
-      if (block?.last !== last) {
-        block = { last, text: chunks.slice(i, stop).map(chunk => chunk.text).join('') }
-        textCache.current.set(first, block)
+      // Isolate complete lines so updating one percentage does not lay out the
+      // entire scrollback. Partial lines must keep wrapping into their neighbor.
+      const completeLines = (i === 0 || chunks[i - 1].text.endsWith('\n')) && last.text.endsWith('\n')
+      const className = completeLines ? 'terminal-lines' : undefined
+      if (detailed) {
+        blocks.push(<span key={'detail:' + first.key} className={className}>{chunks.slice(i, stop).map(chunk => (
+          <TerminalChunkText
+            reveal={echoes.has(chunk.key) && !paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
+            commandMatched={commandRangeIncludes(match, chunk)}
+            echoLength={echoes.get(chunk.key)?.length ?? 0} echoTone={echoes.get(chunk.key)?.tone}
+            chunk={chunk}
+            hits={findOpen ? terminalDocument.hitsFor(chunk) : NO_FIND_HITS}
+            key={chunk.key}
+          />
+        ))}</span>)
+      } else {
+        let block = textCache.current.get(first)
+        if (block?.last !== last) {
+          block = { last, text: chunks.slice(i, stop).map(chunk => chunk.text).join('') }
+          textCache.current.set(first, block)
+        }
+        blocks.push(<span key={'text:' + first.key} data-first-seq={first.seq} className={className}>{block.text}</span>)
       }
-      blocks.push(<span key={'text:' + first.key} data-first-seq={first.seq}>{block.text}</span>)
       i = stop
     }
     return blocks
@@ -106,7 +114,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
     const span = node?.parentElement?.closest<HTMLElement>('[data-seq], [data-first-seq]')
     if (!range || !span || !view.contains(span)) return
     const first = Number(span.dataset.seq ?? span.dataset.firstSeq)
-    let index = chunkIndex(chunks, first)
+    let index = indexAtOrAfterSeq(chunks, first)
     const prefix = range.cloneRange()
     prefix.selectNodeContents(span)
     prefix.setEnd(range.startContainer, range.startOffset)
@@ -191,13 +199,15 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
 
   useLayoutEffect(() => {
     if (follow && !manualScroll.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'instant' })
-  }, [chunks.at(-1)?.key, follow])
+  }, [follow])
 
   const hasOutput = chunks.length > 0
   useEffect(() => {
     const view = scrollRef.current
     const output = view?.querySelector('pre')
     if (!follow || !view || !output) return
+    // Scroll after layout, only when the output or viewport actually changes
+    // height. A same-line progress update must not force a synchronous layout.
     const observer = new ResizeObserver(() => {
       if (!manualScroll.current) view.scrollTop = view.scrollHeight
     })
@@ -317,18 +327,9 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
           </div>
         ) : (
           <pre className="terminal-output" aria-label="串口输出" onDoubleClick={selectTerminalWord}>
-            {compactText(0, start)}
-            {visible.map((chunk) => (
-              <TerminalChunkText
-                reveal={echoes.has(chunk.key) && !paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
-                commandMatched={commandRangeIncludes(match, chunk)}
-                echoLength={echoes.get(chunk.key)?.length ?? 0} echoTone={echoes.get(chunk.key)?.tone}
-                chunk={chunk}
-                hits={findOpen ? terminalDocument.hitsFor(chunk) : NO_FIND_HITS}
-                key={chunk.key}
-              />
-            ))}
-            {compactText(end, chunks.length)}
+            {renderText(0, start)}
+            {renderText(start, end, true)}
+            {renderText(end, chunks.length)}
           </pre>
         )}
       </div>

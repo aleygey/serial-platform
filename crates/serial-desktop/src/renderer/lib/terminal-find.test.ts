@@ -261,7 +261,7 @@ function rx(seq: number, text: string): TimelineEvent {
 it('overwrites flashing progress across RX packets without adding rows or retaining overwritten search results', () => {
   const index = new TerminalDocumentIndex()
   const events = [rx(1, 'device ready\r'), rx(2, '\nErasing at 0x6000 -- 00% complete.')]
-  index.sync(events)
+  index.sync([...events])
   index.search('00%')
   expect(index.matchCount).toBe(1)
   for (let percent = 1; percent <= 100; percent++) {
