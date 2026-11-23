@@ -1,3 +1,4 @@
+import { PortInput } from './port-input'
 import { describe, expect, it } from 'vitest'
 import { acceptsSuggestion, commandBuffer, humanHistoryCandidates, stepHistory, suggestedSuffix } from './command-editor'
 
@@ -31,4 +32,18 @@ describe('Human command editor', () => {
     expect(back.buffer.value).toBe('latest')
     expect(stepHistory(back.buffer, back.cursor, [], 'newer')).toEqual({ buffer: draft })
   })
+})
+
+it('keeps new typing while an earlier write is awaiting acknowledgement, restoring only an untouched rejected draft', async () => {
+  const input = new PortInput()
+  input.edit(commandBuffer('first'))
+  let reject!: () => void
+  const pending = input.submit('first', () => new Promise(resolve => { reject = () => resolve({ status: 'rejected', message: 'busy' }) }), true)
+  expect(input.snapshot().buffer.value).toBe('')
+  input.edit(commandBuffer('second'))
+  reject()
+  await pending
+  expect(input.snapshot().buffer.value).toBe('second')
+  await input.submit('second', async () => ({ status:'rejected', message:'busy' }), true)
+  expect(input.snapshot().buffer.value).toBe('second')
 })

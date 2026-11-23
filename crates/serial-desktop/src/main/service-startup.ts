@@ -6,6 +6,7 @@ export interface StartingService {
   markReady(): void
   stop(): Promise<void>
   startupFailure?(): Error | undefined
+  startupStage?(): string | undefined
   startingPid?(): number | undefined
 }
 
@@ -31,33 +32,43 @@ export async function waitForOwnedServiceIdentity(
   service: StartingService,
   discover: () => Promise<DiscoveredSeriald | undefined>,
   verifyHealth: (discovered: DiscoveredSeriald) => Promise<boolean>,
-  attempts = 40,
-  pause: () => Promise<unknown> = () => delay(150)
+  pause: (ms: number) => Promise<unknown> = delay,
+  now: () => number = Date.now
 ): Promise<DiscoveredSeriald> {
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  const pid = service.startingPid?.()
+  let stage: string | undefined
+  let since = now()
+  let interval = 150
+  for (;;) {
     throwStartupFailure(service)
+    if (!pid || service.startingPid?.() !== pid) throw new Error('本地后端启动已取消')
     const discovered = await discover()
     throwStartupFailure(service)
-    const childPid = service.startingPid?.()
-    if (
-      discovered
-      && childPid !== undefined
-      && discovered.pid === childPid
-      && await verifyHealth(discovered)
-    ) {
+    if (discovered?.pid === pid && await verifyHealth(discovered)) {
       throwStartupFailure(service)
+      if (service.startingPid?.() !== pid) throw new Error('本地后端启动已取消')
       return discovered
     }
-    await pause()
+    const current = service.startupStage?.()
+    if (stage !== current) {
+      stage = current
+      since = now()
+    }
+    // Journal and automation recovery depend on the size of data on disk.
+    // A dead child is detected above even if it exited while recovering.
+    if (stage !== 'recovering serial journals' && stage !== 'loading automation state' && now() - since >= 90_000) {
+      throw new Error('本地后端未能发布匹配当前 App 子进程的服务身份')
+    }
+    await pause(interval)
+    interval = Math.min(1000, interval + 150)
   }
-  throw new Error('本地后端启动后未能发布匹配当前 App 子进程的服务身份')
 }
 
 export async function recoverConcurrentWinner<T>(
   startupError: unknown,
   discover: () => Promise<T | undefined>,
-  attempts = 30,
-  pause: () => Promise<unknown> = () => delay(100)
+  attempts = 120,
+  pause: (ms: number) => Promise<unknown> = delay
 ): Promise<T> {
   if (!errorMessage(startupError).includes('already owned by another process')) {
     throw startupError
@@ -69,7 +80,7 @@ export async function recoverConcurrentWinner<T>(
     } catch {
       // The winner can own the root before its verified endpoint is published.
     }
-    await pause()
+    await pause(Math.min(1000, 150 * (attempt + 1)))
   }
   throw startupError
 }

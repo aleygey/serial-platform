@@ -84,7 +84,6 @@ describe('owned service startup', () => {
           service,
           discover,
           verifyHealth,
-          3,
           pause
         )
       }
@@ -93,6 +92,24 @@ describe('owned service startup', () => {
     expect(foreignHealthReachable).toBe(true)
     expect(service.markReady).not.toHaveBeenCalled()
     expect(service.stop).toHaveBeenCalledOnce()
+  })
+
+  it('waits for a live child recovering a large journal and gives the next stage its own deadline', async () => {
+    const owned = { endpoint: 'http://127.0.0.1:3210', pid: 41, serverId: 'server', daemonEpoch: 'epoch', protocolVersion: 8 }
+    let elapsed = 0
+    const service = { start: vi.fn(), stop: vi.fn(), markReady: vi.fn(), startingPid: () => 41,
+      startupStage: () => elapsed < 300_000 ? 'recovering serial journals' : 'starting HTTP service' }
+    await expect(waitForOwnedServiceIdentity(service, async () => elapsed < 310_000 ? undefined : owned,
+      async () => true, async ms => { elapsed += ms }, () => elapsed)).resolves.toBe(owned)
+    expect(service.stop).not.toHaveBeenCalled()
+  })
+
+  it('stops waiting when the user closes the app during recovery', async () => {
+    let pid: number | undefined = 41
+    const service = { start: vi.fn(), stop: vi.fn(), markReady: vi.fn(), startingPid: () => pid,
+      startupStage: () => 'recovering serial journals' }
+    await expect(waitForOwnedServiceIdentity(service, async () => undefined, async () => false,
+      async () => { pid = undefined })).rejects.toThrow('已取消')
   })
 
   it('accepts only the matching child marker and health identity', async () => {
@@ -130,7 +147,6 @@ describe('owned service startup', () => {
           service,
           discover,
           verifyHealth,
-          4,
           async () => undefined
         )
       }

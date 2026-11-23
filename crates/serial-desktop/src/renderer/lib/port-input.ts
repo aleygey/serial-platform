@@ -28,28 +28,34 @@ export class PortInput {
   private state = { buffer: commandBuffer(), receipts: [] as CommandReceipt[], pending: false }
   private listeners = new Set<() => void>()
   private nextId = 0
+  private edits = 0
   snapshot = () => this.state
   subscribe = (listener: () => void) => {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
   }
-  edit(buffer: CommandBuffer): void { this.update({ ...this.state, buffer }) }
+  edit(buffer: CommandBuffer): void {
+    const previous = this.state.buffer
+    if (buffer.value !== previous.value) this.edits++
+    if (buffer.value !== previous.value || buffer.start !== previous.start || buffer.end !== previous.end) {
+      this.update({ ...this.state, buffer })
+    }
+  }
   private update(next: typeof this.state): void {
     this.state = next
     this.listeners.forEach((listener) => listener())
   }
   async submit(command: string, action: () => Promise<HumanCommandSubmission>, clearDraft: boolean): Promise<void> {
     if (this.state.pending) return
-    const original = this.state.buffer.value
+    const original = this.state.buffer
+    const revision = this.edits
     const receipt: CommandReceipt = { id: ++this.nextId, command, status: 'sending' }
-    this.update({ ...this.state, pending: true, receipts: [receipt, ...this.state.receipts].slice(0, 50) })
+    this.update({ ...this.state, buffer: clearDraft ? commandBuffer() : original, pending: true, receipts: [receipt, ...this.state.receipts].slice(0, 50) })
     let result: HumanCommandSubmission
     try { result = await action() }
     catch { result = { status: 'uncertain', message: HUMAN_COMMAND_UNCERTAIN_MESSAGE } }
-    const resolution = resolveCommandSubmission(command, result)
     this.update({
-      buffer: clearDraft && result.status !== 'rejected' && this.state.buffer.value === original
-        ? commandBuffer(resolution.draft) : this.state.buffer,
+      buffer: clearDraft && result.status === 'rejected' && revision === this.edits ? original : this.state.buffer,
       pending: false,
       receipts: [{ ...receipt, ...result }, ...this.state.receipts.slice(1)]
     })

@@ -3,7 +3,6 @@ import { displayCommand, type AgentCommand } from '../lib/history'
 import { useReducedMotion } from '../lib/use-reduced-motion'
 import MatrixOrb from './ui/matrix-orb'
 import { TextEffect } from './ui/text-effect'
-import { RotateCcw } from 'lucide-react'
 
 interface Props {
   port: string
@@ -17,10 +16,9 @@ interface Props {
   onToggleHistory: () => void
   paused: boolean
   onToggleMotion: () => void
-  onReplay?: () => void
 }
 
-export function AgentDock({ port, orbColor, activity, command, action, outcome, expanded, historyId, onToggleHistory, paused, onToggleMotion, onReplay }: Props) {
+export function AgentDock({ port, orbColor, activity, command, action, outcome, expanded, historyId, onToggleHistory, paused, onToggleMotion }: Props) {
   const reduced = useReducedMotion()
   const current = command && (displayCommand(command.text) || 'Enter')
   const state = command && commandState(command, true)
@@ -43,7 +41,7 @@ export function AgentDock({ port, orbColor, activity, command, action, outcome, 
         {reduced || paused ? status.label : <TextEffect key={status.label} as="span" per="line" preset="fade" speedSegment={1.5}>{status.label}</TextEffect>}
       </span>
     </button>
-    {onReplay && <button type="button" className="agent-replay" onClick={onReplay} title="回放模拟设备的外部 Agent 执行过程"><RotateCcw size={13} aria-hidden />回放示例</button>}
+
     <span className="sr-only" role="status">{status.label}</span>
   </div>
 }

@@ -31,7 +31,9 @@ export function humanHistoryCandidates(history: readonly string[], query: string
 export function suggestedSuffix(buffer: CommandBuffer, history: readonly string[]): string {
   if (!buffer.value || buffer.start !== buffer.end || buffer.end !== buffer.value.length) return ''
   // A repeated exact match is not useful ghost text; prefer the next longer match.
-  return humanHistoryCandidates(history, buffer.value).find((item) => item.length > buffer.value.length)?.slice(buffer.value.length) ?? ''
+  const match = history.find(item => item.length > buffer.value.length && item.startsWith(buffer.value)
+    && !/[\r\n\u0000-\u0008\u000b-\u001f\u007f]/.test(item))
+  return match?.slice(buffer.value.length) ?? ''
 }
 
 export function stepHistory(

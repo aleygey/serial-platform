@@ -48,6 +48,22 @@ async function dragFromRail(port, { cancel = false } = {}) {
   await pause(80)
 }
 
+async function dragBetween(fromSelector, toSelector, fraction = 0.25) {
+  const [from, to] = await js(`[${JSON.stringify(fromSelector)}, ${JSON.stringify(toSelector)}].map((selector,index) => {
+    const rect = document.querySelector(selector).getBoundingClientRect()
+    return { x: Math.round(rect.left + rect.width * (index ? ${fraction} : 0.5)), y: Math.round(rect.top + rect.height / 2) }
+  })`)
+  const mouse = (type, point, extra = {}) => window.webContents.sendInputEvent({ type, ...point, ...extra })
+  mouse('mouseMove', from)
+  mouse('mouseDown', from, { button:'left', clickCount:1 })
+  for (let i = 1; i <= 12; i++) {
+    mouse('mouseMove', { x:Math.round(from.x + (to.x-from.x)*i/12), y:Math.round(from.y + (to.y-from.y)*i/12) }, { modifiers:['leftButtonDown'] })
+    await pause(18)
+  }
+  mouse('mouseUp', to, { button:'left', clickCount:1 })
+  await pause(180)
+}
+
 async function fill(value, start = value.length, end = start, port) {
   await js(`(() => {
     const input = document.querySelector(${JSON.stringify((port ? `[data-port="${port}"] ` : '') + '[aria-label="输入串口命令"]')}); input.focus();
@@ -127,6 +143,23 @@ app.whenReady().then(async () => {
   await fill('uptime', 6, 6, 'COM7')
   await until(`document.querySelector('[data-port="COM7"] .live-command')?.dataset.tone === 'working'`)
   assert.equal(await js(`document.querySelectorAll('form.command-bar [data-slot="prompt-box"] [role="combobox"]').length`), 2)
+  await dragBetween('[data-port="COM6"] [data-slot="model-picker"] button', '[data-port="COM7"] .terminal-header', 0.15)
+  await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM7'`)
+  assert.equal(await js(`!!document.querySelector('[data-slot="model-picker-panel"]')`), false)
+  await dragBetween('[data-port="COM7"] .pane-grip', '[data-port="COM6"] .terminal-header', 0.5)
+  await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM6'`)
+  await dragBetween('[data-device-port="COM6"] .device-choice', '[data-device-port="COM7"] .device-choice')
+  await until(`document.querySelector('[data-device-port]').dataset.devicePort === 'COM7'`)
+  await js(`document.querySelector('[aria-label="切换 COM6 机型"]').click()`)
+  await until(`document.querySelector('.picker-level')?.textContent.includes('具体型号')`)
+  await js(`document.querySelector('[aria-label="全部机型系列"]').click()`)
+  await until(`document.querySelectorAll('[role="option"][data-series]').length === 2`)
+  await js(`document.querySelector('[data-id="series:SHT3x"]').click()`)
+  await until(`document.querySelector('.picker-level')?.textContent.includes('SHT3x')`)
+  assert.equal(await js(`(async () => (await window.serial.bootstrap()).configuredPorts.find(p=>p.config.port==='COM6').config.model_family)()`), 'TL-AS7230')
+  await js(`document.querySelector('[role="option"]').click()`)
+  await until(`document.querySelector('[aria-label="切换 COM6 机型"]').title.includes('SHT31 Sensor Board')`)
+  await until(`!document.querySelector('[data-slot="model-picker-panel"]')`)
   await js(`document.querySelector('[aria-label="移动 COM7 分栏"]').focus()`)
   await key('Left')
   await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM7'`)
@@ -231,6 +264,14 @@ app.whenReady().then(async () => {
     await window.serial.savePreferences({...snapshot.preferences});
   })()`)
   await js(`document.querySelector('.settings-sections [data-id="application"]').click()`)
+  await until(`!!document.querySelector('[data-serial-number="终端字号（px）"] button')`)
+  await js(`document.querySelector('[data-serial-number="终端字号（px）"] button').click()`)
+  await until(`!!document.querySelector('[role="option"][data-id="18"]')`)
+  await js(`document.querySelector('[role="option"][data-id="18"]').click()`)
+  await until(`document.documentElement.style.getPropertyValue('--terminal-font-size') === '18px'`)
+  assert.equal(await js(`(async () => (await window.serial.bootstrap()).preferences.terminalFontSize)()`), 18)
+  await until(`!document.querySelector('[data-slot="model-picker-panel"]')`)
+
   await js(`document.querySelector('[role="radio"][aria-label="浅色"]').click()`)
   await until(`document.documentElement.dataset.theme === 'light' && document.querySelector('[aria-label="浅色"]').getAttribute('aria-checked') === 'true'`)
   assert.equal(await js(`document.querySelector('.baud-value input').value`), '57600')
@@ -278,36 +319,44 @@ app.whenReady().then(async () => {
   await js(`document.querySelector('.macro-scroll').scrollTop = 1000`)
   await screenshot('macro-run-result-light.png')
   await until(`!!document.querySelector('.macro-execution [data-slot="step-player"]')`)
-  await window.loadFile(join(__dirname, '../out/renderer/index.html'), { query: { preview: '1', theme: 'dark' } })
-  await until(`!!document.querySelector('[data-port="COM7"] .live-command[data-tone="working"]')`)
-  assert.equal(await js(`document.querySelector('.history-toggle').getAttribute('aria-expanded')`), 'true')
-  await until(`document.querySelectorAll('.action-trigger').length === 4`)
-  assert.equal(await js(`document.querySelectorAll('.action-trigger[aria-expanded="true"]').length`), 4)
-  await until(`document.querySelector('.agent-scroll').scrollHeight > document.querySelector('.agent-scroll').clientHeight`)
-  await js(`document.querySelector('.agent-scroll').scrollTop = 1000`)
-  await until(`document.querySelector('.agent-scroll').scrollTop > 0`)
-  assert.equal(await js(`/回显已匹配|等待回执|已超时/.test(document.querySelector('.history-drawer').innerText)`), false)
-  await dragFromRail('COM6')
-  await until(`document.querySelectorAll('form.command-bar').length === 2`)
-  assert.equal(await js(`document.querySelector('[data-port="COM6"] .history-toggle').getAttribute('aria-expanded')`), 'false')
-  assert.equal(await js(`document.querySelector('[data-port="COM7"] .history-toggle').getAttribute('aria-expanded')`), 'true')
-  await js(`document.querySelector('[data-port="COM6"] .history-toggle').click()`)
-  await until(`!!document.querySelector('[data-port="COM6"] .action-trigger .command-ink[data-tone="failed"]')`)
-  await until(`Array.from(document.querySelectorAll('.port-console')).every(p => {
-    const box = s => p.querySelector(s).getBoundingClientRect()
-    return box('.terminal-pane').height > box('.history-drawer').height && box('.history-drawer').bottom <= box('.command-bar').top + 1 && box('.history-strip').bottom <= box('.command-bar').top + 1
-  })`)
-  await screenshot('console-history-split-dark.png')
-  for (const port of ['COM6','COM7']) await js(`document.querySelector('[aria-label="关闭 ${port} 分栏"]').click()`)
-  await js(`window.serial.refresh()`)
-  await until(`!!document.querySelector('.workspace-empty')`)
-  assert.equal(await js(`(async () => (await window.serial.bootstrap()).configuredPorts.filter(p => p.session_state === 'online').length)()`), 2)
-  await window.loadFile(join(__dirname, '../out/renderer/index.html'), { query: { preview: '1', focus: 'agent' } })
-  await until(`!!document.querySelector('[data-port="COM7"] .agent-replay')`)
+  // Feed recorded external events through the QA bridge from this test process.
+  await window.loadFile(join(__dirname, '../out/renderer/index.html'), { query: { qa:'1' } })
+  await until(`!!document.querySelector('.device-choice')`)
+  const { previewRunEvents } = await import('../src/renderer/preview-run.ts')
+  const recording = previewRunEvents(await js('window.serial.bootstrap()'))
+  await js(`(async () => {
+    const state = await window.serial.bootstrap()
+    const port = state.configuredPorts.find(p => p.config.port === 'COM7')
+    const run = port.active_run, lease = port.control, events = ${JSON.stringify(recording)}
+    const observer = { id:'qa:observer', kind:'human', label:'值班工作台' }
+    const now = Date.now()*1e6
+    port.active_run = null
+    port.control = { ...lease, owner: observer }
+    port.pending_run_start = { id:'qa-request',port:'COM7',requester:run.owner,required_approver:observer,
+      label:run.label,metadata:{},control_ttl_ms:30000,daemon_epoch:port.daemon_epoch,generation:port.generation,
+      requested_wall_time_ns:now,expires_wall_time_ns:now+30e9,expected_control_id:lease.id,expected_fence:lease.fence }
+    state.events.COM7 = events.slice(0,1)
+    await window.serial.savePreferences({})
+    document.querySelector('[data-device-port="COM7"] .device-choice').click()
+    window.deliverRun = () => {
+      let i=1
+      const advance=async () => {
+        const s = await window.serial.bootstrap()
+        const e = events[i++], active = e.kind === 'run_started'
+        if (active || e.kind === 'run_ended') s.configuredPorts = s.configuredPorts.map(p=>p.config.port==='COM7'
+          ? {...p, active_run:active?run:null,control:active?lease:null,pending_run_start:null} : p)
+        s.events = {...s.events,COM7:[...s.events.COM7,e]}
+        await window.serial.savePreferences({})
+        if (i<events.length) setTimeout(advance,active?1450:540)
+      }
+      setTimeout(advance,500)
+    }
+  })()`)
+  await until(`document.querySelector('.history-toggle')?.textContent.trim()==='等待接管授权'`)
   const trace = await js(`(async () => {
-    document.querySelector('.agent-replay').click()
+    window.deliverRun()
     const labels = [], owners = {}, seenCommands = new Set()
-    let previousY = 0, previousScreenY, reversed = false, folded = false, samples = 0, finishedAt
+    let previousY = 0, previousScreenY, reversed, folded = false, samples = 0, finishedAt
     const start = performance.now()
     await new Promise((resolve, reject) => {
       function sample(now) {
@@ -321,7 +370,9 @@ app.whenReady().then(async () => {
           const matrix = new DOMMatrix(getComputedStyle(pointer).transform)
           const rect = pointer.getBoundingClientRect()
           const screenY = rect.top + rect.height / 2
-          reversed ||= matrix.d > 0.05 || matrix.f < previousY - 0.5 || screenY < previousScreenY - 1.5
+          if (!reversed && (matrix.d > 0.05 || matrix.f < previousY - 0.5 || screenY < previousScreenY - 1.5)) {
+            reversed = { step: nav.dataset.activeNode, previousY, localY:matrix.f, previousScreenY, screenY, direction:matrix.d }
+          }
           previousY = matrix.f
           previousScreenY = screenY
           samples++
@@ -343,7 +394,7 @@ app.whenReady().then(async () => {
   assert.equal(trace.owners['读取传感器状态已完成'], 'idle')
   assert.deepEqual(trace.commands, ['version', 'bus status', 'sensor id', 'temp read', 'humidity read', 'sensor read'])
   assert.ok(trace.samples > 20)
-  assert.equal(trace.reversed, false)
+  assert.equal(trace.reversed, undefined, JSON.stringify(trace.reversed))
   assert.equal(trace.folded, false)
   assert.equal(await js(`document.querySelector('.history-toggle').getAttribute('aria-expanded')`), 'true')
   assert.equal(await js(`(() => {
@@ -377,6 +428,31 @@ app.whenReady().then(async () => {
   await until(`document.querySelector('.history-toggle').textContent === '读取传感器状态已完成' && document.querySelectorAll('.action-trigger').length === 4`)
   assert.equal(await js('window.archiveReads'), 1)
   assert.deepEqual(await js(`[...document.querySelectorAll('.action-trigger')].map(b => b.getAttribute('aria-expanded'))`), ['false', 'true', 'true', 'true'])
-  process.stdout.write('PASS: drag docking, per-port history and input, keyboard navigation, themes, macros, and replayed Agent handoff and Run\n')
+  await js(`(async () => {
+    const s = await window.serial.bootstrap(), base = s.events.COM6[0]
+    s.events.COM6 = Array.from({length:12000}, (_,i)=>({...base,kind:'rx',direction:'rx',seq:i+1,text:(i===42?'earlier marker':'line '+i)+'\\n'}))
+    await window.serial.savePreferences({})
+    document.querySelector('[data-device-port="COM6"] .device-choice').click()
+  })()`)
+  await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12000'`)
+  assert.ok(await js(`document.querySelectorAll('.terminal-output > span').length <= 320`))
+  await js(`(async () => {
+    const s=await window.serial.bootstrap(), lines=s.events.COM6
+    s.events.COM6=[...lines.slice(32),...lines.slice(-32).map(e=>({...e,seq:e.seq+32}))]
+    await window.serial.savePreferences({})
+  })()`)
+  await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12032'`)
+  await js(`document.querySelector('.terminal-page').click()`)
+  await until(`!!document.querySelector('.return-live')`)
+  await js(`document.querySelector('.terminal-find-trigger').click()`)
+  await js(`(() => {
+    const input=document.querySelector('input[aria-label="查找"]')
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'earlier marker')
+    input.dispatchEvent(new Event('input',{bubbles:true}))
+  })()`)
+  await until(`document.querySelector('.term-search-hit.is-current')?.closest('[data-seq]')?.dataset.seq === '43'`)
+  await js(`document.querySelector('[aria-label="关闭查找 (Escape)"]').click(); document.querySelector('.return-live').click()`)
+  await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12032'`)
+  process.stdout.write('PASS: drag docking, per-port history and input, keyboard navigation, themes, model selection, font size, macros, and external Agent handoff and Run\n')
   app.exit(0)
 }).catch((error) => { process.stderr.write(`${error.stack}\n`); app.exit(1) })

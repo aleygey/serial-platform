@@ -1,4 +1,3 @@
-import { setTimeout as delay } from 'node:timers/promises'
 import type {
   DesktopEvent,
   DesktopPreferences,
@@ -45,10 +44,30 @@ export class DesktopCoordinator {
   private qaTheme?: 'dark' | 'light'
 
   constructor(emit: (event: DesktopEvent) => void, qaMode = false, qaTheme?: 'dark' | 'light') {
-    this.emit = emit
+    let pending: TimelineEvent[] = []
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const flush = () => {
+      clearTimeout(timer)
+      timer = undefined
+      if (pending.length) emit({ type: 'timeline-batch', events: pending })
+      pending = []
+    }
+    this.emit = event => {
+      if (event.type === 'timeline') {
+        pending.push(event.event)
+        if (pending.length >= 256) flush()
+        else timer ??= setTimeout(flush, 32)
+      } else {
+        flush()
+        emit(event)
+      }
+    }
     this.qaMode = qaMode
     this.qaTheme = qaTheme
-    this.service = new LocalService((service) => this.emit({ type: 'service', service }))
+    this.service = new LocalService(
+      service => this.emit({ type: 'service', service }),
+      message => this.setConnection('starting', message)
+    )
   }
 
   bootstrap(): Promise<DesktopSnapshot> {
@@ -198,18 +217,19 @@ export class DesktopCoordinator {
 
   async startLocalService(): Promise<void> {
     if (this.qaMode) return
-    const preferences = this.preferences ?? (await this.settings.load())
-    const existing = await this.findExistingLocalClient(preferences.endpoint, true)
-    if (existing) {
-      this.emit({ type: 'notice', message: '已连接该地址上的现有服务，App 不会接管它的进程' })
-    } else {
-      await this.startServiceOrRecoverWinner(preferences.endpoint)
+    if (this.client && this.connection === 'connected') return
+    // Share the verified client with bootstrap and concurrent clicks, including
+    // the cancellable initial history read on a freshly started local service.
+    if (!this.initialSnapshot) {
+      this.initialSnapshot = (async () => {
+        await this.client?.stop()
+        this.client = undefined
+        return this.connectOrOffline(true)
+      })().finally(() => { this.initialSnapshot = undefined })
     }
-    if (!this.client) {
-      const snapshot = await this.connectOrOffline(false)
-      this.emit({ type: 'snapshot', snapshot })
-      if (snapshot.connection !== 'connected') throw new Error(snapshot.connectionMessage)
-    }
+    const snapshot = await this.initialSnapshot
+    this.emit({ type: 'snapshot', snapshot })
+    if (snapshot.connection !== 'connected') throw new Error(snapshot.connectionMessage)
   }
 
   async stopLocalService(): Promise<void> {
@@ -242,6 +262,7 @@ export class DesktopCoordinator {
       }
       this.bindClient(client)
       this.client = client
+      this.setConnection('starting', '正在读取最近的串口记录…')
       const data = await client.start()
       this.setConnection('connected', '实时连接已建立')
       return this.toSnapshot(data)
@@ -317,7 +338,7 @@ export class DesktopCoordinator {
   }
 
   private async startServiceOrRecoverWinner(preferred: string): Promise<SerialClient> {
-    const probe = new SerialClient(preferred)
+    const probe = new SerialClient(preferred, true)
     try {
       await startAndVerifyService(this.service, preferred, () => this.waitUntilOwnedService(probe))
       return probe
@@ -362,9 +383,7 @@ export class DesktopCoordinator {
         } catch {
           return false
         }
-      },
-      40,
-      () => delay(150)
+      }
     )
   }
 

@@ -75,6 +75,17 @@ describe('desktop backend controls', () => {
       .toBe(snapshot)
   })
 
+  it('merges mixed-port batches once, keeping cursor order and rejecting stale epochs', () => {
+    const snapshot = createQaSnapshot()
+    const a = snapshot.events.COM6.at(-1)!, b = snapshot.events.COM7.at(-1)!
+    const next = { ...a, seq:a.seq + 1 }, other = { ...b, seq:b.seq + 1 }
+    const batch = { type:'timeline-batch' as const, events:[next, other, a, next, { ...next, daemon_epoch:'old' }] }
+    const result = mergeDesktopSnapshotEvent(snapshot, batch)!
+    expect(result.events.COM6).toEqual([...snapshot.events.COM6, next])
+    expect(result.events.COM7).toEqual([...snapshot.events.COM7, other])
+    expect(mergeDesktopSnapshotEvent(result, batch)).toBe(result)
+  })
+
   it('exposes a reachable stop action only for an App-owned backend', () => {
     const owned = createQaSnapshot()
     const ownedMarkup = renderToStaticMarkup(
@@ -160,8 +171,8 @@ describe('desktop backend controls', () => {
     const familyMarkup = renderToStaticMarkup(
       <ModelFamilyEditor families={snapshot.modelFamilies} configuredPorts={snapshot.configuredPorts} onSave={action} />
     )
-    expect(familyMarkup).toMatch(/aria-label="删除一级机型 TL-AS7230"[^>]*disabled=""/)
-    expect(familyMarkup).toMatch(/aria-label="二级具体型号 1"[^>]*readOnly=""/)
+    expect(familyMarkup).toMatch(/aria-label="删除机型系列 TL-AS7230"[^>]*disabled=""/)
+    expect(familyMarkup).toMatch(/aria-label="具体型号 1"[^>]*readOnly=""/)
     expect(familyMarkup).toMatch(/aria-label="删除具体型号 TL-AS7230-W 1.0"[^>]*disabled=""/)
     expect(familyMarkup).not.toContain('已绑定 COM6')
   })

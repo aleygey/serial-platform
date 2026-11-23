@@ -29,3 +29,10 @@ export const palettes = {
 export type PaletteId = keyof typeof palettes
 export const paletteId = (value: unknown): PaletteId =>
   typeof value === 'string' && Object.hasOwn(palettes, value) ? value as PaletteId : 'harbor'
+
+export const terminalFontSizes = Array.from({ length: 19 }, (_, index) => 10 + index)
+
+export function terminalFontSize(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(10, Math.min(28, Math.round(value))) : 13
+}

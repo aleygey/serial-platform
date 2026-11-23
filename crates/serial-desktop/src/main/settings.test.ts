@@ -16,8 +16,8 @@ describe('desktop preferences', () => {
       expect(defaults.autoStartLocal).toBe(true)
       expect(defaults.firstUse).toBe('new')
 
-      await store.save({ ...defaults, autoStartLocal: false, firstUse: 'complete' })
-      expect(await store.load()).toMatchObject({ autoStartLocal: false, firstUse: 'complete' })
+      await store.save({ ...defaults, autoStartLocal: false, firstUse: 'complete', terminalFontSize: 18 })
+      expect(await store.load()).toMatchObject({ autoStartLocal: false, firstUse: 'complete', terminalFontSize: 18 })
       const previousPreferences = {
         endpoint: 'http://127.0.0.1:4321',
         autoStartLocal: false,

@@ -8,9 +8,10 @@ type EchoChunk = Pick<TerminalDocumentChunk, 'key' | 'text'>
 
 // Only color an exact echoed line immediately following its TX. A later occurrence may be device output.
 export function commandEchoStyles(events: TimelineEvent[], chunks: readonly EchoChunk[], commands: AgentCommand[], current?: AgentCommand) {
+  const styles = new Map<string, EchoStyle>()
+  if (!commands.length) return styles
   const writes = new Map(commands.map(command => [command.daemonEpoch + ':' + command.firstSeq, command]))
   const textByKey = new Map(chunks.map(chunk => [chunk.key, chunk.text]))
-  const styles = new Map<string, EchoStyle>()
   let pending: { rest: string; tone: StateTone; generation: number; epoch: string; pieces: [string, number][] } | undefined
   let previous: number | undefined
   for (const event of events) {

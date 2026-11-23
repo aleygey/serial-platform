@@ -34,6 +34,6 @@ export function ModelIdentityPicker({ families, family, name, onChange, label = 
   })))
   const value = name ? JSON.stringify([family ?? null, name]) : ''
   if (name && !models.some(model => model.id === value)) models.unshift({ id: value, name, provider: family ?? '', family: family ?? '' })
-  return <ModelPicker label={label} value={value} disabled={disabled} searchable searchPlaceholder="搜索机型…" models={[...models, { id: '', name: '未指定机型' }]}
-    onChange={id => { const model = models.find(item => item.id === id); onChange(model?.family ?? null, model?.name ?? null) }} />
+  return <ModelPicker label={label} value={value} disabled={disabled} searchable browseFamilies searchPlaceholder="搜索系列或具体型号…" models={[...models, { id: '', name: '未指定机型' }]}
+    onChange={id => { const model = models.find(item => item.id === id); onChange(model?.family || null, model?.name ?? null) }} />
 }

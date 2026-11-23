@@ -31,8 +31,8 @@ export function reorderPane(layout: PaneLayout, port: string, target: string): P
   const to = layout.ports.indexOf(target)
   if (from < 0 || to < 0 || from === to) return layout
   const ports = [...layout.ports]
-  ports.splice(from, 1)
-  ports.splice(to, 0, port)
+  ports[from] = target
+  ports[to] = port
   return { ...layout, ports }
 }
 

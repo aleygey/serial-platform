@@ -1,5 +1,5 @@
 import type { DesktopBridge, DesktopEvent, DesktopPreferences, MacroDefinition, MacroExecution, TimelineEvent } from '../shared/contracts'
-import { previewMacro, previewRunEvents } from './preview-run'
+import { previewMacro } from './preview-run'
 import { createQaSnapshot } from '../shared/qa-fixture'
 import { paletteId } from '../shared/appearance'
 import { setupChanges, type SetupRequest, type SetupPlan } from '../shared/first-setup'
@@ -10,17 +10,16 @@ export function installQaBridge(): boolean {
   const params = new URLSearchParams(runtimeWindow.location.search)
   const demo = document.documentElement.hasAttribute('data-serial-preview') || params.get('preview') === '1'
   if (!demo && params.get('qa') !== '1') return false
-  if (demo && params.get('focus') === 'agent') document.documentElement.dataset.serialFocus = 'agent'
   const theme = params.get('theme')
-  let saved: Pick<Partial<DesktopPreferences>, 'palette' | 'theme' | 'firstUse'> = {}
+  let saved: Pick<Partial<DesktopPreferences>, 'palette' | 'theme' | 'firstUse' | 'terminalFontSize'> = {}
   if (demo) {
     try { saved = JSON.parse(window.localStorage.getItem('serial-preview-appearance') ?? '{}') ?? {} } catch { /* Storage may be disabled in an embedded preview. */ }
   }
   const preferences: DesktopPreferences = {
     endpoint: 'http://127.0.0.1:3210', autoStartLocal: true,
     theme: theme === 'light' || theme === 'dark' ? theme : saved.theme === 'dark' || saved.theme === 'system' ? saved.theme : demo ? 'light' : 'system',
-    palette: paletteId(saved.palette), selectedPort: demo ? 'COM7' : 'COM6',
-    firstUse: saved.firstUse ?? (document.documentElement.hasAttribute('data-serial-preview') && document.documentElement.dataset.serialFocus !== 'agent' ? 'new' : 'dismissed')
+    palette: paletteId(saved.palette), terminalFontSize: saved.terminalFontSize, selectedPort: demo ? 'COM7' : 'COM6',
+    firstUse: saved.firstUse ?? (document.documentElement.hasAttribute('data-serial-preview') ? 'new' : 'dismissed')
   }
   let snapshot = createQaSnapshot(preferences)
   const listeners = new Set<(event: DesktopEvent) => void>()
@@ -28,32 +27,20 @@ export function installQaBridge(): boolean {
   const human = { id: 'preview:human', label: '本机', kind: 'human' as const }
   snapshot.actor = human
   const sensor = snapshot.configuredPorts.find(item => item.config.port === 'COM7')!
-  const recording = demo ? previewRunEvents(snapshot) : []
   if (demo) {
-    const initial = recording.slice(0, -3)
-    snapshot.events.COM7 = initial
-    sensor.head_seq = initial.at(-1)!.seq
-    const router = snapshot.configuredPorts.find(item => item.config.port === 'COM6')!
-    const base = snapshot.events.COM6.at(-1)!
-    const tx = { ...base, kind: 'tx', direction: 'tx' as const, actor: sensor.control!.owner, operation_id: 'aux-probe', seq: base.seq + 1,
-      text: 'aux status\r', metadata: { command_description: '查询扩展模块' } }
-    const rx = { ...base, seq: tx.seq + 1, text: 'aux status\n' }
-    const timeout = { ...base, kind: 'command_capture_completed', direction: 'none' as const, seq: rx.seq + 1, text: '', operation_id: tx.operation_id,
-      metadata: { capture: { daemon_epoch: router.daemon_epoch, generation: router.generation, operation_id: tx.operation_id,
-        tx_event_seq: tx.seq, evidence_from_seq: tx.seq, evidence_through_seq: rx.seq, completion: 'timeout', confidence: 'partial' } } }
-    snapshot.events.COM6 = [...snapshot.events.COM6, tx, rx, timeout]
-    router.head_seq = timeout.seq
+    sensor.control = null
+    sensor.active_run = null
+    for (const port of snapshot.configuredPorts) {
+      snapshot.events[port.config.port] = (snapshot.events[port.config.port] ?? []).filter(event => event.direction === 'rx' && !event.run_id).slice(0, 1)
+      port.head_seq = snapshot.events[port.config.port].at(-1)?.seq ?? 0
+    }
   }
-  let playback: number | undefined
   let macroTimer: number | undefined
   let execution: MacroExecution | undefined
   const macros = new Map<string, MacroDefinition>(demo ? [[previewMacro.id, previewMacro]] : [])
-  const tasks = new Map<string, { task: SetupRequest; readyAt: number }>()
   const checks = new Map<string, SetupPlan>()
-  const appliedTasks: SetupRequest[] = []
-  function applyPreviewTask(task: SetupRequest, expectedRevision?: number): MacroDefinition {
+  function restorePreviewTask(task: SetupRequest): void {
     const changes = setupChanges(task, snapshot.configuredPorts.map(p => p.config), snapshot.modelProfiles)
-    if (!changes.alreadyBound && expectedRevision !== undefined && expectedRevision !== snapshot.configRevision) throw new Error('串口配置已改变，请重新确认。')
     const previous = macros.get(changes.macro.id)
     if (previous && previous.script !== changes.macro.script) throw new Error('宏已被编辑，请重新生成任务。')
     const definition = previous ?? { ...changes.macro, language_version: 1, revision: 1, shared: true, updated_at_ns: Date.now() * 1_000_000 }
@@ -61,13 +48,11 @@ export function installQaBridge(): boolean {
     checks.set(definition.id, task.plan!)
     snapshot = { ...snapshot, modelProfiles: changes.profiles, configRevision: snapshot.configRevision + (changes.alreadyBound ? 0 : 1),
       configuredPorts: snapshot.configuredPorts.map(p => p.config.port === task.brief.port ? { ...p, config: changes.ports.find(c => c.port === task.brief.port)!, effective_shell_prompt: task.plan!.shell_prompt } : p) }
-    if (!appliedTasks.some(t => t.id === task.id)) appliedTasks.push(task)
-    return definition
   }
   if (demo) {
     try {
       const stored: SetupRequest[] = JSON.parse(window.localStorage.getItem('serial-preview-setups') ?? '[]')
-      for (const task of stored) if (task.plan) applyPreviewTask(task)
+      for (const task of stored) if (task.plan) restorePreviewTask(task)
     } catch { /* Embedded previews may have no storage. */ }
   }
   const echoedPrompt = (port: string) => port === 'COM7' ? 'sensor> ' : port === 'COM6' ? 'root@router:~# ' : 'uart> '
@@ -83,76 +68,14 @@ export function installQaBridge(): boolean {
       configuredPorts: snapshot.configuredPorts.map(item => item === current ? { ...current, head_seq: seq } : item) }
     return seq
   }
-  function replaySampleRun() {
-    window.clearTimeout(playback)
-    const humanMacro = execution?.port === 'COM7' && execution.status === 'running'
-    if (humanMacro) {
-      listeners.forEach(listener => listener({ type: 'notice', message: 'COM7 正在回放宏，结束后可回放示例 Run。' }))
-      return
-    }
-    hidden.set('COM7', [])
-    visibilityRevision++
-    const approver = { id:'preview:operator', label:'值班工作台', kind:'human' as const }
-    const lease = { ...sensor.control!, owner:approver }
-    const now = Date.now() * 1e6
-    const request = { id:'sample-handoff', port:'COM7', requester:sensor.active_run!.owner, required_approver:approver,
-      label:sensor.active_run!.label, metadata:{}, control_ttl_ms:30_000, daemon_epoch:sensor.daemon_epoch, generation:sensor.generation,
-      expected_control_id:lease.id, expected_fence:lease.fence, requested_wall_time_ns:now, expires_wall_time_ns:now + 30e9 }
-    snapshot = { ...snapshot, events: { ...snapshot.events, COM7: recording.slice(0, 1) },
-      configuredPorts: snapshot.configuredPorts.map(item => item.config.port === 'COM7'
-        ? { ...item, config: { ...item.config, enabled: true }, session_state: 'online', head_seq: 1, active_run: null, control:lease, pending_run_start:request } : item) }
-    publish()
-    const mapped = new Map([[1, 1]])
-    let index = 1
-    const advance = () => {
-      if (!online('COM7')) return
-      const entry = recording[index++]
-      let metadata = entry.metadata
-      if (entry.kind === 'command_capture_completed') {
-        const c = metadata.capture as Record<string, number>
-        metadata = { ...metadata, capture: { ...c, tx_event_seq: mapped.get(c.tx_event_seq), evidence_from_seq: mapped.get(c.evidence_from_seq), evidence_through_seq: mapped.get(c.evidence_through_seq) } }
-      }
-      if (entry.kind === 'run_started' || entry.kind === 'run_ended') {
-        const active = entry.kind === 'run_started'
-        snapshot = { ...snapshot, configuredPorts: snapshot.configuredPorts.map(item => item.config.port === 'COM7'
-          ? { ...item, active_run: active ? sensor.active_run : null, control: active ? sensor.control : null, pending_run_start:null } : item) }
-      }
-      mapped.set(entry.seq, append('COM7', { ...entry, metadata }))
-      publish()
-      if (index < recording.length) playback = window.setTimeout(advance, entry.kind === 'run_started' ? 1650 : 540)
-    }
-    playback = window.setTimeout(advance, 1300)
-  }
   const emitMacro = (value: MacroExecution) => {
     execution = value
     listeners.forEach(listener => listener({ type: 'macro', execution: value }))
   }
   const bridge: DesktopBridge = {
-    createSetup: async brief => {
-      const task: SetupRequest = { id: crypto.randomUUID(), brief, plan: null, agent: null }
-      tasks.set(task.id, { task, readyAt: Date.now() + 1800 })
-      return task
-    },
-    readSetup: async id => {
-      const entry = tasks.get(id)
-      if (!entry) throw new Error('示例任务已结束，请重新生成任务。')
-      const { task, readyAt } = entry
-      if (!task.plan && Date.now() >= readyAt) entry.task = {
-        ...task, agent: '示例 Agent', plan: { shell_prompt: task.brief.prompt_hint || echoedPrompt(task.brief.port),
-          command: task.brief.check === 'heartbeat' ? '' : 'version', expected_reply: task.brief.check === 'heartbeat' ? '' : 'firmware' }
-      }
-      return entry.task
-    },
-    applySetup: async (id, revision) => {
-      const task = await bridge.readSetup(id)
-      const definition = applyPreviewTask(task, revision)
-      if (demo) {
-        try { window.localStorage.setItem('serial-preview-setups', JSON.stringify(appliedTasks)) } catch { /* Optional preview storage. */ }
-      }
-      publish()
-      return definition
-    },
-    ...(demo && { replaySampleRun }),
+    createSetup: async () => { throw new Error('请在桌面应用中创建配置任务，外部 Agent 将通过 Serial MCP 接收任务。') },
+    readSetup: async () => { throw new Error('请在创建任务的桌面应用中查看 Agent 方案。') },
+    applySetup: async () => { throw new Error('请在桌面应用中应用 Agent 方案。') },
     agentHistory: async port => ({ server_id: 'qa-server', runs: [], visibility: { revision: visibilityRevision, hidden: hidden.get(port) ?? [] }, truncated: false, indexing: false }),
     clearAgentHistory: async (port, ids) => {
       const ended = (snapshot.events[port] ?? []).filter(e => ['run_ended', 'run_aborted'].includes(e.kind) && e.run_id).map(e => e.run_id!)
@@ -165,7 +88,6 @@ export function installQaBridge(): boolean {
     bootstrap: async () => snapshot,
     refresh: async () => { publish(); return snapshot },
     sendCommand: async (port, command) => {
-      if (demo) await new Promise(resolve => window.setTimeout(resolve, 240))
       if (!online(port)) return { status: 'rejected', message: '模拟串口未打开' }
       append(port, { kind: 'tx', direction: 'tx', text: command + '\r', actor: human })
       const output = command.trim() === 'version' ? 'firmware  2.4.1\n' : ''
@@ -236,7 +158,6 @@ export function installQaBridge(): boolean {
     setPortOpen: async (port, open) => {
       const run = snapshot.configuredPorts.find(item => item.config.port === port)?.active_run
       if (!open && run) {
-        if (port === 'COM7') window.clearInterval(playback)
         append(port, { kind: 'run_aborted', direction: 'none', text: '', run_id: run.id, metadata: { run } })
       }
       snapshot = {
@@ -273,7 +194,7 @@ export function installQaBridge(): boolean {
       const next = { ...snapshot.preferences, ...patch }
       snapshot = { ...snapshot, preferences: next }
       if (demo) {
-        try { window.localStorage.setItem('serial-preview-appearance', JSON.stringify({theme:next.theme, palette:next.palette, firstUse:next.firstUse})) } catch { /* Optional preview storage. */ }
+        try { window.localStorage.setItem('serial-preview-appearance', JSON.stringify({theme:next.theme, palette:next.palette, terminalFontSize:next.terminalFontSize, firstUse:next.firstUse})) } catch { /* Optional preview storage. */ }
       }
       publish()
     },
@@ -300,7 +221,6 @@ export function installQaBridge(): boolean {
       return () => listeners.delete(listener)
     }
   }
-  if (demo && (document.documentElement.hasAttribute('data-serial-preview') || document.documentElement.dataset.serialFocus === 'agent')) replaySampleRun()
   Object.defineProperty(runtimeWindow, 'serial', { value: bridge, configurable: false })
   return true
 }
