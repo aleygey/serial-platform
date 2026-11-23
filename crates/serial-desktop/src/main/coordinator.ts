@@ -2,6 +2,7 @@ import type {
   DesktopEvent,
   DesktopPreferences,
   DesktopSnapshot,
+  HumanCommandHistory,
   HumanCommandSubmission,
   MacroListQuery,
   MacroSaveRequest,
@@ -9,6 +10,7 @@ import type {
   MacroExecution,
   ModelFamily,
   ModelProfile,
+  PortSnapshot,
   RunStartDecision,
   SerialConfigurationDraft,
   TimelineEvent
@@ -23,7 +25,7 @@ import {
   serialdIdentityMatches,
   type ServerData
 } from './serial-client'
-import { selectLocalEndpoint, type DiscoveredSeriald } from './service-command'
+import { canTryLocalStartup, selectLocalEndpoint, type DiscoveredSeriald } from './service-command'
 import { SettingsStore } from './settings'
 import {
   recoverConcurrentWinner,
@@ -46,17 +48,23 @@ export class DesktopCoordinator {
   constructor(emit: (event: DesktopEvent) => void, qaMode = false, qaTheme?: 'dark' | 'light') {
     let pending: TimelineEvent[] = []
     let timer: ReturnType<typeof setTimeout> | undefined
+    let lastBatch = -Infinity
     const flush = () => {
       clearTimeout(timer)
       timer = undefined
-      if (pending.length) emit({ type: 'timeline-batch', events: pending })
+      if (!pending.length) return
+      lastBatch = performance.now()
+      emit({ type: 'timeline-batch', events: pending })
       pending = []
     }
     this.emit = event => {
       if (event.type === 'timeline') {
         pending.push(event.event)
-        if (pending.length >= 256) flush()
-        else timer ??= setTimeout(flush, 32)
+        // Deliver an idle port's first output immediately. Coalesce a running
+        // stream for at most half a 60 Hz frame, measured from the last delivery.
+        const remaining = 8 - (performance.now() - lastBatch)
+        if (remaining <= 0 || pending.length >= 256) flush()
+        else timer ??= setTimeout(flush, Math.ceil(remaining))
       } else {
         flush()
         emit(event)
@@ -289,7 +297,17 @@ export class DesktopCoordinator {
   private bindClient(client: SerialClient): void {
     client.on('macro', (execution: MacroExecution) => this.emit({ type: 'macro', execution }))
     client.on('timeline', (event: TimelineEvent) => this.emit({ type: 'timeline', event }))
-    client.on('snapshot', () => void this.publishSnapshot())
+    client.on('snapshot', (port?: PortSnapshot) => {
+      if (client !== this.client) return
+      if (port) this.emit({ type: 'port-status', port })
+      else void this.publishSnapshot()
+    })
+    client.on('human-history', (history: HumanCommandHistory) => {
+      if (client === this.client) this.emit({ type: 'human-history', history })
+    })
+    client.on('port-history', (event: Extract<DesktopEvent, { type: 'port-history' }>) => {
+      if (client === this.client) this.emit(event)
+    })
     client.on('connected', () => this.setConnection('connected', '实时连接已建立'))
     client.on('disconnected', () => this.setConnection('reconnecting', '实时连接中断，正在重连…'))
     client.on('notice', (message: string) => this.emit({ type: 'notice', message }))
@@ -321,7 +339,7 @@ export class DesktopCoordinator {
       ? await selectLocalEndpoint(preferred, reachable, () => this.service.discoverEndpoint())
       : (await reachable(preferred) ? { endpoint: preferred, discovered: false } : undefined)
     if (!selection) {
-      if (preferredError && !(discoverActive && isUnusedLocalEndpoint(preferred, preferredError))) {
+      if (preferredError && !(discoverActive && canTryLocalStartup(preferred, preferredError))) {
         throw preferredError
       }
       return undefined
@@ -338,7 +356,7 @@ export class DesktopCoordinator {
   }
 
   private async startServiceOrRecoverWinner(preferred: string): Promise<SerialClient> {
-    const probe = new SerialClient(preferred, true)
+    const probe = new SerialClient(preferred)
     try {
       await startAndVerifyService(this.service, preferred, () => this.waitUntilOwnedService(probe))
       return probe
@@ -377,7 +395,6 @@ export class DesktopCoordinator {
       this.service,
       () => this.service.discoverEndpoint(),
       async (discovered) => {
-        if (discovered.endpoint !== probe.endpoint) return false
         try {
           return serialdIdentityMatches(await probe.healthIdentity(), discovered)
         } catch {
@@ -433,13 +450,6 @@ export class DesktopCoordinator {
     if (!this.client) throw new Error('尚未连接 Serial Platform 后端')
     return this.client
   }
-}
-
-function isUnusedLocalEndpoint(endpoint: string, error: unknown): boolean {
-  const cause = error instanceof TypeError ? error.cause as NodeJS.ErrnoException | undefined : undefined
-  if (cause?.code !== 'ECONNREFUSED') return false
-  const { hostname, protocol } = new URL(endpoint)
-  return protocol === 'http:' && (hostname === 'localhost' || hostname === '[::1]' || /^127(?:\.\d+){3}$/.test(hostname))
 }
 
 function errorMessage(error: unknown): string {

@@ -1,4 +1,5 @@
 import { PortInput } from './port-input'
+import type { HumanCommandSubmission } from '../../shared/contracts'
 import { describe, expect, it } from 'vitest'
 import { acceptsSuggestion, commandBuffer, humanHistoryCandidates, stepHistory, suggestedSuffix } from './command-editor'
 
@@ -46,4 +47,36 @@ it('keeps new typing while an earlier write is awaiting acknowledgement, restori
   expect(input.snapshot().buffer.value).toBe('second')
   await input.submit('second', async () => ({ status:'rejected', message:'busy' }), true)
   expect(input.snapshot().buffer.value).toBe('second')
+})
+
+it('dispatches successive commands, signals and empty Returns in order before any acknowledgement', async () => {
+  const input = new PortInput()
+  const sent: string[] = []
+  const finish: Array<(result: HumanCommandSubmission) => void> = []
+  function send(value: string, clear = true) {
+    return input.submit(value, () => {
+      sent.push(value)
+      return new Promise(resolve => finish.push(resolve))
+    }, clear)
+  }
+  input.edit(commandBuffer('version'))
+  const first = send('version')
+  const enter = send('')
+  const signal = send('Ctrl+C', false)
+  input.edit(commandBuffer('status'))
+  const last = send('status')
+  expect(sent).toEqual(['version', '', 'Ctrl+C', 'status'])
+  finish[3]({ status: 'accepted' })
+  finish[2]({ status: 'uncertain', message: 'disconnected' })
+  await Promise.all([last, signal])
+  expect(input.snapshot().pending).toBe(true)
+  finish[0]({ status: 'rejected', message: 'busy' })
+  finish[1]({ status: 'accepted' })
+  await Promise.all([first, enter])
+  expect(input.snapshot().pending).toBe(false)
+  expect(input.snapshot().buffer.value).toBe('')
+  expect(input.snapshot().receipts.map(r => [r.command, r.status])).toEqual([
+    ['status', 'accepted'], ['Ctrl+C', 'uncertain'], ['', 'accepted'], ['version', 'rejected']
+  ])
+  expect(sent).toHaveLength(4)
 })

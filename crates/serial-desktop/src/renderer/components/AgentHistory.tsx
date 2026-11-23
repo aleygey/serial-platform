@@ -107,17 +107,24 @@ export function AgentHistory({ view, visible, items, paused, activeRunId, curren
   }
 
   function actionRow(action: Extract<AgentHistoryItem, { kind: 'command' }>) {
+    if (action.actionKind === 'macro') {
+      const state = action.macro ? macroExecutionLabel(action.macro) : { label: '已记录', tone: 'idle' }
+      return <div className="outline-action" key={action.id}>
+        <div className="outline-trigger macro-summary" data-rail-node={action.id} data-depth="0" title={action.description + ' · ' + state.label}>
+          <span className="outline-label"><strong className="command-ink" data-tone={state.tone}>{action.description}</strong></span>
+          <span className="sr-only">{state.label}</span>
+        </div>
+      </div>
+    }
     const open = openRows[action.id] ?? true
-    const isMacro = action.actionKind === 'macro'
-    const multi = isMacro || action.actionKind === 'trigger' || action.actionKind === 'sequence' || action.commands.length > 1
+    const multi = action.actionKind === 'trigger' || action.actionKind === 'sequence' || action.commands.length > 1
     const marks = action.commands.map((command, index) => ({
       index: command.stepIndex ?? index, ...commandState(command, command === currentCommand),
     }))
     const last = marks.at(-1)
-    const stepLabel = isMacro || action.actionKind === 'trigger' ? `已记录 ${action.commands.length} 条命令` : action.stepCount
+    const stepLabel = action.actionKind === 'trigger' ? `已记录 ${action.commands.length} 条命令` : action.stepCount
       ? `已记录 ${action.commands.length} / ${action.stepCount} 步` : `已记录 ${action.commands.length} 步`
-    const macroStatus = action.macro && macroExecutionLabel(action.macro)
-    let state: ExecutionState | undefined = macroStatus ?? last
+    let state: ExecutionState | undefined = last
     if (action.triggerStatus) state = triggerState(action.triggerStatus)
     if (action.actionKind === 'sequence') {
       const issue = marks.find(mark => mark.tone === 'failed' || mark.tone === 'waiting')
@@ -128,7 +135,7 @@ export function AgentHistory({ view, visible, items, paused, activeRunId, curren
         state = { tone: 'done', label: '全部已回执' }
       }
     }
-    const name = action.description.replace(/^Macro · /, '')
+    const name = action.description
     const detail = [name, state?.label, multi && stepLabel].filter(Boolean).join(' · ')
     return <div className="outline-action" key={action.id}>
       <button className="outline-trigger action-trigger" type="button" data-rail-node={action.id} data-depth="0"

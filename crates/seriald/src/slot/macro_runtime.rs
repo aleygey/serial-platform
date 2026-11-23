@@ -16,6 +16,7 @@ struct Stop {
 
 pub(super) struct ActiveMacro {
     info: SharedInfo,
+    definition_name: Option<String>,
     control_id: Uuid,
     fence: u64,
     deadline: Instant,
@@ -48,6 +49,9 @@ impl ActiveMacro {
         let info = self.snapshot();
         metadata.insert("macro_execution_id".into(), json!(info.id));
         metadata.insert("macro_id".into(), json!(info.macro_id));
+        if let Some(name) = &self.definition_name {
+            metadata.insert("macro_name".into(), json!(name));
+        }
         metadata.insert("macro_description".into(), json!(info.description));
         metadata.insert("macro_revision".into(), json!(info.revision));
         metadata.insert("macro_line".into(), json!(info.line));
@@ -259,16 +263,20 @@ impl SlotActor {
         }
         info.through_seq = self.seq;
         info.completed_at_ns.get_or_insert_with(wall_time_ns);
+        let mut completion = metadata([
+            ("macro_execution", json!(info)),
+            ("macro_phase", json!("completed")),
+        ]);
+        if let Some(name) = active.definition_name {
+            completion.insert("macro_name".into(), json!(name));
+        }
         self.emit(
             EventKind::Checkpoint,
             Direction::None,
             Vec::new(),
             Some(info.owner.clone()),
             Some(id),
-            metadata([
-                ("macro_execution", json!(info)),
-                ("macro_phase", json!("completed")),
-            ]),
+            completion,
         )
         .await;
         self.terminal_macros.insert(id, info);
@@ -498,6 +506,7 @@ impl SlotActor {
                 let deadline = Instant::now() + Duration::from_secs(prepared.spec.timeout_seconds);
                 self.active_macro = Some(ActiveMacro {
                     info: shared.clone(),
+                    definition_name: prepared.definition.as_ref().map(|d| d.name.clone()),
                     control_id,
                     fence,
                     deadline,
@@ -2107,6 +2116,7 @@ mod tests {
             let (stop, _receiver) = watch::channel(None);
             let active = ActiveMacro {
                 info: Arc::new(StdMutex::new(*execution)),
+                definition_name: None,
                 control_id: f.lease.id,
                 fence: f.lease.fence,
                 deadline: Instant::now() + Duration::from_secs(1),

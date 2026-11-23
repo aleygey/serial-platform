@@ -204,15 +204,20 @@ app.whenReady().then(async () => {
   await key('Escape')
   await key('K', process.platform === 'darwin' ? ['meta'] : ['control'])
   assert.equal(await js(`document.activeElement.closest('[data-port]').dataset.port`), 'COM7')
-  await js(`window.serial.sendCommand = (port, command) => { window.qaCommands.push({port, command}); return new Promise(resolve => window.qaFinish = resolve); }; true`)
+  await js(`window.qaPending = []; window.serial.sendCommand = (port, command) => { window.qaCommands.push({port, command}); return new Promise(resolve => window.qaPending.push(resolve)); }; true`)
   await key('Enter')
-  await until(`document.querySelector('[data-port="COM7"] .send-button').disabled`)
+  await until(`document.querySelector('[data-port="COM7"] .send-button').getAttribute('aria-busy') === 'true'`)
   assert.deepEqual(await js('window.qaCommands.at(-1)'), { port:'COM7', command:'uptime' })
+  await key('Enter')
+  await js(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', repeat:true, bubbles:true, cancelable:true }))`)
+  await fill('next line', 9, 9, 'COM7')
+  await key('Enter')
+  assert.deepEqual(await js('window.qaCommands.slice(-4).map(x=>x.command)'), ['uptime', '', '', 'next line'])
   assert.equal(await js(`document.querySelector('[data-port="COM6"] .send-button').disabled`), false)
   await js(`document.querySelector('[aria-label="关闭 COM7 分栏"]').click()`)
   await dragFromRail('COM7')
-  await until(`document.querySelector('[data-port="COM7"] .send-button').disabled`)
-  await js(`window.qaFinish({status:'accepted'})`)
+  await until(`document.querySelector('[data-port="COM7"] .send-button').getAttribute('aria-busy') === 'true'`)
+  await js(`window.qaPending.reverse().forEach(finish => finish({status:'accepted'}))`)
   await until(`document.querySelector('[data-port="COM7"] .command-editor input').value === ''`)
   assert.equal(await js(`document.querySelector('[data-port="COM6"] .command-editor input').value`), 'version')
   assert.equal(await js(`document.querySelector('[data-port="COM7"] .history-toggle').getAttribute('aria-expanded')`), 'false')
@@ -389,10 +394,11 @@ app.whenReady().then(async () => {
     return { labels, owners, commands: [...seenCommands], reversed, folded, samples }
   })()`)
   assert.deepEqual(trace.labels, ['等待接管授权', 'Agent 正在读取传感器状态', 'Agent 正在读取固件版本', 'Agent 正在读取采样总线状态',
-    'Agent 正在读取传感器标识', 'Agent 正在采样温湿度', 'Agent 正在确认传感器状态', '读取传感器状态已完成'])
+    'Agent 正在读取传感器标识', 'Agent 正在采样温湿度', '采样温湿度已完成', 'Agent 正在确认传感器状态', '读取传感器状态已完成'])
   assert.equal(trace.owners['Agent 正在读取传感器状态'], 'thinking')
   assert.equal(trace.owners['读取传感器状态已完成'], 'idle')
-  assert.deepEqual(trace.commands, ['version', 'bus status', 'sensor id', 'temp read', 'humidity read', 'sensor read'])
+  assert.deepEqual(trace.commands, ['version', 'bus status', 'sensor id', 'sensor read'])
+  assert.equal(await js("document.querySelector('.macro-summary strong').textContent"), '采样温湿度')
   assert.ok(trace.samples > 20)
   assert.equal(trace.reversed, undefined, JSON.stringify(trace.reversed))
   assert.equal(trace.folded, false)
@@ -406,8 +412,8 @@ app.whenReady().then(async () => {
   await js(`[...document.querySelectorAll('.window-bar button')].find(b => b.textContent === '配置').click()`)
   await until(`!!document.querySelector('.settings-page')`)
   await js(`[...document.querySelectorAll('.window-bar button')].find(b => b.textContent === '控制台').click()`)
-  await until(`document.querySelectorAll('.action-trigger').length === 4`)
-  assert.deepEqual(await js(`[...document.querySelectorAll('.action-trigger')].map(b => b.getAttribute('aria-expanded'))`), ['false', 'true', 'true', 'true'])
+  await until(`document.querySelectorAll('.action-trigger').length === 3`)
+  assert.deepEqual(await js(`[...document.querySelectorAll('.action-trigger')].map(b => b.getAttribute('aria-expanded'))`), ['false', 'true', 'true'])
   // Remount after the live buffer has moved past the Run. The same open
   // branches and named result must also work with events read from disk.
   await js(`(async () => {
@@ -425,9 +431,10 @@ app.whenReady().then(async () => {
   await js(`[...document.querySelectorAll('.window-bar button')].find(b => b.textContent === '宏').click()`)
   await until(`!!document.querySelector('.macro-page')`)
   await js(`[...document.querySelectorAll('.window-bar button')].find(b => b.textContent === '控制台').click()`)
-  await until(`document.querySelector('.history-toggle').textContent === '读取传感器状态已完成' && document.querySelectorAll('.action-trigger').length === 4`)
+  await until(`document.querySelector('.history-toggle').textContent === '读取传感器状态已完成' && document.querySelectorAll('.action-trigger').length === 3`)
   assert.equal(await js('window.archiveReads'), 1)
-  assert.deepEqual(await js(`[...document.querySelectorAll('.action-trigger')].map(b => b.getAttribute('aria-expanded'))`), ['false', 'true', 'true', 'true'])
+  assert.deepEqual(await js(`[...document.querySelectorAll('.action-trigger')].map(b => b.getAttribute('aria-expanded'))`), ['false', 'true', 'true'])
+  assert.equal(await js("document.querySelector('.macro-summary strong').textContent"), '采样温湿度')
   await js(`(async () => {
     const s = await window.serial.bootstrap(), base = s.events.COM6[0]
     s.events.COM6 = Array.from({length:12000}, (_,i)=>({...base,kind:'rx',direction:'rx',seq:i+1,text:(i===42?'earlier marker':'line '+i)+'\\n'}))
@@ -435,14 +442,14 @@ app.whenReady().then(async () => {
     document.querySelector('[data-device-port="COM6"] .device-choice').click()
   })()`)
   await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12000'`)
-  assert.ok(await js(`document.querySelectorAll('.terminal-output > span').length <= 320`))
+  assert.ok(await js(`document.querySelectorAll('.terminal-output > span').length < 420`))
   await js(`(async () => {
     const s=await window.serial.bootstrap(), lines=s.events.COM6
     s.events.COM6=[...lines.slice(32),...lines.slice(-32).map(e=>({...e,seq:e.seq+32}))]
     await window.serial.savePreferences({})
   })()`)
   await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12032'`)
-  await js(`document.querySelector('.terminal-page').click()`)
+  await js(`{ const view=document.querySelector('.terminal-scroll'); view.focus(); view.scrollTop = view.scrollHeight / 2 }`)
   await until(`!!document.querySelector('.return-live')`)
   await js(`document.querySelector('.terminal-find-trigger').click()`)
   await js(`(() => {
@@ -453,6 +460,29 @@ app.whenReady().then(async () => {
   await until(`document.querySelector('.term-search-hit.is-current')?.closest('[data-seq]')?.dataset.seq === '43'`)
   await js(`document.querySelector('[aria-label="关闭查找 (Escape)"]').click(); document.querySelector('.return-live').click()`)
   await until(`document.querySelector('.terminal-output > :last-child')?.dataset.seq === '12032'`)
+  await js(`(async () => {
+    const s = await window.serial.bootstrap(), base = s.events.COM6[0]
+    s.events.COM6 = Array.from({length:12000}, (_,i) => ({...base,seq:i+1,text:i<4000 ? 'boot '+i+'\\n' : (i%80===79 ? '#\\n' : '#')}))
+    await window.serial.savePreferences({})
+  })()`)
+  await until(`document.querySelector('.terminal-output')?.textContent.startsWith('boot 0')`)
+  assert.ok(await js(`document.querySelector('.terminal-scroll').scrollHeight / document.querySelector('.terminal-scroll').clientHeight > 100`))
+  await js(`{ const v=document.querySelector('.terminal-scroll'); v.scrollTop=v.scrollHeight/2 }`)
+  await until(`!!document.querySelector('.return-live')`)
+  assert.ok(await js(`Math.abs(document.querySelector('.terminal-scroll').scrollTop/document.querySelector('.terminal-scroll').scrollHeight-.5)<.01`))
+  await js(`document.querySelector('.terminal-scroll').scrollTop=0`)
+  await until(`document.querySelector('.terminal-output [data-seq="1"]')?.textContent === 'boot 0\\n'`)
+  await js(`document.querySelector('.return-live').click()`)
+  await until(`(() => {const v=document.querySelector('.terminal-scroll');return v.scrollHeight-v.clientHeight-v.scrollTop<3})()`)
+  await js(`(async () => {
+    const state=await window.serial.bootstrap(), base=state.events.COM6[0]
+    const lines=['ready\\r','\\nErasing at 0x00 -- 0% complete.']
+    for(let n=1;n<=100;n++) lines.push('\\r', 'Erasing at 0x'+n.toString(16)+' -- '+n+'% complete.')
+    lines.push('\\r\\ndone\\r\\n')
+    state.events.COM6=lines.map((text,i)=>({...base,seq:i+1,text}))
+    await window.serial.savePreferences({})
+  })()`)
+  await until(`document.querySelector('.terminal-output').textContent === 'ready\\nErasing at 0x64 -- 100% complete.\\ndone\\n'`)
   process.stdout.write('PASS: drag docking, per-port history and input, keyboard navigation, themes, model selection, font size, macros, and external Agent handoff and Run\n')
   app.exit(0)
 }).catch((error) => { process.stderr.write(`${error.stack}\n`); app.exit(1) })

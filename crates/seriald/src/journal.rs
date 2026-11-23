@@ -336,8 +336,9 @@ fn rebuild_run_index(
         }
         let (_, offset) = read_segment_header(&mut file, &segment.path)?;
         file.seek(SeekFrom::Start(offset))?;
+        let mut reader = BufReader::new(file);
         while !cancel.load(std::sync::atomic::Ordering::Acquire) {
-            match read_record(&mut file)? {
+            match read_record(&mut reader)? {
                 RecordRead::Event(event) => history.record(&event)?,
                 RecordRead::Eof => break,
                 RecordRead::Invalid(message) if segment.sealed => {
@@ -1224,7 +1225,7 @@ enum RecordRead {
     Invalid(String),
 }
 
-fn read_record(file: &mut File) -> Result<RecordRead, JournalError> {
+fn read_record(file: &mut impl Read) -> Result<RecordRead, JournalError> {
     let mut prefix = [0_u8; RECORD_PREFIX_LEN];
     let read = read_up_to(file, &mut prefix)?;
     if read == 0 {
@@ -1275,7 +1276,7 @@ fn read_record(file: &mut File) -> Result<RecordRead, JournalError> {
     Ok(RecordRead::Event(Box::new(event)))
 }
 
-fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+fn read_up_to(file: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buffer.len() {
         match file.read(&mut buffer[total..]) {
@@ -1302,8 +1303,10 @@ fn recover_open_segment(path: &Path) -> Result<(), JournalError> {
     let mut last_good_offset = data_offset;
     let mut last_seq = None;
     let mut previous = 0;
+    let file_len = file.metadata()?.len();
+    let mut reader = BufReader::with_capacity(64 * 1024, &mut file).take(file_len - data_offset);
     loop {
-        match read_record(&mut file)? {
+        match read_record(&mut reader)? {
             RecordRead::Event(event)
                 if event.port == header.port
                     && event.daemon_epoch == header.daemon_epoch
@@ -1311,7 +1314,7 @@ fn recover_open_segment(path: &Path) -> Result<(), JournalError> {
             {
                 previous = event.seq;
                 last_seq = Some(event.seq);
-                last_good_offset = file.stream_position()?;
+                last_good_offset = file_len - reader.limit();
             }
             RecordRead::Event(_) => break,
             RecordRead::Eof => break,

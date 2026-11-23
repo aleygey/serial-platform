@@ -24,7 +24,7 @@ export function AgentDock({ port, orbColor, activity, command, action, outcome, 
   const state = command && commandState(command, true)
   const ownership = [activity.label, activity.detail].filter(Boolean).join(' · ')
   const toggleLabel = (expanded ? '收起 ' : '展开 ') + port + ' 的执行历史'
-  const task = command?.description || action?.replace(/^Macro · /, '') || activity.run?.label
+  const task = command?.description || action || activity.run?.label
   const status = outcome ?? (activity.run && task
     ? { label: 'Agent 正在' + task, tone: state?.tone ?? activity.tone }
     : { label: activity.phase === 'idle' ? '执行历史' : activity.label, tone: activity.tone })

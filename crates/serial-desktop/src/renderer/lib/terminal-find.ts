@@ -1,4 +1,5 @@
 import type { TimelineEvent } from '../../shared/contracts'
+import { TerminalLine } from './terminal-line'
 
 export interface TerminalDecoration {
   start: number
@@ -74,6 +75,9 @@ export class TerminalDocumentIndex {
   private chunksValue: TerminalDocumentChunk[] = []
   private readonly chunksByKey = new Map<string, TerminalDocumentChunk>()
   private nextAbsolute = 0
+  private readonly line = new TerminalLine()
+  private lineEpoch?: string
+  private lineGeneration?: number
   private queryValue = ''
   /** Absolute position represented by offset zero in both typed arrays. */
   private matchOrigin = 0
@@ -220,6 +224,8 @@ export class TerminalDocumentIndex {
     this.chunksValue = []
     this.chunksByKey.clear()
     this.nextAbsolute = 0
+    this.line.reset()
+    this.lineEpoch = undefined
     this.source = events
     this.statsValue.rebuilds += 1
     for (const event of events) this.appendChunk(event)
@@ -229,8 +235,9 @@ export class TerminalDocumentIndex {
   private appendEvents(events: TimelineEvent[], updateMatches = true): void {
     if (events.length === 0) return
     const oldEnd = this.nextAbsolute
-    for (const event of events) this.appendChunk(event)
-    if (!updateMatches || !this.queryValue || this.nextAbsolute === oldEnd) return
+    let dirty = oldEnd
+    for (const event of events) dirty = Math.min(dirty, this.appendChunk(event))
+    if (!updateMatches || !this.queryValue || (this.nextAbsolute === oldEnd && dirty === oldEnd)) return
     if (this.nextAbsolute - this.matchOrigin > MAX_UINT32) {
       this.fullSearch(this.activeAnchor())
       return
@@ -239,10 +246,11 @@ export class TerminalDocumentIndex {
     const base = this.chunksValue[0]?.absoluteStart ?? this.nextAbsolute
     // Preserve the full-document `/g` non-overlap rule. A tail-only scan may
     // otherwise invent an overlapping match after append ("aa" + "a").
-    const scanStart = Math.max(base, oldEnd - overlap, this.lastMatchEnd() ?? base)
+    if (dirty < oldEnd) this.matchLength = this.lowerBoundStart(Math.max(base, dirty - overlap))
+    const scanStart = Math.max(base, dirty - overlap, this.lastMatchEnd() ?? base)
     const text = this.textBetween(scanStart, this.nextAbsolute)
     this.statsValue.incrementalSearchCharacters += text.length
-    this.scanText(text, scanStart, oldEnd)
+    this.scanText(text, scanStart, dirty === oldEnd ? oldEnd : undefined)
   }
 
   private removePrefix(events: TimelineEvent[], count: number): number {
@@ -252,6 +260,7 @@ export class TerminalDocumentIndex {
     }
     this.chunksValue.splice(0, chunks)
     const base = this.chunksValue[0]?.absoluteStart ?? this.nextAbsolute
+    this.line.retain(this.nextAbsolute - base)
     const removed = this.lowerBoundStart(base)
     this.matchHead += removed
     this.matchLength -= removed
@@ -260,10 +269,32 @@ export class TerminalDocumentIndex {
     return removed
   }
 
-  private appendChunk(event: TimelineEvent): void {
-    if (event.direction !== 'rx') return
-    const text = sanitizeTerminalText(event.text)
+  private appendChunk(event: TimelineEvent): number {
+    if (event.kind === 'gap' || this.lineEpoch !== event.daemon_epoch || this.lineGeneration !== event.generation) {
+      this.line.reset()
+      this.lineEpoch = event.daemon_epoch
+      this.lineGeneration = event.generation
+    }
+    if (event.direction !== 'rx') return this.nextAbsolute
+    const { remove, text } = this.line.write(event.text)
+    this.nextAbsolute -= remove
+    if (remove) {
+      let tail = this.chunksValue.at(-1)
+      while (tail && tail.absoluteEnd > this.nextAbsolute) {
+        this.chunksValue.pop()
+        this.chunksByKey.delete(tail.key)
+        if (tail.absoluteStart < this.nextAbsolute) {
+          const prefix = tail.text.slice(0, this.nextAbsolute - tail.absoluteStart)
+          const kept = { ...tail, text: prefix, absoluteEnd: this.nextAbsolute, decorations: terminalDecorations(prefix) }
+          this.chunksValue.push(kept)
+          this.chunksByKey.set(kept.key, kept)
+          break
+        }
+        tail = this.chunksValue.at(-1)
+      }
+    }
     const absoluteStart = this.nextAbsolute
+    if (!text) return absoluteStart
     this.nextAbsolute += text.length
     const chunk = {
       key: eventKey(event),
@@ -280,6 +311,7 @@ export class TerminalDocumentIndex {
     this.chunksValue.push(chunk)
     this.chunksByKey.set(chunk.key, chunk)
     this.statsValue.sanitizedChunks += 1
+    return absoluteStart
   }
 
   private fullSearch(preferred: MatchAnchor | undefined, fallbackIndex?: number): void {
@@ -532,10 +564,7 @@ export class TerminalDocumentIndex {
 }
 
 export function sanitizeTerminalText(text: string): string {
-  return text
-    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '�')
-    .replace(/\r/g, '')
+  return new TerminalLine().write(text).text
 }
 
 function terminalDecorations(text: string): TerminalDecoration[] {
