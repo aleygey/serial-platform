@@ -258,3 +258,33 @@ function rx(seq: number, text: string): TimelineEvent {
     kind: 'rx', direction: 'rx', text, metadata: {}, durable: true
   }
 }
+it('overwrites flashing progress across RX packets without adding rows or retaining overwritten search results', () => {
+  const index = new TerminalDocumentIndex()
+  const events = [rx(1, 'device ready\r'), rx(2, '\nErasing at 0x6000 -- 00% complete.')]
+  index.sync([...events])
+  index.search('00%')
+  expect(index.matchCount).toBe(1)
+  for (let percent = 1; percent <= 100; percent++) {
+    events.push(rx(events.length + 1, '\r'), rx(events.length + 2, 'Erasing at 0x6000 -- ' + percent + '% complete.'))
+    index.sync([...events])
+  }
+  expect(index.chunks.map(chunk => chunk.text).join('')).toBe('device ready\nErasing at 0x6000 -- 100% complete.')
+  index.search('99%')
+  expect(index.matchCount).toBe(0)
+  index.search('100%')
+  expect(index.matchCount).toBe(1)
+  expect(index.chunks.length).toBeLessThan(5)
+  const reloaded = new TerminalDocumentIndex()
+  reloaded.sync([...events])
+  expect(reloaded.chunks.map(chunk => chunk.text).join('')).toEqual(index.chunks.map(chunk => chunk.text).join(''))
+})
+
+it('preserves CRLF, backspace and split ANSI erase-to-end while keeping prior lines searchable', () => {
+  const index = new TerminalDocumentIndex()
+  const parts = ['kept\r', '\n012345\r', 'xy\x1b[', 'K', '\r\nreadz', '\by', '\r', '\n']
+  const events = parts.map((part, i) => rx(i + 1, part))
+  for (let i = 1; i <= events.length; i++) index.sync(events.slice(0, i))
+  expect(index.chunks.map(chunk => chunk.text).join('')).toBe('kept\nxy\nready\n')
+  index.search('xy\nready')
+  expect(index.matchCount).toBe(1)
+})

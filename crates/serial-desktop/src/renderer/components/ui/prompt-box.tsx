@@ -142,8 +142,8 @@ function PromptBox({
     const [inner, setInner] = useState(defaultValue)
     const value = valueProp ?? inner
     const streaming = status === 'streaming'
-    // The terminal editor can send a bare Return to a device prompt.
-    const canSend = !disabled && status === 'idle' && (!!editor || value.trim().length > 0)
+    // The serial editor accepts a bare Return, including while an earlier write is in flight.
+    const canSend = !disabled && !streaming && (!!editor || (status === 'idle' && value.trim().length > 0))
 
     const fieldRef = useRef<HTMLDivElement>(null)
     const textareaRef = useRef<HTMLTextAreaElement>(null)

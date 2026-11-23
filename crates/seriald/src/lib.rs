@@ -107,6 +107,9 @@ pub async fn serve(
     instance
         .publish(&endpoint)
         .context("publish the active seriald endpoint")?;
+    if managed {
+        eprintln!("seriald endpoint: {}", serde_json::to_string(&endpoint)?);
+    }
     instance.startup_stage("starting HTTP service", started);
     tracing::info!(requested_bind = %bind, actual_bind = %actual_bind, endpoint = %endpoint.endpoint, epoch = %loaded.daemon_epoch, "seriald listening");
     let server = axum::serve(listener, api::router(state.clone()))

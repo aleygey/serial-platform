@@ -31,6 +31,7 @@ export class LocalService {
   private current: ServiceState = { owned: false, status: 'stopped' }
   private stderrTail = ''
   private stage?: string
+  private ownedEndpoint?: DiscoveredSeriald
   private startupFailureValue?: Error
   private readonly onState: (state: ServiceState) => void
 
@@ -47,6 +48,7 @@ export class LocalService {
     const program = await this.resolveProgram()
     this.stderrTail = ''
     this.stage = undefined
+    this.ownedEndpoint = undefined
     this.startupFailureValue = undefined
     this.update({ owned: true, status: 'starting', program: program.path })
     const child = spawn(program.path, buildSpawnArgs(program.args, endpoint), {
@@ -60,6 +62,13 @@ export class LocalService {
       if (this.child !== child) return
       this.stderrTail = `${this.stderrTail}${chunk}`.slice(-16 * 1024)
       if (this.current.status !== 'starting') return
+      const endpoint = this.stderrTail.match(/^seriald endpoint: (\{[^\r\n]+\})\r?$/m)?.[1]
+      if (endpoint && !this.ownedEndpoint) {
+        try {
+          const record = parseDiscoveredEndpoint(endpoint)
+          if (record?.pid === child.pid) this.ownedEndpoint = record
+        } catch { /* Older sidecars can still be discovered through their marker. */ }
+      }
       const stage = Array.from(this.stderrTail.matchAll(/seriald startup: ([^\r\n(]+) \(\d+ ms\)/g)).at(-1)?.[1]
       if (stage && stage !== this.stage) {
         this.stage = stage
@@ -84,6 +93,8 @@ export class LocalService {
   }
 
   async discoverEndpoint(): Promise<DiscoveredSeriald | undefined> {
+    if (this.child && this.ownedEndpoint) return this.ownedEndpoint
+    if (this.child && this.stage && this.stage !== 'starting HTTP service') return undefined
     const program = await this.resolveProgram()
     const output = await new Promise<string>((resolve, reject) => {
       execFile(
@@ -95,7 +106,7 @@ export class LocalService {
             resolve(stdout)
             return
           }
-          if (error.killed && this.current.status === 'starting') { resolve(''); return }
+          if (error.killed) { resolve(''); return }
           const detail = stderr.trim() || error.message
           reject(new Error(`无法发现当前 seriald：${detail}`))
         }

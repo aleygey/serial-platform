@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest'
+import { expect, it, vi } from 'vitest'
 import { createQaSnapshot } from '../../shared/qa-fixture'
 import { buildAgentHistory } from './history'
 import { commandEchoStyles } from './command-echo'
@@ -8,11 +8,14 @@ it('colors just the exact echoed line across RX fragments and leaves device outp
   const cmd = buildAgentHistory(events).filter(row => row.kind === 'command')[0].commands[0]
   const tx = events[2]
   const rx = events[3]
-  const chunks = [{ key: 'qa-epoch:4', text: 'ver' }, { key: 'qa-epoch:5', text: 'sion\nversion X\n' }]
+  const text = new Map([['qa-epoch:4', 'ver'], ['qa-epoch:5', 'sion\nversion X\n']])
+  const textFor = vi.fn((key: string) => text.get(key))
   const stream = [tx, rx, { ...rx, seq: 5 }]
-  const styles = commandEchoStyles(stream, chunks, [cmd])
+  const later = Array.from({ length: 12000 }, (_, i) => ({ ...rx, seq: 6 + i }))
+  const styles = commandEchoStyles([...stream, ...later], textFor, [cmd])
   expect([...styles.values()]).toEqual([{ length: 3, tone: 'done' }, { length: 4, tone: 'done' }])
-  expect(commandEchoStyles(stream, [{ ...chunks[0], text: 'versionX\n' }, chunks[1]], [cmd]).size).toBe(0)
-  expect(commandEchoStyles([tx, { ...rx, seq: 5 }], [{ key: 'qa-epoch:5', text: 'version\n' }], [cmd]).size).toBe(0)
-  expect(commandEchoStyles([tx, { ...rx, generation: 9 }], [{ key: 'qa-epoch:4', text: 'version\n' }], [cmd]).size).toBe(0)
+  expect(textFor).toHaveBeenCalledTimes(2)
+  expect(commandEchoStyles(stream, () => 'versionX\n', [cmd]).size).toBe(0)
+  expect(commandEchoStyles([tx, { ...rx, seq: 5 }], () => 'version\n', [cmd]).size).toBe(0)
+  expect(commandEchoStyles([tx, { ...rx, generation: 9 }], () => 'version\n', [cmd]).size).toBe(0)
 })

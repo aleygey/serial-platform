@@ -86,6 +86,22 @@ describe('desktop backend controls', () => {
     expect(mergeDesktopSnapshotEvent(result, batch)).toBe(result)
   })
 
+  it('applies port and history updates without rebuilding the serial output or accepting stale state', () => {
+    const base = createQaSnapshot()
+    const port = { ...base.configuredPorts[0], head_seq: base.configuredPorts[0].head_seq + 1 }
+    const next = mergeDesktopSnapshotEvent(base, { type: 'port-status', port })!
+    expect(next.configuredPorts[0]).toBe(port)
+    expect(next.events).toBe(base.events)
+    expect(mergeDesktopSnapshotEvent(next, { type: 'port-status', port: base.configuredPorts[0] })).toBe(next)
+    expect(mergeDesktopSnapshotEvent(next, { type: 'port-status', port: { ...port, daemon_epoch: 'stale' } })).toBe(next)
+    const history = { server_id: base.serverId!, revision: 100, entries: [] }
+    const updated = mergeDesktopSnapshotEvent(next, { type: 'human-history', history })!
+    expect(updated.humanHistory).toBe(history)
+    expect(updated.events).toBe(base.events)
+    expect(mergeDesktopSnapshotEvent(updated, { type: 'human-history', history: { ...history, revision: 99 } })).toBe(updated)
+    expect(mergeDesktopSnapshotEvent(updated, { type: 'human-history', history: { ...history, server_id: 'another' } })).toBe(updated)
+  })
+
   it('exposes a reachable stop action only for an App-owned backend', () => {
     const owned = createQaSnapshot()
     const ownedMarkup = renderToStaticMarkup(

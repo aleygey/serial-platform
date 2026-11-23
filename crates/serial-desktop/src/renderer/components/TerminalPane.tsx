@@ -7,6 +7,7 @@ import { InlineTextEffect } from './ui/text-effect'
 import { useReducedMotion } from '../lib/use-reduced-motion'
 import { displayCommand } from '../lib/history'
 import {
+  indexAtOrAfterSeq,
   TerminalDocumentIndex,
   type TerminalDocumentChunk,
   type TerminalFindHit
@@ -27,15 +28,7 @@ interface Props {
 }
 
 const WINDOW_CHUNKS = 320
-function chunkIndex(chunks: readonly TerminalDocumentChunk[], seq: number): number {
-  let lo = 0, hi = chunks.length
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2)
-    if (chunks[mid].seq < seq) lo = mid + 1
-    else hi = mid
-  }
-  return lo
-}
+const TEXT_BLOCK = 128
 
 const NO_COMMANDS: AgentCommand[] = []
 const NO_FIND_HITS: readonly TerminalFindHit[] = Object.freeze([])
@@ -58,7 +51,7 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   const initialStream = useRef({ epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 })
   if (initialStream.current.epoch !== configuredPort?.daemon_epoch) initialStream.current = { epoch: configuredPort?.daemon_epoch, seq: events.at(-1)?.seq ?? 0 }
   const chunks = terminalDocument.chunks
-  const echoes = useMemo(() => commandEchoStyles(events, chunks, commands, currentCommand), [events, chunks, commands, currentCommand])
+  const echoes = useMemo(() => commandEchoStyles(events, key => terminalDocument.textFor(key), commands, currentCommand), [events, terminalDocument, commands, currentCommand])
   const total = terminalDocument.matchCount
   const highlighted = terminalDocument.highlightedMatchCount
   const current = terminalDocument.activeIndex < 0 ? 0 : terminalDocument.activeIndex + 1
@@ -66,33 +59,97 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
 
   const target = findOpen && activeId ? activeId : selectedCommand ? selectedCommand.daemonEpoch + ':' + selectedCommand.firstSeq : ''
   const [anchor, setAnchor] = useState<{ seq?: number; target: string }>()
-  const scrollAnchor = useRef<{ seq: number; top: number } | null>(null)
+  const scrollAnchor = useRef<{ seq: number; offset: number; top: number } | null>(null)
+  const textCache = useRef(new WeakMap<TerminalDocumentChunk, { last: TerminalDocumentChunk; text: string }>())
   const pinned = anchor?.target === target
   const range = pinned ? undefined : findOpen && activeId ? terminalDocument.activeChunkRange : selectedCommand
     ? { first: match?.fromSeq ?? selectedCommand.firstSeq, last: match?.fromSeq ?? selectedCommand.firstSeq } : undefined
   const tailStart = Math.max(0, chunks.length - WINDOW_CHUNKS)
-  const start = pinned && anchor.seq !== undefined ? Math.min(tailStart, chunkIndex(chunks, anchor.seq)) :
-    range ? Math.max(0, Math.min(tailStart, chunkIndex(chunks, range.first) - Math.floor(WINDOW_CHUNKS / 2))) : tailStart
-  const end = Math.min(chunks.length, Math.max(start + WINDOW_CHUNKS, range ? chunkIndex(chunks, range.last) + 1 : 0))
-  const visible = chunks.slice(start, end)
-
-  const page = (direction: number) => {
-    const next = Math.min(tailStart, Math.max(0, start + direction * (WINDOW_CHUNKS / 2)))
-    if (next === start) return
-    const retained = chunks[Math.max(next, start)]
-    const node = scrollRef.current?.querySelector<HTMLElement>(`[data-seq="${retained.seq}"]`)
-    if (node) scrollAnchor.current = { seq: retained.seq, top: node.getBoundingClientRect().top }
-    setFollow(false)
-    setAnchor({ seq: chunks[next].seq, target })
+  const start = pinned && anchor.seq !== undefined ? Math.max(0, Math.min(tailStart, indexAtOrAfterSeq(chunks, anchor.seq) - Math.floor(WINDOW_CHUNKS / 2))) :
+    range ? Math.max(0, Math.min(tailStart, indexAtOrAfterSeq(chunks, range.first) - Math.floor(WINDOW_CHUNKS / 2))) : tailStart
+  const end = Math.min(chunks.length, Math.max(start + WINDOW_CHUNKS, range ? indexAtOrAfterSeq(chunks, range.last) + 1 : 0))
+  // Preserve the browser's exact wrapping, selection and native scrollbar over
+  // the whole retained document. Only the viewport needs per-event markup.
+  function renderText(from: number, until: number, detailed = false) {
+    const blocks: React.ReactNode[] = []
+    const width = detailed ? 16 : TEXT_BLOCK
+    for (let i = from; i < until;) {
+      const first = chunks[i]
+      const nextBucket = (Math.floor(first.seq / width) + 1) * width
+      const stop = Math.min(until, indexAtOrAfterSeq(chunks, nextBucket))
+      const last = chunks[stop - 1]
+      // Isolate complete lines so updating one percentage does not lay out the
+      // entire scrollback. Partial lines must keep wrapping into their neighbor.
+      const completeLines = (i === 0 || chunks[i - 1].text.endsWith('\n')) && last.text.endsWith('\n')
+      const className = completeLines ? 'terminal-lines' : undefined
+      if (detailed) {
+        blocks.push(<span key={'detail:' + first.key} className={className}>{chunks.slice(i, stop).map(chunk => (
+          <TerminalChunkText
+            reveal={echoes.has(chunk.key) && !paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
+            commandMatched={commandRangeIncludes(match, chunk)}
+            echoLength={echoes.get(chunk.key)?.length ?? 0} echoTone={echoes.get(chunk.key)?.tone}
+            chunk={chunk}
+            hits={findOpen ? terminalDocument.hitsFor(chunk) : NO_FIND_HITS}
+            key={chunk.key}
+          />
+        ))}</span>)
+      } else {
+        let block = textCache.current.get(first)
+        if (block?.last !== last) {
+          block = { last, text: chunks.slice(i, stop).map(chunk => chunk.text).join('') }
+          textCache.current.set(first, block)
+        }
+        blocks.push(<span key={'text:' + first.key} data-first-seq={first.seq} className={className}>{block.text}</span>)
+      }
+      i = stop
+    }
+    return blocks
   }
+
+  function rememberViewport(view: HTMLElement) {
+    const box = view.getBoundingClientRect()
+    // Use a real text position: one compact span can wrap across many screens.
+    const range = document.caretRangeFromPoint(box.left + view.clientWidth / 2, box.top + 4)
+    const node = range?.startContainer
+    const span = node?.parentElement?.closest<HTMLElement>('[data-seq], [data-first-seq]')
+    if (!range || !span || !view.contains(span)) return
+    const first = Number(span.dataset.seq ?? span.dataset.firstSeq)
+    let index = indexAtOrAfterSeq(chunks, first)
+    const prefix = range.cloneRange()
+    prefix.selectNodeContents(span)
+    prefix.setEnd(range.startContainer, range.startOffset)
+    let offset = prefix.toString().length
+    while (index + 1 < chunks.length && offset >= chunks[index].text.length) offset -= chunks[index++].text.length
+    const seq = chunks[index]?.seq
+    if (seq === undefined) return
+    // The detailed window is grown around the new position after a thumb drag.
+    if (!pinned || index < start + TEXT_BLOCK / 2 || index >= end - TEXT_BLOCK / 2) setAnchor({ seq, target })
+    scrollAnchor.current = { seq, offset, top: range.getBoundingClientRect().top - box.top }
+  }
+  const firstKey = chunks[0]?.key
   useLayoutEffect(() => {
     const saved = scrollAnchor.current
-    if (!saved) return
-    scrollAnchor.current = null
     const view = scrollRef.current
-    const row = view?.querySelector<HTMLElement>(`[data-seq="${saved.seq}"]`)
-    if (view && row) view.scrollTop += row.getBoundingClientRect().top - saved.top
-  }, [start, anchor])
+    if (!view || !saved || follow || !manualScroll.current) return
+    const row = view.querySelector<HTMLElement>(`[data-seq="${saved.seq}"]`)
+    if (!row) {
+      if (chunks[0] && saved.seq < chunks[0].seq) view.scrollTop = 0
+      return
+    }
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT)
+    let remaining = saved.offset
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const length = node.textContent?.length ?? 0
+      if (remaining <= length) {
+        const range = document.createRange()
+        range.setStart(node, remaining)
+        range.collapse(true)
+        view.scrollTop += range.getBoundingClientRect().top - view.getBoundingClientRect().top - saved.top
+        break
+      }
+      remaining -= length
+    }
+  }, [firstKey])
 
   const openFind = useCallback((): void => {
     if (!findOpen) {
@@ -141,14 +198,16 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
   }, [commandAnchor])
 
   useLayoutEffect(() => {
-    if (follow) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'instant' })
-  }, [chunks.at(-1)?.key, follow])
+    if (follow && !manualScroll.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'instant' })
+  }, [follow])
 
   const hasOutput = chunks.length > 0
   useEffect(() => {
     const view = scrollRef.current
     const output = view?.querySelector('pre')
     if (!follow || !view || !output) return
+    // Scroll after layout, only when the output or viewport actually changes
+    // height. A same-line progress update must not force a synchronous layout.
     const observer = new ResizeObserver(() => {
       if (!manualScroll.current) view.scrollTop = view.scrollHeight
     })
@@ -239,52 +298,43 @@ export const TerminalPane = memo(function TerminalPane({ commands = NO_COMMANDS,
       <div
         className="terminal-scroll"
         ref={scrollRef}
-        tabIndex={-1}
-        onPointerDown={() => { manualScroll.current = true }}
+        tabIndex={0}
+        onPointerDown={event => { if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) manualScroll.current = true }}
+        onTouchMove={() => { manualScroll.current = true }}
         onKeyDown={event => {
           if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key)) manualScroll.current = true
         }}
         onWheel={event => {
-          manualScroll.current = true
-          const view = event.currentTarget
-          if (event.deltaY < 0 && view.scrollTop < 48) page(-1)
-          else if (event.deltaY > 0 && view.scrollHeight - view.scrollTop - view.clientHeight < 48) page(1)
+          if (event.deltaY !== 0) manualScroll.current = true
         }}
         onScroll={(event) => {
           const element = event.currentTarget
-          const atEnd = end === chunks.length && element.scrollHeight - element.scrollTop - element.clientHeight < 36
-          if (follow && !manualScroll.current) return
-          if (atEnd) manualScroll.current = false
-          setFollow(atEnd)
-          if (!target && chunks[start]) {
-            if (atEnd && anchor?.seq !== undefined) setAnchor(undefined)
-            else if (!atEnd && anchor?.seq === undefined) setAnchor({ seq: chunks[start].seq, target })
+          const atEnd = element.scrollHeight - element.scrollTop - element.clientHeight <= 3
+          if (atEnd) {
+            manualScroll.current = false
+            scrollAnchor.current = null
+            if (anchor?.seq !== undefined) setAnchor(undefined)
+          } else {
+            manualScroll.current = true
+            rememberViewport(element)
           }
+          setFollow(atEnd)
         }}
       >
-        {start > 0 && <button type="button" className="terminal-page" onClick={() => page(-1)}>较早的输出</button>}
         {chunks.length === 0 ? (
           <div className="empty-state terminal-empty">
             <strong>{configuredPort?.session_state === 'online' ? '等待设备输出' : configuredPort?.session_state === 'opening' ? '正在打开串口' : configuredPort?.session_state === 'waiting_for_port' ? '等待设备接入' : '串口未打开'}</strong>
           </div>
         ) : (
           <pre className="terminal-output" aria-label="串口输出" onDoubleClick={selectTerminalWord}>
-            {visible.map((chunk) => (
-              <TerminalChunkText
-                reveal={echoes.has(chunk.key) && !paused && !reduced && follow && !selectedCommand && !findOpen && chunk.daemonEpoch === initialStream.current.epoch && chunk.seq > initialStream.current.seq}
-                commandMatched={commandRangeIncludes(match, chunk)}
-                echoLength={echoes.get(chunk.key)?.length ?? 0} echoTone={echoes.get(chunk.key)?.tone}
-                chunk={chunk}
-                hits={findOpen ? terminalDocument.hitsFor(chunk) : NO_FIND_HITS}
-                key={chunk.key}
-              />
-            ))}
+            {renderText(0, start)}
+            {renderText(start, end, true)}
+            {renderText(end, chunks.length)}
           </pre>
         )}
-        {end < chunks.length && <button type="button" className="terminal-page" onClick={() => page(1)}>较新的输出</button>}
       </div>
       {(!follow || selectedCommand) && (
-        <button className="return-live" type="button" onClick={() => { manualScroll.current = false; setAnchor({ target: findOpen && activeId ? activeId : '' }); setFollow(true); onClearCommand() }}>
+        <button className="return-live" type="button" onClick={() => { manualScroll.current = false; scrollAnchor.current = null; setAnchor({ target: findOpen && activeId ? activeId : '' }); setFollow(true); onClearCommand() }}>
           <ArrowDown size={14} /> 返回最新
         </button>
       )}

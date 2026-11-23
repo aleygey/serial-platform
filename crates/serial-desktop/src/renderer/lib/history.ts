@@ -1,4 +1,5 @@
 import type { TimelineEvent, AgentHistoryResponse, MacroExecution } from '../../shared/contracts'
+import { macroGroupKey, repeatedMacroWrite } from '../../shared/history-events'
 
 export interface AgentCommand {
   id: string
@@ -67,6 +68,38 @@ export interface MatchRange {
   hasVisibleOutput: boolean
 }
 
+// RX remains in the terminal. The history rail needs lifecycle events and
+// one representative write per macro execution when its checkpoint is missing.
+export function createHistorySelector() {
+  let source: TimelineEvent[] = []
+  let rows: TimelineEvent[] = []
+  const macroWrites = new Set<string>()
+  return (events: TimelineEvent[]) => {
+    if (source === events) return rows
+    // Keep the existing projection when the ring only discarded ordinary RX.
+    // Rebuild if its representative write fell out, so a later macro write can replace it.
+    const keptFrom = events[0] && (!rows[0] || rows[0].seq >= events[0].seq) ? source.indexOf(events[0]) : -1
+    const overlap = source.length - keptFrom
+    const append = keptFrom >= 0 && events.length >= overlap && source.at(-1) === events[overlap - 1]
+    if (!append) macroWrites.clear()
+    const added: TimelineEvent[] = []
+    for (let i = append ? overlap : 0; i < events.length; i++) {
+      const event = events[i]
+      if (event.actor?.kind !== 'agent' && !event.kind.startsWith('run_') &&
+          event.kind !== 'command_capture_completed' && !event.metadata.macro_execution) continue
+      if (event.direction === 'rx' && !event.metadata.trigger_id) continue
+      if (!repeatedMacroWrite(event, macroWrites)) added.push(event)
+    }
+    source = events
+    if (append) {
+      if (added.length) rows = rows.concat(added)
+    } else if (added.length !== rows.length || added.some((event, index) => event !== rows[index])) {
+      rows = added
+    }
+    return rows
+  }
+}
+
 export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
   const items: AgentHistoryItem[] = []
   const runs = new Map<string, Extract<AgentHistoryItem, { kind: 'run' }>>()
@@ -99,16 +132,25 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
       }
       continue
     }
-    const macro = event.metadata.macro_execution as MacroExecution | undefined
-    if (event.kind === 'checkpoint' && macro?.owner?.kind === 'agent' && macro.daemon_epoch === event.daemon_epoch && macro.generation === event.generation && macro.id) {
-      const runId = event.run_id ?? macro.run_id ?? undefined
-      const id = `macro:${event.daemon_epoch}:${runId ?? ''}:${macro.id}`
+    const info = event.metadata.macro_execution as MacroExecution | undefined
+    const macro = event.kind === 'checkpoint' && info?.owner?.kind === 'agent' &&
+      info.daemon_epoch === event.daemon_epoch && info.generation === event.generation ? info : undefined
+    const execution = macro?.id || (event.kind === 'tx' && event.direction === 'tx' && event.actor?.kind === 'agent' && stringMetadata(event, 'macro_execution_id'))
+    if (execution) {
+      const runId = event.run_id ?? macro?.run_id ?? undefined
+      const id = macroGroupKey(event, runId, execution)
       const group = commandGroups.get(id)
-      if (group) group.macro = macro
-      else {
+      if (group && !macro) continue
+      const definition = event.metadata.macro_definition as { name?: unknown } | null
+      const name = stringValue(definition?.name) ?? stringMetadata(event, 'macro_name')
+      if (group) {
+        group.macro = macro
+        if (name) group.description = cleanInline(name)
+      } else {
         const item: Extract<AgentHistoryItem, { kind: 'command' }> = {
           kind: 'command', id, firstSeq: event.seq, runId, actionKind: 'macro',
-          description: cleanInline(macro.description || macro.macro_id || 'Macro'), macro, commands: [],
+          description: cleanInline(name || macro?.description || stringMetadata(event, 'macro_description')
+            || macro?.macro_id || stringMetadata(event, 'macro_id') || '内联宏'), macro, commands: [],
         }
         commandGroups.set(id, item)
         items.push(item)
@@ -145,19 +187,13 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
       continue
     }
     if (event.kind !== 'tx' || event.direction !== 'tx' || event.actor?.kind !== 'agent') continue
-    const macroExecutionId = stringMetadata(event, 'macro_execution_id')
-    const description = (macroExecutionId
-      ? `Macro · ${stringMetadata(event, 'macro_description') ?? stringMetadata(event, 'macro_id') ?? 'inline'}`
-      : undefined)
-      ?? stringMetadata(event, 'command_sequence_description')
+    const description = stringMetadata(event, 'command_sequence_description')
       ?? stringMetadata(event, 'command_description')
       ?? (event.run_id ? controlSignal(event.text) ?? '串口写入' : undefined)
     if (!description) continue
     const sequenceId = stringMetadata(event, 'command_sequence_id')
     const operationId = event.operation_id ?? undefined
-    const groupKey = macroExecutionId
-      ? `macro:${event.daemon_epoch}:${event.run_id ?? ''}:${macroExecutionId}`
-      : sequenceId
+    const groupKey = sequenceId
       ? `sequence:${event.daemon_epoch}:${event.run_id ?? ''}:${sequenceId}`
       : operationId
         ? `operation:${event.daemon_epoch}:${event.run_id ?? ''}:${operationId}`
@@ -169,7 +205,7 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
         id: groupKey,
         firstSeq: event.seq,
         description: cleanInline(description),
-        actionKind: macroExecutionId ? 'macro' : sequenceId ? 'sequence' : controlSignal(event.text) ? 'signal' : 'single',
+        actionKind: sequenceId ? 'sequence' : controlSignal(event.text) ? 'signal' : 'single',
         stepCount: sequenceId ? integerValue(event.metadata.command_sequence_step_count) : undefined,
         runId: event.run_id ?? undefined,
         commands: []
@@ -178,7 +214,7 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
       items.push(group)
     }
     const stepIndex = numberMetadata(event, 'command_sequence_step_index')
-    const commandKey = macroExecutionId || stepIndex === undefined ? operationId ?? `event:${event.seq}` : `step:${stepIndex}`
+    const commandKey = stepIndex === undefined ? operationId ?? `event:${event.seq}` : `step:${stepIndex}`
     const existing = group.commands.find((command) => command.id === commandKey)
     if (existing) {
       existing.partial ||= event.metadata.partial === true
@@ -191,7 +227,7 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
         generation: event.generation,
         firstSeq: event.seq,
         operationId,
-        expectsCapture: !macroExecutionId && (!!sequenceId || !!stringMetadata(event, 'command_description') || !!captureMatchers(event)?.length),
+        expectsCapture: !!sequenceId || !!commandDescription || !!captureMatchers(event)?.length,
         stepIndex,
         partial: event.metadata.partial === true,
         text: event.text,
@@ -200,7 +236,9 @@ export function buildAgentHistory(events: TimelineEvent[]): AgentHistoryItem[] {
         capture: operationId ? captures.get(`${event.daemon_epoch}:${event.generation}:${operationId}`) : undefined
       })
     }
-    group.commands.sort((a, b) => (a.stepIndex ?? Number.MAX_SAFE_INTEGER) - (b.stepIndex ?? Number.MAX_SAFE_INTEGER) || a.firstSeq - b.firstSeq)
+  }
+  for (const group of commandGroups.values()) {
+    if (group.actionKind === 'sequence') group.commands.sort((a, b) => (a.stepIndex ?? Number.MAX_SAFE_INTEGER) - (b.stepIndex ?? Number.MAX_SAFE_INTEGER) || a.firstSeq - b.firstSeq)
   }
   return items.sort((a, b) => a.firstSeq - b.firstSeq)
 }

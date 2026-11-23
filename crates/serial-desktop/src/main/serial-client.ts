@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { repeatedMacroWrite } from '../shared/history-events'
 import WebSocket from 'ws'
 import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import { setupChanges, type SetupBrief, type SetupRequest } from '../shared/first-setup'
@@ -75,6 +76,9 @@ interface ConfigurePortsResponse {
 
 interface EventQueryResponse {
   events: Record<string, unknown>[]
+  truncated?: boolean
+  next_cursor?: { epoch: string; after_seq: number } | null
+  gaps?: unknown[]
 }
 
 interface PendingRequest {
@@ -161,7 +165,7 @@ export class SerialClient extends EventEmitter {
   private pendingWelcome?: PendingWelcome
   private readonly reconnectLoop: ReconnectLoop
 
-  constructor(endpoint: string, private readonly managedStartup = false) {
+  constructor(endpoint: string) {
     super()
     const parsed = new URL(endpoint)
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('后端地址必须使用 http 或 https')
@@ -193,12 +197,21 @@ export class SerialClient extends EventEmitter {
     this.historyRead = new AbortController()
     this.connectionVersion += 1
     this.reconnectLoop.cancel()
-    await this.refresh(true)
-    await this.openSocket(this.connectionVersion)
+    await this.refresh(false)
+    const ports = [...this.status!.ports]
+    const signal = this.historyRead.signal
+    await this.openSocket(this.connectionVersion, true)
+    // Open the live input path first. Slow disk history can catch up per port.
+    void this.refreshHumanHistory(true)
+    for (const port of ports) {
+      if (port.head_seq > 0) void this.loadHistory(port, signal).catch(error => {
+        if (!signal.aborted && this.status?.daemon_epoch === port.daemon_epoch) this.emit('notice', `${port.config.port} 历史读取失败：${asError(error).message}`)
+      })
+    }
     return this.data()
   }
 
-  async refresh(loadHistory = false): Promise<ServerData> {
+  async refresh(includeHumanHistory = true): Promise<ServerData> {
     const [availablePorts, configuration] = await Promise.all([
       this.get<PortDescriptor[]>('/api/v1/ports'),
       this.loadConsistentConfiguration()
@@ -212,10 +225,7 @@ export class SerialClient extends EventEmitter {
     this.transportProfiles = transport.profiles
     this.modelProfiles = profiles.profiles
     this.modelFamilies = families.families
-    await this.refreshHumanHistory()
-    if (loadHistory) {
-      await Promise.all(status.ports.map((configured) => this.loadHistory(configured)))
-    }
+    if (includeHumanHistory) await this.refreshHumanHistory()
     return this.data()
   }
 
@@ -391,6 +401,7 @@ export class SerialClient extends EventEmitter {
 
   async agentRunEvents(record: import('../shared/contracts').AgentRunRecord): Promise<{ events: TimelineEvent[]; limited: boolean }> {
     const events: TimelineEvent[] = []
+    const macroWrites = new Set<string>()
     let limited = false
     // Read non-RX events through a fixed snapshot boundary. This includes macro checkpoints,
     // capture receipts, BREAK and trigger lifecycle events without loading the whole terminal.
@@ -403,7 +414,10 @@ export class SerialClient extends EventEmitter {
         const page = await this.get<{ events: Record<string, unknown>[]; truncated: boolean; gaps: unknown[]; next_cursor?: { epoch: string; after_seq: number } }>(
           `/api/v1/ports/${encodeURIComponent(record.port)}/events?${query}`)
         limited ||= page.gaps.length > 0
-        events.push(...page.events.map(normalizeTimelineEvent))
+        for (const raw of page.events) {
+          const event = normalizeTimelineEvent(raw)
+          if (!repeatedMacroWrite(event, macroWrites)) events.push(event)
+        }
         if (!page.truncated) break
         const cursor = page.next_cursor
         if (!cursor || cursor.epoch !== record.epoch || !Number.isSafeInteger(cursor.after_seq) || cursor.after_seq <= after) { limited = true; break }
@@ -413,11 +427,15 @@ export class SerialClient extends EventEmitter {
     return { events: events.sort((a, b) => a.seq - b.seq), limited }
   }
 
-  private async refreshHumanHistory(): Promise<void> {
+  private async refreshHumanHistory(publish = false): Promise<void> {
     try {
       const history = await this.queryHumanHistory()
-      if (this.status && history.server_id !== this.status.server_id) return
+      if (this.stopped || (this.status && history.server_id !== this.status.server_id)) return
+      const previous = this.humanHistory
+      if (previous?.server_id === history.server_id && (previous.revision > history.revision
+        || (previous.revision === history.revision && previous.warning === history.warning))) return
       this.humanHistory = history
+      if (publish) this.emit('human-history', history)
     } catch (error) {
       // An unavailable history must not disable the serial terminal itself.
       this.emit('notice', `人工历史暂不可用：${asError(error).message}`)
@@ -632,8 +650,8 @@ export class SerialClient extends EventEmitter {
     this.actor = undefined
   }
 
-  private async loadHistory(configured: PortSnapshot): Promise<void> {
-    const after = Math.max(0, configured.head_seq - 4_000)
+  private async loadHistory(configured: PortSnapshot, signal: AbortSignal): Promise<void> {
+    let after = Math.max(0, configured.head_seq - 4_000)
     const query = new URLSearchParams({
       epoch: configured.daemon_epoch,
       after_seq: String(after),
@@ -641,22 +659,39 @@ export class SerialClient extends EventEmitter {
       limit_events: '4000',
       limit_bytes: String(2 * 1024 * 1024)
     })
-    const response = await this.request(
-      `/api/v1/ports/${encodeURIComponent(configured.config.port)}/events?${query}`,
-      { signal: this.managedStartup ? this.historyRead.signal : AbortSignal.any([this.historyRead.signal, AbortSignal.timeout(8_000)]) }
-    ) as EventQueryResponse
-    const history = response.events.map(normalizeTimelineEvent).sort((a, b) => a.seq - b.seq)
-    if (history.some((event) => (
-      event.port !== configured.config.port
-      || event.daemon_epoch !== configured.daemon_epoch
-      || event.seq > configured.head_seq
-    ))) {
-      throw new Error(`串口 ${configured.config.port} 的历史响应跨越了后端周期或查询上界`)
+    const port = configured.config.port
+    const history: TimelineEvent[] = []
+    let gaps = false
+    while (after < configured.head_seq) {
+      query.set('after_seq', String(after))
+      const page = await this.request(`/api/v1/ports/${encodeURIComponent(port)}/events?${query}`, { signal }) as EventQueryResponse
+      for (const raw of page.events) {
+        const event = normalizeTimelineEvent(raw)
+        if (event.port !== port || event.daemon_epoch !== configured.daemon_epoch || event.seq > configured.head_seq || event.seq <= after) {
+          throw new Error(`串口 ${port} 的历史响应跨越了后端周期或查询边界`)
+        }
+        history.push(event)
+      }
+      gaps ||= !!page.gaps?.length
+      if (!page.truncated) break
+      const cursor = page.next_cursor
+      if (!cursor || cursor.epoch !== configured.daemon_epoch || !Number.isSafeInteger(cursor.after_seq) || cursor.after_seq <= after) {
+        throw new Error('历史分页没有返回有效的后续位置')
+      }
+      after = cursor.after_seq
     }
-    this.events.set(configured.config.port, history)
+    if (signal.aborted || !this.status?.ports.some(item => item.config.port === port && item.daemon_epoch === configured.daemon_epoch)) return
+    if (gaps) this.emit('notice', `${port} 的历史记录存在缺口`)
+    const live = this.events.get(port) ?? []
+    const known = new Set(live.map(event => event.seq))
+    const missing = history.filter(event => !known.has(event.seq) && (live.length < 12_000 || event.seq >= live[0].seq))
+    if (missing.length) {
+      this.events.set(port, [...missing, ...live].sort((a,b) => a.seq - b.seq).slice(-12_000))
+      this.emit('port-history', { type: 'port-history', port, epoch: configured.daemon_epoch, events: missing })
+    }
   }
 
-  private async openSocket(version = this.connectionVersion): Promise<void> {
+  private async openSocket(version = this.connectionVersion, initial = false): Promise<void> {
     if (!this.status || this.stopped) return
     const expectedStatus = this.status
     const socket = new WebSocket(this.endpoint.replace(/^http/, 'ws') + '/api/v1/ws')
@@ -717,7 +752,9 @@ export class SerialClient extends EventEmitter {
 
       const subscriptions = expectedStatus.ports.map((configured) => ({
         port: configured.config.port,
-        cursor: this.authoritativeCursor(configured),
+        cursor: initial && !this.events.get(configured.config.port)?.length
+          ? { epoch: configured.daemon_epoch, after_seq: Math.max(0, configured.head_seq - 1000, (configured.ring_oldest_seq ?? 1) - 1) }
+          : this.authoritativeCursor(configured),
         tail_events: 1000
       }))
       const attachResult = await withTimeout(this.control({
@@ -852,12 +889,6 @@ export class SerialClient extends EventEmitter {
   }
 
   private appendEvent(event: TimelineEvent): void {
-    if (event.direction === 'tx' && event.actor?.kind === 'human' && !event.replay && !this.historyRefreshTimer) {
-      this.historyRefreshTimer = setTimeout(() => {
-        this.historyRefreshTimer = undefined
-        if (!this.stopped) void this.refreshHumanHistory().then(() => this.emit('snapshot'))
-      }, 150)
-    }
     this.assertTimelineIdentity(event)
     let items = this.events.get(event.port) ?? []
     if (items.length && items[0].daemon_epoch !== event.daemon_epoch) {
@@ -865,6 +896,15 @@ export class SerialClient extends EventEmitter {
     }
     const last = items.at(-1)
     if (last && last.seq >= event.seq) return
+    // Only a complete, nonempty human line can change seriald's command history.
+    const command = event.metadata.human_line_input
+    if (!event.replay && event.kind === 'tx' && event.actor?.kind === 'human' && event.metadata.partial !== true
+      && typeof command === 'string' && command.length > 0 && !this.historyRefreshTimer) {
+      this.historyRefreshTimer = setTimeout(() => {
+        this.historyRefreshTimer = undefined
+        if (!this.stopped) void this.refreshHumanHistory(true)
+      }, 150)
+    }
     items.push(event)
     if (items.length > 12_000) items.splice(0, items.length - 12_000)
     this.events.set(event.port, items)
@@ -892,7 +932,6 @@ export class SerialClient extends EventEmitter {
       const next = await this.get<StatusResponse>('/api/v1/status')
       if (this.readySocket !== socket || this.status !== status || revision !== this.activityRevision
         || next.server_id !== status.server_id || next.daemon_epoch !== status.daemon_epoch) return
-      let changed = false
       for (const port of next.ports) {
         const index = status.ports.findIndex((item) => item.config.port === port.config.port)
         const previous = status.ports[index]
@@ -901,9 +940,8 @@ export class SerialClient extends EventEmitter {
         retry ||= Boolean(waiting)
         if (isDeepStrictEqual(previous, port)) continue
         status.ports[index] = port
-        changed = true
+        this.emit('snapshot', port)
       }
-      if (changed) this.emit('snapshot')
     } catch { retry = true }
     finally {
       if (this.activityRequest === socket) this.activityRequest = undefined

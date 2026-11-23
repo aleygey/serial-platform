@@ -44,6 +44,7 @@ export interface PortSnapshot {
   config: PortConfig
   daemon_epoch: string
   head_seq: number
+  ring_oldest_seq?: number | null
   generation: number
   endpoint_present: boolean
   session_state: SessionState
@@ -320,6 +321,9 @@ export interface DesktopBridge {
 
 export type DesktopEvent =
   | { type: 'snapshot'; snapshot: DesktopSnapshot }
+  | { type: 'port-status'; port: PortSnapshot }
+  | { type: 'port-history'; port: string; epoch: string; events: TimelineEvent[] }
+  | { type: 'human-history'; history: HumanCommandHistory }
   | { type: 'timeline'; event: TimelineEvent }
   | { type: 'timeline-batch'; events: TimelineEvent[] }
   | { type: 'macro'; execution: MacroExecution }

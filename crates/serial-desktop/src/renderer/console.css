@@ -269,7 +269,7 @@ button, input, textarea { -webkit-app-region: no-drag; }
 .run-row .run-trigger .outline-label strong { font-size: 14px; }
 .run-row > button:last-child:not(.run-trigger) { padding: 5px; margin-top: 3px; }
 .outline-trigger { width: 100%; text-align: left; border: 0; background: transparent; color: var(--text); cursor: pointer; border-radius: 6px; }
-.outline-trigger:hover, .command-step:hover { background: var(--surface-hover); }
+button.outline-trigger:hover, .command-step:hover { background: var(--surface-hover); }
 .outline-label, .action-meta, .action-progress { display: flex; min-width: 0; align-items: center; gap: 6px; }
 .outline-label > svg { flex: none; color: var(--text-3); transition: transform .18s ease; }
 .outline-trigger[aria-expanded='true'] .outline-label > svg { transform: rotate(90deg); }
@@ -353,7 +353,8 @@ button, input, textarea { -webkit-app-region: no-drag; }
 .agent-scroll .outline-label strong { font-size: 12px; }
 .agent-scroll .run-trigger .outline-label strong { font-size: 13px; }
 .agent-scroll .outline-action { padding-left: 18px; }
-.agent-scroll .action-trigger { display: flex; align-items: center; justify-content: flex-start; gap: 12px; padding: 4px 7px 4px 3px; min-height: 27px; }
+.agent-scroll :is(.action-trigger, .macro-summary) { display: flex; align-items: center; justify-content: flex-start; gap: 12px; padding: 4px 7px 4px 3px; min-height: 27px; }
+.agent-scroll .macro-summary { cursor: default; }
 .agent-scroll .outline-action + .outline-action { margin-top: 0; }
 .agent-scroll .command-step { min-height: 23px; align-items: baseline; }
 .agent-scroll .command-step code { font: 12px/1.5 var(--mono); }
@@ -783,9 +784,9 @@ button, input, textarea { -webkit-app-region: no-drag; }
 .picker-level strong + span { flex:none; margin-inline-start:auto; color:var(--text-2); }
 .picker-anchor [data-model-results] > div:first-child:not([role]) { display:flex; gap:7px; align-items:baseline; color:var(--text-2); font-weight:650; }
 .picker-anchor [data-model-results] small { font-size:10px; font-weight:450; }
-.picker-level button:focus-visible, .terminal-page:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
-.terminal-page { margin:4px var(--pane-inset); padding:3px 6px; color:var(--accent); background:transparent; border:0; font-size:12px; cursor:pointer; }
-.terminal-scroll { overflow-anchor:none; }
+.picker-level button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.terminal-scroll { overflow-anchor:none; contain:strict; }
+.terminal-lines { display:block; contain:layout; }
 .appearance-setting > .form-field { max-width:220px; }
 .is-split .channel-name { flex:1; align-self:stretch; cursor:grab; touch-action:none; user-select:none; }
 .is-split .channel-name h2 { display:flex; flex:1; min-width:4ch; }

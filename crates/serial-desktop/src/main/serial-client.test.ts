@@ -298,6 +298,34 @@ describe('authoritative WebSocket reconnect', () => {
     await client.stop()
   })
 
+  it('accepts live Enter while a slow historical page is pending and merges it without losing live output', async () => {
+    const epoch = FIRST_DAEMON_EPOCH
+    const recent = timelineEvent(epoch, 2000, 'rx')
+    const older = timelineEvent(epoch, 10, 'rx')
+    const backend = await serialBackend({ serverId: FIRST_SERVER_ID, daemonEpoch: epoch, headSeq: 2000, events: [recent] })
+    const fetchRest = globalThis.fetch
+    let finish!: (response: Response) => void
+    const delayed = new Promise<Response>(resolve => { finish = resolve })
+    vi.stubGlobal('fetch', (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+      new URL(String(input)).pathname.endsWith('/events') ? delayed : fetchRest(input, init))
+    const client = new SerialClient(backend.endpoint)
+    try {
+      await client.start()
+      await client.sendCommand('COM6', '')
+      expect(backend.humanCommands).toHaveLength(1)
+      const output = once(client, 'timeline')
+      backend.publish(timelineEvent(epoch, 2001, 'rx'))
+      await withTestTimeout(output, 1000, 'live echo stalled behind disk history')
+      const backfill = once(client, 'port-history')
+      finish(jsonResponse({ events: [older, recent] }))
+      await withTestTimeout(backfill, 1000, 'history was not merged')
+      const sequences = client.data().events.COM6.map(event => event.seq)
+      expect(sequences[0]).toBe(10)
+      expect(sequences.filter(seq => seq === 2000)).toHaveLength(1)
+      expect(sequences.at(-1)).toBeGreaterThan(2000)
+    } finally { await client.stop() }
+  })
+
   it('does not reuse a high old seq in a new epoch, so early approval timeline remains reachable', async () => {
     const initialApproval = runStartApproval(FIRST_DAEMON_EPOCH)
     const backend = await serialBackend({

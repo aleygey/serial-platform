@@ -101,7 +101,7 @@ export function App(): React.JSX.Element {
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
     if (event.type === 'macro') setMacroExecution(event.execution)
-    if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'timeline-batch' || event.type === 'connection' || event.type === 'service') {
+    if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'timeline-batch' || event.type === 'port-status' || event.type === 'port-history' || event.type === 'human-history' || event.type === 'connection' || event.type === 'service') {
       setSnapshot((current) => mergeDesktopSnapshotEvent(current, event))
     }
     if (event.type === 'connection') {
@@ -344,7 +344,7 @@ export function App(): React.JSX.Element {
                 return <Fragment key={JSON.stringify([scope, port])}>
                   {gap(index)}
                   {index > 0 && <Separator className="pane-divider" aria-label={`调整 ${layout.ports[index - 1]} 与 ${port} 的宽度`}><span /></Separator>}
-                  <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors}
+                  <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors} paneOrder={layout.ports}
                   active={selectedPort === port} split={split} dragController={drag} swapTarget={swapTarget === port && draggedPort !== port}
                   animateEntry={!!pendingWidths.current && selectedPort === port} session={session.input} historyView={session.history} humanHistory={humanHistory}
                   onReorder={target => setLayout(current => reorderPane(current, port, target))}
@@ -387,6 +387,28 @@ export function mergeDesktopSnapshotEvent(
     return { ...current, connection: event.state, connectionMessage: event.message }
   }
   if (event.type === 'service') return { ...current, service: event.service }
+  if (event.type === 'port-history') {
+    if (!current.configuredPorts.some(port => port.config.port === event.port && port.daemon_epoch === event.epoch)) return current
+    const live = current.events[event.port] ?? []
+    const known = new Set(live.map(entry => entry.seq))
+    const missing = event.events.filter(entry => !known.has(entry.seq))
+    if (!missing.length) return current
+    const merged = [...missing, ...live].sort((a, b) => a.seq - b.seq).slice(-12_000)
+    return { ...current, events: { ...current.events, [event.port]: merged } }
+  }
+  if (event.type === 'human-history') {
+    const history = event.history
+    if (history.server_id !== current.serverId || (current.humanHistory && history.revision < current.humanHistory.revision)) return current
+    return { ...current, humanHistory: history }
+  }
+  if (event.type === 'port-status') {
+    const port = event.port
+    const index = current.configuredPorts.findIndex(item => item.config.port === port.config.port)
+    if (index < 0 || port.daemon_epoch !== current.daemonEpoch || port.head_seq < current.configuredPorts[index].head_seq) return current
+    const configuredPorts = [...current.configuredPorts]
+    configuredPorts[index] = port
+    return { ...current, configuredPorts }
+  }
   if (event.type !== 'timeline' && event.type !== 'timeline-batch') return current
 
   const incoming = event.type === 'timeline' ? [event.event] : event.events

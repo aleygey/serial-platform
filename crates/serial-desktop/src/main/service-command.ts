@@ -1,5 +1,17 @@
+import { networkInterfaces } from 'node:os'
+
 export function buildSpawnArgs(prefix: string[], endpoint: string): string[] {
-  return [...prefix, '--bind', new URL(endpoint).host]
+  const { hostname, port } = new URL(endpoint)
+  return [...prefix, '--bind', (hostname === 'localhost' ? '127.0.0.1' : hostname) + ':' + (port || '80')]
+}
+
+export function canTryLocalStartup(endpoint: string, error: unknown, interfaces = networkInterfaces()): boolean {
+  const cause = error instanceof TypeError ? error.cause as NodeJS.ErrnoException | undefined : undefined
+  if (cause?.code !== 'ECONNREFUSED' && cause?.code !== 'ETIMEDOUT' && !(error instanceof Error && error.name === 'TimeoutError')) return false
+  const { hostname, protocol } = new URL(endpoint)
+  const address = hostname.replace(/^\[|\]$/g, '')
+  return protocol === 'http:' && (address === 'localhost' || address === '::1' || /^127(?:\.\d+){3}$/.test(address) ||
+    Object.values(interfaces).some(entries => entries?.some(entry => entry.address === address)))
 }
 
 export function buildDiscoverArgs(): string[] {

@@ -74,8 +74,8 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
     if (disabled || !active) setMenu(undefined)
   }, [disabled, active])
   const selectionPending = useRef(true)
-  const suffix = useMemo(() => focused && !composing && !menu && !sending && !disabled
-    ? suggestedSuffix(buffer, remoteSuggestion?.query === buffer.value ? remoteSuggestion.entries : humanHistory) : '', [buffer, humanHistory, remoteSuggestion, focused, composing, menu, sending, disabled])
+  const suffix = useMemo(() => focused && !composing && !menu && !disabled
+    ? suggestedSuffix(buffer, remoteSuggestion?.query === buffer.value ? remoteSuggestion.entries : humanHistory) : '', [buffer, humanHistory, remoteSuggestion, focused, composing, menu, disabled])
 
   const historyQuery = menu?.query ?? buffer.value
   const historyContains = menu?.kind === 'search'
@@ -137,7 +137,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
   const sendTone = sending ? 'working' : receipt?.status === 'rejected' ? 'failed' : receipt?.status === 'uncertain' ? 'waiting' : receipt?.status === 'accepted' ? 'done' : undefined
 
   const submit = async (): Promise<void> => {
-    if (disabled || session.snapshot().pending) return
+    if (disabled) return
     const command = session.snapshot().buffer.value.replace(/[\r\n]+$/, '')
     setMenu(undefined)
     await session.submit(command, () => onSend(command), true)
@@ -216,17 +216,13 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
           }
           if (menuKey(event)) return
           if (menu) setMenu(undefined)
-          if (session.snapshot().pending) {
-            if (['Enter', 'ArrowUp', 'ArrowDown'].includes(event.key)) event.preventDefault()
-            return
-          }
           const current = { value: event.currentTarget.value, start: event.currentTarget.selectionStart ?? buffer.start, end: event.currentTarget.selectionEnd ?? buffer.end }
           if (acceptsSuggestion(event.key, current, suffix, false, event.ctrlKey || event.altKey || event.metaKey || event.shiftKey)) {
             event.preventDefault()
             edit(commandBuffer(current.value + suffix))
           } else if (event.key === 'Enter') {
             event.preventDefault()
-            if (!event.repeat) void submit()
+            void submit()
           } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r') {
             event.preventDefault()
             openHistory(current)
@@ -261,7 +257,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
     <form ref={formRef} onBlur={event => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setMenu(undefined) }} className={`command-bar ${focused ? 'is-focused' : ''}`} aria-label={`${port ?? ''} 串口命令栏`}
       onSubmit={event => { event.preventDefault(); void submit() }}>
       <PromptBox className="serial-prompt" data-tone={sendTone} value={buffer.value} editor={editor}
-        actions={<button className="input-history" type="button" aria-label="查找人工命令历史" title="查找人工命令历史 (Ctrl+R)" disabled={disabled || sending}
+        actions={<button className="input-history" type="button" aria-label="查找人工命令历史" title="查找人工命令历史 (Ctrl+R)" disabled={disabled}
           aria-expanded={menu?.kind === 'search'} onClick={() => menu?.kind === 'search' ? closeMenu(false) : openHistory(buffer)}><History size={15} aria-hidden /></button>}
         efforts={DIRECT_SEND} status={sending ? 'sending' : 'idle'} disabled={disabled} paused={paused}
         hint={null} placeholder={placeholder} clearOnSubmit={false} sendLabel="Run" buttonClassName="send-button"

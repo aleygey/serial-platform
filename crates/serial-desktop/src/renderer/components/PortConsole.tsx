@@ -2,14 +2,14 @@ import { X } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { PortDragHandle, usePortPointerDrag, type PortDragController } from './PortDrag'
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type SyntheticEvent } from 'react'
-import type { AgentHistoryResponse, DesktopSnapshot, TimelineEvent } from '../../shared/contracts'
-import { locateCommandOutput, mergeAgentHistory, type AgentCommand } from '../lib/history'
+import type { AgentHistoryResponse, DesktopSnapshot, MacroExecution, TimelineEvent } from '../../shared/contracts'
+import { createHistorySelector, locateCommandOutput, mergeAgentHistory, type AgentCommand } from '../lib/history'
 import { lastRunOutcome, portActivity } from '../lib/console-workspace'
 import { PortInput } from '../lib/port-input'
 import { ModelIdentityPicker } from './SerialFields'
 import { CommandBar } from './CommandBar'
 import { AgentDock } from './AgentDock'
-import { AgentHistory, type AgentHistoryView } from './AgentHistory'
+import { AgentHistory, macroExecutionLabel, type AgentHistoryView } from './AgentHistory'
 import { TerminalPane } from './TerminalPane'
 import { message, withToast, submitHumanCommand, type SetToast } from '../lib/feedback'
 
@@ -19,6 +19,7 @@ interface Props {
   snapshot: DesktopSnapshot
   colors: { accent: string; output: string }
   selectedPort: string
+  paneOrder: string[]
   active: boolean
   split: boolean
   session: PortInput
@@ -33,7 +34,7 @@ interface Props {
   setToast: SetToast
 }
 
-export function PortConsole({ snapshot, colors, selectedPort, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
+export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
   const headingDrag = usePortPointerDrag(selectedPort, split ? dragController : undefined)
   const [animateDrawer, setAnimateDrawer] = useState(false)
   const [drawerPreference, setDrawerPreference] = useState(historyView.expanded)
@@ -87,12 +88,16 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
 
   const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
   const events = snapshot.events[selectedPort] ?? EMPTY_EVENTS
+  const liveEvents = useRef(events)
+  liveEvents.current = events
+  const selectHistory = useMemo(createHistorySelector, [selectedPort, snapshot.serverId])
+  const liveHistory = useMemo(() => selectHistory(events), [selectHistory, events])
   const activity = portActivity(configuredPort, snapshot.connection === 'connected', snapshot.actor)
   const historyEvents = useMemo(() => {
     const archived = Object.values(agentArchiveEvents)
-    if (!archived.length) return events
-    return [...archived.flat(), ...events].sort((a, b) => a.seq - b.seq)
-  }, [agentArchiveEvents, events])
+    if (!archived.length) return liveHistory
+    return [...archived.flat(), ...liveHistory].sort((a, b) => a.seq - b.seq)
+  }, [agentArchiveEvents, liveHistory])
   const history = useMemo(() => mergeAgentHistory(historyEvents, agentArchive, activity.run), [historyEvents, agentArchive, activity.run])
   const loadRun = useCallback(async (id: string) => {
     const record = agentArchive?.runs.find(item => item.run.id === id)
@@ -101,6 +106,7 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
     const loaded = historyLoad.current.get(id)
     const first = loaded?.epoch === record.epoch ? loaded.through + 1 : record.run.start_seq
     if (through < first) return
+    const events = liveEvents.current
     const startIndex = events.findIndex(e => e.daemon_epoch === record.epoch && e.seq === first)
     const endIndex = startIndex + through - first
     if (startIndex >= 0 && events[endIndex]?.seq === through && events[endIndex].daemon_epoch === record.epoch
@@ -118,7 +124,7 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
         setToast({ kind: 'error', message: message(error) })
       }
     }
-  }, [agentArchive, events, setToast])
+  }, [agentArchive, events[0]?.daemon_epoch, events[0]?.seq, setToast])
   const commands = useMemo(() => history.flatMap(item => item.kind === 'command' ? item.commands : []), [history])
   const currentSelectedCommand = selectedCommand
     ? commands.find((command) => (
@@ -175,10 +181,10 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
   }, [drawerPreference, showHistory, setHistoryOpen])
   const currentStep = useMemo(() => {
     if (!runId || !configuredPort) return
-    let latest: { actionId: string; description: string; command?: AgentCommand; seq: number } | undefined
+    let latest: { actionId: string; description: string; command?: AgentCommand; macro?: MacroExecution; seq: number } | undefined
     for (const action of history) {
       if (action.kind !== 'command' || action.runId !== runId) continue
-      if (!action.commands.length && (!latest || action.firstSeq > latest.seq)) latest = { actionId: action.id, description: action.description, seq: action.firstSeq }
+      if (!action.commands.length && (!latest || action.firstSeq > latest.seq)) latest = { actionId: action.id, description: action.description, macro: action.macro, seq: action.firstSeq }
       for (const command of action.commands) {
         if (command.daemonEpoch === configuredPort.daemon_epoch && command.generation === configuredPort.generation
           && (!latest || command.firstSeq > latest.seq)) latest = { actionId: action.id, description: action.description, command, seq: command.firstSeq }
@@ -187,13 +193,14 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
     return latest
   }, [history, runId, configuredPort?.daemon_epoch, configuredPort?.generation])
   const currentCommand = currentStep?.command
+  const macroState = currentStep?.macro && currentStep.macro.status !== 'running' ? macroExecutionLabel(currentStep.macro) : undefined
   const focusPort = (event: SyntheticEvent) => {
     if (!(event.target instanceof Element) || !event.target.closest('.channel-close')) onFocus()
   }
 
   return <motion.article className={`port-console ${active ? 'is-active' : ''}`} aria-label={`${selectedPort} 控制台`} data-port={selectedPort}
     data-motion={paused ? 'paused' : undefined} data-swap-target={swapTarget || undefined} ref={frame}
-    onPointerDownCapture={focusPort} onFocusCapture={focusPort} layout={reduced ? false : 'position'}
+    onPointerDownCapture={focusPort} onFocusCapture={focusPort} layout={reduced ? false : 'position'} layoutDependency={dragController.drag ? undefined : paneOrder}
     initial={!reduced && animateEntry ? { scale:0.96, opacity:0.76 } : false} animate={{ scale:1, opacity:1 }}
     transition={reduced ? {duration:0} : {type:'spring', stiffness:420, damping:32, layout: { type: 'spring', stiffness: 490, damping: 39 } }}>
     <div className="console-stack channel-body">
@@ -242,7 +249,8 @@ export function PortConsole({ snapshot, colors, selectedPort, active, split, ses
           }} />}
         </div>
       </div>
-      <AgentDock port={selectedPort} activity={activity} orbColor={activity.agentOwned ? colors.accent : colors.output} command={currentCommand} outcome={outcome}
+      <AgentDock port={selectedPort} activity={activity} orbColor={activity.agentOwned ? colors.accent : colors.output} command={currentCommand}
+        outcome={outcome ?? (macroState && { ...macroState, label: currentStep!.description + macroState.label })}
 
         action={currentStep?.description}
         expanded={historyOpen} historyId={historyId} onToggleHistory={() => { setAnimateDrawer(true); setHistoryOpen(!historyOpen) }}

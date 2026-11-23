@@ -170,7 +170,7 @@ export function BounceSidebar({
               itemRefs.current[index] = el;
             }}
           >
-            {isActive && <motion.span aria-hidden className="sidebar-selection" layoutId={selectionId}
+            {isActive && <motion.span aria-hidden className="sidebar-selection" layoutId={selectionId} layoutDependency={activeIndex}
               transition={reduced ? {duration:0} : {type:"spring", stiffness:440, damping:35}} />}
             {renderItem ? renderItem(index, { className: itemClassName, "data-slot": "bounce-sidebar-item", "data-active": isActive, onClick: () => select(index) }, content) : href ? (
               <MotionLink

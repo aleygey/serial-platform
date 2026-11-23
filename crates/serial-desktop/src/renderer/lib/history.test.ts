@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { TimelineEvent } from '../../shared/contracts'
-import { buildAgentHistory, mergeAgentHistory, locateCommandOutput } from './history'
+import { buildAgentHistory, createHistorySelector, mergeAgentHistory, locateCommandOutput } from './history'
 
 function event(seq: number, direction: 'rx' | 'tx', text: string): TimelineEvent {
   return {
@@ -49,10 +49,30 @@ describe('Agent history', () => {
     for (const item of history) {
       expect(item.kind).toBe('command')
       if (item.kind === 'command') {
-        expect(item.description).toBe('Macro · enter-uboot')
-        expect(item.commands).toHaveLength(2)
+        expect(item.description).toBe('enter-uboot')
+        expect(item.commands).toHaveLength(0)
       }
     }
+  })
+
+  it('keeps the live rail stable through 2000 macro writes, and recovers the historical name and final status', () => {
+    const owner = { id: 'agent', kind: 'agent' as const, label: 'Agent' }
+    const macro = { id: 'exec', daemon_epoch: 'epoch', generation: 1, owner, run_id: 'run',
+      macro_id: 'probe', description: '等待提示符', status: 'running', outcome_uncertain: false }
+    const start = { ...event(1, 'tx', ''), kind: 'checkpoint', direction: 'none' as const, run_id: 'run',
+      metadata: { macro_execution: macro, macro_definition: { name: '设备心跳' } } }
+    const writes = Array.from({ length: 2000 }, (_, i) => ({ ...event(i + 2, 'tx', 'ping\r'), actor: owner,
+      run_id: 'run', operation_id: String(i), metadata: { macro_execution_id: 'exec', macro_id: 'probe', macro_name: '设备心跳' } }))
+    const end = { ...start, seq: 2002, metadata: { macro_execution: { ...macro, status: 'timed_out' } } }
+    const select = createHistorySelector()
+    const first = select([event(0, 'rx', 'previous output'), start, writes[0]])
+    expect(select([start, ...writes])).toBe(first)
+    const complete = select([start, ...writes, end])
+    expect(complete).toHaveLength(3)
+    expect(buildAgentHistory(complete)).toMatchObject([{ description: '设备心跳', commands: [], macro: { status: 'timed_out' } }])
+    expect(buildAgentHistory(select(writes.slice(100)))).toMatchObject([{ description: '设备心跳', commands: [] }])
+    expect(select([])).toEqual([])
+    expect(writes).toHaveLength(2000)
   })
 
   it('keeps old-to-new order and groups command sequence steps', () => {

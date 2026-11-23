@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { parseDiscoveredEndpoint } from './local-service'
-import { buildDiscoverArgs, buildSpawnArgs, selectLocalEndpoint } from './service-command'
+import { buildDiscoverArgs, buildSpawnArgs, canTryLocalStartup, selectLocalEndpoint } from './service-command'
 
 describe('local service command', () => {
   const discovered = {
@@ -15,6 +15,15 @@ describe('local service command', () => {
     expect(buildSpawnArgs(['serve', '--managed'], 'http://127.0.0.1:3210')).toEqual([
       'serve', '--managed', '--bind', '127.0.0.1:3210'
     ])
+  })
+
+  it('handles localhost and this machine’s saved LAN endpoint while the local service is recovering', () => {
+    expect(buildSpawnArgs(['serve'], 'http://localhost:3210')).toEqual(['serve', '--bind', '127.0.0.1:3210'])
+    const timeout = new DOMException('health timed out', 'TimeoutError')
+    const interfaces = { lan: [{ address: '192.168.10.24', netmask: '255.255.255.0', family: 'IPv4' as const, mac: '', internal: false, cidr: '192.168.10.24/24' }] }
+    expect(canTryLocalStartup('http://192.168.10.24:3210', timeout, interfaces)).toBe(true)
+    expect(canTryLocalStartup('http://192.168.10.25:3210', timeout, interfaces)).toBe(false)
+    expect(canTryLocalStartup('http://localhost:3210', new Error('wrong protocol'), interfaces)).toBe(false)
   })
 
   it('uses one discovery command for either packaged daemon launcher', () => {

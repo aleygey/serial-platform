@@ -67,7 +67,7 @@ describe('port console', () => {
     const macro = actions.find(action => action.actionKind === 'macro')!
     expect(macro.macro?.status).toBe('succeeded')
     expect(macro.stepCount).toBeUndefined()
-    expect(macro.commands.map(command => commandState(command, true).label)).toEqual(['已发送', '已发送'])
+    expect(macro.commands).toHaveLength(0)
     const checkpoint = events.find(event => event.metadata.macro_phase === 'started')!
     expect(buildAgentHistory([checkpoint])[0]).toMatchObject({ actionKind: 'macro', commands: [], macro: { status: 'running' } })
   })
