@@ -51,7 +51,8 @@ export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagn
   terminalDocument.sync(events)
 
   const [follow, setFollow] = useState(true)
-  const manualScroll = useRef(false)
+  const scrollMode = useRef<'live' | 'reading' | 'inspecting'>('live')
+  const lastLiveTop = useRef(0)
   const [findOpen, setFindOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [, setNavigationRevision] = useState(0)
@@ -69,18 +70,29 @@ export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagn
   const target = findOpen && activeId ? activeId : selectedCommand ? selectedCommand.daemonEpoch + ':' + selectedCommand.firstSeq : ''
   const [anchor, setAnchor] = useState<{ seq?: number; target: string }>()
   const scrollAnchor = useRef<{ seq: number; offset: number; top: number } | null>(null)
+  const pinTail = useCallback(() => {
+    const view = scrollRef.current
+    if (!view || scrollMode.current !== 'live') return
+    const bottom = Math.max(0, view.scrollHeight - view.clientHeight)
+    lastLiveTop.current = bottom
+    if (Math.abs(view.scrollTop - bottom) > 1) view.scrollTop = bottom
+  }, [])
   const returnToLive = useCallback(() => {
-    if (follow && !manualScroll.current && !selectedCommand && !findOpen) return
-    manualScroll.current = false
+    if (scrollMode.current === 'live' && !selectedCommand && !findOpen) return
+    scrollMode.current = 'live'
     scrollAnchor.current = null
     setAnchor(undefined)
     setFindOpen(false)
     if (selectedCommand) onClearCommand()
-    if (follow) {
-      const view = scrollRef.current
-      if (view) view.scrollTop = view.scrollHeight
-    } else setFollow(true)
-  }, [follow, selectedCommand, findOpen, onClearCommand])
+    setFollow(true)
+    // The pending manual scroll and this return can share a React commit.
+    requestAnimationFrame(pinTail)
+  }, [selectedCommand, findOpen, onClearCommand, pinTail])
+  const inspect = useCallback(() => {
+    scrollMode.current = 'inspecting'
+    scrollAnchor.current = null
+    setFollow(false)
+  }, [])
   useImperativeHandle(ref, () => ({ returnToLive }), [returnToLive])
   useLayoutEffect(() => {
     diagnostics?.committed(events, [configuredPort?.effective_shell_prompt, configuredPort?.effective_uboot_prompt], key => terminalDocument.textFor(key))
@@ -164,7 +176,7 @@ export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagn
   useLayoutEffect(() => {
     const saved = scrollAnchor.current
     const view = scrollRef.current
-    if (!view || !saved || follow || !manualScroll.current) return
+    if (!view || !saved || scrollMode.current !== 'reading') return
     const row = view.querySelector<HTMLElement>(`[data-seq="${saved.seq}"]`)
     if (!row) {
       if (chunks[0] && saved.seq < chunks[0].seq) view.scrollTop = 0
@@ -191,64 +203,81 @@ export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagn
       previousFocusRef.current = active instanceof HTMLElement ? active : null
       setFindOpen(true)
     }
-    if (terminalDocument.activeId) setFollow(false)
+    if (terminalDocument.activeId) inspect()
     requestAnimationFrame(() => {
       findInputRef.current?.focus()
       findInputRef.current?.select()
     })
-  }, [findOpen, terminalDocument])
+  }, [findOpen, terminalDocument, inspect])
 
   const closeFind = useCallback((): void => {
     setFindOpen(false)
+    if (scrollMode.current === 'inspecting' && !selectedCommand) scrollMode.current = 'reading'
     const previous = previousFocusRef.current
     requestAnimationFrame(() => {
       if (previous?.isConnected && !('disabled' in previous && Boolean(previous.disabled))) previous.focus()
       else scrollRef.current?.focus()
     })
-  }, [])
+  }, [selectedCommand])
 
   const navigate = useCallback((direction: 1 | -1): void => {
     if (!terminalDocument.move(direction)) return
-    setFollow(false)
+    inspect()
     setNavigationRevision((value) => value + 1)
-  }, [terminalDocument])
+  }, [terminalDocument, inspect])
 
   const updateSearch = (value: string): void => {
     terminalDocument.search(value)
     setSearch(value)
-    if (terminalDocument.activeId) setFollow(false)
+    if (terminalDocument.activeId) inspect()
     setNavigationRevision((revision) => revision + 1)
   }
 
   const commandAnchor = selectedCommand ? `${selectedCommand.daemonEpoch}:${selectedCommand.firstSeq}:${match?.fromSeq}:${match?.hasVisibleOutput}:${events[0]?.daemon_epoch}:${events[0]?.seq}` : ''
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (!selectedCommand) {
+      if (scrollMode.current === 'inspecting' && !findOpen) scrollMode.current = 'reading'
+      return
+    }
+    inspect()
     if (match?.hasVisibleOutput) {
       scrollRef.current?.querySelector(`[data-event-key="${match.daemonEpoch}:${match.fromSeq}"]`)?.scrollIntoView({ block: 'center' })
-      setFollow(false)
-    } else if (selectedCommand) {
+    } else {
       scrollRef.current?.querySelector(`[data-event-key="${selectedCommand.daemonEpoch}:${selectedCommand.firstSeq}"]`)?.scrollIntoView({ block: 'center' })
-      setFollow(false)
     }
-  }, [commandAnchor])
+  }, [commandAnchor, inspect])
 
   useLayoutEffect(() => {
-    if (follow && !manualScroll.current) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'instant' })
-  }, [follow])
+    if (follow) pinTail()
+  }, [follow, target, pinTail])
 
   const hasOutput = chunks.length > 0
-  useEffect(() => {
+  useLayoutEffect(() => {
     const view = scrollRef.current
     const output = view?.querySelector('pre')
-    if (!follow || !view || !output) return
-    // Scroll after layout, only when the output or viewport actually changes
-    // height. A same-line progress update must not force a synchronous layout.
-    const observer = new ResizeObserver(() => {
-      if (!manualScroll.current) view.scrollTop = view.scrollHeight
+    if (!view || !output) return
+    // Both arriving lines and the history drawer change the visible tail.
+    // Same-line progress updates do not need to read the layout.
+    let previousViewport: DOMRectReadOnly | undefined
+    const observer = new ResizeObserver(entries => {
+      const size = entries.find(entry => entry.target === view)?.contentRect
+      if (scrollMode.current === 'live') pinTail()
+      else if (size && previousViewport && size.width === previousViewport.width && size.height !== previousViewport.height) {
+        // Slide the last visible line with the drawer while reading older output.
+        view.scrollTop += previousViewport.height - size.height
+      }
+      if (size) previousViewport = size
     })
     observer.observe(view)
     observer.observe(output)
     return () => observer.disconnect()
-  }, [follow, hasOutput])
+  }, [hasOutput, pinTail])
+
+  function browseInspection(view: HTMLElement, towardEnd = false) {
+    if (!target || scrollMode.current === 'live') return
+    scrollMode.current = 'reading'
+    if (towardEnd && view.scrollHeight - view.scrollTop - view.clientHeight <= 3) returnToLive()
+  }
 
   useEffect(() => {
     if (findOpen && activeId) {
@@ -334,26 +363,36 @@ export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagn
         className="terminal-scroll"
         ref={scrollRef}
         tabIndex={0}
-        onPointerDown={event => { if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) manualScroll.current = true }}
-        onTouchMove={() => { manualScroll.current = true }}
+        onPointerDown={event => { if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) browseInspection(event.currentTarget) }}
+        onTouchMove={event => browseInspection(event.currentTarget)}
         onKeyDown={event => {
-          if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key)) manualScroll.current = true
+          if (event.key === 'End' && !event.shiftKey) {
+            returnToLive()
+          } else if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', ' '].includes(event.key)) {
+            browseInspection(event.currentTarget, ['PageDown', 'ArrowDown'].includes(event.key))
+          }
         }}
-        onWheel={event => {
-          if (event.deltaY !== 0) manualScroll.current = true
-        }}
+        onWheel={event => { if (event.deltaY && !event.ctrlKey) browseInspection(event.currentTarget, event.deltaY > 0) }}
         onScroll={(event) => {
+          if (scrollMode.current === 'inspecting') return
           const element = event.currentTarget
-          const atEnd = element.scrollHeight - element.scrollTop - element.clientHeight <= 3
+          const top = element.scrollTop
+          const atEnd = element.scrollHeight - top - element.clientHeight <= 3
           if (atEnd) {
-            manualScroll.current = false
+            if (scrollMode.current === 'reading' && target) returnToLive()
+            scrollMode.current = 'live'
+            lastLiveTop.current = top
             scrollAnchor.current = null
             if (anchor?.seq !== undefined) setAnchor(undefined)
+            setFollow(true)
           } else {
-            manualScroll.current = true
+            // A queued scroll event may arrive after new lines or a smaller
+            // viewport. Only actual movement away from the tail pauses it.
+            if (scrollMode.current === 'live' && top >= lastLiveTop.current - 1) return
+            scrollMode.current = 'reading'
+            setFollow(false)
             rememberViewport(element)
           }
-          setFollow(atEnd)
         }}
       >
         {chunks.length === 0 ? (

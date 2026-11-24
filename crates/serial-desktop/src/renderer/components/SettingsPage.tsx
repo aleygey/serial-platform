@@ -1,4 +1,4 @@
-import { Plus, Save, Trash2 } from 'lucide-react'
+import { ArrowUpRight, Plus, Save, Trash2 } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type KeyboardEvent } from 'react'
 import { BaudRateField, SerialNumberField } from './BaudRateField'
 import { BounceSidebar } from './ui/bounce-sidebar'
@@ -28,11 +28,12 @@ interface Props {
   modelFamilies: ModelFamily[]
   preferences: DesktopPreferences
   serviceControls?: ReactNode
+  backendConnected?: boolean
   initialPort?: string
   onSaveSerial: (draft: SerialConfigurationDraft) => Promise<boolean>
   onSaveModels: (profiles: ModelProfile[]) => Promise<boolean>
   onSaveModelFamilies: (families: ModelFamily[]) => Promise<boolean>
-  onSavePreferences: (preferences: DesktopPreferences) => Promise<void>
+  onSavePreferences: (preferences: Partial<DesktopPreferences>) => Promise<void>
   onOpenSetup?: () => void
 }
 
@@ -113,8 +114,10 @@ export function SettingsPage(props: Props): React.JSX.Element {
             <ModelFamilyEditor families={props.modelFamilies} configuredPorts={props.configuredPorts} onSave={async (families) => {
               if (await props.onSaveModelFamilies(families)) saveNotice()
             }} />
-            <div className="editor-shell"><div className="editor-heading"><h1>应用</h1></div>
-              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} onOpenSetup={props.onOpenSetup} />
+            <div className="editor-shell application-editor"><div className="editor-heading"><h1>应用</h1>
+              {props.onOpenSetup && <button className="setup-reopen" type="button" onClick={props.onOpenSetup}>首次配置向导<ArrowUpRight size={14} aria-hidden /></button>}
+            </div>
+              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} backendConnected={props.backendConnected} />
             </div>
           </TransitionPanel>
         </section>
@@ -368,60 +371,47 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
   )
 }
 
-function ApplicationSettings({ preferences, onSave, serviceControls, onOpenSetup }: Pick<Props, 'preferences' | 'serviceControls' | 'onOpenSetup'> & { onSave: (preferences: DesktopPreferences) => Promise<void> }): React.JSX.Element {
-  const [value, setValue] = useState(preferences)
-  useConfigurationChange(preferences, setValue)
-  const mode = useAppearanceMode(value.theme)
+function ApplicationSettings({ preferences, onSave, serviceControls, backendConnected }: Pick<Props, 'preferences' | 'serviceControls' | 'backendConnected'> & { onSave: Props['onSavePreferences'] }): React.JSX.Element {
+  const [address, setAddress] = useState(preferences.endpoint)
+  useEffect(() => setAddress(preferences.endpoint), [preferences.endpoint])
+  const mode = useAppearanceMode(preferences.theme)
   const colors = Object.entries(palettes).map(([id, palette]) => {
     const swatch = palette[mode]
     return { value: id, label: palette.name, colors: { sidebar:swatch.rail, panel:swatch.terminal, border:swatch.accent,
       strong:swatch.accent, muted:`color-mix(in srgb, ${swatch.accent} 32%, ${swatch.panel})`, tile:swatch.panel } }
   })
-  return (
-    <div className="app-settings">
-      <div className="appearance-setting"><h2>外观</h2>
-        <ThemeSelector compact aria-label="明暗模式" themes={themes} value={value.theme} onChange={(theme) => {
-          const next = { ...value, theme: theme as ThemePreference }
-          setValue(next)
-          void onSave(next)
-        }} />
-        <ThemeSelector aria-label="主题配色" themes={colors} value={paletteId(value.palette)} onChange={id => {
-          const next = { ...value, palette:paletteId(id) }
-          setValue(next)
-          void onSave(next)
-        }} />
-        <SerialNumberField label="界面字号（px）" choices={interfaceFontSizes} value={interfaceFontSize(value.interfaceFontSize)} onChange={size => {
-          const next = { ...value, interfaceFontSize: size }
-          setValue(next)
-          void onSave(next)
-        }} />
-        <SerialNumberField label="终端字号（px）" choices={terminalFontSizes} value={terminalFontSize(value.terminalFontSize)} onChange={size => {
-          const next = { ...value, terminalFontSize: size }
-          setValue(next)
-          void onSave(next)
-        }} />
+  return <div className="app-settings">
+    <fieldset className="appearance-setting"><legend>外观</legend>
+      <div className="preference-row"><span>明暗模式</span>
+        <ThemeSelector compact aria-label="明暗模式" themes={themes} value={preferences.theme}
+          onChange={theme => void onSave({ theme: theme as ThemePreference })} />
       </div>
-      <h2>后端连接</h2>
+      <div className="preference-row palette-row"><span>主题配色</span>
+        <ThemeSelector aria-label="主题配色" themes={colors} value={paletteId(preferences.palette)} onChange={id => void onSave({ palette: paletteId(id) })} />
+      </div>
+    </fieldset>
+    <fieldset><legend>字号</legend>
+      <div className="font-preferences">
+        <SerialNumberField label="界面字号（px）" choices={interfaceFontSizes} value={interfaceFontSize(preferences.interfaceFontSize)} onChange={size => void onSave({ interfaceFontSize: size })} />
+        <SerialNumberField label="终端字号（px）" choices={terminalFontSizes} value={terminalFontSize(preferences.terminalFontSize)} onChange={size => void onSave({ terminalFontSize: size })} />
+      </div>
+    </fieldset>
+    <fieldset><legend>后端连接</legend>
       {serviceControls}
-      <label><span>后端地址</span><input value={value.endpoint} onChange={(event) => setValue((current) => ({ ...current, endpoint: event.target.value }))} onBlur={() => { if (value.endpoint !== preferences.endpoint) void onSave(value) }} /></label>
-      <label className="auto-start-setting">
-        <span><strong>自动启动本地后端</strong><small>连接不到配置地址时由 App 启动</small></span>
-        <input
-          aria-label="自动启动本地后端"
-          checked={value.autoStartLocal}
-          onChange={(event) => {
-            const next = { ...value, autoStartLocal: event.target.checked }
-            setValue(next)
-            void onSave(next)
-          }}
-          type="checkbox"
-        />
-        <span className="switch-control" />
-      </label>
-      {onOpenSetup && <button className="setup-reopen" type="button" onClick={onOpenSetup}>打开首次配置向导</button>}
-
-    </div>
-  )
+      <MoreFields title="连接与启动" summary={preferences.endpoint} defaultOpen={!backendConnected}>
+        <label className="endpoint-field"><span>后端地址</span>
+          <input value={address} spellCheck={false} autoComplete="off"
+            onChange={event => setAddress(event.target.value)}
+            onBlur={() => { if (address !== preferences.endpoint) void onSave({ endpoint: address }) }} />
+        </label>
+        <label className="auto-start-setting">
+          <span><strong>自动启动本地后端</strong><small>无法连接时启动本地 seriald</small></span>
+          <input type="checkbox" role="switch" aria-label="自动启动本地后端" checked={preferences.autoStartLocal} onChange={event => void onSave({ autoStartLocal: event.target.checked })} />
+          <span className="switch-control" aria-hidden />
+        </label>
+      </MoreFields>
+    </fieldset>
+  </div>
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {

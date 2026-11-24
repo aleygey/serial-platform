@@ -1,15 +1,16 @@
 import { ChevronDown } from 'lucide-react'
-import { useId, type ReactNode } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 import { useReducedMotion } from '../lib/use-reduced-motion'
 import type { ModelFamily } from '../../shared/contracts'
 import { Disclosure, DisclosureContent, DisclosureTrigger } from './ui/disclosure'
 import { ModelPicker } from './ui/model-picker'
 
-export function MoreFields({ title, children }: { title: string; children: ReactNode }) {
+export function MoreFields({ title, summary, defaultOpen = false, children }: { title: string; summary?: string; defaultOpen?: boolean; children: ReactNode }) {
   const id = useId()
+  const [open, setOpen] = useState(defaultOpen)
   const reduced = useReducedMotion()
-  return <Disclosure className="more-fields" transition={{ duration: reduced ? 0 : 0.2 }}>
-    <DisclosureTrigger className="more-trigger" aria-controls={id}>{title}<ChevronDown size={15} aria-hidden /></DisclosureTrigger>
+  return <Disclosure className="more-fields" open={open} onOpenChange={setOpen} transition={{ duration: reduced ? 0 : 0.2 }}>
+    <DisclosureTrigger className="more-trigger" aria-controls={id}>{title}{summary && !open && <code className="disclosure-summary">{summary}</code>}<ChevronDown size={15} aria-hidden /></DisclosureTrigger>
     <DisclosureContent id={id}><div className="more-body">{children}</div></DisclosureContent>
   </Disclosure>
 }

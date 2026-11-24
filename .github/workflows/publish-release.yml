@@ -232,6 +232,7 @@ jobs:
               $ready = $window -and $daemon -and $health.status -eq 'ok' -and $health.protocol_version -eq 9
             } until ($ready -or [DateTime]::UtcNow -ge $deadline)
             if (-not $ready) { throw 'The standalone app did not open its main window and connect to the packaged seriald.' }
+            & ./ci/test-windows-titlebar.ps1 -WindowHandle $window.MainWindowHandle
             Write-Host "Windows desktop window and protocol $($health.protocol_version) daemon are running."
           } finally {
             if ($window) { $null = $window.CloseMainWindow() }

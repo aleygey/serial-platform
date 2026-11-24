@@ -264,6 +264,36 @@ pub struct CommandCaptureMatcher {
     pub value: String,
 }
 
+/// Test a configured prompt against normalized post-write terminal output.
+/// A device logger can begin a timestamped record while the shell is sitting
+/// at its prompt, without emitting a newline first.
+pub fn matches_terminal_prompt(text: &str, prompt: &str) -> bool {
+    let prompt = prompt.trim_end_matches('\n');
+    if prompt.is_empty() {
+        return false;
+    }
+    text.split('\n').any(|line| {
+        line.rmatch_indices(prompt).any(|(start, _)| {
+            let suffix = line[start + prompt.len()..].trim_start_matches([' ', '\t']);
+            suffix.is_empty() || starts_device_log(suffix)
+        })
+    })
+}
+
+fn starts_device_log(text: &str) -> bool {
+    const STAMP: &[u8] = b"[0000-00-00 00:00:00]";
+    let bytes = text.as_bytes();
+    bytes.len() >= STAMP.len()
+        && STAMP
+            .iter()
+            .zip(bytes)
+            .all(|(&pattern, &byte)| match pattern {
+                b'0' => byte.is_ascii_digit(),
+                other => byte == other,
+            })
+        && bytes.get(STAMP.len()).is_none_or(u8::is_ascii_whitespace)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandCaptureCompletionKind {

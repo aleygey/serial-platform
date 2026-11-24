@@ -15,7 +15,7 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 
 ## 快速开始
 
-Windows x64 用户可以直接下载便携版 EXE，双击打开桌面控制台。完整 ZIP 另含独立的 CLI、TUI 和 MCP 适配器。[Windows 桌面版](https://github.com/aleygey/serial-platform/releases/download/v0.9.4/serial-platform-v0.9.4-windows-x86_64.exe) · [v0.9.4 更新与升级说明](./docs/releases/v0.9.4.md)
+Windows x64 用户可以直接下载便携版 EXE，双击打开桌面控制台。完整 ZIP 另含独立的 CLI、TUI 和 MCP 适配器。[Windows 桌面版](https://github.com/aleygey/serial-platform/releases/download/v0.9.5/serial-platform-v0.9.5-windows-x86_64.exe) · [v0.9.5 更新与升级说明](./docs/releases/v0.9.5.md)
 
 发行包解压后保留其中所有文件。首次配置不需要先启动后端：
 

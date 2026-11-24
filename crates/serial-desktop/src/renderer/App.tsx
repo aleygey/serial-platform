@@ -15,6 +15,7 @@ import { Group, Panel, Separator, type GroupImperativeHandle, type Layout } from
 import { motion } from 'motion/react'
 import { DockPreview, InsertionGap, usePortDrag } from './components/PortDrag'
 import { PortConsole } from './components/PortConsole'
+import { WindowTitleBar } from './components/WindowTitleBar'
 import type { AgentHistoryView } from './components/AgentHistory'
 import { PortInput } from './lib/port-input'
 import { closePane, dockedWidths, insertPane, reorderPane, selectPane, type PaneLayout } from './lib/console-workspace'
@@ -237,12 +238,17 @@ export function App(): React.JSX.Element {
 
   const startBackend = async (): Promise<void> => { await withToast(() => window.serial.startLocalService(), setToast, false) }
   const stopBackend = async (): Promise<void> => { await withToast(() => window.serial.stopLocalService(), setToast, false) }
-  const savePreferences = async (preferences: DesktopSnapshot['preferences']): Promise<void> => {
+  const savePreferences = async (patch: Partial<DesktopSnapshot['preferences']>): Promise<void> => {
     const previous = snapshot?.preferences
-    setSnapshot((current) => current ? { ...current, preferences } : current)
-    const saved = await withToast(() => window.serial.savePreferences(preferences), setToast, false)
+    setSnapshot(current => current ? { ...current, preferences: { ...current.preferences, ...patch } } : current)
+    const saved = await withToast(() => window.serial.savePreferences(patch), setToast, false)
     if (!saved && previous) {
-      setSnapshot((current) => current?.preferences === preferences ? { ...current, preferences: previous } : current)
+      setSnapshot(current => {
+        if (!current) return current
+        const restore = Object.fromEntries((Object.keys(patch) as (keyof typeof patch)[])
+          .filter(key => current.preferences[key] === patch[key]).map(key => [key, previous[key]]))
+        return { ...current, preferences: { ...current.preferences, ...restore } }
+      })
     }
   }
 
@@ -266,12 +272,12 @@ export function App(): React.JSX.Element {
 
   if (!snapshot) {
     return (
-      <div className="startup-screen">
+      <div className="app-frame"><WindowTitleBar /><div className="startup-screen">
         <div className="startup-pulse"><span /><span /><span /></div>
         <strong>{loadingMessage}</strong>
         <small>后端、持久记录与实时通道正在就绪</small>
         {toast?.kind === 'error' && <button type="button" onClick={() => window.location.reload()}>重试连接</button>}
-      </div>
+      </div></div>
     )
   }
 
@@ -318,6 +324,7 @@ export function App(): React.JSX.Element {
           modelProfiles={snapshot.modelProfiles}
           modelFamilies={snapshot.modelFamilies}
           preferences={snapshot.preferences}
+          backendConnected={connected}
           initialPort={selectedPort}
           onSaveSerial={async (draft) => withToast(
             () => window.serial.saveSerialConfiguration(draft, snapshot.configRevision),
@@ -456,10 +463,10 @@ const pageItems = [
 ]
 
 export function WindowBar({ page, onPage }: { page: Page; onPage: (page: Page) => void }): React.JSX.Element {
-  return <header className="window-bar">
+  return <WindowTitleBar>
     <GooeyNav aria-label="工作区" items={pageItems} value={pages.indexOf(page)} onChange={index => onPage(pages[index])}
       size="sm" activeColor="var(--run-bg)" activeLabelColor="var(--run-text)" separation={7} radius={8} />
-  </header>
+  </WindowTitleBar>
 }
 
 interface BackendControlsProps {
@@ -480,11 +487,11 @@ export function BackendControls({ snapshot, onStartBackend, onStopBackend }: Bac
         : LoaderCircle
   return (
       <div className="backend-settings" aria-label="后端服务">
-        <button className={`connection-pill ${connected ? 'is-connected' : ''}`} type="button" title={snapshot.connectionMessage} onClick={() => void window.serial.refresh()}>
+        <span className={`connection-pill ${connected ? 'is-connected' : ''}`} role="status" title={snapshot.connectionMessage}>
           {connected ? <Wifi size={14} /> : <WifiOff size={14} />}
           <span>{connected ? '已连接' : snapshot.connection === 'reconnecting' ? '重连中' : '离线'}</span>
           {snapshot.service.owned && <small>PID {snapshot.service.pid}</small>}
-        </button>
+        </span>
         <button
           aria-label={backend.label}
           className={`backend-control is-${backend.kind}`}
@@ -496,7 +503,7 @@ export function BackendControls({ snapshot, onStartBackend, onStopBackend }: Bac
           <BackendIcon className={backend.kind === 'busy' ? 'is-spinning' : undefined} size={14} />
           <span>{backend.label}</span>
         </button>
-        <button className="icon-button" type="button" title="刷新" onClick={() => void window.serial.refresh()}><RefreshCw size={16} /></button>
+        <button className="icon-button" type="button" aria-label="刷新后端状态" title="刷新后端状态" onClick={() => void window.serial.refresh()}><RefreshCw size={15} aria-hidden /></button>
       </div>
   )
 }

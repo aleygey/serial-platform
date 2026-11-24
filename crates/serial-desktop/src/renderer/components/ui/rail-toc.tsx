@@ -22,7 +22,7 @@ const PLANE_HOLE = 4
 const useIsoLayoutEffect =
   typeof window !== "undefined" ? React.useLayoutEffect : React.useEffect
 
-type RailNode = { id: string; x: number; y: number; belowCursor: number }
+type RailNode = { id: string; tone?: string; x: number; y: number; belowCursor: number }
 type Geometry = ReturnType<typeof measureRoute>
 
 function measureRoute(list: HTMLElement, content: HTMLElement) {
@@ -57,7 +57,7 @@ function measureRoute(list: HTMLElement, content: HTMLElement) {
       lineTo(x, y - bend)
     }
     lineTo(x, y)
-    nodes.push({ id: row.dataset.railNode!, x, y, belowCursor: rect.height - inset })
+    nodes.push({ id: row.dataset.railNode!, tone: row.dataset.railTone, x, y, belowCursor: rect.height - inset })
     stops.push(length)
     width = Math.max(width, x + 9)
   }
@@ -129,14 +129,14 @@ const RailToc = ({ selectedId, paused, visible = true, onCursorMove, children, c
       if (!next.nodes.length) { setGeometry(undefined); return }
       setGeometry(old => old?.d === next.d && old.height === next.height &&
         next.nodes.length === old.nodes.length &&
-        next.nodes.every((node, i) => old.nodes[i].id === node.id && old.nodes[i].belowCursor === node.belowCursor) ? old : next)
+        next.nodes.every((node, i) => old.nodes[i].id === node.id && old.nodes[i].tone === node.tone && old.nodes[i].belowCursor === node.belowCursor) ? old : next)
     }
     const schedule = () => { if (!frame) frame = requestAnimationFrame(measure) }
     measure()
     const resize = new ResizeObserver(schedule)
     resize.observe(content)
     const observer = new MutationObserver(schedule)
-    observer.observe(content, { childList: true, subtree: true, attributes: true, attributeFilter: ['inert', 'data-rail-node', 'data-depth'] })
+    observer.observe(content, { childList: true, subtree: true, attributes: true, attributeFilter: ['inert', 'data-rail-node', 'data-rail-tone', 'data-depth'] })
     return () => {
       resize.disconnect()
       observer.disconnect()
@@ -257,17 +257,14 @@ const RailToc = ({ selectedId, paused, visible = true, onCursorMove, children, c
                 const covered = i < reached
                 return (
                   <circle
-                    key={i}
+                    key={node.id}
                     cx={node.x}
                     cy={node.y}
                     r={covered ? 3 : 3.25}
                     strokeWidth="1.25"
-                    className={cn(
-                      "transition-[fill,stroke] duration-200",
-                      covered
-                        ? "fill-[var(--rail)] stroke-[var(--rail)]"
-                        : "fill-transparent stroke-foreground/30",
-                    )}
+                    className="rail-node"
+                    data-tone={node.tone}
+                    data-reached={covered}
                   />
                 )
               })}
@@ -278,6 +275,7 @@ const RailToc = ({ selectedId, paused, visible = true, onCursorMove, children, c
         {geometry && (
           <motion.div
             data-slot="rail-toc-plane"
+            data-tone={geometry.nodes.find(node => node.id === selectedId)?.tone}
             className="pointer-events-none absolute left-0 top-0 -ml-2 -mt-2 h-4 w-4 text-foreground [filter:drop-shadow(0_0_2px_rgb(0_0_0/0.35))]"
             style={{ x, y, rotate: heading }}
             aria-hidden

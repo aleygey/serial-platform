@@ -133,6 +133,18 @@ describe('Agent history', () => {
     expect(locateCommandOutput([echoed, output], command)).toBeUndefined()
   })
 
+  it('locates a prompt before a timestamped log in the same RX line', () => {
+    const command = {
+      id: 'status', daemonEpoch: 'epoch', generation: 1, firstSeq: 5, text: 'status\r',
+      captureMatchers: [{ kind: 'shell_prompt' as const, value: 'root@localhost:/#' }]
+    }
+    const echoed = event(6, 'rx', 'root@localhost:/# status\r\n')
+    const prompt = event(7, 'rx', 'a0b1root@localhost:/# \u001b[0m[2026-11-')
+    const log = event(8, 'rx', '24 11:01:48] device status\r\n')
+    expect(locateCommandOutput([echoed, prompt, log], command)).toMatchObject({ fromSeq: 6, throughSeq: 7, inferred: true })
+    expect(locateCommandOutput([echoed, event(7, 'rx', 'root@localhost:/# [pending]')], command)).toBeUndefined()
+  })
+
   it('prefers the durable command capture matcher over profile prompts', () => {
     const events = [event(6, 'rx', 'working\n'), event(7, 'rx', 'DONE\n'), event(8, 'rx', 'root# ')]
     const command = {

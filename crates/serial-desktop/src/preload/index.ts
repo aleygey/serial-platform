@@ -3,6 +3,7 @@ import type {
   DesktopBridge,
   DesktopEvent,
   DesktopPreferences,
+  DesktopWindowBridge,
   ModelFamily,
   ModelProfile,
   SerialConfigurationDraft
@@ -54,3 +55,14 @@ const bridge: DesktopBridge = {
 }
 
 contextBridge.exposeInMainWorld('serial', bridge)
+
+const desktopWindow: DesktopWindowBridge = {
+  act: action => ipcRenderer.send('window:action', action),
+  isFullScreen: () => ipcRenderer.invoke('window:is-fullscreen'),
+  onFullScreenChange(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, fullScreen: boolean) => listener(fullScreen)
+    ipcRenderer.on('window:fullscreen', handler)
+    return () => ipcRenderer.removeListener('window:fullscreen', handler)
+  }
+}
+contextBridge.exposeInMainWorld('desktopWindow', desktopWindow)
