@@ -341,8 +341,17 @@ export type DesktopEvent =
   | { type: 'notice'; message: string }
   | { type: 'error'; message: string }
 
+export type WindowAction = 'minimize' | 'toggle-fullscreen' | 'close'
+
+export interface DesktopWindowBridge {
+  act(action: WindowAction): void
+  isFullScreen(): Promise<boolean>
+  onFullScreenChange(listener: (fullScreen: boolean) => void): () => void
+}
+
 declare global {
   interface Window {
     serial: DesktopBridge
+    desktopWindow?: DesktopWindowBridge
   }
 }

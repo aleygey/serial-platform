@@ -6,6 +6,7 @@ import { DesktopCoordinator } from './coordinator'
 import type { DesktopPreferences, MacroListQuery, MacroRunRequest, MacroSaveRequest, ModelFamily, ModelProfile, RunStartDecision, SerialConfigurationDraft } from '../shared/contracts'
 import { HELP, startupAction } from './startup'
 import { GracefulQuitGate } from './graceful-quit'
+import { installWindowControls, titleBarOptions } from './window-controls'
 
 const qaMode = process.argv.includes('--qa-screenshot')
 const qaThemeArgument = process.argv.find((argument) => argument.startsWith('--qa-theme='))?.split('=')[1]
@@ -28,9 +29,7 @@ function createWindow(): void {
     minHeight: 700,
     show: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0a0d12' : '#f4f6f8',
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
-    titleBarOverlay: process.platform === 'win32',
-    trafficLightPosition: { x: 18, y: 18 },
+    ...titleBarOptions,
     webPreferences: {
       preload: join(__dirname, '../preload/index.cjs'),
       contextIsolation: true,
@@ -39,6 +38,7 @@ function createWindow(): void {
     }
   })
   window.once('ready-to-show', () => window?.show())
+  installWindowControls(window)
   window.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url)
     return { action: 'deny' }

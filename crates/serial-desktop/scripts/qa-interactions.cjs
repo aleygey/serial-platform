@@ -81,6 +81,45 @@ async function screenshot(name) {
   writeFileSync(join(path, name), (await window.capturePage()).toPNG())
 }
 
+async function checkNativeTitleBar() {
+  const { installWindowControls, titleBarOptions } = await import('../src/main/window-controls.ts')
+  const state = await js('window.serial.bootstrap()')
+  const probe = new BrowserWindow({ width: 1100, height: 750, ...titleBarOptions,
+    webPreferences: { preload: join(__dirname, '../out/preload/index.cjs'), contextIsolation: true, sandbox: true } })
+  installWindowControls(probe)
+  const fullScreen = () => probe.isFullScreen() || (process.platform === 'darwin' && probe.isSimpleFullScreen())
+  probe.webContents.ipc.handle('serial:bootstrap', () => ({ ...state, availablePorts: [], configuredPorts: [], events: {} }))
+  const inspect = code => probe.webContents.executeJavaScript(code)
+  async function waitFor(label, predicate) {
+    for (let count = 0; count < 100; count++) { if (await predicate()) return; await pause(50) }
+    const details = probe.isDestroyed() ? 'closed' : JSON.stringify({ fullScreen: fullScreen(), minimized: probe.isMinimized(),
+      controls: await inspect(`Array.from(document.querySelectorAll('.window-controls button'), b => b.getAttribute('aria-label'))`) })
+    throw new Error('Native window did not ' + label + ': ' + details)
+  }
+  const click = label => inspect(`document.querySelector('.window-controls [aria-label="${label}"]').click()`)
+  try {
+    await probe.loadFile(join(__dirname, '../out/renderer/index.html'))
+    probe.focus()
+    await waitFor('show navigation and controls', () => inspect(`!!document.querySelector('.window-bar nav') && !!document.querySelector('.window-close')`))
+    assert.deepEqual(await inspect(`(() => {
+      const bar=document.querySelector('.window-bar').getBoundingClientRect(), middle=document.elementFromPoint(bar.width/2,bar.height/2)
+      return [middle.className, getComputedStyle(middle).getPropertyValue('app-region'),
+        getComputedStyle(document.querySelector('.window-bar nav button')).getPropertyValue('app-region'),
+        getComputedStyle(document.querySelector('.window-close')).getPropertyValue('app-region')]
+    })()`), ['window-drag-region', 'drag', 'no-drag', 'no-drag'])
+    await click('进入全屏')
+    await waitFor('enter full screen', async () => fullScreen() && await inspect(`!!document.querySelector('[aria-label="退出全屏"]')`))
+    await click('退出全屏')
+    await waitFor('leave full screen', async () => !fullScreen() && await inspect(`!!document.querySelector('[aria-label="进入全屏"]')`))
+    await click('最小化窗口')
+    await waitFor('minimize', () => probe.isMinimized())
+    probe.restore()
+    await waitFor('restore', () => !probe.isMinimized())
+    await click('关闭窗口')
+    await waitFor('close', () => probe.isDestroyed())
+  } finally { if (!probe.isDestroyed()) probe.destroy() }
+}
+
 async function setAgentPhase(phase) {
   await js(`(async () => {
     const snapshot = await window.serial.bootstrap();
@@ -102,6 +141,11 @@ app.whenReady().then(async () => {
   window.focus()
   window.webContents.focus()
   await until(`!!document.querySelector('[aria-label="输入串口命令"]')`)
+  if (process.argv.includes('--window-controls')) {
+    await checkNativeTitleBar()
+    app.exit(0)
+    return
+  }
   await js(`window.qaCommands = []; window.qaSignals = []; window.serial.sendCommand = async (port, command) => { window.qaCommands.push({port, command}); return {status:'accepted'} }; window.serial.sendSignal = async (port, signal) => { window.qaSignals.push({port, signal}); return {status:'accepted'} }; true`)
   await fill('cat')
   await until(`document.querySelector('.command-ghost').textContent === 'cat /etc/version'`)
@@ -274,6 +318,11 @@ app.whenReady().then(async () => {
     await window.serial.savePreferences({...snapshot.preferences});
   })()`)
   await js(`document.querySelector('.settings-sections [data-id="application"]').click()`)
+  await until(`document.querySelector('.app-settings .more-trigger')?.getAttribute('aria-expanded') === 'false'`)
+  assert.deepEqual(await js(`[...document.querySelectorAll('.app-settings legend')].map(el => el.textContent)`), ['外观', '字号', '后端连接'])
+  await js(`document.querySelector('.app-settings .more-trigger').click()`)
+  await until(`!!document.querySelector('.app-settings [aria-label="自动启动本地后端"]')`)
+  await js(`document.querySelector('.app-settings .more-trigger').click()`)
   await until(`!!document.querySelector('[data-serial-number="终端字号（px）"] button')`)
   await js(`document.querySelector('[data-serial-number="终端字号（px）"] button').click()`)
   await until(`!!document.querySelector('[role="option"][data-id="18"]')`)
@@ -294,6 +343,7 @@ app.whenReady().then(async () => {
   await until(`getComputedStyle(document.documentElement).fontSize === '16px'`)
   await js(`document.querySelector('[role="radio"][aria-label="浅色"]').click()`)
   await until(`document.documentElement.dataset.theme === 'light' && document.querySelector('[aria-label="浅色"]').getAttribute('aria-checked') === 'true'`)
+  assert.equal(await js(`getComputedStyle(document.documentElement).fontSize`), '16px')
   assert.equal(await js(`document.querySelector('.baud-value input').value`), '57600')
   await screenshot('settings-components-light.png')
   await js(`document.querySelector('[aria-label="浅色"]').focus()`)
@@ -582,6 +632,7 @@ app.whenReady().then(async () => {
     await window.serial.savePreferences({})
   })()`)
   await until(`document.querySelector('.terminal-output').textContent === 'ready\\nErasing at 0x64 -- 100% complete.\\ndone\\n'`)
-  process.stdout.write('PASS: drag docking, per-port history and input, keyboard navigation, themes, model selection, font size, macros, and external Agent handoff and Run\n')
+  await checkNativeTitleBar()
+  process.stdout.write('PASS: native window controls, title-bar drag region, application preferences, docking, terminal following and external Agent history\n')
   app.exit(0)
 }).catch((error) => { process.stderr.write(`${error.stack}\n`); app.exit(1) })
