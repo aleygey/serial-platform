@@ -1,8 +1,9 @@
 // Rare UI. Copyright (c) 2026 Swami Malode. See RARE-UI-LICENSE.txt.
 'use client'
 
-import React, { useEffect, useRef, useSyncExternalStore } from 'react'
+import React, { useEffect, useRef } from 'react'
 
+import { useDevicePixelRatio } from '../../lib/appearance'
 import { cn } from '../../lib/utils'
 
 export type MatrixOrbState = 'idle' | 'listening' | 'thinking'
@@ -78,20 +79,6 @@ function intensityOf(
   return 0.62 + 0.12 * Math.sin(t * 1.05 - d * 2.4)
 }
 
-function subscribeToZoom(onChange: () => void) {
-  window.addEventListener('resize', onChange)
-  return () => window.removeEventListener('resize', onChange)
-}
-
-// zoom changes devicePixelRatio, and a buffer built for the old one gets upscaled
-function useDevicePixelRatio() {
-  return useSyncExternalStore(
-    subscribeToZoom,
-    () => Math.min(window.devicePixelRatio || 1, 4),
-    () => 1,
-  )
-}
-
 const MatrixOrb = ({
   state = 'idle',
   paused = false,
@@ -107,7 +94,7 @@ const MatrixOrb = ({
   const stateRef = useRef(state)
   const levelRef = useRef(level)
   const redrawRef = useRef<(() => void) | null>(null)
-  const dpr = useDevicePixelRatio()
+  const dpr = Math.min(useDevicePixelRatio(), 4)
 
   useEffect(() => {
     stateRef.current = state

@@ -96,6 +96,7 @@ export class DesktopCoordinator {
   private async initialize(): Promise<DesktopSnapshot> {
     this.preferences = await this.settings.load()
     if (this.qaMode && this.qaTheme) this.preferences = { ...this.preferences, theme: this.qaTheme }
+    this.emit({ type: 'startup-preferences', preferences: this.preferences })
     if (this.qaMode) return createQaSnapshot(this.preferences)
     return this.connectOrOffline(this.preferences.autoStartLocal)
   }

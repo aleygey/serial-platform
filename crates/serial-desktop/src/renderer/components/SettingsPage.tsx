@@ -9,6 +9,7 @@ import { WorkspaceSidebar } from './WorkspaceSidebar'
 import { DEFAULT_THEMES, ThemeSelector } from './ui/theme-selector'
 import { palettes, paletteId, interfaceFontSize, interfaceFontSizes, terminalFontSize, terminalFontSizes } from '../../shared/appearance'
 import { useAppearanceMode } from '../lib/appearance'
+import type { ReleaseUpdates } from '../lib/use-release-updates'
 import type {
   DesktopPreferences,
   ModelFamily,
@@ -27,6 +28,7 @@ interface Props {
   modelProfiles: ModelProfile[]
   modelFamilies: ModelFamily[]
   preferences: DesktopPreferences
+  updates?: ReleaseUpdates
   serviceControls?: ReactNode
   backendConnected?: boolean
   initialPort?: string
@@ -117,7 +119,7 @@ export function SettingsPage(props: Props): React.JSX.Element {
             <div className="editor-shell application-editor"><div className="editor-heading"><h1>应用</h1>
               {props.onOpenSetup && <button className="setup-reopen" type="button" onClick={props.onOpenSetup}>首次配置向导<ArrowUpRight size={14} aria-hidden /></button>}
             </div>
-              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} backendConnected={props.backendConnected} />
+              <ApplicationSettings preferences={props.preferences} onSave={props.onSavePreferences} serviceControls={props.serviceControls} backendConnected={props.backendConnected} updates={props.updates} />
             </div>
           </TransitionPanel>
         </section>
@@ -371,7 +373,7 @@ export function ModelFamilyEditor({ families, configuredPorts, onSave }: { famil
   )
 }
 
-function ApplicationSettings({ preferences, onSave, serviceControls, backendConnected }: Pick<Props, 'preferences' | 'serviceControls' | 'backendConnected'> & { onSave: Props['onSavePreferences'] }): React.JSX.Element {
+function ApplicationSettings({ preferences, onSave, serviceControls, backendConnected, updates }: Pick<Props, 'preferences' | 'serviceControls' | 'backendConnected' | 'updates'> & { onSave: Props['onSavePreferences'] }): React.JSX.Element {
   const [address, setAddress] = useState(preferences.endpoint)
   useEffect(() => setAddress(preferences.endpoint), [preferences.endpoint])
   const mode = useAppearanceMode(preferences.theme)
@@ -411,6 +413,21 @@ function ApplicationSettings({ preferences, onSave, serviceControls, backendConn
         </label>
       </MoreFields>
     </fieldset>
+    {updates && <fieldset><legend>软件更新</legend>
+      <div className="release-check">
+        <span>当前版本 <b>{updates.installed}</b></span>
+        <button type="button" className="setup-secondary" disabled={updates.phase === 'checking'} onClick={updates.check}>检查更新</button>
+        {updates.available && <a className="release-download" href={updates.available.url} target="_blank" rel="noreferrer">
+          {updates.available.portable ? '下载便携版' : '查看新版'} {updates.available.version}</a>}
+        <small role="status">{updates.phase === 'checking' ? '正在检查…' : updates.phase === 'offline' ? '暂时无法检查更新，请稍后重试' :
+          updates.phase === 'checked' && !updates.available ? '已是最新正式版' : ''}</small>
+      </div>
+      <label className="auto-start-setting">
+        <span><strong>自动检查更新</strong></span>
+        <input type="checkbox" role="switch" aria-label="自动检查更新" checked={preferences.autoCheckUpdates !== false} onChange={event => void onSave({ autoCheckUpdates: event.target.checked })} />
+        <span className="switch-control" aria-hidden />
+      </label>
+    </fieldset>}
   </div>
 }
 

@@ -1,12 +1,13 @@
 import { writeSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { app, BrowserWindow, ipcMain, Menu, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, nativeTheme, net, shell } from 'electron'
 import { DesktopCoordinator } from './coordinator'
 import type { DesktopPreferences, MacroListQuery, MacroRunRequest, MacroSaveRequest, ModelFamily, ModelProfile, RunStartDecision, SerialConfigurationDraft } from '../shared/contracts'
 import { HELP, startupAction } from './startup'
 import { GracefulQuitGate } from './graceful-quit'
 import { installWindowControls, titleBarOptions } from './window-controls'
+import { createReleaseChecker } from './release-check'
 
 const qaMode = process.argv.includes('--qa-screenshot')
 const qaThemeArgument = process.argv.find((argument) => argument.startsWith('--qa-theme='))?.split('=')[1]
@@ -61,6 +62,8 @@ function createWindow(): void {
 }
 
 function installIpc(): void {
+  const checkRelease = createReleaseChecker(app.getVersion(), process.platform, process.arch, (url, init) => net.fetch(url, init))
+  ipcMain.handle('desktop:check-release', checkRelease)
   ipcMain.handle('serial:setup-create', (_, brief: import('../shared/first-setup').SetupBrief) => coordinator!.createSetup(brief))
   ipcMain.handle('serial:setup-read', (_, id: string) => coordinator!.readSetup(id))
   ipcMain.handle('serial:setup-apply', (_, id: string, revision: number) => coordinator!.applySetup(id, revision))

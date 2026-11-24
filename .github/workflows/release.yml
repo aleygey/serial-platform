@@ -42,12 +42,6 @@ jobs:
       - name: Verify locked Rust workspace
         run: cargo metadata --locked --no-deps --format-version 1
 
-      - name: Test Rust workspace
-        run: cargo test --workspace --locked
-
-      - name: Build native Rust programs
-        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp
-
       - name: Install locked desktop dependencies
         working-directory: crates/serial-desktop
         run: npm ci --no-audit --no-fund
@@ -55,6 +49,17 @@ jobs:
       - name: Type-check, test, and build Electron desktop
         working-directory: crates/serial-desktop
         run: npm run build
+
+      - name: Check live terminal text at four display scales on Windows
+        if: runner.os == 'Windows'
+        working-directory: crates/serial-desktop
+        run: npx --no-install electron scripts/qa-interactions.cjs --live-output
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Build native Rust programs
+        run: cargo build --release --locked -p serial-cli -p seriald -p serialctl -p serial-mcp
 
       - name: Package native Electron desktop with sidecars
         shell: bash

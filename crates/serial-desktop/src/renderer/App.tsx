@@ -26,7 +26,9 @@ import { SettingsPage } from './components/SettingsPage'
 import { FirstUseSetup } from './components/FirstUseSetup'
 import { RunStartApprovalModal } from './components/RunStartApprovalModal'
 import { resolveBackendControl } from './lib/backend-control'
-import { applyAppearance, useAppearanceMode } from './lib/appearance'
+import { applyAppearance, useAppearanceMode, useDevicePixelRatio } from './lib/appearance'
+import { useReleaseUpdates } from './lib/use-release-updates'
+import type { AvailableRelease } from '../shared/contracts'
 
 type Page = 'console' | 'settings' | 'macros'
 type ConsoleSnapshot = DesktopSnapshot & { missingHistoryRevision?: number }
@@ -34,6 +36,9 @@ type ConsoleSnapshot = DesktopSnapshot & { missingHistoryRevision?: number }
 export function App(): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<ConsoleSnapshot>()
   const mode = useAppearanceMode(snapshot?.preferences.theme ?? 'system')
+  const density = useDevicePixelRatio()
+  const [startupUpdates, setStartupUpdates] = useState<boolean>()
+  const updates = useReleaseUpdates(snapshot ? snapshot.preferences.autoCheckUpdates !== false : startupUpdates)
   const colors = palettes[paletteId(snapshot?.preferences.palette)][mode]
   const [page, setPage] = useState<Page>('console')
   const [setupOpen, setSetupOpen] = useState<boolean>()
@@ -122,6 +127,10 @@ export function App(): React.JSX.Element {
     let cancelled = false
     const buffered: DesktopEvent[] = []
     const unsubscribe = window.serial.onEvent((event) => {
+      if (event.type === 'startup-preferences') {
+        setStartupUpdates(event.preferences.autoCheckUpdates !== false)
+        return
+      }
       if (buffering) {
         if (event.type === 'connection') setLoadingMessage(event.message)
         buffered.push(event)
@@ -195,8 +204,8 @@ export function App(): React.JSX.Element {
   }, [scope, selectedPort, setupOpen, snapshot?.preferences.selectedPort, snapshot?.preferences.firstUse])
 
   useLayoutEffect(() => {
-    applyAppearance(mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize, snapshot?.preferences.interfaceFontSize)
-  }, [mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize, snapshot?.preferences.interfaceFontSize])
+    applyAppearance(mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize, snapshot?.preferences.interfaceFontSize, density)
+  }, [mode, snapshot?.preferences.palette, snapshot?.preferences.terminalFontSize, snapshot?.preferences.interfaceFontSize, density])
 
   useEffect(() => {
     if (!toast) return
@@ -272,7 +281,7 @@ export function App(): React.JSX.Element {
 
   if (!snapshot) {
     return (
-      <div className="app-frame"><WindowTitleBar /><div className="startup-screen">
+      <div className="app-frame"><WindowTitleBar available={updates?.available} /><div className="startup-screen">
         <div className="startup-pulse"><span /><span /><span /></div>
         <strong>{loadingMessage}</strong>
         <small>后端、持久记录与实时通道正在就绪</small>
@@ -312,9 +321,10 @@ export function App(): React.JSX.Element {
   }
   return (
     <div className="app-frame">
-      <WindowBar page={page} onPage={next=>{ if(showSetup) void withToast(()=>leaveSetup(false,next),setToast,false); else setPage(next) }} />
+      <WindowBar page={page} available={updates?.available} onPage={next=>{ if(showSetup) void withToast(()=>leaveSetup(false,next),setToast,false); else setPage(next) }} />
       {showSetup ? <FirstUseSetup key={scope} snapshot={snapshot} execution={macroExecution} onExecution={setMacroExecution} onLeave={leaveSetup} /> : page === 'settings' ? (
         <SettingsPage
+          updates={updates}
           onOpenSetup={()=>setSetupOpen(true)}
 
           serviceControls={<BackendControls snapshot={snapshot} onStartBackend={startBackend} onStopBackend={stopBackend} />}
@@ -462,8 +472,8 @@ const pageItems = [
   { label: '配置', icon: <SlidersHorizontal size={14} aria-hidden /> },
 ]
 
-export function WindowBar({ page, onPage }: { page: Page; onPage: (page: Page) => void }): React.JSX.Element {
-  return <WindowTitleBar>
+export function WindowBar({ page, onPage, available }: { page: Page; onPage: (page: Page) => void; available?: AvailableRelease | null }): React.JSX.Element {
+  return <WindowTitleBar available={available}>
     <GooeyNav aria-label="工作区" items={pageItems} value={pages.indexOf(page)} onChange={index => onPage(pages[index])}
       size="sm" activeColor="var(--run-bg)" activeLabelColor="var(--run-text)" separation={7} radius={8} />
   </WindowTitleBar>
