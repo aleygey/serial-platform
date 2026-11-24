@@ -16,7 +16,7 @@ const bridge: DesktopBridge = {
   refresh: () => ipcRenderer.invoke('serial:refresh'),
   sendCommand: (port, command, traceId) => ipcRenderer.invoke('serial:send-command', port, command, traceId),
   sendSignal: (port, signal) => ipcRenderer.invoke('serial:send-signal', port, signal),
-  queryHumanHistory: (query, contains) => ipcRenderer.invoke('serial:human-history', query, contains),
+  queryHumanHistory: (query, contains, limit) => ipcRenderer.invoke('serial:human-history', query, contains, limit),
   agentHistory: (port) => ipcRenderer.invoke('serial:agent-history', port),
   clearAgentHistory: (port, ids) => ipcRenderer.invoke('serial:clear-agent-history', port, ids),
   agentRunEvents: (record) => ipcRenderer.invoke('serial:agent-run-events', record),
@@ -41,7 +41,13 @@ const bridge: DesktopBridge = {
   startLocalService: () => ipcRenderer.invoke('serial:start-local-service'),
   stopLocalService: () => ipcRenderer.invoke('serial:stop-local-service'),
   onEvent(listener) {
-    const handler = (_event: Electron.IpcRendererEvent, payload: DesktopEvent): void => listener(payload)
+    const handler = (_event: Electron.IpcRendererEvent, payload: DesktopEvent): void => {
+      const events = payload.type === 'timeline-batch' ? payload.events : payload.type === 'timeline' ? [payload.event] : []
+      for (const event of events) {
+        if (event.inputObservation) event.inputObservation.deliveredAt = performance.timeOrigin + performance.now()
+      }
+      listener(payload)
+    }
     ipcRenderer.on('serial:event', handler)
     return () => ipcRenderer.removeListener('serial:event', handler)
   }

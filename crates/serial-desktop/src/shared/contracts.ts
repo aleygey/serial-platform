@@ -112,7 +112,7 @@ export type RunStartDecision = 'approve' | 'deny'
 export const HUMAN_COMMAND_UNCERTAIN_MESSAGE = '人工命令的物理写入结果不确定。请先查看串口时间线，勿直接重发。'
 
 export interface InputSendTiming { sentAt: number; acceptedAt: number }
-export interface InputObservation { ids: string[]; receivedAt: number }
+export interface InputObservation { ids: string[]; receivedAt: number; deliveredAt?: number }
 
 export type HumanCommandSubmission =
   | { status: 'accepted'; timing?: InputSendTiming }
@@ -306,7 +306,7 @@ export interface DesktopBridge {
   refresh(): Promise<DesktopSnapshot>
   sendCommand(port: string, command: string, traceId?: string): Promise<HumanCommandSubmission>
   sendSignal(port: string, signal: 'ctrl_c' | 'ctrl_d'): Promise<HumanCommandSubmission>
-  queryHumanHistory(query: string, contains?: boolean): Promise<HumanCommandHistory>
+  queryHumanHistory(query: string, contains?: boolean, limit?: number): Promise<HumanCommandHistory>
   agentHistory(port: string): Promise<AgentHistoryResponse>
   clearAgentHistory(port: string, ids?: string[]): Promise<AgentHistoryVisibility>
   agentRunEvents(record: AgentRunRecord): Promise<{ events: TimelineEvent[]; limited: boolean }>
@@ -329,9 +329,10 @@ export interface DesktopBridge {
 
 export type DesktopEvent =
   | { type: 'snapshot'; snapshot: DesktopSnapshot }
+  | { type: 'preferences'; preferences: DesktopPreferences }
   | { type: 'port-status'; port: PortSnapshot }
   | { type: 'port-history'; port: string; epoch: string; events: TimelineEvent[] }
-  | { type: 'human-history'; history: HumanCommandHistory }
+  | { type: 'human-history'; history: HumanCommandHistory; singleEntry?: boolean }
   | { type: 'timeline'; event: TimelineEvent }
   | { type: 'timeline-batch'; events: TimelineEvent[] }
   | { type: 'macro'; execution: MacroExecution }

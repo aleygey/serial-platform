@@ -20,7 +20,8 @@ interface Props {
   active: boolean
   paused?: boolean
   placeholder: string
-  onQueryHistory?: (query: string, contains: boolean) => Promise<readonly string[]>
+  onQueryHistory?: (query: string, contains: boolean, limit: number) => Promise<readonly string[]>
+  onTextInput?: (eventTime: number) => void
 }
 
 interface CandidateMenu {
@@ -45,7 +46,7 @@ export function CommandStatusHint({
   return <span className="sr-only" role="status">{label}</span>
 }
 
-export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = [], session, active, paused, placeholder, onQueryHistory }: Props): React.JSX.Element {
+export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = [], session, active, paused, placeholder, onQueryHistory, onTextInput }: Props): React.JSX.Element {
   const menuId = useId()
   const { buffer, pending: sending, receipts } = useSyncExternalStore(session.subscribe, session.snapshot, session.snapshot)
   const [historyCursor, setHistoryCursor] = useState<HistoryCursor>()
@@ -84,7 +85,9 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
     if (!queryEnabled || !queryHistoryRef.current) return
     let active = true
     const timer = setTimeout(() => {
-      void queryHistoryRef.current!(historyQuery, historyContains).then((entries) => {
+      // Commands are distinct. Two prefix results include the newest longer
+      // suggestion even when the first result is an exact match.
+      void queryHistoryRef.current!(historyQuery, historyContains, menuOpen ? 50 : 2).then((entries) => {
         if (!active) return
         setHistoryWarning('')
         if (!historyContains) setRemoteSuggestion({ query: historyQuery, entries })
@@ -95,7 +98,7 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
       })
     }, 80)
     return () => { active = false; clearTimeout(timer) }
-  }, [historyQuery, historyContains, queryEnabled, port])
+  }, [historyQuery, historyContains, queryEnabled, menuOpen, port])
 
   useEffect(() => {
     if (menu?.entries.length) document.getElementById(`${menuId}-${menu.index}`)?.scrollIntoView({ block: 'nearest' })
@@ -189,17 +192,22 @@ export function CommandBar({ port, disabled, onSend, onSignal, humanHistory = []
         aria-activedescendant={menu?.entries.length ? `${menuId}-${menu.index}` : undefined}
         aria-busy={sending}
         autoComplete="off"
+        autoCapitalize="off"
+        spellCheck={false}
         disabled={disabled}
         onChange={(event) => {
           const target = event.target
+          onTextInput?.(event.timeStamp)
           session.edit({ value: target.value, start: target.selectionStart ?? target.value.length, end: target.selectionEnd ?? target.value.length })
           setHistoryCursor(undefined)
           setMenu(undefined)
         }}
         onSelect={(event) => {
           const target = event.currentTarget
-          const next = { value: target.value, start: target.selectionStart ?? target.value.length, end: target.selectionEnd ?? target.value.length }
-          session.edit(next)
+          // A selection notification from Enter can still see the pre-submit DOM value.
+          // Only input events own text changes. Selection tracks the current draft's caret.
+          const { value } = session.snapshot().buffer
+          if (target.value === value) session.edit({ value, start: target.selectionStart ?? value.length, end: target.selectionEnd ?? value.length })
         }}
         onScroll={(event) => setScrollLeft(event.currentTarget.scrollLeft)}
         onFocus={() => setFocused(true)}

@@ -273,7 +273,8 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
     <CommandBar port={selectedPort} paused={paused} session={session} active={active} humanHistory={humanHistory}
       disabled={!activity.canWrite}
       placeholder={!online ? '打开串口后可发送命令' : !activity.canWrite ? '等待串口控制权释放' : '输入命令…'}
-      onQueryHistory={async (query, contains) => (await window.serial.queryHumanHistory(query, contains)).entries.map((entry) => entry.command)}
+      onQueryHistory={async (query, contains, limit) => (await window.serial.queryHumanHistory(query, contains, limit)).entries.map((entry) => entry.command)}
+      onTextInput={diagnostics?.textInput}
       onSend={async (command, keyTime) => {
         const id = diagnostics?.begin(command, keyTime)
         const pending = submitHumanCommand(() => window.serial.sendCommand(selectedPort, command, id), setToast)
