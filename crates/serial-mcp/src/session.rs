@@ -2290,15 +2290,18 @@ mod tests {
     #[tokio::test]
     async fn local_run_start_deadline_cancels_pending_without_legacy_control_rpc() {
         let (mut state, mut server) = run_start_test_state().await;
+        // Allow the loopback handshake to complete, then cross the local deadline
+        // between polls so this exercises cancellation of a known pending approval.
+        let approval_window = Duration::from_secs(1);
         let (result, requests) = tokio::join!(
             state.start_run_with_policy(
                 "COM10".into(),
                 "cancel me".into(),
                 Default::default(),
                 RunStartPolicy {
-                    max_wait: Duration::from_millis(10),
+                    max_wait: approval_window,
                     cleanup_margin: Duration::ZERO,
-                    poll_interval: Duration::from_millis(1),
+                    poll_interval: approval_window,
                     expiry_grace: Duration::ZERO,
                     caller: None,
                 },
