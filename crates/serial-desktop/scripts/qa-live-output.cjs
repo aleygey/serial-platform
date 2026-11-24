@@ -41,7 +41,7 @@ async function measureOutput(fontSize) {
   // The pane entry spring deliberately moves the whole pane after docking.
   for (let i=0; i<120 && [...document.querySelectorAll('.port-console')].some(el => getComputedStyle(el).transform !== 'none'); i++) await frame()
   const peerBefore = glyph(peer)
-  const lines = [], progress = []
+  const lines = [], progress = [], positions = []
   for (let i=0; i<40; i++) {
     const overwrite = i>=24
     rows.push(event(rows.length+1, overwrite ? '\rProgress '+i+' / 99' : message))
@@ -49,11 +49,14 @@ async function measureOutput(fontSize) {
     const rect = glyph(pre)
     if (rect.height <= 0 || rect.y < view.getBoundingClientRect().top || rect.y >= view.getBoundingClientRect().bottom) throw Error('Tail glyph is outside the terminal')
     if (overwrite) progress.push(rect.y)
-    else lines.push(rect.y)
+    else {
+      lines.push(rect.y)
+      if (positions.length < 6) positions.push({y:rect.y, top:view.scrollTop, height:view.scrollHeight, viewport:view.clientHeight})
+    }
   }
   const spread = samples => (Math.max(...samples)-Math.min(...samples))*devicePixelRatio
   return {density:devicePixelRatio, rowHeight:parseFloat(getComputedStyle(pre).lineHeight), drift:spread(lines),
-    progressDrift:spread(progress), peerBefore, peerAfter:glyph(peer), widthBeforeOverflow, widthAfterOverflow}
+    progressDrift:spread(progress), peerBefore, peerAfter:glyph(peer), widthBeforeOverflow, widthAfterOverflow, positions}
 }
 
 exports.checkLiveOutput = async function(window) {

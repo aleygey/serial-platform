@@ -73,9 +73,10 @@ export const TerminalPane = memo(function TerminalPane({ ref, diagnostics, diagn
   const pinTail = useCallback(() => {
     const view = scrollRef.current
     if (!view || scrollMode.current !== 'live') return
-    const bottom = Math.max(0, view.scrollHeight - view.clientHeight)
-    lastLiveTop.current = bottom
-    if (Math.abs(view.scrollTop - bottom) > 1) view.scrollTop = bottom
+    // scrollHeight and clientHeight are rounded CSS pixels. Let Chromium clamp
+    // to the real maximum, which can fall between them at fractional zoom.
+    view.scrollTop = view.scrollHeight
+    lastLiveTop.current = view.scrollTop
   }, [])
   const returnToLive = useCallback(() => {
     if (scrollMode.current === 'live' && !selectedCommand && !findOpen) return
