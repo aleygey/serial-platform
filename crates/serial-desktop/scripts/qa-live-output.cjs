@@ -47,7 +47,12 @@ async function measureOutput(fontSize) {
     rows.push(event(rows.length+1, overwrite ? '\rProgress '+i+' / 99' : message))
     await publish(rows.slice())
     const rect = glyph(pre)
-    if (rect.height <= 0 || rect.y < view.getBoundingClientRect().top || rect.y >= view.getBoundingClientRect().bottom) throw Error('Tail glyph is outside the terminal')
+    const viewport = view.getBoundingClientRect()
+    const visible = Math.min(rect.y + rect.height, viewport.bottom) - Math.max(rect.y, viewport.top)
+    const lineHeight = parseFloat(getComputedStyle(pre).lineHeight)
+    if (visible <= 0 || (viewport.height >= lineHeight && visible < rect.height - 1/devicePixelRatio)) {
+      throw Error('Tail glyph clipped: ' + JSON.stringify({rect, viewport, lineHeight, visible, windowHeight:innerHeight}))
+    }
     if (overwrite) progress.push(rect.y)
     else {
       lines.push(rect.y)
