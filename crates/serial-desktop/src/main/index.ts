@@ -69,7 +69,7 @@ function installIpc(): void {
   ipcMain.handle('serial:send-command', (_event, port: string, command: string, traceId?: string) =>
     coordinator!.sendCommand(port, command, traceId))
   ipcMain.handle('serial:send-signal', (_event, port: string, signal: 'ctrl_c' | 'ctrl_d') => coordinator!.sendSignal(port, signal))
-  ipcMain.handle('serial:human-history', (_event, query: string, contains: boolean) => coordinator!.queryHumanHistory(query, contains))
+  ipcMain.handle('serial:human-history', (_event, query: string, contains: boolean, limit?: number) => coordinator!.queryHumanHistory(query, contains, limit))
   ipcMain.handle('serial:agent-history', (_event, port: string) => coordinator!.agentHistory(port))
   ipcMain.handle('serial:clear-agent-history', (_event, port: string, ids?: string[]) => coordinator!.clearAgentHistory(port, ids))
   ipcMain.handle('serial:agent-run-events', (_event, record: import('../shared/contracts').AgentRunRecord) => coordinator!.agentRunEvents(record))

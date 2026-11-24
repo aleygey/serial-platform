@@ -88,6 +88,10 @@ describe('desktop backend controls', () => {
 
   it('applies port and history updates without rebuilding the serial output or accepting stale state', () => {
     const base = createQaSnapshot()
+    const preferences = { ...base.preferences, selectedPort: 'COM7' }
+    const switched = mergeDesktopSnapshotEvent(base, { type: 'preferences', preferences })!
+    expect(switched.preferences).toBe(preferences)
+    expect(switched.events).toBe(base.events)
     const port = { ...base.configuredPorts[0], head_seq: base.configuredPorts[0].head_seq + 1 }
     const next = mergeDesktopSnapshotEvent(base, { type: 'port-status', port })!
     expect(next.configuredPorts[0]).toBe(port)
@@ -100,6 +104,18 @@ describe('desktop backend controls', () => {
     expect(updated.events).toBe(base.events)
     expect(mergeDesktopSnapshotEvent(updated, { type: 'human-history', history: { ...history, revision: 99 } })).toBe(updated)
     expect(mergeDesktopSnapshotEvent(updated, { type: 'human-history', history: { ...history, server_id: 'another' } })).toBe(updated)
+    const entry = { id: '1', command: 'status', port: 'COM6', wall_time_ns: 1, revision: 101, uses: 1 }
+    const delta = { type: 'human-history' as const, singleEntry: true, history: { ...history, revision: 101, entries: [entry] } }
+    const applied = mergeDesktopSnapshotEvent(updated, delta)!
+    expect(applied.humanHistory?.entries).toEqual([entry])
+    expect(mergeDesktopSnapshotEvent(applied, delta)).toBe(applied)
+    const skipped = { ...delta.history, revision: 103, entries: [{ ...entry, revision: 103, uses: 3 }] }
+    const missing = mergeDesktopSnapshotEvent(applied, { ...delta, history: skipped })!
+    expect(missing.missingHistoryRevision).toBe(103)
+    expect(missing.humanHistory).toBe(applied.humanHistory)
+    const recovered = mergeDesktopSnapshotEvent(missing, { type: 'human-history', history: skipped })!
+    expect(recovered.humanHistory).toBe(skipped)
+    expect(recovered.missingHistoryRevision).toBeUndefined()
   })
 
   it('exposes a reachable stop action only for an App-owned backend', () => {

@@ -517,6 +517,11 @@ app.whenReady().then(async () => {
   await fill('version')
   await key('Return')
   await until(`document.querySelector('.input-diagnostics tbody tr th')?.textContent.includes('命令')`)
+  await until(`document.querySelector('.command-editor input').value === ''`)
+  for (const char of 'status') window.webContents.sendInputEvent({ type: 'char', keyCode: char })
+  await until(`document.querySelector('.command-editor input').value === 'status'`)
+  await key('Return')
+  await until(`document.querySelector('.command-editor input').value === '' && document.querySelector('.input-diagnostics').textContent.includes('文字输入至下一帧')`)
   await js(`document.querySelector('.diagnostic-trigger').click()`)
   await until(`(() => {const v=document.querySelector('.terminal-scroll');return v.scrollHeight-v.clientHeight-v.scrollTop<3})()`)
   await js(`(async () => {

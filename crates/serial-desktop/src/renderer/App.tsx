@@ -10,6 +10,7 @@ import type {
 } from '../shared/contracts'
 import { isApprovalActionable } from '../shared/run-start'
 import { paletteId, palettes } from '../shared/appearance'
+import { applyHistoryEntry } from '../shared/human-history'
 import { Group, Panel, Separator, type GroupImperativeHandle, type Layout } from 'react-resizable-panels'
 import { motion } from 'motion/react'
 import { DockPreview, InsertionGap, usePortDrag } from './components/PortDrag'
@@ -27,9 +28,10 @@ import { resolveBackendControl } from './lib/backend-control'
 import { applyAppearance, useAppearanceMode } from './lib/appearance'
 
 type Page = 'console' | 'settings' | 'macros'
+type ConsoleSnapshot = DesktopSnapshot & { missingHistoryRevision?: number }
 
 export function App(): React.JSX.Element {
-  const [snapshot, setSnapshot] = useState<DesktopSnapshot>()
+  const [snapshot, setSnapshot] = useState<ConsoleSnapshot>()
   const mode = useAppearanceMode(snapshot?.preferences.theme ?? 'system')
   const colors = palettes[paletteId(snapshot?.preferences.palette)][mode]
   const [page, setPage] = useState<Page>('console')
@@ -100,14 +102,13 @@ export function App(): React.JSX.Element {
   }, [layout.ports, selectedPort, page])
 
   const applyEvent = useCallback((event: DesktopEvent): void => {
-    if (event.type === 'macro') setMacroExecution(event.execution)
-    if (event.type === 'snapshot' || event.type === 'timeline' || event.type === 'timeline-batch' || event.type === 'port-status' || event.type === 'port-history' || event.type === 'human-history' || event.type === 'connection' || event.type === 'service') {
-      setSnapshot((current) => mergeDesktopSnapshotEvent(current, event))
-    }
-    if (event.type === 'connection') {
-      setLoadingMessage(event.message)
+    if (event.type === 'macro') {
+      setMacroExecution(event.execution)
     } else if (event.type === 'notice' || event.type === 'error') {
       setToast({ kind: event.type, message: event.message })
+    } else {
+      setSnapshot((current) => mergeDesktopSnapshotEvent(current, event))
+      if (event.type === 'connection') setLoadingMessage(event.message)
     }
   }, [])
 
@@ -128,7 +129,7 @@ export function App(): React.JSX.Element {
     })
     window.serial.bootstrap().then((value) => {
       if (cancelled) return
-      const merged = buffered.reduce<DesktopSnapshot>(
+      const merged = buffered.reduce<ConsoleSnapshot>(
         (current, event) => mergeDesktopSnapshotEvent(current, event) ?? current,
         value
       )
@@ -152,6 +153,16 @@ export function App(): React.JSX.Element {
       unsubscribe()
     }
   }, [applyEvent])
+
+  const missingHistoryRevision = snapshot?.missingHistoryRevision
+  useEffect(() => {
+    if (missingHistoryRevision === undefined || snapshot?.connection !== 'connected') return
+    let active = true
+    void window.serial.queryHumanHistory('').then(history => {
+      if (active) applyEvent({ type: 'human-history', history })
+    }).catch(() => { /* Keep the loaded suggestions. A later history update can retry. */ })
+    return () => { active = false }
+  }, [scope, missingHistoryRevision, snapshot?.connection, applyEvent])
 
   useEffect(() => {
     if (!snapshot) return
@@ -378,11 +389,12 @@ export function App(): React.JSX.Element {
 }
 
 export function mergeDesktopSnapshotEvent(
-  current: DesktopSnapshot | undefined,
+  current: ConsoleSnapshot | undefined,
   event: DesktopEvent
-): DesktopSnapshot | undefined {
+): ConsoleSnapshot | undefined {
   if (event.type === 'snapshot') return event.snapshot
   if (!current) return current
+  if (event.type === 'preferences') return { ...current, preferences: event.preferences }
   if (event.type === 'connection') {
     return { ...current, connection: event.state, connectionMessage: event.message }
   }
@@ -399,7 +411,11 @@ export function mergeDesktopSnapshotEvent(
   if (event.type === 'human-history') {
     const history = event.history
     if (history.server_id !== current.serverId || (current.humanHistory && history.revision < current.humanHistory.revision)) return current
-    return { ...current, humanHistory: history }
+    if (event.singleEntry && history.revision === current.humanHistory?.revision) return current
+    const next = event.singleEntry ? applyHistoryEntry(current.humanHistory, history) : history
+    if (!next) return { ...current, missingHistoryRevision: Math.max(history.revision, current.missingHistoryRevision ?? 0) }
+    return { ...current, humanHistory: next, missingHistoryRevision:
+      (current.missingHistoryRevision ?? 0) > next.revision ? current.missingHistoryRevision : undefined }
   }
   if (event.type === 'port-status') {
     const port = event.port

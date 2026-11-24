@@ -44,7 +44,8 @@ import type { SerialConfigurationDraft } from '../shared/contracts'
 
 describe('DesktopCoordinator offline bootstrap', () => {
   it('keeps the live connection and pending setup when a different preference is saved', async () => {
-    const coordinator = new DesktopCoordinator(vi.fn())
+    const emit = vi.fn()
+    const coordinator = new DesktopCoordinator(emit)
     const task = { id: 'invitation', server: 'server', port: 'COM6' }
     const save = vi.fn().mockResolvedValue(undefined)
     const data = vi.fn(() => serverData(1))
@@ -54,6 +55,8 @@ describe('DesktopCoordinator offline bootstrap', () => {
       client: { data },
     })
     await coordinator.savePreferences({ selectedPort: 'COM6' })
+    expect(data).not.toHaveBeenCalled()
+    expect(emit).toHaveBeenCalledWith({ type: 'preferences', preferences: expect.objectContaining({ selectedPort: 'COM6' }) })
     expect(save).toHaveBeenCalledWith(expect.objectContaining({ theme: 'dark', setupTask: task, selectedPort: 'COM6' }))
     expect((await coordinator.bootstrap()).preferences.setupTask).toEqual(task)
     await coordinator.savePreferences({ firstUse: 'complete', setupTask: undefined })

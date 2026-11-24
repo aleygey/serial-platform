@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { repeatedMacroWrite } from '../shared/history-events'
+import { applyHistoryEntry, HISTORY_WINDOW } from '../shared/human-history'
 import WebSocket from 'ws'
 import { HUMAN_COMMAND_UNCERTAIN_MESSAGE } from '../shared/contracts'
 import { setupChanges, type SetupBrief, type SetupRequest } from '../shared/first-setup'
@@ -358,8 +359,9 @@ export class SerialClient extends EventEmitter {
     await this.sendHumanBytes(port, Buffer.from([signal === 'ctrl_d' ? 0x04 : 0x03]))
   }
 
-  async queryHumanHistory(query = '', contains = false): Promise<HumanCommandHistory> {
-    const parameters = new URLSearchParams({ limit: '1000' })
+  async queryHumanHistory(query = '', contains = false, limit = HISTORY_WINDOW): Promise<HumanCommandHistory> {
+    const bounded = Number.isSafeInteger(limit) ? Math.max(1, Math.min(HISTORY_WINDOW, limit)) : HISTORY_WINDOW
+    const parameters = new URLSearchParams({ limit: String(bounded) })
     if (query) parameters.set(contains ? 'contains' : 'prefix', query)
     return this.get<HumanCommandHistory>(`/api/v1/history/commands?${parameters}`)
   }
@@ -432,6 +434,20 @@ export class SerialClient extends EventEmitter {
 
   private async refreshHumanHistory(publish = false): Promise<void> {
     try {
+      if (this.humanHistory) {
+        const page = await this.queryHumanHistory('', false, 1)
+        if (this.stopped || this.status?.server_id !== page.server_id) return
+        const prior = this.humanHistory
+        if (prior?.server_id === page.server_id && (page.revision < prior.revision ||
+            (page.revision === prior.revision && page.warning === prior.warning))) return
+        const next = applyHistoryEntry(prior, page)
+        if (next) {
+          this.humanHistory = next
+          if (publish) this.emit('human-history', page, true)
+          return
+        }
+      }
+      // Bootstrap, skipped revisions and index recovery need the authoritative window.
       const history = await this.queryHumanHistory()
       if (this.stopped || (this.status && history.server_id !== this.status.server_id)) return
       const previous = this.humanHistory

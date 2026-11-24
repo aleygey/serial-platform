@@ -105,7 +105,7 @@ export function installQaBridge(): boolean {
       publish()
       return { status: 'accepted' }
     },
-    queryHumanHistory: async (query, contains) => ({ ...snapshot.humanHistory!, entries: snapshot.humanHistory!.entries.filter((entry) => contains ? entry.command.includes(query) : entry.command.startsWith(query)) }),
+    queryHumanHistory: async (query, contains, limit = 1000) => ({ ...snapshot.humanHistory!, entries: snapshot.humanHistory!.entries.filter((entry) => contains ? entry.command.includes(query) : entry.command.startsWith(query)).slice(0, limit) }),
     listMacros: async query => {
       const all = [...macros.values()].filter(m => (query.include_drafts || m.shared) && (!query.query || (m.id + m.name + m.description).includes(query.query)))
       return { catalog_revision: macros.size, macros: all, total: all.length, definition: query.id ? macros.get(query.id) : undefined }

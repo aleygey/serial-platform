@@ -9,6 +9,8 @@ export interface InputSample {
   sentAt?: number
   acceptedAt?: number
   receivedAt?: number
+  deliveredAt?: number
+  committedAt?: number
   frameAt?: number
   promptAt?: number
   sharedRx?: boolean
@@ -23,13 +25,33 @@ export class InputDiagnostics {
   private observed?: { epoch: string; seq: number }
   private promptWatch?: { ids: string[]; epoch: string; generation: number; receivedAt: number; tail: string }
   private frames = new Set<number>()
+  private editFrame?: number
+  private pendingEdits: number[] = []
+  private editTimes: number[] = []
+  private frozenEdits?: number[]
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   snapshot = () => this.frozen ?? this.rows
+  typingSnapshot = () => this.frozenEdits ?? this.editTimes
   get paused() { return this.frozen !== undefined }
 
   togglePause(): void {
+    this.frozenEdits = this.paused ? undefined : this.editTimes
     this.frozen = this.paused ? undefined : [...this.rows]
     this.notify()
+  }
+  textInput = (eventTime: number): void => {
+    if (this.paused) return
+    const now = performance.now()
+    this.pendingEdits.push(eventTime > 0 && eventTime <= now ? eventTime : now)
+    if (this.pendingEdits.length > 16) this.pendingEdits.shift()
+    if (this.editFrame !== undefined) return
+    this.editFrame = requestAnimationFrame(() => {
+      this.editFrame = undefined
+      const frame = performance.now()
+      this.editTimes = this.editTimes.concat(this.pendingEdits.map(time => frame - time)).slice(-16)
+      this.pendingEdits = []
+      if (!this.paused) this.notify()
+    })
   }
   begin(command: string, keyTime?: number): string | undefined {
     if (this.paused) return
@@ -84,16 +106,22 @@ export class InputDiagnostics {
       }
     }
     if (!observations.length && !matched.length) return
+    const committedAt = performance.timeOrigin + performance.now()
     const frame = requestAnimationFrame(() => {
       this.frames.delete(frame)
       const frameAt = performance.timeOrigin + performance.now()
-      for (const { ids, receivedAt } of observations) this.update(ids, { receivedAt, frameAt, sharedRx: ids.length > 1 })
+      for (const { ids, receivedAt, deliveredAt } of observations) {
+        this.update(ids, { receivedAt, deliveredAt, committedAt, frameAt, sharedRx: ids.length > 1 })
+      }
       if (matched.length) this.update(matched, { promptAt: frameAt })
     })
     this.frames.add(frame)
   }
 
   dispose(): void {
+    if (this.editFrame !== undefined) cancelAnimationFrame(this.editFrame)
+    this.editFrame = undefined
+    this.pendingEdits = []
     for (const frame of this.frames) cancelAnimationFrame(frame)
     this.frames.clear()
   }

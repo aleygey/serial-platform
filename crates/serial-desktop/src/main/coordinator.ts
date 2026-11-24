@@ -145,9 +145,9 @@ export class DesktopCoordinator {
     }
   }
 
-  async queryHumanHistory(query: string, contains = false) {
+  async queryHumanHistory(query: string, contains = false, limit?: number) {
     if (this.qaMode) return { server_id: 'qa', revision: 0, entries: [] }
-    return this.requireClient().queryHumanHistory(query, contains)
+    return this.requireClient().queryHumanHistory(query, contains, limit)
   }
 
   async agentHistory(port: string) {
@@ -227,7 +227,7 @@ export class DesktopCoordinator {
       const snapshot = await this.connectOrOffline(preferences.autoStartLocal)
       this.emit({ type: 'snapshot', snapshot })
     } else {
-      await this.publishSnapshot()
+      this.emit({ type: 'preferences', preferences: this.preferences })
     }
   }
 
@@ -310,8 +310,8 @@ export class DesktopCoordinator {
       if (port) this.emit({ type: 'port-status', port })
       else void this.publishSnapshot()
     })
-    client.on('human-history', (history: HumanCommandHistory) => {
-      if (client === this.client) this.emit({ type: 'human-history', history })
+    client.on('human-history', (history: HumanCommandHistory, singleEntry?: boolean) => {
+      if (client === this.client) this.emit({ type: 'human-history', history, singleEntry })
     })
     client.on('port-history', (event: Extract<DesktopEvent, { type: 'port-history' }>) => {
       if (client === this.client) this.emit(event)
