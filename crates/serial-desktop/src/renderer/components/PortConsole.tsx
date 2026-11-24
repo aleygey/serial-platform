@@ -1,8 +1,8 @@
 import { Activity, X } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { PortDragHandle, usePortPointerDrag, type PortDragController } from './PortDrag'
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type SyntheticEvent } from 'react'
-import type { AgentHistoryResponse, DesktopSnapshot, MacroExecution, TimelineEvent } from '../../shared/contracts'
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type SyntheticEvent } from 'react'
+import type { AgentHistoryResponse, DesktopSnapshot, MacroExecution, PortSnapshot, TimelineEvent } from '../../shared/contracts'
 import { createHistorySelector, locateCommandOutput, mergeAgentHistory, type AgentCommand } from '../lib/history'
 import { lastRunOutcome, portActivity } from '../lib/console-workspace'
 import { PortInput } from '../lib/port-input'
@@ -17,8 +17,10 @@ import { message, withToast, submitHumanCommand, type SetToast } from '../lib/fe
 
 const EMPTY_EVENTS: TimelineEvent[] = []
 
-interface Props {
-  snapshot: DesktopSnapshot
+interface Props extends Pick<DesktopSnapshot, 'serverId' | 'actor' | 'modelFamilies' | 'configRevision'> {
+  connected: boolean
+  configuredPort?: PortSnapshot
+  events?: TimelineEvent[]
   colors: { accent: string; output: string }
   selectedPort: string
   paneOrder: string[]
@@ -27,16 +29,17 @@ interface Props {
   session: PortInput
   historyView: AgentHistoryView
   humanHistory: string[]
-  onFocus: () => void
+  onFocus: (port: string) => void
   dragController: PortDragController
   swapTarget: boolean
   animateEntry: boolean
-  onReorder: (target: string) => void
-  onClose: () => void
+  onReorder: (port: string, target: string) => void
+  onClose: (port: string) => void
   setToast: SetToast
 }
 
-export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
+export const PortConsole = memo(function PortConsole({ events = EMPTY_EVENTS, configuredPort, serverId, actor, connected, modelFamilies, configRevision,
+  colors, selectedPort, paneOrder, active, split, session, historyView, humanHistory, onFocus, onClose, onReorder, dragController, swapTarget, animateEntry, setToast }: Props): React.JSX.Element {
   const headingDrag = usePortPointerDrag(selectedPort, split ? dragController : undefined)
   const [animateDrawer, setAnimateDrawer] = useState(false)
   const [drawerPreference, setDrawerPreference] = useState(historyView.expanded)
@@ -60,7 +63,7 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
   const panelElements = () => Array.from(frame.current?.closest('.workspace-panels')?.querySelectorAll<HTMLElement>('[data-panel]') ?? [])
   const moveTo = (panel?: HTMLElement) => {
     const target = panel?.querySelector<HTMLElement>('[data-port]')?.dataset.port
-    if (target && target !== selectedPort) onReorder(target)
+    if (target && target !== selectedPort) onReorder(selectedPort, target)
   }
   const historyId = useId()
   const [selectedCommand, setSelectedCommand] = useState<AgentCommand>()
@@ -78,7 +81,7 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
   useEffect(() => {
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    const context = `${snapshot?.serverId ?? ''}:${selectedPort ?? ''}`
+    const context = `${serverId ?? ''}:${selectedPort ?? ''}`
     historyContext.current = context
     setAgentArchive(undefined)
     setAgentArchiveEvents({})
@@ -88,22 +91,20 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
       if (!selectedPort) return
       try {
         const history = await window.serial.agentHistory(selectedPort)
-        if (!cancelled && history.server_id === snapshot?.serverId) setAgentArchive((current) =>
+        if (!cancelled && history.server_id === serverId) setAgentArchive((current) =>
           current && current.visibility.revision > history.visibility.revision ? current : history)
       } catch { /* Live console remains usable when an older daemon has no panel index. */ }
       if (!cancelled) timer = setTimeout(() => void refresh(), 5000)
     }
     void refresh()
     return () => { cancelled = true; historyContext.current = ''; evidenceLoad.current++; historyLoad.current.clear(); if (timer) clearTimeout(timer) }
-  }, [selectedPort, snapshot?.serverId])
+  }, [selectedPort, serverId])
 
-  const configuredPort = snapshot.configuredPorts.find((item) => item.config.port === selectedPort)
-  const events = snapshot.events[selectedPort] ?? EMPTY_EVENTS
   const liveEvents = useRef(events)
   liveEvents.current = events
-  const selectHistory = useMemo(createHistorySelector, [selectedPort, snapshot.serverId])
+  const selectHistory = useMemo(createHistorySelector, [selectedPort, serverId])
   const liveHistory = useMemo(() => selectHistory(events), [selectHistory, events])
-  const activity = portActivity(configuredPort, snapshot.connection === 'connected', snapshot.actor)
+  const activity = portActivity(configuredPort, connected, actor)
   const historyEvents = useMemo(() => {
     const archived = Object.values(agentArchiveEvents)
     if (!archived.length) return liveHistory
@@ -180,7 +181,6 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
       if (context === historyContext.current && load === evidenceLoad.current) setToast({ kind: 'error', message: message(error) })
     }
   }, [history, commands, agentArchive, selectedPort, configuredPort?.daemon_epoch, configuredPort?.head_seq, setToast])
-  const connected = snapshot.connection === 'connected'
   const online = connected && configuredPort?.session_state === 'online'
   const lastOutcome = useMemo(() => lastRunOutcome(historyEvents, configuredPort, history), [historyEvents, history, selectedPort, configuredPort?.daemon_epoch, configuredPort?.generation])
   const endedCurrentRun = !!activity.run && lastOutcome?.runId === activity.run.id
@@ -210,16 +210,16 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
     if (context !== historyContext.current) return
     for (const id of visibility.hidden) historyLoad.current.delete(id)
     setAgentArchive((current) => current ? { ...current, visibility } : {
-      server_id: snapshot.serverId ?? '', runs: [], visibility, truncated: false, indexing: false
+      server_id: serverId ?? '', runs: [], visibility, truncated: false, indexing: false
     })
     setAgentArchiveEvents(current => Object.fromEntries(Object.entries(current).filter(([id]) => !visibility.hidden.includes(id))))
     setSelectedCommand(undefined)
     evidenceLoad.current++
     setCommandEvidence(undefined)
     setToast({ kind: 'notice', message: 'Agent 历史已清理；原始串口日志和人工历史保留。' })
-  }, [selectedPort, snapshot.serverId, setToast])
+  }, [selectedPort, serverId, setToast])
   const focusPort = (event: SyntheticEvent) => {
-    if (!(event.target instanceof Element) || !event.target.closest('.channel-close')) onFocus()
+    if (!(event.target instanceof Element) || !event.target.closest('.channel-close')) onFocus(selectedPort)
   }
 
   return <motion.article className={`port-console ${active ? 'is-active' : ''}`} aria-label={`${selectedPort} 控制台`} data-port={selectedPort}
@@ -232,11 +232,11 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
         diagnosticPanel={diagnostics && <InputDiagnosticPanel recorder={diagnostics} port={selectedPort} historyCount={events.length} />}
         paused={paused} active={active} configuredPort={configuredPort} events={displayedEvents} commands={commands} currentCommand={currentCommand}
         heading={<div className="channel-name" {...headingDrag}>
-          <ModelIdentityPicker label={`切换 ${selectedPort} 机型`} families={snapshot.modelFamilies} family={configuredPort?.config.model_family}
+          <ModelIdentityPicker label={`切换 ${selectedPort} 机型`} families={modelFamilies} family={configuredPort?.config.model_family}
             name={configuredPort?.config.model_name} disabled={!connected || !configuredPort || savingModel}
             onChange={async (family, name) => {
               setSavingModel(true)
-              try { await withToast(() => window.serial.setPortModel(selectedPort, family, name, snapshot.configRevision), setToast, false) }
+              try { await withToast(() => window.serial.setPortModel(selectedPort, family, name, configRevision), setToast, false) }
               finally { setSavingModel(false) }
             }} />
           <h2>{split ? <PortDragHandle keyboardOnly className="pane-grip" port={selectedPort} controller={dragController} aria-label={`移动 ${selectedPort} 分栏`} title="拖动交换分栏，或按左右方向键"
@@ -251,7 +251,7 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
         </div>}
         actions={<><button className="terminal-find-trigger diagnostic-trigger" type="button" aria-label="输入诊断" aria-expanded={!!diagnostics}
           title="输入诊断" onClick={() => setDiagnostics(current => current ? undefined : new InputDiagnostics())}><Activity size={15} aria-hidden /></button>
-          <button className="channel-close" type="button" aria-label={`关闭 ${selectedPort} 分栏`} title="关闭分栏" onClick={onClose}><X size={15} /></button></>}
+          <button className="channel-close" type="button" aria-label={`关闭 ${selectedPort} 分栏`} title="关闭分栏" onClick={() => onClose(selectedPort)}><X size={15} /></button></>}
         selectedCommand={currentSelectedCommand} match={match} onClearCommand={clearCommand} />
     </div>
     <section className="command-history-dock" aria-label={selectedPort + ' 执行历史'}>
@@ -285,7 +285,7 @@ export function PortConsole({ snapshot, colors, selectedPort, paneOrder, active,
       }}
       onSignal={(signal) => submitHumanCommand(() => window.serial.sendSignal(selectedPort, signal), setToast)} />
   </motion.article>
-}
+})
 
 function commandIdentity(command: AgentCommand): string {
   return `${command.daemonEpoch}:${command.generation}:${command.firstSeq}:${command.id}`

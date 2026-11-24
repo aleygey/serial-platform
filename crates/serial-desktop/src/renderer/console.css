@@ -172,6 +172,9 @@ button, input, textarea { -webkit-app-region: no-drag; }
 .terminal-output {
   padding: 19px var(--pane-inset) clamp(0px, calc(100cqb - var(--terminal-line-height, 22px)), 38px);
   color: var(--work-output, var(--text)); font: var(--terminal-font-size, 13px)/var(--terminal-line-height, 22px) var(--mono); tab-size: 4;
+  /* Keep serial glyphs literal. Shaping an unterminated run of '#' as a
+     programming ligature otherwise stalls wrapping in both console panes. */
+  font-variant-ligatures: none;
 }
 .return-live { bottom: 10px; }
 .terminal-empty { padding: 20px; text-align: center; }

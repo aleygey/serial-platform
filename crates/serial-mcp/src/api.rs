@@ -145,7 +145,18 @@ impl ApiClient {
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {
-        self.get_json("/api/v1/health").await
+        let health: HealthResponse = self.get_json("/api/v1/health").await?;
+        if health.status != "ok" {
+            bail!("seriald health status is {:?}", health.status);
+        }
+        if health.protocol_version != serial_protocol::PROTOCOL_VERSION {
+            bail!(
+                "seriald protocol version {} is incompatible with serial-mcp protocol version {}",
+                health.protocol_version,
+                serial_protocol::PROTOCOL_VERSION
+            );
+        }
+        Ok(health)
     }
 
     pub async fn status(&self) -> Result<StatusResponse> {

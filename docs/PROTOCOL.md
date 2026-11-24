@@ -820,7 +820,9 @@ POST /mcp
 }
 ```
 
-统一启动器只在 `service`、`protocol_version=9` 和完整 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用该 adapter。启动器创建新 adapter 时还用 `pid` 区分并发启动中的 owner 与 loser。HTTP adapter 的 WebSocket session 固定为该启动身份；同一 endpoint 若返回不同 server/epoch，session 会拒绝跨 daemon 重连，adapter 重启后才会发布新的 `/health` 身份。
+统一启动器只在 `service`、`protocol_version=9` 和完整的 seriald endpoint/server/epoch 身份都与当前活动端点一致时复用适配器。创建新适配器时，启动器还会核对进程 `pid`。
+
+HTTP MCP 固定使用启动时的 endpoint 和 `server_id`。从 0.9.7 起，健康检查和读取当前串口状态都会核对后端的启动批次。同一个后端重启后，适配器用新 WebSocket 的 Welcome 验证 HTTP 返回的 epoch，再清除旧连接的 Run 句柄和控制租约。此后 `/health` 返回新 epoch，Agent 可以发起新的 Run。健康检查在后端离线、协议不兼容或身份校验失败时返回 HTTP 503。重连过程中不补发串口写入。
 
 统一启动时，MCP listener 使用已验证 `active-endpoint.json.address` 的精确 IP，并固定使用 port 3211；只有 seriald 原本是 IPv4/IPv6 通配 bind 时，活动地址才先转换为 `127.0.0.1`/`::1`。因此 host-only 场景会得到例如 `192.168.56.109:3211`，不会悄悄改成 loopback，也不会绑定所有接口。
 

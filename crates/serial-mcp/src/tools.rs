@@ -14,8 +14,9 @@ use serial_protocol::{
     CreateMonitorRequest, Cursor, Direction, EchoMode, EventKind, EventQuery, EventQueryResponse,
     MAX_BREAK_DURATION_MS, MAX_COMMAND_CAPTURE_DETAIL_BYTES, MAX_COMMAND_DESCRIPTION_BYTES,
     MAX_MONITOR_MATCHERS, MAX_MONITOR_PATTERN_BYTES, MAX_MONITOR_TOTAL_PATTERN_BYTES,
-    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MIN_BREAK_DURATION_MS, MonitorMatcher, PROTOCOL_VERSION,
-    SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse, WritePacing,
+    MAX_PHYSICAL_WRITE_TIMEOUT_MS, MIN_BREAK_DURATION_MS, McpHealthResponse, MonitorMatcher,
+    PROTOCOL_VERSION, SequenceWritePrecondition, SessionState, SlotSnapshot, StatusResponse,
+    WritePacing,
 };
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -228,6 +229,22 @@ impl AgentTools {
         }?;
         self.attach_recent_context(name, &mut output).await;
         Ok(output)
+    }
+
+    pub(crate) async fn http_health(&self) -> Result<McpHealthResponse> {
+        let health = self.api.health().await?;
+        self.session
+            .observe_daemon(health.server_id, health.daemon_epoch)
+            .await?;
+        Ok(McpHealthResponse {
+            status: health.status,
+            service: "serial-mcp".into(),
+            protocol_version: health.protocol_version,
+            pid: std::process::id(),
+            seriald_endpoint: self.api.endpoint().to_owned(),
+            seriald_server_id: health.server_id,
+            seriald_daemon_epoch: health.daemon_epoch,
+        })
     }
 
     /// Adds a compact activity summary only when another serial actor acted
@@ -1741,7 +1758,12 @@ impl AgentTools {
         }
         let started = self
             .session
-            .start_run_with_handle(args.port.clone(), args.label, BTreeMap::new())
+            .start_run_with_handle(
+                args.port.clone(),
+                slot.daemon_epoch,
+                args.label,
+                BTreeMap::new(),
+            )
             .await?;
         let run = started.run;
         self.remember_live_cursor(
@@ -1807,6 +1829,9 @@ impl AgentTools {
     async fn status(&self) -> Result<StatusResponse> {
         let status = self.api.status().await?;
         ensure_protocol_compatible(&status)?;
+        self.session
+            .observe_daemon(status.server_id, status.daemon_epoch)
+            .await?;
         Ok(status)
     }
 

@@ -9,6 +9,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct TestDaemon(Arc<Mutex<DaemonData>>);
 struct DaemonData {
+    server_id: Uuid,
+    welcome_epoch: Option<Uuid>,
     slot: SlotSnapshot,
     actor: Actor,
     lease: ControlLease,
@@ -49,7 +51,13 @@ async fn fixture(uncertain_start: bool) -> (AgentTools, TestDaemon, tokio::task:
         end_seq: None,
         metadata: Default::default(),
     };
+    let identity = crate::session::ExpectedDaemonIdentity {
+        server_id: Uuid::nil(),
+        daemon_epoch: slot.daemon_epoch,
+    };
     let data = TestDaemon(Arc::new(Mutex::new(DaemonData {
+        server_id: identity.server_id,
+        welcome_epoch: None,
         slot,
         actor,
         lease,
@@ -63,6 +71,7 @@ async fn fixture(uncertain_start: bool) -> (AgentTools, TestDaemon, tokio::task:
         macro_requests: 0,
     })));
     let router = Router::new()
+        .route("/api/v1/health", get(health))
         .route("/api/v1/ws", get(ws_upgrade))
         .route("/api/v1/status", get(status))
         .route("/api/v1/macros", get(macro_catalog))
@@ -80,7 +89,7 @@ async fn fixture(uncertain_start: bool) -> (AgentTools, TestDaemon, tokio::task:
             endpoint,
             "test".into(),
             Some(Duration::from_secs(1800)),
-            None,
+            Some(identity),
         ),
         "test".into(),
         crate::config::CaptureLimits::default(),
@@ -108,10 +117,21 @@ async fn macro_catalog(State(data): State<TestDaemon>) -> Json<MacroListResponse
     })
 }
 
+async fn health(State(data): State<TestDaemon>) -> Json<HealthResponse> {
+    let data = data.0.lock().unwrap();
+    Json(HealthResponse {
+        status: "ok".into(),
+        server_id: data.server_id,
+        daemon_epoch: data.slot.daemon_epoch,
+        uptime_ms: 100,
+        protocol_version: PROTOCOL_VERSION,
+    })
+}
+
 async fn status(State(data): State<TestDaemon>) -> Json<StatusResponse> {
     let data = data.0.lock().unwrap();
     Json(StatusResponse {
-        server_id: Uuid::nil(),
+        server_id: data.server_id,
         daemon_epoch: data.slot.daemon_epoch,
         protocol_version: PROTOCOL_VERSION,
         config_revision: 1,
@@ -148,8 +168,8 @@ async fn serve_socket(mut socket: WebSocket, data: TestDaemon) {
             let result = match &request {
                 ClientMessage::Hello { .. } => {
                     let response = ServerMessage::Welcome {
-                        server_id: Uuid::nil(),
-                        daemon_epoch: data.slot.daemon_epoch,
+                        server_id: data.server_id,
+                        daemon_epoch: data.welcome_epoch.unwrap_or(data.slot.daemon_epoch),
                         protocol_version: PROTOCOL_VERSION,
                         actor: data.actor.clone(),
                     };
@@ -353,6 +373,107 @@ async fn mcp_run_start_keeps_exact_compact_result_and_supports_followup_calls() 
     assert_eq!(ended["isError"], false, "{ended}");
     assert_eq!(ended["structuredContent"]["run_id"], output["run_id"]);
     assert!(data.0.lock().unwrap().slot.active_run.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn http_mcp_rebinds_same_server_for_new_runs_and_revokes_old_handles() {
+    let (tools, data, server) = fixture(false).await;
+    let start = || tools.call("run_start", json!({"port":"COM6", "label":"new boot"}));
+    let mut run = start().await.unwrap();
+    let initial = tools.http_health().await.unwrap();
+    assert_eq!(initial.pid, std::process::id());
+    assert_eq!(initial.service, "serial-mcp");
+    assert_eq!(initial.protocol_version, PROTOCOL_VERSION);
+
+    for health_first in [false, true] {
+        let epoch = Uuid::new_v4();
+        {
+            let mut state = data.0.lock().unwrap();
+            state.slot.daemon_epoch = epoch;
+            state.slot.active_run = None;
+            state.slot.control = None;
+            state.run.id = Uuid::new_v4();
+            state.lease.epoch = epoch;
+        }
+        if health_first {
+            assert_eq!(
+                tools.http_health().await.unwrap().seriald_daemon_epoch,
+                epoch
+            );
+        }
+        let next = start().await.unwrap();
+        assert_eq!(next["cursor"]["epoch"], json!(epoch));
+        assert_ne!(run["run_handle"], next["run_handle"]);
+        assert!(
+            tools
+                .call("run_end", json!({"run_handle":run["run_handle"]}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown run_handle")
+        );
+        let health = tools.http_health().await.unwrap();
+        assert_eq!(health.seriald_daemon_epoch, epoch);
+        assert_eq!(health.pid, initial.pid);
+        assert_eq!(health.seriald_endpoint, initial.seriald_endpoint);
+        let state = data.0.lock().unwrap();
+        assert_eq!(
+            json!(state.slot.active_run.as_ref().unwrap().id),
+            next["run_id"]
+        );
+        assert!(!state.requests.iter().any(|r| matches!(
+            r,
+            ClientMessage::Write { .. } | ClientMessage::EndRun { .. }
+        )));
+        run = next;
+    }
+    tools
+        .call("run_end", json!({"run_handle":run["run_handle"]}))
+        .await
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_http_rebind_preserves_the_confirmed_socket_and_run() {
+    let (tools, data, server) = fixture(false).await;
+    let run = tools
+        .call("run_start", json!({"port":"COM6", "label":"in progress"}))
+        .await
+        .unwrap();
+    let original = tools.http_health().await.unwrap();
+    {
+        let mut state = data.0.lock().unwrap();
+        state.server_id = Uuid::new_v4();
+    }
+    assert!(
+        tools
+            .http_health()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("server identity changed")
+    );
+    {
+        let mut state = data.0.lock().unwrap();
+        state.server_id = original.seriald_server_id;
+        state.slot.daemon_epoch = Uuid::new_v4();
+        state.welcome_epoch = Some(original.seriald_daemon_epoch);
+    }
+    assert!(
+        tools
+            .http_health()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("restarted between")
+    );
+    data.0.lock().unwrap().slot.daemon_epoch = original.seriald_daemon_epoch;
+    tools
+        .call("run_end", json!({"run_handle":run["run_handle"]}))
+        .await
+        .unwrap();
     server.abort();
 }
 

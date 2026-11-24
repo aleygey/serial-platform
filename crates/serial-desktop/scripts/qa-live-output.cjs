@@ -60,6 +60,16 @@ async function measureOutput(fontSize) {
     }
   }
   const spread = samples => (Math.max(...samples)-Math.min(...samples))*devicePixelRatio
+  // U-Boot can emit thousands of progress packets without a single LF.
+  // Preserve every byte and keep the tail visible when the pane soft-wraps.
+  const lastSeq = rows.at(-1).seq
+  const hashes = Array.from({length:1500}, (_, i) => event(lastSeq+i+1, '########'))
+  await publish(hashes)
+  if (getComputedStyle(pre).fontVariantLigatures !== 'none' ||
+      pre.textContent !== '#'.repeat(hashes.length * 8) ||
+      view.scrollHeight - view.scrollTop - view.clientHeight > 2) {
+    throw Error('Continuous flash progress must render as literal, tail-following serial text')
+  }
   return {density:devicePixelRatio, rowHeight:parseFloat(getComputedStyle(pre).lineHeight), drift:spread(lines),
     progressDrift:spread(progress), peerBefore, peerAfter:glyph(peer), widthBeforeOverflow, widthAfterOverflow, positions}
 }
