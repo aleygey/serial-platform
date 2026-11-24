@@ -24,6 +24,32 @@ async function key(keyCode, modifiers = []) {
   window.webContents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
   await pause(35)
 }
+
+async function checkReleasePreferences() {
+  await js(`window.qaReleaseChecks=0; window.qaReleaseResult='offline';
+    window.desktopUpdates={installedVersion:'1.0.0', check:async()=>{
+      window.qaReleaseChecks++;
+      if(window.qaReleaseResult==='offline') throw Error('offline');
+      return window.qaReleaseResult==='current' ? null : {version:'1.1.0',portable:true,url:'https://example.invalid/fixture.exe'};
+    }}; window.serial.savePreferences({autoCheckUpdates:false})`)
+  const check = "document.querySelector('.release-check button')"
+  const toggle = "document.querySelector('[aria-label=\"自动检查更新\"]')"
+  await until(`!!${check} && !${toggle}.checked`)
+  await js(`${check}.click()`)
+  await until(`document.querySelector('.release-check [role="status"]').textContent.includes('重试')`)
+  await js(`window.qaReleaseResult='current'; ${check}.click()`)
+  await until(`document.querySelector('.release-check [role="status"]').textContent.includes('已是最新')`)
+  assert.equal(await js('window.qaReleaseChecks'), 2)
+  await js(`window.qaReleaseResult='available'; ${toggle}.click()`)
+  await until(`${toggle}.checked`)
+  await pause(8100)
+  await until(`document.querySelector('.window-update')?.textContent.includes('1.1.0') && document.querySelector('.release-download')?.textContent.includes('下载便携版')`)
+  assert.equal(await js('window.qaReleaseChecks'), 3)
+  await js(`${toggle}.click()`)
+  await until(`!${toggle}.checked`)
+  assert.equal(await js('(async()=>(await window.serial.bootstrap()).preferences.autoCheckUpdates)()'), false)
+  await js('delete window.desktopUpdates; window.serial.savePreferences({})')
+}
 async function dragFromRail(port, { cancel = false } = {}) {
   window.focus()
   window.webContents.focus()
@@ -141,6 +167,13 @@ app.whenReady().then(async () => {
   window.focus()
   window.webContents.focus()
   await until(`!!document.querySelector('[aria-label="输入串口命令"]')`)
+  if (process.argv.includes('--live-output')) {
+    await dragFromRail('COM7')
+    await until(`document.querySelectorAll('.port-console').length === 2`)
+    await require('./qa-live-output.cjs').checkLiveOutput(window)
+    app.exit(0)
+    return
+  }
   if (process.argv.includes('--window-controls')) {
     await checkNativeTitleBar()
     app.exit(0)
@@ -346,6 +379,7 @@ app.whenReady().then(async () => {
   assert.equal(await js(`getComputedStyle(document.documentElement).fontSize`), '16px')
   assert.equal(await js(`document.querySelector('.baud-value input').value`), '57600')
   await screenshot('settings-components-light.png')
+  await checkReleasePreferences()
   await js(`document.querySelector('[aria-label="浅色"]').focus()`)
   await key('End')
   await until(`document.documentElement.dataset.theme === 'dark'`)

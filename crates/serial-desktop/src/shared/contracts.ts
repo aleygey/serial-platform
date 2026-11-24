@@ -255,6 +255,7 @@ export interface MacroExecution {
 export interface DesktopPreferences {
   endpoint: string
   autoStartLocal: boolean
+  autoCheckUpdates?: boolean
   theme: ThemePreference
   terminalFontSize?: number
   interfaceFontSize?: number
@@ -329,6 +330,7 @@ export interface DesktopBridge {
 
 export type DesktopEvent =
   | { type: 'snapshot'; snapshot: DesktopSnapshot }
+  | { type: 'startup-preferences'; preferences: DesktopPreferences }
   | { type: 'preferences'; preferences: DesktopPreferences }
   | { type: 'port-status'; port: PortSnapshot }
   | { type: 'port-history'; port: string; epoch: string; events: TimelineEvent[] }
@@ -343,6 +345,17 @@ export type DesktopEvent =
 
 export type WindowAction = 'minimize' | 'toggle-fullscreen' | 'close'
 
+export interface AvailableRelease {
+  version: string
+  url: string
+  portable: boolean
+}
+
+export interface DesktopUpdates {
+  installedVersion: string
+  check(): Promise<AvailableRelease | null>
+}
+
 export interface DesktopWindowBridge {
   act(action: WindowAction): void
   isFullScreen(): Promise<boolean>
@@ -353,5 +366,6 @@ declare global {
   interface Window {
     serial: DesktopBridge
     desktopWindow?: DesktopWindowBridge
+    desktopUpdates?: DesktopUpdates
   }
 }

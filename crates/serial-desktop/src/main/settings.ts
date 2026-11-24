@@ -6,6 +6,7 @@ import type { DesktopPreferences } from '../shared/contracts'
 const defaults: DesktopPreferences = {
   endpoint: 'http://127.0.0.1:3210',
   autoStartLocal: true,
+  autoCheckUpdates: true,
   theme: 'system',
   palette: 'harbor',
   firstUse: 'new'

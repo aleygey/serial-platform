@@ -56,6 +56,11 @@ jobs:
         working-directory: crates/serial-desktop
         run: npm run build
 
+      - name: Check live terminal text at four display scales on Windows
+        if: runner.os == 'Windows'
+        working-directory: crates/serial-desktop
+        run: npx --no-install electron scripts/qa-interactions.cjs --live-output
+
       - name: Package native Electron desktop with sidecars
         shell: bash
         run: |

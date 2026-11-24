@@ -90,10 +90,12 @@ describe('DesktopCoordinator offline bootstrap', () => {
     healthIdentity.mockRejectedValueOnce(failure === 'ECONNREFUSED'
       ? new TypeError('fetch failed', { cause: Object.assign(new Error('connection refused'), { code: failure }) })
       : new Error(failure))
-    const coordinator = new DesktopCoordinator(vi.fn())
+    const emit = vi.fn()
+    const coordinator = new DesktopCoordinator(emit)
     Object.assign(coordinator, { settings: { load: async () => preferences }, service })
 
     const snapshot = await coordinator.bootstrap()
+    expect(emit.mock.calls[0]).toEqual([{ type: 'startup-preferences', preferences }])
     expect(service.start.mock.calls).toEqual(shouldStart ? [[endpoint]] : [])
     expect(snapshot.connectionMessage).toBe(message)
   })

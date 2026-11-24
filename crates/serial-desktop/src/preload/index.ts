@@ -1,8 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import { version } from '../../package.json'
 import type {
   DesktopBridge,
   DesktopEvent,
   DesktopPreferences,
+  DesktopUpdates,
   DesktopWindowBridge,
   ModelFamily,
   ModelProfile,
@@ -66,3 +68,6 @@ const desktopWindow: DesktopWindowBridge = {
   }
 }
 contextBridge.exposeInMainWorld('desktopWindow', desktopWindow)
+
+const updates: DesktopUpdates = { installedVersion: version, check: () => ipcRenderer.invoke('desktop:check-release') }
+contextBridge.exposeInMainWorld('desktopUpdates', updates)

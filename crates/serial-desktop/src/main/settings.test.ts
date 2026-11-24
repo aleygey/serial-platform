@@ -14,10 +14,11 @@ describe('desktop preferences', () => {
       const store = new SettingsStore(join(directory, 'desktop.json'))
       const defaults = await store.load()
       expect(defaults.autoStartLocal).toBe(true)
+      expect(defaults.autoCheckUpdates).toBe(true)
       expect(defaults.firstUse).toBe('new')
 
-      await store.save({ ...defaults, autoStartLocal: false, firstUse: 'complete', terminalFontSize: 18, interfaceFontSize: 21 })
-      expect(await store.load()).toMatchObject({ autoStartLocal: false, firstUse: 'complete', terminalFontSize: 18, interfaceFontSize: 21 })
+      await store.save({ ...defaults, autoStartLocal: false, autoCheckUpdates: false, firstUse: 'complete', terminalFontSize: 18, interfaceFontSize: 21 })
+      expect(await store.load()).toMatchObject({ autoStartLocal: false, autoCheckUpdates: false, firstUse: 'complete', terminalFontSize: 18, interfaceFontSize: 21 })
       const previousPreferences = {
         endpoint: 'http://127.0.0.1:4321',
         autoStartLocal: false,
@@ -25,7 +26,7 @@ describe('desktop preferences', () => {
         theme: 'dark'
       }
       await writeFile(store.path, JSON.stringify(previousPreferences))
-      expect(await store.load()).toEqual({ ...previousPreferences, palette: 'harbor', firstUse: 'dismissed' })
+      expect(await store.load()).toEqual({ ...previousPreferences, autoCheckUpdates: true, palette: 'harbor', firstUse: 'dismissed' })
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
