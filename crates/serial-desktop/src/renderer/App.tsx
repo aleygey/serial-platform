@@ -62,13 +62,13 @@ export function App(): React.JSX.Element {
   const knownPorts = useMemo(() => [...new Set([...(snapshot?.configuredPorts ?? []).map((port) => port.config.port), ...(snapshot?.availablePorts ?? []).map((port) => port.name)])], [snapshot?.configuredPorts, snapshot?.availablePorts])
   const humanHistory = useMemo(() => snapshot?.humanHistory?.entries.map((item) => item.command) ?? [], [snapshot?.humanHistory])
   const [railOrder, setRailOrder] = useState<{ scope: string; ports: string[] }>()
-  const railPorts = railOrder?.scope === scope
-    ? [...railOrder.ports.filter(port => knownPorts.includes(port)), ...knownPorts.filter(port => !railOrder.ports.includes(port))] : knownPorts
-  const swapRailPorts = (port: string, target: string) => {
+  const railPorts = useMemo(() => railOrder?.scope === scope
+    ? [...railOrder.ports.filter(port => knownPorts.includes(port)), ...knownPorts.filter(port => !railOrder.ports.includes(port))] : knownPorts, [railOrder, scope, knownPorts])
+  const swapRailPorts = useCallback((port: string, target: string) => {
     const next = reorderPane({ ports: railPorts }, port, target)
     if (next.ports !== railPorts) setRailOrder({ scope, ports: next.ports })
-  }
-  const drag = usePortDrag(deckRef, (port, slot) => {
+  }, [railPorts, scope])
+  const dropPort = useCallback((port: string, slot: number) => {
     if (!knownPorts.includes(port)) return
     keepEmpty.current = false
     const from = layout.ports.indexOf(port)
@@ -76,7 +76,8 @@ export function App(): React.JSX.Element {
     const next = from < 0 ? insertPane(layout, port, slot) : { ...reorderPane(layout, port, target), active: port }
     pendingWidths.current = dockedWidths(next.ports, groupRef.current?.getLayout() ?? {})
     setLayout(next)
-  }, swapRailPorts)
+  }, [knownPorts, layout])
+  const drag = usePortDrag(deckRef, dropPort, swapRailPorts)
   useEffect(() => { drag.cancel() }, [page, scope, drag.cancel])
 
   useLayoutEffect(() => {
@@ -239,11 +240,18 @@ export function App(): React.JSX.Element {
     return () => window.removeEventListener('keydown', handler)
   }, [page])
 
-  const selectPort = (port: string): void => {
+  const selectPort = useCallback((port: string): void => {
     if (selectedPort === port) return
     keepEmpty.current = false
     setLayout((current) => selectPane(current, port))
-  }
+  }, [selectedPort])
+  const closePortView = useCallback((port: string) => {
+    if (layout.ports.length === 1) keepEmpty.current = true
+    setLayout(current => closePane(current, port))
+  }, [layout.ports.length])
+  const reorderPortView = useCallback((port: string, target: string) => {
+    setLayout(current => reorderPane(current, port, target))
+  }, [])
 
   const startBackend = async (): Promise<void> => { await withToast(() => window.serial.startLocalService(), setToast, false) }
   const stopBackend = async (): Promise<void> => { await withToast(() => window.serial.stopLocalService(), setToast, false) }
@@ -303,10 +311,6 @@ export function App(): React.JSX.Element {
       .flatMap(e => e.text.slice(-240).split(/[\r\n]+/)).filter(Boolean).slice(-3),
   } : undefined
   const gap = (index: number) => <InsertionGap active={inserting && slot === index} preview={dockPreview} weight={drag.drag?.weight ?? 1} />
-  const closePortView = (port: string) => {
-    if (layout.ports.length === 1) keepEmpty.current = true
-    setLayout(current => closePane(current, port))
-  }
   const split = layout.ports.length > 1
   const connected = snapshot.connection === 'connected'
   const preferences = snapshot.preferences
@@ -372,11 +376,12 @@ export function App(): React.JSX.Element {
                 return <Fragment key={JSON.stringify([scope, port])}>
                   {gap(index)}
                   {index > 0 && <Separator className="pane-divider" aria-label={`调整 ${layout.ports[index - 1]} 与 ${port} 的宽度`}><span /></Separator>}
-                  <Panel id={port} minSize="250px"><PortConsole snapshot={snapshot} selectedPort={port} colors={colors} paneOrder={layout.ports}
+                  <Panel id={port} minSize="250px"><PortConsole selectedPort={port} colors={colors} paneOrder={layout.ports}
+                  events={snapshot.events[port]} configuredPort={snapshot.configuredPorts.find(item => item.config.port === port)}
+                  serverId={snapshot.serverId} actor={snapshot.actor} connected={connected} modelFamilies={snapshot.modelFamilies} configRevision={snapshot.configRevision}
                   active={selectedPort === port} split={split} dragController={drag} swapTarget={swapTarget === port && draggedPort !== port}
                   animateEntry={!!pendingWidths.current && selectedPort === port} session={session.input} historyView={session.history} humanHistory={humanHistory}
-                  onReorder={target => setLayout(current => reorderPane(current, port, target))}
-                  setToast={setToast} onFocus={() => selectPort(port)} onClose={() => closePortView(port)} /></Panel>
+                  onReorder={reorderPortView} setToast={setToast} onFocus={selectPort} onClose={closePortView} /></Panel>
                 </Fragment>
               })}
               {gap(layout.ports.length)}

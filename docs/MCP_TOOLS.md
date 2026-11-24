@@ -30,6 +30,8 @@ MCP host 对该 URL 发送 JSON-RPC `POST`。notification 返回 HTTP 202；没�
 
 统一入口会在同一本地数据目录中自动发现并验证唯一 `seriald`，没有可用服务时才启动后端；默认和自定义 endpoint 使用相同复用规则。选定后端后，裸 `serial` 从实际 `ActiveEndpoint` 继承精确 IP，并在该 IP 的 3211 端口保证 HTTP MCP 可用。例如后端活动地址为 `192.168.56.109:3210` 时，MCP 地址是 `http://192.168.56.109:3211/mcp`，不会另外绑定 localhost。后端 wildcard bind 发布为可连接的 loopback `ActiveEndpoint`，因此 `0.0.0.0` / `::` 分别收敛为 `127.0.0.1:3211` / `[::1]:3211`。health 检查、进程复用、启动等待和最终输出都使用同一个目标地址；复用还会核对当前 Serial wire protocol v9、后端 endpoint、server ID 和 daemon epoch。Electron App 的 Local Service 只管理 `seriald`，不会代替统一入口启动 HTTP MCP。
 
+0.9.7 的 HTTP MCP 可以跟随同一 `seriald` 重启。后端恢复后可以直接调用 `run_start` 获取新句柄。旧 Run 已结束，之前下发的命令不会自动重试。若更新前曾单独运行 `serial-mcp`，首次升级请替换并重启这个进程。
+
 HTTP MCP 没有认证。listener 只接受精确 loopback 或可信 host-only 网卡的 unicast 地址，拒绝 wildcard、broadcast 和 multicast。非 loopback 部署必须限制在可信 host-only 网络，并使用主机防火墙限制来源，不能把 3211 端口暴露到普通局域网或公网。
 
 原生 MCP host 可以不发送 `Origin`。若发送，必须精确为 `http://<listener-IP>:<listener-port>`；只在 loopback listener 上额外接受 `localhost`。不接受其他主机名、不同 IP/端口、HTTPS、credentials、path、query 或 fragment；IPv6 地址使用方括号形式。

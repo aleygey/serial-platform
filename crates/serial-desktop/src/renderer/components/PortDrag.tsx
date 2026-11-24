@@ -1,7 +1,8 @@
 import { motion, useMotionValue, useReducedMotion, type HTMLMotionProps } from 'motion/react'
-import { useCallback, useEffect, useRef, useState, type RefObject, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
 
 type Point = { x: number; y: number }
+const railTargetAt = (point: Point) => document.elementFromPoint(point.x, point.y)?.closest<HTMLElement>('[data-device-port]')?.dataset.devicePort
 interface Drag {
   port: string
   index: number | null
@@ -52,7 +53,7 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
     const index = centers.current.findIndex(center => offset < center)
     return index === -1 ? centers.current.length : index
   }, [deck, x, y])
-  const begin = (port: string, point?: Point) => {
+  const begin = useCallback((port: string, point?: Point) => {
     const area = deck.current
     if (!area || document.querySelector('[aria-modal="true"]')) return
     window.clearTimeout(settleTimer.current)
@@ -71,17 +72,16 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
     const existing = panels.find(panel => panel.id === port)
     const share = existing ? weight(existing) : panels.reduce((sum, node) => sum + weight(node), 0) / (panels.length || 1)
     update({port, weight: share || 1, keyboard: !point, index: point ? pointIndex(point) : panels.length})
-  }
-  const railTargetAt = (point: Point) => document.elementFromPoint(point.x, point.y)?.closest<HTMLElement>('[data-device-port]')?.dataset.devicePort
-  const move = (point: Point) => {
+  }, [deck, pointIndex, update])
+  const move = useCallback((point: Point) => {
     const current = live.current
     if (!current) return
     pointer.current = point
     const index = pointIndex(point)
     const railTarget = index === null ? railTargetAt(point) : undefined
     if (current.index !== index || current.railTarget !== railTarget) update({ ...current, index, railTarget })
-  }
-  const finish = (point?: Point) => {
+  }, [pointIndex, update])
+  const finish = useCallback((point?: Point) => {
     const current = live.current
     if (!current) return
     const index = point ? pointIndex(point) : current.index
@@ -93,11 +93,11 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
     pointer.current = null
     update(null)
     onDrop(current.port, index)
-  }
-  const step = (direction: number) => {
+  }, [cancel, onDrop, onRailDrop, pointIndex, update])
+  const step = useCallback((direction: number) => {
     const current = live.current
     if (current?.keyboard) update({ ...current, index: Math.min(centers.current.length, Math.max(0, (current.index ?? 0) + direction)) })
-  }
+  }, [update])
   const dragging = !!drag
   const pointerDragging = dragging && !drag.keyboard
   useEffect(() => {
@@ -140,7 +140,8 @@ export function usePortDrag(deck: RefObject<HTMLDivElement | null>, onDrop: (por
       window.removeEventListener('blur', cancel)
     }
   }, [dragging, cancel])
-  return { drag, settling, x, y, begin, move, finish, cancel, step }
+  return useMemo(() => ({ drag, settling, x, y, begin, move, finish, cancel, step }),
+    [drag, settling, x, y, begin, move, finish, cancel, step])
 }
 
 export type PortDragController = ReturnType<typeof usePortDrag>

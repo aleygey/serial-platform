@@ -175,15 +175,9 @@ struct HttpState {
     tools: AgentTools,
     active_requests: ActiveRequests,
     listen: SocketAddr,
-    health: McpHealthResponse,
 }
 
-pub async fn serve_http(
-    tools: AgentTools,
-    listen: SocketAddr,
-    managed: bool,
-    health: McpHealthResponse,
-) -> Result<()> {
+pub async fn serve_http(tools: AgentTools, listen: SocketAddr, managed: bool) -> Result<()> {
     validate_http_listen(listen)?;
     if !listen.ip().is_loopback() {
         eprintln!(
@@ -196,7 +190,6 @@ pub async fn serve_http(
         tools,
         active_requests: Arc::new(Mutex::new(HashMap::new())),
         listen,
-        health,
     };
     axum::serve(
         listener,
@@ -210,8 +203,15 @@ pub async fn serve_http(
     Ok(())
 }
 
-async fn http_health(State(state): State<HttpState>) -> Json<McpHealthResponse> {
-    Json(state.health)
+async fn http_health(
+    State(state): State<HttpState>,
+) -> Result<Json<McpHealthResponse>, (StatusCode, String)> {
+    state
+        .tools
+        .http_health()
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
 }
 
 async fn http_shutdown_signal(managed: bool) {
@@ -976,15 +976,6 @@ mod tests {
             tools,
             active_requests: Arc::new(Mutex::new(HashMap::new())),
             listen,
-            health: McpHealthResponse {
-                status: "ok".into(),
-                service: "serial-mcp".into(),
-                protocol_version: serial_protocol::PROTOCOL_VERSION,
-                pid: 42,
-                seriald_endpoint: "http://127.0.0.1:1".into(),
-                seriald_server_id: uuid::Uuid::nil(),
-                seriald_daemon_epoch: uuid::Uuid::nil(),
-            },
         };
         Router::new()
             .route("/health", get(http_health))
@@ -998,14 +989,7 @@ mod tests {
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(health.status(), StatusCode::OK);
-        let payload: McpHealthResponse =
-            serde_json::from_slice(&to_bytes(health.into_body(), 16 * 1024).await.unwrap())
-                .unwrap();
-        assert_eq!(payload.service, "serial-mcp");
-        assert_eq!(payload.protocol_version, serial_protocol::PROTOCOL_VERSION);
-        assert_eq!(payload.pid, 42);
-        assert_eq!(payload.seriald_endpoint, "http://127.0.0.1:1");
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let initialize = test_http_app()
             .oneshot(

@@ -15,7 +15,7 @@ use serial_protocol::{
     WireFrame, WritePacing, decode_wire_frame, encode_client_control,
 };
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, client::IntoClientRequest},
@@ -90,6 +90,19 @@ pub(crate) struct ExpectedDaemonIdentity {
     pub daemon_epoch: Uuid,
 }
 
+impl ExpectedDaemonIdentity {
+    fn same_boot(self, observed: Self) -> Result<bool> {
+        if self.server_id != observed.server_id {
+            bail!(
+                "seriald server identity changed: expected {}, found {}; verify the configured endpoint before restarting serial-mcp",
+                self.server_id,
+                observed.server_id
+            );
+        }
+        Ok(self.daemon_epoch == observed.daemon_epoch)
+    }
+}
+
 fn ensure_welcome_identity(
     expected: Option<ExpectedDaemonIdentity>,
     server_id: Uuid,
@@ -98,13 +111,13 @@ fn ensure_welcome_identity(
     let Some(expected) = expected else {
         return Ok(());
     };
-    if expected.server_id != server_id || expected.daemon_epoch != daemon_epoch {
+    if !expected.same_boot(ExpectedDaemonIdentity {
+        server_id,
+        daemon_epoch,
+    })? {
         bail!(
-            "seriald identity changed while serial-mcp was running: expected server {} epoch {}, \
-         but the WebSocket welcomed server {} epoch {}; restart serial-mcp",
-            expected.server_id,
+            "seriald restarted between the HTTP observation (epoch {}) and WebSocket welcome (epoch {}); start a new Run against the current daemon",
             expected.daemon_epoch,
-            server_id,
             daemon_epoch
         );
     }
@@ -115,6 +128,7 @@ fn ensure_welcome_identity(
 pub struct SessionHandle {
     tx: mpsc::Sender<SessionRequest>,
     lifecycle_tx: mpsc::UnboundedSender<RunLifecycle>,
+    binding: Option<watch::Receiver<ExpectedDaemonIdentity>>,
 }
 
 /// Public Run identity plus the one opaque MCP capability issued to its caller.
@@ -163,6 +177,10 @@ enum RunLifecycle {
 }
 
 enum SessionRequest {
+    ObserveDaemon {
+        identity: ExpectedDaemonIdentity,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Macro {
         port: String,
         action: MacroAction,
@@ -210,6 +228,7 @@ enum SessionRequest {
     },
     StartRun {
         port: String,
+        observed_epoch: Uuid,
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
         reply: Reply,
@@ -295,12 +314,36 @@ impl SessionHandle {
     ) -> Self {
         let (tx, rx) = mpsc::channel(32);
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_session(
-            SessionState::with_run_idle_ttl(endpoint, actor_label, run_idle_ttl, expected_daemon),
-            rx,
-            lifecycle_rx,
-        ));
-        Self { tx, lifecycle_tx }
+        let state =
+            SessionState::with_run_idle_ttl(endpoint, actor_label, run_idle_ttl, expected_daemon);
+        let binding = state.binding.as_ref().map(watch::Sender::subscribe);
+        tokio::spawn(run_session(state, rx, lifecycle_rx));
+        Self {
+            tx,
+            lifecycle_tx,
+            binding,
+        }
+    }
+
+    pub async fn observe_daemon(&self, server_id: Uuid, daemon_epoch: Uuid) -> Result<()> {
+        let Some(binding) = &self.binding else {
+            return Ok(());
+        };
+        let identity = ExpectedDaemonIdentity {
+            server_id,
+            daemon_epoch,
+        };
+        if binding.borrow().same_boot(identity)? {
+            return Ok(());
+        }
+        let (reply, observed) = oneshot::channel();
+        self.tx
+            .send(SessionRequest::ObserveDaemon { identity, reply })
+            .await
+            .context("serial session task stopped")?;
+        observed
+            .await
+            .context("serial session task stopped during reconnect")?
     }
 
     pub async fn update_run_idle_ttl(&self, run_idle_ttl: Option<Duration>) -> Result<()> {
@@ -393,6 +436,7 @@ impl SessionHandle {
     pub async fn start_run_with_handle(
         &self,
         port: String,
+        observed_epoch: Uuid,
         label: String,
         metadata: std::collections::BTreeMap<String, Value>,
     ) -> Result<StartedRun> {
@@ -400,6 +444,7 @@ impl SessionHandle {
         self.tx
             .send(SessionRequest::StartRun {
                 port,
+                observed_epoch,
                 label,
                 metadata,
                 reply,
@@ -604,7 +649,7 @@ impl OwnedRun {
 struct SessionState {
     endpoint: String,
     actor_label: String,
-    expected_daemon: Option<ExpectedDaemonIdentity>,
+    binding: Option<watch::Sender<ExpectedDaemonIdentity>>,
     socket: Option<Socket>,
     actor: Option<Actor>,
     leases: HashMap<String, ControlLease>,
@@ -622,7 +667,7 @@ impl SessionState {
         Self {
             endpoint,
             actor_label,
-            expected_daemon,
+            binding: expected_daemon.map(|identity| watch::channel(identity).0),
             socket: None,
             actor: None,
             leases: HashMap::new(),
@@ -633,6 +678,9 @@ impl SessionState {
 
     async fn handle(&mut self, request: SessionRequest) {
         match request {
+            SessionRequest::ObserveDaemon { identity, reply } => {
+                let _ = reply.send(self.rebind_if_restarted(identity).await);
+            }
             SessionRequest::Macro {
                 port,
                 action,
@@ -711,10 +759,24 @@ impl SessionState {
             }
             SessionRequest::StartRun {
                 port,
+                observed_epoch,
                 label,
                 metadata,
                 reply,
             } => {
+                if self
+                    .binding
+                    .as_ref()
+                    .is_some_and(|bound| bound.borrow().daemon_epoch != observed_epoch)
+                {
+                    send_reply(
+                        reply,
+                        Err(anyhow::anyhow!(
+                            "seriald restarted after the port status was read; call run_start again"
+                        )),
+                    );
+                    return;
+                }
                 let result = self
                     .start_run_observed(port, label, metadata, &reply)
                     .await
@@ -896,13 +958,31 @@ impl SessionState {
         if self.socket.is_some() {
             return Ok(());
         }
-        self.leases.clear();
-        self.owned_runs.clear();
-        self.actor = None;
-        let request = ws_url(&self.endpoint)?.into_client_request()?;
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(request))
+        let expected = self.binding.as_ref().map(|bound| *bound.borrow());
+        self.open_connection(expected).await
+    }
+
+    async fn rebind_if_restarted(&mut self, observed: ExpectedDaemonIdentity) -> Result<()> {
+        let Some(binding) = &self.binding else {
+            return Ok(());
+        };
+        if binding.borrow().same_boot(observed)? {
+            return Ok(());
+        }
+        // A delayed HTTP response can describe an older boot. Keep the existing
+        // socket and its capabilities until the new Welcome confirms this one.
+        self.open_connection(Some(observed)).await
+    }
+
+    async fn open_connection(&mut self, expected: Option<ExpectedDaemonIdentity>) -> Result<()> {
+        tokio::time::timeout(DEFAULT_RPC_TIMEOUT, self.handshake(expected))
             .await
-            .context("timed out connecting to seriald WebSocket")??;
+            .context("timed out opening the seriald WebSocket session")?
+    }
+
+    async fn handshake(&mut self, expected: Option<ExpectedDaemonIdentity>) -> Result<()> {
+        let request = ws_url(&self.endpoint)?.into_client_request()?;
+        let (mut socket, _) = connect_async(request).await?;
         let hello = ClientMessage::Hello {
             request_id: Uuid::new_v4(),
             protocol_version: PROTOCOL_VERSION,
@@ -920,9 +1000,13 @@ impl SessionState {
                     ..
                 }) => {
                     ensure_welcome_protocol(protocol_version)?;
-                    ensure_welcome_identity(self.expected_daemon, server_id, daemon_epoch)?;
+                    ensure_welcome_identity(expected, server_id, daemon_epoch)?;
+                    self.disconnect();
                     self.actor = Some(actor);
                     self.socket = Some(socket);
+                    if let (Some(binding), Some(identity)) = (&self.binding, expected) {
+                        binding.send_replace(identity);
+                    }
                     return Ok(());
                 }
                 WireFrame::Control(ServerMessage::Error { message, .. }) => {
@@ -2689,13 +2773,13 @@ mod tests {
             ensure_welcome_identity(Some(expected), Uuid::new_v4(), expected.daemon_epoch)
                 .unwrap_err()
                 .to_string()
-                .contains("restart serial-mcp")
+                .contains("server identity changed")
         );
         assert!(
             ensure_welcome_identity(Some(expected), expected.server_id, Uuid::new_v4())
                 .unwrap_err()
                 .to_string()
-                .contains("restart serial-mcp")
+                .contains("restarted between")
         );
     }
 

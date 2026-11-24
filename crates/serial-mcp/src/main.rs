@@ -10,7 +10,6 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use serial_protocol::{McpHealthResponse, PROTOCOL_VERSION};
 
 #[derive(Parser)]
 #[command(name = "serial-mcp", version, about = "MCP adapter for seriald")]
@@ -73,36 +72,15 @@ async fn run() -> Result<()> {
         );
     }
     let api = api::ApiClient::new(resolved.endpoint.clone())?;
-    let http_health = if args.listen.is_some() {
+    let expected_daemon = if args.listen.is_some() {
         let seriald = api.health().await?;
-        if seriald.status != "ok" {
-            bail!("seriald health status is {:?}", seriald.status);
-        }
-        if seriald.protocol_version != PROTOCOL_VERSION {
-            bail!(
-                "seriald protocol version {} is incompatible with serial-mcp protocol version {}",
-                seriald.protocol_version,
-                PROTOCOL_VERSION
-            );
-        }
-        Some(McpHealthResponse {
-            status: "ok".into(),
-            service: "serial-mcp".into(),
-            protocol_version: PROTOCOL_VERSION,
-            pid: std::process::id(),
-            seriald_endpoint: api.endpoint().to_owned(),
-            seriald_server_id: seriald.server_id,
-            seriald_daemon_epoch: seriald.daemon_epoch,
+        Some(session::ExpectedDaemonIdentity {
+            server_id: seriald.server_id,
+            daemon_epoch: seriald.daemon_epoch,
         })
     } else {
         None
     };
-    let expected_daemon = http_health
-        .as_ref()
-        .map(|health| session::ExpectedDaemonIdentity {
-            server_id: health.seriald_server_id,
-            daemon_epoch: health.seriald_daemon_epoch,
-        });
     let initial_orphan_run_timeout = resolved.orphan_run_timeout;
     let session = session::SessionHandle::spawn(
         resolved.endpoint,
@@ -120,15 +98,7 @@ async fn run() -> Result<()> {
     }
     let tools = tools::AgentTools::new(api, session, actor_label, resolved.capture);
     match args.listen {
-        Some(listen) => {
-            mcp::serve_http(
-                tools,
-                listen,
-                args.managed,
-                http_health.expect("HTTP identity is resolved with --listen"),
-            )
-            .await
-        }
+        Some(listen) => mcp::serve_http(tools, listen, args.managed).await,
         None => mcp::serve_stdio(tools).await,
     }
 }
