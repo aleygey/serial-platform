@@ -13454,7 +13454,7 @@ impl CommandBoundaryMatcher {
             // Agent capture. A shell prompt at the start of the device echo
             // (for example `dut# show status`) is not the command's final
             // prompt and must not truncate the highlighted response.
-            Self::Prompt(value) => text.split('\n').any(|line| line.ends_with(value)),
+            Self::Prompt(value) => serial_protocol::matches_terminal_prompt(text, value),
             Self::Regex(value) => value.is_match(text),
         }
     }

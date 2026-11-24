@@ -121,7 +121,8 @@ button, input, textarea { -webkit-app-region: no-drag; }
 .workspace-panels [data-panel] { min-height: 0; }
 .port-console {
   --pane-inset: clamp(14px, 2.4cqi, 20px);
-  display: flex; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; position: relative;
+  display: grid; grid-template: minmax(0, 1fr) auto auto / minmax(0, 1fr);
+  width: 100%; height: 100%; min-width: 0; min-height: 0; position: relative;
   container-type: inline-size; background: var(--terminal); overflow: clip;
 }
 .pane-divider { width: 1px; background: var(--console-edge); position: relative; z-index: 3; outline-offset: -1px; }
@@ -313,7 +314,7 @@ button.outline-trigger:hover, .command-step:hover { background: var(--surface-ho
 .baud-control button:disabled { opacity: .35; }
 
 /* The terminal, disclosure and command form share the same column in every pane. */
-.port-console .channel-body { display: flex; flex: 1 1 0; min-height: 0; }
+.port-console .channel-body { display: flex; min-height: 0; }
 .channel-heading.terminal-header { position: relative; flex: 0 0 auto; min-height: 57px; height: auto; padding: 9px var(--pane-inset); background: var(--terminal); }
 .terminal-header .channel-name > span { flex-wrap: wrap; }
 .terminal-find-widget { top: 52px; }
@@ -373,6 +374,14 @@ button.outline-trigger:hover, .command-step:hover { background: var(--surface-ho
 .port-console .outline-trigger:has(.command-ink[data-tone='working']) { color: var(--accent); }
 .port-console .outline-trigger:has(.command-ink[data-tone='failed']) { color: var(--danger); }
 .port-console .outline-trigger:has(.command-ink[data-tone='waiting']) { color: var(--warning); }
+.agent-scroll .action-trigger[aria-expanded='true'] .command-ink { color: var(--text); text-decoration: none; }
+.run-outline .rail-node { color: var(--rail); stroke: currentColor; fill: transparent; }
+.run-outline .rail-node[data-reached='true'] { fill: currentColor; }
+.run-outline :is(.rail-node, [data-slot='rail-toc-plane'])[data-tone='idle'] { color: var(--text-3); }
+.run-outline :is(.rail-node, [data-slot='rail-toc-plane'])[data-tone='working'] { color: var(--accent); }
+.run-outline :is(.rail-node, [data-slot='rail-toc-plane'])[data-tone='done'] { color: var(--online); }
+.run-outline :is(.rail-node, [data-slot='rail-toc-plane'])[data-tone='waiting'] { color: var(--warning); }
+.run-outline :is(.rail-node, [data-slot='rail-toc-plane'])[data-tone='failed'] { color: var(--danger); }
 @keyframes command-cursor { 0%, 100% { opacity: .25; } 55% { opacity: .95; } }
 .live-command[data-tone='working']::after {
   content: ''; display: inline-block; width: .45em; height: 1em; margin-left: .45em;

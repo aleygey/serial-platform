@@ -33,6 +33,7 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
   const scope = useId()
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
+  const scrollingHistory = useRef(false)
   const [openRows, setOpenRows] = useState(view.rows)
   const setRow = useCallback((id: string, open: boolean) => {
     view.rows = { ...view.rows, [id]: open }
@@ -86,8 +87,17 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
   }, [pendingDelete])
 
   useEffect(() => {
-    if (visible) follow.current = true
+    if (visible) {
+      follow.current = true
+      scrollingHistory.current = false
+    }
   }, [visible])
+
+  function browseHistory(view: HTMLElement, towardEnd = false) {
+    const atEnd = view.scrollHeight - view.clientHeight - view.scrollTop <= 3
+    follow.current = towardEnd && atEnd
+    scrollingHistory.current = !follow.current
+  }
 
   const revealCursor = useCallback((list: HTMLElement, y: number, belowCursor: number) => {
     const viewport = scroll.current
@@ -101,6 +111,7 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
 
   const toggle = (id: string, open: boolean, runId?: string) => {
     follow.current = false
+    scrollingHistory.current = false
     setPendingDelete(undefined)
     setSelectedRun(runId)
     setFocusedRow(id)
@@ -111,7 +122,7 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
     if (action.actionKind === 'macro') {
       const state = action.macro ? macroExecutionLabel(action.macro) : { label: '已记录', tone: 'idle' }
       return <div className="outline-action" key={action.id}>
-        <div className="outline-trigger macro-summary" data-rail-node={action.id} data-depth="0" title={action.description + ' · ' + state.label}>
+        <div className="outline-trigger macro-summary" data-rail-node={action.id} data-rail-tone={state.tone} data-depth="0" title={action.description + ' · ' + state.label}>
           <span className="outline-label"><strong className="command-ink" data-tone={state.tone}>{action.description}</strong></span>
           <span className="sr-only">{state.label}</span>
         </div>
@@ -128,7 +139,7 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
     let state: ExecutionState | undefined = last
     if (action.triggerStatus) state = triggerState(action.triggerStatus)
     if (action.actionKind === 'sequence') {
-      const issue = marks.find(mark => mark.tone === 'failed' || mark.tone === 'waiting')
+      const issue = marks.find(mark => mark.tone === 'failed') ?? marks.find(mark => mark.tone === 'waiting')
       if (issue) state = issue
       else if (action.stepCount && action.commands.length < action.stepCount) {
         state = action.runId && action.runId === activeRunId ? { tone: 'working', label: '序列进行中' } : { tone: 'idle', label: '部分步骤已记录' }
@@ -139,7 +150,7 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
     const name = action.description
     const detail = [name, state?.label, multi && stepLabel].filter(Boolean).join(' · ')
     return <div className="outline-action" key={action.id}>
-      <button className="outline-trigger action-trigger" type="button" data-rail-node={action.id} data-depth="0"
+      <button className="outline-trigger action-trigger" type="button" data-rail-node={action.id} data-rail-tone={state?.tone} data-depth="0"
         title={detail} aria-label={detail} aria-expanded={open} aria-controls={scope + action.id} onClick={() => toggle(action.id, open, action.runId)}>
         <span className="outline-label"><strong className="command-ink" data-tone={state?.tone}>{name}</strong></span>
         {multi && <StepPlayer steps={marks} total={action.stepCount} label={stepLabel} paused={paused} />}
@@ -150,9 +161,15 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
           const active = selectedCommand?.daemonEpoch === command.daemonEpoch && selectedCommand?.generation === command.generation && selectedCommand.firstSeq === command.firstSeq
           const value = displayCommand(command.text) || 'Enter'
           const state = commandState(command, command === currentCommand)
-          const detail = value + ' · ' + state.label
-          return <button key={id} data-current-command={command === currentCommand} aria-label={detail} title={detail} data-rail-node={id} data-depth="1" type="button" className={`command-step ${active ? 'is-selected' : ''}`}
-            aria-current={active ? 'location' : undefined} onClick={() => { follow.current = false; setSelectedRun(action.runId); setFocusedRow(id); onSelect(command) }}>
+          const detail = value + ' · ' + state.label + ' · 定位串口回显'
+          return <button key={id} data-current-command={command === currentCommand} aria-label={detail} title={detail} data-rail-node={id} data-rail-tone={state.tone} data-depth="1" type="button" className={`command-step ${active ? 'is-selected' : ''}`}
+            aria-current={active ? 'location' : command === currentCommand ? 'step' : undefined} onClick={() => {
+              follow.current = false
+              scrollingHistory.current = false
+              setSelectedRun(action.runId)
+              setFocusedRow(id)
+              onSelect(command)
+            }}>
             <code className="command-ink" data-tone={state.tone}>{command === currentCommand && !reduced ? <TextEffect as="span" per="line" preset="fade">{value}</TextEffect> : value}</code>
           </button>
         })}
@@ -175,8 +192,16 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
           onClick={() => void clear('*')} aria-label="清空已结束的 Agent Run" title="清理已结束的 Run"><Trash2 size={13} /></button>
       </div>
       {notice && <p role="status" className="history-notice">{notice}</p>}
-      <div className="agent-scroll" ref={scroll} onWheel={() => { follow.current = false }} onTouchStart={() => { follow.current = false }}
-        onKeyDown={event => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) follow.current = false }} tabIndex={0} role="region" aria-label="命令历史">
+      <div className="agent-scroll" ref={scroll} tabIndex={0} role="region" aria-label="命令历史"
+        onWheel={event => { if (event.deltaY && !event.ctrlKey) browseHistory(event.currentTarget, event.deltaY > 0) }}
+        onTouchMove={event => browseHistory(event.currentTarget)}
+        onPointerDown={event => { if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) browseHistory(event.currentTarget) }}
+        onKeyDown={event => {
+          if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) {
+            browseHistory(event.currentTarget, ['ArrowDown', 'PageDown', 'End'].includes(event.key))
+          }
+        }}
+        onScroll={event => { if (scrollingHistory.current) browseHistory(event.currentTarget, true) }}>
         {!items.length && <div className="empty-state compact">暂无 Agent 执行记录
         </div>}
         {runs.map(run => {
@@ -202,7 +227,7 @@ export const AgentHistory = memo(function AgentHistory({ view, visible, items, p
                   <span>Run 已启动</span>{!!run.startedAt && <time>{new Date(run.startedAt / 1e6).toLocaleTimeString('zh-CN', {hour12:false})}</time>}
                 </div>}
                 {groups.map(actionRow)}
-                {run.status !== 'running' && <div className="run-lifecycle command-ink" data-rail-node={'end:' + id} data-depth="0" data-tone={run.status==='completed' ? 'done' : 'failed'}>{run.label}{run.status==='completed' ? '已完成' : '已中止'}</div>}
+                {run.status !== 'running' && <div className="run-lifecycle command-ink" data-rail-node={'end:' + id} data-depth="0" data-rail-tone={run.status==='completed' ? 'done' : 'failed'} data-tone={run.status==='completed' ? 'done' : 'failed'}>{run.label}{run.status==='completed' ? '已完成' : '已中止'}</div>}
               </RailToc>
             </OutlineBranch>
           </section>

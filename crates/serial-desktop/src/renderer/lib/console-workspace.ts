@@ -52,7 +52,7 @@ export function commandState(command: AgentCommand, awaitingCapture: boolean): E
   if (!capture) return awaitingCapture && command.expectsCapture !== false
     ? { label: '等待回执', tone: 'working' } : { label: '已发送', tone: 'idle' }
   switch (capture.completion) {
-    case 'timeout': return { label: '已超时', tone: 'failed' }
+    case 'timeout': return { label: '回执超时', tone: 'waiting' }
     case 'disconnected': return { label: '连接中断', tone: 'failed' }
     case 'run_aborted': return { label: '已中止', tone: 'failed' }
   }

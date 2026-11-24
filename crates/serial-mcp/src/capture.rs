@@ -46,9 +46,8 @@ pub struct CaptureOptions {
 pub enum CompletionPattern {
     /// Exact normalized terminal text anywhere in the post-TX window.
     Literal(String),
-    /// Exact normalized terminal text only at the end of a logical line.
-    /// Device prompts use this form so a prompt-looking fragment in ordinary
-    /// output cannot finish a command.
+    /// A normalized shell/boot prompt at a line boundary, including a prompt
+    /// immediately followed by an asynchronous timestamped device log.
     Prompt(String),
 }
 
@@ -1132,8 +1131,7 @@ fn matched_pattern(text: &str, patterns: &[CompletionPattern]) -> Option<Complet
         }
         CompletionPattern::Prompt(prompt) => {
             let normalized = terminal_text(prompt.as_bytes());
-            let normalized = normalized.trim_end_matches('\n');
-            (!normalized.is_empty() && text.split('\n').any(|line| line.ends_with(normalized)))
+            serial_protocol::matches_terminal_prompt(&text, &normalized)
                 .then(|| Completion::Prompt(prompt.clone()))
         }
     })
@@ -1302,6 +1300,31 @@ mod tests {
         assert_eq!(
             matched_pattern("message mentions SigmaStar # but continues", &prompt),
             None
+        );
+    }
+
+    #[test]
+    fn prompt_boundary_survives_padding_and_an_interleaved_device_log() {
+        let prompt = [CompletionPattern::Prompt("root@localhost:/#".into())];
+        for output in [
+            "value\r\nroot@localhost:/# \t",
+            "a0b1root@localhost:/# \x1b[0m[2026-11-24 11:01:48] device status\r\n",
+        ] {
+            assert!(matches!(
+                matched_pattern(output, &prompt),
+                Some(Completion::Prompt(_))
+            ));
+        }
+        for output in [
+            "root@localhost:/# status",
+            "root@localhost:/# [ready]",
+            "root@localhost:/# [2026-11-24] status",
+        ] {
+            assert_eq!(matched_pattern(output, &prompt), None);
+        }
+        assert_eq!(
+            matched_pattern("### ", &[CompletionPattern::Prompt("##".into())]),
+            Some(Completion::Prompt("##".into()))
         );
     }
 

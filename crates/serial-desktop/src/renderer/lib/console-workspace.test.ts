@@ -53,7 +53,9 @@ describe('port console', () => {
     expect(commandState(last, true).label).toBe('等待回执')
     expect(commandState(last, false).label).toBe('已发送')
     expect(commandState(first, false).label).toBe('回显已匹配')
-    expect(commandState({ ...first, capture: { ...first.capture!, completion: 'timeout' } }, false).tone).toBe('failed')
+    expect(commandState({ ...first, capture: { ...first.capture!, completion: 'timeout' } }, false)).toEqual({ label: '回执超时', tone: 'waiting' })
+    expect(commandState({ ...first, capture: { ...first.capture!, completion: 'disconnected' } }, false).tone).toBe('failed')
+    expect(commandState({ ...first, partial: true }, false).tone).toBe('failed')
     expect(commandState({ ...first, capture: { ...first.capture!, confidence: 'interfered' } }, false).tone).toBe('waiting')
   })
 

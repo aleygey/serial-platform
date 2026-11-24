@@ -373,11 +373,10 @@ export function locateCommandOutput(
 }
 
 /**
- * A persisted profile prompt is a command boundary only at the end of a
- * terminal line (or the current document). In particular, `root# show` is an
- * echoed command prefix, not the prompt that completed that command. A target
- * may reset prompt styling before its newline, so accept only SGR resets in
- * that narrow suffix.
+ * Mirror serial_protocol::matches_terminal_prompt on the original text so
+ * the returned offsets still identify the RX event containing the prompt.
+ * In particular, `root# show` is an echo prefix, while a timestamped device
+ * log can start on the prompt's line before the shell has printed a newline.
  */
 function findCompletedPrompt(text: string, prompt: string): { start: number; end: number } | undefined {
   if (!prompt) return undefined
@@ -387,8 +386,8 @@ function findCompletedPrompt(text: string, prompt: string): { start: number; end
     if (start < 0) return undefined
     const end = start + prompt.length
     const suffix = text.slice(end)
-    if (/^(?:(?:\u001b\[(?:0)?m))*(?:\r\n|\r|\n|$)/u.test(suffix)) return { start, end }
-    from = start + Math.max(1, prompt.length)
+    if (/^(?:[ \t]|\u001b\[0?m)*(?:[\r\n]|$|\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\](?=[ \t\r\n]|$))/u.test(suffix)) return { start, end }
+    from = start + 1
   }
   return undefined
 }
