@@ -2460,6 +2460,7 @@ struct CurrentProfileRevisions {
 
 enum MenuIoCommand {
     Reload,
+    QuickModel { mutation: Option<Box<MenuMutation>> },
     Mutation { mutation: Box<MenuMutation> },
 }
 
@@ -3148,6 +3149,7 @@ struct App {
     monitor_commands: Option<mpsc::Sender<(Uuid, u64)>>,
     pending_monitor_delete: Option<(Uuid, u64, Instant)>,
     port_mouse_tabs: Vec<(Rect, usize)>,
+    model_mouse_rows: Option<(Rect, usize)>,
     history_mouse_rows: Vec<(Rect, RunPanelRow)>,
     macro_saved_panel: Option<macro_ui::Panel>,
     macro_panel_id: Uuid,
@@ -3250,6 +3252,7 @@ impl App {
             monitor_commands: None,
             pending_monitor_delete: None,
             port_mouse_tabs: Vec::new(),
+            model_mouse_rows: None,
             history_mouse_rows: Vec::new(),
             macro_saved_panel: None,
             macro_panel_id: Uuid::new_v4(),
@@ -7438,11 +7441,28 @@ impl App {
         // Modals own interaction; no click or wheel may reach the underlying
         // serial controls while a confirmation, editor, or search is open.
         if self.help
-            || self.menu.is_some()
             || self.macro_panel.is_some()
             || self.output_search.is_some()
             || self.pending_run_start_approval().is_some()
         {
+            return;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && matches!(menu.page, MenuPage::ModelFamilies | MenuPage::ModelNames)
+                && !menu.busy
+                && menu.confirmation.is_none()
+                && menu.prompt.is_none()
+                && menu.choice.is_none()
+                && menu.field_help.is_none()
+                && let Some((rows, first)) = self.model_mouse_rows
+                && rect_contains(rows, Position::new(mouse.column, mouse.row))
+            {
+                menu.selected = first + usize::from(mouse.row - rows.y);
+                self.model_mouse_rows = None;
+                self.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                self.dirty = true;
+            }
             return;
         }
         if matches!(
@@ -8413,11 +8433,7 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
-        self.open_menu_page(Some(MenuPage::QuickProfiles));
-        if let Some(menu) = self.menu.as_mut() {
-            menu.push(MenuPage::ModelFamilies);
-            menu.quick_model = true;
-        }
+        self.open_menu_page(Some(MenuPage::ModelFamilies));
     }
 
     fn open_menu_page(&mut self, page: Option<MenuPage>) {
@@ -8430,6 +8446,10 @@ impl App {
             .map(|config| config.config.recent_models.clone())
             .unwrap_or_default();
         if let Some(page) = page {
+            if page == MenuPage::ModelFamilies {
+                menu.push(MenuPage::QuickProfiles);
+                menu.quick_model = true;
+            }
             menu.push(page);
         }
         self.submit_menu_command(&mut menu, MenuIoCommand::Reload);
@@ -8450,6 +8470,15 @@ impl App {
             menu.message = tr("menu.io.unavailable").into();
             self.status = menu.message.clone();
             return false;
+        };
+        let command = match command {
+            MenuIoCommand::Reload if menu.quick_model => {
+                MenuIoCommand::QuickModel { mutation: None }
+            }
+            MenuIoCommand::Mutation { mutation } if menu.quick_model => MenuIoCommand::QuickModel {
+                mutation: Some(mutation),
+            },
+            other => other,
         };
         match commands.try_send(command) {
             Ok(()) => {
@@ -11767,11 +11796,15 @@ async fn execute_menu_io(
     api: &ApiClient,
     command: MenuIoCommand,
 ) -> Result<(MenuCatalog, MenuSuccess)> {
+    let discover_ports = !matches!(command, MenuIoCommand::QuickModel { .. });
     let success = match command {
-        MenuIoCommand::Reload => MenuSuccess::Loaded,
-        MenuIoCommand::Mutation { mutation } => execute_menu_mutation(api, *mutation).await?,
+        MenuIoCommand::Reload | MenuIoCommand::QuickModel { mutation: None } => MenuSuccess::Loaded,
+        MenuIoCommand::Mutation { mutation }
+        | MenuIoCommand::QuickModel {
+            mutation: Some(mutation),
+        } => execute_menu_mutation(api, *mutation).await?,
     };
-    Ok((load_menu_catalog(api).await?, success))
+    Ok((load_menu_catalog(api, discover_ports).await?, success))
 }
 
 async fn execute_menu_mutation(api: &ApiClient, mutation: MenuMutation) -> Result<MenuSuccess> {
@@ -12218,10 +12251,16 @@ async fn update_current_profiles(api: &ApiClient, update: CurrentProfileUpdate) 
     Ok(())
 }
 
-async fn load_menu_catalog(api: &ApiClient) -> Result<MenuCatalog> {
+async fn load_menu_catalog(api: &ApiClient, discover_ports: bool) -> Result<MenuCatalog> {
     let (status, detected_ports, transport, model, families) = tokio::try_join!(
         api.configuration_status(),
-        api.ports(),
+        async {
+            if discover_ports {
+                api.ports().await
+            } else {
+                Ok(Vec::new())
+            }
+        },
         api.transport_profiles(),
         api.model_profiles(),
         api.model_families(),
@@ -12871,9 +12910,10 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.help {
         draw_help(frame, app, area);
     }
-    if let Some(menu) = app.menu.as_ref() {
-        draw_menu(frame, app, menu, area);
-    }
+    app.model_mouse_rows = app
+        .menu
+        .as_ref()
+        .and_then(|menu| draw_menu(frame, app, menu, area));
     if let Some(panel) = app.macro_panel.as_ref() {
         panel.draw(frame, app.software_cursor_visible);
     }
@@ -15592,7 +15632,12 @@ fn help_lines(_app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
+fn draw_menu(
+    frame: &mut Frame<'_>,
+    app: &App,
+    menu: &MenuState,
+    area: Rect,
+) -> Option<(Rect, usize)> {
     let width = area.width.saturating_sub(4).clamp(1, 100);
     let height = area.height.saturating_sub(2).clamp(1, 34);
     let popup = centered_rect(width, height, area);
@@ -15659,6 +15704,11 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
             .unwrap_or(0)
             .min(max_start)
     };
+    let hit_rows = matches!(menu.page, MenuPage::ModelFamilies | MenuPage::ModelNames).then(|| {
+        let mut rect = chunks[1];
+        rect.height = rect.height.min(rows.len().saturating_sub(start) as u16);
+        (rect, start)
+    });
     frame.render_widget(
         Paragraph::new(
             rows.into_iter()
@@ -15680,6 +15730,7 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, menu: &MenuState, area: Rect) {
     } else if let Some(help) = menu.field_help.as_ref() {
         draw_menu_field_help(frame, help, popup);
     }
+    hit_rows
 }
 
 fn draw_menu_confirmation(frame: &mut Frame<'_>, confirmation: &MenuConfirmation, parent: Rect) {
@@ -22867,6 +22918,63 @@ mod tests {
         assert_eq!(update.revisions.config, Some(41));
         assert_eq!(update.revisions.model_family, Some(41));
         assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn quick_model_mouse_hits_the_rendered_family_and_model() {
+        let (current, mut catalog) = editable_profile_fixture();
+        catalog.model_families[0]
+            .model_names
+            .push("DUT Console 2.0".into());
+        let mut app = App::new(vec![current], None);
+        let (menu_commands, mut requests) = mpsc::channel(2);
+        app.menu_commands = Some(menu_commands);
+        app.open_model_picker();
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(MenuIoCommand::QuickModel { mutation: None })
+        ));
+        let (commands, _) = mpsc::channel(1);
+        app.handle_menu_io_event(
+            MenuIoEvent::Completed {
+                catalog: Box::new(catalog),
+                success: MenuSuccess::Loaded,
+            },
+            &commands,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut click = |app: &mut App, row: ModelTreeRow| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let (rect, first) = app.model_mouse_rows.unwrap();
+            let index = model_tree_rows(app.menu.as_ref().unwrap())
+                .iter()
+                .position(|item| item == &row)
+                .unwrap();
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y + (index - first) as u16,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &commands,
+            );
+        };
+        let family = "DUT Console".to_owned();
+        app.menu.as_mut().unwrap().model_family = None;
+        click(&mut app, ModelTreeRow::Family(family.clone()));
+        assert_eq!(
+            app.menu.as_ref().unwrap().model_family.as_ref(),
+            Some(&family)
+        );
+        click(
+            &mut app,
+            ModelTreeRow::Model(family, "DUT Console 2.0".into()),
+        );
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(MenuIoCommand::QuickModel { mutation: Some(_) })
+        ));
     }
 
     #[test]

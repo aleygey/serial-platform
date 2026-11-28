@@ -2,7 +2,8 @@ import { ArrowUpRight, Plus, Save, Trash2 } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type KeyboardEvent } from 'react'
 import { BaudRateField, SerialNumberField } from './BaudRateField'
 import { BounceSidebar } from './ui/bounce-sidebar'
-import { ModelIdentityPicker, MoreFields, OptionField } from './SerialFields'
+import { tcpPortAddress } from '../lib/tcp-endpoint'
+import { ModelIdentityPicker, MoreFields, OptionField, PortEndpointField } from './SerialFields'
 import { ModelPicker } from './ui/model-picker'
 import { TransitionPanel } from './ui/transition-panel'
 import { WorkspaceSidebar } from './WorkspaceSidebar'
@@ -146,6 +147,7 @@ function SerialEditor({
   )
   const [value, setValue] = useState(draft)
   useConfigurationChange(draft, setValue)
+  const tcp = !!tcpPortAddress(selectedPort)
   const updateProfile = <K extends keyof TransportProfile>(key: K, next: TransportProfile[K]): void => {
     setValue((current) => ({ ...current, transportProfile: { ...current.transportProfile, [key]: next } }))
   }
@@ -154,7 +156,7 @@ function SerialEditor({
     <div className="editor-shell">
       <div className="editor-heading">
         <div><h1>串口配置</h1></div>
-        <button className="primary-button" type="button" disabled={!value.port || !value.transportProfile.baud_rate || Boolean(value.modelFamily) !== Boolean(value.modelName)} onClick={async () => {
+        <button className="primary-button" type="button" disabled={!value.port || value.port !== selectedPort || !value.transportProfile.baud_rate || Boolean(value.modelFamily) !== Boolean(value.modelName)} onClick={async () => {
           if (await onSaveSerial(value)) onSaved()
         }}><Save size={16} /> 保存串口配置</button>
       </div>
@@ -162,29 +164,29 @@ function SerialEditor({
         <section className="config-section">
           <h2>设备</h2>
           <div className="field-grid two">
-            <OptionField label="串口" value={selectedPort} options={allPorts.map(port => ({id:port, name:port}))} onChange={setSelectedPort} />
+            <PortEndpointField port={selectedPort} ports={allPorts.map(port => ({id:port, name:port}))} onChange={setSelectedPort} />
             <div className="form-field"><span>机型</span><ModelIdentityPicker families={modelFamilies} family={value.modelFamily} name={value.modelName}
               onChange={(modelFamily, modelName) => setValue(current => ({...current, modelFamily, modelName}))} /></div>
           </div>
         </section>
         <section className="config-section">
           <h2>通信参数</h2>
-          <div className="field-grid three">
+          {tcp ? <p>通过原始 TCP 收发串口数据。波特率、校验位和流控在串口服务器上设置。</p> : <div className="field-grid three">
             <BaudRateField value={value.transportProfile.baud_rate} onChange={rate => updateProfile('baud_rate', rate)} />
             <SerialNumberField label="数据位" value={DATA_BITS.indexOf(value.transportProfile.data_bits) + 5} choices={[5,6,7,8]}
               onChange={n => updateProfile('data_bits', DATA_BITS[n - 5])} />
             <SerialNumberField label="停止位" value={value.transportProfile.stop_bits === 'one' ? 1 : 2} choices={[1,2]}
               onChange={n => updateProfile('stop_bits', n === 1 ? 'one' : 'two')} />
-          </div>
+          </div>}
           <MoreFields title="高级通信设置">
             <div className="field-grid two">
-              <OptionField label="校验位" value={value.transportProfile.parity} options={[{id:'none',name:'无'},{id:'odd',name:'奇校验'},{id:'even',name:'偶校验'}]} onChange={id => updateProfile('parity', id)} />
-              <OptionField label="流控" value={value.transportProfile.flow_control} options={[{id:'none',name:'无'},{id:'software',name:'软件'},{id:'hardware',name:'硬件'}]} onChange={id => updateProfile('flow_control', id)} />
+              {!tcp && <><OptionField label="校验位" value={value.transportProfile.parity} options={[{id:'none',name:'无'},{id:'odd',name:'奇校验'},{id:'even',name:'偶校验'}]} onChange={id => updateProfile('parity', id)} />
+              <OptionField label="流控" value={value.transportProfile.flow_control} options={[{id:'none',name:'无'},{id:'software',name:'软件'},{id:'hardware',name:'硬件'}]} onChange={id => updateProfile('flow_control', id)} /></>}
               <OptionField label="交互 Profile" value={value.modelProfile ?? ''} options={[{id:'',name:'通用'}, ...modelProfiles.map(profile => ({id:profile.name,name:profile.name}))]}
                 onChange={id => setValue(current => selectModelProfile(current, id || null, modelProfiles))} />
             </div>
             <div className="inline-switches">
-              {(['dtr','rts','auto_open'] as const).map(key => <label key={key}><input type="checkbox" checked={value.transportProfile[key]} onChange={event => updateProfile(key,event.target.checked)} />{key === 'auto_open' ? '自动打开' : key.toUpperCase()}</label>)}
+              {(tcp ? ['auto_open'] as const : ['dtr','rts','auto_open'] as const).map(key => <label key={key}><input type="checkbox" checked={value.transportProfile[key]} onChange={event => updateProfile(key,event.target.checked)} />{key === 'auto_open' ? '自动打开' : key.toUpperCase()}</label>)}
             </div>
           </MoreFields>
         </section>
@@ -416,11 +418,10 @@ function ApplicationSettings({ preferences, onSave, serviceControls, backendConn
     {updates && <fieldset><legend>软件更新</legend>
       <div className="release-check">
         <span>当前版本 <b>{updates.installed}</b></span>
-        <button type="button" className="setup-secondary" disabled={updates.phase === 'checking'} onClick={updates.check}>检查更新</button>
-        {updates.available && <a className="release-download" href={updates.available.url} target="_blank" rel="noreferrer">
-          {updates.available.portable ? '下载便携版' : '查看新版'} {updates.available.version}</a>}
-        <small role="status">{updates.phase === 'checking' ? '正在检查…' : updates.phase === 'offline' ? '暂时无法检查更新，请稍后重试' :
-          updates.phase === 'checked' && !updates.available ? '已是最新正式版' : ''}</small>
+        <button type="button" className="setup-secondary" disabled={updates.busy} onClick={updates.check}>检查更新</button>
+        {updates.available?.installable && <button type="button" className="release-download" disabled={updates.busy} onClick={updates.install}>
+          更新并重启至 {updates.available.version}</button>}
+        <small role="status">{updates.status}</small>
       </div>
       <label className="auto-start-setting">
         <span><strong>自动检查更新</strong></span>
@@ -437,7 +438,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function serialDraft(port: string, configuredPorts: PortSnapshot[], profiles: TransportProfile[]): SerialConfigurationDraft {
   const configured = configuredPorts.find((item) => item.config.port === port)
-  const profile = profiles.find((item) => item.name === configured?.config.transport_profile) ?? profiles[0] ?? defaultTransport()
+  const profile = profiles.find((item) => item.name === configured?.config.transport_profile) ?? (tcpPortAddress(port) ? defaultTransport() : profiles[0] ?? defaultTransport())
   return {
     port,
     enabled: configured?.config.enabled ?? true,

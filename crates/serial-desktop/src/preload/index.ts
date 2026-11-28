@@ -69,5 +69,9 @@ const desktopWindow: DesktopWindowBridge = {
 }
 contextBridge.exposeInMainWorld('desktopWindow', desktopWindow)
 
-const updates: DesktopUpdates = { installedVersion: version, check: () => ipcRenderer.invoke('desktop:check-release') }
+const updates: DesktopUpdates = {
+  installedVersion: version,
+  check: () => ipcRenderer.invoke('desktop:check-release'),
+  install: releaseVersion => ipcRenderer.invoke('desktop:install-release', releaseVersion)
+}
 contextBridge.exposeInMainWorld('desktopUpdates', updates)

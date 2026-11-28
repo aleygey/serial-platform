@@ -25,12 +25,23 @@ async function key(keyCode, modifiers = []) {
   await pause(35)
 }
 
+async function clickAt(selector) {
+  const point = await js(`(() => {const el=document.querySelector(${JSON.stringify(selector)}); const r=el.getBoundingClientRect();
+    const x=Math.round(r.left+r.width/2), y=Math.round(r.top+r.height/2);
+    if (!el.contains(document.elementFromPoint(x,y))) throw Error('Pointer cannot reach '+el.outerHTML);
+    return {x,y}})()`)
+  const input = window.webContents.debugger
+  if (!input.isAttached()) input.attach()
+  await input.sendCommand('Input.dispatchMouseEvent', {type:'mouseMoved', ...point})
+  await input.sendCommand('Input.dispatchMouseEvent', {type:'mousePressed', button:'left', clickCount:1, ...point})
+  await input.sendCommand('Input.dispatchMouseEvent', {type:'mouseReleased', button:'left', clickCount:1, ...point})
+}
 async function checkReleasePreferences() {
   await js(`window.qaReleaseChecks=0; window.qaReleaseResult='offline';
-    window.desktopUpdates={installedVersion:'1.0.0', check:async()=>{
+    window.desktopUpdates={installedVersion:'1.0.0', install:async version=>{window.qaInstalled=version; throw Error('fixture install failure')}, check:async()=>{
       window.qaReleaseChecks++;
       if(window.qaReleaseResult==='offline') throw Error('offline');
-      return window.qaReleaseResult==='current' ? null : {version:'1.1.0',portable:true,url:'https://example.invalid/fixture.exe'};
+      return window.qaReleaseResult==='current' ? null : {version:'1.1.0',installable:true};
     }}; window.serial.savePreferences({autoCheckUpdates:false})`)
   const check = "document.querySelector('.release-check button')"
   const toggle = "document.querySelector('[aria-label=\"自动检查更新\"]')"
@@ -43,8 +54,10 @@ async function checkReleasePreferences() {
   await js(`window.qaReleaseResult='available'; ${toggle}.click()`)
   await until(`${toggle}.checked`)
   await pause(8100)
-  await until(`document.querySelector('.window-update')?.textContent.includes('1.1.0') && document.querySelector('.release-download')?.textContent.includes('下载便携版')`)
+  await until(`document.querySelector('.window-update')?.textContent.includes('1.1.0') && document.querySelector('.release-download')?.textContent.includes('更新并重启')`)
   assert.equal(await js('window.qaReleaseChecks'), 3)
+  await clickAt('.release-download')
+  await until(`window.qaInstalled==='1.1.0' && document.querySelector('.release-check [role="status"]').textContent.includes('更新失败')`)
   await js(`${toggle}.click()`)
   await until(`!${toggle}.checked`)
   assert.equal(await js('(async()=>(await window.serial.bootstrap()).preferences.autoCheckUpdates)()'), false)
@@ -105,6 +118,37 @@ async function screenshot(name) {
   const path = join(__dirname, '../qa')
   mkdirSync(path, { recursive: true })
   writeFileSync(join(path, name), (await window.capturePage()).toPNG())
+}
+
+async function checkModelSelection() {
+  await clickAt('[aria-label="切换 COM6 机型"]')
+  await until(`document.querySelector('.picker-level')?.textContent.includes('具体型号')`)
+  await clickAt('[aria-label="全部机型系列"]')
+  await until(`document.querySelectorAll('[role="option"][data-series]').length === 2`)
+  await clickAt('[data-id="series:SHT3x"]')
+  await until(`document.querySelector('.picker-level')?.textContent.includes('SHT3x')`)
+  assert.equal(await js(`(async () => (await window.serial.bootstrap()).configuredPorts.find(p=>p.config.port==='COM6').config.model_family)()`), 'TL-AS7230')
+  await clickAt('[role="option"]')
+  await until(`document.querySelector('[aria-label="切换 COM6 机型"]').title.includes('SHT31 Sensor Board')`)
+  await until(`!document.querySelector('[data-slot="model-picker-panel"]')`)
+}
+
+async function checkTcpConfiguration() {
+  await js(`document.querySelector('[data-slot="gooey-nav-segment"]:last-child button').click()`)
+  await until(`!!document.querySelector('.settings-sections [data-id="serial"]')`)
+  await js(`document.querySelector('.settings-sections [data-id="serial"]').click()`)
+  await clickAt('[aria-label="串口"]')
+  await clickAt('[role="option"][data-id="tcp"]')
+  const address = '[aria-label="TCP 服务器地址"]'
+  const set = text => js(`{const input=document.querySelector(${JSON.stringify(address)});
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(text)});
+    input.dispatchEvent(new Event('input',{bubbles:true}))}`)
+  await set('192.168.1.252:65536')
+  await until(`document.querySelector('.editor-heading .primary-button').disabled`)
+  await set('192.168.1.252:10001')
+  await until(`!document.querySelector('.editor-heading .primary-button').disabled && !document.querySelector('[role="tabpanel"][data-active="true"] .baud-value')`)
+  await clickAt('.editor-heading .primary-button')
+  await until(`(async () => (await window.serial.bootstrap()).configuredPorts.some(p=>p.config.port==='192.168.1.252:10001'))()`)
 }
 
 async function checkNativeTitleBar() {
@@ -179,6 +223,15 @@ app.whenReady().then(async () => {
     app.exit(0)
     return
   }
+  if (process.argv.includes('--serial-settings')) {
+    await checkModelSelection()
+    await checkTcpConfiguration()
+    await js(`document.querySelector('.settings-sections [data-id="application"]').click()`)
+    await checkReleasePreferences()
+    process.stdout.write('PASS: mouse model selection, TCP configuration and update actions\n')
+    app.exit(0)
+    return
+  }
   await js(`window.qaCommands = []; window.qaSignals = []; window.serial.sendCommand = async (port, command) => { window.qaCommands.push({port, command}); return {status:'accepted'} }; window.serial.sendSignal = async (port, signal) => { window.qaSignals.push({port, signal}); return {status:'accepted'} }; true`)
   await fill('cat')
   await until(`document.querySelector('.command-ghost').textContent === 'cat /etc/version'`)
@@ -229,16 +282,7 @@ app.whenReady().then(async () => {
   await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM6'`)
   await dragBetween('[data-device-port="COM6"] .device-choice', '[data-device-port="COM7"] .device-choice')
   await until(`document.querySelector('[data-device-port]').dataset.devicePort === 'COM7'`)
-  await js(`document.querySelector('[aria-label="切换 COM6 机型"]').click()`)
-  await until(`document.querySelector('.picker-level')?.textContent.includes('具体型号')`)
-  await js(`document.querySelector('[aria-label="全部机型系列"]').click()`)
-  await until(`document.querySelectorAll('[role="option"][data-series]').length === 2`)
-  await js(`document.querySelector('[data-id="series:SHT3x"]').click()`)
-  await until(`document.querySelector('.picker-level')?.textContent.includes('SHT3x')`)
-  assert.equal(await js(`(async () => (await window.serial.bootstrap()).configuredPorts.find(p=>p.config.port==='COM6').config.model_family)()`), 'TL-AS7230')
-  await js(`document.querySelector('[role="option"]').click()`)
-  await until(`document.querySelector('[aria-label="切换 COM6 机型"]').title.includes('SHT31 Sensor Board')`)
-  await until(`!document.querySelector('[data-slot="model-picker-panel"]')`)
+  await checkModelSelection()
   await js(`document.querySelector('[aria-label="移动 COM7 分栏"]').focus()`)
   await key('Left')
   await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM7'`)
@@ -270,7 +314,7 @@ app.whenReady().then(async () => {
   assert.equal(await js(`document.querySelector('[data-port="COM7"] .command-editor input').disabled`), false)
   await setAgentPhase('running')
   await js(`document.querySelector('[data-port="COM7"] .orb-control').click()`)
-  window.webContents.debugger.attach()
+  if (!window.webContents.debugger.isAttached()) window.webContents.debugger.attach()
   try {
     const command = '[data-port="COM7"] .live-command'
     await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
@@ -666,7 +710,8 @@ app.whenReady().then(async () => {
     await window.serial.savePreferences({})
   })()`)
   await until(`document.querySelector('.terminal-output').textContent === 'ready\\nErasing at 0x64 -- 100% complete.\\ndone\\n'`)
+  await checkTcpConfiguration()
   await checkNativeTitleBar()
-  process.stdout.write('PASS: native window controls, title-bar drag region, application preferences, docking, terminal following and external Agent history\n')
+  process.stdout.write('PASS: TCP configuration, model selection, in-app updates, native window controls, title-bar drag region, application preferences, docking, terminal following and external Agent history\n')
   app.exit(0)
 }).catch((error) => { process.stderr.write(`${error.stack}\n`); app.exit(1) })

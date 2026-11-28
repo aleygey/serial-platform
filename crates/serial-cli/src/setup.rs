@@ -105,7 +105,10 @@ fn choose_ports(config: &DaemonConfig) -> Result<Vec<String>, String> {
             PortChoice::Cancel => return Err("已取消，未保存配置".into()),
             PortChoice::Refresh => {}
             PortChoice::Manual => {
-                let text = ask("串口名称（逗号多选，例如 COM4 或 /dev/ttyUSB0）", "")?;
+                let text = ask(
+                    "串口名称或 TCP 地址（逗号多选，例如 COM4、/dev/ttyUSB0 或 192.168.1.252:10001）",
+                    "",
+                )?;
                 match parse_ports(&text, &[]) {
                     Ok(v) if !v.is_empty() => return Ok(v),
                     Ok(_) => {}

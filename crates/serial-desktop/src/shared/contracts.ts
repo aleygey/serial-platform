@@ -347,13 +347,13 @@ export type WindowAction = 'minimize' | 'toggle-fullscreen' | 'close'
 
 export interface AvailableRelease {
   version: string
-  url: string
-  portable: boolean
+  installable: boolean
 }
 
 export interface DesktopUpdates {
   installedVersion: string
   check(): Promise<AvailableRelease | null>
+  install(version: string): Promise<void>
 }
 
 export interface DesktopWindowBridge {

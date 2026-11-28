@@ -11,7 +11,7 @@ seriald HTTP/WebSocket: http://127.0.0.1:3210
 MCP Streamable HTTP:    http://127.0.0.1:3211/mcp
 ```
 
-公开设备标识只有 `port`，值是操作系统串口名。HTTP path 中必须 percent-encode `/` 等保留字符，例如：
+`port` 是公开设备标识，可取操作系统串口名或 TCP 串口服务器的 IP 与端口，如 `192.168.1.252:10001`。原始 TCP 支持字节收发和自动重连，UART BREAK 返回 `break_unsupported`。HTTP path 中必须 percent-encode `/` 等保留字符，例如：
 
 ```text
 /dev/cu.usbserial-210

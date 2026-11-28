@@ -28,7 +28,10 @@ export function installWindowControls(target: BrowserWindow): void {
           // Keep the console in its current macOS Space.
           target.setSimpleFullScreen(!target.isSimpleFullScreen())
           notifyState()
-        } else target.setFullScreen(!target.isFullScreen())
+        } else {
+          target.setFullScreen(!target.isFullScreen())
+          notifyState()
+        }
         break
       case 'close': target.close(); break
     }

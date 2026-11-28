@@ -6,7 +6,7 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 
 ## 核心设计
 
-- **端口就是设备位**：公开接口只使用操作系统串口名，例如 `COM4` 或 `/dev/cu.usbserial-210`。没有额外的设备位名称。
+- **端口就是设备位**。本地串口使用系统名称，如 `COM4` 或 `/dev/ttyUSB0`。TCP 串口服务器使用 `192.168.1.252:10001` 或 `[IPv6]:端口`。
 - **一个物理写入者**：`seriald` 独占串口句柄，通过带 fencing 的 Control 串行化人和 Agent 的写入。
 - **同一份事实记录**：RX、确认后的 TX、Control、Run、Macro、断连和重配事件进入同一条带序号时间线。
 - **历史跨客户端重开保留**：日志由后端持久化；关闭再打开 TUI 或 App 不会清空已有串口记录。
@@ -15,7 +15,7 @@ Serial Platform 是一个面向人和 Agent 协同操作的通用串口平台。
 
 ## 快速开始
 
-Windows x64 用户可以直接下载便携版 EXE，双击打开桌面控制台。完整 ZIP 另含独立的 CLI、TUI 和 MCP 适配器。[Windows 桌面版](https://github.com/aleygey/serial-platform/releases/download/v0.9.7/serial-platform-v0.9.7-windows-x86_64.exe) · [v0.9.7 更新与升级说明](./docs/releases/v0.9.7.md)
+Windows x64 用户可以直接下载便携版 EXE，双击打开桌面控制台。完整 ZIP 另含独立的 CLI、TUI 和 MCP 适配器。[Windows 桌面版](https://github.com/aleygey/serial-platform/releases/latest) · [v0.9.8 更新与升级说明](./docs/releases/v0.9.8.md)
 
 发行包解压后保留其中所有文件。首次配置不需要先启动后端：
 
@@ -77,7 +77,9 @@ serial logs --port COM4 --regex '(?i)panic|watchdog'
 
 ## Profile 与机型目录
 
-端口配置由操作系统串口、Transport Profile、行为 Model Profile、成对的机型系列/具体机型身份和开关组成：
+可在桌面「配置 → 串口配置 → 串口」选择「添加 TCP 串口服务器…」，输入 `192.168.1.252:10001` 后保存。首次配置向导也有同一入口。服务器需开启原始 TCP 透传，UART 波特率、校验和流控在服务器端设置。CLI、TUI 和 MCP 都使用保存的地址作为 `port`。
+
+端口配置示例
 
 ```json
 {

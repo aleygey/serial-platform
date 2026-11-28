@@ -38,11 +38,12 @@ Serial Platform 是通用的人/Agent 协同串口平台：后端独占物理 UA
 
 ## 公开身份模型
 
-操作系统串口名是唯一的公开设备标识：
+`port` 标识一个本地串口或 TCP 串口服务器。
 
 - Windows：`COM4`
 - macOS：`/dev/cu.usbserial-210`
 - Linux：`/dev/ttyUSB0`
+- 原始 TCP 串口服务器（各系统）使用 `192.168.1.252:10001` 或 `[2001:db8::1]:10001`。网络连接从 `seriald` 所在主机发起。
 
 配置、HTTP path、WebSocket 消息、时间线事件与 MCP 参数都使用 `port`。包含 `/` 的串口名在 HTTP path 中进行 percent-encoding。
 
