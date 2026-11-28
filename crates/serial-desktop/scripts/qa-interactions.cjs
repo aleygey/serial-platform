@@ -314,7 +314,7 @@ app.whenReady().then(async () => {
   assert.equal(await js(`document.querySelector('[data-port="COM7"] .command-editor input').disabled`), false)
   await setAgentPhase('running')
   await js(`document.querySelector('[data-port="COM7"] .orb-control').click()`)
-  window.webContents.debugger.attach()
+  if (!window.webContents.debugger.isAttached()) window.webContents.debugger.attach()
   try {
     const command = '[data-port="COM7"] .live-command'
     await window.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
