@@ -30,9 +30,11 @@ async function clickAt(selector) {
     const x=Math.round(r.left+r.width/2), y=Math.round(r.top+r.height/2);
     if (!el.contains(document.elementFromPoint(x,y))) throw Error('Pointer cannot reach '+el.outerHTML);
     return {x,y}})()`)
-  for (const type of ['mouseMove','mouseDown','mouseUp']) {
-    window.webContents.sendInputEvent({type, button:'left', clickCount:1, ...point})
-  }
+  const input = window.webContents.debugger
+  if (!input.isAttached()) input.attach()
+  await input.sendCommand('Input.dispatchMouseEvent', {type:'mouseMoved', ...point})
+  await input.sendCommand('Input.dispatchMouseEvent', {type:'mousePressed', button:'left', clickCount:1, ...point})
+  await input.sendCommand('Input.dispatchMouseEvent', {type:'mouseReleased', button:'left', clickCount:1, ...point})
 }
 async function checkReleasePreferences() {
   await js(`window.qaReleaseChecks=0; window.qaReleaseResult='offline';
@@ -116,6 +118,19 @@ async function screenshot(name) {
   const path = join(__dirname, '../qa')
   mkdirSync(path, { recursive: true })
   writeFileSync(join(path, name), (await window.capturePage()).toPNG())
+}
+
+async function checkModelSelection() {
+  await clickAt('[aria-label="切换 COM6 机型"]')
+  await until(`document.querySelector('.picker-level')?.textContent.includes('具体型号')`)
+  await clickAt('[aria-label="全部机型系列"]')
+  await until(`document.querySelectorAll('[role="option"][data-series]').length === 2`)
+  await clickAt('[data-id="series:SHT3x"]')
+  await until(`document.querySelector('.picker-level')?.textContent.includes('SHT3x')`)
+  assert.equal(await js(`(async () => (await window.serial.bootstrap()).configuredPorts.find(p=>p.config.port==='COM6').config.model_family)()`), 'TL-AS7230')
+  await clickAt('[role="option"]')
+  await until(`document.querySelector('[aria-label="切换 COM6 机型"]').title.includes('SHT31 Sensor Board')`)
+  await until(`!document.querySelector('[data-slot="model-picker-panel"]')`)
 }
 
 async function checkTcpConfiguration() {
@@ -208,6 +223,15 @@ app.whenReady().then(async () => {
     app.exit(0)
     return
   }
+  if (process.argv.includes('--serial-settings')) {
+    await checkModelSelection()
+    await checkTcpConfiguration()
+    await js(`document.querySelector('.settings-sections [data-id="application"]').click()`)
+    await checkReleasePreferences()
+    process.stdout.write('PASS: mouse model selection, TCP configuration and update actions\n')
+    app.exit(0)
+    return
+  }
   await js(`window.qaCommands = []; window.qaSignals = []; window.serial.sendCommand = async (port, command) => { window.qaCommands.push({port, command}); return {status:'accepted'} }; window.serial.sendSignal = async (port, signal) => { window.qaSignals.push({port, signal}); return {status:'accepted'} }; true`)
   await fill('cat')
   await until(`document.querySelector('.command-ghost').textContent === 'cat /etc/version'`)
@@ -258,16 +282,7 @@ app.whenReady().then(async () => {
   await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM6'`)
   await dragBetween('[data-device-port="COM6"] .device-choice', '[data-device-port="COM7"] .device-choice')
   await until(`document.querySelector('[data-device-port]').dataset.devicePort === 'COM7'`)
-  await clickAt('[aria-label="切换 COM6 机型"]')
-  await until(`document.querySelector('.picker-level')?.textContent.includes('具体型号')`)
-  await clickAt('[aria-label="全部机型系列"]')
-  await until(`document.querySelectorAll('[role="option"][data-series]').length === 2`)
-  await clickAt('[data-id="series:SHT3x"]')
-  await until(`document.querySelector('.picker-level')?.textContent.includes('SHT3x')`)
-  assert.equal(await js(`(async () => (await window.serial.bootstrap()).configuredPorts.find(p=>p.config.port==='COM6').config.model_family)()`), 'TL-AS7230')
-  await clickAt('[role="option"]')
-  await until(`document.querySelector('[aria-label="切换 COM6 机型"]').title.includes('SHT31 Sensor Board')`)
-  await until(`!document.querySelector('[data-slot="model-picker-panel"]')`)
+  await checkModelSelection()
   await js(`document.querySelector('[aria-label="移动 COM7 分栏"]').focus()`)
   await key('Left')
   await until(`document.querySelector('.workspace-panels [data-port]').dataset.port === 'COM7'`)
