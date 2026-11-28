@@ -131,7 +131,7 @@ async function checkTcpConfiguration() {
   await set('192.168.1.252:65536')
   await until(`document.querySelector('.editor-heading .primary-button').disabled`)
   await set('192.168.1.252:10001')
-  await until(`!document.querySelector('.editor-heading .primary-button').disabled && !document.querySelector('.baud-value')`)
+  await until(`!document.querySelector('.editor-heading .primary-button').disabled && !document.querySelector('[role="tabpanel"][data-active="true"] .baud-value')`)
   await clickAt('.editor-heading .primary-button')
   await until(`(async () => (await window.serial.bootstrap()).configuredPorts.some(p=>p.config.port==='192.168.1.252:10001'))()`)
 }

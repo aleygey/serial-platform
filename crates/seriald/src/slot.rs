@@ -4758,8 +4758,9 @@ impl SlotActor {
     ) {
         let previous_effective =
             resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
-        let previous_transport =
-            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
+        let previous_transport = matches!(tcp_endpoint(&self.config.port), Ok(None)).then(|| {
+            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref())
+        });
         let previous = std::mem::replace(&mut self.config, config);
         let previous_model_profile = previous.model_profile.clone();
         let previous_model_family = previous.model_family.clone();
@@ -4771,8 +4772,9 @@ impl SlotActor {
         }
         let effective =
             resolve_model_settings(&SerialSettings::default(), self.model_profile.as_ref());
-        let effective_transport =
-            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref());
+        let effective_transport = matches!(tcp_endpoint(&self.config.port), Ok(None)).then(|| {
+            resolve_transport_settings(&SerialSettings::default(), self.transport_profile.as_ref())
+        });
         self.emit(
             EventKind::PortReconfigured,
             Direction::None,
