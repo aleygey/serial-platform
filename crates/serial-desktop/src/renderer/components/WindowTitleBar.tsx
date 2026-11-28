@@ -1,8 +1,8 @@
 import { ArrowDownToLine, Fullscreen, Minimize, Minus, X } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
-import type { AvailableRelease } from '../../shared/contracts'
+import type { ReleaseUpdates } from '../lib/use-release-updates'
 
-export function WindowTitleBar({ children, available }: { children?: ReactNode; available?: AvailableRelease | null }) {
+export function WindowTitleBar({ children, updates }: { children?: ReactNode; updates?: ReleaseUpdates }) {
   const bridge = typeof window !== 'undefined' ? window.desktopWindow : undefined
   const [fullScreen, setFullScreen] = useState(false)
   useEffect(() => {
@@ -20,8 +20,9 @@ export function WindowTitleBar({ children, available }: { children?: ReactNode; 
   return <header className="window-bar">
     {children}
     <div className="window-drag-region" aria-hidden="true" />
-    {available && <a className="window-update" href={available.url} target="_blank" rel="noreferrer"
-      aria-label={`${available.portable ? '下载' : '查看'}新版 ${available.version}`}><ArrowDownToLine size={14} aria-hidden />新版 {available.version}</a>}
+    {updates?.available && <button type="button" className="window-update" disabled={!updates.available.installable || updates.busy}
+      onClick={updates.install} title={updates.status || '安装更新并重启'} aria-label={'更新并重启至 ' + updates.available.version}>
+      <ArrowDownToLine size={14} aria-hidden />{updates.phase === 'installing' ? '正在更新…' : updates.phase === 'failed' ? '重试更新' : '更新至 ' + updates.available.version}</button>}
     {bridge && <div className="window-controls" role="group" aria-label="窗口控制">
       <button type="button" aria-label="最小化窗口" title="最小化窗口" onClick={() => bridge.act('minimize')}><Minus aria-hidden size={16} /></button>
       <button type="button" aria-label={screenLabel} title={screenLabel} onClick={() => bridge.act('toggle-fullscreen')}><ScreenIcon aria-hidden size={15} /></button>

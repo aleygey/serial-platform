@@ -155,7 +155,8 @@ export function usePortPointerDrag(port: string, controller?: PortDragController
   const point = (event: ReactPointerEvent) => ({ x: event.clientX, y: event.clientY })
   return {
     onPointerDown(event: ReactPointerEvent<HTMLElement>) {
-      if (!controller || event.button !== 0 || !event.isPrimary || pointer.current) return
+      // React portals bubble through the heading, but list options are outside the drag handle.
+      if (!controller || event.button !== 0 || !event.isPrimary || pointer.current || !event.currentTarget.contains(event.target as Node)) return
       pointer.current = { id: event.pointerId, origin: point(event) }
       panned.current = false
       // Keep normal clicks on the model picker and capture a drag beyond its bounds.

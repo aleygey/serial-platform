@@ -1,71 +1,10 @@
 // Rare UI. Copyright (c) 2026 Swami Malode. See RARE-UI-LICENSE.txt.
-'use client'
-
-import { ChevronLeft, ChevronRight, Check, ChevronDown, Search } from 'lucide-react'
-import {
-    AnimatePresence,
-    animate,
-    motion,
-    useReducedMotion,
-    type AnimationPlaybackControls,
-    type Transition,
-} from 'motion/react'
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react'
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
-
 import { createPortal } from 'react-dom'
-import { ScrollProgress } from './scroll-progress'
 import { cn } from '../../lib/utils'
 
-export type PickerModel = {
-    id: string
-    name: string
-    provider?: string
-    series?: boolean
-}
-
-type Phase = 'closed' | 'open' | 'closing'
-type Point = { x: number; y: number }
-
-const PANEL_RADIUS = 16
-const LIST_MAX_HEIGHT = 320
-const EDGE = 8
-const ROLL_STAGGER = 0.014
-
-const OPEN: Transition = { type: 'spring', duration: 0.42, bounce: 0.14 }
-const CLOSE: Transition = { type: 'spring', duration: 0.36, bounce: 0.06 }
-const SLIDE: Transition = { type: 'spring', duration: 0.3, bounce: 0.12 }
-// fast and bounceless so the highlight stays under the pointer instead of trailing it
-const TRACK: Transition = { type: 'spring', duration: 0.18, bounce: 0 }
-const ROLL: Transition = { type: 'spring', duration: 0.42, bounce: 0.1 }
-const INSTANT: Transition = { duration: 0 }
-
-function RollingText({ text, roll }: { text: string; roll: boolean }) {
-    // letters keep their identity by occurrence, so the ones two names share slide into place instead of rolling
-    const seen: Record<string, number> = {}
-    const letters = [...text].map((char) => {
-        seen[char] = (seen[char] ?? 0) + 1
-        return { char, key: `${char}${seen[char]}` }
-    })
-
-    return (
-        <span aria-hidden className="relative inline-flex whitespace-pre">
-            <AnimatePresence mode="popLayout" initial={false}>
-                {letters.map(({ char, key }, i) => (
-                    <motion.span
-                        key={key}
-                        layout={roll ? 'position' : false}
-                        initial={{ opacity: 0, y: '0.7em', filter: 'blur(3px)' }}
-                        animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-                        exit={{ opacity: 0, y: '-0.7em', filter: 'blur(3px)', transition: roll ? { duration: 0.12 } : INSTANT }}
-                        transition={roll ? { ...ROLL, delay: i * ROLL_STAGGER } : INSTANT}
-                    >
-                        {char}
-                    </motion.span>
-                ))}
-            </AnimatePresence>
-        </span>
-    )
-}
+export type PickerModel = { id: string; name: string; provider?: string; series?: boolean }
 
 export type ModelPickerProps = Omit<React.ComponentProps<'div'>, 'onChange' | 'defaultValue' | 'children'> & {
     models: PickerModel[]
@@ -82,515 +21,161 @@ export type ModelPickerProps = Omit<React.ComponentProps<'div'>, 'onChange' | 'd
     renderValue?: (model: PickerModel) => React.ReactNode
 }
 
-function ModelPicker({
-    models,
-    value,
-    defaultValue,
-    onChange,
-    label, disabled, compact, renderValue, browseFamilies = false,
-    searchable = false, searchPlaceholder = '搜索…', onSearchChange,
-    className,
-    ...props
+type Placement = { left: number; top?: number; bottom?: number; width: number; maxHeight: number }
+
+export function ModelPicker({
+    models, value, defaultValue, onChange, label, disabled, compact, renderValue, browseFamilies = false,
+    searchable = false, searchPlaceholder = '搜索…', onSearchChange, className, ...props
 }: ModelPickerProps) {
-    const reduced = !!useReducedMotion()
     const id = useId()
-    const listId = `${id}-list`
+    const listId = id + '-list'
     const [inner, setInner] = useState(defaultValue ?? models[0]?.id)
-    const selectedId = value ?? inner
-    const selected = models.find((model) => model.id === selectedId) ?? models[0]
-
-    const [phase, setPhase] = useState<Phase>('closed')
-    const [foldTo, setFoldTo] = useState<string | undefined>(undefined)
-    const [picked, setPicked] = useState<string | undefined>(undefined)
-    const [query, setQuery] = useState('')
+    const selected = models.find(model => model.id === (value ?? inner)) ?? models[0]
+    const [placement, setPlacement] = useState<Placement>()
     const [family, setFamily] = useState<string>()
+    const [query, setQuery] = useState('')
     const [active, setActive] = useState(0)
-
-    const rootRef = useRef<HTMLDivElement>(null)
-    const triggerRef = useRef<HTMLButtonElement>(null)
-    const triggerIconRef = useRef<HTMLSpanElement>(null)
-    const surfaceRef = useRef<HTMLDivElement>(null)
-    const contentRef = useRef<HTMLDivElement>(null)
-    const listRef = useRef<HTMLDivElement>(null)
-    const inputRef = useRef<HTMLInputElement>(null)
-    const highlightRef = useRef<HTMLDivElement>(null)
-    const highlightPlacedRef = useRef(false)
-    const placeRef = useRef<Point>({ x: 0, y: 0 })
-    const heightRef = useRef(0)
-    const runningRef = useRef<AnimationPlaybackControls[]>([])
-
-    const open = phase === 'open'
-    const filtered = useMemo(() => {
+    const trigger = useRef<HTMLButtonElement>(null)
+    const panel = useRef<HTMLDivElement>(null)
+    const list = useRef<HTMLDivElement>(null)
+    const input = useRef<HTMLInputElement>(null)
+    const open = !!placement && !disabled
+    const choices = useMemo((): PickerModel[] => {
+        if (!open) return []
         const q = query.trim().toLowerCase()
-        if (q) return models.filter(model => `${model.name} ${model.provider ?? ''}`.toLowerCase().includes(q))
+        if (q) return models.filter(model => (model.name + ' ' + (model.provider ?? '')).toLowerCase().includes(q))
         if (!browseFamilies) return models
         if (family) return models.filter(model => model.provider === family)
-        const names = [...new Set(models.map(model => model.provider).filter((name): name is string => !!name))]
-        return [...names.map(name => ({ id: 'series:' + name, name, series: true })), ...models.filter(model => !model.provider)] as PickerModel[]
-    }, [models, query, browseFamilies, family])
-    const anchor = useRef({ left: 0, top: 0 })
-    const [scrolls, setScrolls] = useState(false)
-    const current = filtered[active]
+        const providers = new Set(models.map(model => model.provider).filter((name): name is string => !!name))
+        return [...Array.from(providers, name => ({ id: 'series:' + name, name, series: true })), ...models.filter(model => !model.provider)]
+    }, [open, query, models, browseFamilies, family])
 
-    const show = () => {
-        if (phase !== 'closed') {
-            return
-        }
-        const rect = triggerRef.current?.getBoundingClientRect()
-        if (!rect || disabled) return
-        anchor.current = { left: rect.left, top: rect.top }
+    function show() {
+        if (disabled || !trigger.current || !selected) return
+        const rect = trigger.current.getBoundingClientRect()
+        const anchor = compact ? trigger.current.closest('[data-serial-number]')?.getBoundingClientRect() ?? rect : rect
+        const width = Math.min(window.innerWidth - 16, 390, Math.max(anchor.width, browseFamilies ? 300 : searchable ? 258 : 112))
+        const below = window.innerHeight - rect.bottom - 12
+        const above = rect.top - 12
+        const down = below >= 320 || below >= above
+        setPlacement({
+            left: Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8)),
+            ...(down ? { top: rect.bottom + 4 } : { bottom: window.innerHeight - rect.top + 4 }),
+            width, maxHeight: Math.max(36, Math.min(320, (down ? below : above) - (searchable ? 40 : 0) - (browseFamilies ? 38 : 0) - 2)),
+        })
         setQuery('')
         onSearchChange?.('')
-        setFamily(browseFamilies ? selected?.provider : undefined)
-        const choices = browseFamilies ? models.filter(model => model.provider === selected?.provider) : models
-        setActive(browseFamilies && !selected?.provider ? 0 : Math.max(0, choices.indexOf(selected)))
-        setPhase('open')
+        setFamily(browseFamilies ? selected.provider : undefined)
+        const siblings = browseFamilies ? models.filter(model => model.provider === selected.provider) : models
+        setActive(browseFamilies && !selected.provider ? 0 : Math.max(0, siblings.indexOf(selected)))
     }
-
-    // a mouse pick hands focus back without the keyboard ring, a keyboard one keeps it
-    const close = (to: string | undefined, refocus: 'keyboard' | 'pointer' | false) => {
-        if (phase !== 'open') {
-            return
-        }
-        setFoldTo(to)
-        setPhase(reduced ? 'closed' : 'closing')
-        if (refocus) {
-            triggerRef.current?.focus({ preventScroll: true, focusVisible: refocus === 'keyboard' } as FocusOptions)
-        }
+    function close(refocus = true) {
+        setPlacement(undefined)
+        if (refocus) trigger.current?.focus({ preventScroll: true })
     }
-
-    const choose = (model: PickerModel, via: 'keyboard' | 'pointer') => {
-        if (model.series) {
-            setFamily(model.name)
-            setActive(0)
-            if (listRef.current) listRef.current.scrollTop = 0
-            inputRef.current?.focus({ preventScroll: true })
-            return
-        }
-        if (value === undefined) {
-            setInner(model.id)
-        }
-        if (model.id !== selectedId) {
-            onChange?.(model.id)
-        }
-        setPicked(model.id)
-        close(model.id, via)
+    function browse(next?: string) {
+        setFamily(next)
+        setActive(0)
+        if (list.current) list.current.scrollTop = 0
+        input.current?.focus({ preventScroll: true })
     }
-
-    // the panel is laid out in place from the first frame; a pill-shaped window opens around the chosen row and later folds back onto it
+    function choose(model: PickerModel) {
+        if (model.series) return browse(model.name)
+        close()
+        if (value === undefined) setInner(model.id)
+        if (model.id !== selected?.id) onChange?.(model.id)
+    }
     useLayoutEffect(() => {
-        const root = rootRef.current
-        const trigger = triggerRef.current
-        const pillIcon = triggerIconRef.current
-        const surface = surfaceRef.current
-        const content = contentRef.current
-        const list = listRef.current
-        if (phase === 'closed' || !root || !trigger || !pillIcon || !surface || !content || !list) {
-            return
-        }
-
-        const pillWidth = trigger.offsetWidth
-        const pillHeight = trigger.offsetHeight
-        const field = compact ? root.closest<HTMLElement>('[data-serial-number]') : null
-        const panelWidth = Math.min(window.innerWidth - EDGE * 2, 390, Math.max(field?.offsetWidth ?? pillWidth, browseFamilies ? 300 : searchable ? 258 : 112))
-        content.style.width = panelWidth + 'px'
-        const rect = trigger.getBoundingClientRect()
-        const below = window.innerHeight - rect.bottom - EDGE - 4
-        const above = rect.top - EDGE - 4
-        const space = Math.max(below, above)
-        list.style.maxHeight = Math.min(LIST_MAX_HEIGHT, Math.max(36, space - (searchable ? 44 : 6) - (browseFamilies ? 38 : 0))) + "px"
-        const height = content.offsetHeight
-        const rootRect = root.getBoundingClientRect()
-        // screen rects include any zoom or scale above the picker, while offsets and styles are in local pixels
-        const scale = rootRect.width / root.offsetWidth || 1
-
-        // the content offset that sits a row's icon and center exactly on the pill's
-        const alignTo = (row: Element | null | undefined): Point | null => {
-            const icon = row?.querySelector('[data-slot="model-picker-icon"]')
-            if (!row || !icon) {
-                return null
-            }
-            const box = content.getBoundingClientRect()
-            const rowRect = row.getBoundingClientRect()
-            return {
-                x: (pillIcon.getBoundingClientRect().left - rootRect.left - (icon.getBoundingClientRect().left - box.left)) / scale,
-                y: pillHeight / 2 - (rowRect.top + rowRect.height / 2 - box.top) / scale,
-            }
-        }
-        const pillWindow = (at: Point) => {
-            const top = -at.y
-            const left = -at.x
-            const right = panelWidth - left - pillWidth
-            const bottom = height - top - pillHeight
-            return `inset(${top}px ${right}px ${bottom}px ${left}px round ${pillHeight / 2}px)`
-        }
-        const fullWindow = `inset(0px 0px 0px 0px round ${PANEL_RADIUS}px)`
-
-        runningRef.current.forEach((control) => control.stop())
-        runningRef.current = []
-
-        if (phase === 'open') {
-            const row = list.querySelector<HTMLElement>('[aria-selected="true"]')
-            if (row && list.scrollHeight > list.clientHeight) {
-                list.scrollTop = row.offsetTop - list.clientHeight / 2 + row.offsetHeight / 2
-            }
-            const place = {
-                x: Math.max(
-                    (EDGE - rootRect.left) / scale,
-                    Math.min(field ? (field.getBoundingClientRect().left - rootRect.left) / scale : compact ? pillWidth - panelWidth : 0, (window.innerWidth - EDGE - rootRect.left) / scale - panelWidth),
-                ),
-                y: below >= height || below >= above ? pillHeight + 4 : -height - 4,
-            }
-            setScrolls(list.scrollHeight > list.clientHeight + 1)
-            placeRef.current = place
-            heightRef.current = height
-            content.style.transform = `translateX(${place.x}px) translateY(${place.y}px)`
-            ;(searchable ? inputRef.current : list)?.focus({ preventScroll: true })
-
-            if (reduced) {
-                content.style.clipPath = fullWindow
-                Object.assign(surface.style, {
-                    left: `${place.x}px`,
-                    top: `${place.y}px`,
-                    width: `${panelWidth}px`,
-                    height: `${height}px`,
-                    borderRadius: `${PANEL_RADIUS}px`,
-                    opacity: '1',
-                })
-                return
-            }
-            content.style.clipPath = pillWindow(place)
-            runningRef.current = [
-                animate(content, { clipPath: fullWindow }, OPEN),
-                animate(
-                    surface,
-                    {
-                        left: [0, place.x],
-                        top: [0, place.y],
-                        width: [pillWidth, panelWidth],
-                        height: [pillHeight, height],
-                        borderRadius: [pillHeight / 2, PANEL_RADIUS],
-                    },
-                    OPEN,
-                ),
-                animate(surface, { opacity: [0, 1] }, { duration: 0.12 }),
-            ]
-            return
-        }
-
-        // closing: the row being folded into rides back to the pill while everything around it clips away
-        const from = placeRef.current
-        const row = foldTo ? list.querySelector(`[data-id="${CSS.escape(foldTo)}"]`) : null
-        const rowRect = row?.getBoundingClientRect()
-        const listRect = list.getBoundingClientRect()
-        // a row scrolled out of the list is hidden by its overflow, so folding onto it would end on an empty window
-        const visible = rowRect && rowRect.top >= listRect.top - 1 && rowRect.bottom <= listRect.bottom + 1
-        const aligned = visible ? alignTo(row) : null
-        const to = aligned ?? from
-        runningRef.current = [
-            animate(content, { x: [from.x, to.x], y: [from.y, to.y], clipPath: pillWindow(to) }, CLOSE),
-            animate(content, { opacity: aligned ? 1 : 0 }, { duration: 0.12 }),
-            animate(
-                surface,
-                { left: 0, top: 0, width: pillWidth, height: pillHeight, borderRadius: pillHeight / 2 },
-                CLOSE,
-            ),
-            animate(surface, { opacity: 0 }, { duration: 0.2, delay: 0.1 }),
-        ]
-        const finish = runningRef.current
-        Promise.all(finish.map((control) => control.finished)).then(() => {
-            if (runningRef.current === finish) {
-                setPhase('closed')
-            }
-        })
-    }, [phase, foldTo, reduced, searchable])
-
-    useEffect(() => () => runningRef.current.forEach((control) => control.stop()), [])
-
-    // filtering changes the panel height, so the surface follows it
+        if (!open) return
+        ;(input.current ?? list.current)?.focus({ preventScroll: true })
+        list.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+    }, [open])
     useEffect(() => {
-        const content = contentRef.current
-        const surface = surfaceRef.current
-        if (!open || !content || !surface) {
-            return
-        }
-        const observer = new ResizeObserver(() => {
-            const list = listRef.current
-            if (list) setScrolls(list.scrollHeight > list.clientHeight + 1)
-            const height = content.offsetHeight
-            if (height !== heightRef.current) {
-                heightRef.current = height
-                const at = placeRef.current
-                if (at.y < 0) {
-                    at.y = -height - 4
-                    content.style.transform = `translateX(${at.x}px) translateY(${at.y}px)`
-                }
-                animate(surface, { height, top: at.y }, reduced ? INSTANT : SLIDE)
-            }
-        })
-        observer.observe(content)
-        return () => observer.disconnect()
-    }, [open, reduced])
-
-    useEffect(() => {
-        if (!open) {
-            return
-        }
+        if (!open) return
+        const dismiss = () => setPlacement(undefined)
         const outside = (event: PointerEvent) => {
-            if (!rootRef.current?.contains(event.target as Node) && !contentRef.current?.contains(event.target as Node)) {
-                close(selectedId, false)
-            }
+            const node = event.target as Node
+            if (!trigger.current?.contains(node) && !panel.current?.contains(node)) dismiss()
         }
-        const resize = () => close(selectedId, false)
-        document.addEventListener('pointerdown', outside)
         const onScroll = (event: Event) => {
-            // Incoming output can scroll a neighboring terminal while this menu is open.
-            const anchor = triggerRef.current
-            if (anchor && event.target instanceof Node && event.target.contains(anchor)) resize()
+            if (trigger.current && event.target instanceof Node && event.target.contains(trigger.current)) dismiss()
         }
+        document.addEventListener('pointerdown', outside)
         window.addEventListener('scroll', onScroll, true)
-        window.addEventListener('resize', resize)
+        window.addEventListener('resize', dismiss)
         return () => {
             document.removeEventListener('pointerdown', outside)
             window.removeEventListener('scroll', onScroll, true)
-            window.removeEventListener('resize', resize)
+            window.removeEventListener('resize', dismiss)
         }
-    })
+    }, [open])
 
-    // positioned from layout offsets, not screen rects, so zoom or scale above the picker cannot throw it off
-    useLayoutEffect(() => {
-        const highlight = highlightRef.current
-        const row = listRef.current?.querySelector<HTMLElement>(`[data-index="${active}"]`)
-        if (!highlight) {
-            highlightPlacedRef.current = false
-            return
-        }
-        if (!row || phase === 'closing') {
-            animate(highlight, { opacity: 0 }, reduced ? INSTANT : { duration: 0.15 })
-            return
-        }
-        const target = { y: row.offsetTop, height: row.offsetHeight, opacity: 1 }
-        animate(highlight, target, highlightPlacedRef.current && !reduced ? TRACK : INSTANT)
-        highlightPlacedRef.current = true
-    }, [active, filtered, phase, reduced])
-
-    useEffect(() => {
-        const list = listRef.current
-        const row = list?.querySelector<HTMLElement>(`[data-index="${active}"]`)
-        if (!open || !list || !row) {
-            return
-        }
-        if (row.offsetTop < list.scrollTop) {
-            list.scrollTop = row.offsetTop - 6
-        } else if (row.offsetTop + row.offsetHeight > list.scrollTop + list.clientHeight) {
-            list.scrollTop = row.offsetTop + row.offsetHeight - list.clientHeight + 6
-        }
-    }, [active, open])
-
-    const showFamilies = () => {
-        setFamily(undefined)
-        setActive(0)
-        if (listRef.current) listRef.current.scrollTop = 0
-        inputRef.current?.focus({ preventScroll: true })
-    }
-    const onPanelKey = (event: React.KeyboardEvent) => {
+    function onKey(event: React.KeyboardEvent) {
         if (event.nativeEvent.isComposing) return
-        const count = filtered.length
-        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-            event.preventDefault()
-            if (count) {
-                setActive((n) => (n + (event.key === 'ArrowDown' ? 1 : -1) + count) % count)
-            }
-        } else if (event.key === 'Home' || event.key === 'End') {
-            event.preventDefault()
-            setActive(event.key === 'Home' ? 0 : Math.max(0, count - 1))
-        } else if (event.key === 'ArrowLeft' && browseFamilies && family && !query) {
-            event.preventDefault()
-            showFamilies()
-        } else if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement)) {
-            event.preventDefault()
-            if (current) {
-                choose(current, 'keyboard')
-            }
-        } else if (event.key === 'Escape') {
-            event.preventDefault()
-            close(selectedId, 'keyboard')
-        } else if (event.key === 'Tab') {
-            close(selectedId, 'keyboard')
+        const count = choices.length
+        let next = active
+        switch (event.key) {
+            case 'ArrowDown': next = (active + 1) % count; break
+            case 'ArrowUp': next = (active - 1 + count) % count; break
+            case 'Home': next = 0; break
+            case 'End': next = count - 1; break
+            case 'ArrowLeft':
+                if (!browseFamilies || !family || query) return
+                browse(); break
+            case 'Enter':
+                if (event.target instanceof HTMLButtonElement) return
+                if (choices[active]) choose(choices[active])
+                break
+            case 'Escape': close(); break
+            case 'Tab': close(); return
+            default: return
+        }
+        event.preventDefault()
+        event.stopPropagation()
+        if (count && next !== active) {
+            setActive(next)
+            document.getElementById(id + '-option-' + next)?.scrollIntoView({ block: 'nearest' })
         }
     }
 
-    const onTriggerKey = (event: React.KeyboardEvent) => {
-        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-            event.preventDefault()
-            show()
-        }
-    }
-
-    let index = -1
-    const groups: { provider?: string; items: { model: PickerModel; index: number }[] }[] = []
-    for (const model of filtered) {
-        index += 1
-        const last = groups[groups.length - 1]
-        if (last && last.provider === model.provider) {
-            last.items.push({ model, index })
-        } else {
-            groups.push({ provider: model.provider, items: [{ model, index }] })
-        }
-    }
-
-    if (!selected) {
-        return null
-    }
-
-    // a pick already flies the row into place, so only outside changes to value roll the name
-    const roll = !reduced && selected.id !== picked
-
-    return (
-        <div ref={rootRef} data-slot="model-picker" data-compact={compact || undefined} className={cn('relative inline-flex', className)} {...props}>
-            <button
-                ref={triggerRef}
-                type="button"
-                aria-haspopup="listbox"
-                aria-expanded={open}
-                aria-controls={open ? listId : undefined}
-                aria-label={label}
-                aria-describedby={id + '-value'}
-                disabled={disabled || !models.length}
-                title={label + (selected.name ? " · " + selected.name : "")}
-                onClick={() => (open ? close(selectedId, 'pointer') : show())}
-                onKeyDown={onTriggerKey}
-                className={cn(
-                    'flex h-8 cursor-pointer items-center gap-2 rounded-full pr-2 pl-2.5 text-[0.8125rem] font-medium text-black/90 outline-none transition-colors hover:bg-black/[0.05] focus-visible:ring-2 focus-visible:ring-black/15 dark:text-white/90 dark:hover:bg-white/[0.07] dark:focus-visible:ring-white/25',
-                )}
-            >
-                <span ref={triggerIconRef} className="picker-value">{compact ? null : renderValue ? renderValue(selected) : <RollingText text={selected.name} roll={roll} />}</span>
-                <motion.span
-                    className="grid place-items-center"
-                    animate={{ opacity: open ? 1 : 0.7, rotate: open ? 180 : 0 }}
-                    transition={reduced || phase !== 'closed' ? INSTANT : { duration: 0.25 }}
-                >
-                    <ChevronDown className="size-3.5" />
-                </motion.span>
-            </button>
-
-            <span className="sr-only" id={id + '-value'}>{selected.name}</span>
-            {phase !== 'closed' && createPortal(
-                <div className="picker-anchor" style={anchor.current}>
-                    <div
-                        data-slot="picker-surface" ref={surfaceRef}
-                        aria-hidden
-                        className="pointer-events-none absolute top-0 left-0 z-50 border border-black/[0.08] bg-white opacity-0 shadow-[0_12px_40px_-12px_rgba(0,0,0,0.25)] dark:border-white/[0.08] dark:bg-[#1c1c1c] dark:shadow-[0_12px_40px_-12px_rgba(0,0,0,0.7)]"
-                    />
-                    <div
-                        ref={contentRef}
-                        data-slot="model-picker-panel"
-                        onKeyDown={onPanelKey}
-                        className={cn(
-                            'absolute top-0 left-0 z-50 flex flex-col [clip-path:inset(50%)]',
-                            phase === 'closing' && 'pointer-events-none',
-                        )}
-                    >
-                        {searchable && (
-                            <div data-slot="picker-search" className="flex h-10 items-center gap-2">
-                                <Search aria-hidden className="size-3.5 shrink-0" />
-                                <input
-                                    ref={inputRef}
-                                    value={query}
-                                    onChange={(event) => {
-                                        setQuery(event.target.value)
-                                        onSearchChange?.(event.target.value)
-                                        setActive(0)
-                                    }}
-                                    placeholder={searchPlaceholder}
-                                    role="combobox"
-                                    aria-expanded={open}
-                                    aria-controls={listId}
-                                    aria-activedescendant={current ? `${id}-option-${active}` : undefined}
-                                    aria-label={'搜索' + label}
-                                    className="h-full min-w-0 flex-1 bg-transparent text-[0.8125rem] text-black outline-none placeholder:text-black/35 dark:text-white dark:placeholder:text-white/35"
-                                />
-                            </div>
-                        )}
-
-                        {browseFamilies && <div className="picker-level">
-                            {query.trim() ? <span>匹配的具体型号</span> : family ? <>
-                                <button type="button" title="全部机型系列" aria-label="全部机型系列" onClick={showFamilies}><ChevronLeft size={15} />系列</button>
-                                <strong>{family}</strong><span>具体型号</span>
-                            </> : <strong>机型系列</strong>}
-                        </div>}
-                        {scrolls && <ScrollProgress className="picker-progress" containerRef={listRef} />}
-                        <div
-                            ref={listRef}
-                            id={listId}
-                            role="listbox"
-                            tabIndex={searchable ? undefined : -1}
-                            aria-label={label}
-                            aria-activedescendant={!searchable && current ? `${id}-option-${active}` : undefined}
-                            className="relative overflow-y-auto p-1.5 outline-none [scrollbar-width:none]"
-                            style={{ maxHeight: LIST_MAX_HEIGHT }}
-                        >
-                            <div
-                                ref={highlightRef}
-                                aria-hidden
-                                className="pointer-events-none absolute top-0 right-1.5 left-1.5 rounded-[10px] bg-black/[0.05] opacity-0 dark:bg-white/[0.07]"
-                            />
-                            {groups.map((group, g) => (
-                                <div key={`${group.provider ?? ''}-${g}`} role="group" aria-label={group.provider} data-model-results={browseFamilies && !!group.provider || undefined}>
-                                    {group.provider && (!browseFamilies || !!query.trim()) && (
-                                        <div className="px-2.5 pt-2 pb-1 text-[0.6875rem] font-medium text-black/35 dark:text-white/35">
-                                            {browseFamilies && <small>系列</small>}{group.provider}
-                                        </div>
-                                    )}
-                                    {group.items.map(({ model, index: i }) => {
-                                        const isSelected = model.id === selected.id
-                                        return (
-                                            <div
-                                                key={model.id}
-                                                id={`${id}-option-${i}`}
-                                                role="option"
-                                                aria-selected={isSelected}
-                                                data-series={model.series || undefined}
-                                                data-id={model.id}
-                                                data-index={i}
-                                                onPointerMove={() => setActive(i)}
-                                                onMouseDown={(event) => event.preventDefault()}
-                                                onClick={() => choose(model, 'pointer')}
-                                                className={cn(
-                                                    'relative flex h-9 cursor-pointer items-center gap-2.5 rounded-[10px] px-2.5 text-[0.8125rem] font-medium transition-colors',
-                                                    i === active || model.id === foldTo
-                                                        ? 'text-black/90 dark:text-white/90'
-                                                        : 'text-black/65 dark:text-white/65',
-                                                )}
-                                            >
-                                                <span data-slot="model-picker-icon" className="relative min-w-0 flex-1 truncate">{model.name}</span>
-                                                {model.series && <ChevronRight size={14} aria-hidden />}
-                                                {isSelected && (
-                                                    <Check
-                                                        className={cn(
-                                                            'relative size-3.5 shrink-0 opacity-60 transition-opacity duration-150',
-                                                            phase === 'closing' && 'opacity-0',
-                                                        )}
-                                                    />
-                                                )}
-                                            </div>
-                                        )
-                                    })}
-                                </div>
-                            ))}
-                            {!filtered.length && (
-                                <div className="px-2.5 py-6 text-center text-[0.8125rem] text-black/40 dark:text-white/40">
-                                    没有匹配项
-                                </div>
-                            )}
-                        </div>
-
-                    </div>
-                </div>, rootRef.current?.closest('.app-frame')?.querySelector('.picker-layer') ?? document.body
-            )}
-        </div>
-    )
+    if (!selected) return null
+    const activeId = choices[active] ? id + '-option-' + active : undefined
+    return <div data-slot="model-picker" data-compact={compact || undefined} className={cn('relative inline-flex', className)} {...props}>
+        <button ref={trigger} type="button" aria-haspopup="listbox" aria-expanded={open} aria-controls={open ? listId : undefined}
+            aria-label={label} aria-describedby={id + '-value'} title={label + (selected.name ? ' · ' + selected.name : '')}
+            disabled={disabled} onClick={() => open ? close() : show()}
+            onKeyDown={event => { if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); show() } }}>
+            <span className="picker-value">{compact ? null : renderValue ? renderValue(selected) : selected.name}</span>
+            <span aria-hidden><ChevronDown size={14} /></span>
+        </button>
+        <span className="sr-only" id={id + '-value'}>{selected.name}</span>
+        {open && createPortal(<div className="picker-anchor" style={{ left: placement.left, top: placement.top, bottom: placement.bottom, width: placement.width }}>
+            <div ref={panel} data-slot="model-picker-panel" onKeyDown={onKey}>
+                {searchable && <div data-slot="picker-search" className="flex h-10 items-center gap-2">
+                    <Search aria-hidden size={14}/><input ref={input} role="combobox" aria-label={'搜索' + label} aria-controls={listId}
+                        aria-expanded={open} aria-activedescendant={activeId} placeholder={searchPlaceholder} value={query}
+                        onChange={event => { setQuery(event.target.value); setActive(0); onSearchChange?.(event.target.value) }}
+                        className="h-full min-w-0 flex-1 bg-transparent outline-none" /></div>}
+                {browseFamilies && <div className="picker-level">{query.trim() ? <span>匹配的具体型号</span> : family ? <>
+                    <button type="button" aria-label="全部机型系列" onClick={() => browse()}><ChevronLeft size={15}/>系列</button>
+                    <strong>{family}</strong><span>具体型号</span></> : <strong>机型系列</strong>}</div>}
+                <div ref={list} role="listbox" id={listId} aria-label={label} tabIndex={searchable ? undefined : -1}
+                    aria-activedescendant={searchable ? undefined : activeId} className="overflow-y-auto p-1.5 outline-none" style={{ maxHeight: placement.maxHeight }}>
+                    {choices.map((model, index) => <React.Fragment key={model.id}>
+                        {model.provider && (!browseFamilies || !!query.trim()) && choices[index - 1]?.provider !== model.provider &&
+                            <div className="picker-group-label">{browseFamilies && '系列 · '}{model.provider}</div>}
+                        <div role="option" id={id + '-option-' + index} aria-selected={model.id === selected.id} data-active={active === index || undefined}
+                            data-series={model.series || undefined} data-id={model.id} onPointerMove={() => setActive(index)}
+                            onMouseDown={event => event.preventDefault()} onClick={() => choose(model)}
+                            className="flex h-9 cursor-pointer items-center gap-2.5 rounded-[10px] px-2.5 text-[0.8125rem]">
+                            <span className="min-w-0 flex-1 truncate">{model.name}</span>
+                            {model.series && <ChevronRight aria-hidden size={14}/>}
+                            {model.id === selected.id && <Check aria-hidden size={14}/>}
+                        </div></React.Fragment>)}
+                    {!choices.length && <div className="px-2.5 py-4 text-center">没有匹配项</div>}
+                </div>
+            </div>
+        </div>, trigger.current?.closest('.app-frame')?.querySelector('.picker-layer') ?? document.body)}
+    </div>
 }
-
-export { ModelPicker }
 export default ModelPicker

@@ -28,7 +28,7 @@ import { RunStartApprovalModal } from './components/RunStartApprovalModal'
 import { resolveBackendControl } from './lib/backend-control'
 import { applyAppearance, useAppearanceMode, useDevicePixelRatio } from './lib/appearance'
 import { useReleaseUpdates } from './lib/use-release-updates'
-import type { AvailableRelease } from '../shared/contracts'
+import type { ReleaseUpdates } from './lib/use-release-updates'
 
 type Page = 'console' | 'settings' | 'macros'
 type ConsoleSnapshot = DesktopSnapshot & { missingHistoryRevision?: number }
@@ -289,7 +289,7 @@ export function App(): React.JSX.Element {
 
   if (!snapshot) {
     return (
-      <div className="app-frame"><WindowTitleBar available={updates?.available} /><div className="startup-screen">
+      <div className="app-frame"><WindowTitleBar updates={updates} /><div className="startup-screen">
         <div className="startup-pulse"><span /><span /><span /></div>
         <strong>{loadingMessage}</strong>
         <small>后端、持久记录与实时通道正在就绪</small>
@@ -325,7 +325,7 @@ export function App(): React.JSX.Element {
   }
   return (
     <div className="app-frame">
-      <WindowBar page={page} available={updates?.available} onPage={next=>{ if(showSetup) void withToast(()=>leaveSetup(false,next),setToast,false); else setPage(next) }} />
+      <WindowBar page={page} updates={updates} onPage={next=>{ if(showSetup) void withToast(()=>leaveSetup(false,next),setToast,false); else setPage(next) }} />
       {showSetup ? <FirstUseSetup key={scope} snapshot={snapshot} execution={macroExecution} onExecution={setMacroExecution} onLeave={leaveSetup} /> : page === 'settings' ? (
         <SettingsPage
           updates={updates}
@@ -477,8 +477,8 @@ const pageItems = [
   { label: '配置', icon: <SlidersHorizontal size={14} aria-hidden /> },
 ]
 
-export function WindowBar({ page, onPage, available }: { page: Page; onPage: (page: Page) => void; available?: AvailableRelease | null }): React.JSX.Element {
-  return <WindowTitleBar available={available}>
+export function WindowBar({ page, onPage, updates }: { page: Page; onPage: (page: Page) => void; updates?: ReleaseUpdates }): React.JSX.Element {
+  return <WindowTitleBar updates={updates}>
     <GooeyNav aria-label="工作区" items={pageItems} value={pages.indexOf(page)} onChange={index => onPage(pages[index])}
       size="sm" activeColor="var(--run-bg)" activeLabelColor="var(--run-text)" separation={7} radius={8} />
   </WindowTitleBar>

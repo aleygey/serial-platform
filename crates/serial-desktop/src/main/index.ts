@@ -1,13 +1,14 @@
 import { writeSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { app, BrowserWindow, ipcMain, Menu, nativeTheme, net, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, net, shell } from 'electron'
 import { DesktopCoordinator } from './coordinator'
 import type { DesktopPreferences, MacroListQuery, MacroRunRequest, MacroSaveRequest, ModelFamily, ModelProfile, RunStartDecision, SerialConfigurationDraft } from '../shared/contracts'
 import { HELP, startupAction } from './startup'
 import { GracefulQuitGate } from './graceful-quit'
 import { installWindowControls, titleBarOptions } from './window-controls'
-import { createReleaseChecker } from './release-check'
+import { createReleaseChecker, type CheckedRelease } from './release-check'
+import { installRelease, installTarget } from './release-install'
 
 const qaMode = process.argv.includes('--qa-screenshot')
 const qaThemeArgument = process.argv.find((argument) => argument.startsWith('--qa-theme='))?.split('=')[1]
@@ -62,8 +63,27 @@ function createWindow(): void {
 }
 
 function installIpc(): void {
-  const checkRelease = createReleaseChecker(app.getVersion(), process.platform, process.arch, (url, init) => net.fetch(url, init))
-  ipcMain.handle('desktop:check-release', checkRelease)
+  const request = (url: string, init: RequestInit) => net.fetch(url, init)
+  const checkRelease = createReleaseChecker(app.getVersion(), process.platform, process.arch, request)
+  const target = app.isPackaged && installTarget(process.platform, process.execPath, process.env)
+  let offered: CheckedRelease | null = null
+  let installing = false
+  ipcMain.handle('desktop:check-release', async () => {
+    offered = await checkRelease()
+    return offered && { version: offered.version, installable: !!target && offered.installable }
+  })
+  ipcMain.handle('desktop:install-release', async (_event, version: string) => {
+    if (installing) throw new Error('更新正在进行')
+    if (!target || !offered?.asset || offered.version !== version) throw new Error('请重新检查更新')
+    installing = true
+    try {
+      await installRelease(offered.asset, target, request)
+      app.quit()
+    } catch (error) {
+      installing = false
+      throw error
+    }
+  })
   ipcMain.handle('serial:setup-create', (_, brief: import('../shared/first-setup').SetupBrief) => coordinator!.createSetup(brief))
   ipcMain.handle('serial:setup-read', (_, id: string) => coordinator!.readSetup(id))
   ipcMain.handle('serial:setup-apply', (_, id: string, revision: number) => coordinator!.applySetup(id, revision))
@@ -146,6 +166,10 @@ if (startup === 'help') {
     installIpc()
     installMenu()
     createWindow()
+    if (process.env.SERIAL_PLATFORM_UPDATE_ERROR) {
+      dialog.showErrorBox('更新失败，已恢复原版本', process.env.SERIAL_PLATFORM_UPDATE_ERROR)
+      delete process.env.SERIAL_PLATFORM_UPDATE_ERROR
+    }
   })
   app.on('before-quit', (event) => {
     const intercepted = quitGate.intercept(

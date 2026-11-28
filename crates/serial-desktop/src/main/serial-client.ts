@@ -220,17 +220,20 @@ export class SerialClient extends EventEmitter {
       this.get<PortDescriptor[]>('/api/v1/ports'),
       this.loadConsistentConfiguration()
     ])
-    const { status, transport, profiles, families } = configuration
+    this.acceptConfiguration(configuration)
+    this.availablePorts = availablePorts
+    if (includeHumanHistory) await this.refreshHumanHistory()
+    return this.data()
+  }
+
+  private acceptConfiguration({ status, transport, profiles, families }: ConfigurationSnapshot): void {
     assertCompatibleProtocol(status.protocol_version)
     this.reconcileEventEpochs(status)
     this.status = status
     if (this.humanHistory?.server_id !== status.server_id) this.humanHistory = undefined
-    this.availablePorts = availablePorts
     this.transportProfiles = transport.profiles
     this.modelProfiles = profiles.profiles
     this.modelFamilies = families.families
-    if (includeHumanHistory) await this.refreshHumanHistory()
-    return this.data()
   }
 
   data(): ServerData {
@@ -272,7 +275,8 @@ export class SerialClient extends EventEmitter {
     } catch (error) {
       return this.recoverConfigurationConflict(error)
     }
-    await this.refresh()
+    // A model binding only changes configuration. Hardware discovery can block on USB drivers.
+    this.acceptConfiguration(await this.loadConsistentConfiguration())
   }
 
   async saveSerialConfiguration(

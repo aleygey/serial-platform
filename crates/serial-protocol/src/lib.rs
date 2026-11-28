@@ -484,8 +484,8 @@ pub struct ProbeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotConfig {
-    /// Operating-system serial port name and the sole identity of this
-    /// logical connection (for example `COM4` or `/dev/cu.usbserial-210`).
+    /// OS serial device or raw TCP serial server address (e.g. `COM4`,
+    /// `/dev/ttyUSB0`, or `192.168.1.252:10001`). Also used as the slot identity.
     pub port: String,
     /// Optional reusable physical UART profile. No profile means 115200 8N1.
     #[serde(default, skip_serializing_if = "Option::is_none")]

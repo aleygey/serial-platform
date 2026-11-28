@@ -1,3 +1,4 @@
+use crate::config::tcp_endpoint;
 use crate::control::{AcquireOutcome, ControlError, ControlLimits, ControlState, ReleaseOutcome};
 use crate::journal::{JournalError, JournalHandle, PendingAppend};
 use crate::ring::{EventRing, ReplayError, ReplayWindow};
@@ -32,10 +33,9 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-#[cfg(any(not(windows), test))]
-use tokio::io::AsyncWriteExt;
 #[cfg(not(windows))]
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::ReadBuf;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio_serial::{
     DataBits as TokioDataBits, FlowControl as TokioFlowControl, Parity as TokioParity, SerialPort,
@@ -1744,8 +1744,8 @@ impl SlotActor {
         .await;
 
         let effective_settings = self.effective_serial_settings();
-        match open_port(&self.config.port, &effective_settings) {
-            Ok(stream) => {
+        match open_port_worker(&self.config.port, &effective_settings).await {
+            Ok((worker, events)) => {
                 self.endpoint_present = true;
                 self.generation = self.generation.saturating_add(1);
                 let released =
@@ -1761,7 +1761,6 @@ impl SlotActor {
                     .await;
                     self.emit_release(released, EventKind::ControlRevoked).await;
                 }
-                let (worker, events) = spawn_port_worker(stream);
                 self.port = Some(worker);
                 self.port_events = Some(events);
                 self.session_state = SessionState::Online;
@@ -1776,11 +1775,15 @@ impl SlotActor {
                     Vec::new(),
                     Some(system_actor()),
                     None,
-                    metadata([
-                        ("port", json!(self.config.port)),
-                        ("baud_rate", json!(effective_settings.baud_rate)),
-                        ("backend", json!(serial_backend_name())),
-                    ]),
+                    if matches!(tcp_endpoint(&self.config.port), Ok(Some(_))) {
+                        metadata([("port", json!(self.config.port)), ("backend", json!("tcp"))])
+                    } else {
+                        metadata([
+                            ("port", json!(self.config.port)),
+                            ("baud_rate", json!(effective_settings.baud_rate)),
+                            ("backend", json!(serial_backend_name())),
+                        ])
+                    },
                 )
                 .await;
             }
@@ -4459,7 +4462,8 @@ impl SlotActor {
             effective_uboot_prompt: resolved.uboot_prompt,
             effective_write_eol: Some(resolved.write_eol),
             effective_echo: Some(resolved.echo),
-            effective_transport: Some(transport),
+            effective_transport: matches!(tcp_endpoint(&self.config.port), Ok(None))
+                .then_some(transport),
             effective_write_pacing: Some(WritePacing {
                 chunk_size: effective_settings.write_chunk_size,
                 chunk_delay_ms: effective_settings.write_chunk_delay_ms,
@@ -4549,7 +4553,9 @@ impl SlotActor {
         let next_model = resolve_model_settings(&SerialSettings::default(), model_profile.as_ref());
         let reopened = self.config.port != config.port
             || self.config.enabled != config.enabled
-            || previous_transport != next_transport;
+            || previous_transport.auto_open != next_transport.auto_open
+            || (matches!(tcp_endpoint(&config.port), Ok(None))
+                && previous_transport != next_transport);
         let device_changed = self.model_profile != model_profile
             || self.config.model_profile != config.model_profile
             || previous_device != next_model;
@@ -4928,6 +4934,9 @@ impl SlotActor {
     }
 
     async fn stop_port(&mut self) {
+        if matches!(tcp_endpoint(&self.config.port), Ok(Some(_))) {
+            self.endpoint_present = false;
+        }
         self.stop_macro(
             serial_protocol::MacroStatus::Cancelled,
             "serial port stopped",
@@ -6359,6 +6368,7 @@ fn initial_snapshot(
     let resolved = resolve_model_settings(&SerialSettings::default(), model_profile.as_ref());
     let transport =
         resolve_transport_settings(&SerialSettings::default(), transport_profile.as_ref());
+    let uart = matches!(tcp_endpoint(&config.port), Ok(None));
     SlotSnapshot {
         config,
         daemon_epoch,
@@ -6384,7 +6394,7 @@ fn initial_snapshot(
         effective_uboot_prompt: resolved.uboot_prompt,
         effective_write_eol: Some(resolved.write_eol),
         effective_echo: Some(resolved.echo),
-        effective_transport: Some(transport),
+        effective_transport: uart.then_some(transport),
         effective_write_pacing: Some(resolved.write_pacing),
     }
 }
@@ -6639,15 +6649,65 @@ fn open_port(
     Ok(WindowsSerialPort { reader, writer })
 }
 
+async fn open_port_worker(
+    port: &str,
+    settings: &SerialSettings,
+) -> Result<(PortWorker, mpsc::Receiver<PortEvent>), PortOpenError> {
+    let Some(address) = tcp_endpoint(port).map_err(|message| PortOpenError {
+        code: ErrorCode::BadRequest,
+        message: message.into(),
+    })?
+    else {
+        return open_port(port, settings).map(spawn_port_worker);
+    };
+    let stream = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .map_err(|_| PortOpenError {
+        code: ErrorCode::PortIo,
+        message: format!("TCP connection to {address} timed out"),
+    })?
+    .map_err(|error| PortOpenError {
+        code: ErrorCode::PortIo,
+        message: format!("TCP {address}: {error}"),
+    })?;
+    stream.set_nodelay(true).map_err(|error| PortOpenError {
+        code: ErrorCode::PortIo,
+        message: error.to_string(),
+    })?;
+    let (reader, writer) = stream.into_split();
+    Ok(spawn_async_port_worker(
+        reader,
+        writer,
+        AsyncBreakControl::Tcp,
+    ))
+}
+
+enum AsyncBreakControl {
+    Tcp,
+    #[cfg(not(windows))]
+    Uart(SharedSerialStream),
+}
+
 #[cfg(not(windows))]
 fn spawn_port_worker(stream: SerialStream) -> (PortWorker, mpsc::Receiver<PortEvent>) {
+    let shared = SharedSerialStream::new(stream);
+    let control = AsyncBreakControl::Uart(shared.clone());
+    let (reader, writer) = tokio::io::split(shared);
+    spawn_async_port_worker(reader, writer, control)
+}
+
+fn spawn_async_port_worker(
+    reader_half: impl AsyncRead + Unpin + Send + 'static,
+    writer_half: impl AsyncWrite + Unpin + Send + 'static,
+    break_control: AsyncBreakControl,
+) -> (PortWorker, mpsc::Receiver<PortEvent>) {
     let (commands, command_rx) = mpsc::channel(PORT_WRITE_QUEUE);
     let (reader_commands, reader_command_rx) = mpsc::channel(PORT_READER_COMMAND_QUEUE);
     let (events, event_rx) = mpsc::channel(PORT_EVENT_QUEUE);
     let (cancel, cancel_rx) = watch::channel(false);
-    let shared = SharedSerialStream::new(stream);
-    let break_control = shared.clone();
-    let (reader_half, writer_half) = tokio::io::split(shared);
     let reader = tokio::spawn(run_port_reader(
         reader_half,
         events.clone(),
@@ -6709,9 +6769,8 @@ fn spawn_port_worker(stream: WindowsSerialPort) -> (PortWorker, mpsc::Receiver<P
     )
 }
 
-#[cfg(not(windows))]
 async fn run_port_reader(
-    mut reader: tokio::io::ReadHalf<SharedSerialStream>,
+    mut reader: impl AsyncRead + Unpin,
     events: mpsc::Sender<PortEvent>,
     mut commands: mpsc::Receiver<PortReaderCommand>,
     mut cancel: watch::Receiver<bool>,
@@ -7078,7 +7137,6 @@ fn rx_read_capacity(pending_len: usize) -> usize {
     RX_BUFFER_BYTES.saturating_sub(pending_len)
 }
 
-#[cfg(any(not(windows), test))]
 fn arm_rx_flush_deadline(
     current: Option<tokio::time::Instant>,
     now: tokio::time::Instant,
@@ -7118,10 +7176,9 @@ fn enqueue_rx(events: &mpsc::Sender<PortEvent>, pending: &mut Vec<u8>, dropped_b
     }
 }
 
-#[cfg(not(windows))]
 async fn run_port_writer(
-    mut writer: tokio::io::WriteHalf<SharedSerialStream>,
-    break_control: SharedSerialStream,
+    mut writer: impl AsyncWrite + Unpin,
+    break_control: AsyncBreakControl,
     mut command_rx: mpsc::Receiver<PortCommand>,
     events: mpsc::Sender<PortEvent>,
     mut cancel: watch::Receiver<bool>,
@@ -7156,8 +7213,22 @@ async fn run_port_writer(
                 let _ = reply.send(outcome);
                 state
             }
-            PortCommand::Break { duration, reply } => {
-                let outcome = send_break_async(&break_control, duration, &mut cancel).await;
+            PortCommand::Break {
+                duration: _duration,
+                reply,
+            } => {
+                let outcome = match &break_control {
+                    AsyncBreakControl::Tcp => PortBreakOutcome {
+                        error: Some(PortBreakFailure::Unsupported(
+                            "raw TCP has no UART BREAK signal".into(),
+                        )),
+                        cancelled: false,
+                    },
+                    #[cfg(not(windows))]
+                    AsyncBreakControl::Uart(port) => {
+                        send_break_async(port, _duration, &mut cancel).await
+                    }
+                };
                 let result = outcome.error.clone().map_or(Ok(()), Err);
                 let state = (
                     break_failure_closes_port(outcome.error.as_ref()),
@@ -7436,7 +7507,6 @@ fn wait_windows_pacing(
 /// still has the fixed no-progress timeout. The caller must reject a pacing
 /// plan that exceeds [`MAX_WRITE_TIMEOUT`] before enqueueing it and supplies
 /// the resulting absolute deadline here.
-#[cfg(any(not(windows), test))]
 async fn write_with_pacing<W>(
     writer: &mut W,
     data: &[u8],
@@ -7593,7 +7663,6 @@ fn ensure_lease_covers_write(
     Ok(())
 }
 
-#[cfg(any(not(windows), test))]
 async fn send_port_closed(
     events: &mpsc::Sender<PortEvent>,
     cancel: &mut watch::Receiver<bool>,
@@ -7607,11 +7676,12 @@ async fn send_port_closed(
 }
 
 fn endpoint_present(port_name: &str) -> bool {
-    serialport::available_ports().is_ok_and(|ports| {
-        ports
-            .iter()
-            .any(|port| port.port_name.eq_ignore_ascii_case(port_name))
-    })
+    matches!(tcp_endpoint(port_name), Ok(None))
+        && serialport::available_ports().is_ok_and(|ports| {
+            ports
+                .iter()
+                .any(|port| port.port_name.eq_ignore_ascii_case(port_name))
+        })
 }
 
 fn wall_time_ns() -> i64 {
@@ -7656,6 +7726,102 @@ mod tests {
         assert!(!settings.rts);
         assert_eq!(settings.write_eol, "\r");
         assert_eq!(settings.echo, EchoMode::On);
+    }
+
+    #[tokio::test]
+    async fn tcp_slot_round_trips_bytes_rejects_break_and_reconnects() {
+        use crate::journal::{JournalConfig, JournalManager};
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let temp = tempfile::tempdir().unwrap();
+            let journal = JournalManager::open(JournalConfig::new(temp.path())).unwrap();
+            let config = SlotConfig {
+                port: address,
+                transport_profile: None,
+                model_profile: None,
+                model_family: None,
+                model_name: None,
+                enabled: true,
+            };
+            let slot = SlotHandle::spawn(
+                config,
+                None,
+                None,
+                ControlLimits::default(),
+                Uuid::new_v4(),
+                Instant::now(),
+                journal.handle(),
+            );
+            let mut state = slot.snapshot.clone();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let generation = state
+                .wait_for(|s| s.session_state == SessionState::Online)
+                .await
+                .unwrap()
+                .generation;
+            assert!(slot.snapshot().endpoint_present);
+            assert!(slot.snapshot().effective_transport.is_none());
+            let mut events = slot.attach(None, 0).await.unwrap().live;
+            let incoming = [0xff, 0, 0x0a];
+            peer.write_all(&incoming).await.unwrap();
+            let mut seen = Vec::new();
+            while seen.len() < incoming.len() {
+                let event = events.recv().await.unwrap();
+                if event.direction == Direction::Rx {
+                    seen.extend_from_slice(&event.data);
+                }
+            }
+            assert_eq!(seen, incoming);
+
+            let actor = Actor {
+                id: "human:tcp-test".into(),
+                label: "test".into(),
+                kind: ActorKind::Human,
+            };
+            let outgoing = vec![0, 0x80, 0x0d];
+            slot.send_human_command(
+                Uuid::new_v4(),
+                actor.clone(),
+                generation,
+                outgoing.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let mut received = [0; 3];
+            peer.read_exact(&mut received).await.unwrap();
+            assert_eq!(outgoing, received);
+            let lease = slot.snapshot().control.unwrap();
+            let result = slot
+                .send_break(
+                    Uuid::new_v4(),
+                    actor,
+                    lease.id,
+                    lease.fence,
+                    100,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert!(matches!(result, Err(SlotError::BreakUnsupported)));
+            assert_eq!(slot.snapshot().session_state, SessionState::Online);
+
+            drop(peer);
+            let (_second, _) = listener.accept().await.unwrap();
+            state
+                .wait_for(|s| s.generation > generation && s.session_state == SessionState::Online)
+                .await
+                .unwrap();
+            assert!(slot.snapshot().control.is_none());
+            slot.shutdown().await;
+            drop(slot);
+            journal.shutdown().await.unwrap();
+        })
+        .await
+        .expect("TCP slot timed out");
     }
 
     #[test]

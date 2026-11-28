@@ -3,9 +3,9 @@ import { useEffect, useId, useRef, useState } from 'react'
 import type { DesktopSnapshot, MacroDefinition, MacroExecution } from '../../shared/contracts'
 import type { SetupBrief, SetupRequest } from '../../shared/first-setup'
 import { message } from '../lib/feedback'
-import { MoreFields } from './SerialFields'
+import { tcpPortAddress } from '../lib/tcp-endpoint'
+import { MoreFields, PortEndpointField } from './SerialFields'
 import { SetupTranscript } from './SetupTranscript'
-import { ModelPicker } from './ui/model-picker'
 
 const stages = ['选择串口', '识别提示符', '设计检查', '接收方案']
 const questions = ['你要配置哪个串口？', '设备准备好时，最后一行显示什么？', '怎样判断设备有响应？', '让外部 Agent 生成配置']
@@ -20,7 +20,8 @@ export function FirstUseSetup({ snapshot, execution, onExecution, onLeave }: {
   const ports = [...new Set([...configuredPorts.map(p => p.config.port), ...availablePorts.map(p => p.name)])]
   const saved = snapshot.preferences.setupTask?.server === snapshot.serverId ? snapshot.preferences.setupTask : undefined
   const [step, setStep] = useState(saved ? 3 : 0)
-  const [port, setPort] = useState(saved?.port ?? configuredPorts.find(p => p.session_state === 'online' && !p.control)?.config.port ?? ports[0] ?? '')
+  const [chosenPort, setPort] = useState<string | undefined>(saved?.port)
+  const port = chosenPort ?? configuredPorts.find(p => p.session_state === 'online' && !p.control)?.config.port ?? ports[0] ?? ''
   const [supplyPrompt, setSupplyPrompt] = useState(false)
   const [hint, setHint] = useState('')
   const [check, setCheck] = useState<SetupBrief['check']>('heartbeat')
@@ -45,9 +46,6 @@ export function FirstUseSetup({ snapshot, execution, onExecution, onLeave }: {
   const handoff = `请通过 Serial MCP 的 setup_proposal 工具读取配置任务 ${id}。根据我的回答和 ${port} 的回显生成 Shell 提示符与一次健康检查的方案，通过同一工具回传。保留提示符末尾的空格。识别不了时请问我。`
 
   useEffect(() => { heading.current?.focus({ preventScroll:true }) }, [step])
-  useEffect(() => {
-    if (!port && ports.length) setPort(ports[0])
-  }, [port, ports[0]])
   useEffect(() => {
     if (step !== 3 || !id || proposal || !online) return
     let cancelled = false
@@ -77,7 +75,7 @@ export function FirstUseSetup({ snapshot, execution, onExecution, onLeave }: {
   async function next() {
     if (step === 0) {
       if (!port || !online) throw new Error('连接后端并选择一个串口。')
-      if (!status) await window.serial.saveSerialConfiguration({ port, enabled:true, transportProfile:snapshot.transportProfiles[0] ?? fallbackTransport }, snapshot.configRevision)
+      if (!status) await window.serial.saveSerialConfiguration({ port, enabled:true, transportProfile:tcpPortAddress(port) ? fallbackTransport : snapshot.transportProfiles[0] ?? fallbackTransport }, snapshot.configRevision)
       else if (!status.config.enabled) await window.serial.setPortOpen(port, true)
       setStep(1)
     } else if (step === 1) {
@@ -105,8 +103,9 @@ export function FirstUseSetup({ snapshot, execution, onExecution, onLeave }: {
         <form aria-labelledby={titleId} onSubmit={event => { event.preventDefault(); void action(next) }}>
           <h1 id={titleId} ref={heading} tabIndex={-1}>{definition ? '配置已保存' : questions[step]}</h1>
           {step === 0 && <><p>先连接设备，向导会用它的回显来配置 Shell 和检查宏。</p>
-            {ports.length ? <div className="setup-port"><ModelPicker label="选择要配置的串口" value={port} models={ports.map(name => ({id:name, name, provider:configuredPorts.find(p=>p.config.port===name)?.config.model_name ?? undefined}))} searchable={ports.length>7} onChange={setPort} /></div>
-              : online && <p role="status">插入串口设备后刷新列表。</p>}
+            <div className="setup-port"><PortEndpointField label="选择要配置的串口" port={port}
+              ports={ports.map(name => ({id:name, name, provider:configuredPorts.find(p=>p.config.port===name)?.config.model_name ?? undefined}))}
+              onChange={setPort} /></div>
             {!online && <p role="status">{snapshot.connectionMessage}</p>}
             <button className="setup-link" type="button" onClick={() => void action(async()=>{await window.serial.refresh()})}><RefreshCw size={13}/>{online ? '刷新设备' : '重新连接后端'}</button>
           </>}

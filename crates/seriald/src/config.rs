@@ -1026,7 +1026,10 @@ pub(crate) fn validate_ports(
             }
         }
 
-        let port_key = port_identity_key(&slot.port);
+        let address =
+            tcp_endpoint(&slot.port).map_err(|reason| invalid_port(index, "port", reason))?;
+        let port_key =
+            address.map_or_else(|| port_identity_key(&slot.port), |addr| addr.to_string());
         if let Some(first) = seen_ports.insert(port_key, index) {
             return Err(ConfigValidationError::DuplicatePort {
                 first,
@@ -1043,6 +1046,27 @@ fn catalog_summary(names: String) -> String {
     } else {
         names
     }
+}
+
+/// A raw TCP serial server uses an IP literal and port. Device paths stay opaque.
+pub(crate) fn tcp_endpoint(port: &str) -> Result<Option<SocketAddr>, &'static str> {
+    let address = if let Some(address) = port.strip_prefix("tcp://") {
+        address
+    } else if port.starts_with('[')
+        || port.split_once(':').is_some_and(|(host, _)| {
+            host.contains('.') && host.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        })
+    {
+        port
+    } else {
+        return Ok(None);
+    };
+    address
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|a| a.port() != 0)
+        .map(Some)
+        .ok_or("expected an IPv4:port or [IPv6]:port address with port 1-65535")
 }
 
 fn port_identity_key(port: &str) -> String {
@@ -1588,6 +1612,33 @@ mod tests {
         config.ports = vec![slot("/dev/cu.usbserial-210")];
         config.validate().unwrap();
         assert_eq!(config.ports[0].port, "/dev/cu.usbserial-210");
+    }
+
+    #[test]
+    fn tcp_slot_addresses_are_validated_and_aliases_cannot_own_two_connections() {
+        let mut config = DaemonConfig::generate();
+        config.ports = vec![
+            slot("COM4"),
+            slot("/dev/serial/by-path/pci-0:1"),
+            slot("192.168.1.252:10001"),
+            slot("[::1]:10001"),
+        ];
+        config.validate().unwrap();
+        config.ports.push(slot("tcp://[0:0:0:0:0:0:0:1]:10001"));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigValidationError::DuplicatePort { .. })
+        ));
+        for port in [
+            "192.168.1.252:0",
+            "192.168.1.252:65536",
+            "tcp://",
+            "[::1]:",
+            "127.0.0.999:10001",
+        ] {
+            config.ports = vec![slot(port)];
+            assert!(config.validate().is_err(), "{port}");
+        }
     }
 
     #[test]
